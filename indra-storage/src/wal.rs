@@ -133,8 +133,17 @@ impl MempoolWal {
 
     /// Truncate the WAL (after a successful compaction or snapshot).
     pub fn truncate(&mut self) -> StorageResult<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
+        // Close and reopen the file to avoid Windows permission issues
+        // with truncating an append-mode file handle.
+        drop(std::mem::replace(
+            &mut self.file,
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&self.path)?,
+        ));
         Ok(())
     }
 
