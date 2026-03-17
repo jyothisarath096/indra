@@ -1,0 +1,24 @@
+[package]
+name        = "indra-node"
+description = "INDRA v2 node binary — consensus engine, storage, sync, slash detection"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+indra-core      = { path = "../indra-core" }
+indra-crypto    = { path = "../indra-crypto" }
+indra-state     = { path = "../indra-state" }
+indra-consensus = { path = "../indra-consensus" }
+indra-storage   = { path = "../indra-storage" }
+indra-network   = { path = "../indra-network" }
+thiserror.workspace = true
+
+[dev-dependencies]
+indra-core      = { path = "../indra-core" }
+indra-crypto    = { path = "../indra-crypto" }
+indra-state     = { path = "../indra-state" }
+indra-consensus = { path = "../indra-consensus" }
+indra-storage   = { path = "../indra-storage" }
+indra-network   = { path = "../indra-network" }

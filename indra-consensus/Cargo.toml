@@ -1,0 +1,18 @@
+[package]
+name        = "indra-consensus"
+description = "INDRA consensus engine — mempool, proposer election, block production, voting, QC"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+indra-core   = { path = "../indra-core" }
+indra-crypto = { path = "../indra-crypto" }
+indra-state  = { path = "../indra-state" }
+thiserror.workspace = true
+
+[dev-dependencies]
+indra-core   = { path = "../indra-core" }
+indra-crypto = { path = "../indra-crypto" }
+indra-state  = { path = "../indra-state" }

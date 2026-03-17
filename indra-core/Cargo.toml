@@ -1,0 +1,17 @@
+[package]
+name        = "indra-core"
+description = "INDRA core — protocol constants, SSZ serialisation, all consensus data structures"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+indra-crypto       = { path = "../indra-crypto" }
+sha2.workspace     = true
+thiserror.workspace = true
+hex.workspace       = true
+
+[dev-dependencies]
+proptest.workspace = true
+hex.workspace      = true

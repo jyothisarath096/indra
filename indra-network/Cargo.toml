@@ -1,0 +1,16 @@
+[package]
+name        = "indra-network"
+description = "INDRA v2 P2P networking — wire protocol, peer table, gossip"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+indra-core   = { path = "../indra-core" }
+indra-crypto = { path = "../indra-crypto" }
+thiserror.workspace = true
+
+[dev-dependencies]
+indra-core   = { path = "../indra-core" }
+indra-crypto = { path = "../indra-crypto" }

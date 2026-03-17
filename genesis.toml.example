@@ -1,0 +1,63 @@
+# =============================================================================
+# INDRA v2 — Example Genesis Configuration
+# =============================================================================
+#
+# How to use this file:
+#
+# 1. Each validator runs:
+#      indra-cli keygen --passphrase "my-unique-passphrase" --output keys.json
+#
+# 2. Each validator shares ONLY their public section (validator_id, *_pk fields)
+#    with the genesis coordinator.
+#
+# 3. The coordinator fills in this file with all validators' public keys
+#    and distributes it to everyone.
+#
+# 4. Each validator runs:
+#      indra-node --genesis genesis.toml --keys keys.json --data-dir ./data
+#
+# =============================================================================
+
+[genesis]
+timestamp    = 1700000000       # 2023-11-14 00:00:00 UTC — fixed genesis time
+chain_id     = "indra-testnet-1"
+total_supply = 1000000000000000 # 1,000,000,000 INDRA in Spark (10^6 Spark per INDRA)
+
+# Minimum 4 validators required (BFT safety: 3f+1, f=1 means tolerate 1 failure)
+# Recommended for testnet: 4–10 validators
+
+[[validators]]
+name                = "alice"
+validator_id        = "aabbcc..."   # 64 hex chars (32 bytes)
+hybrid_classical_pk = "aabbcc..."   # 64 hex chars (Ed25519 public key)
+hybrid_pq_pk        = "aabbcc..."   # variable length (Dilithium2 public key)
+bls_pk              = "aabbcc..."   # 96 hex chars (BLS12-381 public key)
+vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
+stake               = 100000000000 # 100,000 INDRA in Spark
+
+[[validators]]
+name                = "bob"
+validator_id        = "112233..."
+hybrid_classical_pk = "112233..."
+hybrid_pq_pk        = "112233..."
+bls_pk              = "112233..."
+vrf_pk              = "112233..."
+stake               = 100000000000
+
+[[validators]]
+name                = "carol"
+validator_id        = "334455..."
+hybrid_classical_pk = "334455..."
+hybrid_pq_pk        = "334455..."
+bls_pk              = "334455..."
+vrf_pk              = "334455..."
+stake               = 100000000000
+
+[[validators]]
+name                = "dave"
+validator_id        = "556677..."
+hybrid_classical_pk = "556677..."
+hybrid_pq_pk        = "556677..."
+bls_pk              = "556677..."
+vrf_pk              = "556677..."
+stake               = 100000000000

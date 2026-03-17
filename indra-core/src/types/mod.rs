@@ -1,0 +1,11 @@
+//! All INDRA v2 protocol data structures.
+
+pub mod block;
+pub mod checkpoint;
+pub mod crypto;
+pub mod governance;
+pub mod primitives;
+pub mod qc;
+pub mod slashing;
+pub mod transaction;
+pub mod vote;
