@@ -92,7 +92,7 @@ fn two_nodes_exchange_status() {
         }
     });
 
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(500));
 
     let client = Transport::bind("127.0.0.1:0").unwrap();
     let mut conn = client.dial(server_addr).unwrap();
