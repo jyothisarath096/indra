@@ -287,6 +287,7 @@ dependencies = [
 name = "indra-node"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "indra-consensus",
  "indra-core",
  "indra-crypto",
