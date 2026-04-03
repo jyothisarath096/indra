@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+hex.workspace = true
 indra-core   = { path = "../indra-core" }
 indra-crypto = { path = "../indra-crypto" }
 thiserror.workspace = true

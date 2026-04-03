@@ -61,6 +61,47 @@ use crate::{
 ///
 /// On success: returns the updated state.
 /// On failure: returns an error and the original state is unchanged.
+
+/// Apply slash evidence — reduce offending validator stake.
+///
+/// Double-precommit: 5% of stake (SLASH_DOUBLE_PRECOMMIT_BPS = 500)
+/// Surround vote:   100% of stake (SLASH_SURROUND_VOTE_BPS = 10_000)
+#[allow(dead_code)]
+fn apply_slash(state: &mut ChainState, evidence: &indra_core::types::slashing::SlashEvidenceV1) {
+    use indra_core::types::primitives::{SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_SURROUND_VOTE_BPS};
+
+    let validator_id = evidence.validator_id;
+    // Determine offence type from the two conflicting votes
+    let is_double_precommit = evidence.vote_1.height == evidence.vote_2.height
+        && evidence.vote_1.round == evidence.vote_2.round
+        && evidence.vote_1.block_hash != evidence.vote_2.block_hash;
+    let slash_bps = if is_double_precommit {
+        SLASH_DOUBLE_PRECOMMIT_BPS
+    } else {
+        SLASH_SURROUND_VOTE_BPS
+    };
+
+    if let Some(validator) = state.validators.get_mut(&validator_id) {
+        let slash_amount = validator.stake_spark
+            .saturating_mul(slash_bps as u64)
+            / 10_000;
+        validator.stake_spark = validator.stake_spark.saturating_sub(slash_amount);
+
+        // Deactivate if stake drops below minimum
+        use indra_core::types::primitives::MIN_STAKE_SPARK;
+        if validator.stake_spark < MIN_STAKE_SPARK {
+            validator.status = crate::ValidatorStatus::Slashed;
+        }
+
+        println!(
+            "[slash] validator {}... slashed {} Spark",
+            hex::encode(validator_id.0).chars().take(8).collect::<String>(),
+            slash_amount,
+        );
+    }
+}
+
+/// Apply a block to the chain state, updating UTXOs, nullifiers, fees and validators.
 pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 

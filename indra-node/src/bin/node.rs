@@ -77,8 +77,18 @@ fn main() {
     };
 
     // Init node engine + consensus driver
-    let engine = NodeEngine::init(config)
+    let mut engine = NodeEngine::init(config)
         .unwrap_or_else(|e| panic!("Node init failed: {}", e));
+
+    // Load validator set from genesis.toml
+    let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
+    if std::path::Path::new(&genesis_path).exists() {
+        indra_node::load_genesis_validators(&genesis_path, &mut engine.state);
+        println!("Validator set: {} active validators",
+            engine.state.validators.active_count());
+    } else {
+        println!("[warning] genesis.toml not found at {} — validator set empty", genesis_path);
+    }
 
     let validator_id = engine.validator_id()
         .map(|id| hex::encode(id.0))
@@ -308,11 +318,46 @@ fn main() {
                         //
                         // For now: the bootstrap node (no bootstrap-peers arg) always proposes
                         // to demonstrate block advancement.
-                        let is_bootstrap = {
-                            driver.lock().unwrap().engine.config.bootstrap_peers.is_empty()
+                        // VRF-based proposer election
+                        let should_propose = {
+                            let d = driver.lock().unwrap();
+                            let vrf_seed = d.engine.config.vrf_seed.unwrap_or([0u8; 32]);
+                            let vrf_kp = indra_crypto::VrfKeypair::from_seed(&vrf_seed);
+                            let epoch_seed = indra_core::types::primitives::Bytes32::from(
+                                indra_crypto::sha256(&d.engine.state.tip_hash.0)
+                            );
+                            let height = d.engine.state.height + 1;
+
+                            // Build candidate list from active validators
+                            let total_stake = d.engine.state.validators.total_active_stake();
+                            let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
+                                d.engine.state.validators.active_validators()
+                                    .map(|v| indra_consensus::proposer::ProposerCandidate {
+                                        validator_id: v.validator_id,
+                                        vrf_pubkey: indra_crypto::sha256(&v.validator_id.0),
+                                        stake: v.stake_spark,
+                                    })
+                                    .collect();
+
+                            if candidates.is_empty() {
+                                // No validators loaded — fall back to bootstrap behaviour
+                                d.engine.config.bootstrap_peers.is_empty()
+                            } else {
+                                let election = indra_consensus::proposer::ProposerElection {
+                                    epoch_seed,
+                                    height,
+                                    candidates,
+                                };
+                                let slot = indra_consensus::proposer::compute_proposer_vrf(
+                                    &vrf_kp, &epoch_seed, height
+                                );
+                                let elected = indra_consensus::elect_proposer(&election)
+                                    .unwrap_or(indra_core::types::primitives::Bytes32::ZERO);
+                                elected == slot.proposer_id
+                            }
                         };
 
-                        if is_bootstrap {
+                        if should_propose {
                             // Propose a block
                             use indra_core::{
                                 Bytes32, ProtocolVersion, VariableBytes,

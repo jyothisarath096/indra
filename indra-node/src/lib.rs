@@ -42,7 +42,7 @@ pub mod net_driver;
 pub use config::NodeConfig;
 pub use error::{NodeError, NodeResult};
 pub use engine::NodeEngine;
-pub use genesis::{build_genesis_block, build_genesis_state};
+pub use genesis::{build_genesis_block, build_genesis_state, load_genesis_validators};
 pub use sync::import_block;
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};
 pub use driver::{ConsensusDriver, DriverEvent, DriverAction};

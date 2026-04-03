@@ -122,7 +122,7 @@ fn mempool_to_block_pipeline() {
         epoch_seed: Bytes32::from(seed),
         height: 1,
         candidates: vec![ProposerCandidate {
-            validator_id: Bytes32::from(indra_crypto::sha256(&indra_crypto::sha256(&seed))),
+            validator_id: Bytes32::from(indra_crypto::sha256(&indra_crypto::VrfKeypair::from_seed(&seed).public_key())),
             vrf_pubkey:   seed,
             stake:        1_000_000,
         }],

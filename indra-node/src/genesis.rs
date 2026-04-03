@@ -61,6 +61,95 @@ pub fn build_genesis_state() -> ChainState {
     ChainState::new_genesis()
 }
 
+
+/// Load validator entries from a genesis.toml file.
+///
+/// Reads each [[validators]] section and registers them in the
+/// provided ChainState validator set with Active status.
+pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::ChainState) {
+    use indra_core::types::primitives::Bytes32;
+    use indra_state::{ValidatorEntry, ValidatorStatus};
+
+    let content = std::fs::read_to_string(genesis_path)
+        .unwrap_or_else(|e| panic!("Cannot read genesis file {}: {}", genesis_path, e));
+
+    // Parse each [[validators]] block
+    let mut in_validator = false;
+    let mut current: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut validators = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "[[validators]]" {
+            if !current.is_empty() {
+                validators.push(current.clone());
+                current.clear();
+            }
+            in_validator = true;
+            continue;
+        }
+        if line.starts_with('[') && line != "[[validators]]" {
+            if in_validator && !current.is_empty() {
+                validators.push(current.clone());
+                current.clear();
+            }
+            in_validator = false;
+            continue;
+        }
+        if in_validator {
+            if let Some(eq) = line.find('=') {
+                let key = line[..eq].trim().to_string();
+                let val = line[eq+1..].trim()
+                    .trim_matches('"')
+                    .trim_end_matches(',')
+                    .trim_matches('"')
+                    .to_string();
+                current.insert(key, val);
+            }
+        }
+    }
+    if !current.is_empty() {
+        validators.push(current);
+    }
+
+    println!("[genesis] Loading {} validators from {}", validators.len(), genesis_path);
+
+    for v in validators {
+        let id_hex = match v.get("validator_id") {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let stake_str = v.get("stake").cloned().unwrap_or_else(|| "0".to_string());
+        let stake: u64 = stake_str.trim().parse().unwrap_or(0);
+        let name = v.get("name").cloned().unwrap_or_default();
+
+        let id_bytes = match hex::decode(&id_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                eprintln!("[genesis] Invalid validator_id for {}: {}", name, id_hex);
+                continue;
+            }
+        };
+
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&id_bytes);
+        let validator_id = Bytes32::from(arr);
+
+        let entry = ValidatorEntry {
+            validator_id,
+            stake_spark: stake,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+        };
+
+        state.validators.upsert(entry);
+        println!("[genesis]   + {} ({}...)", name, &id_hex[..8]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

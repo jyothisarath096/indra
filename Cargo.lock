@@ -314,6 +314,7 @@ dependencies = [
 name = "indra-state"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "indra-core",
  "indra-crypto",
  "thiserror",

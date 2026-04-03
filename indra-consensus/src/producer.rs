@@ -158,7 +158,7 @@ mod tests {
             height,
             candidates: vec![
                 crate::proposer::ProposerCandidate {
-                    validator_id: Bytes32::from(indra_crypto::sha256(&indra_crypto::sha256(&vrf_pk))),
+                    validator_id: Bytes32::from(indra_crypto::sha256(&indra_crypto::VrfKeypair::from_seed(&vrf_pk).public_key())),
                     vrf_pubkey:   vrf_pk,
                     stake,
                 }
