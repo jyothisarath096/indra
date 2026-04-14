@@ -24,17 +24,17 @@ pub const EPOCH_DURATION_BLOCKS: u64 = 300;
 pub const MAX_VALIDATORS: usize = 1_500;
 
 /// Epochs a validator's stake is locked after initiating exit.
-pub const UNBONDING_PERIOD_EPOCHS: u64 = 200;
+pub const UNBONDING_PERIOD_EPOCHS: u64 = 60; // reduced from 200 — 30 days vs 100 days, industry standard
 
 /// Epochs after exit during which a validator's signatures remain valid.
 /// AUTH_WINDOW = UNBONDING_PERIOD + 100
-pub const AUTH_WINDOW_EPOCHS: u64 = 300;
+pub const AUTH_WINDOW_EPOCHS: u64 = 160; // reduced with unbonding — unbonding(60) + buffer(100)
 
 /// Epochs beyond which a new node must have a checkpoint to sync.
 pub const WS_WINDOW_EPOCHS: u64 = 500;
 
 /// Epochs within which a validator must claim rewards before expiry.
-pub const CLAIM_WINDOW_EPOCHS: u64 = 1_000;
+pub const CLAIM_WINDOW_EPOCHS: u64 = 175_200; // ~100 years — rewards never expire in practice
 
 /// Default propose phase timeout (ms).
 pub const T_PROPOSE_MS: u64 = 2_000;
@@ -57,7 +57,7 @@ pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
 /// Slash fraction for double precommit: 5% (500 basis points out of 10000).
-pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 500;
+pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 1_000; // increased from 500 — stronger deterrent
 
 /// Slash fraction for surround vote: 100% (10000 / 10000).
 pub const SLASH_SURROUND_VOTE_BPS: u32 = 10_000;
@@ -132,7 +132,7 @@ pub const MIN_STAKE_SPARK: u64 = MIN_STAKE_INDRA * SPARK_PER_INDRA;
 pub const DUST_LIMIT_SPARK: u64 = 1_000;
 
 /// Annual inflation rate in basis points (300 = 3.00%). Immutable.
-pub const INFLATION_RATE_BPS: u32 = 300;
+pub const INFLATION_RATE_BPS: u32 = 100; // reduced from 300 (3%) — credible monetary policy
 
 /// Validator reward pool share in basis points.
 pub const VALIDATOR_POOL_SHARE_BPS: u32 = 6_000;
@@ -167,7 +167,15 @@ pub const TARGET_UTILISATION_DENOMINATOR: u64 = 100;
 pub const QUORUM_THRESHOLD_BPS: u32 = 3_300;
 
 /// Required YES fraction of participating stake to pass (8000 = 80.00%).
-pub const PASS_THRESHOLD_BPS: u32 = 8_000;
+pub const PASS_THRESHOLD_BPS: u32 = 6_600; // reduced from 8000 — 80% impossible at 500+ validators
+
+/// Veto threshold — if this fraction of total stake votes No, the proposal fails
+/// regardless of the yes percentage. Prevents minority capture via voter apathy.
+/// A coordinated third of stake can block any proposal (lazy-majority attack defence).
+pub const VETO_THRESHOLD_BPS: u32 = 3_300;
+/// Veto threshold — if this fraction of total stake votes No, the proposal fails
+/// regardless of the yes percentage. Prevents minority capture via voter apathy.
+/// At 33%: a coordinated 1/3 of stake can block any proposal (lazy-majority attack defence).
 
 /// Required YES fraction of total stake for emergency proposals (9000 = 90.00%).
 pub const EMERGENCY_PASS_BPS: u32 = 9_000;
