@@ -84,11 +84,15 @@ impl RpcServer {
             }
         };
 
-        let http_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response.len(),
-            response
-        );
+        let http_response = if response == "__OPTIONS__" {
+            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n".to_string()
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+        };
 
         if let Ok(mut w) = stream.try_clone() {
             let _ = w.write_all(http_response.as_bytes());
@@ -102,19 +106,30 @@ impl RpcServer {
     ) -> Result<String, Box<dyn std::error::Error>> {
         let mut reader = BufReader::new(stream.try_clone()?);
 
-        // Read HTTP headers to find Content-Length
+        // Read HTTP headers to find Content-Length and method
         let mut content_length = 0usize;
+        let mut is_options = false;
         let mut line = String::new();
+        let mut first_line = true;
 
         loop {
             line.clear();
             reader.read_line(&mut line)?;
             let trimmed = line.trim();
+            if first_line {
+                if trimmed.starts_with("OPTIONS") { is_options = true; }
+                first_line = false;
+            }
             if trimmed.is_empty() { break; }
             if trimmed.to_lowercase().starts_with("content-length:") {
                 let val = trimmed["content-length:".len()..].trim();
                 content_length = val.parse().unwrap_or(0);
             }
+        }
+
+        // Respond to CORS preflight immediately
+        if is_options {
+            return Ok("__OPTIONS__".to_string());
         }
 
         if content_length == 0 {
