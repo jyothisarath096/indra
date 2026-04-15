@@ -156,6 +156,21 @@ pub enum IndraError {
         current_height: u64,
     },
 
+    /// A staking operation was structurally invalid.
+    #[error("invalid staking op: {0}")]
+    InvalidStakingOp(String),
+
+    /// Commission rate outside the protocol-allowed range.
+    #[error("commission {actual} bps out of range [{min}, {max}]")]
+    CommissionOutOfRange {
+        /// The actual commission value supplied.
+        actual: u32,
+        /// The minimum allowed commission.
+        min: u32,
+        /// The maximum allowed commission.
+        max: u32,
+    },
+
     /// An internal invariant was violated. The node must halt.
     #[error("INVARIANT VIOLATION: {message} — node must halt")]
     InvariantViolation {

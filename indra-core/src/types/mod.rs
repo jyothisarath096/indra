@@ -7,5 +7,6 @@ pub mod governance;
 pub mod primitives;
 pub mod qc;
 pub mod slashing;
+pub mod staking;
 pub mod transaction;
 pub mod vote;

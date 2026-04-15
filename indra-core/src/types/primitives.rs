@@ -169,10 +169,23 @@ pub const QUORUM_THRESHOLD_BPS: u32 = 3_300;
 /// Required YES fraction of participating stake to pass (8000 = 80.00%).
 pub const PASS_THRESHOLD_BPS: u32 = 6_600; // reduced from 8000 — 80% impossible at 500+ validators
 
+/// Minimum validator commission rate in basis points (500 = 5%).
+/// Validators cannot undercut this — prevents race-to-zero on delegator fees.
+pub const MIN_COMMISSION_BPS: u32 = 500;
+
+/// Maximum validator commission rate in basis points (2000 = 20%).
+/// Set by governance — prevents validators extracting excessive rent.
+pub const MAX_COMMISSION_BPS: u32 = 2_000;
+
+/// Default commission rate for validators that do not set one explicitly.
+pub const DEFAULT_COMMISSION_BPS: u32 = 1_000;
+
 /// Veto threshold — if this fraction of total stake votes No, the proposal fails
 /// regardless of the yes percentage. Prevents minority capture via voter apathy.
 /// A coordinated third of stake can block any proposal (lazy-majority attack defence).
 pub const VETO_THRESHOLD_BPS: u32 = 3_300;
+/// Minimum validator commission rate in basis points (500 = 5%).
+/// Validators cannot undercut this — prevents race-to-zero on delegator fees.
 /// Veto threshold — if this fraction of total stake votes No, the proposal fails
 /// regardless of the yes percentage. Prevents minority capture via voter apathy.
 /// At 33%: a coordinated 1/3 of stake can block any proposal (lazy-majority attack defence).
