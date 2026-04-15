@@ -107,6 +107,22 @@ pub enum StateError {
 
     // ── State integrity errors ─────────────────────────────────────────────
 
+    /// A staking operation was invalid.
+    #[error("invalid staking op: {0}")]
+    InvalidStakingOp(String),
+
+    /// Validator not found in the validator set.
+    #[error("validator not found")]
+    ValidatorNotFound,
+
+    /// Validator is not in Active status.
+    #[error("validator is not active")]
+    ValidatorNotActive,
+
+    /// Delegator not found for this validator.
+    #[error("delegator not found")]
+    DelegatorNotFound,
+
     /// An invariant was violated. The node must halt.
     #[error("INVARIANT VIOLATION: {message}")]
     InvariantViolation {

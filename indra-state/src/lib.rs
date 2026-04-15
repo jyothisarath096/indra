@@ -42,6 +42,7 @@ pub mod validator;
 pub mod chain;
 pub mod apply;
 pub mod fee;
+pub mod delegation;
 pub mod epoch;
 
 pub use error::{StateError, StateResult};
@@ -51,4 +52,6 @@ pub use validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};
 pub use chain::ChainState;
 pub use apply::apply_block;
 pub use fee::compute_next_base_fee;
+pub use delegation::apply_staking_op;
 pub use epoch::apply_epoch_transition;
+pub use validator::DelegatorEntry;

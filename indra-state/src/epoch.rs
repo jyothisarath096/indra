@@ -132,11 +132,37 @@ fn distribute_validator_rewards(
             .saturating_mul(*stake)
             / total_stake;
 
-        if let Some(entry) = state.validators.get_mut(id) {
-            entry.pending_rewards = entry.pending_rewards.saturating_add(reward);
-            entry.rewards_last_epoch = current_epoch;
-            distributed = distributed.saturating_add(reward);
+        // Split reward: commission to validator, rest to delegators
+        let commission_bps = state.validators.get(id)
+            .map(|v| v.commission_bps)
+            .unwrap_or(1_000);
+
+        let delegated = state.delegations.total_delegated(id);
+        let validator_self_reward;
+        let delegator_pool;
+
+        if delegated == 0 {
+            // No delegators — validator keeps all
+            validator_self_reward = reward;
+            delegator_pool = 0;
+        } else {
+            // Commission fraction goes to validator
+            let commission = reward.saturating_mul(commission_bps as u64) / 10_000;
+            validator_self_reward = commission;
+            delegator_pool = reward.saturating_sub(commission);
         }
+
+        if let Some(entry) = state.validators.get_mut(id) {
+            entry.pending_rewards = entry.pending_rewards.saturating_add(validator_self_reward);
+            entry.rewards_last_epoch = current_epoch;
+            distributed = distributed.saturating_add(validator_self_reward);
+        }
+
+        // Distribute delegator pool proportionally
+        let remainder_delegators = state.delegations.distribute_rewards(id, delegator_pool, current_epoch);
+        distributed = distributed.saturating_add(delegator_pool.saturating_sub(remainder_delegators));
+        // Delegator remainder back to treasury
+        state.treasury_balance = state.treasury_balance.saturating_add(remainder_delegators);
     }
 
     // Remainder (due to floor division) goes to treasury

@@ -12,7 +12,7 @@ use indra_core::types::primitives::{
 use crate::{
     nullifier::NullifierSet,
     utxo::UtxoSet,
-    validator::ValidatorSet,
+    validator::{ValidatorSet, DelegationMap},
 };
 
 /// The complete chain state at a given block height.
@@ -50,6 +50,9 @@ pub struct ChainState {
 
     /// Current validator set.
     pub validators: ValidatorSet,
+
+    /// Delegation map: validator_id → delegator entries.
+    pub delegations: DelegationMap,
 }
 
 impl ChainState {
@@ -67,6 +70,7 @@ impl ChainState {
             utxos:            UtxoSet::new(),
             nullifiers:       NullifierSet::new(),
             validators:       ValidatorSet::new(),
+            delegations:      DelegationMap::new(),
         }
     }
 
