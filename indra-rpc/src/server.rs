@@ -70,7 +70,8 @@ impl RpcServer {
     }
 
     /// Handle one HTTP connection.
-    fn handle_connection(stream: TcpStream, engine: Arc<Mutex<NodeEngine>>) {
+    /// Handle a single inbound TCP stream as a JSON-RPC request.
+    pub fn handle_connection(stream: TcpStream, engine: Arc<Mutex<NodeEngine>>) {
         let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
         let response = match Self::read_and_process(&stream, &engine) {
             Ok(resp) => resp,
@@ -173,6 +174,101 @@ impl RpcServer {
 
         Ok(resp.to_json())
     }
+}
+
+/// Handle one HTTP/JSON-RPC request from a raw TCP stream with a NodeEngine reference.
+///
+/// This is the integration point for the node binary. It borrows the engine
+/// for the duration of one request only — no Arc or cloning required.
+pub fn handle_with_engine(stream: TcpStream, engine: &NodeEngine) {
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let response = match read_and_process_ref(&stream, engine) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let resp = RpcResponse::err(
+                JsonId::Null,
+                ERR_INTERNAL_ERROR,
+                e.to_string(),
+            );
+            resp.to_json()
+        }
+    };
+
+    let http_response = if response == "__OPTIONS__" {
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n".to_string()
+    } else {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+    };
+
+    if let Ok(mut w) = stream.try_clone() {
+        let _ = w.write_all(http_response.as_bytes());
+    }
+}
+
+/// Read and process one HTTP request using a plain engine reference.
+fn read_and_process_ref(
+    stream: &TcpStream,
+    engine: &NodeEngine,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut content_length = 0usize;
+    let mut is_options = false;
+    let mut line = String::new();
+    let mut first_line = true;
+
+    loop {
+        line.clear();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+        if first_line {
+            if trimmed.starts_with("OPTIONS") { is_options = true; }
+            first_line = false;
+        }
+        if trimmed.is_empty() { break; }
+        if trimmed.to_lowercase().starts_with("content-length:") {
+            let val = trimmed["content-length:".len()..].trim();
+            content_length = val.parse().unwrap_or(0);
+        }
+    }
+
+    if is_options {
+        return Ok("__OPTIONS__".to_string());
+    }
+
+    if content_length == 0 {
+        return Ok(RpcResponse::err(
+            JsonId::Null,
+            ERR_PARSE_ERROR,
+            "empty request body".to_string(),
+        ).to_json());
+    }
+
+    let mut body = vec![0u8; content_length.min(1_048_576)];
+    use std::io::Read;
+    reader.read_exact(&mut body)?;
+    let body_str = String::from_utf8_lossy(&body);
+
+    let req = match parse_request(&body_str) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(RpcResponse::err(JsonId::Null, ERR_PARSE_ERROR, e).to_json());
+        }
+    };
+
+    let id = req.id.clone();
+    let state = NodeState { engine };
+    let result = dispatch(&req.method, &req.params, &state);
+
+    let resp = match result {
+        Ok(json) => RpcResponse::ok(id, json),
+        Err(e)   => RpcResponse::err(id, e.code(), e.to_string()),
+    };
+
+    Ok(resp.to_json())
 }
 
 /// Make a direct in-process RPC call (for testing without HTTP).

@@ -411,6 +411,33 @@ fn main() {
         });
     }
 
+    // ── Thread 5: RPC server ────────────────────────────────────────────────
+    // Inline HTTP/JSON-RPC handler — avoids circular dependency with indra-rpc.
+    // Reads chain state directly from the driver under a brief lock.
+    {
+        let driver_rpc = Arc::clone(&driver);
+        let rpc_addr = get_arg("--rpc-addr").unwrap_or_else(|| "127.0.0.1:8545".to_string());
+        println!("[RPC] Listening on {}", rpc_addr);
+
+        std::thread::spawn(move || {
+            let listener = match std::net::TcpListener::bind(&rpc_addr) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("[rpc] bind failed: {}", e); return; }
+            };
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let driver_rpc = Arc::clone(&driver_rpc);
+                        std::thread::spawn(move || {
+                            handle_rpc(stream, &driver_rpc);
+                        });
+                    }
+                    Err(e) => eprintln!("[rpc] accept error: {}", e),
+                }
+            }
+        });
+    }
+
     // ── Main thread: status printer ─────────────────────────────────────────
     let mut last_height = 0u64;
     let mut tick = 0u64;
@@ -454,4 +481,154 @@ fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes[..32]);
     arr
+}
+
+/// Inline JSON-RPC handler for the node binary.
+///
+/// Reads one HTTP request, dispatches to the appropriate chain query,
+/// and writes the JSON response. Locks the driver only for the duration
+/// of the state read — not while writing the HTTP response.
+fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>) {
+    use std::io::{BufRead, BufReader, Write, Read};
+
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+
+    // ── Parse HTTP request ────────────────────────────────────────────────
+    let mut reader = match stream.try_clone() {
+        Ok(s) => BufReader::new(s),
+        Err(_) => return,
+    };
+
+    let mut content_length = 0usize;
+    let mut is_options = false;
+    let mut line = String::new();
+    let mut first_line = true;
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).is_err() { return; }
+        let trimmed = line.trim();
+        if first_line {
+            if trimmed.starts_with("OPTIONS") { is_options = true; }
+            first_line = false;
+        }
+        if trimmed.is_empty() { break; }
+        if trimmed.to_lowercase().starts_with("content-length:") {
+            content_length = trimmed["content-length:".len()..].trim().parse().unwrap_or(0);
+        }
+    }
+
+    let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
+
+    if is_options {
+        let resp = format!("HTTP/1.1 204 No Content\r\n{}Connection: close\r\n\r\n", cors);
+        let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+        return;
+    }
+
+    if content_length == 0 {
+        let body = r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"empty body"},"id":null}"#;
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, body.len(), body);
+        let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+        return;
+    }
+
+    let mut body_bytes = vec![0u8; content_length.min(1_048_576)];
+    if reader.read_exact(&mut body_bytes).is_err() { return; }
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // ── Parse JSON-RPC method ─────────────────────────────────────────────
+    let method = extract_json_str(&body_str, "method").unwrap_or_default();
+    let id_raw = extract_json_id(&body_str);
+
+    // ── Lock driver, read state, build response ───────────────────────────
+    let result: String = {
+        let guard = driver.lock().unwrap();
+        let s = &guard.engine.state;
+        let mempool_size = guard.engine.mempool.len();
+
+        match method.as_str() {
+            "indra_getHeight" => {
+                format!(r#"{{"height":{}}}"#, s.height)
+            }
+            "indra_getTip" => {
+                format!(r#"{{"height":{},"tip_hash":"{}"}}"#,
+                    s.height, hex::encode(s.tip_hash.0))
+            }
+            "indra_getChainInfo" => {
+                format!(
+                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"active_validators":{},"mempool_size":{},"epoch":{}}}"#,
+                    s.height,
+                    hex::encode(s.tip_hash.0),
+                    s.base_fee,
+                    s.total_supply,
+                    s.treasury_balance,
+                    s.burn_buffer,
+                    s.validators.active_count(),
+                    mempool_size,
+                    s.current_epoch(),
+                )
+            }
+            "indra_getMempoolSize" => {
+                format!(r#"{{"size":{}}}"#, mempool_size)
+            }
+            "indra_getValidatorSet" => {
+                let entries: Vec<String> = s.validators.active_validators().map(|v| {
+                    format!(
+                        r#"{{"validator_id":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{}}}"#,
+                        hex::encode(v.validator_id.0),
+                        v.stake_spark,
+                        v.commission_bps,
+                        v.pending_rewards,
+                        v.registered_epoch,
+                    )
+                }).collect();
+                format!(r#"{{"validators":[{}]}}"#, entries.join(","))
+            }
+            _ => {
+                let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found: {}"}},"id":{}}}"#, method, id_raw);
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                return;
+            }
+        }
+    };
+
+    let json_resp = format!(r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#, result, id_raw);
+    let http_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        cors, json_resp.len(), json_resp
+    );
+    let _ = stream.try_clone().map(|mut w| w.write_all(http_resp.as_bytes()));
+}
+
+/// Extract a string field value from a JSON string (simple, no full parser needed).
+fn extract_json_str(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let pos = json.find(&needle)?;
+    let after = &json[pos + needle.len()..];
+    let colon = after.find(':')? + 1;
+    let rest = after[colon..].trim_start();
+    if rest.starts_with('"') {
+        let inner = &rest[1..];
+        let end = inner.find('"')? ;
+        Some(inner[..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract the id field from a JSON-RPC request as a raw JSON value.
+fn extract_json_id(json: &str) -> String {
+    let needle = "\"id\"";
+    if let Some(pos) = json.find(needle) {
+        let after = &json[pos + needle.len()..];
+        if let Some(colon) = after.find(':') {
+            let rest = after[colon + 1..].trim_start();
+            // Take until comma or closing brace
+            let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
+            return rest[..end].trim().to_string();
+        }
+    }
+    "null".to_string()
 }
