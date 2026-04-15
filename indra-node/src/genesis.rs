@@ -143,6 +143,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             pending_rewards: 0,
             rewards_last_epoch: 0,
             self_report_count: 0,
+            commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
         };
 
         state.validators.upsert(entry);
