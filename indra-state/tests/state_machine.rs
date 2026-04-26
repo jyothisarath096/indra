@@ -15,10 +15,12 @@ use indra_core::{
         },
     },
 };
+use indra_crypto::{commit, prove_range};
 use indra_state::{
     apply_block, ChainState,
     utxo::UtxoSet,
 };
+use rand::{SeedableRng, rngs::StdRng};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -37,10 +39,16 @@ fn dummy_pubkey() -> HybridPubKey {
 }
 
 fn make_output(byte: u8) -> OutputV1 {
+    let value = 10_000u64 + byte as u64;
+    let blinding = [byte; 32];
+    let commitment = commit(value, &blinding);
+    let mut rng = StdRng::from_seed([byte; 32]);
+    let proof = prove_range(value, &blinding, &mut rng).unwrap();
+
     OutputV1 {
-        commitment:   CommitmentV1 { compressed_point: Bytes32::from([byte; 32]) },
+        commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
         owner_pubkey: dummy_pubkey(),
-        range_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+        range_proof:  VariableBytes::from_slice(&proof).unwrap(),
         lock_height:  0,
     }
 }

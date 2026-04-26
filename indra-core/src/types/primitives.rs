@@ -106,7 +106,7 @@ pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
 pub const MAX_BLS_AGG_SIG_BYTES: usize = 96;
 
 /// Maximum Bulletproof range proof per output (bytes).
-pub const MAX_RANGE_PROOF_BYTES: usize = 8_192; // 8 KB
+pub const MAX_RANGE_PROOF_BYTES: usize = 674;
 
 /// Maximum governance operation payload (bytes).
 pub const MAX_GOV_PAYLOAD_BYTES: usize = 4_096;

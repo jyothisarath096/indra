@@ -16,6 +16,7 @@ pub mod commitment;
 pub mod vrf;
 
 pub use error::{CryptoError, CryptoResult};
+pub use indra_bulletproofs::{prove_range, verify_range, BulletproofError, RANGE_PROOF_BYTES};
 pub use hash::{sha256, hash_pair, domain_hash};
 pub use hybrid::{
     ClassicalKeypair, ClassicalPublicKey, ClassicalSignature,

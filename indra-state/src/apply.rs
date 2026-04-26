@@ -34,6 +34,7 @@
 
 use std::collections::HashSet;
 
+use indra_crypto::verify_range;
 use indra_core::{
     codec::Encode,
     types::{
@@ -50,8 +51,6 @@ use crate::{
     epoch::{apply_epoch_transition, is_epoch_boundary, epoch_for_height},
     error::{StateError, StateResult},
     fee::compute_next_base_fee,
-    utxo::UtxoSet,
-    nullifier::NullifierSet,
 };
 
 /// Apply a block to the chain state, producing a new state.
@@ -255,6 +254,13 @@ fn validate_transaction(
         });
     }
 
+    for (idx, output) in tx.outputs.iter().enumerate() {
+        let commitment_bytes = output.commitment.compressed_point.0;
+        let proof_bytes = output.range_proof.as_slice();
+        verify_range(&commitment_bytes, proof_bytes)
+            .map_err(|_| StateError::RangeProofInvalid { index: idx })?;
+    }
+
     Ok(())
 }
 
@@ -293,6 +299,7 @@ fn apply_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_crypto::{commit, prove_range};
     use indra_core::{
         Bytes32, CommitmentV1, HybridPubKey, HybridSignature, VariableBytes,
         ProtocolVersion,
@@ -306,7 +313,8 @@ mod tests {
             },
         },
     };
-    use crate::{chain::ChainState, utxo::UtxoSet};
+    use rand::{SeedableRng, rngs::StdRng};
+    use crate::chain::ChainState;
 
     // ── Test helpers ──────────────────────────────────────────────────────
 
@@ -325,10 +333,16 @@ mod tests {
     }
 
     fn dummy_output(byte: u8) -> OutputV1 {
+        let value = 1_000u64 + byte as u64;
+        let blinding = [byte; 32];
+        let commitment = commit(value, &blinding);
+        let mut rng = StdRng::from_seed([byte; 32]);
+        let proof = prove_range(value, &blinding, &mut rng).unwrap();
+
         OutputV1 {
-            commitment:   CommitmentV1 { compressed_point: Bytes32::from([byte; 32]) },
+            commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
             owner_pubkey: dummy_pubkey(),
-            range_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            range_proof:  VariableBytes::from_slice(&proof).unwrap(),
             lock_height:  0,
         }
     }

@@ -105,6 +105,13 @@ pub enum StateError {
         current_height: u64,
     },
 
+    /// A transaction output carries an invalid Bulletproof range proof.
+    #[error("output {index} has an invalid range proof")]
+    RangeProofInvalid {
+        /// Output index within the transaction.
+        index: usize,
+    },
+
     // ── State integrity errors ─────────────────────────────────────────────
 
     /// A staking operation was invalid.
