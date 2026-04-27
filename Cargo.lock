@@ -255,12 +255,14 @@ name = "indra-cli"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "indra-bulletproofs",
  "indra-consensus",
  "indra-core",
  "indra-crypto",
  "indra-node",
  "indra-rpc",
  "indra-state",
+ "rand 0.8.6",
  "thiserror",
 ]
 

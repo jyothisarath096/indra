@@ -37,8 +37,12 @@ pub mod error;
 pub mod keygen;
 pub mod genesis_cmd;
 pub mod query;
+pub mod wallet;
+pub mod tx_builder;
 
 pub use error::{CliError, CliResult};
 pub use keygen::{generate_keypairs, generate_from_passphrase, ValidatorKeys, KeysFile};
 pub use genesis_cmd::{GenesisEntry, build_genesis_config, GenesisConfig};
 pub use query::{rpc_call, QueryResult};
+pub use wallet::{Wallet, WalletEntry};
+pub use tx_builder::{build_transaction, TxParams, BuiltTransaction};

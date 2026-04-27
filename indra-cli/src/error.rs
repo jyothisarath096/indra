@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum CliError {
     /// I/O error.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 
     /// Invalid hex input.
     #[error("invalid hex: {0}")]
@@ -28,6 +28,23 @@ pub enum CliError {
     /// Genesis config is invalid.
     #[error("genesis error: {0}")]
     Genesis(String),
+
+    /// Wallet has insufficient balance.
+    #[error("insufficient balance: have {have} Spark, need {need} Spark")]
+    InsufficientBalance {
+        /// Available balance in Spark.
+        have: u64,
+        /// Required amount in Spark.
+        need: u64,
+    },
+
+    /// Failed to parse a value.
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    /// Transaction build failed.
+    #[error("transaction error: {0}")]
+    Transaction(String),
 }
 
 /// Convenience alias.

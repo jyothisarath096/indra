@@ -97,6 +97,31 @@ impl PqKeypair {
         Self { pk, sk }
     }
 
+    /// Load a Dilithium2 keypair from raw byte slices.
+    ///
+    /// Use this to restore a previously generated keypair from stored bytes.
+    /// The bytes must have been produced by a prior call to `generate()`.
+    pub fn from_bytes(pk_bytes: &[u8], sk_bytes: &[u8]) -> CryptoResult<Self> {
+        use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+        let pk = dilithium2::PublicKey::from_bytes(pk_bytes)
+            .map_err(|_| CryptoError::MalformedPublicKey {
+                scheme: "dilithium2",
+                actual: pk_bytes.len(),
+            })?;
+        let sk = dilithium2::SecretKey::from_bytes(sk_bytes)
+            .map_err(|_| CryptoError::MalformedPublicKey {
+                scheme: "dilithium2-sk",
+                actual: sk_bytes.len(),
+            })?;
+        Ok(Self { pk, sk })
+    }
+
+    /// Return the raw secret key bytes (for storage in keys.json).
+    pub fn secret_key_bytes(&self) -> Vec<u8> {
+        use pqcrypto_traits::sign::SecretKey as _;
+        self.sk.as_bytes().to_vec()
+    }
+
     /// Return the public key.
     pub fn public_key(&self) -> PqPublicKey {
         PqPublicKey(self.pk.as_bytes().to_vec())

@@ -15,9 +15,19 @@ indra-node      = { path = "../indra-node" }
 indra-rpc       = { path = "../indra-rpc" }
 thiserror.workspace = true
 hex.workspace = true
+rand.workspace = true
+indra-bulletproofs = { path = "../indra-bulletproofs" }
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }
 indra-crypto    = { path = "../indra-crypto" }
 indra-node      = { path = "../indra-node" }
 indra-rpc       = { path = "../indra-rpc" }
+
+[[bin]]
+name = "indra-send"
+path = "src/bin/send.rs"
+
+[[bin]]
+name = "indra-keygen"
+path = "src/bin/keygen.rs"

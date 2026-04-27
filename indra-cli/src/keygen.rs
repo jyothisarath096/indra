@@ -65,6 +65,9 @@ pub struct KeysFile {
     pub bls_seed: [u8; 32],
     /// VRF keypair seed (keep secret).
     pub vrf_seed: [u8; 32],
+    /// Dilithium2 secret key bytes (keep secret).
+    /// Stored because Dilithium2 has no deterministic from_seed.
+    pub pq_sk: Vec<u8>,
 }
 
 impl KeysFile {
@@ -110,6 +113,7 @@ pub fn generate_keypairs(
 ) -> CliResult<KeysFile> {
     let classical = ClassicalKeypair::from_seed(&hybrid_seed);
     let pq = PqKeypair::generate();
+    let pq_sk_bytes = pq.secret_key_bytes();
     let hybrid = HybridKeypair::new(classical, pq);
     let pk = hybrid.public_key();
 
@@ -122,6 +126,8 @@ pub fn generate_keypairs(
     let bls_pk_bytes = bls.public_key().0;
     let vrf_pk_bytes = vrf.public_key();
 
+    let pq_sk = pq_sk_bytes;
+
     Ok(KeysFile {
         public: ValidatorKeys {
             validator_id,
@@ -133,6 +139,7 @@ pub fn generate_keypairs(
         hybrid_seed,
         bls_seed,
         vrf_seed,
+        pq_sk,
     })
 }
 
