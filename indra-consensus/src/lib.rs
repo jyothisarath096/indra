@@ -57,4 +57,4 @@ pub use mempool::{Mempool, MempoolEntry, MempoolConfig};
 pub use proposer::{elect_proposer, ProposerElection, SlotResult};
 pub use producer::{produce_block, BlockTemplate};
 pub use vote::{VoteCollector, VoteDecision, produce_vote};
-pub use qc::{build_qc, verify_qc, QcBuilder};
+pub use qc::{build_qc, qc_signing_bytes, verify_qc, verify_qc_strict, QcBuilder};

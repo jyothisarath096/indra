@@ -41,6 +41,12 @@ pub struct NodeConfig {
 
     /// Maximum mempool size (number of transactions).
     pub mempool_capacity: usize,
+
+    /// Enforce QC, VRF, and state-root verification on imported block headers.
+    ///
+    /// Testnet can keep this disabled while legacy placeholder headers are still
+    /// in use. Mainnet must enable it.
+    pub strict_header_verification: bool,
 }
 
 impl NodeConfig {
@@ -57,6 +63,7 @@ impl NodeConfig {
             bootstrap_peers:  vec![],
             snapshot_interval: 300,
             mempool_capacity:  5_000,
+            strict_header_verification: false,
         }
     }
 
@@ -73,6 +80,7 @@ impl NodeConfig {
             bootstrap_peers:  vec![],
             snapshot_interval: 300,
             mempool_capacity:  5_000,
+            strict_header_verification: false,
         }
     }
 

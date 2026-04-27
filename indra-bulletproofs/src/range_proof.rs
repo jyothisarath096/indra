@@ -281,18 +281,10 @@ pub fn prove<R: rand_core::RngCore + rand_core::CryptoRng>(
     let mut ipa_transcript = transcript;
     let ipa = inner_product::prove(&mut ipa_transcript, &q, g_vec, h_prime, l_x, r_x);
 
-    for scalar in &mut a_l {
-        *scalar = Scalar::ZERO;
-    }
-    for scalar in &mut a_r {
-        *scalar = Scalar::ZERO;
-    }
-    for scalar in &mut s_l {
-        *scalar = Scalar::ZERO;
-    }
-    for scalar in &mut s_r {
-        *scalar = Scalar::ZERO;
-    }
+    a_l.fill(Scalar::ZERO);
+    a_r.fill(Scalar::ZERO);
+    s_l.fill(Scalar::ZERO);
+    s_r.fill(Scalar::ZERO);
 
     Ok(RangeProof {
         a: a_compressed,

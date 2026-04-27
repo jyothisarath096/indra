@@ -78,6 +78,7 @@ fn main() {
         bootstrap_peers:   bootstrap_peers.clone(),
         snapshot_interval: 300,
         mempool_capacity:  5_000,
+        strict_header_verification: false,
     };
 
     // Init node engine + consensus driver
@@ -88,6 +89,8 @@ fn main() {
     let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
     if std::path::Path::new(&genesis_path).exists() {
         indra_node::load_genesis_validators(&genesis_path, &mut engine.state);
+        engine.rebuild_state_from_block_log()
+            .unwrap_or_else(|e| panic!("State replay failed after loading genesis validators: {}", e));
         println!("Validator set: {} active validators",
             engine.state.validators.active_count());
     } else {
@@ -336,11 +339,11 @@ fn main() {
                             let total_stake = d.engine.state.validators.total_active_stake();
                             let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
                                 d.engine.state.validators.active_validators()
-                                    .map(|v| indra_consensus::proposer::ProposerCandidate {
+                                    .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                                         validator_id: v.validator_id,
-                                        vrf_pubkey: indra_crypto::sha256(&v.validator_id.0),
+                                        vrf_pubkey: vrf_pk,
                                         stake: v.stake_spark,
-                                    })
+                                    }))
                                     .collect();
 
                             if candidates.is_empty() {

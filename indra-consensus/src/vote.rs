@@ -159,7 +159,7 @@ impl VoteCollector {
 
     /// Return the current decision without adding a vote.
     pub fn current_decision(&self) -> VoteDecision {
-        use indra_core::types::primitives::QUORUM_THRESHOLD_BPS;
+        use indra_core::types::primitives::CONSENSUS_QUORUM_BPS;
 
         if self.total_stake == 0 {
             return VoteDecision::Waiting;
@@ -174,7 +174,7 @@ impl VoteCollector {
         // Check if any hash crossed the quorum threshold
         for (block_hash, stake) in &stake_by_hash {
             let bps = stake.saturating_mul(10_000) / self.total_stake;
-            if bps as u32 >= QUORUM_THRESHOLD_BPS {
+            if bps as u32 >= CONSENSUS_QUORUM_BPS {
                 return VoteDecision::QuorumReached {
                     block_hash: *block_hash,
                     stake_bps: bps,
@@ -335,8 +335,8 @@ mod tests {
     fn two_thirds_stake_threshold() {
         // 3 validators: 34%, 33%, 33% stake
         let (v1, kp1) = voter(0x01, 3_400);
-        let (v2, kp2) = voter(0x02, 3_300);
-        let (v3, kp3) = voter(0x03, 3_300);
+        let (v2, kp2) = voter(0x02, 3_200);
+        let (v3, _kp3) = voter(0x03, 3_400);
         let block_hash = Bytes32::from([0xCCu8; 32]);
 
         let mut collector = VoteCollector::new(
@@ -344,15 +344,35 @@ mod tests {
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
-        // First two votes: 67% — just below 3300/3300 threshold (QUORUM = 33%)
-        // Actually QUORUM_THRESHOLD_BPS = 3300 = 33%, so 2 validators at 67% total exceeds it
+        // First two votes total 66%, which is below the strict > 2/3 threshold.
         let vote1 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
         let vote2 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
 
         let d1 = collector.add_vote(vote1).unwrap();
         let d2 = collector.add_vote(vote2).unwrap();
 
-        // 3400 + 3300 = 6700 out of 10000 = 67% > 33% threshold
-        assert!(matches!(d2, VoteDecision::QuorumReached { .. }));
+        assert!(matches!(d1, VoteDecision::Waiting));
+        assert!(matches!(d2, VoteDecision::Waiting));
+    }
+
+    #[test]
+    fn quorum_requires_two_thirds() {
+        let (v1, kp1) = voter(0x11, 3_400);
+        let (v2, kp2) = voter(0x12, 3_300);
+        let (v3, kp3) = voter(0x13, 3_300);
+        let block_hash = Bytes32::from([0xDDu8; 32]);
+
+        let mut collector = VoteCollector::new(
+            1, 0, VoteStep::Precommit,
+            vec![v1.clone(), v2.clone(), v3.clone()],
+        );
+
+        let vote1 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
+        let vote2 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
+        let vote3 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v3.validator_id, &kp3).unwrap();
+
+        assert!(matches!(collector.add_vote(vote1).unwrap(), VoteDecision::Waiting));
+        assert!(matches!(collector.add_vote(vote2).unwrap(), VoteDecision::QuorumReached { stake_bps, .. } if stake_bps == 6_700));
+        assert!(matches!(collector.add_vote(vote3).unwrap(), VoteDecision::QuorumReached { stake_bps, .. } if stake_bps == 10_000));
     }
 }

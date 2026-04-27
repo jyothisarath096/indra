@@ -51,7 +51,7 @@ impl Transcript {
         let mut hasher = Sha512::new();
         hasher.update(&self.state);
         hasher.update(b"challenge");
-        hasher.update(&(label.len() as u32).to_le_bytes());
+        hasher.update((label.len() as u32).to_le_bytes());
         hasher.update(label);
 
         let hash = hasher.finalize();

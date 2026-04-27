@@ -84,11 +84,11 @@ fn state_root_changes_after_each_block() {
     let root0 = compute_state_root(&state);
 
     let b1 = make_block(1, state.tip_hash, state.base_fee);
-    import_block(&b1, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+    import_block(&b1, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
     let root1 = compute_state_root(&state);
 
     let b2 = make_block(2, state.tip_hash, state.base_fee);
-    import_block(&b2, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+    import_block(&b2, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
     let root2 = compute_state_root(&state);
 
     assert_ne!(root0, root1);
@@ -110,7 +110,7 @@ fn block_store_survives_reopen() {
 
         for i in 1..=3u64 {
             let b = make_block(i, state.tip_hash, state.base_fee);
-            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
         }
     }
 
@@ -154,7 +154,7 @@ fn full_node_pipeline() {
 
     let roots: Vec<Bytes32> = (1..=10u64).map(|i| {
         let b = make_block(i, state.tip_hash, state.base_fee);
-        import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+        import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
         compute_state_root(&state)
     }).collect();
 

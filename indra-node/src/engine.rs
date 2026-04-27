@@ -31,6 +31,7 @@ use indra_storage::{BlockStore, StateStore};
 use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
+    genesis::build_genesis_block,
     sync::import_block,
 };
 
@@ -62,14 +63,14 @@ impl NodeEngine {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(indra_storage::StorageError::Io)?;
 
-        let block_store = BlockStore::open(config.block_log_path())?;
+        let mut block_store = BlockStore::open(config.block_log_path())?;
         let state_store = StateStore::open(config.state_dir())?;
 
-        // Load state from snapshot or start from genesis
-        let state = match state_store.load_latest()? {
-            Some(s) => s,
-            None => ChainState::new_genesis(),
-        };
+        // Snapshots currently store only summary fields, so rebuild the
+        // authoritative state from the append-only block log on startup.
+        let _latest_snapshot = state_store.load_latest()?;
+        let mut state = ChainState::new_genesis();
+        rebuild_state_from_block_log(&mut state, &mut block_store)?;
 
         let mempool = Mempool::new(indra_consensus::mempool::MempoolConfig {
             capacity: config.mempool_capacity,
@@ -126,6 +127,20 @@ impl NodeEngine {
         self.validator_id
     }
 
+    /// Rebuild the current chain state by replaying the block log on top of
+    /// the current genesis-equivalent state.
+    ///
+    /// Callers should pre-load any genesis validators before invoking this so
+    /// replay starts from the correct validator set.
+    pub fn rebuild_state_from_block_log(&mut self) -> NodeResult<()> {
+        let mut rebuilt = ChainState::new_genesis();
+        rebuilt.validators = self.state.validators.clone();
+        rebuilt.delegations = self.state.delegations.clone();
+        rebuild_state_from_block_log(&mut rebuilt, &mut self.block_store)?;
+        self.state = rebuilt;
+        Ok(())
+    }
+
     /// Check if this node is the elected proposer for the next height.
     pub fn is_proposer(&self, election: &ProposerElection) -> bool {
         let Some(vrf_kp) = &self.vrf_keypair else { return false; };
@@ -170,8 +185,30 @@ impl NodeEngine {
             &mut self.mempool,
             &mut self.block_store,
             &self.state_store,
+            self.config.strict_header_verification,
         )
     }
+}
+
+fn rebuild_state_from_block_log(
+    state: &mut ChainState,
+    block_store: &mut BlockStore,
+) -> NodeResult<()> {
+    if block_store.is_empty() {
+        return Ok(());
+    }
+
+    let genesis = block_store.get(0)?;
+    if genesis.header.height != build_genesis_block().header.height {
+        return Err(NodeError::GenesisMismatch);
+    }
+
+    for height in 1..block_store.next_height() {
+        let block = block_store.get(height)?;
+        indra_state::apply_block(state, &block)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,6 +273,46 @@ mod tests {
 
         engine.commit_block(&block).unwrap();
         assert_eq!(engine.height(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_rebuilds_state_from_block_log() {
+        let dir = temp_dir("d");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config.clone()).unwrap();
+
+        use indra_core::{
+            Bytes32, ProtocolVersion, VariableBytes,
+            types::block::{BlockHeaderV1, BlockV1},
+            types::primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES},
+        };
+
+        for height in 1..=3u64 {
+            let block = BlockV1 {
+                header: BlockHeaderV1 {
+                    protocol_version:    ProtocolVersion::CURRENT,
+                    height,
+                    prev_hash:           engine.state.tip_hash,
+                    timestamp:           1_700_000_000 + height,
+                    state_root:          Bytes32::ZERO,
+                    validator_set_root:  Bytes32::ZERO,
+                    mempool_set_root:    Bytes32::ZERO,
+                    base_fee:            engine.state.base_fee,
+                    proposer_vrf_output: Bytes32::ZERO,
+                    proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+                    quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                },
+                transactions:      vec![],
+                slashing_evidence: vec![],
+                governance_ops:    vec![],
+            };
+            engine.commit_block(&block).unwrap();
+        }
+
+        let restarted = NodeEngine::init(config).unwrap();
+        assert_eq!(restarted.state.height, 3);
+        assert_eq!(restarted.state.tip_hash, engine.state.tip_hash);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

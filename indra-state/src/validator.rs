@@ -28,6 +28,14 @@ pub enum ValidatorStatus {
 pub struct ValidatorEntry {
     /// Validator identity: SHA-256(hybrid_public_key_bytes).
     pub validator_id: Bytes32,
+    /// Ed25519 public key bytes for vote signature verification.
+    pub hybrid_classical_pk: Option<[u8; 32]>,
+    /// Dilithium public key bytes for vote signature verification.
+    pub hybrid_pq_pk: Option<Vec<u8>>,
+    /// BLS public key bytes for QC aggregate verification.
+    pub bls_pk: Option<[u8; 48]>,
+    /// VRF public key bytes for proposer verification.
+    pub vrf_pk: Option<[u8; 32]>,
     /// Staked amount in Spark.
     pub stake_spark: u64,
     /// Current lifecycle status.
@@ -159,6 +167,10 @@ mod tests {
     fn make_validator(id_byte: u8, stake: u64, epoch: u64) -> ValidatorEntry {
         ValidatorEntry {
             validator_id:     Bytes32::from([id_byte; 32]),
+            hybrid_classical_pk: None,
+            hybrid_pq_pk:    None,
+            bls_pk:          None,
+            vrf_pk:          None,
             stake_spark:      stake,
             status:           ValidatorStatus::Active,
             registered_epoch: epoch,

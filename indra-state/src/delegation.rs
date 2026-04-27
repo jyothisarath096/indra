@@ -184,6 +184,10 @@ mod tests {
         let validator_id = Bytes32::from([id_byte; 32]);
         let entry = ValidatorEntry {
             validator_id,
+            hybrid_classical_pk: None,
+            hybrid_pq_pk: None,
+            bls_pk: None,
+            vrf_pk: None,
             stake_spark: 10_000_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 0,

@@ -11,7 +11,7 @@ use indra_core::{
     },
 };
 use indra_crypto::{
-    bls::BlsKeypair,
+    bls::{BlsKeypair, aggregate_signatures},
     hybrid::HybridKeypair,
     VrfKeypair,
 };
@@ -21,7 +21,7 @@ use indra_consensus::{
     proposer::{ProposerCandidate, ProposerElection, compute_proposer_vrf},
     producer::{BlockTemplate, produce_block},
     vote::{RegisteredVoter, VoteCollector, VoteDecision, produce_vote},
-    qc::{QcBuilder, QcValidator, verify_qc},
+    qc::{QcBuilder, QcValidator, qc_signing_bytes, verify_qc, verify_qc_strict},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -183,8 +183,9 @@ fn full_consensus_round() {
     let qc = builder.build().unwrap();
     assert_eq!(qc.signer_count(), 3);
 
-    // Verify the QC
+    // Placeholder QC construction still passes the stake/PQ checks.
     assert!(verify_qc(&qc, &qc_validators, total_stake).is_ok());
+    assert!(verify_qc_strict(&qc, &qc_validators, total_stake).is_err());
 }
 
 #[test]
@@ -223,9 +224,56 @@ fn qc_builder_quorum_detection() {
     // Before any votes
     assert_eq!(builder.current_stake_bps(), 0);
 
-    // v1 votes (70%) → quorum reached (need 33%)
+    // v1 votes (70%) → quorum reached (need > 2/3)
     let vote1 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.id, &v1.hybrid_kp).unwrap();
     builder.add_precommit(vote1);
-    assert!(builder.current_stake_bps() >= 3_300);
+    assert!(builder.current_stake_bps() >= 6_667);
     assert!(builder.build().is_ok());
+}
+
+#[test]
+fn strict_qc_verification_accepts_real_bls_aggregate() {
+    use indra_core::types::crypto::PQVoteSig;
+    use indra_core::types::primitives::{MAX_PQ_SIG_BYTES, VariableBytes};
+    use indra_core::types::qc::{QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
+
+    let validators = vec![
+        TestValidator::new(0x21, 3_400),
+        TestValidator::new(0x22, 3_300),
+        TestValidator::new(0x23, 3_300),
+    ];
+    let qc_validators: Vec<QcValidator> = validators.iter().enumerate()
+        .map(|(i, v)| v.as_qc_validator(i))
+        .collect();
+    let block_hash = Bytes32::from([0xEFu8; 32]);
+    let height = 7u64;
+    let round = 0u32;
+
+    let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
+    let mut pq_signatures = Vec::new();
+    let signing_bytes = qc_signing_bytes(height, round, &block_hash);
+    let bls_sigs = validators.iter()
+        .enumerate()
+        .map(|(position, validator)| {
+            signer_bitfield[position / 8] |= 1 << (position % 8);
+            let vote = produce_vote(height, round, VoteStep::Precommit, block_hash, validator.id, &validator.hybrid_kp).unwrap();
+            pq_signatures.push(PQVoteSig {
+                validator_id: validator.id,
+                pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(vote.signature.pq_sig.as_slice()).unwrap(),
+            });
+            validator.bls_kp.sign(&signing_bytes)
+        })
+        .collect::<Vec<_>>();
+
+    let agg = aggregate_signatures(&bls_sigs).unwrap();
+    let qc = QuorumCertificateV1 {
+        height,
+        round,
+        block_hash,
+        bls_agg_sig: VariableBytes::from_slice(&agg.0).unwrap(),
+        signer_bitfield,
+        pq_signatures,
+    };
+
+    assert!(verify_qc_strict(&qc, &qc_validators, 10_000).is_ok());
 }

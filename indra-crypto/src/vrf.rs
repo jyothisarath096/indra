@@ -95,9 +95,9 @@ fn hash_to_ristretto(data: &[u8]) -> RistrettoPoint {
     let mut counter: u8 = 0;
     loop {
         let mut h = Sha512::new();
-        h.update(&[SUITE, 0x01]);
+        h.update([SUITE, 0x01]);
         h.update(data);
-        h.update(&[counter]);
+        h.update([counter]);
         let hash = h.finalize();
 
         let mut bytes = [0u8; 32];
@@ -132,7 +132,7 @@ fn compute_challenge(
     V: &RistrettoPoint,
 ) -> [u8; 16] {
     let mut h = Sha512::new();
-    h.update(&[SUITE, 0x02]);
+    h.update([SUITE, 0x02]);
     h.update(Y.compress().as_bytes());
     h.update(H.compress().as_bytes());
     h.update(Gamma.compress().as_bytes());
@@ -176,7 +176,7 @@ pub fn vrf_prove(kp: &VrfKeypair, alpha: &[u8]) -> (VrfOutput, VrfProof) {
 
     // Compute VRF output: SHA-512(suite || 0x03 || Gamma)[..32]
     let mut h = Sha512::new();
-    h.update(&[SUITE, 0x03]);
+    h.update([SUITE, 0x03]);
     h.update(Gamma.compress().as_bytes());
     let output_hash = h.finalize();
     let mut output = [0u8; 32];
@@ -238,7 +238,7 @@ pub fn vrf_verify(
 
     // Verify output
     let mut h = Sha512::new();
-    h.update(&[SUITE, 0x03]);
+    h.update([SUITE, 0x03]);
     h.update(Gamma.compress().as_bytes());
     let output_hash = h.finalize();
     if output.0 != output_hash[..32] {

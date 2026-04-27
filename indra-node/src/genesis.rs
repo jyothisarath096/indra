@@ -70,6 +70,18 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
     use indra_core::types::primitives::Bytes32;
     use indra_state::{ValidatorEntry, ValidatorStatus};
 
+    fn parse_fixed_hex<const N: usize>(value: Option<&String>) -> Option<[u8; N]> {
+        let hex = value?;
+        let bytes = hex::decode(hex).ok()?;
+        let array: [u8; N] = bytes.try_into().ok()?;
+        Some(array)
+    }
+
+    fn parse_vec_hex(value: Option<&String>) -> Option<Vec<u8>> {
+        let hex = value?;
+        hex::decode(hex).ok()
+    }
+
     let content = std::fs::read_to_string(genesis_path)
         .unwrap_or_else(|e| panic!("Cannot read genesis file {}: {}", genesis_path, e));
 
@@ -137,6 +149,10 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
 
         let entry = ValidatorEntry {
             validator_id,
+            hybrid_classical_pk: parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
+            hybrid_pq_pk: parse_vec_hex(v.get("hybrid_pq_pk")),
+            bls_pk: parse_fixed_hex::<48>(v.get("bls_pk")),
+            vrf_pk: parse_fixed_hex::<32>(v.get("vrf_pk")),
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,

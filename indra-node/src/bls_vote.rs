@@ -25,7 +25,7 @@ use indra_core::{
         primitives::{
             Bytes32, VariableBytes,
             MAX_BLS_AGG_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
-            QUORUM_THRESHOLD_BPS,
+            CONSENSUS_QUORUM_BPS,
         },
         qc::QuorumCertificateV1,
         crypto::PQVoteSig,
@@ -63,20 +63,22 @@ impl BlsVoteSigner {
 
 /// Compute the BLS signing message for a vote.
 ///
-/// BLS signs: VOTE_SIGN || height || round || step || block_hash || validator_id
+/// BLS signs: VOTE_SIGN || height || round || step || block_hash
+///
+/// The aggregate signature must cover the same message for every signer, so
+/// validator identity is intentionally excluded here.
 pub fn bls_vote_message(
     height: u64,
     round: u32,
     step: VoteStep,
     block_hash: &Bytes32,
-    validator_id: &Bytes32,
+    _validator_id: &Bytes32,
 ) -> Vec<u8> {
     let mut buf = VOTE_SIGN.to_vec();
     height.encode(&mut buf);
     round.encode(&mut buf);
     step.encode(&mut buf);
     block_hash.encode(&mut buf);
-    validator_id.encode(&mut buf);
     buf
 }
 
@@ -145,10 +147,10 @@ pub fn build_bls_qc(
     } else {
         0
     };
-    if (stake_bps as u32) < QUORUM_THRESHOLD_BPS {
+    if (stake_bps as u32) < CONSENSUS_QUORUM_BPS {
         return Err(NodeError::BlockInvalid {
             height,
-            reason: format!("quorum not reached: {stake_bps} bps < {QUORUM_THRESHOLD_BPS} bps"),
+            reason: format!("quorum not reached: {stake_bps} bps < {CONSENSUS_QUORUM_BPS} bps"),
         });
     }
 
@@ -240,7 +242,7 @@ mod tests {
         let block_hash = Bytes32::from([0xCCu8; 32]);
         let (pc1, _, id1) = make_precommit(0x01, 1, block_hash);
 
-        // Only 1 of 10: 10% < 33% threshold
+        // Only 1 of 10: 10% < consensus threshold
         let positions = vec![(id1, 0usize, 1_000u64)];
         let result = build_bls_qc(1, 0, block_hash, &[pc1], &positions, 10_000);
         assert!(result.is_err());

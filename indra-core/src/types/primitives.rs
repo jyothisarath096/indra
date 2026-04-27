@@ -165,6 +165,9 @@ pub const TARGET_UTILISATION_DENOMINATOR: u64 = 100;
 
 /// Minimum stake participation for a vote to be valid (3300 = 33.00%).
 pub const QUORUM_THRESHOLD_BPS: u32 = 3_300;
+/// Consensus quorum threshold — strictly more than 2/3 of stake must agree
+/// for a block to be finalised.
+pub const CONSENSUS_QUORUM_BPS: u32 = 6_667;
 
 /// Required YES fraction of participating stake to pass (8000 = 80.00%).
 pub const PASS_THRESHOLD_BPS: u32 = 6_600; // reduced from 8000 — 80% impossible at 500+ validators
@@ -189,7 +192,6 @@ pub const VETO_THRESHOLD_BPS: u32 = 3_300;
 /// Veto threshold — if this fraction of total stake votes No, the proposal fails
 /// regardless of the yes percentage. Prevents minority capture via voter apathy.
 /// At 33%: a coordinated 1/3 of stake can block any proposal (lazy-majority attack defence).
-
 /// Required YES fraction of total stake for emergency proposals (9000 = 90.00%).
 pub const EMERGENCY_PASS_BPS: u32 = 9_000;
 
