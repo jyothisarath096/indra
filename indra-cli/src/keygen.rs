@@ -87,6 +87,7 @@ impl KeysFile {
     "hybrid_seed": "{h_seed}",
     "bls_seed": "{b_seed}",
     "vrf_seed": "{v_seed}",
+    "pq_sk": "{pq_sk}",
     "WARNING": "Keep private seeds secret. Never share this section."
   }}
 }}"#,
@@ -98,6 +99,7 @@ impl KeysFile {
             h_seed       = hex::encode(self.hybrid_seed),
             b_seed       = hex::encode(self.bls_seed),
             v_seed       = hex::encode(self.vrf_seed),
+            pq_sk        = hex::encode(&self.pq_sk),
         )
     }
 }

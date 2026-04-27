@@ -544,9 +544,9 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
 
     // ── Lock driver, read state, build response ───────────────────────────
     let result: String = {
-        let guard = driver.lock().unwrap();
-        let s = &guard.engine.state;
+        let mut guard = driver.lock().unwrap();
         let mempool_size = guard.engine.mempool.len();
+        let s = &guard.engine.state;
 
         match method.as_str() {
             "indra_getHeight" => {
@@ -585,6 +585,72 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     )
                 }).collect();
                 format!(r#"{{"validators":[{}]}}"#, entries.join(","))
+            }
+            "indra_sendTransaction" => {
+                // Params: ["<tx_hex>"]
+                let tx_hex = first_param.clone().unwrap_or_default();
+                if tx_hex.is_empty() {
+                    let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"missing tx_hex param"}},"id":{}}}"#, id_raw);
+                    let resp = format!("HTTP/1.1 200 OK
+Content-Type: application/json
+{}Content-Length: {}
+Connection: close
+
+{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let tx_bytes = match hex::decode(&tx_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid hex encoding"}},"id":{}}}"#, id_raw);
+                        let resp = format!("HTTP/1.1 200 OK
+Content-Type: application/json
+{}Content-Length: {}
+Connection: close
+
+{}", cors, err.len(), err);
+                        let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                        return;
+                    }
+                };
+                use indra_core::codec::{Decode, ByteReader};
+                use indra_core::types::transaction::TransactionV1;
+                let mut reader = ByteReader::new(&tx_bytes);
+                match TransactionV1::decode(&mut reader) {
+                    Ok(tx) => {
+                        let base_fee = guard.engine.state.base_fee;
+                        let height = guard.engine.state.height;
+                        match guard.engine.mempool.submit(tx, base_fee, height) {
+                            Ok(tx_id) => {
+                                format!(r#"{{"tx_id":"{}","status":"accepted"}}"#,
+                                    hex::encode(tx_id.0))
+                            }
+                            Err(e) => {
+                                let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"mempool rejected: {}"}},"id":{}}}"#, e, id_raw);
+                                let resp = format!("HTTP/1.1 200 OK
+Content-Type: application/json
+{}Content-Length: {}
+Connection: close
+
+{}", cors, err.len(), err);
+                                let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"tx decode failed: {}"}},"id":{}}}"#, e, id_raw);
+                        let resp = format!("HTTP/1.1 200 OK
+Content-Type: application/json
+{}Content-Length: {}
+Connection: close
+
+{}", cors, err.len(), err);
+                        let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                        return;
+                    }
+                }
             }
             "indra_getBalance" => {
                 // Params: ["<classical_pubkey_hex>"]
