@@ -35,6 +35,8 @@ use crate::error::{StateError, StateResult};
 /// A UTXO entry in the set: the output itself plus metadata.
 #[derive(Debug, Clone)]
 pub struct UtxoEntry {
+    /// The UTXO ID (key in the set — stored here for convenience).
+    pub utxo_id: Bytes32,
     /// The output data.
     pub output: OutputV1,
     /// Block height at which this output was created.
@@ -106,6 +108,7 @@ impl UtxoSet {
             });
         }
         self.entries.insert(id, UtxoEntry {
+            utxo_id: id,
             output,
             created_height: height,
             tx_index,
@@ -127,6 +130,12 @@ impl UtxoSet {
     }
 
     /// Check whether a UTXO exists (is unspent).
+    /// Iterate over all UTXO entries (used for wallet scan and balance queries).
+    pub fn all_entries(&self) -> impl Iterator<Item = &UtxoEntry> {
+        self.entries.values()
+    }
+
+    /// True if a UTXO with the given ID exists in the set.
     pub fn contains(&self, id: &Bytes32) -> bool {
         self.entries.contains_key(id)
     }

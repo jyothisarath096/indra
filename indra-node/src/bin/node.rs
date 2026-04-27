@@ -540,6 +540,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
     // ── Parse JSON-RPC method ─────────────────────────────────────────────
     let method = extract_json_str(&body_str, "method").unwrap_or_default();
     let id_raw = extract_json_id(&body_str);
+    let first_param = extract_json_first_param(&body_str);
 
     // ── Lock driver, read state, build response ───────────────────────────
     let result: String = {
@@ -585,6 +586,56 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                 }).collect();
                 format!(r#"{{"validators":[{}]}}"#, entries.join(","))
             }
+            "indra_getBalance" => {
+                // Params: ["<classical_pubkey_hex>"]
+                let pubkey_hex = first_param.clone().unwrap_or_default();
+                let mut balance: u64 = 0;
+                if pubkey_hex.len() == 64 {
+                    if let Ok(pk_bytes) = hex::decode(&pubkey_hex) {
+                        for entry in s.utxos.all_entries() {
+                            let owner = hex::encode(entry.output.owner_pubkey.classical_pk.0);
+                            if owner == pubkey_hex {
+                                balance = balance.saturating_add(
+                                    // value is hidden in commitment — return 0 for now
+                                    // wallet tracks actual values locally
+                                    0u64
+                                );
+                            }
+                            let _ = pk_bytes.len(); // suppress unused warning
+                        }
+                    }
+                }
+                // Note: values are confidential — balance must be tracked by wallet
+                // This endpoint returns UTXO count only
+                let utxo_count = if pubkey_hex.len() == 64 {
+                    s.utxos.all_entries()
+                        .filter(|e| hex::encode(e.output.owner_pubkey.classical_pk.0) == pubkey_hex)
+                        .count()
+                } else { 0 };
+                format!(r#"{{"pubkey":"{}","utxo_count":{},"note":"values are confidential — use wallet scan for balance"}}"#,
+                    pubkey_hex, utxo_count)
+            }
+            "indra_getUtxos" => {
+                // Params: ["<classical_pubkey_hex>"]
+                let pubkey_hex = first_param.clone().unwrap_or_default();
+                let entries: Vec<String> = if pubkey_hex.len() == 64 {
+                    s.utxos.all_entries()
+                        .filter(|e| hex::encode(e.output.owner_pubkey.classical_pk.0) == pubkey_hex)
+                        .map(|e| {
+                            format!(
+                                r#"{{"utxo_id":"{}","created_height":{},"tx_index":{},"out_index":{},"lock_height":{}}}"#,
+                                hex::encode(e.utxo_id.0),
+                                e.created_height,
+                                e.tx_index,
+                                e.output_index,
+                                e.output.lock_height,
+                            )
+                        })
+                        .collect()
+                } else { vec![] };
+                format!(r#"{{"pubkey":"{}","utxos":[{}]}}"#,
+                    pubkey_hex, entries.join(","))
+            }
             _ => {
                 let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found: {}"}},"id":{}}}"#, method, id_raw);
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
@@ -600,6 +651,25 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
         cors, json_resp.len(), json_resp
     );
     let _ = stream.try_clone().map(|mut w| w.write_all(http_resp.as_bytes()));
+}
+
+/// Extract the first element from the JSON-RPC params array.
+fn extract_json_first_param(json: &str) -> Option<String> {
+    let params_pos = json.find("\"params\"")?;
+    let after = &json[params_pos + 8..];
+    let arr_start = after.find('[')? + 1;
+    let arr = after[arr_start..].trim_start();
+    if arr.starts_with('"') {
+        let inner = &arr[1..];
+        let end = inner.find('"')?;
+        Some(inner[..end].to_string())
+    } else if arr.starts_with(']') {
+        None
+    } else {
+        // numeric param
+        let end = arr.find(|c: char| !c.is_ascii_digit()).unwrap_or(arr.len());
+        Some(arr[..end].to_string())
+    }
 }
 
 /// Extract a string field value from a JSON string (simple, no full parser needed).
