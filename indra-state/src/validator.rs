@@ -19,6 +19,8 @@ pub enum ValidatorStatus {
     },
     /// Slashed: permanently removed, stake partially or fully burned.
     Slashed,
+    /// Exited: completed voluntary unbonding, no longer in active set.
+    Exited,
 }
 
 /// A single validator's entry in the validator set.

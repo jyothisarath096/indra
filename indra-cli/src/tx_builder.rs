@@ -107,18 +107,29 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         InputV1 { utxo_id: e.utxo_id, nullifier }
     }).collect();
 
-    // 5. Generate blinding factors deterministically from seed + context
-    let recipient_blinding = derive_blinding(&params.hybrid_seed, b"recipient", 0);
+    let mut rng = rand::rngs::OsRng;
+    // 5. Generate random blinding factors using OsRng.
+    // Each transaction gets unique blindings — reusing blindings across
+    // transactions breaks Pedersen commitment hiding (audit finding #8).
+    use rand::RngCore;
+    let mut blinding_buf = [0u8; 32];
+    rng.fill_bytes(&mut blinding_buf);
+    let recipient_blinding = blinding_buf;
+
     let change_blinding = if change_spark > DUST_LIMIT_SPARK {
-        Some(derive_blinding(&params.hybrid_seed, b"change", 0))
+        let mut cb = [0u8; 32];
+        rng.fill_bytes(&mut cb);
+        Some(cb)
     } else {
         None
     };
-    let fee_blinding = derive_blinding(&params.hybrid_seed, b"fee", 0);
+
+    let mut fee_blinding_buf = [0u8; 32];
+    rng.fill_bytes(&mut fee_blinding_buf);
+    let fee_blinding = fee_blinding_buf;
 
     // 6. Build outputs with Pedersen commitments + range proofs
     let mut outputs = Vec::new();
-    let mut rng = rand::rngs::OsRng;
 
     // Recipient output
     let recipient_commitment = commit(params.amount_spark, &recipient_blinding);
@@ -212,14 +223,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     })
 }
 
-/// Derive a blinding factor deterministically from seed + purpose + index.
-fn derive_blinding(seed: &[u8; 32], purpose: &[u8], index: u32) -> [u8; 32] {
-    let mut data = Vec::with_capacity(seed.len() + purpose.len() + 4);
-    data.extend_from_slice(seed);
-    data.extend_from_slice(purpose);
-    data.extend_from_slice(&index.to_le_bytes());
-    sha256(&data)
-}
+
 
 /// Encode transaction fields for signing (everything except the signature field).
 fn encode_for_signing(tx: &TransactionV1) -> Vec<u8> {

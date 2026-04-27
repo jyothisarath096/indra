@@ -84,7 +84,15 @@ impl NodeEngine {
                 config.vrf_seed,
             ) {
                 let classical = ClassicalKeypair::from_seed(&vs);
-                let pq = PqKeypair::generate();
+                let pq = if let (Some(pk), Some(sk)) = (
+                    config.pq_pk.as_deref(),
+                    config.pq_sk.as_deref(),
+                ) {
+                    PqKeypair::from_bytes(pk, sk)
+                        .unwrap_or_else(|_| PqKeypair::generate())
+                } else {
+                    PqKeypair::generate()
+                };
                 let hybrid = HybridKeypair::new(classical, pq);
                 let bls = BlsKeypair::from_seed(&bs)?;
                 let vrf = VrfKeypair::from_seed(&vrfs);

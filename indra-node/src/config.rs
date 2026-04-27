@@ -23,6 +23,13 @@ pub struct NodeConfig {
     /// Required if validator_seed is set.
     pub vrf_seed: Option<[u8; 32]>,
 
+    /// The node's Dilithium2 secret key bytes (from keys.json).
+    /// Required if validator_seed is set.
+    pub pq_sk: Option<Vec<u8>>,
+
+    /// The node's Dilithium2 public key bytes (from keys.json).
+    pub pq_pk: Option<Vec<u8>>,
+
     /// Listen address for P2P (Phase 6).
     pub p2p_addr: String,
 
@@ -44,6 +51,8 @@ impl NodeConfig {
             validator_seed:   Some([0x42u8; 32]),
             bls_seed:         Some([0x42u8; 32]),
             vrf_seed:         Some([0x42u8; 32]),
+            pq_sk:            None,
+            pq_pk:            None,
             p2p_addr:         "127.0.0.1:30303".to_string(),
             bootstrap_peers:  vec![],
             snapshot_interval: 300,
@@ -58,6 +67,8 @@ impl NodeConfig {
             validator_seed:   None,
             bls_seed:         None,
             vrf_seed:         None,
+            pq_sk:            None,
+            pq_pk:            None,
             p2p_addr:         "127.0.0.1:30303".to_string(),
             bootstrap_peers:  vec![],
             snapshot_interval: 300,

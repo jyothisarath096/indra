@@ -58,6 +58,8 @@ fn main() {
     let hybrid_seed = extract_hex32(&keys_str, "hybrid_seed");
     let bls_seed    = extract_hex32(&keys_str, "bls_seed");
     let vrf_seed    = extract_hex32(&keys_str, "vrf_seed");
+    let pq_sk       = extract_hex_field(&keys_str, "pq_sk");
+    let pq_pk       = extract_hex_field(&keys_str, "hybrid_pq_pk");
 
     let bootstrap_peers: Vec<String> = if bootstrap.is_empty() {
         vec![]
@@ -70,6 +72,8 @@ fn main() {
         validator_seed:    Some(hybrid_seed),
         bls_seed:          Some(bls_seed),
         vrf_seed:          Some(vrf_seed),
+        pq_sk:             if pq_sk.is_empty() { None } else { Some(pq_sk) },
+        pq_pk:             if pq_pk.is_empty() { None } else { Some(pq_pk) },
         p2p_addr:          p2p_addr.clone(),
         bootstrap_peers:   bootstrap_peers.clone(),
         snapshot_interval: 300,
@@ -466,6 +470,18 @@ fn main() {
 
         last_height = height;
     }
+}
+
+fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
+    let key = format!("\"{}\":", field);
+    let pos = match json.find(&key) {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let after = &json[pos + key.len()..];
+    let start = after.find('"').unwrap_or(0) + 1;
+    let end   = after[start..].find('"').unwrap_or(0) + start;
+    hex::decode(&after[start..end]).unwrap_or_default()
 }
 
 fn extract_hex32(json: &str, field: &str) -> [u8; 32] {

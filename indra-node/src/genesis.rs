@@ -14,14 +14,11 @@ use indra_core::{
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes,
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
-            MAX_RANGE_PROOF_BYTES,
         },
-        crypto::{CommitmentV1, HybridPubKey},
-        transaction::OutputV1,
     },
 };
 use indra_state::ChainState;
-use indra_crypto::{sha256, pedersen::commit};
+use indra_crypto::sha256;
 
 /// Build the genesis block.
 ///
@@ -117,7 +114,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
 
     println!("[genesis] Loading {} validators from {}", validators.len(), genesis_path);
 
-    for (validator_index, v) in validators.iter().enumerate() {
+    for v in &validators {
         let id_hex = match v.get("validator_id") {
             Some(s) => s.clone(),
             None => continue,
@@ -150,87 +147,10 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         };
 
         let _ = state.validators.upsert(entry);
-        println!("[genesis]   + {} ({}...)", name, &id_hex[..8]);
-
-        // Create spendable genesis UTXO for this validator
-        // Blinding = SHA-256(classical_pk || "genesis-utxo-blinding")
-        let classical_pk_hex = match v.get("hybrid_classical_pk") {
-            Some(s) => s.clone(),
-            None => continue,
-        };
-        let classical_pk_bytes = match hex::decode(&classical_pk_hex) {
-            Ok(b) if b.len() == 32 => b,
-            _ => {
-                eprintln!("[genesis] Invalid hybrid_classical_pk for {}", name);
-                continue;
-            }
-        };
-        let pq_pk_hex = v.get("hybrid_pq_pk").cloned().unwrap_or_default();
-        let pq_pk_bytes = hex::decode(&pq_pk_hex).unwrap_or_else(|_| vec![0u8; 1312]);
-
-        // Derive blinding deterministically
-        let mut blinding_input = classical_pk_bytes.clone();
-        blinding_input.extend_from_slice(b"genesis-utxo-blinding");
-        let blinding: [u8; 32] = sha256(&blinding_input);
-
-        // Build Pedersen commitment: C = stake*G + blinding*H
-        let commitment = commit(stake, &blinding);
-
-        // Generate range proof
-        let mut rng = rand::rngs::OsRng;
-        let range_proof_bytes = match indra_crypto::prove_range(stake, &blinding, &mut rng) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[genesis] Range proof failed for {}: {}", name, e);
-                continue;
-            }
-        };
-
-        // Build owner pubkey
-        let mut pk_arr = [0u8; 32];
-        pk_arr.copy_from_slice(&classical_pk_bytes);
-
-        let pq_pk_var = match indra_core::types::primitives::VariableBytes::<{indra_core::types::primitives::MAX_PQ_PK_BYTES}>::from_slice(&pq_pk_bytes) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("[genesis] PQ pubkey too large for {}", name);
-                continue;
-            }
-        };
-
-        let owner_pubkey = HybridPubKey {
-            classical_pk: Bytes32::from(pk_arr),
-            pq_pk: pq_pk_var,
-        };
-
-        let proof_var = match VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&range_proof_bytes) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("[genesis] Range proof too large for {}", name);
-                continue;
-            }
-        };
-
-        let output = OutputV1 {
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
-            owner_pubkey,
-            range_proof: proof_var,
-            lock_height: 0,
-        };
-
-        match state.utxos.insert(output, 0, 0, validator_index as u32) {
-            Ok(utxo_id) => {
-                println!("[genesis]   UTXO {} = {} Spark (blinding: {}...)",
-                    hex::encode(&utxo_id.0[..8]),
-                    stake,
-                    hex::encode(&blinding[..8]),
-                );
-            }
-            Err(e) => eprintln!("[genesis] Failed to insert UTXO for {}: {}", name, e),
-        }
+        println!("[genesis]   + {} ({}...) stake={} Spark", name, &id_hex[..8], stake);
     }
+    // NOTE: validator stake is bonded in ValidatorEntry only.
+    // Liquid INDRA allocations are distributed separately via treasury.
 }
 
 #[cfg(test)]

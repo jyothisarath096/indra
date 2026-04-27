@@ -185,11 +185,10 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
 
     for id in ids {
         if let Some(entry) = state.validators.get_mut(&id) {
-            // Stake is returned to the validator's UTXO set entry
-            // (in Phase 3 this triggers a UTXO creation)
-            // For now, mark as fully exited by setting stake to 0
+            // Stake is returned to the validator via a UTXO creation (Phase 12+).
+            // Mark as cleanly exited — distinct from slashing.
             entry.stake_spark = 0;
-            entry.status = ValidatorStatus::Slashed; // reuse Slashed as "exited"
+            entry.status = ValidatorStatus::Exited;
         }
     }
 }
