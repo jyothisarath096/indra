@@ -1,3 +1,4 @@
 [
+  {"utxo_id":"89b8335f03635e9d16adf84ef03b8b82c665f49bf7149a7211bfe6f65ef0ee50","value_spark":100000000000,"blinding":"75aa2708d271119c54b71e1d07f85dc364b29a1dabc6ba4d72086b7d91b9f399","created_height":0,"tx_index":0,"out_index":0,"spent":false},
   {"utxo_id":"5da5dfdea31dd16ddbd35218fcca069b4280c487ba6e3f79d8bb2128f6952c4e","value_spark":100000000000,"blinding":"75aa2708d271119c54b71e1d07f85dc364b29a1dabc6ba4d72086b7d91b9f399","created_height":0,"tx_index":0,"out_index":0,"spent":true}
 ]

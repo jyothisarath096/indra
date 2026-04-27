@@ -109,15 +109,27 @@ fn main() {
     match submit_transaction(&node_url, &built.tx_hex) {
         Ok(response) => {
             println!("OK");
-            println!("Response: {}", response);
 
-            // Update wallet — mark inputs as spent, add change output
+            // Check if node accepted or rejected
+            if response.contains("\"error\"") {
+                // Extract error message
+                let msg = if let Some(start) = response.find("\"message\":\"") {
+                    let after = &response[start + 11..];
+                    let end = after.find('"').unwrap_or(after.len());
+                    after[..end].to_string()
+                } else {
+                    response.clone()
+                };
+                eprintln!("Node rejected transaction: {}", msg);
+                eprintln!("Wallet NOT updated — UTXO is still spendable.");
+                std::process::exit(1);
+            }
+
+            // Accepted — mark inputs as spent
             let mut wallet = wallet;
             for id in &built.spent_utxo_ids {
                 wallet.mark_spent(id);
             }
-            // Note: change UTXO ID will be confirmed after block inclusion
-            // For now save the updated spent state
             wallet.save(&wallet_path).unwrap_or_else(|e| {
                 eprintln!("Warning: could not save wallet: {}", e);
             });

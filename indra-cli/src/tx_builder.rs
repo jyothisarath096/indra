@@ -31,8 +31,10 @@ use crate::{
     wallet::Wallet,
 };
 
-/// Minimum fee in Spark (1 KB at base fee 100 Spark/KB).
-pub const MIN_FEE_SPARK: u64 = 100;
+/// Minimum fee in Spark.
+/// Transactions with Bulletproof range proofs are ~4-5 KB.
+/// At base fee 100 Spark/KB, minimum realistic fee is 500 Spark.
+pub const MIN_FEE_SPARK: u64 = 500;
 
 /// Dust limit — outputs below this are rejected.
 pub const DUST_LIMIT_SPARK: u64 = 100;
@@ -305,7 +307,7 @@ mod tests {
         let params = TxParams {
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 1_000_000,
-            fee_spark: 100,
+            fee_spark: 500,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,
@@ -315,7 +317,7 @@ mod tests {
         let result = build_transaction(&params).unwrap();
         assert!(!result.tx_hex.is_empty());
         assert_eq!(result.tx_id.len(), 64);
-        assert_eq!(result.change_spark, 8_999_900);
+        assert_eq!(result.change_spark, 8_999_500);
         assert_eq!(result.spent_utxo_ids.len(), 1);
     }
 
@@ -327,7 +329,7 @@ mod tests {
         let params = TxParams {
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 100_000_000,
-            fee_spark: 100,
+            fee_spark: 500,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,
@@ -345,7 +347,7 @@ mod tests {
         let params = TxParams {
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 1,
-            fee_spark: 100,
+            fee_spark: 500,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,

@@ -158,16 +158,26 @@ impl Wallet {
     /// Load wallet from JSON string.
     pub fn from_json(json: &str) -> CliResult<Self> {
         let mut wallet = Self::new();
-        // Simple parser — find each utxo_id and parse the entry
+        // Simple parser — find each { object } block containing utxo_id
         let mut pos = 0;
-        while let Some(start) = json[pos..].find("utxo_id") {
-            let obj_start = pos + json[pos..].rfind('{')
-                .unwrap_or(0);
-            let obj_end = match json[pos + start..].find('}') {
-                Some(e) => pos + start + e + 1,
+        while pos < json.len() {
+            // Find next opening brace
+            let obj_start = match json[pos..].find('{') {
+                Some(i) => pos + i,
+                None => break,
+            };
+            // Find matching closing brace
+            let obj_end = match json[obj_start..].find('}') {
+                Some(i) => obj_start + i + 1,
                 None => break,
             };
             let obj = &json[obj_start..obj_end];
+            pos = obj_end;
+
+            // Only process objects that contain utxo_id
+            if !obj.contains("utxo_id") {
+                continue;
+            }
 
             let utxo_id = parse_str_field(obj, "utxo_id")?;
             let value   = parse_u64_field(obj, "value_spark")?;
@@ -201,8 +211,6 @@ impl Wallet {
                 out_index: out_idx,
                 spent,
             });
-
-            pos = obj_end;
         }
         Ok(wallet)
     }
