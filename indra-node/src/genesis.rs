@@ -35,13 +35,8 @@ pub fn build_genesis_block() -> BlockV1 {
             mempool_set_root:    Bytes32::ZERO,
             base_fee:            INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap_or_else(|_| {
-                // Safety: empty slice always fits
-                panic!("empty VRF proof should always fit")
-            }),
-            quorum_certificate:  VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap_or_else(|_| {
-                panic!("empty QC should always fit")
-            }),
+            proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::default(),
+            quorum_certificate:  VariableBytes::<MAX_QC_SIZE_BYTES>::default(),
         },
         transactions:      vec![],
         slashing_evidence: vec![],
@@ -82,8 +77,13 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         hex::decode(hex).ok()
     }
 
-    let content = std::fs::read_to_string(genesis_path)
-        .unwrap_or_else(|e| panic!("Cannot read genesis file {}: {}", genesis_path, e));
+    let content = match std::fs::read_to_string(genesis_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("[genesis] cannot read {}: {}", genesis_path, e);
+            return;
+        }
+    };
 
     // Parse each [[validators]] block
     let mut in_validator = false;
@@ -124,6 +124,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         validators.push(current);
     }
 
+    // NOTE: startup logging for node bootstrap; replace with structured tracing later.
     println!("[genesis] Loading {} validators from {}", validators.len(), genesis_path);
 
     for v in &validators {
@@ -163,6 +164,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         };
 
         let _ = state.validators.upsert(entry);
+        // NOTE: startup logging for node bootstrap; replace with structured tracing later.
         println!("[genesis]   + {} ({}...) stake={} Spark", name, &id_hex[..8], stake);
     }
     // NOTE: validator stake is bonded in ValidatorEntry only.

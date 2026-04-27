@@ -5,7 +5,7 @@ use indra_core::{
     Bytes32, ProtocolVersion, VariableBytes,
     types::{
         block::{BlockHeaderV1, BlockV1},
-        primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES},
+        primitives::MAX_VRF_PROOF_BYTES,
     },
 };
 use indra_state::ChainState;
@@ -13,7 +13,7 @@ use indra_consensus::mempool::Mempool;
 use indra_storage::{BlockStore, StateStore};
 use indra_node::{
     NodeConfig, NodeEngine,
-    genesis::{build_genesis_block, build_genesis_state, genesis_block_hash},
+    genesis::{build_genesis_state, genesis_block_hash},
     state_root::compute_state_root,
     sync::import_block,
 };

@@ -49,11 +49,8 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
 /// This is a Merkle root over all active validator identities.
 /// Sorted ascending by validator_id for determinism.
 pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
-    use indra_crypto::hash_pair;
-
     let mut validator_ids: Vec<[u8; 32]> = state.validators
         .active_validators()
-        .into_iter()
         .map(|e| e.validator_id.0)
         .collect();
 

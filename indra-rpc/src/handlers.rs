@@ -3,7 +3,6 @@
 //! Each handler receives the parsed request params and a reference to
 //! the node state, and returns a JSON string result or an RpcError.
 
-use indra_core::codec::Encode;
 use indra_node::NodeEngine;
 
 use crate::{
@@ -172,7 +171,7 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
 ///
 /// Params: `["<tx_hex>"]`
 /// Result: `{"tx_id": "<hex>", "status": "accepted"}`
-fn send_transaction(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+fn send_transaction(params: &[String], _state: &NodeState<'_>) -> RpcResult<String> {
     let tx_hex = params.first()
         .ok_or_else(|| RpcError::InvalidParams("missing transaction parameter".to_string()))?;
 

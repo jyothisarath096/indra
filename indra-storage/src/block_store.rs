@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use indra_core::{
     codec::{Decode, Encode},
@@ -32,7 +32,6 @@ const ENTRY_HEADER_BYTES: usize = 12;
 
 /// An append-only block log with an in-memory height→offset index.
 pub struct BlockStore {
-    path:   PathBuf,
     file:   File,
     index:  HashMap<u64, u64>, // height → file offset of the entry header
     next_height: u64,
@@ -44,15 +43,13 @@ impl BlockStore {
     /// On first open, scans the file to rebuild the index.
     /// Truncates any incomplete final entry.
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
-        let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
-            .open(&path)?;
+            .open(path)?;
 
         let mut store = Self {
-            path,
             file,
             index: HashMap::new(),
             next_height: 0,
@@ -117,12 +114,20 @@ impl BlockStore {
         let mut header = [0u8; ENTRY_HEADER_BYTES];
         self.file.read_exact(&mut header)?;
 
-        let stored_height = u64::from_le_bytes(
-            header[..8].try_into().unwrap_or([0u8; 8])
-        );
-        let length = u32::from_le_bytes(
-            header[8..12].try_into().unwrap_or([0u8; 4])
-        ) as usize;
+        let stored_height_bytes: [u8; 8] = header[..8]
+            .try_into()
+            .map_err(|_| StorageError::Corruption {
+                height,
+                detail: "entry header truncated while reading height".to_string(),
+            })?;
+        let stored_height = u64::from_le_bytes(stored_height_bytes);
+        let length_bytes: [u8; 4] = header[8..12]
+            .try_into()
+            .map_err(|_| StorageError::Corruption {
+                height,
+                detail: "entry header truncated while reading length".to_string(),
+            })?;
+        let length = u32::from_le_bytes(length_bytes) as usize;
 
         if stored_height != height {
             return Err(StorageError::Corruption {
@@ -160,12 +165,20 @@ impl BlockStore {
             let mut header = [0u8; ENTRY_HEADER_BYTES];
             self.file.read_exact(&mut header)?;
 
-            let height = u64::from_le_bytes(
-                header[..8].try_into().unwrap_or([0u8; 8])
-            );
-            let length = u32::from_le_bytes(
-                header[8..12].try_into().unwrap_or([0u8; 4])
-            ) as u64;
+            let height_bytes: [u8; 8] = header[..8]
+                .try_into()
+                .map_err(|_| StorageError::Corruption {
+                    height: self.next_height,
+                    detail: "entry header truncated while rebuilding height index".to_string(),
+                })?;
+            let height = u64::from_le_bytes(height_bytes);
+            let length_bytes: [u8; 4] = header[8..12]
+                .try_into()
+                .map_err(|_| StorageError::Corruption {
+                    height,
+                    detail: "entry header truncated while rebuilding length index".to_string(),
+                })?;
+            let length = u32::from_le_bytes(length_bytes) as u64;
 
             if offset + ENTRY_HEADER_BYTES as u64 + length > file_len {
                 // Truncated entry — stop here and truncate the file
@@ -174,7 +187,7 @@ impl BlockStore {
             }
 
             self.index.insert(height, offset);
-            if max_height.map_or(true, |m| height > m) {
+            if max_height.is_none_or(|m| height > m) {
                 max_height = Some(height);
             }
 
@@ -191,6 +204,7 @@ impl BlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use indra_core::{
         Bytes32, ProtocolVersion, VariableBytes,
         types::{

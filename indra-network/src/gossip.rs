@@ -137,7 +137,7 @@ impl GossipEngine {
 
         for addr in &targets {
             if let Some(conn) = self.connections.get_mut(addr) {
-                if let Err(_) = conn.send(msg) {
+                if conn.send(msg).is_err() {
                     // Connection failed — mark disconnected, score penalty applied elsewhere
                     self.peers.mark_disconnected(addr);
                 }

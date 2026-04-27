@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bytes needed for the signer bitfield. ceil(MAX_VALIDATORS / 8).
-pub const SIGNER_BITFIELD_BYTES: usize = (MAX_VALIDATORS + 7) / 8;
+pub const SIGNER_BITFIELD_BYTES: usize = MAX_VALIDATORS.div_ceil(8);
 
 /// A Quorum Certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,10 @@ impl QuorumCertificateV1 {
     /// Return true if the validator at `slot` is marked as a signer.
     pub fn is_signer(&self, slot: usize) -> bool {
         if slot >= MAX_VALIDATORS { return false; }
-        (self.signer_bitfield[slot / 8] >> (slot % 8)) & 1 == 1
+        self.signer_bitfield
+            .get(slot / 8)
+            .map(|byte| (byte >> (slot % 8)) & 1 == 1)
+            .unwrap_or(false)
     }
 }
 

@@ -3,11 +3,10 @@
 use std::time::Duration;
 
 use indra_crypto::{
-    bls::{BlsKeypair, BlsSignature, aggregate_signatures},
-    hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair, verify_hybrid},
+    bls::{aggregate_signatures, BlsSignature},
+    hybrid::{verify_hybrid, ClassicalKeypair, PqKeypair},
     sha256,
     vrf::{vrf_prove, vrf_verify},
-    VrfKeypair,
 };
 
 use crate::{

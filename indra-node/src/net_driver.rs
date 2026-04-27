@@ -6,16 +6,9 @@
 
 use std::net::SocketAddr;
 
-use indra_core::codec::{Decode, ByteReader};
-use indra_core::types::{
-    block::BlockV1,
-    transaction::TransactionV1,
-    vote::VoteV1,
-    primitives::Bytes32,
-};
 use indra_network::message::Message;
 
-use crate::driver::{ConsensusDriver, DriverAction, DriverEvent};
+use crate::driver::{DriverAction, DriverEvent};
 
 /// Convert a network Message into a DriverEvent.
 pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {

@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use indra_core::Bytes32;
 use indra_state::{apply_block, ChainState};
 use indra_node::state_root::compute_state_root;
 
@@ -45,7 +44,7 @@ pub fn bench_chain_of_blocks(n: u64, iterations: u64) {
         }
     });
     r.print();
-    r.assert_faster_than(Duration::from_millis(n as u64 * 5));
+    r.assert_faster_than(Duration::from_millis(n * 5));
 }
 
 /// Benchmark state root computation.

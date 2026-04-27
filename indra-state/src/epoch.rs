@@ -195,7 +195,7 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
 
 /// True if the given height is the last block of an epoch.
 pub fn is_epoch_boundary(height: u64) -> bool {
-    height > 0 && height % EPOCH_DURATION_BLOCKS == 0
+    height > 0 && height.is_multiple_of(EPOCH_DURATION_BLOCKS)
 }
 
 /// Epoch number for a given height (0-indexed).
@@ -206,7 +206,7 @@ pub fn epoch_for_height(height: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::{GENESIS_SUPPLY_SPARK, EPOCH_DURATION_BLOCKS};
+    use indra_core::types::primitives::GENESIS_SUPPLY_SPARK;
 
     #[test]
     fn epoch_boundary_detection() {

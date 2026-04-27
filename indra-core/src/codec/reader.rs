@@ -31,12 +31,11 @@ impl<'a> ByteReader<'a> {
         let end = self.pos.checked_add(n).ok_or(IndraError::UnexpectedEof {
             needed: n, available: self.remaining(),
         })?;
-        if end > self.data.len() {
+        let Some(slice) = self.data.get(self.pos..end) else {
             return Err(IndraError::UnexpectedEof {
                 needed: n, available: self.remaining(),
             });
-        }
-        let slice = &self.data[self.pos..end];
+        };
         self.pos = end;
         Ok(slice)
     }
@@ -52,19 +51,30 @@ impl<'a> ByteReader<'a> {
     /// Read one byte.
     pub fn read_u8(&mut self) -> IndraResult<u8> {
         let b = self.read_bytes(1)?;
-        Ok(b[0])
+        b.first().copied().ok_or(IndraError::UnexpectedEof {
+            needed: 1,
+            available: 0,
+        })
     }
 
     /// Read a little-endian u16.
     pub fn read_u16_le(&mut self) -> IndraResult<u16> {
         let b = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+        let arr: [u8; 2] = b.try_into().map_err(|_| IndraError::UnexpectedEof {
+            needed: 2,
+            available: b.len(),
+        })?;
+        Ok(u16::from_le_bytes(arr))
     }
 
     /// Read a little-endian u32.
     pub fn read_u32_le(&mut self) -> IndraResult<u32> {
         let b = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let arr: [u8; 4] = b.try_into().map_err(|_| IndraError::UnexpectedEof {
+            needed: 4,
+            available: b.len(),
+        })?;
+        Ok(u32::from_le_bytes(arr))
     }
 
     /// Read a little-endian u64.

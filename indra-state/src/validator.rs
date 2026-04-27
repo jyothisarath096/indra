@@ -162,7 +162,6 @@ impl ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::MAX_VALIDATORS;
 
     fn make_validator(id_byte: u8, stake: u64, epoch: u64) -> ValidatorEntry {
         ValidatorEntry {

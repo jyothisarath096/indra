@@ -13,8 +13,7 @@ use indra_core::{
     codec::Encode,
     types::{
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes,
-            MAX_RANGE_PROOF_BYTES, INITIAL_BASE_FEE_SPARK_PER_KB,
+            Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES,
         },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         transaction::{InputV1, OutputV1, TransactionV1},
@@ -180,7 +179,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         fee_commitment: CommitmentV1 {
             compressed_point: Bytes32::from(fee_commitment.0),
         },
-        signature: dummy_signature(),
+        signature: dummy_signature()?,
     };
 
     // 9. Sign: compute tx hash (all fields except signature), then sign
@@ -190,7 +189,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     let classical = ClassicalKeypair::from_seed(&params.hybrid_seed);
     let pq = PqKeypair::from_bytes(
         // pq_pk is embedded in sender_pubkey
-        &params.sender_pubkey.pq_pk.as_slice().to_vec(),
+        params.sender_pubkey.pq_pk.as_slice(),
         &params.pq_sk_bytes,
     ).map_err(|e| CliError::Crypto(e.to_string()))?;
     let keypair = HybridKeypair::new(classical, pq);
@@ -271,11 +270,13 @@ fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
 }
 
 /// Build a dummy signature (all zeros) for pre-signing placeholder.
-fn dummy_signature() -> HybridSignature {
-    HybridSignature {
-        classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-        pq_sig:        VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
-    }
+fn dummy_signature() -> CliResult<HybridSignature> {
+    Ok(HybridSignature {
+        classical_sig: VariableBytes::from_slice(&[0u8; 64])
+            .map_err(|_| CliError::Transaction("dummy classical signature exceeded max length".into()))?,
+        pq_sig: VariableBytes::from_slice(&[0u8; 2420])
+            .map_err(|_| CliError::Transaction("dummy PQ signature exceeded max length".into()))?,
+    })
 }
 
 #[cfg(test)]

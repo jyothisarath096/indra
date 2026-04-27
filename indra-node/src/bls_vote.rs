@@ -33,7 +33,7 @@ use indra_core::{
     },
 };
 use indra_crypto::{
-    bls::{BlsKeypair, BlsPublicKey, BlsSignature, aggregate_signatures, verify_aggregate},
+    bls::{BlsKeypair, BlsPublicKey, BlsSignature, aggregate_signatures},
     hash::domains::VOTE_SIGN,
     CryptoError,
 };
@@ -103,7 +103,6 @@ pub fn build_bls_qc(
 ) -> NodeResult<QuorumCertificateV1> {
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut bls_sigs: Vec<BlsSignature> = Vec::new();
-    let mut bls_msgs: Vec<Vec<u8>> = Vec::new();
     let mut pq_sigs: Vec<PQVoteSig> = Vec::new();
     let mut signed_stake: u64 = 0;
 
@@ -126,7 +125,7 @@ pub fn build_bls_qc(
             &block_hash, &pc.vote.validator_id,
         );
         bls_sigs.push(pc.bls_sig.clone());
-        bls_msgs.push(msg);
+        let _msg = msg;
 
         let pq_sig = PQVoteSig {
             validator_id: pc.vote.validator_id,
@@ -176,13 +175,6 @@ pub fn build_bls_qc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::{
-        VariableBytes,
-        types::{
-            crypto::HybridSignature,
-            primitives::{MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES},
-        },
-    };
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
     use indra_consensus::vote::produce_vote;
 
@@ -212,8 +204,8 @@ mod tests {
     #[test]
     fn bls_qc_with_real_signatures() {
         let block_hash = Bytes32::from([0xAAu8; 32]);
-        let (pc1, s1, id1) = make_precommit(0x01, 1, block_hash);
-        let (pc2, s2, id2) = make_precommit(0x02, 1, block_hash);
+        let (pc1, _s1, id1) = make_precommit(0x01, 1, block_hash);
+        let (pc2, _s2, id2) = make_precommit(0x02, 1, block_hash);
 
         let positions = vec![
             (id1, 0usize, 5_000u64),

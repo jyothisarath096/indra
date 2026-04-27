@@ -22,14 +22,18 @@ pub fn merkleise(chunks: &[[u8; 32]]) -> [u8; 32] {
 
     while layer.len() > 1 {
         let mut next = Vec::with_capacity(layer.len() / 2);
-        let mut i = 0;
-        while i + 1 < layer.len() {
-            next.push(hash_pair(&layer[i], &layer[i + 1]));
-            i += 2;
+        for pair in layer.chunks_exact(2) {
+            let Some((left, right_slice)) = pair.split_first() else {
+                continue;
+            };
+            let Some((right, _)) = right_slice.split_first() else {
+                continue;
+            };
+            next.push(hash_pair(left, right));
         }
         layer = next;
     }
-    layer[0]
+    layer.into_iter().next().unwrap_or([0u8; 32])
 }
 
 /// Chunk a byte sequence into 32-byte pieces (zero-padding the last),
@@ -43,7 +47,9 @@ pub fn hash_tree_root_chunks(data: &[u8]) -> [u8; 32] {
     while i < data.len() {
         let mut chunk = [0u8; 32];
         let end = (i + 32).min(data.len());
-        chunk[..end - i].copy_from_slice(&data[i..end]);
+        if let (Some(dst), Some(src)) = (chunk.get_mut(..end - i), data.get(i..end)) {
+            dst.copy_from_slice(src);
+        }
         chunks.push(chunk);
         i += 32;
     }

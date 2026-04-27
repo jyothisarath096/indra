@@ -34,7 +34,7 @@ use std::time::Duration;
 use indra_node::NodeEngine;
 
 use crate::{
-    error::{RpcError, ERR_INTERNAL_ERROR, ERR_PARSE_ERROR},
+    error::{ERR_INTERNAL_ERROR, ERR_PARSE_ERROR},
     handlers::{dispatch, NodeState},
     types::{parse_request, JsonId, RpcResponse},
 };

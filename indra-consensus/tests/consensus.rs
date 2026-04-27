@@ -17,8 +17,8 @@ use indra_crypto::{
 };
 use indra_state::ChainState;
 use indra_consensus::{
-    mempool::{Mempool, MempoolConfig},
-    proposer::{ProposerCandidate, ProposerElection, compute_proposer_vrf},
+    mempool::Mempool,
+    proposer::{ProposerCandidate, ProposerElection},
     producer::{BlockTemplate, produce_block},
     vote::{RegisteredVoter, VoteCollector, VoteDecision, produce_vote},
     qc::{QcBuilder, QcValidator, qc_signing_bytes, verify_qc, verify_qc_strict},
@@ -56,7 +56,6 @@ fn dummy_tx(fee: u64, nonce: u8) -> TransactionV1 {
 struct TestValidator {
     hybrid_kp: HybridKeypair,
     bls_kp:    BlsKeypair,
-    vrf_kp:    VrfKeypair,
     id:        Bytes32,
     stake:     u64,
 }
@@ -67,18 +66,9 @@ impl TestValidator {
         let pq = indra_crypto::hybrid::PqKeypair::generate();
         let hybrid_kp = HybridKeypair::new(classical, pq);
         let bls_kp    = BlsKeypair::from_seed(&[seed; 32]).unwrap();
-        let vrf_kp    = VrfKeypair::from_seed(&[seed; 32]);
         let pk = hybrid_kp.public_key();
         let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
-        Self { hybrid_kp, bls_kp, vrf_kp, id, stake }
-    }
-
-    fn as_proposer_candidate(&self) -> ProposerCandidate {
-        ProposerCandidate {
-            validator_id: Bytes32::from(indra_crypto::sha256(&self.vrf_kp.public_key())),
-            vrf_pubkey:   self.vrf_kp.public_key(),
-            stake:        self.stake,
-        }
+        Self { hybrid_kp, bls_kp, id, stake }
     }
 
     fn as_registered_voter(&self) -> RegisteredVoter {

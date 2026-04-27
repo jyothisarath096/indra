@@ -131,14 +131,13 @@ impl Message {
 
     /// Decode a message from wire bytes (after the 4-byte length prefix).
     pub fn decode_wire(data: &[u8]) -> NetworkResult<Self> {
-        if data.is_empty() {
+        let Some((&msg_type_byte, payload)) = data.split_first() else {
             return Err(NetworkError::DecodeFailed {
                 reason: "empty message".to_string(),
             });
-        }
+        };
 
-        let msg_type = MessageType::from_byte(data[0])?;
-        let payload = &data[1..];
+        let msg_type = MessageType::from_byte(msg_type_byte)?;
 
         Self::decode_payload(msg_type, payload)
     }
@@ -201,58 +200,110 @@ impl Message {
                 Ok(Self::Tx(tx))
             }
             MessageType::PeerList => {
-                if payload.len() < 4 {
-                    return Err(NetworkError::DecodeFailed {
+                let count_bytes: [u8; 4] = payload
+                    .get(..4)
+                    .ok_or(NetworkError::DecodeFailed {
                         reason: "peer list too short".to_string(),
-                    });
-                }
-                let count = u32::from_le_bytes(
-                    payload[..4].try_into().unwrap_or([0u8; 4])
-                ) as usize;
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid peer list length prefix".to_string(),
+                    })?;
+                let count = u32::from_le_bytes(count_bytes) as usize;
                 let mut peers = Vec::with_capacity(count);
                 let mut offset = 4;
                 for _ in 0..count {
-                    if offset + 2 > payload.len() { break; }
+                    let Some(len_bytes) = payload.get(offset..offset + 2) else {
+                        return Err(NetworkError::DecodeFailed {
+                            reason: "peer list entry length truncated".to_string(),
+                        });
+                    };
                     let len = u16::from_le_bytes(
-                        payload[offset..offset+2].try_into().unwrap_or([0u8; 2])
+                        len_bytes.try_into().map_err(|_| NetworkError::DecodeFailed {
+                            reason: "invalid peer list entry length".to_string(),
+                        })?
                     ) as usize;
                     offset += 2;
-                    if offset + len > payload.len() { break; }
-                    let s = String::from_utf8_lossy(&payload[offset..offset+len]).to_string();
+                    let Some(peer_bytes) = payload.get(offset..offset + len) else {
+                        return Err(NetworkError::DecodeFailed {
+                            reason: "peer list entry truncated".to_string(),
+                        });
+                    };
+                    let s = String::from_utf8_lossy(peer_bytes).to_string();
                     peers.push(s);
                     offset += len;
                 }
                 Ok(Self::PeerList(peers))
             }
             MessageType::Ping => {
-                if payload.len() < 8 {
-                    return Err(NetworkError::DecodeFailed { reason: "short ping".to_string() });
-                }
-                let nonce = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0u8; 8]));
+                let nonce_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short ping".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid ping payload".to_string(),
+                    })?;
+                let nonce = u64::from_le_bytes(nonce_bytes);
                 Ok(Self::Ping(nonce))
             }
             MessageType::Pong => {
-                if payload.len() < 8 {
-                    return Err(NetworkError::DecodeFailed { reason: "short pong".to_string() });
-                }
-                let nonce = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0u8; 8]));
+                let nonce_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short pong".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid pong payload".to_string(),
+                    })?;
+                let nonce = u64::from_le_bytes(nonce_bytes);
                 Ok(Self::Pong(nonce))
             }
             MessageType::GetBlocks => {
-                if payload.len() < 16 {
-                    return Err(NetworkError::DecodeFailed { reason: "short get_blocks".to_string() });
-                }
-                let from_height = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0u8; 8]));
-                let to_height   = u64::from_le_bytes(payload[8..16].try_into().unwrap_or([0u8; 8]));
+                let from_height_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short get_blocks".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid get_blocks from_height".to_string(),
+                    })?;
+                let to_height_bytes: [u8; 8] = payload
+                    .get(8..16)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short get_blocks".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid get_blocks to_height".to_string(),
+                    })?;
+                let from_height = u64::from_le_bytes(from_height_bytes);
+                let to_height = u64::from_le_bytes(to_height_bytes);
                 Ok(Self::GetBlocks { from_height, to_height })
             }
             MessageType::Status => {
-                if payload.len() < 40 {
-                    return Err(NetworkError::DecodeFailed { reason: "short status".to_string() });
-                }
-                let height = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0u8; 8]));
-                let mut tip = [0u8; 32];
-                tip.copy_from_slice(&payload[8..40]);
+                let height_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short status".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid status height".to_string(),
+                    })?;
+                let tip: [u8; 32] = payload
+                    .get(8..40)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short status".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid status tip hash".to_string(),
+                    })?;
+                let height = u64::from_le_bytes(height_bytes);
                 Ok(Self::Status { height, tip_hash: Bytes32::from(tip) })
             }
         }

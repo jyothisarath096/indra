@@ -85,7 +85,7 @@ impl SlashDetector {
     fn observe_precommit(&mut self, vote: VoteV1) -> Option<SlashEvidence> {
         let existing = self.precommits
             .entry(vote.validator_id)
-            .or_insert_with(Vec::new);
+            .or_default();
 
         // Check for double precommit: same height+round, different block hash
         for prev in existing.iter() {
@@ -109,7 +109,7 @@ impl SlashDetector {
     fn observe_prevote(&mut self, vote: VoteV1) -> Option<SlashEvidence> {
         let existing = self.prevotes
             .entry(vote.validator_id)
-            .or_insert_with(Vec::new);
+            .or_default();
 
         // Check for surround vote:
         // outer (h1, r1) surrounds inner (h2, r2) if h1 < h2 and r1 > r2

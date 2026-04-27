@@ -132,7 +132,7 @@ fn apply_set_commission(
     validator_id: &Bytes32,
     new_commission_bps: u32,
 ) -> StateResult<()> {
-    if new_commission_bps < MIN_COMMISSION_BPS || new_commission_bps > MAX_COMMISSION_BPS {
+    if !(MIN_COMMISSION_BPS..=MAX_COMMISSION_BPS).contains(&new_commission_bps) {
         return Err(StateError::InvalidStakingOp(
             "commission out of governance-set range".into()
         ));

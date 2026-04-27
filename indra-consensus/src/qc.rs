@@ -154,7 +154,10 @@ fn build_qc_from_votes(
         // Set bitfield bit
         let pos = validator.position;
         if pos < MAX_VALIDATORS {
-            signer_bitfield[pos / 8] |= 1 << (pos % 8);
+            let byte_index = pos / 8;
+            if let Some(byte) = signer_bitfield.get_mut(byte_index) {
+                *byte |= 1 << (pos % 8);
+            }
         }
 
         // Collect BLS sig bytes (the classical_sig field carries Ed25519 in Phase 3/4;

@@ -133,9 +133,8 @@ fn extract_string_field(json: &str, field: &str) -> Option<String> {
     let colon_pos = after_key.find(':')?;
     let after_colon = after_key[colon_pos + 1..].trim_start();
 
-    if after_colon.starts_with('"') {
+    if let Some(content) = after_colon.strip_prefix('"') {
         // String value
-        let content = &after_colon[1..];
         let end = content.find('"')?;
         Some(content[..end].to_string())
     } else {
@@ -157,8 +156,7 @@ fn extract_id(json: &str) -> JsonId {
     };
     let after_colon = after_key[colon_pos + 1..].trim_start();
 
-    if after_colon.starts_with('"') {
-        let content = &after_colon[1..];
+    if let Some(content) = after_colon.strip_prefix('"') {
         if let Some(end) = content.find('"') {
             return JsonId::Str(content[..end].to_string());
         }

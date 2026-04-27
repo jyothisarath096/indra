@@ -25,7 +25,7 @@ use indra_core::{
     types::{primitives::Bytes32, transaction::TransactionV1},
 };
 
-use crate::error::{StorageError, StorageResult};
+use crate::error::StorageResult;
 
 const TAG_SUBMIT: u8 = 0x01;
 const TAG_EVICT:  u8 = 0x02;
@@ -86,9 +86,10 @@ impl MempoolWal {
             let mut header = [0u8; 5];
             self.file.read_exact(&mut header)?;
             let tag = header[0];
-            let length = u32::from_le_bytes(
-                header[1..5].try_into().unwrap_or([0u8; 4])
-            ) as usize;
+            let length_bytes: [u8; 4] = header[1..5]
+                .try_into()
+                .map_err(|_| crate::error::StorageError::TruncatedEntry { offset })?;
+            let length = u32::from_le_bytes(length_bytes) as usize;
 
             if offset + ENTRY_OVERHEAD as u64 + length as u64 > file_len {
                 break; // truncated

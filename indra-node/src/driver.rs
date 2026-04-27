@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use indra_core::types::{
     block::BlockV1,
     primitives::Bytes32,
-    vote::{VoteStep, VoteV1},
+    vote::VoteV1,
 };
 use indra_consensus::{
     vote::{RegisteredVoter, VoteCollector, VoteDecision},
@@ -37,7 +37,7 @@ use indra_consensus::{
 
 use crate::{
     engine::NodeEngine,
-    error::{NodeError, NodeResult},
+    error::NodeError,
     slash::{SlashDetector, SlashEvidence},
 };
 
@@ -145,7 +145,7 @@ impl ConsensusDriver {
         }
     }
 
-    fn process_block(&mut self, from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
+    fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
         let height = block.header.height;
 
         // Try to import (validate + apply + store)
@@ -155,7 +155,7 @@ impl ConsensusDriver {
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 vec![DriverAction::BroadcastBlock(block)]
             }
-            Err(NodeError::BlockInvalid { height, reason }) => {
+            Err(NodeError::BlockInvalid { height: _, reason: _ }) => {
                 // Don't broadcast invalid blocks
                 vec![DriverAction::None]
             }
@@ -163,7 +163,7 @@ impl ConsensusDriver {
         }
     }
 
-    fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+    fn process_vote(&mut self, _from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
 
         // Check for slash conditions
@@ -183,7 +183,7 @@ impl ConsensusDriver {
             ));
 
         match collector.add_vote(vote.clone()) {
-            Ok(VoteDecision::QuorumReached { block_hash, stake_bps }) => {
+            Ok(VoteDecision::QuorumReached { block_hash: _, stake_bps: _ }) => {
                 // Quorum reached — in Phase 7 this triggers QC construction
                 // For now just broadcast the vote
                 actions.push(DriverAction::BroadcastVote(vote));
@@ -246,7 +246,8 @@ mod tests {
     use indra_core::{
         Bytes32, ProtocolVersion, VariableBytes,
         types::block::{BlockHeaderV1, BlockV1},
-        types::primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES},
+        types::primitives::MAX_VRF_PROOF_BYTES,
+        types::vote::VoteStep,
     };
     use crate::NodeConfig;
     use std::path::PathBuf;

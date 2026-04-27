@@ -60,7 +60,6 @@ use crate::{
 ///
 /// On success: returns the updated state.
 /// On failure: returns an error and the original state is unchanged.
-
 /// Apply slash evidence — reduce offending validator stake.
 ///
 /// Double-precommit: 5% of stake (SLASH_DOUBLE_PRECOMMIT_BPS = 500)
@@ -92,11 +91,6 @@ fn apply_slash(state: &mut ChainState, evidence: &indra_core::types::slashing::S
             validator.status = crate::ValidatorStatus::Slashed;
         }
 
-        println!(
-            "[slash] validator {}... slashed {} Spark",
-            hex::encode(validator_id.0).chars().take(8).collect::<String>(),
-            slash_amount,
-        );
     }
 }
 
@@ -306,10 +300,8 @@ mod tests {
         types::{
             transaction::{InputV1, OutputV1, TransactionV1},
             block::{BlockV1, BlockHeaderV1},
-            governance::GovernanceOpV1,
-            slashing::SlashEvidenceV1,
             primitives::{
-                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
+                INITIAL_BASE_FEE_SPARK_PER_KB,
             },
         },
     };

@@ -13,10 +13,6 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use indra_core::{
-    codec::Encode,
-    types::primitives::Bytes32,
-};
 use indra_network::{
     message::Message,
     peer::ScoreEvent,
@@ -167,8 +163,6 @@ fn main() {
         let conns    = Arc::clone(&conns);
         let driver   = Arc::clone(&driver);
         let peers    = bootstrap_peers.clone();
-        let p2p      = p2p_addr.clone();
-
         std::thread::spawn(move || {
             // Wait a moment for the listener to start
             std::thread::sleep(Duration::from_millis(500));
@@ -336,7 +330,6 @@ fn main() {
                             let height = d.engine.state.height + 1;
 
                             // Build candidate list from active validators
-                            let total_stake = d.engine.state.validators.total_active_stake();
                             let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
                                 d.engine.state.validators.active_validators()
                                     .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
@@ -400,7 +393,7 @@ fn main() {
                             };
 
                             // Process locally
-                            let actions = driver.lock().unwrap().process(
+                            let _actions = driver.lock().unwrap().process(
                                 DriverEvent::InboundBlock { from: None, block: block.clone() }
                             );
 
@@ -744,8 +737,7 @@ fn extract_json_first_param(json: &str) -> Option<String> {
     let after = &json[params_pos + 8..];
     let arr_start = after.find('[')? + 1;
     let arr = after[arr_start..].trim_start();
-    if arr.starts_with('"') {
-        let inner = &arr[1..];
+    if let Some(inner) = arr.strip_prefix('"') {
         let end = inner.find('"')?;
         Some(inner[..end].to_string())
     } else if arr.starts_with(']') {
@@ -764,9 +756,8 @@ fn extract_json_str(json: &str, key: &str) -> Option<String> {
     let after = &json[pos + needle.len()..];
     let colon = after.find(':')? + 1;
     let rest = after[colon..].trim_start();
-    if rest.starts_with('"') {
-        let inner = &rest[1..];
-        let end = inner.find('"')? ;
+    if let Some(inner) = rest.strip_prefix('"') {
+        let end = inner.find('"')?;
         Some(inner[..end].to_string())
     } else {
         None
@@ -781,7 +772,7 @@ fn extract_json_id(json: &str) -> String {
         if let Some(colon) = after.find(':') {
             let rest = after[colon + 1..].trim_start();
             // Take until comma or closing brace
-            let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
+            let end = rest.find([',', '}']).unwrap_or(rest.len());
             return rest[..end].trim().to_string();
         }
     }

@@ -77,12 +77,20 @@ impl StateStore {
                 let mut header = [0u8; 12];
                 f.read_exact(&mut header)?;
 
-                let height = u64::from_le_bytes(
-                    header[..8].try_into().unwrap_or([0u8; 8])
-                );
-                let length = u32::from_le_bytes(
-                    header[8..12].try_into().unwrap_or([0u8; 4])
-                ) as usize;
+                let height_bytes: [u8; 8] = header[..8]
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated while reading height".to_string(),
+                    })?;
+                let height = u64::from_le_bytes(height_bytes);
+                let length_bytes: [u8; 4] = header[8..12]
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height,
+                        detail: "snapshot header truncated while reading length".to_string(),
+                    })?;
+                let length = u32::from_le_bytes(length_bytes) as usize;
 
                 let mut state_bytes = vec![0u8; length];
                 f.read_exact(&mut state_bytes)?;

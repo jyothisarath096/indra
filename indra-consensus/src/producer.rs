@@ -16,7 +16,6 @@
 //! - Sign the block header (proposers don't sign headers — the QC does)
 
 use indra_core::{
-    codec::Encode,
     types::{
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes,
@@ -145,8 +144,7 @@ mod tests {
     use indra_state::ChainState;
     use indra_crypto::VrfKeypair;
     use crate::{
-        mempool::{Mempool, MempoolConfig},
-        proposer::ProposerCandidate,
+        mempool::Mempool,
     };
 
     fn make_election(seed: &[u8; 32], height: u64, vrf_pk: [u8; 32], stake: u64) -> ProposerElection {
@@ -171,7 +169,6 @@ mod tests {
         let state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x42u8; 32];
-        let kp = VrfKeypair::from_seed(&seed);
         let election = make_election(&seed, 1, seed, 1_000_000);
 
         let template = BlockTemplate {

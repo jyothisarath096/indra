@@ -11,14 +11,11 @@ use indra_core::{
     VoteV1,
     QuorumCertificateV1,
     CheckpointV1,
-    GovernanceOpV1,
-    SlashEvidenceV1,
 };
 use indra_core::types::vote::VoteStep;
-use indra_core::types::governance::GovernanceActionType;
 use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
 use indra_core::types::primitives::{
-    MAX_INPUTS, MAX_OUTPUTS, MAX_TX_PER_BLOCK,
+    MAX_INPUTS, MAX_OUTPUTS,
     DUST_LIMIT_SPARK, MIN_BASE_FEE_SPARK_PER_KB,
     GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA, SPARK_PER_INDRA,
     VALIDATOR_POOL_SHARE_BPS, TREASURY_SHARE_BPS, BURN_BUFFER_SHARE_BPS,

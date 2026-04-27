@@ -35,7 +35,7 @@ pub fn bench_block_store_append(n: u64, iterations: u64) {
         let _ = std::fs::remove_file(&path);
     });
     r.print();
-    r.assert_faster_than(Duration::from_millis(n as u64 * 2 + 10));
+    r.assert_faster_than(Duration::from_millis(n * 2 + 10));
     let _ = std::fs::remove_file(&path);
 }
 

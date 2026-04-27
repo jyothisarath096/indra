@@ -29,8 +29,6 @@ use indra_core::{
 use indra_crypto::{
     hash::domains::VOTE_SIGN,
     hybrid::{HybridKeypair, verify_hybrid, HybridPublicKey, ClassicalPublicKey, PqPublicKey, HybridSignature, ClassicalSignature, PqSignature},
-    sha256,
-    CryptoError,
 };
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -111,6 +109,11 @@ impl VoteCollector {
                 expected_round:  self.round,
             });
         }
+        if vote.step != self.step {
+            return Err(ConsensusError::CryptoError {
+                detail: "vote step mismatch".to_string(),
+            });
+        }
 
         // Find the voter
         let voter = self.voters.iter()
@@ -167,7 +170,7 @@ impl VoteCollector {
 
         // Count stake per block_hash
         let mut stake_by_hash: HashMap<Bytes32, u64> = HashMap::new();
-        for (_, (vote, stake)) in &self.received {
+        for (vote, stake) in self.received.values() {
             *stake_by_hash.entry(vote.block_hash).or_insert(0) += stake;
         }
 
@@ -250,7 +253,7 @@ pub fn vote_signing_bytes(
 mod tests {
     use super::*;
     use indra_core::types::vote::VoteStep;
-    use indra_crypto::hybrid::HybridKeypair;
+    use indra_crypto::{hybrid::HybridKeypair, sha256};
 
     fn voter(seed: u8, stake: u64) -> (RegisteredVoter, HybridKeypair) {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[seed; 32]);
@@ -306,7 +309,7 @@ mod tests {
 
     #[test]
     fn unknown_voter_rejected() {
-        let (v, kp) = voter(0x01, 10_000);
+        let (v, _kp) = voter(0x01, 10_000);
         let (stranger, stranger_kp) = voter(0x99, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
         // Register only v, not stranger

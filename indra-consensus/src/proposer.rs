@@ -1,7 +1,7 @@
 //! VRF-based proposer election.
 
 use indra_core::types::primitives::Bytes32;
-use indra_crypto::{sha256, vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};
+use indra_crypto::{sha256, vrf_prove, VrfKeypair, VrfOutput, VrfProof};
 
 use crate::error::{ConsensusError, ConsensusResult};
 

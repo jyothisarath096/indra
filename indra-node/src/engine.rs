@@ -23,7 +23,7 @@ use indra_crypto::{
 use indra_state::ChainState;
 use indra_consensus::{
     mempool::Mempool,
-    proposer::{ProposerCandidate, ProposerElection, compute_proposer_vrf, elect_proposer},
+    proposer::{ProposerElection, compute_proposer_vrf, elect_proposer},
     producer::{BlockTemplate, produce_block},
 };
 use indra_storage::{BlockStore, StateStore};
@@ -48,8 +48,10 @@ pub struct NodeEngine {
     /// State snapshot store.
     pub state_store: StateStore,
     /// The validator's hybrid keypair (if this is a validator node).
+    #[allow(dead_code)] // retained for future local signing flows
     hybrid_keypair: Option<HybridKeypair>,
     /// The validator's BLS keypair.
+    #[allow(dead_code)] // retained for future local QC aggregation flows
     bls_keypair: Option<BlsKeypair>,
     /// The validator's VRF keypair.
     vrf_keypair: Option<VrfKeypair>,
@@ -159,7 +161,7 @@ impl NodeEngine {
         timestamp: u64,
         prev_qc_bytes: Vec<u8>,
     ) -> NodeResult<indra_core::types::block::BlockV1> {
-        let vrf_kp = self.vrf_keypair.as_ref()
+        let _vrf_kp = self.vrf_keypair.as_ref()
             .ok_or(NodeError::NotProposer { height: self.state.height + 1 })?;
 
         let template = BlockTemplate {
@@ -285,7 +287,7 @@ mod tests {
         use indra_core::{
             Bytes32, ProtocolVersion, VariableBytes,
             types::block::{BlockHeaderV1, BlockV1},
-            types::primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES},
+            types::primitives::MAX_VRF_PROOF_BYTES,
         };
 
         for height in 1..=3u64 {

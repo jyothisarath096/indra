@@ -23,7 +23,6 @@ use indra_crypto::{VrfOutput, VrfProof, vrf_verify};
 
 use crate::{
     error::{NodeError, NodeResult},
-    genesis::build_genesis_block,
     state_root::{compute_state_root, compute_validator_set_root},
 };
 
@@ -72,7 +71,7 @@ pub fn import_block(
     mempool.evict_spent(&state.nullifiers);
 
     // 5. Take snapshot if on interval
-    if height % SNAPSHOT_INTERVAL == 0 && height > 0 {
+    if height > 0 && height.is_multiple_of(SNAPSHOT_INTERVAL) {
         state_store.save(state)?;
     }
 

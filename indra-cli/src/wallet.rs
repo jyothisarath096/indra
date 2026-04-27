@@ -12,12 +12,7 @@
 use std::collections::HashMap;
 
 use indra_core::{
-    codec::Encode,
-    types::{
-        primitives::Bytes32,
-        crypto::HybridPubKey,
-        transaction::OutputV1,
-    },
+    types::primitives::Bytes32,
 };
 use indra_crypto::sha256;
 
