@@ -316,12 +316,14 @@ name = "indra-node"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "indra-bulletproofs",
  "indra-consensus",
  "indra-core",
  "indra-crypto",
  "indra-network",
  "indra-state",
  "indra-storage",
+ "rand 0.8.6",
  "thiserror",
 ]
 

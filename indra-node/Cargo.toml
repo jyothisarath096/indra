@@ -14,6 +14,8 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
 indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
+indra-bulletproofs = { path = "../indra-bulletproofs" }
+rand.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
