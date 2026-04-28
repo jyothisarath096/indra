@@ -1,0 +1,4 @@
+module IndraFFI {
+    header "indra.h"
+    export *
+}
