@@ -303,6 +303,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "indra-ffi"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "indra-bulletproofs",
+ "indra-cli",
+ "indra-core",
+ "indra-crypto",
+ "indra-state",
+ "rand 0.8.6",
+]
+
+[[package]]
 name = "indra-network"
 version = "0.1.0"
 dependencies = [

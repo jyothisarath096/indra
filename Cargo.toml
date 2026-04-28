@@ -11,6 +11,7 @@ members  = [
     "indra-rpc",
     "indra-cli",
     "indra-bench",
+    "indra-ffi",
 ]
 resolver = "2"
 

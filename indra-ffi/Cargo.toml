@@ -1,0 +1,19 @@
+[package]
+name        = "indra-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "indra_ffi"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+indra-core         = { path = "../indra-core" }
+indra-crypto       = { path = "../indra-crypto" }
+indra-state        = { path = "../indra-state" }
+indra-bulletproofs = { path = "../indra-bulletproofs" }
+indra-cli          = { path = "../indra-cli" }
+hex                = { version = "0.4", default-features = false, features = ["alloc"] }
+rand               = { version = "0.8", default-features = false, features = ["std"] }
