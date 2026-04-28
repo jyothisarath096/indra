@@ -17,3 +17,6 @@ indra-bulletproofs = { path = "../indra-bulletproofs" }
 indra-cli          = { path = "../indra-cli" }
 hex                = { version = "0.4", default-features = false, features = ["alloc"] }
 rand               = { version = "0.8", default-features = false, features = ["std"] }
+
+[build-dependencies]
+cc = "1.0"

@@ -306,6 +306,7 @@ dependencies = [
 name = "indra-ffi"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "hex",
  "indra-bulletproofs",
  "indra-cli",
