@@ -141,7 +141,7 @@ pub const ERA_1_2_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 4;
 pub const ERA_3_PLUS_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 8;
 
 /// Era 1 block reward in Spark.
-pub const ERA_1_BLOCK_REWARD_SPARK: u64 = 1_129_700_000;
+pub const ERA_1_BLOCK_REWARD_SPARK: u64 = 1_189_200_000;
 
 /// Era 2 block reward in Spark.
 pub const ERA_2_BLOCK_REWARD_SPARK: u64 = ERA_1_BLOCK_REWARD_SPARK / 2;
@@ -155,11 +155,9 @@ pub const ERA_4_BLOCK_REWARD_SPARK: u64 = ERA_3_BLOCK_REWARD_SPARK / 2;
 /// Era 5 block reward in Spark.
 pub const ERA_5_BLOCK_REWARD_SPARK: u64 = ERA_4_BLOCK_REWARD_SPARK / 2;
 
-/// Total validator rewards pool in Spark (95% of genesis supply).
-pub const VALIDATOR_REWARDS_POOL_SPARK: u64 = 950_000_000 * SPARK_PER_INDRA;
-
-/// Operational bootstrap allocation in Spark (5% of genesis supply).
-pub const OPERATIONAL_BOOTSTRAP_SPARK: u64 = 50_000_000 * SPARK_PER_INDRA;
+/// All 1,000,000,000 INDRA are earned through block rewards.
+/// No pre-allocation to any person or entity.
+pub const VALIDATOR_REWARDS_POOL_SPARK: u64 = 1_000_000_000 * SPARK_PER_INDRA;
 
 /// Fraction of transaction fees burned (basis points).
 pub const FEE_BURN_BPS: u32 = 5_000;
@@ -459,17 +457,18 @@ mod tests {
 
     #[test]
     fn economics_constants_consistent() {
+        assert_eq!(
+            VALIDATOR_REWARDS_POOL_SPARK,
+            GENESIS_SUPPLY_SPARK,
+            "All INDRA must be in the validator rewards pool — no pre-mine"
+        );
         assert_eq!(HARD_CAP_SPARK, GENESIS_SUPPLY_SPARK);
         assert_eq!(GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA);
-        assert_eq!(
-            VALIDATOR_REWARDS_POOL_SPARK + OPERATIONAL_BOOTSTRAP_SPARK,
-            GENESIS_SUPPLY_SPARK
-        );
         assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
         let era_1_total = ERA_1_2_DURATION_BLOCKS * ERA_1_BLOCK_REWARD_SPARK;
         let era_1_indra = era_1_total / SPARK_PER_INDRA;
         assert!(
-            (237_000_000..=238_000_000).contains(&era_1_indra),
+            (248_000_000..=252_000_000).contains(&era_1_indra),
             "Era 1 total INDRA out of range: {}",
             era_1_indra
         );

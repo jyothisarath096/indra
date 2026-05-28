@@ -19,7 +19,7 @@ use indra_core::types::primitives::{
     DUST_LIMIT_SPARK, MIN_BASE_FEE_SPARK_PER_KB,
     GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA, SPARK_PER_INDRA,
     FEE_BURN_BPS, FEE_VALIDATOR_BPS, HARD_CAP_SPARK,
-    OPERATIONAL_BOOTSTRAP_SPARK, VALIDATOR_REWARDS_POOL_SPARK,
+    VALIDATOR_REWARDS_POOL_SPARK,
 };
 use indra_core::codec::{Encode, Decode};
 use indra_core::IndraError;
@@ -258,10 +258,7 @@ fn genesis_supply_consistency() {
 #[test]
 fn allocation_shares_sum_to_ten_thousand() {
     assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
-    assert_eq!(
-        VALIDATOR_REWARDS_POOL_SPARK + OPERATIONAL_BOOTSTRAP_SPARK,
-        GENESIS_SUPPLY_SPARK
-    );
+    assert_eq!(VALIDATOR_REWARDS_POOL_SPARK, GENESIS_SUPPLY_SPARK);
 }
 
 #[test]

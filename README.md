@@ -194,7 +194,7 @@ All endpoints accept JSON-RPC 2.0 POST requests to `http://node:8545`.
 
 Total supply:      1,000,000,000 INDRA (hard cap, immutable)
 Distribution:      95% earned via block rewards (~100 years)
-5% operational bootstrap (Foundation, 6-year vest)
+0% pre-mine. 100% earned by validators securing the network.
 Block rewards:
 Era 1 (Yr 1-4):  ~11.29 INDRA/block
 Era 2 (Yr 4-8):  ~5.64 INDRA/block
