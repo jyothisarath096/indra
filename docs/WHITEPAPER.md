@@ -1,8 +1,8 @@
 # INDRA Protocol
 ## A Post-Quantum Monetary Settlement Network
 
-**Version 1.2 — Pre-release draft**
-**INDRA Protocol Foundation**
+**Version 1.3 — Pre-release draft**
+**Bonkai and team**
 
 ---
 
@@ -23,11 +23,11 @@ Pedersen commitments and Bulletproof range proofs. Consensus is achieved
 via a Tendermint-style Byzantine Fault Tolerant protocol with six-second
 absolute finality.
 
-The monetary policy is simple and immutable: one billion INDRA, all
-pre-minted at genesis, 95% locked in a protocol reward reserve released
-deterministically to validators over approximately one hundred years, the
-remainder decreasing over time through fee burn. No new supply is ever
-created after genesis.
+The monetary policy is simple and immutable: one billion INDRA, all pre-minted at genesis and locked in a
+protocol reward reserve, released deterministically to validators
+through block rewards over approximately one hundred years. No new
+supply is ever created after genesis. No coins were pre-allocated
+to any person or entity. Every INDRA is earned by securing the network.
 
 INDRA is written entirely in Rust. All code is open source. The
 implementation has undergone preliminary internal and AI-assisted review.
@@ -314,26 +314,26 @@ requiring genuine adoption across the ecosystem.
 ### 3.2 Genesis allocation
 
 ```
-Validator Rewards Reserve   950,000,000 INDRA   95%
+Validator Rewards Pool   1,000,000,000 INDRA   100%
   Locked in protocol at genesis.
   Released deterministically via block rewards over ~100 years.
   Earned by whoever secures the network.
-  No pre-allocation to any specific entity.
-
-Operational Bootstrap        50,000,000 INDRA    5%
-  Held by INDRA Foundation (3-of-5 multisig).
-  Lock: 2 years. Then 4-year linear vest.
-  Purpose: audits, legal, infrastructure,
-  development, ecosystem education.
-  All transactions publicly on-chain.
+  No pre-allocation to any person or entity.
+  Founders earn INDRA the same way as everyone else: by validating.
 ```
 
-The 95% validator-earned distribution means no entity receives
-INDRA by decree. Every coin beyond the 5% operational bootstrap
-must be earned by running infrastructure that secures the network.
-This follows Bitcoin's distribution model: the network's first
-participants earn the most, and the schedule is public and fixed
-so that anyone can participate from genesis.
+Every INDRA must be earned by running infrastructure that
+secures the network. There is no foundation pre-mine, no team
+allocation, no investor reserve, and no operational bootstrap.
+This follows Bitcoin's distribution model exactly: the network's
+first participants earn the most, and the schedule is public and
+fixed so that anyone can participate from genesis on equal terms.
+
+The founders hold no pre-mined INDRA. Like all participants,
+they earn block rewards by running validator nodes. This is the
+strongest possible alignment between builders and network: the
+protocol succeeds or it does not, and the builders succeed or
+they do not, together.
 
 ### 3.3 Block reward schedule
 
@@ -342,10 +342,10 @@ created supply. The reward per block follows a schedule of flat
 periods and halvings:
 
 ```
-Era 1  Year 1-4    ~11.29 INDRA/block    237,500,000 INDRA
-Era 2  Year 4-8    ~5.64 INDRA/block     118,750,000 INDRA
-Era 3  Year 8-16   ~2.82 INDRA/block     118,750,000 INDRA
-Era 4  Year 16-24  ~1.41 INDRA/block      59,375,000 INDRA
+Era 1  Year 1-4    ~11.89 INDRA/block    250,000,000 INDRA
+Era 2  Year 4-8    ~5.94 INDRA/block     125,000,000 INDRA
+Era 3  Year 8-16   ~2.97 INDRA/block     125,000,000 INDRA
+Era 4  Year 16-24  ~1.49 INDRA/block      62,500,000 INDRA
 Era 5+ Halves every 8 years thereafter
 ```
 
@@ -550,12 +550,12 @@ if delegators present:
 
 **Example (100 active validators, equal stake, 10% commission):**
 ```
-Era 1 annual block reward pool: ~237,500,000 INDRA
-Per validator annual (block rewards): 2,375,000 INDRA
+Era 1 annual block reward pool: ~250,000,000 INDRA
+Per validator annual (block rewards): 2,500,000 INDRA
 Per validator annual (fees at 100K tx/day, 0.01 INDRA avg):
   fee pool to validators = 365,000 INDRA / 100 = 3,650 INDRA
-Validator self-reward (commission): 237,850 INDRA/year
-Delegator pool: 2,140,650 INDRA/year (distributed by stake)
+Validator self-reward (commission): 250,365 INDRA/year
+Delegator pool: 2,253,285 INDRA/year (distributed by stake)
 Delegator with 1,000 INDRA staked (1% of 100K):
   annual reward ≈ 2,140 INDRA → ~214% APY (Era 1)
 ```
@@ -814,7 +814,7 @@ smartphone hardware. Systematic benchmarking across
 representative devices is required before production claims
 can be made.
 
-**Early validator concentration.** Era 1 releases 237.5 million
+**Early validator concentration.** Era 1 releases 250 million
 INDRA over four years. With a small initial validator set,
 these rewards accrue to a small number of operators. This
 mirrors Bitcoin's early mining concentration. Resolution
@@ -860,8 +860,8 @@ simulated adversarial conditions. Complete documentation.
 **Phase 4 — Mainnet**
 Reproducible genesis ceremony with publicly verifiable genesis
 hash. Bootstrap nodes operational. Wallets available. Block
-explorer live. INDRA Foundation legally established. IIP
-process open.
+explorer live. IIP process open. Community governance of
+protocol improvements through open proposals.
 
 **Phase 5 — Ecosystem development**
 Exchange integrations as demand warrants. TypeScript SDK for
@@ -876,18 +876,20 @@ INDRA Protocol was designed and built by Bonkai and a small
 team of engineers. The code is public and the design has been
 examined independently.
 
+The founders hold no pre-mined INDRA. There is no team
+allocation, no foundation reserve, and no operational
+bootstrap. The founders earn INDRA the same way as every
+other participant: by running validator nodes that secure
+the network. This is not a rhetorical position — it is
+encoded in the protocol. The genesis block contains no
+pre-mine. Every INDRA that exists was earned.
+
 A protocol's security derives from its mathematical properties
 and open-source implementation, not from the credentials of
 its creators. The cryptographic guarantees of INDRA do not
 depend on trusting any individual. They depend on published
 mathematical constructions, open source code, and the
 adversarial conditions of a public network over time.
-
-The INDRA Protocol Foundation will be established as a
-non-profit organisation responsible for ecosystem
-infrastructure. The Foundation has no monetary authority
-over the protocol and cannot change the supply schedule
-or monetary parameters.
 
 Contact: indraprotocol@protonmail.com
 Repository: github.com/jyothisarath096/indra
@@ -926,7 +928,7 @@ BFT safety threshold:       <33.33% Byzantine stake
 Min validator stake:        100,000 INDRA
 Min delegation:             100 INDRA
 Unbonding period:           30 hours
-Era 1 block reward:         ~11.29 INDRA/block
+Era 1 block reward:         ~11.89 INDRA/block
 Era 1 duration:             4 years (21,024,000 blocks)
 Era 2 duration:             4 years
 Era 3+ duration:            8 years per era
@@ -998,7 +1000,7 @@ be published in full.
 
 ---
 
-*INDRA Protocol — Pre-release working draft v1.1*
+*INDRA Protocol — Pre-release working draft v1.3*
 *This is a technical specification, not a financial instrument prospectus.*
 *Protocol parameters may change before mainnet.*
 *This document does not constitute investment advice.*
