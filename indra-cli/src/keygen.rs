@@ -7,8 +7,9 @@
 //!
 //! ## Security
 //!
-//! Each keypair is derived from a 32-byte random seed.
-//! The seeds are the private keys — keep them secret.
+//! Wallet recovery uses a 24-word BIP-39 mnemonic that encodes a 32-byte
+//! master seed. INDRA derives all signing seeds deterministically from that
+//! master seed using domain-separated SHA-256.
 //! Never share anything from the `private` section of the keys file.
 //!
 //! ## Output format (keys.json)
@@ -32,7 +33,10 @@
 
 use indra_crypto::{
     bls::BlsKeypair,
+    derive_all_seeds,
+    generate_mnemonic,
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+    mnemonic_to_seed,
     sha256,
     VrfKeypair,
 };
@@ -66,7 +70,6 @@ pub struct KeysFile {
     /// VRF keypair seed (keep secret).
     pub vrf_seed: [u8; 32],
     /// Dilithium2 secret key bytes (keep secret).
-    /// Stored because Dilithium2 has no deterministic from_seed.
     pub pq_sk: Vec<u8>,
 }
 
@@ -77,6 +80,7 @@ impl KeysFile {
         format!(
             r#"{{
   "validator_id": "{validator_id}",
+  "mnemonic_hint": "Back up your 24-word BIP-39 recovery phrase separately. It is never stored in this file.",
   "public": {{
     "hybrid_classical_pk": "{classical}",
     "hybrid_pq_pk": "{pq}",
@@ -105,16 +109,14 @@ impl KeysFile {
 }
 
 /// Generate a complete set of validator keypairs from three seeds.
-///
-/// If seeds are None, they are set to a deterministic test value.
-/// In production, seeds should be generated from a secure RNG.
 pub fn generate_keypairs(
     hybrid_seed: [u8; 32],
     bls_seed: [u8; 32],
     vrf_seed: [u8; 32],
 ) -> CliResult<KeysFile> {
     let classical = ClassicalKeypair::from_seed(&hybrid_seed);
-    let pq = PqKeypair::generate();
+    let pq = PqKeypair::from_seed(&hybrid_seed)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
     let pq_sk_bytes = pq.secret_key_bytes();
     let hybrid = HybridKeypair::new(classical, pq);
     let pk = hybrid.public_key();
@@ -157,6 +159,24 @@ pub fn generate_from_passphrase(passphrase: &str) -> CliResult<KeysFile> {
     generate_keypairs(hybrid_seed, bls_seed, vrf_seed)
 }
 
+/// Generate a complete validator keypair set from a new mnemonic.
+pub fn generate_from_new_mnemonic() -> CliResult<(String, KeysFile)> {
+    let phrase = generate_mnemonic();
+    let master_seed = mnemonic_to_seed(&phrase)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let derived = derive_all_seeds(&master_seed);
+    let keys = generate_keypairs(derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)?;
+    Ok((phrase, keys))
+}
+
+/// Recover a validator keypair set from an existing mnemonic.
+pub fn recover_from_mnemonic(phrase: &str) -> CliResult<KeysFile> {
+    let master_seed = mnemonic_to_seed(phrase)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let derived = derive_all_seeds(&master_seed);
+    generate_keypairs(derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,8 +196,10 @@ mod tests {
         let k2 = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
         assert_eq!(k1.public.validator_id, k2.public.validator_id);
         assert_eq!(k1.public.hybrid_classical_pk, k2.public.hybrid_classical_pk);
+        assert_eq!(k1.public.hybrid_pq_pk, k2.public.hybrid_pq_pk);
         assert_eq!(k1.public.bls_pk, k2.public.bls_pk);
         assert_eq!(k1.public.vrf_pk, k2.public.vrf_pk);
+        assert_eq!(k1.pq_sk, k2.pq_sk);
     }
 
     #[test]
@@ -206,6 +228,7 @@ mod tests {
         let keys = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
         let json = keys.to_json();
         assert!(json.contains("validator_id"));
+        assert!(json.contains("mnemonic_hint"));
         assert!(json.contains("hybrid_classical_pk"));
         assert!(json.contains("bls_pk"));
         assert!(json.contains("vrf_pk"));
@@ -217,5 +240,15 @@ mod tests {
         let keys = generate_keypairs([0x42u8; 32], [0x42u8; 32], [0x42u8; 32]).unwrap();
         let expected = indra_crypto::sha256(&keys.public.hybrid_classical_pk);
         assert_eq!(keys.public.validator_id, expected);
+    }
+
+    #[test]
+    fn mnemonic_recovery_is_deterministic() {
+        let (phrase, keys1) = generate_from_new_mnemonic().unwrap();
+        let keys2 = recover_from_mnemonic(&phrase).unwrap();
+        assert_eq!(keys1.public.validator_id, keys2.public.validator_id);
+        assert_eq!(keys1.public.hybrid_classical_pk, keys2.public.hybrid_classical_pk);
+        assert_eq!(keys1.public.hybrid_pq_pk, keys2.public.hybrid_pq_pk);
+        assert_eq!(keys1.pq_sk, keys2.pq_sk);
     }
 }

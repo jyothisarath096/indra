@@ -25,6 +25,7 @@ license = "MIT"
 sha2               = { version = "0.10", default-features = false }
 thiserror          = { version = "1.0" }
 hex                = { version = "0.4", default-features = false, features = ["alloc"] }
+bip39              = { version = "2.0", default-features = false, features = ["rand"] }
 ed25519-dalek      = { version = "2.1", default-features = false, features = ["alloc"] }
 curve25519-dalek   = { version = "4.1", default-features = false, features = ["alloc"] }
 pqcrypto-dilithium = { version = "0.5", default-features = false }

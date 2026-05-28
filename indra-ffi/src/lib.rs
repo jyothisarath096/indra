@@ -15,7 +15,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-use std::{ffi::c_char, panic::catch_unwind};
+use std::{ffi::{CStr, c_char}, panic::catch_unwind};
 
 use indra_bulletproofs::RANGE_PROOF_BYTES;
 use indra_crypto::sha256;
@@ -133,6 +133,96 @@ pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -
             *out = keypair;
             IndraError::Ok.code()
         }
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Generate a new random 24-word BIP-39 mnemonic phrase.
+///
+/// # Safety
+///
+/// `out_phrase` must point to a writable buffer of length `out_len`.
+#[no_mangle]
+pub unsafe extern "C" fn indra_generate_mnemonic(
+    out_phrase: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if out_phrase.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    match catch_unwind(|| {
+        let phrase = keygen::new_mnemonic();
+        let bytes = phrase.as_bytes();
+        if bytes.len().saturating_add(1) > out_len {
+            return Err(IndraError::BufferTooSmall);
+        }
+        let out_slice = std::slice::from_raw_parts_mut(out_phrase.cast::<u8>(), out_len);
+        out_slice[..bytes.len()].copy_from_slice(bytes);
+        out_slice[bytes.len()] = 0;
+        Ok(())
+    }) {
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Recover an INDRA keypair from a BIP-39 mnemonic phrase.
+///
+/// # Safety
+///
+/// `phrase` must point to a valid null-terminated UTF-8 C string and `out`
+/// must point to writable `IndraKeyPair` storage.
+#[no_mangle]
+pub unsafe extern "C" fn indra_keygen_from_mnemonic(
+    phrase: *const c_char,
+    out: *mut IndraKeyPair,
+) -> i32 {
+    if phrase.is_null() || out.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    *out = IndraKeyPair::zeroed();
+
+    match catch_unwind(|| {
+        let phrase_str = CStr::from_ptr(phrase)
+            .to_str()
+            .map_err(|_| IndraError::InvalidParam)?;
+        keygen::generate_from_mnemonic(phrase_str)
+    }) {
+        Ok(Ok(keypair)) => {
+            *out = keypair;
+            IndraError::Ok.code()
+        }
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Validate a BIP-39 mnemonic phrase.
+///
+/// # Safety
+///
+/// `phrase` must point to a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn indra_validate_mnemonic(phrase: *const c_char) -> i32 {
+    if phrase.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    match catch_unwind(|| {
+        let phrase_str = CStr::from_ptr(phrase)
+            .to_str()
+            .map_err(|_| IndraError::InvalidParam)?;
+        if keygen::is_valid_mnemonic(phrase_str) {
+            Ok(())
+        } else {
+            Err(IndraError::InvalidParam)
+        }
+    }) {
+        Ok(Ok(())) => IndraError::Ok.code(),
         Ok(Err(err)) => err.code(),
         Err(_) => IndraError::Internal.code(),
     }
@@ -373,8 +463,10 @@ pub extern "C" fn indra_error_string(error_code: i32) -> *const c_char {
 mod tests {
     use super::*;
 
+    const MNEMONIC_MAX_BYTES: usize = 300;
     const INDRA_OK: i32 = IndraError::Ok as i32;
     const INDRA_ERR_NULL_POINTER: i32 = IndraError::NullPointer as i32;
+    const INDRA_ERR_INVALID_PARAM: i32 = IndraError::InvalidParam as i32;
 
     #[test]
     fn keygen_produces_valid_output() {
@@ -398,6 +490,8 @@ mod tests {
         }
         assert_eq!(out1.validator_id, out2.validator_id);
         assert_eq!(out1.classical_pk, out2.classical_pk);
+        assert_eq!(out1.pq_pk, out2.pq_pk);
+        assert_eq!(out1.pq_sk, out2.pq_sk);
     }
 
     #[test]
@@ -412,6 +506,42 @@ mod tests {
         let seed = [0x42u8; 32];
         let result = unsafe { indra_keygen(seed.as_ptr(), std::ptr::null_mut()) };
         assert_eq!(result, INDRA_ERR_NULL_POINTER);
+    }
+
+    #[test]
+    fn generate_mnemonic_produces_phrase() {
+        let mut phrase = [0u8; MNEMONIC_MAX_BYTES];
+        let code = unsafe {
+            indra_generate_mnemonic(phrase.as_mut_ptr().cast::<c_char>(), phrase.len())
+        };
+        assert_eq!(code, INDRA_OK);
+        let nul = phrase.iter().position(|b| *b == 0).unwrap();
+        let rendered = std::str::from_utf8(&phrase[..nul]).unwrap();
+        assert_eq!(rendered.split_whitespace().count(), 24);
+    }
+
+    #[test]
+    fn keygen_from_mnemonic_is_deterministic() {
+        let phrase = std::ffi::CString::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+        ).unwrap();
+        let mut out1 = IndraKeyPair::zeroed();
+        let mut out2 = IndraKeyPair::zeroed();
+        unsafe {
+            assert_eq!(indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out1), INDRA_OK);
+            assert_eq!(indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out2), INDRA_OK);
+        }
+        assert_eq!(out1.validator_id, out2.validator_id);
+        assert_eq!(out1.classical_pk, out2.classical_pk);
+        assert_eq!(out1.pq_pk, out2.pq_pk);
+        assert_eq!(out1.pq_sk, out2.pq_sk);
+    }
+
+    #[test]
+    fn validate_mnemonic_rejects_invalid_phrase() {
+        let phrase = std::ffi::CString::new("invalid phrase").unwrap();
+        let code = unsafe { indra_validate_mnemonic(phrase.as_ptr()) };
+        assert_eq!(code, INDRA_ERR_INVALID_PARAM);
     }
 
     #[test]

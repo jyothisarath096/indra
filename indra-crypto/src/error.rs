@@ -57,6 +57,10 @@ pub enum CryptoError {
     /// BLS aggregation requires at least one signer.
     #[error("BLS aggregation requires at least one signer")]
     EmptySignerSet,
+
+    /// Invalid or malformed BIP-39 mnemonic phrase.
+    #[error("invalid BIP-39 mnemonic phrase")]
+    InvalidMnemonic,
 }
 
 /// Convenience alias.

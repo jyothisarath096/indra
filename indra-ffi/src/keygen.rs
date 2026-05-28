@@ -1,5 +1,5 @@
-use indra_cli::generate_keypairs;
-use indra_crypto::sha256;
+use indra_cli::{generate_keypairs, recover_from_mnemonic};
+use indra_crypto::{derive_all_seeds, generate_mnemonic, validate_mnemonic};
 
 use crate::{errors::IndraError, IndraKeyPair};
 
@@ -8,10 +8,29 @@ const PQ_SK_BYTES: usize = 2560;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
 pub fn generate(seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
-    let bls_seed = sha256(&[seed.as_slice(), b"bls"].concat());
-    let vrf_seed = sha256(&[seed.as_slice(), b"vrf"].concat());
-    let keys = generate_keypairs(seed, bls_seed, vrf_seed).map_err(|_| IndraError::KeygenFailed)?;
+    let derived = derive_all_seeds(&seed);
+    let keys = generate_keypairs(derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)
+        .map_err(|_| IndraError::KeygenFailed)?;
+    keys_to_ffi(&keys)
+}
 
+/// Generate a new BIP-39 mnemonic phrase.
+pub fn new_mnemonic() -> String {
+    generate_mnemonic()
+}
+
+/// Generate an INDRA keypair bundle from a BIP-39 mnemonic phrase.
+pub fn generate_from_mnemonic(phrase: &str) -> Result<IndraKeyPair, IndraError> {
+    let keys = recover_from_mnemonic(phrase).map_err(|_| IndraError::InvalidParam)?;
+    keys_to_ffi(&keys)
+}
+
+/// Validate a mnemonic phrase.
+pub fn is_valid_mnemonic(phrase: &str) -> bool {
+    validate_mnemonic(phrase)
+}
+
+fn keys_to_ffi(keys: &indra_cli::KeysFile) -> Result<IndraKeyPair, IndraError> {
     if keys.public.hybrid_pq_pk.len() != PQ_PK_BYTES || keys.pq_sk.len() != PQ_SK_BYTES {
         return Err(IndraError::KeygenFailed);
     }

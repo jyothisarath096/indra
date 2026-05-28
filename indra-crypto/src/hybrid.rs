@@ -14,14 +14,19 @@ use ed25519_dalek::{
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_traits::sign::{
     PublicKey as PqPubKeyTrait,
+    SecretKey as PqSecretKeyTrait,
     SignedMessage as PqSignedMsg,
-
 };
 
 use crate::{
     constants::{CLASSICAL_SIG_BYTES, CLASSICAL_PK_BYTES},
     error::{CryptoError, CryptoResult},
 };
+
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    fn indra_dilithium2_seed_keypair(pk: *mut u8, sk: *mut u8, seed: *const u8) -> i32;
+}
 
 // ── Classical (Ed25519) ───────────────────────────────────────────────────────
 
@@ -91,6 +96,37 @@ pub struct PqKeypair {
 }
 
 impl PqKeypair {
+    /// Generate a deterministic Dilithium2 keypair from a 32-byte seed.
+    pub fn from_seed(seed: &[u8; 32]) -> CryptoResult<Self> {
+        let mut pk_bytes = [0u8; 1312];
+        let mut sk_bytes = [0u8; 2560];
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            indra_dilithium2_seed_keypair(
+                pk_bytes.as_mut_ptr(),
+                sk_bytes.as_mut_ptr(),
+                seed.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(CryptoError::MalformedPublicKey {
+                scheme: "dilithium2-seeded",
+                actual: rc as usize,
+            });
+        }
+        let pk = dilithium2::PublicKey::from_bytes(&pk_bytes)
+            .map_err(|_| CryptoError::MalformedPublicKey {
+                scheme: "dilithium2",
+                actual: pk_bytes.len(),
+            })?;
+        let sk = dilithium2::SecretKey::from_bytes(&sk_bytes)
+            .map_err(|_| CryptoError::MalformedPublicKey {
+                scheme: "dilithium2-sk",
+                actual: sk_bytes.len(),
+            })?;
+        Ok(Self { pk, sk })
+    }
+
     /// Generate a new Dilithium2 keypair using the library's secure RNG.
     pub fn generate() -> Self {
         let (pk, sk) = dilithium2::keypair();
@@ -278,7 +314,7 @@ mod tests {
 
     #[test]
     fn pq_sign_verify_roundtrip() {
-        let kp = PqKeypair::generate();
+        let kp = PqKeypair::from_seed(&[0x11u8; 32]).unwrap();
         let msg = b"INDRA PQ test";
         let sig = kp.sign(msg).unwrap();
         assert!(verify_pq(msg, &sig, &kp.public_key()).is_ok());
@@ -286,7 +322,7 @@ mod tests {
 
     #[test]
     fn pq_wrong_message_fails() {
-        let kp = PqKeypair::generate();
+        let kp = PqKeypair::from_seed(&[0x22u8; 32]).unwrap();
         let sig = kp.sign(b"correct").unwrap();
         assert!(verify_pq(b"wrong", &sig, &kp.public_key()).is_err());
     }
@@ -295,7 +331,7 @@ mod tests {
     fn hybrid_both_schemes_must_pass() {
         let kp = HybridKeypair::new(
             ClassicalKeypair::from_seed(&[0xABu8; 32]),
-            PqKeypair::generate(),
+            PqKeypair::from_seed(&[0x33u8; 32]).unwrap(),
         );
         let msg = b"hybrid test message";
         let sig = kp.sign(msg).unwrap();
@@ -306,9 +342,17 @@ mod tests {
     fn hybrid_wrong_message_fails() {
         let kp = HybridKeypair::new(
             ClassicalKeypair::from_seed(&[0xCDu8; 32]),
-            PqKeypair::generate(),
+            PqKeypair::from_seed(&[0x44u8; 32]).unwrap(),
         );
         let sig = kp.sign(b"signed").unwrap();
         assert!(verify_hybrid(b"different", &sig, &kp.public_key()).is_err());
+    }
+
+    #[test]
+    fn pq_seeded_keygen_is_deterministic() {
+        let a = PqKeypair::from_seed(&[0x55u8; 32]).unwrap();
+        let b = PqKeypair::from_seed(&[0x55u8; 32]).unwrap();
+        assert_eq!(a.public_key(), b.public_key());
+        assert_eq!(a.secret_key_bytes(), b.secret_key_bytes());
     }
 }
