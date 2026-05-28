@@ -181,7 +181,6 @@ fn verify_block_qc(
         .filter_map(|(position, validator)| Some(QcValidator {
             validator_id: validator.validator_id,
             position,
-            bls_pk: validator.bls_pk?,
             pq_pk: validator.hybrid_pq_pk.clone()?,
             stake: validator.stake_spark,
         }))

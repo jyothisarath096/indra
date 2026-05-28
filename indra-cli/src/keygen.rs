@@ -2,7 +2,7 @@
 //!
 //! Generates all three keypairs a validator needs:
 //!   1. Hybrid (Ed25519 + Dilithium2) — for transaction and vote signatures
-//!   2. BLS12-381 — for QC aggregation
+//!   2. Legacy BLS12-381 metadata — retained for backward compatibility only
 //!   3. VRF — for proposer election
 //!
 //! ## Security

@@ -32,7 +32,6 @@ pub mod config;
 pub mod error;
 pub mod genesis;
 pub mod engine;
-pub mod bls_vote;
 pub mod state_root;
 pub mod sync;
 pub mod slash;

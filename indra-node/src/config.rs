@@ -15,8 +15,9 @@ pub struct NodeConfig {
     /// If None, this node is a full node (validates but does not propose).
     pub validator_seed: Option<[u8; 32]>,
 
-    /// The node's BLS signing seed (32 bytes).
-    /// Required if validator_seed is set.
+    /// Legacy BLS signing seed (32 bytes).
+    /// Retained for backward compatibility with existing key files.
+    /// No longer used for QC verification.
     pub bls_seed: Option<[u8; 32]>,
 
     /// The node's VRF seed (32 bytes).

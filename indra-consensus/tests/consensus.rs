@@ -11,7 +11,6 @@ use indra_core::{
     },
 };
 use indra_crypto::{
-    bls::{BlsKeypair, aggregate_signatures},
     hybrid::HybridKeypair,
     VrfKeypair,
 };
@@ -21,7 +20,7 @@ use indra_consensus::{
     proposer::{ProposerCandidate, ProposerElection},
     producer::{BlockTemplate, produce_block},
     vote::{RegisteredVoter, VoteCollector, VoteDecision, produce_vote},
-    qc::{QcBuilder, QcValidator, qc_signing_bytes, verify_qc, verify_qc_strict},
+    qc::{QcBuilder, QcValidator, verify_qc, verify_qc_strict},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,7 +54,6 @@ fn dummy_tx(fee: u64, nonce: u8) -> TransactionV1 {
 
 struct TestValidator {
     hybrid_kp: HybridKeypair,
-    bls_kp:    BlsKeypair,
     id:        Bytes32,
     stake:     u64,
 }
@@ -65,10 +63,9 @@ impl TestValidator {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[seed; 32]);
         let pq = indra_crypto::hybrid::PqKeypair::generate();
         let hybrid_kp = HybridKeypair::new(classical, pq);
-        let bls_kp    = BlsKeypair::from_seed(&[seed; 32]).unwrap();
         let pk = hybrid_kp.public_key();
         let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
-        Self { hybrid_kp, bls_kp, id, stake }
+        Self { hybrid_kp, id, stake }
     }
 
     fn as_registered_voter(&self) -> RegisteredVoter {
@@ -86,7 +83,6 @@ impl TestValidator {
         QcValidator {
             validator_id: self.id,
             position,
-            bls_pk:       self.bls_kp.public_key().0,
             pq_pk:        pk.pq.0.clone(),
             stake:        self.stake,
         }
@@ -173,9 +169,8 @@ fn full_consensus_round() {
     let qc = builder.build().unwrap();
     assert_eq!(qc.signer_count(), 3);
 
-    // Placeholder QC construction still passes the stake/PQ checks.
     assert!(verify_qc(&qc, &qc_validators, total_stake).is_ok());
-    assert!(verify_qc_strict(&qc, &qc_validators, total_stake).is_err());
+    assert!(verify_qc_strict(&qc, &qc_validators, total_stake).is_ok());
 }
 
 #[test]
@@ -222,7 +217,7 @@ fn qc_builder_quorum_detection() {
 }
 
 #[test]
-fn strict_qc_verification_accepts_real_bls_aggregate() {
+fn strict_qc_verification_accepts_dilithium_only_qc() {
     use indra_core::types::crypto::PQVoteSig;
     use indra_core::types::primitives::{MAX_PQ_SIG_BYTES, VariableBytes};
     use indra_core::types::qc::{QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
@@ -241,26 +236,18 @@ fn strict_qc_verification_accepts_real_bls_aggregate() {
 
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_signatures = Vec::new();
-    let signing_bytes = qc_signing_bytes(height, round, &block_hash);
-    let bls_sigs = validators.iter()
-        .enumerate()
-        .map(|(position, validator)| {
-            signer_bitfield[position / 8] |= 1 << (position % 8);
-            let vote = produce_vote(height, round, VoteStep::Precommit, block_hash, validator.id, &validator.hybrid_kp).unwrap();
-            pq_signatures.push(PQVoteSig {
-                validator_id: validator.id,
-                pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(vote.signature.pq_sig.as_slice()).unwrap(),
-            });
-            validator.bls_kp.sign(&signing_bytes)
-        })
-        .collect::<Vec<_>>();
-
-    let agg = aggregate_signatures(&bls_sigs).unwrap();
+    validators.iter().enumerate().for_each(|(position, validator)| {
+        signer_bitfield[position / 8] |= 1 << (position % 8);
+        let vote = produce_vote(height, round, VoteStep::Precommit, block_hash, validator.id, &validator.hybrid_kp).unwrap();
+        pq_signatures.push(PQVoteSig {
+            validator_id: validator.id,
+            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(vote.signature.pq_sig.as_slice()).unwrap(),
+        });
+    });
     let qc = QuorumCertificateV1 {
         height,
         round,
         block_hash,
-        bls_agg_sig: VariableBytes::from_slice(&agg.0).unwrap(),
         signer_bitfield,
         pq_signatures,
     };

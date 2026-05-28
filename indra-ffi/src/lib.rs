@@ -111,6 +111,11 @@ impl IndraTxResult {
 }
 
 /// Generate a new INDRA keypair from one 32-byte wallet seed.
+///
+/// # Safety
+///
+/// `seed` must point to at least 32 readable bytes and `out` must point to a
+/// valid writable `IndraKeyPair`.
 #[no_mangle]
 pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -> i32 {
     if seed.is_null() || out.is_null() {
@@ -134,6 +139,11 @@ pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -
 }
 
 /// Derive the validator id from a classical public key.
+///
+/// # Safety
+///
+/// `classical_pk` must point to at least 32 readable bytes and `out_id` must
+/// point to a writable 32-byte output buffer.
 #[no_mangle]
 pub unsafe extern "C" fn indra_validator_id(classical_pk: *const u8, out_id: *mut u8) -> i32 {
     if classical_pk.is_null() || out_id.is_null() {
@@ -151,6 +161,12 @@ pub unsafe extern "C" fn indra_validator_id(classical_pk: *const u8, out_id: *mu
 }
 
 /// Build and sign a transaction for the iOS wallet.
+///
+/// # Safety
+///
+/// `params` and `out` must be valid non-null pointers. Any pointer fields inside
+/// `params` must reference readable memory for the documented lengths, and
+/// `out` must point to writable storage for `IndraTxResult`.
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_tx(params: *const IndraTxParams, out: *mut IndraTxResult) -> i32 {
     if params.is_null() || out.is_null() {
@@ -226,6 +242,11 @@ pub unsafe extern "C" fn indra_build_tx(params: *const IndraTxParams, out: *mut 
 }
 
 /// Hex-encode raw transaction bytes into a caller-provided buffer.
+///
+/// # Safety
+///
+/// `tx_bytes` must reference `tx_bytes_len` readable bytes and `out_hex` must
+/// point to a writable buffer of length `out_hex_len`.
 #[no_mangle]
 pub unsafe extern "C" fn indra_tx_to_hex(
     tx_bytes: *const u8,
@@ -257,6 +278,11 @@ pub unsafe extern "C" fn indra_tx_to_hex(
 }
 
 /// Derive the deterministic genesis blinding factor from a classical public key.
+///
+/// # Safety
+///
+/// `classical_pk` must point to at least 32 readable bytes and
+/// `out_blinding` must point to a writable 32-byte output buffer.
 #[no_mangle]
 pub unsafe extern "C" fn indra_genesis_utxo_blinding(
     classical_pk: *const u8,
@@ -277,6 +303,11 @@ pub unsafe extern "C" fn indra_genesis_utxo_blinding(
 }
 
 /// Verify a Bulletproof range proof against a Pedersen commitment.
+///
+/// # Safety
+///
+/// `commitment_bytes` must point to 32 readable bytes and `proof_bytes` must
+/// point to `proof_len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn indra_verify_range_proof(
     commitment_bytes: *const u8,
@@ -303,6 +334,11 @@ pub unsafe extern "C" fn indra_verify_range_proof(
 }
 
 /// Free a byte buffer allocated by Rust.
+///
+/// # Safety
+///
+/// `ptr` must either be null or a pointer returned by `indra_build_tx()` for a
+/// byte buffer, paired with the original allocation length.
 #[no_mangle]
 pub unsafe extern "C" fn indra_free_bytes(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
@@ -313,6 +349,11 @@ pub unsafe extern "C" fn indra_free_bytes(ptr: *mut u8, len: usize) {
 }
 
 /// Free a `usize` array allocated by Rust.
+///
+/// # Safety
+///
+/// `ptr` must either be null or a pointer returned by `indra_build_tx()` for a
+/// `usize` array, paired with the original allocation length.
 #[no_mangle]
 pub unsafe extern "C" fn indra_free_usize(ptr: *mut usize, len: usize) {
     if ptr.is_null() {

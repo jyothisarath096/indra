@@ -1,14 +1,13 @@
 //! Quorum Certificate — proof that ≥ 2/3 stake precommitted to a block.
 //!
-//! Classical component:  1× BLS aggregate signature (48 bytes regardless of N signers).
-//! PQ component:         Individual Dilithium2 signatures for quorum-minimum validators.
-//! Signer tracking:      1-bit-per-validator bitfield (188 bytes for 1500 validators).
+//! INDRA QCs are now fully post-quantum: they contain one Dilithium2 signature
+//! per signer plus a signer bitfield, and no BLS aggregate signature.
 
 use crate::{
     codec::{Encode, Decode, ByteReader, encode_list, decode_list, list_encoded_len},
     error::IndraResult,
     types::{
-        primitives::{Bytes32, VariableBytes, MAX_VALIDATORS, MAX_BLS_AGG_SIG_BYTES},
+        primitives::{Bytes32, MAX_QC_SIGNERS, MAX_VALIDATORS},
         crypto::PQVoteSig,
     },
 };
@@ -25,8 +24,6 @@ pub struct QuorumCertificateV1 {
     pub round: u32,
     /// Certified block hash.
     pub block_hash: Bytes32,
-    /// BLS12-381 aggregate of all classical signer components (48 bytes).
-    pub bls_agg_sig: VariableBytes<MAX_BLS_AGG_SIG_BYTES>,
     /// Bitfield: bit i = 1 → validator at slot i signed.
     pub signer_bitfield: [u8; SIGNER_BITFIELD_BYTES],
     /// Individual Dilithium2 signatures for included validators.
@@ -54,13 +51,11 @@ impl Encode for QuorumCertificateV1 {
         self.height.encode(buf);
         self.round.encode(buf);
         self.block_hash.encode(buf);
-        self.bls_agg_sig.encode(buf);
         buf.extend_from_slice(&self.signer_bitfield);
         encode_list(&self.pq_signatures, buf);
     }
     fn encoded_len(&self) -> usize {
         8 + 4 + 32
-            + self.bls_agg_sig.encoded_len()
             + SIGNER_BITFIELD_BYTES
             + list_encoded_len(&self.pq_signatures)
     }
@@ -71,12 +66,11 @@ impl Decode for QuorumCertificateV1 {
         let height      = u64::decode(r)?;
         let round       = u32::decode(r)?;
         let block_hash  = Bytes32::decode(r)?;
-        let bls_agg_sig = VariableBytes::decode(r)?;
         let bf_bytes    = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield.copy_from_slice(bf_bytes);
-        let pq_signatures = decode_list(r, MAX_VALIDATORS, "pq_signatures")?;
-        Ok(Self { height, round, block_hash, bls_agg_sig, signer_bitfield, pq_signatures })
+        let pq_signatures = decode_list(r, MAX_QC_SIGNERS, "pq_signatures")?;
+        Ok(Self { height, round, block_hash, signer_bitfield, pq_signatures })
     }
 }
 
@@ -90,7 +84,6 @@ mod tests {
             height:          1_000,
             round:           0,
             block_hash:      Bytes32::from([0x77u8; 32]),
-            bls_agg_sig:     VariableBytes::from_slice(&[0xAAu8; 96]).unwrap(),
             signer_bitfield: [0b11111111u8; SIGNER_BITFIELD_BYTES],
             pq_signatures:   vec![],
         }

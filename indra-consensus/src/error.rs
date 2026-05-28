@@ -77,6 +77,42 @@ pub enum ConsensusError {
         need_bps: u64,
     },
 
+    /// Signer stake does not meet the QC threshold.
+    #[error("insufficient QC signer stake: have {have}, need {need}")]
+    InsufficientStake {
+        /// Stake represented by included signatures.
+        have: u64,
+        /// Required quorum stake.
+        need: u64,
+    },
+
+    /// QC signature list length does not match the signer bitfield.
+    #[error("QC signature count mismatch: expected {expected}, got {got}")]
+    SignatureCountMismatch {
+        /// Number of signatures implied by the signer bitfield.
+        expected: usize,
+        /// Number of PQ signatures carried in the QC.
+        got: usize,
+    },
+
+    /// Duplicate PQ signatures were included for the same validator.
+    #[error("duplicate QC signature for validator")]
+    DuplicateSignature,
+
+    /// A signer indicated by the bitfield is missing its PQ signature.
+    #[error("missing QC signature for validator {validator_id}")]
+    MissingSignature {
+        /// The validator whose signature is missing.
+        validator_id: indra_core::types::primitives::Bytes32,
+    },
+
+    /// A validator's PQ signature did not verify.
+    #[error("invalid QC PQ signature for validator {validator_id}")]
+    InvalidPQSignature {
+        /// The validator whose signature failed verification.
+        validator_id: indra_core::types::primitives::Bytes32,
+    },
+
     /// A QC failed signature verification.
     #[error("QC signature verification failed")]
     QcVerificationFailed,

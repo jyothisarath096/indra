@@ -7,7 +7,7 @@
 //! ### `keygen`
 //! Generate a complete validator keypair set:
 //! - Ed25519 + Dilithium2 hybrid keypair (for signing transactions and votes)
-//! - BLS12-381 keypair (for QC aggregation)
+//! - Legacy BLS12-381 keypair metadata (retained for backward compatibility)
 //! - VRF keypair (for proposer election)
 //!
 //! Output: a `keys.json` file with hex-encoded public and private keys.

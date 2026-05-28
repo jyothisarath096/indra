@@ -102,9 +102,6 @@ pub const MAX_PQ_PK_BYTES: usize = 1_400;
 /// Maximum VRF proof size (bytes).
 pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
 
-/// Maximum BLS aggregate signature size (bytes).
-pub const MAX_BLS_AGG_SIG_BYTES: usize = 96;
-
 /// Maximum Bulletproof range proof per output (bytes).
 pub const MAX_RANGE_PROOF_BYTES: usize = 674;
 
@@ -172,6 +169,12 @@ pub const FEE_VALIDATOR_BPS: u32 = 5_000;
 
 /// Soft target for the number of active validators.
 pub const TARGET_VALIDATOR_COUNT: u64 = 200;
+
+/// Target active validator set size for QC size management.
+pub const TARGET_VALIDATOR_SET_SIZE: u64 = 150;
+
+/// Maximum validators that may appear in a single QC.
+pub const MAX_QC_SIGNERS: usize = 200;
 
 /// Slash for repeated missed blocks (>10% proposals missed), in basis points.
 pub const SLASH_REPEATED_MISS_BPS: u32 = 1;

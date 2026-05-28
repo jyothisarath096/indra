@@ -32,8 +32,6 @@ pub struct ValidatorEntry {
     pub hybrid_classical_pk: Option<[u8; 32]>,
     /// Dilithium public key bytes for vote signature verification.
     pub hybrid_pq_pk: Option<Vec<u8>>,
-    /// BLS public key bytes for QC aggregate verification.
-    pub bls_pk: Option<[u8; 48]>,
     /// VRF public key bytes for proposer verification.
     pub vrf_pk: Option<[u8; 32]>,
     /// Staked amount in Spark.
@@ -168,7 +166,6 @@ mod tests {
             validator_id:     Bytes32::from([id_byte; 32]),
             hybrid_classical_pk: None,
             hybrid_pq_pk:    None,
-            bls_pk:          None,
             vrf_pk:          None,
             stake_spark:      stake,
             status:           ValidatorStatus::Active,

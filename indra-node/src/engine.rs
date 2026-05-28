@@ -16,7 +16,6 @@
 
 use indra_core::types::primitives::Bytes32;
 use indra_crypto::{
-    bls::BlsKeypair,
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
 };
@@ -50,9 +49,6 @@ pub struct NodeEngine {
     /// The validator's hybrid keypair (if this is a validator node).
     #[allow(dead_code)] // retained for future local signing flows
     hybrid_keypair: Option<HybridKeypair>,
-    /// The validator's BLS keypair.
-    #[allow(dead_code)] // retained for future local QC aggregation flows
-    bls_keypair: Option<BlsKeypair>,
     /// The validator's VRF keypair.
     vrf_keypair: Option<VrfKeypair>,
     /// This validator's identity (SHA-256 of hybrid public key classical component).
@@ -80,10 +76,9 @@ impl NodeEngine {
         });
 
         // Build validator keypairs if configured
-        let (hybrid_keypair, bls_keypair, vrf_keypair, validator_id) =
-            if let (Some(vs), Some(bs), Some(vrfs)) = (
+        let (hybrid_keypair, vrf_keypair, validator_id) =
+            if let (Some(vs), Some(vrfs)) = (
                 config.validator_seed,
-                config.bls_seed,
                 config.vrf_seed,
             ) {
                 let classical = ClassicalKeypair::from_seed(&vs);
@@ -97,13 +92,12 @@ impl NodeEngine {
                     PqKeypair::generate()
                 };
                 let hybrid = HybridKeypair::new(classical, pq);
-                let bls = BlsKeypair::from_seed(&bs)?;
                 let vrf = VrfKeypair::from_seed(&vrfs);
                 let pk = hybrid.public_key();
                 let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
-                (Some(hybrid), Some(bls), Some(vrf), Some(id))
+                (Some(hybrid), Some(vrf), Some(id))
             } else {
-                (None, None, None, None)
+                (None, None, None)
             };
 
         Ok(Self {
@@ -113,7 +107,6 @@ impl NodeEngine {
             block_store,
             state_store,
             hybrid_keypair,
-            bls_keypair,
             vrf_keypair,
             validator_id,
         })

@@ -186,7 +186,6 @@ mod tests {
             validator_id,
             hybrid_classical_pk: None,
             hybrid_pq_pk: None,
-            bls_pk: None,
             vrf_pk: None,
             stake_spark: 10_000_000_000,
             status: ValidatorStatus::Active,

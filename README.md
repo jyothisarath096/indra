@@ -212,19 +212,17 @@ Full economics: see [WHITEPAPER.md] or check indraprotocol.com
 
 ## Post-quantum security
 
-INDRA implements NIST FIPS 204 (ML-DSA, formerly Dilithium2) for
-post-quantum signatures alongside classical Ed25519 in a hybrid scheme.
-Both signatures must verify for a transaction to be valid.
+INDRA transaction ownership and consensus finality are fully post-quantum.
+Transaction signatures use an Ed25519 + Dilithium2 hybrid, while Quorum
+Certificates use Dilithium2-only verification. Amount confidentiality still
+uses classical cryptography and is documented as such.
 
-This protects against quantum computers that can break ECDSA and EdDSA
-using Shor's algorithm. The hybrid scheme ensures security under both
-classical and quantum threat models simultaneously.
-
-Classical security:  Ed25519 (128-bit)
-Post-quantum:        Dilithium2 / ML-DSA (NIST FIPS 204, 128-bit PQ)
-Hybrid:              Both must verify — stronger than either alone
-Confidential txs:    Pedersen commitments (amounts hidden)
-Range proofs:        Bulletproofs (prove amount > 0 without revealing it)
+| Component | Scheme | Quantum-safe |
+|-----------|--------|--------------|
+| Transaction signatures | Ed25519 + Dilithium2 | Yes (hybrid) |
+| QC finality proofs | Dilithium2 | Yes |
+| Block hashing | SHA-256 | Partial |
+| Amount hiding | Ristretto255 / Pedersen | No (known) |
 
 
 ---
@@ -276,4 +274,3 @@ Does not control monetary policy or protocol parameters.
 
 Website: indraprotocol.com (coming soon)
 GitHub:  github.com/jyothisarath096/indra
-

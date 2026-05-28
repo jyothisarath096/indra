@@ -156,7 +156,6 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             validator_id,
             hybrid_classical_pk: parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
             hybrid_pq_pk: parse_vec_hex(v.get("hybrid_pq_pk")),
-            bls_pk: parse_fixed_hex::<48>(v.get("bls_pk")),
             vrf_pk: parse_fixed_hex::<32>(v.get("vrf_pk")),
             stake_spark: stake,
             status: ValidatorStatus::Active,

@@ -31,7 +31,9 @@ name                = "alice"
 validator_id        = "aabbcc..."   # 64 hex chars (32 bytes)
 hybrid_classical_pk = "aabbcc..."   # 64 hex chars (Ed25519 public key)
 hybrid_pq_pk        = "aabbcc..."   # variable length (Dilithium2 public key)
-bls_pk              = "aabbcc..."   # 96 hex chars (BLS12-381 public key)
+# bls_pk is no longer used for QC verification (Dilithium2-only QCs).
+# Retained for reference/backward compatibility with older genesis tooling.
+bls_pk              = "aabbcc..."   # 96 hex chars (legacy BLS12-381 public key)
 vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
 stake               = 100000000000 # 100,000 INDRA in Spark
 

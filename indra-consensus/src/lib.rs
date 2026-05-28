@@ -23,8 +23,8 @@
 //!   block hash. Tracks received votes and detects when quorum is reached.
 //!
 //! - **Quorum Certificate**: collects votes until 2/3 stake threshold is
-//!   met, then aggregates the BLS classical signatures and bundles the
-//!   individual Dilithium2 signatures into a `QuorumCertificateV1`.
+//!   met, then bundles the individual Dilithium2 signatures into a
+//!   fully post-quantum `QuorumCertificateV1`.
 //!
 //! ## What this crate does NOT do
 //!
