@@ -9,6 +9,8 @@
 
 use std::io::Write;
 
+const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -33,8 +35,8 @@ fn main() {
         std::process::exit(1);
     });
 
-    let amount_spark = (amount_indra * 1_000_000.0) as u64;
-    let fee_spark    = (fee_indra   * 1_000_000.0) as u64;
+    let amount_spark = (amount_indra * SPARK_PER_INDRA_F64) as u64;
+    let fee_spark    = (fee_indra   * SPARK_PER_INDRA_F64) as u64;
     let fee_spark    = fee_spark.max(indra_cli::tx_builder::MIN_FEE_SPARK);
 
     println!("INDRA Send");
@@ -73,8 +75,11 @@ fn main() {
         std::process::exit(1);
     });
 
-    println!("Wallet balance: {} Spark ({:.6} INDRA)",
-        wallet.balance(), wallet.balance() as f64 / 1_000_000.0);
+    println!(
+        "Wallet balance: {} Spark ({:.8} INDRA)",
+        wallet.balance(),
+        wallet.balance() as f64 / SPARK_PER_INDRA_F64
+    );
 
     if wallet.balance() == 0 {
         eprintln!("Error: wallet is empty. Add UTXOs first with 'indra-wallet scan'.");
@@ -99,7 +104,11 @@ fn main() {
 
     println!("\nTransaction built:");
     println!("  TX ID:    {}", built.tx_id);
-    println!("  Change:   {} Spark ({:.6} INDRA)", built.change_spark, built.change_spark as f64 / 1_000_000.0);
+    println!(
+        "  Change:   {} Spark ({:.8} INDRA)",
+        built.change_spark,
+        built.change_spark as f64 / SPARK_PER_INDRA_F64
+    );
     println!("  Inputs:   {}", built.spent_utxo_ids.len());
 
     // Submit to node

@@ -11,7 +11,7 @@
 //! ## state_root
 //!
 //! SHA-256(height || base_fee || tip_hash || total_supply || treasury
-//!         || utxo_set_hash || nullifier_set_hash)
+//!         || fee_reward_pool || utxo_set_hash || nullifier_set_hash)
 //!
 //! ## validator_set_root
 //!
@@ -32,6 +32,7 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
     data.extend_from_slice(&state.tip_hash.0);
     data.extend_from_slice(&state.total_supply.to_le_bytes());
     data.extend_from_slice(&state.treasury_balance.to_le_bytes());
+    data.extend_from_slice(&state.fee_reward_pool.to_le_bytes());
 
     // Hash of UTXO count (Phase 6 replaces with full Merkle trie)
     let utxo_count = state.utxos.len() as u64;

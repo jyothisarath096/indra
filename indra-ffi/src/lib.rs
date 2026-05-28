@@ -394,7 +394,7 @@ mod tests {
         let params = IndraTxParams {
             recipient_classical_pk: keys.classical_pk.as_ptr(),
             amount_spark: 1_000_000,
-            fee_spark: 500,
+            fee_spark: 50_000,
             utxos: &utxo,
             utxo_count: 1,
             sender_classical_seed: keys.classical_seed.as_ptr(),

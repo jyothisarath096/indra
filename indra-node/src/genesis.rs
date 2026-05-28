@@ -12,7 +12,7 @@ use indra_core::{
     types::{
         block::{BlockHeaderV1, BlockV1},
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes,
+            Bytes32, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK, ProtocolVersion, VariableBytes,
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
         },
     },
@@ -53,7 +53,11 @@ pub fn genesis_block_hash() -> Bytes32 {
 
 /// Build the initial chain state (genesis state).
 pub fn build_genesis_state() -> ChainState {
-    ChainState::new_genesis()
+    let state = ChainState::new_genesis();
+    assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
+    assert!(state.total_supply <= HARD_CAP_SPARK);
+    assert_eq!(state.fee_reward_pool, 0);
+    state
 }
 
 
@@ -168,7 +172,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         println!("[genesis]   + {} ({}...) stake={} Spark", name, &id_hex[..8], stake);
     }
     // NOTE: validator stake is bonded in ValidatorEntry only.
-    // Liquid INDRA allocations are distributed separately via treasury.
+    // Liquid allocations are handled separately from validator bonding state.
 }
 
 #[cfg(test)]

@@ -14,6 +14,8 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
+const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let get = |flag: &str| -> Option<String> {
@@ -100,8 +102,11 @@ fn main() {
         });
 
         println!("Added UTXO: {} ({} Spark)", parts[0], value);
-        println!("New balance: {} Spark ({:.6} INDRA)",
-            wallet.balance(), wallet.balance() as f64 / 1_000_000.0);
+        println!(
+            "New balance: {} Spark ({:.8} INDRA)",
+            wallet.balance(),
+            wallet.balance() as f64 / SPARK_PER_INDRA_F64
+        );
         return;
     }
 
@@ -123,8 +128,11 @@ fn main() {
         }
     }
 
-    println!("\nCurrent wallet balance: {} Spark ({:.6} INDRA)",
-        wallet.balance(), wallet.balance() as f64 / 1_000_000.0);
+    println!(
+        "\nCurrent wallet balance: {} Spark ({:.8} INDRA)",
+        wallet.balance(),
+        wallet.balance() as f64 / SPARK_PER_INDRA_F64
+    );
 }
 
 /// Query the node for UTXOs owned by a pubkey.

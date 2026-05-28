@@ -18,7 +18,8 @@ use indra_core::types::primitives::{
     MAX_INPUTS, MAX_OUTPUTS,
     DUST_LIMIT_SPARK, MIN_BASE_FEE_SPARK_PER_KB,
     GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA, SPARK_PER_INDRA,
-    VALIDATOR_POOL_SHARE_BPS, TREASURY_SHARE_BPS, BURN_BUFFER_SHARE_BPS,
+    FEE_BURN_BPS, FEE_VALIDATOR_BPS, HARD_CAP_SPARK,
+    OPERATIONAL_BOOTSTRAP_SPARK, VALIDATOR_REWARDS_POOL_SPARK,
 };
 use indra_core::codec::{Encode, Decode};
 use indra_core::IndraError;
@@ -251,14 +252,16 @@ fn truncated_bytes_rejected() {
 #[test]
 fn genesis_supply_consistency() {
     assert_eq!(GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA);
-    assert_eq!(GENESIS_SUPPLY_SPARK, 1_000_000_000_000_000u64); // 1B INDRA × 1M Spark
+    assert_eq!(GENESIS_SUPPLY_SPARK, 100_000_000_000_000_000u64);
+    assert_eq!(HARD_CAP_SPARK, GENESIS_SUPPLY_SPARK);
 }
 
 #[test]
 fn allocation_shares_sum_to_ten_thousand() {
+    assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
     assert_eq!(
-        VALIDATOR_POOL_SHARE_BPS + TREASURY_SHARE_BPS + BURN_BUFFER_SHARE_BPS,
-        10_000
+        VALIDATOR_REWARDS_POOL_SPARK + OPERATIONAL_BOOTSTRAP_SPARK,
+        GENESIS_SUPPLY_SPARK
     );
 }
 

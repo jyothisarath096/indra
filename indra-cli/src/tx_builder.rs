@@ -13,7 +13,7 @@ use indra_core::{
     codec::Encode,
     types::{
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES,
+            Bytes32, MAX_RANGE_PROOF_BYTES, ProtocolVersion, VariableBytes,
         },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         transaction::{InputV1, OutputV1, TransactionV1},
@@ -32,11 +32,11 @@ use crate::{
 
 /// Minimum fee in Spark.
 /// Transactions with Bulletproof range proofs are ~4-5 KB.
-/// At base fee 100 Spark/KB, minimum realistic fee is 500 Spark.
-pub const MIN_FEE_SPARK: u64 = 500;
+/// At 8 decimal places this is 0.0005 INDRA = 50,000 Spark.
+pub const MIN_FEE_SPARK: u64 = 50_000;
 
 /// Dust limit — outputs below this are rejected.
-pub const DUST_LIMIT_SPARK: u64 = 100;
+pub const DUST_LIMIT_SPARK: u64 = 100_000;
 
 /// Parameters for building a transaction.
 pub struct TxParams<'a> {
@@ -312,7 +312,7 @@ mod tests {
         let params = TxParams {
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 1_000_000,
-            fee_spark: 500,
+            fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,
@@ -322,7 +322,7 @@ mod tests {
         let result = build_transaction(&params).unwrap();
         assert!(!result.tx_hex.is_empty());
         assert_eq!(result.tx_id.len(), 64);
-        assert_eq!(result.change_spark, 8_999_500);
+        assert_eq!(result.change_spark, 8_950_000);
         assert_eq!(result.spent_utxo_ids.len(), 1);
     }
 
@@ -334,7 +334,7 @@ mod tests {
         let params = TxParams {
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 100_000_000,
-            fee_spark: 500,
+            fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,
@@ -352,7 +352,7 @@ mod tests {
         let params = TxParams {
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 1,
-            fee_spark: 500,
+            fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,

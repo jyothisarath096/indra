@@ -151,16 +151,18 @@ impl StateStore {
 }
 
 /// Serialise a ChainState to bytes.
-/// Format: height(8) || base_fee(8) || tip_hash(32) || total_supply(8) || treasury(8)
+/// Format: height(8) || base_fee(8) || tip_hash(32) || total_supply(8)
+///      || treasury(8) || fee_reward_pool(8)
 /// This is a minimal snapshot — the full UTXO/nullifier/validator sets
 /// are rebuilt from block replay in Phase 6. For now we store the summary fields.
 fn serialise_chain_state(state: &ChainState) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64);
+    let mut buf = Vec::with_capacity(72);
     buf.extend_from_slice(&state.height.to_le_bytes());
     buf.extend_from_slice(&state.base_fee.to_le_bytes());
     buf.extend_from_slice(&state.tip_hash.0);
     buf.extend_from_slice(&state.total_supply.to_le_bytes());
     buf.extend_from_slice(&state.treasury_balance.to_le_bytes());
+    buf.extend_from_slice(&state.fee_reward_pool.to_le_bytes());
     buf
 }
 
@@ -175,6 +177,11 @@ fn deserialise_chain_state(bytes: &[u8], _height: u64) -> Result<ChainState, Str
     let tip_hash: [u8; 32] = bytes[16..48].try_into().map_err(|_| "bad tip_hash")?;
     let total_supply = u64::from_le_bytes(bytes[48..56].try_into().map_err(|_| "bad total_supply")?);
     let treasury = u64::from_le_bytes(bytes[56..64].try_into().map_err(|_| "bad treasury")?);
+    let fee_reward_pool = if bytes.len() >= 72 {
+        u64::from_le_bytes(bytes[64..72].try_into().map_err(|_| "bad fee_reward_pool")?)
+    } else {
+        0
+    };
 
     use indra_core::types::primitives::Bytes32;
     let mut state = ChainState::new_genesis();
@@ -182,7 +189,8 @@ fn deserialise_chain_state(bytes: &[u8], _height: u64) -> Result<ChainState, Str
     state.base_fee     = base_fee;
     state.tip_hash     = Bytes32::from(tip_hash);
     state.total_supply = total_supply;
-    state.treasury_balance     = treasury;
+    state.treasury_balance = treasury;
+    state.fee_reward_pool = fee_reward_pool;
     Ok(state)
 }
 
@@ -204,12 +212,14 @@ mod tests {
         let mut state = ChainState::new_genesis();
         state.height = 42;
         state.base_fee = 500;
+        state.fee_reward_pool = 777;
 
         store.save(&state).unwrap();
 
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded.height, 42);
         assert_eq!(loaded.base_fee, 500);
+        assert_eq!(loaded.fee_reward_pool, 777);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

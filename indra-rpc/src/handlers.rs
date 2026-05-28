@@ -57,27 +57,45 @@ fn get_tip(state: &NodeState<'_>) -> RpcResult<String> {
 /// `indra_getChainInfo` — returns a full chain summary.
 ///
 /// Result: `{"height", "tip_hash", "base_fee", "total_supply",
-///           "treasury_balance", "burn_buffer", "active_validators",
-///           "mempool_size", "epoch"}`
+///           "treasury_balance", "burn_buffer", "fee_reward_pool",
+///           "active_validators", "mempool_size", "epoch",
+///           "block_reward_spark", "era"}`
 fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let s = &state.engine.state;
     let tip = hex::encode(s.tip_hash.0);
     let active_validators = s.validators.active_count();
     let mempool_size = state.engine.mempool.len();
     let epoch = s.current_epoch();
+    let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
+    let era = era_for_height(s.height);
 
     Ok(format!(
-        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"active_validators":{validators},"mempool_size":{mempool},"epoch":{epoch}}}"#,
+        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"mempool_size":{mempool},"epoch":{epoch},"block_reward_spark":{block_reward_spark},"era":{era}}}"#,
         height        = s.height,
         tip           = tip,
         base_fee      = s.base_fee,
         total_supply  = s.total_supply,
         treasury      = s.treasury_balance,
         burn          = s.burn_buffer,
+        fee_reward_pool = s.fee_reward_pool,
         validators    = active_validators,
         mempool       = mempool_size,
         epoch         = epoch,
+        block_reward_spark = block_reward_spark,
+        era           = era,
     ))
+}
+
+fn era_for_height(height: u64) -> u64 {
+    use indra_core::types::primitives::{ERA_1_2_DURATION_BLOCKS, ERA_3_PLUS_DURATION_BLOCKS};
+
+    if height < ERA_1_2_DURATION_BLOCKS {
+        1
+    } else if height < ERA_1_2_DURATION_BLOCKS * 2 {
+        2
+    } else {
+        3 + ((height - (ERA_1_2_DURATION_BLOCKS * 2)) / ERA_3_PLUS_DURATION_BLOCKS)
+    }
 }
 
 /// `indra_getMempoolSize` — returns the number of pending transactions.

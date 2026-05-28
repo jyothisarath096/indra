@@ -23,7 +23,7 @@ const TAG_SET_COMMISSION: u8      = 5;
 
 /// A public staking operation included in a block.
 ///
-/// All amounts are in Spark (1 INDRA = 1_000_000 Spark).
+/// All amounts are in Spark (1 INDRA = 100_000_000 Spark).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StakingOp {
     /// Delegate Spark to a validator.

@@ -54,10 +54,12 @@ fn format_result(method: &str, json: &str) -> String {
             let height = extract_number(json, "height").unwrap_or(0);
             let base_fee = extract_number(json, "base_fee").unwrap_or(0);
             let supply = extract_number(json, "total_supply").unwrap_or(0);
+            let fee_reward_pool = extract_number(json, "fee_reward_pool").unwrap_or(0);
             let validators = extract_number(json, "active_validators").unwrap_or(0);
             let epoch = extract_number(json, "epoch").unwrap_or(0);
+            let era = extract_number(json, "era").unwrap_or(0);
             format!(
-                "Height:            {height}\nEpoch:             {epoch}\nBase fee:          {base_fee} Spark/KB\nTotal supply:      {supply} Spark\nActive validators: {validators}"
+                "Height:            {height}\nEpoch:             {epoch}\nEra:               {era}\nBase fee:          {base_fee} Spark/KB\nTotal supply:      {supply} Spark\nFee reward pool:   {fee_reward_pool} Spark\nActive validators: {validators}"
             )
         }
         "indra_getMempoolSize" => {

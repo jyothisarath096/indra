@@ -569,17 +569,29 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     s.height, hex::encode(s.tip_hash.0))
             }
             "indra_getChainInfo" => {
+                let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
+                let era = if s.height < indra_core::types::primitives::ERA_1_2_DURATION_BLOCKS {
+                    1
+                } else if s.height < indra_core::types::primitives::ERA_1_2_DURATION_BLOCKS * 2 {
+                    2
+                } else {
+                    3 + ((s.height - (indra_core::types::primitives::ERA_1_2_DURATION_BLOCKS * 2))
+                        / indra_core::types::primitives::ERA_3_PLUS_DURATION_BLOCKS)
+                };
                 format!(
-                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"active_validators":{},"mempool_size":{},"epoch":{}}}"#,
+                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"mempool_size":{},"epoch":{},"block_reward_spark":{},"era":{}}}"#,
                     s.height,
                     hex::encode(s.tip_hash.0),
                     s.base_fee,
                     s.total_supply,
                     s.treasury_balance,
                     s.burn_buffer,
+                    s.fee_reward_pool,
                     s.validators.active_count(),
                     mempool_size,
                     s.current_epoch(),
+                    block_reward_spark,
+                    era,
                 )
             }
             "indra_getMempoolSize" => {

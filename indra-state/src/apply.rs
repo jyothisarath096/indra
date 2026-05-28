@@ -39,7 +39,8 @@ use indra_core::{
     codec::Encode,
     types::{
         primitives::{
-            Bytes32, PROTOCOL_VERSION, MAX_BLOCK_SIZE_BYTES, MAX_TX_PER_BLOCK,
+            Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_TX_PER_BLOCK,
+            PROTOCOL_VERSION,
         },
         block::BlockV1,
         transaction::TransactionV1,
@@ -139,6 +140,12 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
     if is_epoch_boundary(state.height) {
         let epoch = epoch_for_height(state.height);
         apply_epoch_transition(state, epoch)?;
+    }
+
+    if state.total_supply > HARD_CAP_SPARK {
+        return Err(StateError::InvariantViolation {
+            message: "CRITICAL: total supply exceeds hard cap — constitutional invariant violated",
+        });
     }
 
     Ok(())
@@ -283,9 +290,10 @@ fn apply_transaction(
         )?;
     }
 
-    // Fees are burned (100% burn — no validator fee payment in v1)
-    // Total supply decreases by fee_amount
-    state.total_supply = state.total_supply.saturating_sub(tx.fee_amount);
+    let burn_amount = tx.fee_amount / 2;
+    let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
+    state.total_supply = state.total_supply.saturating_sub(burn_amount);
+    state.fee_reward_pool = state.fee_reward_pool.saturating_add(validator_amount);
 
     Ok(())
 }
@@ -494,8 +502,8 @@ mod tests {
         let tx = make_tx(utxo_id, Bytes32::from([0x11u8; 32]));
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block).unwrap();
-        // Supply decreases by the fee (100% burn)
-        assert_eq!(state.total_supply, initial_supply - fee);
+        assert_eq!(state.total_supply, initial_supply - (fee / 2));
+        assert_eq!(state.fee_reward_pool, fee - (fee / 2));
     }
 
     #[test]

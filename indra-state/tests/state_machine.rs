@@ -160,6 +160,7 @@ fn fee_evolves_over_blocks() {
 fn epoch_transition_fires_at_boundary() {
     let mut state = ChainState::new_genesis();
     let supply_before = state.total_supply;
+    let treasury_before = state.treasury_balance;
 
     // Apply exactly one epoch worth of blocks
     for _ in 0..EPOCH_DURATION_BLOCKS {
@@ -169,14 +170,12 @@ fn epoch_transition_fires_at_boundary() {
 
     assert_eq!(state.height, EPOCH_DURATION_BLOCKS);
     assert_eq!(state.current_epoch(), 1);
-    // Supply should have increased (inflation minted)
-    assert!(state.total_supply > supply_before);
-    // Treasury should have received its share
-    assert!(state.treasury_balance > 0);
+    assert_eq!(state.total_supply, supply_before);
+    assert_eq!(state.treasury_balance, treasury_before);
 }
 
 #[test]
-fn two_epochs_inflate_twice() {
+fn two_epochs_preserve_supply() {
     let mut state = ChainState::new_genesis();
 
     // First epoch
@@ -192,7 +191,7 @@ fn two_epochs_inflate_twice() {
         apply_block(&mut state, &block).unwrap();
     }
 
-    assert!(state.total_supply > supply_after_epoch1);
+    assert_eq!(state.total_supply, supply_after_epoch1);
     assert_eq!(state.current_epoch(), 2);
 }
 
@@ -212,8 +211,8 @@ fn fees_are_burned() {
     let block = make_block(&state, vec![tx]);
     apply_block(&mut state, &block).unwrap();
 
-    // Supply must have decreased by exactly the fee
-    assert_eq!(state.total_supply, supply_before - fee);
+    assert_eq!(state.total_supply, supply_before - (fee / 2));
+    assert_eq!(state.fee_reward_pool, fee - (fee / 2));
 }
 
 #[test]

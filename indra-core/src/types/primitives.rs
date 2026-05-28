@@ -56,8 +56,8 @@ pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
-/// Slash fraction for double precommit: 5% (500 basis points out of 10000).
-pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 1_000; // increased from 500 — stronger deterrent
+/// Slash fraction for double precommit: 10% (1000 basis points out of 10000).
+pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 1_000;
 
 /// Slash fraction for surround vote: 100% (10000 / 10000).
 pub const SLASH_SURROUND_VOTE_BPS: u32 = 10_000;
@@ -116,32 +116,74 @@ pub const MAX_GOV_PAYLOAD_BYTES: usize = 4_096;
 /// Genesis supply in INDRA (human-readable unit).
 pub const GENESIS_SUPPLY_INDRA: u64 = 1_000_000_000;
 
-/// Spark per INDRA (1 INDRA = 1,000,000 Spark).
-pub const SPARK_PER_INDRA: u64 = 1_000_000;
+/// Spark per INDRA — 8 decimal places (matches Bitcoin's satoshi model).
+pub const SPARK_PER_INDRA: u64 = 100_000_000;
 
-/// Genesis supply in Spark (base unit).
+/// Genesis supply in Spark. All 1 billion INDRA are pre-minted at genesis.
 pub const GENESIS_SUPPLY_SPARK: u64 = GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA;
 
+/// Hard cap in Spark. Total supply can only decrease via fee burn.
+pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
+
 /// Minimum validator stake in INDRA.
-pub const MIN_STAKE_INDRA: u64 = 10_000;
+pub const MIN_STAKE_INDRA: u64 = 100_000;
 
 /// Minimum validator stake in Spark.
 pub const MIN_STAKE_SPARK: u64 = MIN_STAKE_INDRA * SPARK_PER_INDRA;
 
 /// Minimum UTXO value in Spark. Outputs below this are rejected.
-pub const DUST_LIMIT_SPARK: u64 = 1_000;
+pub const DUST_LIMIT_SPARK: u64 = 100_000;
 
-/// Annual inflation rate in basis points (300 = 3.00%). Immutable.
-pub const INFLATION_RATE_BPS: u32 = 100; // reduced from 300 (3%) — credible monetary policy
+/// Blocks per year assuming a 6 second target block time.
+pub const BLOCKS_PER_YEAR: u64 = 5_256_000;
 
-/// Validator reward pool share in basis points.
-pub const VALIDATOR_POOL_SHARE_BPS: u32 = 6_000;
+/// Blocks per era for Eras 1 and 2 (4 years each).
+pub const ERA_1_2_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 4;
 
-/// Treasury share in basis points.
-pub const TREASURY_SHARE_BPS: u32 = 3_000;
+/// Blocks per era for Era 3+ (8 years each).
+pub const ERA_3_PLUS_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 8;
 
-/// Burn buffer share in basis points.
-pub const BURN_BUFFER_SHARE_BPS: u32 = 1_000;
+/// Era 1 block reward in Spark.
+pub const ERA_1_BLOCK_REWARD_SPARK: u64 = 1_129_700_000;
+
+/// Era 2 block reward in Spark.
+pub const ERA_2_BLOCK_REWARD_SPARK: u64 = ERA_1_BLOCK_REWARD_SPARK / 2;
+
+/// Era 3 block reward in Spark.
+pub const ERA_3_BLOCK_REWARD_SPARK: u64 = ERA_2_BLOCK_REWARD_SPARK / 2;
+
+/// Era 4 block reward in Spark.
+pub const ERA_4_BLOCK_REWARD_SPARK: u64 = ERA_3_BLOCK_REWARD_SPARK / 2;
+
+/// Era 5 block reward in Spark.
+pub const ERA_5_BLOCK_REWARD_SPARK: u64 = ERA_4_BLOCK_REWARD_SPARK / 2;
+
+/// Total validator rewards pool in Spark (95% of genesis supply).
+pub const VALIDATOR_REWARDS_POOL_SPARK: u64 = 950_000_000 * SPARK_PER_INDRA;
+
+/// Operational bootstrap allocation in Spark (5% of genesis supply).
+pub const OPERATIONAL_BOOTSTRAP_SPARK: u64 = 50_000_000 * SPARK_PER_INDRA;
+
+/// Fraction of transaction fees burned (basis points).
+pub const FEE_BURN_BPS: u32 = 5_000;
+
+/// Fraction of transaction fees distributed to validators (basis points).
+pub const FEE_VALIDATOR_BPS: u32 = 5_000;
+
+/// Soft target for the number of active validators.
+pub const TARGET_VALIDATOR_COUNT: u64 = 200;
+
+/// Slash for repeated missed blocks (>10% proposals missed), in basis points.
+pub const SLASH_REPEATED_MISS_BPS: u32 = 1;
+
+/// Slash for 24 consecutive hours offline, in basis points.
+pub const SLASH_OFFLINE_24H_BPS: u32 = 50;
+
+/// Slash for 7 consecutive days offline, in basis points.
+pub const SLASH_OFFLINE_7D_BPS: u32 = 200;
+
+/// Slash for intentional double-signing, in basis points.
+pub const SLASH_DOUBLE_SIGN_BPS: u32 = 1_000;
 
 /// Initial base fee in Spark per KB.
 pub const INITIAL_BASE_FEE_SPARK_PER_KB: u64 = 100;
@@ -414,14 +456,23 @@ mod tests {
 
     #[test]
     fn economics_constants_consistent() {
+        assert_eq!(HARD_CAP_SPARK, GENESIS_SUPPLY_SPARK);
         assert_eq!(GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA);
-        assert_eq!(MIN_STAKE_SPARK, MIN_STAKE_INDRA * SPARK_PER_INDRA);
-        // Allocation shares must sum to 10000 bps
         assert_eq!(
-            VALIDATOR_POOL_SHARE_BPS + TREASURY_SHARE_BPS + BURN_BUFFER_SHARE_BPS,
-            10_000
+            VALIDATOR_REWARDS_POOL_SPARK + OPERATIONAL_BOOTSTRAP_SPARK,
+            GENESIS_SUPPLY_SPARK
         );
-        // AUTH_WINDOW >= UNBONDING_PERIOD (must cover exit + buffer)
+        assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
+        let era_1_total = ERA_1_2_DURATION_BLOCKS * ERA_1_BLOCK_REWARD_SPARK;
+        let era_1_indra = era_1_total / SPARK_PER_INDRA;
+        assert!(
+            (237_000_000..=238_000_000).contains(&era_1_indra),
+            "Era 1 total INDRA out of range: {}",
+            era_1_indra
+        );
+        assert_eq!(SPARK_PER_INDRA, 100_000_000);
+        assert_eq!(MIN_STAKE_INDRA, 100_000);
+        assert_eq!(MIN_STAKE_SPARK, MIN_STAKE_INDRA * SPARK_PER_INDRA);
         assert!(AUTH_WINDOW_EPOCHS >= UNBONDING_PERIOD_EPOCHS);
     }
 }

@@ -42,6 +42,9 @@ pub struct ChainState {
     /// Burn buffer balance in Spark (pending governance-directed burns).
     pub burn_buffer: u64,
 
+    /// Accumulated validator fee rewards awaiting epoch distribution.
+    pub fee_reward_pool: u64,
+
     /// All unspent transaction outputs.
     pub utxos: UtxoSet,
 
@@ -67,6 +70,7 @@ impl ChainState {
             total_supply:     GENESIS_SUPPLY_SPARK,
             treasury_balance: 0,
             burn_buffer:      0,
+            fee_reward_pool:  0,
             utxos:            UtxoSet::new(),
             nullifiers:       NullifierSet::new(),
             validators:       ValidatorSet::new(),
@@ -100,6 +104,7 @@ mod tests {
         assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
         assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
         assert_eq!(state.treasury_balance, 0);
+        assert_eq!(state.fee_reward_pool, 0);
         assert!(state.utxos.is_empty());
         assert!(state.nullifiers.is_empty());
         assert!(state.validators.is_empty());
