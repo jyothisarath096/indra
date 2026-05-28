@@ -15,14 +15,23 @@ One billion INDRA. No new coins ever. Governed by consensus, not administrators.
 ## Key properties
 
 Hard cap:         1,000,000,000 INDRA (immutable)
+
 Decimals:         8 (1 INDRA = 100,000,000 Spark)
+
 Block time:       6 seconds
+
 Finality:         Instant (BFT — no forks possible)
+
 Signatures:       Ed25519 + Dilithium2 (NIST FIPS 204)
+
 Transactions:     Confidential (Pedersen commitments + Bulletproofs)
+
 Block reward:     ~11.29 INDRA/block (Era 1, Year 1-4)
+
 Fee split:        50% burned / 50% to validators
+
 Consensus:        Proof of Stake (Tendermint-style BFT)
+
 Language:         Rust
 
 
@@ -32,16 +41,27 @@ Language:         Rust
 
 indra/
 ├── indra-core/          # Types, codec, primitives, protocol constants
+
 ├── indra-crypto/        # Ed25519, Dilithium2, BLS, VRF, Pedersen
+
 ├── indra-bulletproofs/  # Range proof implementation (dalek 4.x)
+
 ├── indra-state/         # State transitions, UTXO set, epoch logic
+
 ├── indra-consensus/     # BFT consensus, mempool, proposer election
+
 ├── indra-network/       # P2P networking, gossip protocol
+
 ├── indra-storage/       # Block store, WAL, state snapshots
+
 ├── indra-node/          # Node binary, engine, RPC handler
+
 ├── indra-rpc/           # JSON-RPC server
+
 ├── indra-cli/           # CLI tools (keygen, send, wallet-scan)
+
 ├── indra-ffi/           # C FFI bridge for iOS/Android wallets
+
 └── indra-bench/         # Benchmarks
 
 
