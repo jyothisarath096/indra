@@ -127,12 +127,6 @@ pub const GENESIS_SUPPLY_SPARK: u64 = GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA;
 /// Hard cap in Spark. Total supply can only decrease via fee burn.
 pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
 
-/// Minimum validator stake in INDRA.
-pub const MIN_STAKE_INDRA: u64 = 100_000;
-
-/// Minimum validator stake in Spark.
-pub const MIN_STAKE_SPARK: u64 = MIN_STAKE_INDRA * SPARK_PER_INDRA;
-
 /// Minimum UTXO value in Spark. Outputs below this are rejected.
 pub const DUST_LIMIT_SPARK: u64 = 100_000;
 
@@ -176,11 +170,64 @@ pub const TARGET_VALIDATOR_COUNT: u64 = 200;
 /// Saturation is disabled until the active validator set reaches this size.
 pub const SATURATION_MIN_VALIDATORS: u64 = 20;
 
+/// Minimum active validator set size (bootstrap phase).
+pub const MIN_ACTIVE_VALIDATORS: usize = 4;
+
+/// Maximum active validator set size (mature network).
+pub const MAX_ACTIVE_VALIDATORS: usize = 200;
+
 /// Target active validator set size for QC size management.
 pub const TARGET_VALIDATOR_SET_SIZE: u64 = 150;
 
+/// Phase 1 total-stake threshold for validator set expansion.
+pub const VALIDATOR_SET_PHASE1_STAKE: u64 = 10_000_000 * SPARK_PER_INDRA;
+
+/// Phase 2 total-stake threshold for validator set expansion.
+pub const VALIDATOR_SET_PHASE2_STAKE: u64 = 100_000_000 * SPARK_PER_INDRA;
+
+/// Phase 3 total-stake threshold for validator set expansion.
+pub const VALIDATOR_SET_PHASE3_STAKE: u64 = 500_000_000 * SPARK_PER_INDRA;
+
+/// Maximum active validators during Phase 1.
+pub const VALIDATOR_SET_PHASE1_MAX: usize = 50;
+
+/// Maximum active validators during Phase 2.
+pub const VALIDATOR_SET_PHASE2_MAX: usize = 100;
+
+/// Maximum active validators during Phase 3.
+pub const VALIDATOR_SET_PHASE3_MAX: usize = 150;
+
+/// Maximum active validators during Phase 4.
+pub const VALIDATOR_SET_PHASE4_MAX: usize = 200;
+
 /// Maximum validators that may appear in a single QC.
-pub const MAX_QC_SIGNERS: usize = 200;
+pub const MAX_QC_SIGNERS: usize = MAX_ACTIVE_VALIDATORS;
+
+/// Compute the maximum active validator set size from total staked supply.
+pub fn max_active_validators(total_staked_spark: u64) -> usize {
+    if total_staked_spark < VALIDATOR_SET_PHASE1_STAKE {
+        VALIDATOR_SET_PHASE1_MAX
+    } else if total_staked_spark < VALIDATOR_SET_PHASE2_STAKE {
+        VALIDATOR_SET_PHASE2_MAX
+    } else if total_staked_spark < VALIDATOR_SET_PHASE3_STAKE {
+        VALIDATOR_SET_PHASE3_MAX
+    } else {
+        VALIDATOR_SET_PHASE4_MAX
+    }
+}
+
+/// Compute the current validator-set growth phase from total staked supply.
+pub fn validator_set_phase(total_staked_spark: u64) -> u8 {
+    if total_staked_spark < VALIDATOR_SET_PHASE1_STAKE {
+        1
+    } else if total_staked_spark < VALIDATOR_SET_PHASE2_STAKE {
+        2
+    } else if total_staked_spark < VALIDATOR_SET_PHASE3_STAKE {
+        3
+    } else {
+        4
+    }
+}
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
 
@@ -512,8 +559,44 @@ mod tests {
             era_1_indra
         );
         assert_eq!(SPARK_PER_INDRA, 100_000_000);
-        assert_eq!(MIN_STAKE_INDRA, 100_000);
-        assert_eq!(MIN_STAKE_SPARK, MIN_STAKE_INDRA * SPARK_PER_INDRA);
+        assert!(VALIDATOR_SET_PHASE1_STAKE < VALIDATOR_SET_PHASE2_STAKE);
+        assert!(VALIDATOR_SET_PHASE2_STAKE < VALIDATOR_SET_PHASE3_STAKE);
+        assert!(VALIDATOR_SET_PHASE1_MAX < VALIDATOR_SET_PHASE2_MAX);
+        assert!(VALIDATOR_SET_PHASE2_MAX < VALIDATOR_SET_PHASE3_MAX);
+        assert!(VALIDATOR_SET_PHASE3_MAX < VALIDATOR_SET_PHASE4_MAX);
+        assert!(VALIDATOR_SET_PHASE4_MAX <= MAX_QC_SIGNERS);
         assert!(AUTH_WINDOW_EPOCHS >= UNBONDING_PERIOD_EPOCHS);
+    }
+
+    #[test]
+    fn validator_set_sizing_consistent() {
+        assert_eq!(max_active_validators(0), VALIDATOR_SET_PHASE1_MAX);
+        assert_eq!(
+            max_active_validators(VALIDATOR_SET_PHASE1_STAKE - 1),
+            VALIDATOR_SET_PHASE1_MAX
+        );
+        assert_eq!(
+            max_active_validators(VALIDATOR_SET_PHASE1_STAKE),
+            VALIDATOR_SET_PHASE2_MAX
+        );
+        assert_eq!(
+            max_active_validators(VALIDATOR_SET_PHASE2_STAKE - 1),
+            VALIDATOR_SET_PHASE2_MAX
+        );
+        assert_eq!(
+            max_active_validators(VALIDATOR_SET_PHASE2_STAKE),
+            VALIDATOR_SET_PHASE3_MAX
+        );
+        assert_eq!(
+            max_active_validators(VALIDATOR_SET_PHASE3_STAKE - 1),
+            VALIDATOR_SET_PHASE3_MAX
+        );
+        assert_eq!(
+            max_active_validators(VALIDATOR_SET_PHASE3_STAKE),
+            VALIDATOR_SET_PHASE4_MAX
+        );
+        assert_eq!(max_active_validators(u64::MAX), VALIDATOR_SET_PHASE4_MAX);
+        assert!(MAX_QC_SIGNERS >= VALIDATOR_SET_PHASE4_MAX);
+        assert!(MIN_ACTIVE_VALIDATORS <= VALIDATOR_SET_PHASE1_MAX);
     }
 }

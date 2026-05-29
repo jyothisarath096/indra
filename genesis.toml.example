@@ -35,7 +35,13 @@ hybrid_pq_pk        = "aabbcc..."   # variable length (Dilithium2 public key)
 # Retained for reference/backward compatibility with older genesis tooling.
 bls_pk              = "aabbcc..."   # 96 hex chars (legacy BLS12-381 public key)
 vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
-stake               = 100000000000 # 100,000 INDRA in Spark
+# Genesis validator stake in Spark (1 INDRA = 100,000,000 Spark)
+# Genesis validators are exempt from minimum stake requirements.
+# stake = 100000000000 -> 1,000 INDRA per genesis validator
+# All genesis validators enter the active set regardless of stake.
+# New validators joining after genesis compete for active set slots
+# by stake ranking — no hard minimum, market-driven admission.
+stake               = 100000000000
 
 [[validators]]
 name                = "bob"

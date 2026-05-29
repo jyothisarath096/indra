@@ -65,6 +65,18 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let s = &state.engine.state;
     let tip = hex::encode(s.tip_hash.0);
     let active_validators = s.validators.active_count();
+    let total_staked_spark = s
+        .validators
+        .total_selectable_self_stake()
+        .saturating_add(s.delegations.total_staked());
+    let max_active_validators =
+        indra_core::types::primitives::max_active_validators(total_staked_spark);
+    let effective_min_stake_spark = s
+        .validators
+        .effective_min_active_stake(&s.delegations)
+        .unwrap_or(0);
+    let validator_set_phase =
+        indra_core::types::primitives::validator_set_phase(total_staked_spark);
     let mempool_size = state.engine.mempool.len();
     let epoch = s.current_epoch();
     let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
@@ -74,7 +86,7 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let blocks_retained = state.engine.block_store.len();
 
     Ok(format!(
-        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"mempool_size":{mempool},"epoch":{epoch},"pruned_mode":{pruned_mode},"lowest_block":{lowest_block},"blocks_retained":{blocks_retained},"block_reward_spark":{block_reward_spark},"era":{era}}}"#,
+        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"max_active_validators":{max_active_validators},"total_staked_spark":{total_staked_spark},"effective_min_stake_spark":{effective_min_stake_spark},"validator_set_phase":{validator_set_phase},"mempool_size":{mempool},"epoch":{epoch},"pruned_mode":{pruned_mode},"lowest_block":{lowest_block},"blocks_retained":{blocks_retained},"block_reward_spark":{block_reward_spark},"era":{era}}}"#,
         height        = s.height,
         tip           = tip,
         base_fee      = s.base_fee,
@@ -83,6 +95,10 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
         burn          = s.burn_buffer,
         fee_reward_pool = s.fee_reward_pool,
         validators    = active_validators,
+        max_active_validators = max_active_validators,
+        total_staked_spark = total_staked_spark,
+        effective_min_stake_spark = effective_min_stake_spark,
+        validator_set_phase = validator_set_phase,
         mempool       = mempool_size,
         epoch         = epoch,
         pruned_mode   = if pruned_mode { "true" } else { "false" },
@@ -173,7 +189,13 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
         .get(&id)
         .ok_or_else(|| RpcError::NotFound(format!("validator {id_hex} not found")))?;
 
-    let status = if validator.is_active() { "active" } else { "inactive" };
+    let status = match validator.status {
+        indra_state::ValidatorStatus::Registered => "registered",
+        indra_state::ValidatorStatus::Active => "active",
+        indra_state::ValidatorStatus::Unbonding { .. } => "unbonding",
+        indra_state::ValidatorStatus::Slashed => "slashed",
+        indra_state::ValidatorStatus::Exited => "exited",
+    };
 
     Ok(format!(
         r#"{{"validator_id":"{id}","stake":{stake},"status":"{status}","epoch_joined":{epoch}}}"#,

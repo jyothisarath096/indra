@@ -91,10 +91,10 @@ impl GenesisConfig {
     /// Checks:
     /// - At least 4 validators (minimum for BFT safety: 3f+1 where f=1)
     /// - All validator IDs are unique
-    /// - All stakes are above MIN_STAKE_SPARK
+    /// - All stakes are above the protocol dust floor
     /// - Total stake matches expectations
     pub fn validate(&self) -> CliResult<()> {
-        use indra_core::types::primitives::MIN_STAKE_SPARK;
+        use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
         if self.validators.len() < 4 {
             return Err(CliError::Genesis(
@@ -110,9 +110,14 @@ impl GenesisConfig {
                     format!("duplicate validator_id: {}", v.validator_id)
                 ));
             }
-            if v.stake < MIN_STAKE_SPARK {
+            if v.stake < DUST_LIMIT_SPARK {
                 return Err(CliError::Genesis(
-                    format!("validator {} stake {} is below minimum {}", v.name, v.stake, MIN_STAKE_SPARK)
+                    format!(
+                        "validator {} stake {} is below dust limit {}",
+                        v.name,
+                        v.stake,
+                        DUST_LIMIT_SPARK
+                    )
                 ));
             }
         }
@@ -159,13 +164,13 @@ pub fn entry_from_keys(
 mod tests {
     use super::*;
     use crate::keygen::generate_keypairs;
-    use indra_core::types::primitives::MIN_STAKE_SPARK;
+    use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
     fn test_validators(count: usize) -> Vec<GenesisEntry> {
         (0..count).map(|i| {
             let seed = [i as u8 + 1; 32];
             let keys = generate_keypairs(seed, seed, seed).unwrap();
-            entry_from_keys(&format!("validator-{i}"), &keys, MIN_STAKE_SPARK * 10)
+            entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10)
         }).collect()
     }
 
@@ -191,9 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn below_min_stake_rejected() {
+    fn below_dust_stake_rejected() {
         let mut validators = test_validators(4);
-        validators[0].stake = 1; // below MIN_STAKE_SPARK
+        validators[0].stake = 1; // below DUST_LIMIT_SPARK
         let result = build_genesis_config(
             "test", 0, 1_000_000_000_000_000, validators,
         );

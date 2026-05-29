@@ -63,7 +63,7 @@ fn apply_delegate(
     // Validator must exist and be active
     let validator = state.validators.get(validator_id)
         .ok_or(StateError::ValidatorNotFound)?;
-    if !validator.is_active() {
+    if !matches!(validator.status, ValidatorStatus::Active | ValidatorStatus::Registered) {
         return Err(StateError::ValidatorNotActive);
     }
     if amount_spark < validator.min_delegation_spark {
@@ -150,7 +150,7 @@ fn apply_set_commission(
     let validator = state.validators.get_mut(validator_id)
         .ok_or(StateError::ValidatorNotFound)?;
 
-    if !matches!(validator.status, ValidatorStatus::Active) {
+    if !matches!(validator.status, ValidatorStatus::Active | ValidatorStatus::Registered) {
         return Err(StateError::ValidatorNotActive);
     }
 
@@ -250,6 +250,22 @@ mod tests {
             delegator_pubkey: pubkey,
         };
         assert!(apply_staking_op(&mut state, &op).is_err());
+    }
+
+    #[test]
+    fn delegate_to_registered_validator_succeeds() {
+        let mut state = ChainState::new_genesis();
+        let validator_id = make_active_validator(&mut state, 0x01);
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
+        let pubkey = dummy_pubkey(0x02);
+
+        let op = StakingOp::Delegate {
+            validator_id,
+            amount_spark: 1_000_000,
+            delegator_pubkey: pubkey,
+        };
+        assert!(apply_staking_op(&mut state, &op).is_ok());
+        assert_eq!(state.delegations.total_delegated(&validator_id), 1_000_000);
     }
 
     #[test]

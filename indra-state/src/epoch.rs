@@ -62,6 +62,11 @@ pub fn apply_epoch_transition(
     distribute_fee_rewards(state, current_epoch);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
+    let total_staked = state
+        .validators
+        .total_selectable_self_stake()
+        .saturating_add(state.delegations.total_staked());
+    state.validators.select_active_set(&state.delegations, total_staked);
 
     Ok(())
 }

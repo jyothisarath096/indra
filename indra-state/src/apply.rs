@@ -85,13 +85,7 @@ fn apply_slash(state: &mut ChainState, evidence: &indra_core::types::slashing::S
             .saturating_mul(slash_bps as u64)
             / 10_000;
         validator.stake_spark = validator.stake_spark.saturating_sub(slash_amount);
-
-        // Deactivate if stake drops below minimum
-        use indra_core::types::primitives::MIN_STAKE_SPARK;
-        if validator.stake_spark < MIN_STAKE_SPARK {
-            validator.status = crate::ValidatorStatus::Slashed;
-        }
-
+        validator.status = crate::ValidatorStatus::Slashed;
     }
 }
 

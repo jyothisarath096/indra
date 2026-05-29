@@ -5,11 +5,13 @@
 
 use std::collections::HashMap;
 
-use indra_core::types::primitives::{Bytes32, MAX_VALIDATORS};
+use indra_core::types::primitives::{max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS};
 
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidatorStatus {
+    /// Registered: waiting for entry into the active set.
+    Registered,
     /// Active: eligible to propose and vote.
     Active,
     /// Unbonding: initiated exit, stake locked until unbonding_end_epoch.
@@ -106,6 +108,20 @@ impl ValidatorSet {
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
 
+    /// Total stake of all validators eligible for active-set selection.
+    pub fn total_selectable_self_stake(&self) -> u64 {
+        self.validators.values()
+            .filter(|v| matches!(v.status, ValidatorStatus::Active | ValidatorStatus::Registered))
+            .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
+    }
+
+    /// Stake of the lowest-ranked active validator, if any.
+    pub fn effective_min_active_stake(&self, delegations: &DelegationMap) -> Option<u64> {
+        self.active_validators()
+            .map(|v| v.stake_spark.saturating_add(delegations.total_delegated(&v.validator_id)))
+            .min()
+    }
+
     /// Look up a validator by ID.
     pub fn get(&self, id: &Bytes32) -> Option<&ValidatorEntry> {
         self.validators.get(id)
@@ -157,6 +173,36 @@ impl ValidatorSet {
             }
         }
     }
+
+    /// Reselect the active validator set by stake ranking.
+    pub fn select_active_set(&mut self, delegations: &DelegationMap, total_staked_spark: u64) {
+        let max_active = max_active_validators(total_staked_spark);
+        let mut candidates: Vec<(Bytes32, u64)> = self
+            .validators
+            .values()
+            .filter(|v| matches!(v.status, ValidatorStatus::Active | ValidatorStatus::Registered))
+            .map(|v| {
+                (
+                    v.validator_id,
+                    v.stake_spark.saturating_add(delegations.total_delegated(&v.validator_id)),
+                )
+            })
+            .collect();
+
+        candidates.sort_by(|(id_a, stake_a), (id_b, stake_b)| {
+            stake_b.cmp(stake_a).then_with(|| id_a.0.cmp(&id_b.0))
+        });
+
+        for (index, (id, _)) in candidates.iter().enumerate() {
+            if let Some(validator) = self.validators.get_mut(id) {
+                if index < max_active {
+                    validator.status = ValidatorStatus::Active;
+                } else {
+                    validator.status = ValidatorStatus::Registered;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,7 +222,7 @@ mod tests {
             rewards_last_epoch: epoch,
             self_report_count: 0,
             commission_bps:   1_000,
-            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            min_delegation_spark: DUST_LIMIT_SPARK,
         }
     }
 
@@ -239,6 +285,34 @@ mod tests {
         let id = Bytes32::from([0x01u8; 32]);
         assert_eq!(vs.get(&id).unwrap().pending_rewards, 500);
     }
+
+    #[test]
+    fn select_active_set_promotes_top_ranked_validators() {
+        let mut vs = ValidatorSet::new();
+        let mut waiting = make_validator(0x01, 500, 0);
+        waiting.status = ValidatorStatus::Registered;
+        vs.upsert(waiting).unwrap();
+        vs.upsert(make_validator(0x02, 300, 0)).unwrap();
+        vs.upsert(make_validator(0x03, 100, 0)).unwrap();
+
+        let delegations = DelegationMap::new();
+        vs.select_active_set(&delegations, 0);
+
+        assert!(matches!(vs.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Active));
+        assert!(matches!(vs.get(&Bytes32::from([0x02; 32])).unwrap().status, ValidatorStatus::Active));
+        assert!(matches!(vs.get(&Bytes32::from([0x03; 32])).unwrap().status, ValidatorStatus::Active));
+    }
+
+    #[test]
+    fn effective_min_active_stake_tracks_lowest_active_validator() {
+        let mut vs = ValidatorSet::new();
+        vs.upsert(make_validator(0x01, 5_000, 0)).unwrap();
+        vs.upsert(make_validator(0x02, 2_000, 0)).unwrap();
+        vs.upsert(make_validator(0x03, 8_000, 0)).unwrap();
+
+        let delegations = DelegationMap::new();
+        assert_eq!(vs.effective_min_active_stake(&delegations), Some(2_000));
+    }
 }
 
 /// A single delegator's position with a validator.
@@ -292,6 +366,15 @@ impl DelegationMap {
                 .filter(|d| d.unbonding_end_epoch.is_none())
                 .fold(0u64, |acc, d| acc.saturating_add(d.staked_spark)))
             .unwrap_or(0)
+    }
+
+    /// Total active delegated stake across all validators.
+    pub fn total_staked(&self) -> u64 {
+        self.delegators
+            .values()
+            .flat_map(|entries| entries.iter())
+            .filter(|entry| entry.unbonding_end_epoch.is_none())
+            .fold(0u64, |acc, entry| acc.saturating_add(entry.staked_spark))
     }
 
     /// Get all delegators for a validator.
@@ -349,7 +432,6 @@ impl DelegationMap {
         amount_spark: u64,
         unbonding_end_epoch: u64,
     ) -> Result<(), &'static str> {
-        use indra_core::types::primitives::MIN_STAKE_SPARK;
         let entries = self.delegators
             .get_mut(validator_id)
             .ok_or("validator has no delegators")?;
@@ -364,7 +446,7 @@ impl DelegationMap {
         }
         entry.staked_spark = entry.staked_spark.saturating_sub(amount_spark);
         // If remaining stake is below dust, undelegate everything
-        if entry.staked_spark < MIN_STAKE_SPARK {
+        if entry.staked_spark < DUST_LIMIT_SPARK {
             entry.staked_spark = 0;
         }
         entry.unbonding_end_epoch = Some(unbonding_end_epoch);

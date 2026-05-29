@@ -621,6 +621,16 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
             }
             "indra_getChainInfo" => {
                 let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
+                let total_staked_spark = s
+                    .validators
+                    .total_selectable_self_stake()
+                    .saturating_add(s.delegations.total_staked());
+                let max_active_validators =
+                    indra_core::types::primitives::max_active_validators(total_staked_spark);
+                let effective_min_stake_spark =
+                    s.validators.effective_min_active_stake(&s.delegations).unwrap_or(0);
+                let validator_set_phase =
+                    indra_core::types::primitives::validator_set_phase(total_staked_spark);
                 let era = if s.height < indra_core::types::primitives::ERA_1_2_DURATION_BLOCKS {
                     1
                 } else if s.height < indra_core::types::primitives::ERA_1_2_DURATION_BLOCKS * 2 {
@@ -630,7 +640,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                         / indra_core::types::primitives::ERA_3_PLUS_DURATION_BLOCKS)
                 };
                 format!(
-                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{}}}"#,
+                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"max_active_validators":{},"total_staked_spark":{},"effective_min_stake_spark":{},"validator_set_phase":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{}}}"#,
                     s.height,
                     hex::encode(s.tip_hash.0),
                     s.base_fee,
@@ -639,6 +649,10 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     s.burn_buffer,
                     s.fee_reward_pool,
                     s.validators.active_count(),
+                    max_active_validators,
+                    total_staked_spark,
+                    effective_min_stake_spark,
+                    validator_set_phase,
                     mempool_size,
                     s.current_epoch(),
                     if guard.engine.block_store.is_archive() { "false" } else { "true" },

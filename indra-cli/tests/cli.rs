@@ -5,7 +5,7 @@ use indra_cli::{
     genesis_cmd::{build_genesis_config, entry_from_keys},
     query::rpc_call,
 };
-use indra_core::types::primitives::MIN_STAKE_SPARK;
+use indra_core::types::primitives::DUST_LIMIT_SPARK;
 use indra_node::{NodeConfig, NodeEngine};
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ fn keys_json_is_valid_structure() {
 
 #[test]
 fn genesis_with_4_validators() {
-    let stake = MIN_STAKE_SPARK * 100;
+    let stake = DUST_LIMIT_SPARK * 100;
     let validators: Vec<_> = (0..4u8).map(|i| {
         let seed = [i + 1; 32];
         let keys = generate_keypairs(seed, seed, seed).unwrap();
@@ -85,7 +85,7 @@ fn genesis_with_4_validators() {
 
 #[test]
 fn genesis_rejects_3_validators() {
-    let stake = MIN_STAKE_SPARK * 100;
+    let stake = DUST_LIMIT_SPARK * 100;
     let validators: Vec<_> = (0..3u8).map(|i| {
         let seed = [i + 1; 32];
         let keys = generate_keypairs(seed, seed, seed).unwrap();
@@ -124,7 +124,7 @@ fn full_testnet_setup_pipeline() {
     let dave  = generate_from_passphrase("dave-testnet-seed-v1").unwrap();
 
     // Step 2: Coordinator builds genesis
-    let stake = MIN_STAKE_SPARK * 100;
+    let stake = DUST_LIMIT_SPARK * 100;
     let validators = vec![
         entry_from_keys("alice", &alice, stake),
         entry_from_keys("bob",   &bob,   stake),
