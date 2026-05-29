@@ -1,7 +1,7 @@
 # INDRA Protocol
 ## A Post-Quantum Monetary Settlement Network
 
-**Version 1.7 — Pre-release draft**
+**Version 1.8 — Pre-release draft**
 **Bonkai and team**
 
 ---
@@ -417,6 +417,18 @@ No treasury share. No governance share. As transaction volume
 grows, fee revenue supplements block rewards and net supply
 decreases.
 
+**Monetary dynamics:** In the early phase, circulating supply
+grows as the locked reserve releases block rewards. Total supply
+is hard-capped and can only decrease via fee burn. In a mature
+high-transaction phase, fee burn may exceed new circulation,
+making circulating supply net-deflationary. INDRA is positioned
+as a store of value, not a medium of exchange — deflationary
+pressure is an intentional design choice consistent with this
+positioning, not a flaw. Validators earn from both block rewards
+(fixed in INDRA terms) and fee revenue (grows with adoption).
+This two-component reward structure reduces reliance on either
+component alone.
+
 ### 3.5 Anti-concentration
 
 **Saturation is disabled below 20 active validators.**
@@ -486,24 +498,51 @@ handled at the application layer, as with Bitcoin and Ethereum.
 
 ### 5.1 Open participation
 
-Any entity that stakes sufficient INDRA can operate a validator
-node. No permission, no identity verification, no KYC.
+Any entity can register as a validator. There is no permission
+process, no identity verification, no KYC, and no hard minimum
+stake requirement. Admission to the active consensus set is
+determined purely by stake ranking — the top N validators by
+total backing (own stake plus delegations) are active at any
+given epoch.
+
+**No hard minimum stake.** The only floor is the dust limit
+(0.001 INDRA) to prevent spam registrations. The effective
+minimum to enter the active set is the stake of the lowest
+currently active validator — a market-determined number that
+adjusts automatically as the network grows.
+
+**Active set size grows with the network.** As more INDRA is
+staked, more validator slots open. This ties decentralisation
+directly to economic security: more stake = more security =
+safely support more validators.
 
 ```
-Minimum validator stake:    100,000 INDRA
-Adjustable range:           50,000 to 500,000 INDRA
-Adjustment mechanism:       IIP process (not governance vote)
-Adjustment timelock:        90 days minimum
+Total staked    Max active validators
+< 1M INDRA      20 validators
+< 10M INDRA     50 validators
+< 50M INDRA     100 validators
+< 200M INDRA    200 validators
+< 500M INDRA    350 validators
+≥ 500M INDRA    500 validators
 ```
 
-The minimum stake is an alignment mechanism, not a barrier.
-Validators with skin in the game have financial incentive to
-behave correctly.
+**How to join as a validator:**
+1. Register by staking any amount above the dust limit
+2. Attract delegation from INDRA holders to boost total backing
+3. At the next epoch boundary (~30 minutes): if your total
+   backing ranks in the top N, you enter the active set
+4. No application, no approval, no waiting list beyond stake ranking
 
-**Note on stake value:** The minimum stake is denominated in INDRA,
-not fiat. Its real-world cost depends entirely on what INDRA is
-worth at any given time, which is unknown at pre-mainnet. Early
-validators operate with no reference price.
+**Displacement:** If another validator accumulates more total
+backing than you, they may displace you from the active set at
+the next epoch reselection. You remain registered (waiting) —
+your stake is not returned or slashed. You can re-enter by
+gaining more delegation. This is stake competition, not
+punishment.
+
+**Genesis validators** are pre-registered in the genesis block
+and form the initial active set regardless of stake amount.
+They are the founding operators who bootstrap the chain.
 
 ### 5.2 Validator lifecycle
 
@@ -601,10 +640,11 @@ before mainnet stake reaches significant value.
 **Delegator slashing:** Delegators share in slashing proportional
 to their delegation. Choose validators with no equivocation history.
 
-### 5.6 Saturation and anti-concentration
+### 5.6 Anti-concentration
 
-Saturation disabled below 20 validators (bootstrap phase).
-Above 20:
+**Saturation mechanism (soft nudge, not enforcement):**
+Above 20 active validators, rewards are subject to a saturation
+curve:
 
 ```
 saturation_point = total_active_stake / active_validator_count
@@ -612,22 +652,48 @@ Below saturation: 100% reward efficiency
 Above saturation: efficiency = saturation_point / validator_stake
 ```
 
-Does not prevent hidden Sybil splitting. Reduces visible
-concentration. Complemented by wallet transparency tooling.
+This makes visible stake concentration economically inefficient.
+It does not prevent Sybil splitting — a sophisticated actor can
+operate multiple validators under different identities and bypass
+the curve. This is acknowledged. No on-chain mechanism can solve
+Sybil without becoming identity-governed, which INDRA rejects.
+The saturation curve deters lazy concentration; transparency
+tooling in the wallet complements it for sophisticated actors.
 
-Maximum QC size: MAX_QC_SIGNERS = 200 validators.
+**Dynamic active set as the primary anti-concentration mechanism:**
+The more meaningful protection is the stake-ranked active set
+itself. As the network grows, more validator slots open (up to
+500 at full maturity). Delegation allows community participants
+to collectively boost smaller validators into the active set,
+providing an organic check on concentration that no fixed
+mechanism can replicate.
+
+**QC size limits:**
+Maximum QC signers: 500 validators
+Maximum QC size: ~1.2 MB (500 × ~2,420 bytes)
+Within the 2 MB protocol limit.
+Verification time at 500 validators: ~50ms (0.8% of block time).
 
 ### 5.7 Delegation — earning yield from any device
 
 ```
-Minimum delegation:     Dust limit (0.001 INDRA minimum)
-                        Each validator sets their own floor above this
+Minimum delegation:     Dust limit (0.001 INDRA protocol floor)
+                        Each validator sets their own minimum above this
+                        Default: no minimum (accept any amount)
 Maximum delegation:     No limit
 Unbonding period:       30 hours
 Commission range:       0-20% (set by each validator)
 Reward frequency:       Each epoch (~30 minutes)
 Key custody:            Delegator retains full custody always
 ```
+
+**Delegation boosts validators into the active set.**
+A small validator with many delegators can have higher total
+backing than a large self-staking operator. The community can
+collectively vote validators in and out of the active set
+simply by choosing where to delegate. This is the most
+powerful decentralisation mechanism in the protocol — no
+governance vote, no permission, just economic signal.
 
 **Delegation is non-custodial.** The validator cannot spend,
 redirect, or access delegated funds. Delegation is a cryptographic
@@ -756,10 +822,24 @@ Early validators take the highest risk and earn the highest
 rewards. The schedule is public from genesis — anyone can
 join from block 0.
 
-**No economic security analysis.** The minimum stake requirement
-and economic security budget have not been formally modelled.
-Attack cost vs. reward analysis will be included in the security
-audit before mainnet.
+**Economic security model (structural):**
+An attack on INDRA requires controlling more than one-third of
+total staked supply. At any given token price P:
+
+```
+Attack cost = 34% × total_staked_INDRA × P
+Attacker's stake slashed: 10% of their stake if detected
+
+Example (illustrative, no price assumed):
+  10M INDRA staked → attack requires 3.4M INDRA
+  100M INDRA staked → attack requires 34M INDRA
+  500M INDRA staked → attack requires 170M INDRA
+```
+
+The cost of attack scales directly with total staked supply and
+token price. A formal economic security analysis with attack
+cost vs. maximum extractable value will be published with the
+security audit before mainnet.
 
 **No smart contracts.** INDRA is a settlement layer. This
 is a deliberate design choice, not a roadmap item.
@@ -884,7 +964,12 @@ Blocks per year:            5,256,000
 Epoch duration:             300 blocks (~30 minutes)
 Consensus quorum:           66.67% of total stake
 BFT safety threshold:       <33.33% Byzantine stake
-Min validator stake:        100,000 INDRA
+Min validator stake:        None (dust limit only: 0.001 INDRA)
+                            Active set admission by stake ranking
+Effective min stake:        Lowest active validator's total backing
+                            (market-determined, updates each epoch)
+Max active validators:      20 → 50 → 100 → 200 → 350 → 500
+                            (grows with total staked supply)
 Min delegation:             Dust limit (validator sets own floor)
 Unbonding period:           30 hours
 Default prune window:       50,000 blocks (~300 MB)
@@ -897,6 +982,7 @@ Fee to validators:          50% of all fees
 Slash — double sign:        10% of stake
 Slash — offline:            No penalty (lost rewards only)
 Saturation threshold:       Active when validators > 20
+                            saturation_point = total_stake / active_count
 ```
 
 ### C. QC verification benchmark
@@ -950,7 +1036,7 @@ mainnet. Audit report will be published in full.
 
 ---
 
-*INDRA Protocol — Pre-release working draft v1.7*
+*INDRA Protocol — Pre-release working draft v1.8*
 *This is a technical specification, not a financial instrument prospectus.*
 *Protocol parameters may change before mainnet.*
 *This document does not constitute investment advice.*
