@@ -56,11 +56,16 @@ pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
-/// Slash fraction for double precommit: 10% (1000 basis points out of 10000).
+/// Slash fraction for double precommit (alias for SLASH_DOUBLE_SIGN_BPS).
+/// Both are equivocation offences — same penalty: 10% of stake.
 pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 1_000;
 
-/// Slash fraction for surround vote: 100% (10000 / 10000).
-pub const SLASH_SURROUND_VOTE_BPS: u32 = 10_000;
+/// Slash fraction for surround vote: same as double-sign (10%).
+/// Surround voting is a form of equivocation — intentional malicious act.
+/// Note: 100% slash (10_000 bps) was removed as disproportionate.
+/// A validator who double-signs loses 10% stake and is ejected from
+/// the active set — sufficient deterrence without total destruction.
+pub const SLASH_SURROUND_VOTE_BPS: u32 = 1_000;
 
 /// Grace period (epochs) for a self-reported software-bug slash.
 pub const SLASH_GRACE_PERIOD_EPOCHS: u64 = 5;
@@ -174,16 +179,33 @@ pub const TARGET_VALIDATOR_SET_SIZE: u64 = 150;
 /// Maximum validators that may appear in a single QC.
 pub const MAX_QC_SIGNERS: usize = 200;
 
-/// Slash for repeated missed blocks (>10% proposals missed), in basis points.
-pub const SLASH_REPEATED_MISS_BPS: u32 = 1;
-
-/// Slash for 24 consecutive hours offline, in basis points.
-pub const SLASH_OFFLINE_24H_BPS: u32 = 50;
-
-/// Slash for 7 consecutive days offline, in basis points.
-pub const SLASH_OFFLINE_7D_BPS: u32 = 200;
-
-/// Slash for intentional double-signing, in basis points.
+/// Slash for intentional double-signing (equivocation), in basis points.
+/// 1000 bps = 10% of stake burned.
+///
+/// ## Slashing philosophy (v7.1)
+///
+/// INDRA does NOT slash validators for being offline.
+/// Offline validators simply earn no rewards — the economic
+/// incentive to stay online is sufficient without punitive slashing.
+///
+/// This follows Bitcoin's model: miners who stop mining earn nothing,
+/// but are not penalised for stopping. Validators who go offline earn
+/// nothing, but their stake is not burned.
+///
+/// The ONLY slashable offence is intentional equivocation:
+/// signing two different blocks at the same height (double-sign).
+/// This is an unambiguous malicious act that threatens consensus safety.
+/// All other failures (missed blocks, downtime, crashes) result only
+/// in lost rewards for the affected epochs.
+///
+/// Rationale:
+/// - A validator who can only run 4 hours/day should be welcome.
+///   They earn proportionally. They are not punished.
+/// - Infrastructure failures (crashes, ISP outages) should not
+///   destroy a validator's stake. This would centralise validation
+///   toward only large professional operators with redundant infra.
+/// - Liveness is maintained by the economic incentive to earn rewards,
+///   not by the threat of stake destruction.
 pub const SLASH_DOUBLE_SIGN_BPS: u32 = 1_000;
 
 /// Initial base fee in Spark per KB.

@@ -27,6 +27,7 @@ extern "C" {
 #define INDRA_VALIDATOR_ID_BYTES  32
 #define INDRA_BYTES32_LEN         32
 #define INDRA_TX_ID_BYTES         32
+#define INDRA_MNEMONIC_MAX_BYTES 300
 
 typedef struct {
     uint8_t validator_id[INDRA_VALIDATOR_ID_BYTES];
@@ -71,6 +72,18 @@ int32_t indra_keygen(
     const uint8_t* seed,
     IndraKeyPair* out
 );
+
+int32_t indra_generate_mnemonic(
+    char* out_phrase,
+    size_t out_len
+);
+
+int32_t indra_keygen_from_mnemonic(
+    const char* phrase,
+    IndraKeyPair* out
+);
+
+int32_t indra_validate_mnemonic(const char* phrase);
 
 int32_t indra_validator_id(
     const uint8_t* classical_pk,

@@ -35,3 +35,14 @@ xcodebuild -create-xcframework \
     -output IndraFFI.xcframework
 
 echo "Done: IndraFFI.xcframework"
+
+# Write module maps so Swift can import the framework
+MODULEMAP='framework module IndraFFI {
+    umbrella header "indra.h"
+    export *
+    module * { export * }
+}'
+
+echo "$MODULEMAP" > IndraFFI.xcframework/ios-arm64/Headers/module.modulemap
+echo "$MODULEMAP" > IndraFFI.xcframework/ios-arm64_x86_64-simulator/Headers/module.modulemap
+echo "Module maps written"
