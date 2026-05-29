@@ -10,9 +10,17 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fs2::available_space;
+use indra_core::types::primitives::{
+    DEFAULT_PRUNE_KEEP_BLOCKS,
+    DISK_CRITICAL_THRESHOLD_BYTES,
+    DISK_WARN_THRESHOLD_BYTES,
+    MIN_PRUNE_KEEP_BLOCKS,
+};
 use indra_network::{
     message::Message,
     peer::ScoreEvent,
@@ -31,6 +39,17 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("INDRA node");
+        println!("  --keys <path>");
+        println!("  --data-dir <path>");
+        println!("  --p2p-addr <host:port>");
+        println!("  --bootstrap-peers <addr,addr,...>");
+        println!("  --genesis <path>");
+        println!("  --archive");
+        println!("  --prune-keep <blocks>  (minimum {})", MIN_PRUNE_KEEP_BLOCKS);
+        return;
+    }
     let get_arg = |flag: &str| -> Option<String> {
         args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
     };
@@ -39,6 +58,11 @@ fn main() {
     let data_dir   = get_arg("--data-dir").unwrap_or_else(|| "./indra-data".to_string());
     let p2p_addr   = get_arg("--p2p-addr").unwrap_or_else(|| "0.0.0.0:30303".to_string());
     let bootstrap  = get_arg("--bootstrap-peers").unwrap_or_default();
+    let archive    = args.iter().any(|arg| arg == "--archive");
+    let prune_keep = get_arg("--prune-keep")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS)
+        .max(MIN_PRUNE_KEEP_BLOCKS);
 
     println!("╔══════════════════════════════════════════╗");
     println!("║      INDRA v2 — Phase 8 Node Starting     ║");
@@ -47,6 +71,12 @@ fn main() {
     println!("Data:      {}", data_dir);
     println!("P2P:       {}", p2p_addr);
     println!("Bootstrap: {}", if bootstrap.is_empty() { "(bootstrap node)" } else { &bootstrap });
+    println!("Mode:      {}", if archive { "archive" } else { "pruned" });
+    if !archive {
+        println!("Retain:    {} blocks", prune_keep);
+    }
+
+    check_disk_space(Path::new(&data_dir));
 
     // Load keys
     let keys_str = std::fs::read_to_string(&keys_path)
@@ -74,6 +104,7 @@ fn main() {
         bootstrap_peers:   bootstrap_peers.clone(),
         snapshot_interval: 300,
         mempool_capacity:  5_000,
+        prune_keep_blocks: if archive { None } else { Some(prune_keep) },
         strict_header_verification: false,
     };
 
@@ -464,8 +495,28 @@ fn main() {
             tick, height, progress, base_fee, mempool, peers
         );
 
+        if tick.is_multiple_of(10) {
+            check_disk_space(Path::new(&data_dir));
+        }
+
         last_height = height;
     }
+}
+
+fn check_disk_space(data_dir: &Path) -> u64 {
+    let available = available_space(data_dir).unwrap_or(0);
+    if available > 0 && available < DISK_CRITICAL_THRESHOLD_BYTES {
+        eprintln!(
+            "[disk] CRITICAL: only {} MB remaining",
+            available / 1024 / 1024
+        );
+    } else if available > 0 && available < DISK_WARN_THRESHOLD_BYTES {
+        eprintln!(
+            "[disk] WARNING: only {} GB remaining",
+            available / 1024 / 1024 / 1024
+        );
+    }
+    available
 }
 
 fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
@@ -579,7 +630,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                         / indra_core::types::primitives::ERA_3_PLUS_DURATION_BLOCKS)
                 };
                 format!(
-                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"mempool_size":{},"epoch":{},"block_reward_spark":{},"era":{}}}"#,
+                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{}}}"#,
                     s.height,
                     hex::encode(s.tip_hash.0),
                     s.base_fee,
@@ -590,6 +641,9 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     s.validators.active_count(),
                     mempool_size,
                     s.current_epoch(),
+                    if guard.engine.block_store.is_archive() { "false" } else { "true" },
+                    guard.engine.block_store.lowest_height(),
+                    guard.engine.block_store.len(),
                     block_reward_spark,
                     era,
                 )

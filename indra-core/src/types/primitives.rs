@@ -173,11 +173,28 @@ pub const FEE_VALIDATOR_BPS: u32 = 5_000;
 /// Soft target for the number of active validators.
 pub const TARGET_VALIDATOR_COUNT: u64 = 200;
 
+/// Saturation is disabled until the active validator set reaches this size.
+pub const SATURATION_MIN_VALIDATORS: u64 = 20;
+
 /// Target active validator set size for QC size management.
 pub const TARGET_VALIDATOR_SET_SIZE: u64 = 150;
 
 /// Maximum validators that may appear in a single QC.
 pub const MAX_QC_SIGNERS: usize = 200;
+
+// ── Pruning ───────────────────────────────────────────────────────────────────
+
+/// Default number of blocks to retain in pruned mode.
+pub const DEFAULT_PRUNE_KEEP_BLOCKS: u64 = 50_000;
+
+/// Minimum number of blocks to keep when pruning.
+pub const MIN_PRUNE_KEEP_BLOCKS: u64 = 1_000;
+
+/// Disk space warning threshold in bytes (5 GB).
+pub const DISK_WARN_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Disk space critical threshold in bytes (500 MB).
+pub const DISK_CRITICAL_THRESHOLD_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Slash for intentional double-signing (equivocation), in basis points.
 /// 1000 bps = 10% of stake burned.

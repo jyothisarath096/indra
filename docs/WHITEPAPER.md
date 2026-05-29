@@ -1,7 +1,7 @@
 # INDRA Protocol
 ## A Post-Quantum Monetary Settlement Network
 
-**Version 1.3 — Pre-release draft**
+**Version 1.5 — Pre-release draft**
 **Bonkai and team**
 
 ---
@@ -201,9 +201,12 @@ evidence that a supermajority of validators agreed on a block.
 
 Each QC contains one Dilithium2 signature per signing validator.
 Verification iterates all signatures — O(n) in validator count.
-At the target validator set of 50-150 validators, this adds
-approximately 2.5-7.5ms per QC verification, which is entirely
-acceptable for a 6-second settlement chain.
+At the target validator set of 50-150 validators, QC
+verification adds a small overhead per block. Internal benchmarks
+on Apple M-series hardware indicate this overhead is well within
+acceptable bounds for a 6-second block time. Formal benchmark
+results will be published before mainnet alongside the security
+audit report.
 
 BLS12-381 aggregate signatures were considered during development
 for their O(1) verification efficiency. They were deliberately
@@ -378,13 +381,26 @@ validator count. Validators with stake below the saturation
 point receive full rewards. Validators above the saturation
 point receive diminishing marginal rewards.
 
-This makes visible stake concentration economically inefficient.
-It does not prevent hidden coordination among operators who
-split stake across multiple validators. No protocol mechanism
-can fully prevent this without becoming identity-governed.
-The saturation mechanism reduces the incentive for visible
-concentration and is complemented by transparency tooling in
-the wallet interface.
+**Saturation is disabled below 20 active validators.**
+During early bootstrap when validator count is small, all
+validators receive full proportional rewards. This ensures
+the network can bootstrap correctly before saturation
+mechanics become meaningful.
+
+Above 20 validators, the saturation point is:
+
+```
+saturation_point = total_active_stake / active_validator_count
+```
+
+Validators above the saturation point receive diminishing
+marginal rewards. This makes visible concentration economically
+inefficient without penalising the bootstrap phase.
+
+This mechanism does not prevent hidden coordination among
+operators who split stake across multiple validators. No protocol
+mechanism can fully prevent this without becoming identity-governed.
+Transparency tooling in the wallet complements the saturation curve.
 
 ### 3.6 No monetary governance
 
@@ -548,66 +564,87 @@ if delegators present:
     each_delegator_gets = delegator_pool × (delegator_stake / total_delegated)
 ```
 
-**Example (100 active validators, equal stake, 10% commission):**
-```
-Era 1 annual block reward pool: ~250,000,000 INDRA
-Per validator annual (block rewards): 2,500,000 INDRA
-Per validator annual (fees at 100K tx/day, 0.01 INDRA avg):
-  fee pool to validators = 365,000 INDRA / 100 = 3,650 INDRA
-Validator self-reward (commission): 250,365 INDRA/year
-Delegator pool: 2,253,285 INDRA/year (distributed by stake)
-Delegator with 1,000 INDRA staked (1% of 100K):
-  annual reward ≈ 2,140 INDRA → ~214% APY (Era 1)
-```
-
-Note: these figures are illustrative for Era 1 with 100 validators.
-Rewards decrease as validator count grows and as eras advance.
+Early-stage block rewards are intentionally high to incentivise
+bootstrap participation when the validator set is small. As the
+validator set grows and fee revenue matures, per-validator rewards
+normalise. The exact yield depends on total staked supply, validator
+count, and transaction volume — all of which evolve organically
+as the network grows. Specific yield projections are not published
+in this document as they depend on adoption variables outside the
+protocol's control.
 
 ### 5.5 Slashing
 
-Slashing penalises validators (and their delegators) for
-misbehaviour. Penalties are calibrated to distinguish honest
-infrastructure failures from malicious behaviour:
+INDRA's slashing model is deliberately minimal. Only one
+category of behaviour results in stake being burned:
+intentional equivocation (double-signing).
 
 ```
-Offence                          Penalty          Notes
-─────────────────────────────────────────────────────────────────
-Miss block as proposer           Lost reward only  No stake burned
-                                                   Happens to all validators
-                                                   occasionally — not punished
+Offence                  Penalty           Notes
+────────────────────────────────────────────────────────────────
+Miss block as proposer   Lost reward only  No stake burned.
+                                           Normal — not punished.
 
-Repeated misses (>10% of         0.01% of stake   Indicates persistent
-proposals over an epoch)                           infrastructure problem
+Offline (any duration)   No rewards        Stake never burned for
+                         while offline     being offline. Come back
+                                           online → earn again.
 
-Offline 24 consecutive hours     0.50% of stake   Sustained absence
-                                                   affecting liveness
-
-Offline 7 consecutive days       2.00% of stake   Severe liveness failure
-
-Double-signing a block           10.00% of stake  Intentional attack on
-(equivocation)                                     consensus safety
-                                                   Forced exit from active set
+Double-signing a block   10% of stake      Intentional malicious act.
+(equivocation)           burned            Requires deliberately
+                                           signing two conflicting
+                                           blocks. No honest validator
+                                           ever triggers this.
+                                           Forced exit from active set.
 ```
+
+**The philosophy: earn when you work, nothing when you don't.**
+
+INDRA does not slash validators for being offline. A validator
+who can only run their node four hours per day earns
+proportionally to those four hours. Their stake is never
+touched for the time they are offline.
+
+This follows Bitcoin's model. Miners who stop mining earn
+nothing — they are not penalised for stopping. The economic
+incentive to earn rewards is sufficient without the threat
+of stake destruction for honest failures.
+
+Punitive downtime slashing would centralise validation toward
+only large professional operators with redundant infrastructure.
+Individuals, researchers, and community members running nodes
+on personal hardware would be systematically penalised for
+normal infrastructure failures: power outages, ISP downtime,
+hardware maintenance. INDRA explicitly rejects this design.
+
+**Validator portability:**
+A validator's identity is derived deterministically from their
+24-word recovery phrase. The same phrase always produces the
+same validator ID and signing keys. A validator can stop their
+node, move to new hardware, enter their recovery phrase, and
+resume with the same identity and accumulated stake. There is
+no registration process and no downtime penalty for the
+transition.
+
+**Key architecture (v1):**
+In the current implementation, the validator signing key and
+wallet key are derived from the same 24-word phrase using
+domain-separated derivation. This simplifies the user experience
+at the cost of operational key separation.
+
+A future protocol version will separate consensus signing keys
+(hot keys, used for block signing) from withdrawal keys (cold
+keys, controlling stake). This follows the Ethereum validator
+model and reduces risk if a consensus key is exposed — an
+attacker who obtains the signing key could trigger a double-sign
+slash but could not steal the underlying stake. This separation
+is planned before mainnet stake reaches significant value.
 
 **Delegator slashing:**
 Delegators share in slashing events proportional to their
-delegation. If a validator is slashed 10% for double-signing,
-each delegator loses 10% of their delegated stake.
-
-This creates a selection incentive: delegators should choose
-reliable validators, not just high-commission validators.
-The wallet UI surfaces validator uptime history, slash history,
-and stake concentration to help delegators make informed choices.
-
-**Why this calibration:**
-Infrastructure failures (missed blocks, brief downtime) are
-inevitable in any distributed system. Cloud providers experience
-outages. Internet connections drop. Severely penalising honest
-validators for routine infrastructure failures would deter
-participation and centralise the validator set toward only
-large professional operators. The current calibration penalises
-sustained absence and malicious behaviour severely, while
-treating brief outages with proportionate responses.
+delegation. If a validator double-signs and loses 10% of stake,
+delegators lose 10% of their delegated portion. This creates
+a meaningful selection incentive — choose validators with
+no history of equivocation.
 
 ### 5.6 Saturation and anti-concentration
 
@@ -677,6 +714,29 @@ Key custody:            Delegator retains full custody
 6. Confirm with Face ID / fingerprint
 7. Delegation active at next epoch boundary
 8. Rewards accumulate and are claimable each epoch
+
+**Delegation is non-custodial.**
+The validator never holds the delegator's INDRA. Delegation
+is a cryptographic instruction to the protocol. The validator
+cannot spend, redirect, or access delegated funds. Private
+keys remain in the delegator's device at all times.
+
+**Rewards are automatic and validator-proof.**
+The protocol calculates and distributes rewards at each epoch
+boundary without validator intervention. Commission is deducted
+by the protocol automatically. Validators cannot intercept,
+delay, or redirect delegator rewards.
+
+**Split delegation is supported.**
+A delegator can split stake across multiple validators to
+spread slashing risk and support decentralisation. For example,
+500 INDRA to one validator and 500 to another in a different
+geographic region.
+
+**Commission changes apply prospectively.**
+Rate changes take effect from the next epoch only. The current
+epoch always uses the previously advertised rate. Delegators
+can undelegate before a new rate takes effect.
 
 **Undelegation:**
 Undelegation is not instant. The 30-hour unbonding period
@@ -817,6 +877,9 @@ can be made.
 **Early validator concentration.** Era 1 releases 250 million
 INDRA over four years. With a small initial validator set,
 these rewards accrue to a small number of operators. This
+mirrors Bitcoin's early mining concentration and resolves
+through organic validator set growth. With a small initial validator set,
+these rewards accrue to a small number of operators. This
 mirrors Bitcoin's early mining concentration. Resolution
 comes through organic validator set growth as rewards remain
 attractive and the network develops.
@@ -832,6 +895,32 @@ with open validator participation, adversarial conditions, and
 sustained operation has not yet occurred.
 
 ---
+
+## 7b. Minimum System Requirements
+
+To run an INDRA validator node:
+
+```
+CPU:      2 cores (any modern processor, 2015 or newer)
+RAM:      4 GB minimum / 8 GB recommended
+Storage:  50 GB SSD (chain grows over time)
+          HDD is not recommended (too slow for state reads)
+Network:  10 Mbps stable upload and download
+          Port 30303 open for P2P (configurable)
+          Static IP recommended but not required
+Uptime:   No minimum requirement
+          Validators earn proportional to time online
+          No penalty for being offline
+OS:       macOS 12+
+          Ubuntu 20.04+ / Debian 11+
+          Windows 10+ (64-bit)
+```
+
+A validator can run on a personal laptop, a home server,
+a cloud VPS, or a university research machine. The minimum
+hardware is modest by design — INDRA's consensus is not
+computationally intensive. The primary requirement is a
+stable internet connection when the node is running.
 
 ## 8. Roadmap
 
@@ -935,7 +1024,7 @@ Era 3+ duration:            8 years per era
 Fee burn:                   50% of all fees
 Fee to validators:          50% of all fees
 Slash — double sign:        10% of stake
-Slash — 7 days offline:     2% of stake
+Offline (any duration):     No penalty — lost rewards only
 ```
 
 ### C. Security review summary
@@ -1000,7 +1089,7 @@ be published in full.
 
 ---
 
-*INDRA Protocol — Pre-release working draft v1.3*
+*INDRA Protocol — Pre-release working draft v1.5*
 *This is a technical specification, not a financial instrument prospectus.*
 *Protocol parameters may change before mainnet.*
 *This document does not constitute investment advice.*

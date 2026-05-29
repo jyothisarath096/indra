@@ -61,8 +61,14 @@ impl NodeEngine {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(indra_storage::StorageError::Io)?;
 
-        let mut block_store = BlockStore::open(config.block_log_path())?;
+        let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
         let state_store = StateStore::open(config.state_dir())?;
+
+        if block_store.lowest_height() > 0 {
+            return Err(NodeError::PrunedReplayUnsupported {
+                lowest_height: block_store.lowest_height(),
+            });
+        }
 
         // Snapshots currently store only summary fields, so rebuild the
         // authoritative state from the append-only block log on startup.

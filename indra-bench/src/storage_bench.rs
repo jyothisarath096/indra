@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use indra_core::Bytes32;
-use indra_storage::BlockStore;
+use indra_storage::{BlockStore, PruneConfig};
 
 use crate::{
     fixtures::dummy_block,
@@ -22,7 +22,7 @@ pub fn bench_block_store_append(n: u64, iterations: u64) {
     let path = temp_path(&format!("append_{n}"));
 
     let r = bench(&format!("block_store_append_{n}"), iterations, || {
-        let mut store = BlockStore::open(&path).unwrap();
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
         // Store the genesis block first (height 0)
         let genesis = dummy_block(0, Bytes32::ZERO, 0);
         let _ = store.append(&genesis);
@@ -43,7 +43,7 @@ pub fn bench_block_store_append(n: u64, iterations: u64) {
 pub fn bench_block_store_read(iterations: u64) {
     let path = temp_path("read");
     {
-        let mut store = BlockStore::open(&path).unwrap();
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
         for i in 0..10u64 {
             let block = dummy_block(i, Bytes32::ZERO, 10);
             store.append(&block).unwrap();
@@ -51,7 +51,7 @@ pub fn bench_block_store_read(iterations: u64) {
     }
 
     let r = bench("block_store_read", iterations, || {
-        let mut store = BlockStore::open(&path).unwrap();
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
         let _ = store.get(5);
     });
     r.print();

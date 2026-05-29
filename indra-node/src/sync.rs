@@ -307,7 +307,10 @@ mod tests {
 
         let mut state = ChainState::new_genesis();
         let mut mempool = Mempool::default_config();
-        let mut block_store = BlockStore::open(dir.join("blocks.log")).unwrap();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        ).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         let block = make_block(1, state.tip_hash, INITIAL_BASE_FEE_SPARK_PER_KB);
@@ -326,7 +329,10 @@ mod tests {
 
         let mut state = ChainState::new_genesis();
         let mut mempool = Mempool::default_config();
-        let mut block_store = BlockStore::open(dir.join("blocks.log")).unwrap();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        ).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         for i in 1..=10u64 {
@@ -347,7 +353,10 @@ mod tests {
 
         let mut state = ChainState::new_genesis();
         let mut mempool = Mempool::default_config();
-        let mut block_store = BlockStore::open(dir.join("blocks.log")).unwrap();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        ).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         // Try to import height 5 when we're at genesis (height 0)

@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use indra_storage::PruneConfig;
+
 /// All configuration for a running INDRA node.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -43,6 +45,11 @@ pub struct NodeConfig {
     /// Maximum mempool size (number of transactions).
     pub mempool_capacity: usize,
 
+    /// Number of recent blocks to keep in pruned mode.
+    ///
+    /// `None` means archive mode.
+    pub prune_keep_blocks: Option<u64>,
+
     /// Enforce QC, VRF, and state-root verification on imported block headers.
     ///
     /// Testnet can keep this disabled while legacy placeholder headers are still
@@ -64,6 +71,7 @@ impl NodeConfig {
             bootstrap_peers:  vec![],
             snapshot_interval: 300,
             mempool_capacity:  5_000,
+            prune_keep_blocks: None,
             strict_header_verification: false,
         }
     }
@@ -81,6 +89,7 @@ impl NodeConfig {
             bootstrap_peers:  vec![],
             snapshot_interval: 300,
             mempool_capacity:  5_000,
+            prune_keep_blocks: None,
             strict_header_verification: false,
         }
     }
@@ -103,5 +112,13 @@ impl NodeConfig {
     /// Path to the mempool WAL file.
     pub fn wal_path(&self) -> PathBuf {
         self.data_dir.join("mempool.wal")
+    }
+
+    /// Pruning configuration derived from this node config.
+    pub fn prune_config(&self) -> PruneConfig {
+        match self.prune_keep_blocks {
+            Some(keep) => PruneConfig::keep(keep),
+            None => PruneConfig::archive(),
+        }
     }
 }

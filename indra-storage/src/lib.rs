@@ -42,6 +42,6 @@ pub mod state_store;
 pub mod wal;
 
 pub use error::{StorageError, StorageResult};
-pub use block_store::BlockStore;
+pub use block_store::{BlockStore, PruneConfig};
 pub use state_store::StateStore;
 pub use wal::MempoolWal;

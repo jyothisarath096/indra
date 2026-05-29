@@ -59,6 +59,7 @@ fn get_tip(state: &NodeState<'_>) -> RpcResult<String> {
 /// Result: `{"height", "tip_hash", "base_fee", "total_supply",
 ///           "treasury_balance", "burn_buffer", "fee_reward_pool",
 ///           "active_validators", "mempool_size", "epoch",
+///           "pruned_mode", "lowest_block", "blocks_retained",
 ///           "block_reward_spark", "era"}`
 fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let s = &state.engine.state;
@@ -68,9 +69,12 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let epoch = s.current_epoch();
     let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
     let era = era_for_height(s.height);
+    let pruned_mode = !state.engine.block_store.is_archive();
+    let lowest_block = state.engine.block_store.lowest_height();
+    let blocks_retained = state.engine.block_store.len();
 
     Ok(format!(
-        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"mempool_size":{mempool},"epoch":{epoch},"block_reward_spark":{block_reward_spark},"era":{era}}}"#,
+        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"mempool_size":{mempool},"epoch":{epoch},"pruned_mode":{pruned_mode},"lowest_block":{lowest_block},"blocks_retained":{blocks_retained},"block_reward_spark":{block_reward_spark},"era":{era}}}"#,
         height        = s.height,
         tip           = tip,
         base_fee      = s.base_fee,
@@ -81,6 +85,9 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
         validators    = active_validators,
         mempool       = mempool_size,
         epoch         = epoch,
+        pruned_mode   = if pruned_mode { "true" } else { "false" },
+        lowest_block  = lowest_block,
+        blocks_retained = blocks_retained,
         block_reward_spark = block_reward_spark,
         era           = era,
     ))
@@ -121,6 +128,13 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     // For now, return current block info if height matches current height
     // Full block retrieval from block_store requires &mut (Phase 8 refactor)
     let s = &state.engine.state;
+    if height < state.engine.block_store.lowest_height() {
+        return Err(RpcError::NotFound(format!(
+            "Block {height} has been pruned. Lowest available: {}. Use an archive node for historical queries.",
+            state.engine.block_store.lowest_height()
+        )));
+    }
+
     if height > s.height {
         return Err(RpcError::NotFound(format!("block {height} not yet produced")));
     }
@@ -254,6 +268,8 @@ mod tests {
         assert!(result.contains("\"base_fee\""));
         assert!(result.contains("\"total_supply\""));
         assert!(result.contains("\"epoch\""));
+        assert!(result.contains("\"pruned_mode\""));
+        assert!(result.contains("\"lowest_block\""));
         let _ = std::fs::remove_dir_all(temp_dir("ci"));
     }
 

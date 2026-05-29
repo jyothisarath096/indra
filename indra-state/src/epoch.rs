@@ -23,7 +23,7 @@ use indra_core::types::primitives::{
     ERA_1_BLOCK_REWARD_SPARK,
     ERA_2_BLOCK_REWARD_SPARK,
     HARD_CAP_SPARK,
-    TARGET_VALIDATOR_COUNT,
+    SATURATION_MIN_VALIDATORS,
 };
 
 use crate::{
@@ -84,12 +84,17 @@ fn saturation_adjusted_reward(
     raw_reward: u64,
     validator_stake: u64,
     total_active_stake: u64,
+    active_validator_count: u64,
 ) -> u64 {
-    if total_active_stake == 0 || TARGET_VALIDATOR_COUNT == 0 {
+    if total_active_stake == 0 || active_validator_count == 0 {
         return raw_reward;
     }
 
-    let saturation_point = total_active_stake / TARGET_VALIDATOR_COUNT;
+    if active_validator_count <= SATURATION_MIN_VALIDATORS {
+        return raw_reward;
+    }
+
+    let saturation_point = total_active_stake / active_validator_count;
     if saturation_point == 0 || validator_stake <= saturation_point {
         return raw_reward;
     }
@@ -114,10 +119,16 @@ fn distribute_block_rewards(
         .active_validators()
         .map(|v| (v.validator_id, v.stake_spark))
         .collect();
+    let active_validator_count = active.len() as u64;
 
     for (id, stake) in &active {
         let raw_reward = epoch_block_reward.saturating_mul(*stake) / total_stake;
-        let adjusted_reward = saturation_adjusted_reward(raw_reward, *stake, total_stake);
+        let adjusted_reward = saturation_adjusted_reward(
+            raw_reward,
+            *stake,
+            total_stake,
+            active_validator_count,
+        );
 
         let commission_bps = state
             .validators
@@ -300,19 +311,25 @@ mod tests {
 
     #[test]
     fn saturation_below_point_full_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 100, 200_000);
+        let reward = saturation_adjusted_reward(1_000_000, 100, 200_000, 200);
         assert_eq!(reward, 1_000_000);
     }
 
     #[test]
     fn saturation_above_point_reduced_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 2_000, 200_000);
+        let reward = saturation_adjusted_reward(1_000_000, 2_000, 200_000, 200);
         assert_eq!(reward, 500_000);
     }
 
     #[test]
     fn saturation_at_point_full_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 1_000, 200_000);
+        let reward = saturation_adjusted_reward(1_000_000, 1_000, 200_000, 200);
+        assert_eq!(reward, 1_000_000);
+    }
+
+    #[test]
+    fn saturation_disabled_for_small_validator_sets() {
+        let reward = saturation_adjusted_reward(1_000_000, 50_000, 200_000, 20);
         assert_eq!(reward, 1_000_000);
     }
 

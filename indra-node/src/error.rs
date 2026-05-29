@@ -40,6 +40,13 @@ pub enum NodeError {
     /// Genesis state mismatch.
     #[error("genesis mismatch: stored genesis differs from configured genesis")]
     GenesisMismatch,
+
+    /// Restarting from a pruned block log requires full state snapshots.
+    #[error("pruned block replay requires full state snapshots; lowest stored block is {lowest_height}")]
+    PrunedReplayUnsupported {
+        /// Lowest block height still present in the local block store.
+        lowest_height: u64,
+    },
 }
 
 /// Convenience alias.

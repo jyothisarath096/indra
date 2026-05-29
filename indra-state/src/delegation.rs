@@ -66,6 +66,15 @@ fn apply_delegate(
     if !validator.is_active() {
         return Err(StateError::ValidatorNotActive);
     }
+    if amount_spark < validator.min_delegation_spark {
+        return Err(StateError::InvalidStakingOp(
+            format!(
+                "delegation below validator minimum: have {} Spark, need {} Spark",
+                amount_spark,
+                validator.min_delegation_spark,
+            ),
+        ));
+    }
 
     // Derive delegator_id from pubkey bytes
     let delegator_id = pubkey_to_id(delegator_pubkey);
@@ -194,6 +203,7 @@ mod tests {
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: 1_000,
+            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
         };
         state.validators.upsert(entry).unwrap();
         validator_id
@@ -221,6 +231,21 @@ mod tests {
 
         let op = StakingOp::Delegate {
             validator_id: Bytes32::from([0xFFu8; 32]),
+            amount_spark: 1_000_000,
+            delegator_pubkey: pubkey,
+        };
+        assert!(apply_staking_op(&mut state, &op).is_err());
+    }
+
+    #[test]
+    fn delegate_below_validator_minimum_fails() {
+        let mut state = ChainState::new_genesis();
+        let validator_id = make_active_validator(&mut state, 0x01);
+        state.validators.get_mut(&validator_id).unwrap().min_delegation_spark = 2_000_000;
+        let pubkey = dummy_pubkey(0x02);
+
+        let op = StakingOp::Delegate {
+            validator_id,
             amount_spark: 1_000_000,
             delegator_pubkey: pubkey,
         };

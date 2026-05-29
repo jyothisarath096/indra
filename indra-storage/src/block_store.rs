@@ -22,7 +22,10 @@ use std::path::Path;
 
 use indra_core::{
     codec::{Decode, Encode},
-    types::block::BlockV1,
+    types::{
+        block::BlockV1,
+        primitives::{DEFAULT_PRUNE_KEEP_BLOCKS, MIN_PRUNE_KEEP_BLOCKS},
+    },
 };
 
 use crate::error::{StorageError, StorageResult};
@@ -30,11 +33,41 @@ use crate::error::{StorageError, StorageResult};
 /// The header size for each block entry: u64 height + u32 length.
 const ENTRY_HEADER_BYTES: usize = 12;
 
+/// Pruning configuration for the block store.
+#[derive(Debug, Clone)]
+pub struct PruneConfig {
+    /// Maximum number of recent blocks to keep.
+    pub keep_blocks: Option<u64>,
+}
+
+impl PruneConfig {
+    /// Default validator mode: keep the recent prune window.
+    pub fn default_validator() -> Self {
+        Self {
+            keep_blocks: Some(DEFAULT_PRUNE_KEEP_BLOCKS),
+        }
+    }
+
+    /// Archive mode: keep all blocks forever.
+    pub fn archive() -> Self {
+        Self { keep_blocks: None }
+    }
+
+    /// Custom keep window with a safety floor.
+    pub fn keep(n: u64) -> Self {
+        Self {
+            keep_blocks: Some(n.max(MIN_PRUNE_KEEP_BLOCKS)),
+        }
+    }
+}
+
 /// An append-only block log with an in-memory height→offset index.
 pub struct BlockStore {
     file:   File,
     index:  HashMap<u64, u64>, // height → file offset of the entry header
     next_height: u64,
+    prune_cfg: PruneConfig,
+    lowest_height: u64,
 }
 
 impl BlockStore {
@@ -42,17 +75,20 @@ impl BlockStore {
     ///
     /// On first open, scans the file to rebuild the index.
     /// Truncates any incomplete final entry.
-    pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
+    pub fn open(path: impl AsRef<Path>, prune_cfg: PruneConfig) -> StorageResult<Self> {
         let file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         let mut store = Self {
             file,
             index: HashMap::new(),
             next_height: 0,
+            prune_cfg,
+            lowest_height: 0,
         };
         store.rebuild_index()?;
         Ok(store)
@@ -71,6 +107,16 @@ impl BlockStore {
     /// The height of the next block to be appended.
     pub fn next_height(&self) -> u64 {
         self.next_height
+    }
+
+    /// Lowest block height currently stored.
+    pub fn lowest_height(&self) -> u64 {
+        self.lowest_height
+    }
+
+    /// True if this store keeps all blocks forever.
+    pub fn is_archive(&self) -> bool {
+        self.prune_cfg.keep_blocks.is_none()
     }
 
     /// Append a block to the store.
@@ -99,11 +145,26 @@ impl BlockStore {
 
         self.index.insert(height, offset);
         self.next_height += 1;
+
+        if let Some(keep) = self.prune_cfg.keep_blocks {
+            if height >= keep {
+                let prune_below = height + 1 - keep;
+                self.prune_below(prune_below)?;
+            }
+        }
+
         Ok(())
     }
 
     /// Read a block by height.
     pub fn get(&mut self, height: u64) -> StorageResult<BlockV1> {
+        if !self.index.is_empty() && height < self.lowest_height {
+            return Err(StorageError::BlockPruned {
+                height,
+                lowest_available: self.lowest_height,
+            });
+        }
+
         let offset = self.index.get(&height)
             .copied()
             .ok_or(StorageError::BlockNotFound { height })?;
@@ -145,6 +206,54 @@ impl BlockStore {
             height,
             detail: e.to_string(),
         })
+    }
+
+    /// Remove all blocks with heights below `prune_below`.
+    fn prune_below(&mut self, prune_below: u64) -> StorageResult<()> {
+        if prune_below <= self.lowest_height {
+            return Ok(());
+        }
+
+        let keep_from_height = prune_below;
+        let keep_offset = match self.index.get(&keep_from_height).copied() {
+            Some(offset) => offset,
+            None => {
+                let next_available = self.index.keys()
+                    .filter(|&&height| height >= keep_from_height)
+                    .min()
+                    .copied();
+                match next_available {
+                    Some(height) => self.index[&height],
+                    None => return Ok(()),
+                }
+            }
+        };
+
+        if keep_offset == 0 {
+            return Ok(());
+        }
+
+        let file_len = self.file.seek(SeekFrom::End(0))?;
+        let keep_bytes = (file_len - keep_offset) as usize;
+        let mut kept_data = vec![0u8; keep_bytes];
+        self.file.seek(SeekFrom::Start(keep_offset))?;
+        self.file.read_exact(&mut kept_data)?;
+
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.set_len(0)?;
+        self.file.write_all(&kept_data)?;
+        self.file.flush()?;
+
+        let offset_adjustment = keep_offset;
+        let mut new_index = HashMap::new();
+        for (&height, &old_offset) in &self.index {
+            if height >= keep_from_height {
+                new_index.insert(height, old_offset.saturating_sub(offset_adjustment));
+            }
+        }
+        self.index = new_index;
+        self.lowest_height = self.index.keys().min().copied().unwrap_or(0);
+        Ok(())
     }
 
     /// Scan the file to rebuild the height→offset index.
@@ -197,6 +306,7 @@ impl BlockStore {
         }
 
         self.next_height = max_height.map_or(0, |h| h + 1);
+        self.lowest_height = self.index.keys().min().copied().unwrap_or(0);
         Ok(())
     }
 }
@@ -213,9 +323,9 @@ mod tests {
         },
     };
 
-    fn temp_path() -> PathBuf {
+    fn temp_path(label: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_test_blocks_{}.bin", std::process::id()));
+        p.push(format!("indra_test_blocks_{}_{}.bin", label, std::process::id()));
         p
     }
 
@@ -242,8 +352,8 @@ mod tests {
 
     #[test]
     fn append_and_retrieve() {
-        let path = temp_path();
-        let mut store = BlockStore::open(&path).unwrap();
+        let path = temp_path("append");
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
 
         let b0 = dummy_block(0, [0u8; 32]);
         let b1 = dummy_block(1, [0u8; 32]);
@@ -260,10 +370,10 @@ mod tests {
 
     #[test]
     fn non_sequential_rejected() {
-        let path = temp_path();
+        let path = temp_path("nonseq");
         let mut path2 = path.clone();
         path2.set_extension("bin2");
-        let mut store = BlockStore::open(&path2).unwrap();
+        let mut store = BlockStore::open(&path2, PruneConfig::archive()).unwrap();
         let b0 = dummy_block(0, [0u8; 32]);
         let b2 = dummy_block(2, [0u8; 32]); // skip height 1
         store.append(&b0).unwrap();
@@ -273,19 +383,92 @@ mod tests {
 
     #[test]
     fn index_survives_reopen() {
-        let path = temp_path();
+        let path = temp_path("reopen");
         let mut p3 = path.clone();
         p3.set_extension("bin3");
         {
-            let mut store = BlockStore::open(&p3).unwrap();
+            let mut store = BlockStore::open(&p3, PruneConfig::archive()).unwrap();
             store.append(&dummy_block(0, [0u8; 32])).unwrap();
             store.append(&dummy_block(1, [0u8; 32])).unwrap();
         }
         // Reopen and check index is rebuilt
-        let mut store2 = BlockStore::open(&p3).unwrap();
+        let mut store2 = BlockStore::open(&p3, PruneConfig::archive()).unwrap();
         assert_eq!(store2.len(), 2);
         assert_eq!(store2.get(0).unwrap().header.height, 0);
         assert_eq!(store2.get(1).unwrap().header.height, 1);
         let _ = std::fs::remove_file(&p3);
+    }
+
+    #[test]
+    fn pruning_removes_old_blocks() {
+        let path = temp_path("prune");
+        let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(5) }).unwrap();
+
+        for height in 0..10u64 {
+            store.append(&dummy_block(height, [0u8; 32])).unwrap();
+        }
+
+        assert!(store.get(0).is_err());
+        assert!(store.get(4).is_err());
+        assert!(store.get(5).is_ok());
+        assert!(store.get(9).is_ok());
+        assert_eq!(store.lowest_height(), 5);
+        assert_eq!(store.len(), 5);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn archive_mode_keeps_all_blocks() {
+        let path = temp_path("archive");
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+
+        for height in 0..20u64 {
+            store.append(&dummy_block(height, [0u8; 32])).unwrap();
+        }
+
+        assert!(store.get(0).is_ok());
+        assert!(store.get(19).is_ok());
+        assert_eq!(store.len(), 20);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pruned_store_survives_reopen() {
+        let path = temp_path("pruned_reopen");
+        {
+            let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(3) }).unwrap();
+            for height in 0..10u64 {
+                store.append(&dummy_block(height, [0u8; 32])).unwrap();
+            }
+            assert_eq!(store.lowest_height(), 7);
+        }
+
+        let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(3) }).unwrap();
+        assert!(store.get(6).is_err());
+        assert!(store.get(7).is_ok());
+        assert_eq!(store.len(), 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pruned_block_error_is_informative() {
+        let path = temp_path("pruned_err");
+        let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(5) }).unwrap();
+        for height in 0..10u64 {
+            store.append(&dummy_block(height, [0u8; 32])).unwrap();
+        }
+
+        match store.get(0) {
+            Err(StorageError::BlockPruned { height, lowest_available }) => {
+                assert_eq!(height, 0);
+                assert_eq!(lowest_available, 5);
+            }
+            other => panic!("expected BlockPruned, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -49,6 +49,8 @@ pub struct ValidatorEntry {
     /// Commission rate in basis points (e.g. 1000 = 10%).
     /// Bounded by [MIN_COMMISSION_BPS, MAX_COMMISSION_BPS].
     pub commission_bps: u32,
+    /// Validator-specific minimum delegation amount in Spark.
+    pub min_delegation_spark: u64,
 }
 
 impl ValidatorEntry {
@@ -174,6 +176,7 @@ mod tests {
             rewards_last_epoch: epoch,
             self_report_count: 0,
             commission_bps:   1_000,
+            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
         }
     }
 

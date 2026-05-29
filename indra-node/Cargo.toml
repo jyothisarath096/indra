@@ -17,6 +17,7 @@ indra-network   = { path = "../indra-network" }
 indra-bulletproofs = { path = "../indra-bulletproofs" }
 rand.workspace = true
 thiserror.workspace = true
+fs2 = "0.4"
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }

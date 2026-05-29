@@ -16,6 +16,15 @@ pub enum StorageError {
         height: u64,
     },
 
+    /// Block has been pruned and is no longer available.
+    #[error("block {height} has been pruned (lowest available: {lowest_available})")]
+    BlockPruned {
+        /// The requested height.
+        height: u64,
+        /// Lowest height currently retained by this node.
+        lowest_available: u64,
+    },
+
     /// The stored data failed to decode — likely corruption.
     #[error("data corruption at height {height}: {detail}")]
     Corruption {

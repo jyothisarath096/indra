@@ -10,7 +10,7 @@ use indra_core::{
 };
 use indra_state::ChainState;
 use indra_consensus::mempool::Mempool;
-use indra_storage::{BlockStore, StateStore};
+use indra_storage::{BlockStore, PruneConfig, StateStore};
 use indra_node::{
     NodeConfig, NodeEngine,
     genesis::{build_genesis_state, genesis_block_hash},
@@ -78,7 +78,7 @@ fn state_root_changes_after_each_block() {
 
     let mut state = ChainState::new_genesis();
     let mut mempool = Mempool::default_config();
-    let mut block_store = BlockStore::open(dir.join("blocks.log")).unwrap();
+    let mut block_store = BlockStore::open(dir.join("blocks.log"), PruneConfig::archive()).unwrap();
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
     let root0 = compute_state_root(&state);
@@ -105,7 +105,7 @@ fn block_store_survives_reopen() {
     {
         let mut state = ChainState::new_genesis();
         let mut mempool = Mempool::default_config();
-        let mut block_store = BlockStore::open(&log_path).unwrap();
+        let mut block_store = BlockStore::open(&log_path, PruneConfig::archive()).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         for i in 1..=3u64 {
@@ -115,7 +115,7 @@ fn block_store_survives_reopen() {
     }
 
     // Reopen and verify blocks are still there
-    let mut store2 = BlockStore::open(&log_path).unwrap();
+    let mut store2 = BlockStore::open(&log_path, PruneConfig::archive()).unwrap();
     assert_eq!(store2.len(), 4); // genesis + 3 blocks
     assert_eq!(store2.get(1).unwrap().header.height, 1);
     assert_eq!(store2.get(3).unwrap().header.height, 3);
@@ -149,7 +149,7 @@ fn full_node_pipeline() {
 
     let mut state = build_genesis_state();
     let mut mempool = Mempool::default_config();
-    let mut block_store = BlockStore::open(dir.join("blocks.log")).unwrap();
+    let mut block_store = BlockStore::open(dir.join("blocks.log"), PruneConfig::archive()).unwrap();
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
     let roots: Vec<Bytes32> = (1..=10u64).map(|i| {

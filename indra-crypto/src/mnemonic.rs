@@ -7,7 +7,7 @@ use alloc::{
     vec::Vec,
 };
 
-use bip39::{Language, Mnemonic};
+use bip39::{Language, Mnemonic, rand::RngCore};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{error::CryptoError, sha256};
@@ -30,9 +30,12 @@ pub struct DerivedSeeds {
 
 /// Generate a new random 24-word BIP-39 mnemonic phrase.
 pub fn generate_mnemonic() -> String {
-    Mnemonic::generate_in(Language::English, MNEMONIC_WORD_COUNT)
-        .expect("24-word mnemonic generation should never fail")
-        .to_string()
+    let mut entropy = [0u8; 32];
+    bip39::rand::thread_rng().fill_bytes(&mut entropy);
+    match Mnemonic::from_entropy_in(Language::English, &entropy) {
+        Ok(mnemonic) => mnemonic.to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 /// Convert a BIP-39 mnemonic phrase to a 32-byte master seed.
