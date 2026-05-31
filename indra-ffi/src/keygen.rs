@@ -41,5 +41,7 @@ fn keys_to_ffi(keys: &indra_cli::KeysFile) -> Result<IndraKeyPair, IndraError> {
     out.pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
     out.classical_seed.copy_from_slice(&keys.hybrid_seed);
     out.pq_sk.copy_from_slice(&keys.pq_sk);
+    out.bls_seed.copy_from_slice(&keys.bls_seed);
+    out.vrf_seed.copy_from_slice(&keys.vrf_seed);
     Ok(out)
 }

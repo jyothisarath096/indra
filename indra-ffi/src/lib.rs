@@ -41,6 +41,8 @@ pub struct IndraKeyPair {
     pub pq_pk: [u8; PQ_PK_BYTES],
     pub classical_seed: [u8; CLASSICAL_SK_BYTES],
     pub pq_sk: [u8; PQ_SK_BYTES],
+    pub bls_seed: [u8; BYTES32_LEN],
+    pub vrf_seed: [u8; BYTES32_LEN],
 }
 
 impl IndraKeyPair {
@@ -52,6 +54,8 @@ impl IndraKeyPair {
             pq_pk: [0u8; PQ_PK_BYTES],
             classical_seed: [0u8; CLASSICAL_SK_BYTES],
             pq_sk: [0u8; PQ_SK_BYTES],
+            bls_seed: [0u8; BYTES32_LEN],
+            vrf_seed: [0u8; BYTES32_LEN],
         }
     }
 }
@@ -535,6 +539,44 @@ mod tests {
         assert_eq!(out1.classical_pk, out2.classical_pk);
         assert_eq!(out1.pq_pk, out2.pq_pk);
         assert_eq!(out1.pq_sk, out2.pq_sk);
+    }
+
+    #[test]
+    fn keygen_from_mnemonic_includes_all_seeds() {
+        let phrase = std::ffi::CString::new(
+            "abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon abandon abandon art"
+        )
+        .unwrap();
+        let mut out = IndraKeyPair::zeroed();
+
+        let result = unsafe { indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out) };
+
+        assert_eq!(result, INDRA_OK);
+        assert_ne!(out.classical_seed, [0u8; 32], "hybrid_seed is zero");
+        assert_ne!(out.bls_seed, [0u8; 32], "bls_seed is zero");
+        assert_ne!(out.vrf_seed, [0u8; 32], "vrf_seed is zero");
+        assert_ne!(
+            out.classical_seed, out.bls_seed,
+            "hybrid and bls seeds are identical"
+        );
+        assert_ne!(
+            out.classical_seed, out.vrf_seed,
+            "hybrid and vrf seeds are identical"
+        );
+        assert_ne!(
+            out.bls_seed, out.vrf_seed,
+            "bls and vrf seeds are identical"
+        );
+
+        let mut out2 = IndraKeyPair::zeroed();
+        unsafe {
+            assert_eq!(indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out2), INDRA_OK);
+        }
+        assert_eq!(out.bls_seed, out2.bls_seed);
+        assert_eq!(out.vrf_seed, out2.vrf_seed);
     }
 
     #[test]
