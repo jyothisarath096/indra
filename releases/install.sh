@@ -37,7 +37,7 @@ echo "✓ Detected platform: $PLATFORM"
 
 # Check disk space (need at least 2 GB)
 AVAILABLE=$(df -k "$HOME" | awk 'NR==2 {print $4}')
-AVAILABLE_GB=$(echo "$AVAILABLE / 1024 / 1024" | bc)
+AVAILABLE_GB=$((AVAILABLE / 1024 / 1024))
 if [ "$AVAILABLE_GB" -lt 2 ]; then
     echo "ERROR: Insufficient disk space. Need at least 2 GB, have ${AVAILABLE_GB} GB"
     exit 1
