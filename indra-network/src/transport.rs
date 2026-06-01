@@ -24,6 +24,16 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default read timeout.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Result of polling a connection for one inbound message.
+pub enum RecvStatus {
+    /// A full message was received.
+    Message(Message),
+    /// No message is available yet; the connection is still alive.
+    NoData,
+    /// The peer closed the connection cleanly.
+    Disconnected,
+}
+
 /// A TCP connection to a single peer.
 pub struct Connection {
     stream: TcpStream,
@@ -51,14 +61,13 @@ impl Connection {
     /// Receive one message from this peer.
     ///
     /// Reads the 4-byte length prefix, then the payload.
-    /// Returns None if the connection was closed cleanly.
-    pub fn recv(&mut self) -> NetworkResult<Option<Message>> {
+    pub fn recv(&mut self) -> NetworkResult<RecvStatus> {
         let mut len_buf = [0u8; 4];
         match self.stream.read_exact(&mut len_buf) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None), // timeout — no data yet
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(None), // timeout — no data yet
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(RecvStatus::Disconnected),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(RecvStatus::NoData),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(RecvStatus::NoData),
             Err(e) => return Err(NetworkError::Io(e)),
         }
 
@@ -74,7 +83,7 @@ impl Connection {
         self.stream.read_exact(&mut payload)?;
 
         let msg = Message::decode_wire(&payload)?;
-        Ok(Some(msg))
+        Ok(RecvStatus::Message(msg))
     }
 
     /// Close this connection.
@@ -145,7 +154,11 @@ mod tests {
             loop {
                 match server.accept().unwrap() {
                     Some(mut conn) => {
-                        let msg = conn.recv().unwrap().unwrap();
+                        let msg = match conn.recv().unwrap() {
+                            RecvStatus::Message(msg) => msg,
+                            RecvStatus::NoData => continue,
+                            RecvStatus::Disconnected => panic!("connection closed unexpectedly"),
+                        };
                         return msg;
                     }
                     None => {

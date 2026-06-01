@@ -26,12 +26,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use indra_core::codec::Encode;
 use indra_core::types::{
     block::BlockV1,
     primitives::Bytes32,
-    vote::VoteV1,
+    vote::{VoteStep, VoteV1},
 };
 use indra_consensus::{
+    build_qc,
     vote::{RegisteredVoter, VoteCollector, VoteDecision},
 };
 
@@ -106,6 +108,10 @@ pub struct ConsensusDriver {
     slash_detector: SlashDetector,
     /// Vote collectors keyed by (height, round).
     vote_collectors: HashMap<(u64, u32), VoteCollector>,
+    /// Pending blocks by block hash until precommit quorum forms.
+    pending_blocks: HashMap<Bytes32, BlockV1>,
+    /// Serialised QC for the most recently finalised height.
+    last_qc_bytes: Vec<u8>,
     /// Registered voters for the current epoch.
     registered_voters: Vec<RegisteredVoter>,
 }
@@ -113,18 +119,32 @@ pub struct ConsensusDriver {
 impl ConsensusDriver {
     /// Create a new driver from a node engine.
     pub fn new(engine: NodeEngine) -> Self {
-        Self {
+        let mut driver = Self {
             engine,
             slash_detector: SlashDetector::new(),
             vote_collectors: HashMap::new(),
+            pending_blocks: HashMap::new(),
+            last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
-        }
+        };
+        driver.refresh_registered_voters();
+        driver
     }
 
     /// Register voters for the current epoch (called on epoch transition).
     pub fn set_voters(&mut self, voters: Vec<RegisteredVoter>) {
         self.vote_collectors.clear();
         self.registered_voters = voters;
+    }
+
+    /// Refresh the registered voter list from the engine's active validator set.
+    pub fn refresh_registered_voters(&mut self) {
+        self.set_voters(self.engine.registered_voters());
+    }
+
+    /// Return the previously finalised QC bytes for the next proposal header.
+    pub fn last_qc_bytes(&self) -> Vec<u8> {
+        self.last_qc_bytes.clone()
     }
 
     /// Process one inbound event. Returns a list of actions to take.
@@ -146,21 +166,26 @@ impl ConsensusDriver {
     }
 
     fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
-        let height = block.header.height;
-
-        // Try to import (validate + apply + store)
-        match self.engine.commit_block(&block) {
-            Ok(_) => {
-                // Prune slash detector state older than this height
-                self.slash_detector.prune_below(height.saturating_sub(100));
-                vec![DriverAction::BroadcastBlock(block)]
-            }
-            Err(NodeError::BlockInvalid { height: _, reason: _ }) => {
-                // Don't broadcast invalid blocks
-                vec![DriverAction::None]
-            }
-            Err(_) => vec![DriverAction::None],
+        if block.header.height != self.engine.state.height + 1
+            || block.header.prev_hash != self.engine.state.tip_hash
+        {
+            return vec![DriverAction::None];
         }
+
+        let mut projected_state = self.engine.state.clone();
+        if indra_state::apply_block(&mut projected_state, &block).is_err() {
+            return vec![DriverAction::None];
+        }
+
+        let block_hash = block.header.block_hash();
+        self.pending_blocks.insert(block_hash, block.clone());
+
+        let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
+        if let Ok(local_vote) = self.engine.sign_vote(block.header.height, 0, VoteStep::Precommit, block_hash) {
+            actions.extend(self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote));
+        }
+
+        actions
     }
 
     fn process_vote(&mut self, _from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
@@ -172,6 +197,12 @@ impl ConsensusDriver {
         }
 
         // Route to appropriate vote collector
+        actions.extend(self.record_vote_and_actions(_from, vote));
+        actions
+    }
+
+    fn record_vote_and_actions(&mut self, _from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+        let mut actions = Vec::new();
         let key = (vote.height, vote.round);
         let collector = self.vote_collectors
             .entry(key)
@@ -183,20 +214,53 @@ impl ConsensusDriver {
             ));
 
         match collector.add_vote(vote.clone()) {
-            Ok(VoteDecision::QuorumReached { block_hash: _, stake_bps: _ }) => {
-                // Quorum reached — in Phase 7 this triggers QC construction
-                // For now just broadcast the vote
-                actions.push(DriverAction::BroadcastVote(vote));
+            Ok(VoteDecision::QuorumReached { block_hash, stake_bps: _ }) => {
+                actions.push(DriverAction::BroadcastVote(vote.clone()));
+                actions.extend(self.finalize_block_on_quorum(vote.height, vote.round, block_hash));
             }
             Ok(VoteDecision::Waiting) => {
                 actions.push(DriverAction::BroadcastVote(vote));
             }
-            Err(_) => {
-                // Invalid vote — no action
-            }
+            Err(_) => {}
         }
 
         actions
+    }
+
+    fn finalize_block_on_quorum(&mut self, height: u64, round: u32, block_hash: Bytes32) -> Vec<DriverAction> {
+        let Some(block) = self.pending_blocks.remove(&block_hash) else {
+            return vec![DriverAction::None];
+        };
+        let key = (height, round);
+        let Some(collector) = self.vote_collectors.get(&key) else {
+            return vec![DriverAction::None];
+        };
+
+        let qc_validators = self.engine.qc_validators();
+        if qc_validators.len() != self.registered_voters.len() {
+            return vec![DriverAction::None];
+        }
+        let quorum_votes: Vec<&VoteV1> = collector
+            .accepted_votes()
+            .into_iter()
+            .filter(|vote| vote.block_hash == block_hash && vote.step == VoteStep::Precommit)
+            .collect();
+        let qc = match build_qc(height, round, block_hash, &qc_validators, quorum_votes) {
+            Ok(qc) => qc,
+            Err(_) => return vec![DriverAction::None],
+        };
+
+        match self.engine.commit_block(&block) {
+            Ok(_) => {
+                self.last_qc_bytes = qc.encode_to_vec();
+                self.vote_collectors.remove(&key);
+                self.slash_detector.prune_below(height.saturating_sub(100));
+                self.refresh_registered_voters();
+                vec![DriverAction::BroadcastBlock(block)]
+            }
+            Err(NodeError::BlockInvalid { .. }) => vec![DriverAction::None],
+            Err(_) => vec![DriverAction::None],
+        }
     }
 
     fn process_tx(&mut self, _from: SocketAddr, tx_bytes: Vec<u8>) -> Vec<DriverAction> {
@@ -246,9 +310,14 @@ mod tests {
     use indra_core::{
         Bytes32, ProtocolVersion, VariableBytes,
         types::block::{BlockHeaderV1, BlockV1},
-        types::primitives::MAX_VRF_PROOF_BYTES,
+        types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES},
         types::vote::VoteStep,
     };
+    use indra_crypto::{
+        VrfKeypair,
+        hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+    };
+    use indra_state::{ValidatorEntry, ValidatorStatus};
     use crate::NodeConfig;
     use std::path::PathBuf;
 
@@ -279,12 +348,42 @@ mod tests {
         }
     }
 
+    fn install_single_active_validator(driver: &mut ConsensusDriver, seed: [u8; 32]) {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let hybrid = HybridKeypair::new(classical, pq);
+        let public = hybrid.public_key();
+        let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+
+        driver.engine.state.validators.upsert(ValidatorEntry {
+            validator_id,
+            name: "test-validator".to_string(),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.clone()),
+            vrf_pk: Some(vrf_pk),
+            stake_spark: 1_000_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: DEFAULT_COMMISSION_BPS,
+            min_delegation_spark: DUST_LIMIT_SPARK,
+        }).unwrap();
+        driver.refresh_registered_voters();
+    }
+
     #[test]
     fn driver_commits_valid_block() {
         let dir = temp_dir("a");
-        let config = NodeConfig::local_test(dir.clone());
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&[0x42u8; 32]).unwrap();
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         let mut driver = ConsensusDriver::new(engine);
+        install_single_active_validator(&mut driver, [0x42u8; 32]);
 
         let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });

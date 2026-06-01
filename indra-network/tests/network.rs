@@ -8,7 +8,7 @@ use indra_core::types::primitives::Bytes32;
 use indra_network::{
     message::Message,
     peer::{PeerTable, PeerStatus, ScoreEvent, INITIAL_SCORE},
-    transport::Transport,
+    transport::{RecvStatus, Transport},
     gossip::GossipEngine,
 };
 
@@ -73,7 +73,10 @@ fn two_nodes_exchange_status() {
         loop {
             match server_transport.accept().unwrap() {
                 Some(mut conn) => {
-                    let msg = conn.recv().unwrap().unwrap();
+                    let msg = match conn.recv().unwrap() {
+                        RecvStatus::Message(msg) => msg,
+                        _ => panic!("unexpected recv status"),
+                    };
                     // Echo back a status
                     let response = Message::Status {
                         height: 100,
@@ -108,7 +111,10 @@ fn two_nodes_exchange_status() {
         _ => panic!("wrong message type"),
     }
 
-    let response = conn.recv().unwrap().unwrap();
+    let response = match conn.recv().unwrap() {
+        RecvStatus::Message(msg) => msg,
+        _ => panic!("unexpected recv status"),
+    };
     match response {
         Message::Status { height, .. } => assert_eq!(height, 100),
         _ => panic!("wrong response type"),

@@ -37,6 +37,10 @@ pub enum NodeError {
         height: u64,
     },
 
+    /// The node is not configured as a validator for local signing.
+    #[error("node is not configured as a validator")]
+    NotValidator,
+
     /// Genesis state mismatch.
     #[error("genesis mismatch: stored genesis differs from configured genesis")]
     GenesisMismatch,

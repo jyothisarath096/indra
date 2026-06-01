@@ -23,7 +23,7 @@ use indra_core::types::primitives::{
 use indra_network::{
     message::Message,
     peer::ScoreEvent,
-    transport::Transport,
+    transport::{RecvStatus, Transport},
     gossip::GossipEngine,
 };
 use indra_node::{
@@ -131,7 +131,9 @@ fn main() {
     println!("Height:    {}", engine.height());
     println!("\nStarting P2P and consensus...\n");
 
-    let driver = ConsensusDriver::new(engine);
+    let mut driver_state = ConsensusDriver::new(engine);
+    driver_state.refresh_registered_voters();
+    let driver = driver_state;
 
     // Shared state between threads
     let driver    = Arc::new(Mutex::new(driver));
@@ -151,7 +153,7 @@ fn main() {
             println!("[P2P] Listening on {}", p2p);
 
             for stream in listener.incoming() {
-                match stream {
+                        match stream {
                     Ok(stream) => {
                         let addr = match stream.peer_addr() {
                             Ok(a) => a,
@@ -240,9 +242,14 @@ fn main() {
                     let msg = {
                         let mut g = gossip.lock().unwrap();
                         match g.recv_from(&addr) {
-                            Ok(Some(m)) => Some(m),
-                            Ok(None) => {
+                            Ok(RecvStatus::Message(m)) => Some(m),
+                            Ok(RecvStatus::NoData) => {
                                 // No data yet — keep connection alive
+                                None
+                            }
+                            Ok(RecvStatus::Disconnected) => {
+                                eprintln!("[gossip] peer {} disconnected", addr);
+                                g.remove_connection(&addr);
                                 None
                             }
                             Err(e) => {
@@ -326,8 +333,6 @@ fn main() {
                         // VRF-based proposer election
                         let should_propose = {
                             let d = driver.lock().unwrap();
-                            let vrf_seed = d.engine.config.vrf_seed.unwrap_or([0u8; 32]);
-                            let vrf_kp = indra_crypto::VrfKeypair::from_seed(&vrf_seed);
                             let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                 indra_crypto::sha256(&d.engine.state.tip_hash.0)
                             );
@@ -352,12 +357,7 @@ fn main() {
                                     height,
                                     candidates,
                                 };
-                                let slot = indra_consensus::proposer::compute_proposer_vrf(
-                                    &vrf_kp, &epoch_seed, height
-                                );
-                                let elected = indra_consensus::elect_proposer(&election)
-                                    .unwrap_or(indra_core::types::primitives::Bytes32::ZERO);
-                                elected == slot.proposer_id
+                                d.engine.is_proposer(&election)
                             }
                         };
 
@@ -370,50 +370,58 @@ fn main() {
                         }
 
                         if should_propose {
-                            // Propose a block
-                            use indra_core::{
-                                Bytes32, ProtocolVersion, VariableBytes,
-                                types::block::{BlockHeaderV1, BlockV1},
-                                types::primitives::{MAX_VRF_PROOF_BYTES},
+                            let proposal = {
+                                let mut d = driver.lock().unwrap();
+                                let epoch_seed = indra_core::types::primitives::Bytes32::from(
+                                    indra_crypto::sha256(&d.engine.state.tip_hash.0)
+                                );
+                                let height = d.engine.state.height + 1;
+                                let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
+                                    d.engine.state.validators.active_validators()
+                                        .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
+                                            validator_id: v.validator_id,
+                                            vrf_pubkey: vrf_pk,
+                                            stake: v.stake_spark,
+                                        }))
+                                        .collect();
+                                let election = indra_consensus::proposer::ProposerElection {
+                                    epoch_seed,
+                                    height,
+                                    candidates,
+                                };
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                match d.engine.propose(&election, timestamp, d.last_qc_bytes()) {
+                                    Ok(block) => {
+                                        let actions = d.process(DriverEvent::InboundBlock {
+                                            from: None,
+                                            block: block.clone(),
+                                        });
+                                        Some((block, actions))
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[consensus] proposal failed: {}", e);
+                                        None
+                                    }
+                                }
                             };
 
-                            let (prev_hash, base_fee, new_height) = {
-                                let d = driver.lock().unwrap();
-                                (d.engine.state.tip_hash, d.engine.state.base_fee, d.engine.state.height + 1)
-                            };
+                            if let Some((block, actions)) = proposal {
+                                for action in actions {
+                                    if let Some(out_msg) = action_to_message(&action) {
+                                        let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                    }
+                                }
 
-                            let block = BlockV1 {
-                                header: BlockHeaderV1 {
-                                    protocol_version:    ProtocolVersion::CURRENT,
-                                    height:              new_height,
-                                    prev_hash,
-                                    timestamp:           std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    state_root:          Bytes32::ZERO,
-                                    validator_set_root:  Bytes32::ZERO,
-                                    mempool_set_root:    Bytes32::ZERO,
-                                    base_fee,
-                                    proposer_vrf_output: Bytes32::ZERO,
-                                    proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-                                    quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
-                                },
-                                transactions:      vec![],
-                                slashing_evidence: vec![],
-                                governance_ops:    vec![],
-                            };
-
-                            // Process locally
-                            let _actions = driver.lock().unwrap().process(
-                                DriverEvent::InboundBlock { from: None, block: block.clone() }
-                            );
-
-                            // Broadcast to peers
-                            let _ = gossip.lock().unwrap().broadcast(&Message::Block(block));
-
-                            let new_h = driver.lock().unwrap().height();
-                            println!("[consensus] ✓ proposed block → height={}", new_h);
+                                let new_h = driver.lock().unwrap().height();
+                                println!(
+                                    "[consensus] ✓ proposed block {} → height={}",
+                                    hex::encode(block.header.block_hash().0),
+                                    new_h
+                                );
+                            }
                         }
                     }
                 }

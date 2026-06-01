@@ -24,6 +24,8 @@ use indra_consensus::{
     mempool::Mempool,
     proposer::{ProposerElection, compute_proposer_vrf, elect_proposer},
     producer::{BlockTemplate, produce_block},
+    qc::QcValidator,
+    vote::{RegisteredVoter, produce_vote},
 };
 use indra_storage::{BlockStore, StateStore};
 
@@ -145,7 +147,8 @@ impl NodeEngine {
     /// Check if this node is the elected proposer for the next height.
     pub fn is_proposer(&self, election: &ProposerElection) -> bool {
         let Some(vrf_kp) = &self.vrf_keypair else { return false; };
-        let slot = compute_proposer_vrf(vrf_kp, &election.epoch_seed, self.state.height + 1);
+        let Some(validator_id) = self.validator_id else { return false; };
+        let slot = compute_proposer_vrf(validator_id, vrf_kp, &election.epoch_seed, self.state.height + 1);
         let elected = match elect_proposer(election) {
             Ok(id) => id,
             Err(_) => return false,
@@ -172,6 +175,49 @@ impl NodeEngine {
         };
 
         produce_block(&template, &self.state, &self.mempool, election)
+            .map_err(NodeError::Consensus)
+    }
+
+    /// Build the current epoch voter list from active validators.
+    pub fn registered_voters(&self) -> Vec<RegisteredVoter> {
+        let mut active: Vec<_> = self.state.validators.active_validators().collect();
+        active.sort_by_key(|validator| validator.validator_id.0);
+        active.into_iter()
+            .filter_map(|validator| Some(RegisteredVoter {
+                validator_id: validator.validator_id,
+                classical_pk: validator.hybrid_classical_pk?,
+                pq_pk: validator.hybrid_pq_pk.clone()?,
+                stake: validator.stake_spark,
+            }))
+            .collect()
+    }
+
+    /// Build the QC validator list for the current epoch.
+    pub fn qc_validators(&self) -> Vec<QcValidator> {
+        let mut active: Vec<_> = self.state.validators.active_validators().collect();
+        active.sort_by_key(|validator| validator.validator_id.0);
+        active.into_iter()
+            .enumerate()
+            .filter_map(|(position, validator)| Some(QcValidator {
+                validator_id: validator.validator_id,
+                position,
+                pq_pk: validator.hybrid_pq_pk.clone()?,
+                stake: validator.stake_spark,
+            }))
+            .collect()
+    }
+
+    /// Sign a consensus vote with this node's validator keypair.
+    pub fn sign_vote(
+        &self,
+        height: u64,
+        round: u32,
+        step: indra_core::types::vote::VoteStep,
+        block_hash: Bytes32,
+    ) -> NodeResult<indra_core::types::vote::VoteV1> {
+        let validator_id = self.validator_id.ok_or(NodeError::NotValidator)?;
+        let hybrid_keypair = self.hybrid_keypair.as_ref().ok_or(NodeError::NotValidator)?;
+        produce_vote(height, round, step, block_hash, validator_id, hybrid_keypair)
             .map_err(NodeError::Consensus)
     }
 

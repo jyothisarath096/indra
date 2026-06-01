@@ -25,7 +25,7 @@ use crate::{
     error::{NetworkError, NetworkResult},
     message::Message,
     peer::{PeerTable, ScoreEvent},
-    transport::Connection,
+    transport::{Connection, RecvStatus},
 };
 
 /// Maximum gossip fanout per message.
@@ -154,11 +154,11 @@ impl GossipEngine {
     }
 
     /// Receive one message from a specific peer connection.
-    pub fn recv_from(&mut self, addr: &SocketAddr) -> NetworkResult<Option<Message>> {
+    pub fn recv_from(&mut self, addr: &SocketAddr) -> NetworkResult<RecvStatus> {
         if let Some(conn) = self.connections.get_mut(addr) {
             conn.recv()
         } else {
-            Ok(None)
+            Ok(RecvStatus::NoData)
         }
     }
 

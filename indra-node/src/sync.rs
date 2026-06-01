@@ -16,7 +16,7 @@ use indra_consensus::mempool::Mempool;
 use indra_storage::{BlockStore, StateStore};
 use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_consensus::{
-    proposer::{ProposerCandidate, compute_vrf_input},
+    proposer::{ProposerCandidate, ProposerElection, compute_vrf_input, elect_proposer},
     qc::{QcValidator, verify_qc, verify_qc_strict},
 };
 use indra_crypto::{VrfOutput, VrfProof, vrf_verify};
@@ -122,7 +122,10 @@ fn verify_proposer_vrf(
         return Ok(());
     }
 
-    let vrf_input = compute_vrf_input(&state.tip_hash.0, block.header.height);
+    let epoch_seed = indra_core::types::primitives::Bytes32::from(
+        indra_crypto::sha256(&state.tip_hash.0)
+    );
+    let vrf_input = compute_vrf_input(&epoch_seed.0, block.header.height);
     let proof = VrfProof(proof_bytes.to_vec());
     let output = VrfOutput(block.header.proposer_vrf_output.0);
 
@@ -137,11 +140,20 @@ fn verify_proposer_vrf(
         });
     }
 
-    // NOTE: the current block header does not carry enough information to
-    // re-run the full stake-weighted proposer election for every validator.
-    // This check proves ownership of the VRF proof by an active validator and
-    // fails closed on ambiguity; a future header revision should commit the
-    // elected proposer identity or the election transcript explicitly.
+    let matched_validator_id = matching_candidates[0].validator_id;
+    let election = ProposerElection {
+        epoch_seed,
+        height: block.header.height,
+        candidates,
+    };
+    let elected = elect_proposer(&election).map_err(NodeError::Consensus)?;
+    if matched_validator_id != elected {
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: "block was proposed by a validator that did not win the slot".to_string(),
+        });
+    }
+
     Ok(())
 }
 

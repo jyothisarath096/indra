@@ -64,6 +64,10 @@ pub fn produce_block(
 ) -> ConsensusResult<BlockV1> {
     // Verify this keypair is the elected proposer
     let slot = compute_proposer_vrf(
+        election.candidates.iter()
+            .find(|candidate| candidate.vrf_pubkey == template.proposer_vrf_keypair.public_key())
+            .map(|candidate| candidate.validator_id)
+            .ok_or(ConsensusError::WrongProposer)?,
         &template.proposer_vrf_keypair,
         &template.epoch_seed,
         state.height + 1,
@@ -147,17 +151,16 @@ mod tests {
         mempool::Mempool,
     };
 
-    fn make_election(seed: &[u8; 32], height: u64, vrf_pk: [u8; 32], stake: u64) -> ProposerElection {
-        // VrfKeypair::from_seed(vrf_pk).public_key() == sha256(vrf_pk)
-        // compute_proposer_vrf returns proposer_id = sha256(public_key) = sha256(sha256(vrf_pk))
-        // elect_proposer uses candidate.vrf_pubkey as the seed, same derivation, so IDs match.
+    fn make_election(seed: &[u8; 32], height: u64, vrf_seed: [u8; 32], stake: u64) -> ProposerElection {
+        let vrf_pubkey = VrfKeypair::from_seed(&vrf_seed).public_key();
+        let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
         ProposerElection {
             epoch_seed: Bytes32::from(*seed),
             height,
             candidates: vec![
                 crate::proposer::ProposerCandidate {
-                    validator_id: Bytes32::from(indra_crypto::sha256(&indra_crypto::VrfKeypair::from_seed(&vrf_pk).public_key())),
-                    vrf_pubkey:   vrf_pk,
+                    validator_id,
+                    vrf_pubkey:   vrf_pubkey,
                     stake,
                 }
             ],
