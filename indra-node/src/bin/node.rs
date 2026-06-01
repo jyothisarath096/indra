@@ -361,6 +361,14 @@ fn main() {
                             }
                         };
 
+                        // Debug: log proposer election result every tick
+                        {
+                            let d = driver.lock().unwrap();
+                            let cand_count = d.engine.state.validators.active_validators()
+                                .filter(|v| v.vrf_pk.is_some()).count();
+                            eprintln!("[proposer] candidates={} should_propose={}", cand_count, should_propose);
+                        }
+
                         if should_propose {
                             // Propose a block
                             use indra_core::{
