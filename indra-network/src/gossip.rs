@@ -153,6 +153,20 @@ impl GossipEngine {
         conn.send(msg)
     }
 
+    /// Receive one message from a specific peer connection.
+    pub fn recv_from(&mut self, addr: &SocketAddr) -> NetworkResult<Option<Message>> {
+        if let Some(conn) = self.connections.get_mut(addr) {
+            conn.recv()
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Return the socket addresses of all connected peers.
+    pub fn connected_addrs(&self) -> Vec<SocketAddr> {
+        self.connections.keys().cloned().collect()
+    }
+
     /// Check if a message hash has been seen recently.
     pub fn is_seen(&self, hash: &[u8; 32]) -> bool {
         self.seen_set.contains(hash)

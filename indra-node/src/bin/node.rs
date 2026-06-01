@@ -8,8 +8,7 @@
 //!   gossip_recv   — reads messages from all connected peers, routes to driver
 //!   consensus     — every 6s: check if proposer, propose block, broadcast votes
 
-use std::collections::HashMap;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +23,7 @@ use indra_core::types::primitives::{
 use indra_network::{
     message::Message,
     peer::ScoreEvent,
-    transport::{Transport, Connection},
+    transport::Transport,
     gossip::GossipEngine,
 };
 use indra_node::{
@@ -137,13 +136,10 @@ fn main() {
     // Shared state between threads
     let driver    = Arc::new(Mutex::new(driver));
     let gossip    = Arc::new(Mutex::new(GossipEngine::new()));
-    // connection map: addr → Connection (for gossip_recv thread)
-    let conns: Arc<Mutex<HashMap<SocketAddr, Connection>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // ── Thread 1: P2P listener ──────────────────────────────────────────────
     {
         let gossip  = Arc::clone(&gossip);
-        let conns   = Arc::clone(&conns);
         let driver  = Arc::clone(&driver);
         let p2p     = p2p_addr.clone();
 
@@ -165,13 +161,8 @@ fn main() {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-                        // Add to gossip engine
-                        if let Ok(conn) = Connection::from_stream(stream.try_clone().unwrap_or_else(|_| panic!("clone failed"))) {
+                        if let Ok(conn) = indra_network::transport::Connection::from_stream(stream) {
                             let _ = gossip.lock().unwrap().add_connection(addr, conn);
-                        }
-                        // Add raw stream to conns for recv loop
-                        if let Ok(conn2) = Connection::from_stream(stream) {
-                            conns.lock().unwrap().insert(addr, conn2);
                         }
 
                         // Send our status
@@ -191,7 +182,6 @@ fn main() {
     // ── Thread 2: Peer dialer ───────────────────────────────────────────────
     {
         let gossip   = Arc::clone(&gossip);
-        let conns    = Arc::clone(&conns);
         let driver   = Arc::clone(&driver);
         let peers    = bootstrap_peers.clone();
         std::thread::spawn(move || {
@@ -219,19 +209,7 @@ fn main() {
                     match transport.dial(addr) {
                         Ok(conn) => {
                             println!("[P2P] Connected to {}", addr);
-                            // Add to gossip
-                            let conn2 = match TcpStream::connect(addr) {
-                                Ok(s) => {
-                                    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
-                                    match Connection::from_stream(s) {
-                                        Ok(c) => c,
-                                        Err(_) => continue,
-                                    }
-                                }
-                                Err(_) => continue,
-                            };
                             let _ = gossip.lock().unwrap().add_connection(addr, conn);
-                            conns.lock().unwrap().insert(addr, conn2);
 
                             // Send status
                             let height   = driver.lock().unwrap().height();
@@ -251,32 +229,27 @@ fn main() {
 
     // ── Thread 3: Gossip receive loop ───────────────────────────────────────
     {
-        let conns   = Arc::clone(&conns);
         let gossip  = Arc::clone(&gossip);
         let driver  = Arc::clone(&driver);
 
         std::thread::spawn(move || {
             loop {
-                // Collect addrs to avoid holding lock while reading
-                let addrs: Vec<SocketAddr> = conns.lock().unwrap().keys().cloned().collect();
+                let addrs = gossip.lock().unwrap().connected_addrs();
 
                 for addr in addrs {
                     let msg = {
-                        let mut c = conns.lock().unwrap();
-                        if let Some(conn) = c.get_mut(&addr) {
-                            match conn.recv() {
-                                Ok(Some(m)) => Some(m),
-                                Ok(None) => {
-                                    // Connection closed
-                                    eprintln!("[gossip] peer {} disconnected", addr);
-                                    c.remove(&addr);
-                                    gossip.lock().unwrap().remove_connection(&addr);
-                                    None
-                                }
-                                Err(_) => None,
+                        let mut g = gossip.lock().unwrap();
+                        match g.recv_from(&addr) {
+                            Ok(Some(m)) => Some(m),
+                            Ok(None) => {
+                                eprintln!("[gossip] peer {} disconnected", addr);
+                                g.remove_connection(&addr);
+                                None
                             }
-                        } else {
-                            None
+                            Err(_) => {
+                                g.remove_connection(&addr);
+                                None
+                            }
                         }
                     };
 
