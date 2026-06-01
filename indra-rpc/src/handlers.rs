@@ -198,8 +198,9 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
     };
 
     Ok(format!(
-        r#"{{"validator_id":"{id}","stake":{stake},"status":"{status}","epoch_joined":{epoch}}}"#,
+        r#"{{"validator_id":"{id}","name":"{name}","stake":{stake},"status":"{status}","epoch_joined":{epoch}}}"#,
         id     = id_hex,
+        name   = validator.name,
         stake  = validator.stake_spark,
         status = status,
         epoch  = validator.registered_epoch,
@@ -209,13 +210,14 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
 /// `indra_getValidatorSet` — returns all active validators.
 ///
 /// Result: `{"validators": [{"validator_id", "stake"}, ...]}`
+// v2 — includes name field
 fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
     let mut entries = Vec::new();
     for v in state.engine.state.validators.active_validators() {
         let id_hex = hex::encode(v.validator_id.0);
         entries.push(format!(
-            r#"{{"validator_id":"{}","stake":{}}}"#,
-            id_hex, v.stake_spark
+            r#"{{"validator_id":"{}","name":"{}","stake":{}}}"#,
+            id_hex, v.name, v.stake_spark
         ));
     }
     Ok(format!(r#"{{"validators":[{}]}}"#, entries.join(",")))

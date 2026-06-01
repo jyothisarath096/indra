@@ -668,8 +668,9 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
             "indra_getValidatorSet" => {
                 let entries: Vec<String> = s.validators.active_validators().map(|v| {
                     format!(
-                        r#"{{"validator_id":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{}}}"#,
+                        r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{}}}"#,
                         hex::encode(v.validator_id.0),
+                        v.name,
                         v.stake_spark,
                         v.commission_bps,
                         v.pending_rewards,

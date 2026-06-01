@@ -30,6 +30,8 @@ pub enum ValidatorStatus {
 pub struct ValidatorEntry {
     /// Validator identity: SHA-256(hybrid_public_key_bytes).
     pub validator_id: Bytes32,
+    /// Human-readable validator display name.
+    pub name: String,
     /// Ed25519 public key bytes for vote signature verification.
     pub hybrid_classical_pk: Option<[u8; 32]>,
     /// Dilithium public key bytes for vote signature verification.
@@ -212,6 +214,7 @@ mod tests {
     fn make_validator(id_byte: u8, stake: u64, epoch: u64) -> ValidatorEntry {
         ValidatorEntry {
             validator_id:     Bytes32::from([id_byte; 32]),
+            name:             format!("validator-{id_byte}"),
             hybrid_classical_pk: None,
             hybrid_pq_pk:    None,
             vrf_pk:          None,

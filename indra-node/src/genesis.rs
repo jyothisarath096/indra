@@ -154,6 +154,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
 
         let entry = ValidatorEntry {
             validator_id,
+            name: name.clone(),
             hybrid_classical_pk: parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
             hybrid_pq_pk: parse_vec_hex(v.get("hybrid_pq_pk")),
             vrf_pk: parse_fixed_hex::<32>(v.get("vrf_pk")),
