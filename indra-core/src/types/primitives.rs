@@ -180,22 +180,22 @@ pub const MAX_ACTIVE_VALIDATORS: usize = 200;
 pub const TARGET_VALIDATOR_SET_SIZE: u64 = 150;
 
 /// Phase 1 total-stake threshold for validator set expansion.
-pub const VALIDATOR_SET_PHASE1_STAKE: u64 = 10_000_000 * SPARK_PER_INDRA;
+pub const VALIDATOR_SET_PHASE1_STAKE: u64 = 1_000_000 * SPARK_PER_INDRA;
 
 /// Phase 2 total-stake threshold for validator set expansion.
-pub const VALIDATOR_SET_PHASE2_STAKE: u64 = 100_000_000 * SPARK_PER_INDRA;
+pub const VALIDATOR_SET_PHASE2_STAKE: u64 = 10_000_000 * SPARK_PER_INDRA;
 
 /// Phase 3 total-stake threshold for validator set expansion.
-pub const VALIDATOR_SET_PHASE3_STAKE: u64 = 500_000_000 * SPARK_PER_INDRA;
+pub const VALIDATOR_SET_PHASE3_STAKE: u64 = 50_000_000 * SPARK_PER_INDRA;
 
 /// Maximum active validators during Phase 1.
-pub const VALIDATOR_SET_PHASE1_MAX: usize = 50;
+pub const VALIDATOR_SET_PHASE1_MAX: usize = 20;
 
 /// Maximum active validators during Phase 2.
-pub const VALIDATOR_SET_PHASE2_MAX: usize = 100;
+pub const VALIDATOR_SET_PHASE2_MAX: usize = 50;
 
 /// Maximum active validators during Phase 3.
-pub const VALIDATOR_SET_PHASE3_MAX: usize = 150;
+pub const VALIDATOR_SET_PHASE3_MAX: usize = 100;
 
 /// Maximum active validators during Phase 4.
 pub const VALIDATOR_SET_PHASE4_MAX: usize = 200;
