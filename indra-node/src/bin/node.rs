@@ -242,11 +242,11 @@ fn main() {
                         match g.recv_from(&addr) {
                             Ok(Some(m)) => Some(m),
                             Ok(None) => {
-                                eprintln!("[gossip] peer {} disconnected", addr);
-                                g.remove_connection(&addr);
+                                // No data yet — keep connection alive
                                 None
                             }
-                            Err(_) => {
+                            Err(e) => {
+                                eprintln!("[gossip] peer {} disconnected: {}", addr, e);
                                 g.remove_connection(&addr);
                                 None
                             }

@@ -57,7 +57,8 @@ impl Connection {
         match self.stream.read_exact(&mut len_buf) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None), // timeout — no data yet
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(None), // timeout — no data yet
             Err(e) => return Err(NetworkError::Io(e)),
         }
 
