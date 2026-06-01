@@ -61,6 +61,8 @@ pub struct ValidatorKeys {
 /// A complete keys file including private seeds.
 #[derive(Debug, Clone)]
 pub struct KeysFile {
+    /// Validator display name chosen at key generation.
+    pub name: String,
     /// All public keys.
     pub public: ValidatorKeys,
     /// Hybrid keypair seed (keep secret).
@@ -79,6 +81,7 @@ impl KeysFile {
         let v = &self.public;
         format!(
             r#"{{
+  "name": "{name}",
   "validator_id": "{validator_id}",
   "mnemonic_hint": "Back up your 24-word BIP-39 recovery phrase separately. It is never stored in this file.",
   "public": {{
@@ -95,6 +98,7 @@ impl KeysFile {
     "WARNING": "Keep private seeds secret. Never share this section."
   }}
 }}"#,
+            name         = self.name,
             validator_id = hex::encode(v.validator_id),
             classical    = hex::encode(v.hybrid_classical_pk),
             pq           = hex::encode(&v.hybrid_pq_pk),
@@ -110,6 +114,7 @@ impl KeysFile {
 
 /// Generate a complete set of validator keypairs from three seeds.
 pub fn generate_keypairs(
+    name: String,
     hybrid_seed: [u8; 32],
     bls_seed: [u8; 32],
     vrf_seed: [u8; 32],
@@ -133,6 +138,7 @@ pub fn generate_keypairs(
     let pq_sk = pq_sk_bytes;
 
     Ok(KeysFile {
+        name,
         public: ValidatorKeys {
             validator_id,
             hybrid_classical_pk: pk.classical.0,
@@ -151,30 +157,30 @@ pub fn generate_keypairs(
 ///
 /// This is NOT cryptographically secure — use proper random seeds in production.
 /// This is for testnet convenience only.
-pub fn generate_from_passphrase(passphrase: &str) -> CliResult<KeysFile> {
+pub fn generate_from_passphrase(passphrase: &str, name: String) -> CliResult<KeysFile> {
     use indra_crypto::hash::domain_hash;
     let hybrid_seed = domain_hash(b"INDRA-KEYGEN-HYBRID-v1", passphrase.as_bytes());
     let bls_seed    = domain_hash(b"INDRA-KEYGEN-BLS-v1",    passphrase.as_bytes());
     let vrf_seed    = domain_hash(b"INDRA-KEYGEN-VRF-v1",    passphrase.as_bytes());
-    generate_keypairs(hybrid_seed, bls_seed, vrf_seed)
+    generate_keypairs(name, hybrid_seed, bls_seed, vrf_seed)
 }
 
 /// Generate a complete validator keypair set from a new mnemonic.
-pub fn generate_from_new_mnemonic() -> CliResult<(String, KeysFile)> {
+pub fn generate_from_new_mnemonic(name: String) -> CliResult<(String, KeysFile)> {
     let phrase = generate_mnemonic();
     let master_seed = mnemonic_to_seed(&phrase)
         .map_err(|e| CliError::Crypto(e.to_string()))?;
     let derived = derive_all_seeds(&master_seed);
-    let keys = generate_keypairs(derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)?;
+    let keys = generate_keypairs(name, derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)?;
     Ok((phrase, keys))
 }
 
 /// Recover a validator keypair set from an existing mnemonic.
-pub fn recover_from_mnemonic(phrase: &str) -> CliResult<KeysFile> {
+pub fn recover_from_mnemonic(phrase: &str, name: String) -> CliResult<KeysFile> {
     let master_seed = mnemonic_to_seed(phrase)
         .map_err(|e| CliError::Crypto(e.to_string()))?;
     let derived = derive_all_seeds(&master_seed);
-    generate_keypairs(derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)
+    generate_keypairs(name, derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)
 }
 
 #[cfg(test)]
@@ -183,7 +189,14 @@ mod tests {
 
     #[test]
     fn keygen_produces_all_fields() {
-        let keys = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
+        let keys = generate_keypairs(
+            "validator".to_string(),
+            [0x01u8; 32],
+            [0x02u8; 32],
+            [0x03u8; 32],
+        )
+        .unwrap();
+        assert_eq!(keys.name, "validator");
         assert_eq!(keys.public.hybrid_classical_pk.len(), 32);
         assert_eq!(keys.public.bls_pk.len(), 48);
         assert_eq!(keys.public.vrf_pk.len(), 32);
@@ -192,9 +205,22 @@ mod tests {
 
     #[test]
     fn keygen_is_deterministic() {
-        let k1 = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
-        let k2 = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
+        let k1 = generate_keypairs(
+            "validator".to_string(),
+            [0x01u8; 32],
+            [0x02u8; 32],
+            [0x03u8; 32],
+        )
+        .unwrap();
+        let k2 = generate_keypairs(
+            "validator".to_string(),
+            [0x01u8; 32],
+            [0x02u8; 32],
+            [0x03u8; 32],
+        )
+        .unwrap();
         assert_eq!(k1.public.validator_id, k2.public.validator_id);
+        assert_eq!(k1.name, k2.name);
         assert_eq!(k1.public.hybrid_classical_pk, k2.public.hybrid_classical_pk);
         assert_eq!(k1.public.hybrid_pq_pk, k2.public.hybrid_pq_pk);
         assert_eq!(k1.public.bls_pk, k2.public.bls_pk);
@@ -204,29 +230,49 @@ mod tests {
 
     #[test]
     fn different_seeds_give_different_keys() {
-        let k1 = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
-        let k2 = generate_keypairs([0xFFu8; 32], [0xFEu8; 32], [0xFDu8; 32]).unwrap();
+        let k1 = generate_keypairs(
+            "alice".to_string(),
+            [0x01u8; 32],
+            [0x02u8; 32],
+            [0x03u8; 32],
+        )
+        .unwrap();
+        let k2 = generate_keypairs(
+            "bob".to_string(),
+            [0xFFu8; 32],
+            [0xFEu8; 32],
+            [0xFDu8; 32],
+        )
+        .unwrap();
         assert_ne!(k1.public.validator_id, k2.public.validator_id);
     }
 
     #[test]
     fn passphrase_keygen_is_deterministic() {
-        let k1 = generate_from_passphrase("testnet-validator-1").unwrap();
-        let k2 = generate_from_passphrase("testnet-validator-1").unwrap();
+        let k1 = generate_from_passphrase("testnet-validator-1", "validator".to_string()).unwrap();
+        let k2 = generate_from_passphrase("testnet-validator-1", "validator".to_string()).unwrap();
         assert_eq!(k1.public.validator_id, k2.public.validator_id);
+        assert_eq!(k1.name, "validator");
     }
 
     #[test]
     fn different_passphrases_give_different_keys() {
-        let k1 = generate_from_passphrase("alice").unwrap();
-        let k2 = generate_from_passphrase("bob").unwrap();
+        let k1 = generate_from_passphrase("alice", "alice".to_string()).unwrap();
+        let k2 = generate_from_passphrase("bob", "bob".to_string()).unwrap();
         assert_ne!(k1.public.validator_id, k2.public.validator_id);
     }
 
     #[test]
     fn keys_json_contains_required_fields() {
-        let keys = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
+        let keys = generate_keypairs(
+            "validator".to_string(),
+            [0x01u8; 32],
+            [0x02u8; 32],
+            [0x03u8; 32],
+        )
+        .unwrap();
         let json = keys.to_json();
+        assert!(json.contains("\"name\": \"validator\""));
         assert!(json.contains("validator_id"));
         assert!(json.contains("mnemonic_hint"));
         assert!(json.contains("hybrid_classical_pk"));
@@ -237,15 +283,22 @@ mod tests {
 
     #[test]
     fn validator_id_is_sha256_of_classical_pk() {
-        let keys = generate_keypairs([0x42u8; 32], [0x42u8; 32], [0x42u8; 32]).unwrap();
+        let keys = generate_keypairs(
+            "validator".to_string(),
+            [0x42u8; 32],
+            [0x42u8; 32],
+            [0x42u8; 32],
+        )
+        .unwrap();
         let expected = indra_crypto::sha256(&keys.public.hybrid_classical_pk);
         assert_eq!(keys.public.validator_id, expected);
     }
 
     #[test]
     fn mnemonic_recovery_is_deterministic() {
-        let (phrase, keys1) = generate_from_new_mnemonic().unwrap();
-        let keys2 = recover_from_mnemonic(&phrase).unwrap();
+        let (phrase, keys1) = generate_from_new_mnemonic("validator".to_string()).unwrap();
+        let keys2 = recover_from_mnemonic(&phrase, "validator".to_string()).unwrap();
+        assert_eq!(keys1.name, keys2.name);
         assert_eq!(keys1.public.validator_id, keys2.public.validator_id);
         assert_eq!(keys1.public.hybrid_classical_pk, keys2.public.hybrid_classical_pk);
         assert_eq!(keys1.public.hybrid_pq_pk, keys2.public.hybrid_pq_pk);

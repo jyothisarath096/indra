@@ -149,8 +149,13 @@ pub fn entry_from_keys(
     keys: &crate::keygen::KeysFile,
     stake: u64,
 ) -> GenesisEntry {
+    let entry_name = if keys.name.is_empty() {
+        name.to_string()
+    } else {
+        keys.name.clone()
+    };
     GenesisEntry {
-        name:                name.to_string(),
+        name:                entry_name,
         validator_id:        hex::encode(keys.public.validator_id),
         hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
         hybrid_pq_pk:        hex::encode(&keys.public.hybrid_pq_pk),
@@ -169,7 +174,7 @@ mod tests {
     fn test_validators(count: usize) -> Vec<GenesisEntry> {
         (0..count).map(|i| {
             let seed = [i as u8 + 1; 32];
-            let keys = generate_keypairs(seed, seed, seed).unwrap();
+            let keys = generate_keypairs(format!("validator-{i}"), seed, seed, seed).unwrap();
             entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10)
         }).collect()
     }

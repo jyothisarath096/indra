@@ -10,9 +10,24 @@ fn main() {
     let passphrase = args.iter()
         .position(|a| a == "--passphrase")
         .and_then(|i| args.get(i + 1));
+    let name_arg = args.iter()
+        .position(|a| a == "--name")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let name = name_arg.unwrap_or_else(|| {
+        if recover_phrase.is_some() {
+            String::new()
+        } else {
+            print!("  Enter your validator name: ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut input = String::new();
+            let _ = std::io::stdin().read_line(&mut input);
+            input.trim().to_string()
+        }
+    });
 
     let (mnemonic, keys) = if let Some(phrase) = recover_phrase {
-        match indra_cli::recover_from_mnemonic(phrase) {
+        match indra_cli::recover_from_mnemonic(phrase, name.clone()) {
             Ok(keys) => (None, keys),
             Err(err) => {
                 eprintln!("Mnemonic recovery failed: {}", err);
@@ -20,7 +35,7 @@ fn main() {
             }
         }
     } else if let Some(phrase) = passphrase {
-        match indra_cli::generate_from_passphrase(phrase) {
+        match indra_cli::generate_from_passphrase(phrase, name.clone()) {
             Ok(keys) => (None, keys),
             Err(err) => {
                 eprintln!("Passphrase key generation failed: {}", err);
@@ -28,7 +43,7 @@ fn main() {
             }
         }
     } else {
-        match indra_cli::generate_from_new_mnemonic() {
+        match indra_cli::generate_from_new_mnemonic(name.clone()) {
             Ok((phrase, keys)) => (Some(phrase), keys),
             Err(err) => {
                 eprintln!("Mnemonic generation failed: {}", err);
@@ -64,6 +79,7 @@ fn main() {
         println!();
     }
 
+    println!("  Validator Name:   {}", keys.name);
     println!("  Validator ID:     {}", hex::encode(keys.public.validator_id));
     println!("  Classical PK:     {}", hex::encode(keys.public.hybrid_classical_pk));
     println!("  Keys written to:  {}", output);

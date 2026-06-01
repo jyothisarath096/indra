@@ -93,7 +93,9 @@ if [ -f "$DATA_DIR/keys.json" ]; then
 else
     echo "  Generating your validator keypair..."
     echo ""
-    "$BIN_DIR/indra-keygen" --output "$DATA_DIR/keys.json"
+    echo "  Enter your validator display name (e.g. your name or city):"
+    read -p "  Name: " VALIDATOR_NAME
+    "$BIN_DIR/indra-keygen" --name "$VALIDATOR_NAME" --output "$DATA_DIR/keys.json"
     echo ""
     echo "  ⚠️  IMPORTANT: Write down your 24-word"
     echo "  recovery phrase shown above."

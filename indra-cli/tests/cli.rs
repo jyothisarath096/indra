@@ -25,7 +25,14 @@ fn engine(suffix: &str) -> (NodeEngine, PathBuf) {
 
 #[test]
 fn keygen_all_keys_present() {
-    let keys = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
+    let keys = generate_keypairs(
+        "TestValidator".to_string(),
+        [0x01u8; 32],
+        [0x02u8; 32],
+        [0x03u8; 32],
+    )
+    .unwrap();
+    assert_eq!(keys.name, "TestValidator");
     assert_eq!(keys.public.hybrid_classical_pk.len(), 32);
     assert_eq!(keys.public.bls_pk.len(), 48);
     assert_eq!(keys.public.vrf_pk.len(), 32);
@@ -34,27 +41,47 @@ fn keygen_all_keys_present() {
 
 #[test]
 fn keygen_deterministic_from_seed() {
-    let k1 = generate_keypairs([0xAAu8; 32], [0xBBu8; 32], [0xCCu8; 32]).unwrap();
-    let k2 = generate_keypairs([0xAAu8; 32], [0xBBu8; 32], [0xCCu8; 32]).unwrap();
+    let k1 = generate_keypairs(
+        "Deterministic".to_string(),
+        [0xAAu8; 32],
+        [0xBBu8; 32],
+        [0xCCu8; 32],
+    )
+    .unwrap();
+    let k2 = generate_keypairs(
+        "Deterministic".to_string(),
+        [0xAAu8; 32],
+        [0xBBu8; 32],
+        [0xCCu8; 32],
+    )
+    .unwrap();
     assert_eq!(k1.public.validator_id, k2.public.validator_id);
+    assert_eq!(k1.name, k2.name);
 }
 
 #[test]
 fn keygen_from_passphrase() {
-    let k = generate_from_passphrase("my-testnet-validator").unwrap();
-    let k2 = generate_from_passphrase("my-testnet-validator").unwrap();
+    let k = generate_from_passphrase("my-testnet-validator", "Alice".to_string()).unwrap();
+    let k2 = generate_from_passphrase("my-testnet-validator", "Alice".to_string()).unwrap();
     assert_eq!(k.public.validator_id, k2.public.validator_id);
+    assert_eq!(k.name, "Alice");
     // Different passphrase = different key
-    let k3 = generate_from_passphrase("other-validator").unwrap();
+    let k3 = generate_from_passphrase("other-validator", "Bob".to_string()).unwrap();
     assert_ne!(k.public.validator_id, k3.public.validator_id);
 }
 
 #[test]
 fn keys_json_is_valid_structure() {
-    let keys = generate_keypairs([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]).unwrap();
+    let keys = generate_keypairs(
+        "TestValidator".to_string(),
+        [0x01u8; 32],
+        [0x02u8; 32],
+        [0x03u8; 32],
+    )
+    .unwrap();
     let json = keys.to_json();
     // All required fields present
-    for field in &["validator_id", "hybrid_classical_pk", "bls_pk", "vrf_pk", "hybrid_seed", "WARNING"] {
+    for field in &["name", "validator_id", "hybrid_classical_pk", "bls_pk", "vrf_pk", "hybrid_seed", "WARNING"] {
         assert!(json.contains(field), "missing: {field}");
     }
 }
@@ -63,12 +90,12 @@ fn keys_json_is_valid_structure() {
 
 #[test]
 fn genesis_with_4_validators() {
-    let stake = DUST_LIMIT_SPARK * 100;
-    let validators: Vec<_> = (0..4u8).map(|i| {
-        let seed = [i + 1; 32];
-        let keys = generate_keypairs(seed, seed, seed).unwrap();
-        entry_from_keys(&format!("v{i}"), &keys, stake)
-    }).collect();
+        let stake = DUST_LIMIT_SPARK * 100;
+        let validators: Vec<_> = (0..4u8).map(|i| {
+            let seed = [i + 1; 32];
+            let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
+            entry_from_keys(&format!("v{i}"), &keys, stake)
+        }).collect();
 
     let config = build_genesis_config(
         "indra-testnet-1",
@@ -88,7 +115,7 @@ fn genesis_rejects_3_validators() {
     let stake = DUST_LIMIT_SPARK * 100;
     let validators: Vec<_> = (0..3u8).map(|i| {
         let seed = [i + 1; 32];
-        let keys = generate_keypairs(seed, seed, seed).unwrap();
+        let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
         entry_from_keys(&format!("v{i}"), &keys, stake)
     }).collect();
 
@@ -118,10 +145,10 @@ fn query_pipeline() {
 #[test]
 fn full_testnet_setup_pipeline() {
     // Step 1: Each participant generates their keys
-    let alice = generate_from_passphrase("alice-testnet-seed-v1").unwrap();
-    let bob   = generate_from_passphrase("bob-testnet-seed-v1").unwrap();
-    let carol = generate_from_passphrase("carol-testnet-seed-v1").unwrap();
-    let dave  = generate_from_passphrase("dave-testnet-seed-v1").unwrap();
+    let alice = generate_from_passphrase("alice-testnet-seed-v1", "alice".to_string()).unwrap();
+    let bob   = generate_from_passphrase("bob-testnet-seed-v1", "bob".to_string()).unwrap();
+    let carol = generate_from_passphrase("carol-testnet-seed-v1", "carol".to_string()).unwrap();
+    let dave  = generate_from_passphrase("dave-testnet-seed-v1", "dave".to_string()).unwrap();
 
     // Step 2: Coordinator builds genesis
     let stake = DUST_LIMIT_SPARK * 100;
@@ -143,6 +170,7 @@ fn full_testnet_setup_pipeline() {
 
     // Step 3: Write keys.json (verify output is valid)
     let alice_json = alice.to_json();
+    assert!(alice_json.contains("\"name\": \"alice\""));
     assert!(alice_json.contains("validator_id"));
     assert!(alice_json.contains("WARNING"));
 

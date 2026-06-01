@@ -9,8 +9,13 @@ const PQ_SK_BYTES: usize = 2560;
 /// Generate an INDRA keypair bundle from one wallet seed.
 pub fn generate(seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
     let derived = derive_all_seeds(&seed);
-    let keys = generate_keypairs(derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)
-        .map_err(|_| IndraError::KeygenFailed)?;
+    let keys = generate_keypairs(
+        String::new(),
+        derived.hybrid_seed,
+        derived.bls_seed,
+        derived.vrf_seed,
+    )
+    .map_err(|_| IndraError::KeygenFailed)?;
     keys_to_ffi(&keys)
 }
 
@@ -21,7 +26,8 @@ pub fn new_mnemonic() -> String {
 
 /// Generate an INDRA keypair bundle from a BIP-39 mnemonic phrase.
 pub fn generate_from_mnemonic(phrase: &str) -> Result<IndraKeyPair, IndraError> {
-    let keys = recover_from_mnemonic(phrase).map_err(|_| IndraError::InvalidParam)?;
+    let keys = recover_from_mnemonic(phrase, String::new())
+        .map_err(|_| IndraError::InvalidParam)?;
     keys_to_ffi(&keys)
 }
 
