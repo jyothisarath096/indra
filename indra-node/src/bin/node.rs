@@ -35,6 +35,65 @@ use indra_node::{
 const BLOCK_TIME: Duration = Duration::from_secs(6);
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
+const SYNC_BATCH_SIZE: u64 = 50;
+
+#[derive(Debug, Clone)]
+struct SyncState {
+    am_syncing: bool,
+    sync_target_height: u64,
+    sync_peer: Option<SocketAddr>,
+    requested_to_height: u64,
+}
+
+impl SyncState {
+    fn idle() -> Self {
+        Self {
+            am_syncing: false,
+            sync_target_height: 0,
+            sync_peer: None,
+            requested_to_height: 0,
+        }
+    }
+
+    fn begin(&mut self, peer: SocketAddr, from_height: u64, target_height: u64) -> (u64, u64) {
+        self.am_syncing = true;
+        self.sync_target_height = target_height;
+        self.sync_peer = Some(peer);
+        let to_height = target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+        self.requested_to_height = to_height;
+        (from_height, to_height)
+    }
+
+    fn request_next_batch(
+        &mut self,
+        current_height: u64,
+    ) -> Option<(SocketAddr, u64, u64)> {
+        let peer = self.sync_peer?;
+        if !self.am_syncing || current_height >= self.sync_target_height {
+            self.am_syncing = false;
+            self.requested_to_height = current_height;
+            return None;
+        }
+        if current_height < self.requested_to_height {
+            return None;
+        }
+
+        let from_height = current_height.saturating_add(1);
+        let to_height = self
+            .sync_target_height
+            .min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+        self.requested_to_height = to_height;
+        Some((peer, from_height, to_height))
+    }
+
+    fn finish_if_caught_up(&mut self, current_height: u64) {
+        if self.am_syncing && current_height >= self.sync_target_height {
+            self.am_syncing = false;
+            self.sync_peer = None;
+            self.requested_to_height = current_height;
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -138,6 +197,7 @@ fn main() {
     // Shared state between threads
     let driver    = Arc::new(Mutex::new(driver));
     let gossip    = Arc::new(Mutex::new(GossipEngine::new()));
+    let sync_state = Arc::new(Mutex::new(SyncState::idle()));
 
     // ── Thread 1: P2P listener ──────────────────────────────────────────────
     {
@@ -233,6 +293,7 @@ fn main() {
     {
         let gossip  = Arc::clone(&gossip);
         let driver  = Arc::clone(&driver);
+        let sync_state = Arc::clone(&sync_state);
 
         std::thread::spawn(move || {
             loop {
@@ -264,6 +325,93 @@ fn main() {
                         // Score the peer
                         gossip.lock().unwrap().score_event(&addr, ScoreEvent::ValidBlock);
 
+                        match &msg {
+                            Message::GetBlocks { from_height, to_height } => {
+                                let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
+                                let blocks_to_send = {
+                                    let mut d = driver.lock().unwrap();
+                                    let mut blocks = Vec::new();
+                                    for height in *from_height..=upper {
+                                        match d.engine.block_store.get(height) {
+                                            Ok(block) => blocks.push(block),
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    blocks
+                                };
+
+                                for block in blocks_to_send {
+                                    let _ = gossip.lock().unwrap().send_to(&addr, &Message::Block(block));
+                                }
+                                continue;
+                            }
+                            Message::Block(block) => {
+                                let mut request_more = None;
+                                let maybe_event = {
+                                    let mut d = driver.lock().unwrap();
+                                    let my_height = d.height();
+                                    let block_height = block.header.height;
+                                    let syncing = sync_state.lock().unwrap().am_syncing;
+
+                                    if block_height <= my_height {
+                                        None
+                                    } else if syncing && block_height == my_height + 1 {
+                                        match d.engine.commit_block(&block) {
+                                            Ok(()) => {
+                                                d.refresh_registered_voters();
+                                                let new_height = d.height();
+                                                {
+                                                    let mut sync = sync_state.lock().unwrap();
+                                                    sync.finish_if_caught_up(new_height);
+                                                    request_more = sync.request_next_batch(new_height);
+                                                }
+                                                None
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[sync] failed to import block {} from {}: {}",
+                                                    block_height, addr, e
+                                                );
+                                                None
+                                            }
+                                        }
+                                    } else if block_height == my_height + 1 {
+                                        message_to_event(Message::Block(block.clone()), addr)
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some((peer, from_height, to_height)) = request_more {
+                                    let req = Message::GetBlocks { from_height, to_height };
+                                    let _ = gossip.lock().unwrap().send_to(&peer, &req);
+                                }
+
+                                if let Some(event) = maybe_event {
+                                    let actions = driver.lock().unwrap().process(event);
+                                    for action in actions {
+                                        if let Some(out_msg) = action_to_message(&action) {
+                                            let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                        }
+                                        if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
+                                            let peer_tip = *to_height;
+                                            let (req_from, req_to) = {
+                                                let mut sync = sync_state.lock().unwrap();
+                                                sync.begin(*from, *from_height, peer_tip)
+                                            };
+                                            let req = Message::GetBlocks {
+                                                from_height: req_from,
+                                                to_height: req_to,
+                                            };
+                                            let _ = gossip.lock().unwrap().send_to(from, &req);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+
                         // Convert to driver event and process
                         if let Some(event) = message_to_event(msg, addr) {
                             let actions = driver.lock().unwrap().process(event);
@@ -273,9 +421,13 @@ fn main() {
                                 }
                                 // Handle sync request
                                 if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
+                                    let (req_from, req_to) = {
+                                        let mut sync = sync_state.lock().unwrap();
+                                        sync.begin(*from, *from_height, *to_height)
+                                    };
                                     let req = Message::GetBlocks {
-                                        from_height: *from_height,
-                                        to_height: *to_height,
+                                        from_height: req_from,
+                                        to_height: req_to,
                                     };
                                     let _ = gossip.lock().unwrap().send_to(from, &req);
                                 }
@@ -293,6 +445,7 @@ fn main() {
     {
         let driver  = Arc::clone(&driver);
         let gossip  = Arc::clone(&gossip);
+        let sync_state = Arc::clone(&sync_state);
 
         std::thread::spawn(move || {
             // Wait for peer connections to establish
@@ -319,17 +472,12 @@ fn main() {
                         let status = Message::Status { height, tip_hash };
                         let _ = gossip.lock().unwrap().broadcast(&status);
 
-                        // In a full implementation, the VRF election determines the proposer.
-                        // For Phase 8, we use round-robin based on height to demonstrate
-                        // block advancement. The validator whose position matches
-                        // (height % validator_count) proposes.
-                        //
-                        // Full VRF-based election is already implemented in indra-consensus
-                        // and will be wired in Phase 9 when we have the full validator set
-                        // loaded from genesis.
-                        //
-                        // For now: the bootstrap node (no bootstrap-peers arg) always proposes
-                        // to demonstrate block advancement.
+                        if sync_state.lock().unwrap().am_syncing {
+                            println!("[consensus] height={} sync in progress — not proposing", height);
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+
                         // VRF-based proposer election
                         let should_propose = {
                             let d = driver.lock().unwrap();
