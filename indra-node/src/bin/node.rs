@@ -436,6 +436,7 @@ fn main() {
     // Reads chain state directly from the driver under a brief lock.
     {
         let driver_rpc = Arc::clone(&driver);
+        let gossip_rpc = Arc::clone(&gossip);
         let rpc_addr = get_arg("--rpc-addr").unwrap_or_else(|| "127.0.0.1:8545".to_string());
         println!("[RPC] Listening on {}", rpc_addr);
 
@@ -448,8 +449,9 @@ fn main() {
                 match stream {
                     Ok(stream) => {
                         let driver_rpc = Arc::clone(&driver_rpc);
+                        let gossip_rpc = Arc::clone(&gossip_rpc);
                         std::thread::spawn(move || {
-                            handle_rpc(stream, &driver_rpc);
+                            handle_rpc(stream, &driver_rpc, &gossip_rpc);
                         });
                     }
                     Err(e) => eprintln!("[rpc] accept error: {}", e),
@@ -540,7 +542,7 @@ fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
 /// Reads one HTTP request, dispatches to the appropriate chain query,
 /// and writes the JSON response. Locks the driver only for the duration
 /// of the state read — not while writing the HTTP response.
-fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>) {
+fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>, gossip: &Arc<Mutex<indra_network::GossipEngine>>) {
     use std::io::{BufRead, BufReader, Write, Read};
 
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -649,7 +651,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     guard.engine.block_store.len(),
                     block_reward_spark,
                     era,
-                    0usize, // TODO: pass gossip connection count to RPC handler
+                    gossip.lock().unwrap().connection_count(),
                 )
             }
             "indra_getMempoolSize" => {
