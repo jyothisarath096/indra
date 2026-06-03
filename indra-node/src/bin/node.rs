@@ -629,7 +629,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                         / indra_core::types::primitives::ERA_3_PLUS_DURATION_BLOCKS)
                 };
                 format!(
-                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"max_active_validators":{},"total_staked_spark":{},"effective_min_stake_spark":{},"validator_set_phase":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{}}}"#,
+                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"max_active_validators":{},"total_staked_spark":{},"effective_min_stake_spark":{},"validator_set_phase":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{},"peers":{}}}"#,
                     s.height,
                     hex::encode(s.tip_hash.0),
                     s.base_fee,
@@ -649,6 +649,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     guard.engine.block_store.len(),
                     block_reward_spark,
                     era,
+                    0usize, // TODO: pass gossip connection count to RPC handler
                 )
             }
             "indra_getMempoolSize" => {
