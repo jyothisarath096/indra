@@ -110,6 +110,8 @@ pub struct ConsensusDriver {
     vote_collectors: HashMap<(u64, u32), VoteCollector>,
     /// Pending blocks by block hash until precommit quorum forms.
     pending_blocks: HashMap<Bytes32, BlockV1>,
+    /// Votes received before the matching proposal was staged locally.
+    buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
     /// Blocks whose quorum arrived before the proposal was staged locally.
     pending_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Serialised QC for the most recently finalised height.
@@ -128,6 +130,7 @@ impl ConsensusDriver {
             slash_detector: SlashDetector::new(),
             vote_collectors: HashMap::new(),
             pending_blocks: HashMap::new(),
+            buffered_votes: HashMap::new(),
             pending_quorum: HashSet::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
@@ -208,21 +211,32 @@ impl ConsensusDriver {
         );
         self.pending_blocks.insert(block_hash, block.clone());
 
+        let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
+        let buffered_key = (block.header.height, block.header.proposer_round, block_hash);
+        if let Some(buffered_votes) = self.buffered_votes.remove(&buffered_key) {
+            for (from, vote) in buffered_votes {
+                actions.extend(self.record_vote_and_actions(from, vote));
+            }
+        }
+
         if self
             .pending_quorum
             .remove(&(block.header.height, block.header.proposer_round, block_hash))
         {
-            let actions = self.finalize_block_on_quorum(
+            actions.extend(self.finalize_block_on_quorum(
                 block.header.height,
                 block.header.proposer_round,
                 block_hash,
-            );
+            ));
             if actions.iter().any(|action| !matches!(action, DriverAction::None)) {
                 return actions;
             }
         }
 
-        let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
+        if self.engine.state.height >= block.header.height {
+            return actions;
+        }
+
         if let Ok(local_vote) = self.engine.sign_vote(
             block.header.height,
             block.header.proposer_round,
@@ -251,6 +265,18 @@ impl ConsensusDriver {
     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
 
+        if vote.height <= self.engine.state.height {
+            eprintln!(
+                "[vote] ignoring stale vote from {} for {} at height={} round={} (local height={})",
+                from,
+                hex::encode(&vote.block_hash.0[..4]),
+                vote.height,
+                vote.round,
+                self.engine.state.height,
+            );
+            return actions;
+        }
+
         eprintln!(
             "[vote] received vote from {} for {} at height={} round={}",
             from,
@@ -262,6 +288,23 @@ impl ConsensusDriver {
         // Check for slash conditions
         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
             actions.push(DriverAction::SlashDetected(evidence));
+        }
+
+        if vote.height == self.engine.state.height + 1
+            && !self.pending_blocks.contains_key(&vote.block_hash)
+        {
+            eprintln!(
+                "[vote] buffering vote from {} for {} at height={} round={} until proposal is staged",
+                from,
+                hex::encode(&vote.block_hash.0[..4]),
+                vote.height,
+                vote.round,
+            );
+            self.buffered_votes
+                .entry((vote.height, vote.round, vote.block_hash))
+                .or_default()
+                .push((from, vote));
+            return actions;
         }
 
         // Route to appropriate vote collector
@@ -382,6 +425,7 @@ impl ConsensusDriver {
                 );
                 self.last_qc_bytes = qc.encode_to_vec();
                 self.vote_collectors.remove(&key);
+                self.buffered_votes.remove(&(height, round, block_hash));
                 self.pending_quorum.remove(&(height, round, block_hash));
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
@@ -664,6 +708,40 @@ mod tests {
         let actions = driver.process(DriverEvent::InboundBlock { from: Some(peer_a), block });
 
         assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
+        assert_eq!(driver.height(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_ignores_stale_votes_after_block_already_committed() {
+        let dir = temp_dir("e");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let local_seed = [0x52u8; 32];
+        let pq = PqKeypair::from_seed(&local_seed).unwrap();
+        config.validator_seed = Some(local_seed);
+        config.vrf_seed = Some(local_seed);
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+        let remote_a = install_active_validator(&mut driver, [0x53u8; 32], "remote-a");
+        let _remote_b = install_active_validator(&mut driver, [0x54u8; 32], "remote-b");
+        let _local = install_active_validator(&mut driver, local_seed, "local");
+        driver.refresh_registered_voters();
+
+        let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        driver.engine.commit_block(&block).unwrap();
+        assert_eq!(driver.height(), 1);
+
+        let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
+        let vote_a = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Precommit, block.header.block_hash(), remote_a_id, &remote_a
+        ).unwrap();
+
+        let peer_a: SocketAddr = "127.0.0.1:9201".parse().unwrap();
+        let actions = driver.process(DriverEvent::InboundVote { from: peer_a, vote: vote_a });
+
+        assert!(!actions.iter().any(|a| matches!(a, DriverAction::BroadcastVote(_))));
         assert_eq!(driver.height(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
