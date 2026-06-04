@@ -54,6 +54,10 @@ echo "Downloading INDRA node binary..."
 curl -sSf "$GITHUB_RAW/$PLATFORM/indra-node" -o "$BIN_DIR/indra-node"
 chmod +x "$BIN_DIR/indra-node"
 
+curl -sSf "$GITHUB_RAW/$PLATFORM/indra-tx" -o "$BIN_DIR/indra-tx"
+chmod +x "$BIN_DIR/indra-tx"
+
+
 echo "Downloading INDRA keygen..."
 curl -sSf "$GITHUB_RAW/$PLATFORM/indra-keygen" -o "$BIN_DIR/indra-keygen"
 chmod +x "$BIN_DIR/indra-keygen"
