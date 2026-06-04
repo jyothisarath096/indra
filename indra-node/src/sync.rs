@@ -16,7 +16,10 @@ use indra_consensus::mempool::Mempool;
 use indra_storage::{BlockStore, StateStore};
 use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_consensus::{
-    proposer::{ProposerCandidate, ProposerElection, compute_vrf_input, elect_proposer},
+    proposer::{
+        ProposerCandidate, ProposerElection, compute_vrf_input, elect_proposer,
+        election_slot_from_timestamp,
+    },
     qc::{QcValidator, verify_qc, verify_qc_strict},
 };
 use indra_crypto::{VrfOutput, VrfProof, vrf_verify};
@@ -125,7 +128,8 @@ fn verify_proposer_vrf(
     let epoch_seed = indra_core::types::primitives::Bytes32::from(
         indra_crypto::sha256(&state.tip_hash.0)
     );
-    let vrf_input = compute_vrf_input(&epoch_seed.0, block.header.height);
+    let slot = election_slot_from_timestamp(block.header.timestamp);
+    let vrf_input = compute_vrf_input(&epoch_seed.0, slot);
     let proof = VrfProof(proof_bytes.to_vec());
     let output = VrfOutput(block.header.proposer_vrf_output.0);
 
@@ -143,7 +147,7 @@ fn verify_proposer_vrf(
     let matched_validator_id = matching_candidates[0].validator_id;
     let election = ProposerElection {
         epoch_seed,
-        height: block.header.height,
+        slot,
         candidates,
     };
     let elected = elect_proposer(&election).map_err(NodeError::Consensus)?;

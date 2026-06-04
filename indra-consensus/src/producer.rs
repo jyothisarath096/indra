@@ -70,7 +70,7 @@ pub fn produce_block(
             .ok_or(ConsensusError::WrongProposer)?,
         &template.proposer_vrf_keypair,
         &template.epoch_seed,
-        state.height + 1,
+        election.slot,
     );
 
     let elected = elect_proposer(election)?;
@@ -151,12 +151,12 @@ mod tests {
         mempool::Mempool,
     };
 
-    fn make_election(seed: &[u8; 32], height: u64, vrf_seed: [u8; 32], stake: u64) -> ProposerElection {
+    fn make_election(seed: &[u8; 32], slot: u64, vrf_seed: [u8; 32], stake: u64) -> ProposerElection {
         let vrf_pubkey = VrfKeypair::from_seed(&vrf_seed).public_key();
         let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
         ProposerElection {
             epoch_seed: Bytes32::from(*seed),
-            height,
+            slot,
             candidates: vec![
                 crate::proposer::ProposerCandidate {
                     validator_id,

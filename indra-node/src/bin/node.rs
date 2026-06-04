@@ -26,6 +26,7 @@ use indra_network::{
     transport::{RecvStatus, Transport},
     gossip::GossipEngine,
 };
+use indra_consensus::proposer::election_slot_from_timestamp;
 use indra_node::{
     NodeConfig, NodeEngine,
     driver::{ConsensusDriver, DriverAction, DriverEvent},
@@ -478,13 +479,18 @@ fn main() {
                             continue;
                         }
 
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let slot = election_slot_from_timestamp(now_secs);
+
                         // VRF-based proposer election
                         let should_propose = {
                             let d = driver.lock().unwrap();
                             let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                 indra_crypto::sha256(&d.engine.state.tip_hash.0)
                             );
-                            let height = d.engine.state.height + 1;
 
                             // Build candidate list from active validators
                             let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
@@ -502,25 +508,12 @@ fn main() {
                             } else {
                                 let election = indra_consensus::proposer::ProposerElection {
                                     epoch_seed,
-                                    height,
+                                    slot,
                                     candidates,
                                 };
                                 d.engine.is_proposer(&election)
                             }
                         };
-
-                        // Debug: log proposer election result every tick
-                        {
-                            let d = driver.lock().unwrap();
-                            let cand_count = d.engine.state.validators.active_validators()
-                                .filter(|v| v.vrf_pk.is_some()).count();
-                            let my_id = d.engine.validator_id()
-                                .map(|id| hex::encode(&id.0[..4]))
-                                .unwrap_or("none".to_string());
-                            let has_vrf = d.engine.has_vrf_keypair();
-                            eprintln!("[proposer] id={} has_vrf={} candidates={} should_propose={}", 
-                                my_id, has_vrf, cand_count, should_propose);
-                        }
 
                         if should_propose {
                             let proposal = {
@@ -528,7 +521,6 @@ fn main() {
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                     indra_crypto::sha256(&d.engine.state.tip_hash.0)
                                 );
-                                let height = d.engine.state.height + 1;
                                 let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
                                     d.engine.state.validators.active_validators()
                                         .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
@@ -539,14 +531,10 @@ fn main() {
                                         .collect();
                                 let election = indra_consensus::proposer::ProposerElection {
                                     epoch_seed,
-                                    height,
+                                    slot,
                                     candidates,
                                 };
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                match d.engine.propose(&election, timestamp, d.last_qc_bytes()) {
+                                match d.engine.propose(&election, now_secs, d.last_qc_bytes()) {
                                     Ok(block) => {
                                         let actions = d.process(DriverEvent::InboundBlock {
                                             from: None,

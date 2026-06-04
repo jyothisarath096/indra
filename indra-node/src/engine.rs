@@ -182,7 +182,7 @@ impl NodeEngine {
             );
             return false;
         };
-        let slot = compute_proposer_vrf(validator_id, vrf_kp, &election.epoch_seed, self.state.height + 1);
+        let slot = compute_proposer_vrf(validator_id, vrf_kp, &election.epoch_seed, election.slot);
         let elected = match elect_proposer(election) {
             Ok(id) => id,
             Err(_) => {

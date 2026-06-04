@@ -1,6 +1,6 @@
 //! Deterministic proposer election and VRF proof generation.
 
-use indra_core::types::primitives::Bytes32;
+use indra_core::types::primitives::{Bytes32, BLOCK_TIME_TARGET_SECS};
 use indra_crypto::{sha256, vrf_prove, VrfKeypair, VrfOutput, VrfProof};
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -33,8 +33,12 @@ pub struct SlotResult {
 pub struct ProposerElection {
     /// The epoch seed.
     pub epoch_seed: Bytes32,
-    /// The height being proposed.
-    pub height: u64,
+    /// The deterministic slot index being proposed.
+    ///
+    /// This is derived from the wall-clock block-time bucket, not the chain
+    /// height, so proposer selection can change across repeated rounds while a
+    /// height is still unfinalized.
+    pub slot: u64,
     /// All active validators and their stakes.
     pub candidates: Vec<ProposerCandidate>,
 }
@@ -42,17 +46,22 @@ pub struct ProposerElection {
 impl ProposerElection {
     /// Compute the deterministic VRF input for this election.
     pub fn vrf_input(&self) -> [u8; 32] {
-        compute_vrf_input(&self.epoch_seed.0, self.height)
+        compute_vrf_input(&self.epoch_seed.0, self.slot)
     }
 }
 
 /// Compute the VRF input deterministically.
-pub fn compute_vrf_input(epoch_seed: &[u8; 32], height: u64) -> [u8; 32] {
+pub fn compute_vrf_input(epoch_seed: &[u8; 32], slot: u64) -> [u8; 32] {
     use indra_crypto::hash::domains::VRF_INPUT;
     let mut data = VRF_INPUT.to_vec();
     data.extend_from_slice(epoch_seed);
-    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(&slot.to_le_bytes());
     sha256(&data)
+}
+
+/// Derive the deterministic election slot from a block timestamp.
+pub fn election_slot_from_timestamp(timestamp: u64) -> u64 {
+    timestamp / BLOCK_TIME_TARGET_SECS
 }
 
 /// Compute the stake-weighted election score for a VRF output.
@@ -113,9 +122,9 @@ pub fn compute_proposer_vrf(
     validator_id: Bytes32,
     keypair: &VrfKeypair,
     epoch_seed: &Bytes32,
-    height: u64,
+    slot: u64,
 ) -> SlotResult {
-    let vrf_input = compute_vrf_input(&epoch_seed.0, height);
+    let vrf_input = compute_vrf_input(&epoch_seed.0, slot);
     let (vrf_output, vrf_proof) = vrf_prove(keypair, &vrf_input);
     SlotResult {
         proposer_id: validator_id,
@@ -140,7 +149,7 @@ mod tests {
     fn election(candidates: Vec<ProposerCandidate>) -> ProposerElection {
         ProposerElection {
             epoch_seed: Bytes32::from([0x42u8; 32]),
-            height: 1,
+            slot: 1,
             candidates,
         }
     }
@@ -175,6 +184,24 @@ mod tests {
         let i1 = compute_vrf_input(&seed.0, 1);
         let i2 = compute_vrf_input(&seed.0, 2);
         assert_ne!(i1, i2);
+    }
+
+    #[test]
+    fn election_winner_varies_across_slots() {
+        let candidates = vec![
+            candidate(0x01, 1_000_000),
+            candidate(0x02, 1_000_000),
+        ];
+        let mut winners = std::collections::BTreeSet::new();
+        for slot in 1..=10 {
+            let election = ProposerElection {
+                epoch_seed: Bytes32::from([0x42u8; 32]),
+                slot,
+                candidates: candidates.clone(),
+            };
+            winners.insert(elect_proposer(&election).unwrap());
+        }
+        assert!(winners.len() > 1, "winner did not vary across slots");
     }
 
     #[test]

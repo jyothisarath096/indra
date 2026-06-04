@@ -107,7 +107,7 @@ fn mempool_to_block_pipeline() {
     let vrf_pubkey = indra_crypto::VrfKeypair::from_seed(&seed).public_key();
     let election = ProposerElection {
         epoch_seed: Bytes32::from(seed),
-        height: 1,
+        slot: 1,
         candidates: vec![ProposerCandidate {
             validator_id: Bytes32::from(indra_crypto::sha256(&vrf_pubkey)),
             vrf_pubkey,
