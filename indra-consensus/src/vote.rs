@@ -197,6 +197,11 @@ impl VoteCollector {
     pub fn vote_count(&self) -> usize {
         self.received.len()
     }
+
+    /// True if this collector already accepted a vote from `validator_id`.
+    pub fn has_vote_from(&self, validator_id: &Bytes32) -> bool {
+        self.received.contains_key(validator_id)
+    }
 }
 
 /// Produce a signed vote.

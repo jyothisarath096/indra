@@ -189,6 +189,13 @@ impl ConsensusDriver {
         }
     }
 
+    fn collector_has_vote_from(&self, height: u64, round: u32, validator_id: Bytes32) -> bool {
+        self.vote_collectors
+            .get(&(height, round))
+            .map(|collector| collector.has_vote_from(&validator_id))
+            .unwrap_or(false)
+    }
+
     fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
         if block.header.height != self.engine.state.height + 1
             || block.header.prev_hash != self.engine.state.tip_hash
@@ -202,6 +209,9 @@ impl ConsensusDriver {
         }
 
         let block_hash = block.header.block_hash();
+        if self.pending_blocks.contains_key(&block_hash) {
+            return vec![DriverAction::None];
+        }
         eprintln!(
             "[vote] received proposal {} from {} at height={} round={}, staging block",
             hex::encode(&block_hash.0[..4]),
@@ -237,6 +247,22 @@ impl ConsensusDriver {
             return actions;
         }
 
+        if let Some(local_validator_id) = self.engine.validator_id() {
+            if self.collector_has_vote_from(
+                block.header.height,
+                block.header.proposer_round,
+                local_validator_id,
+            ) {
+                eprintln!(
+                    "[vote] local precommit already counted for {} at height={} round={}, skipping duplicate",
+                    hex::encode(&block_hash.0[..4]),
+                    block.header.height,
+                    block.header.proposer_round,
+                );
+                return actions;
+            }
+        }
+
         if let Ok(local_vote) = self.engine.sign_vote(
             block.header.height,
             block.header.proposer_round,
@@ -264,6 +290,22 @@ impl ConsensusDriver {
 
     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
+
+        if self
+            .engine
+            .validator_id()
+            .is_some_and(|local_id| local_id == vote.validator_id)
+            && self.collector_has_vote_from(vote.height, vote.round, vote.validator_id)
+        {
+            eprintln!(
+                "[vote] ignoring echoed local vote from {} for {} at height={} round={}",
+                from,
+                hex::encode(&vote.block_hash.0[..4]),
+                vote.height,
+                vote.round,
+            );
+            return actions;
+        }
 
         if vote.height <= self.engine.state.height {
             eprintln!(
@@ -743,6 +785,51 @@ mod tests {
 
         assert!(!actions.iter().any(|a| matches!(a, DriverAction::BroadcastVote(_))));
         assert_eq!(driver.height(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_vote_counted_once_and_echo_ignored() {
+        let dir = temp_dir("f");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let local_seed = [0x62u8; 32];
+        let pq = PqKeypair::from_seed(&local_seed).unwrap();
+        config.validator_seed = Some(local_seed);
+        config.vrf_seed = Some(local_seed);
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let _remote = install_active_validator(&mut driver, [0x63u8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let block_hash = block.header.block_hash();
+        let actions = driver.process(DriverEvent::InboundBlock { from: None, block: block.clone() });
+        assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastVote(_))));
+
+        let local_validator_id = Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
+        let collector = driver
+            .vote_collectors
+            .get(&(1, 0))
+            .expect("collector must exist after local precommit");
+        assert!(collector.has_vote_from(&local_validator_id));
+        assert_eq!(collector.vote_count(), 1);
+
+        let echoed_local_vote = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Precommit, block_hash, local_validator_id, &local
+        ).unwrap();
+        let peer: SocketAddr = "127.0.0.1:9301".parse().unwrap();
+        let echo_actions = driver.process(DriverEvent::InboundVote { from: peer, vote: echoed_local_vote });
+        assert!(echo_actions.is_empty());
+
+        let collector = driver
+            .vote_collectors
+            .get(&(1, 0))
+            .expect("collector must still exist after ignoring echo");
+        assert_eq!(collector.vote_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
