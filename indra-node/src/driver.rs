@@ -41,6 +41,7 @@ use crate::{
     engine::NodeEngine,
     error::NodeError,
     slash::{SlashDetector, SlashEvidence},
+    sync::verify_proposer_vrf,
 };
 
 /// An inbound event for the driver to process.
@@ -196,10 +197,33 @@ impl ConsensusDriver {
             .unwrap_or(false)
     }
 
+    fn pending_block_for_slot(&self, height: u64, round: u32) -> Option<Bytes32> {
+        self.pending_blocks
+            .iter()
+            .find(|(_, block)| {
+                block.header.height == height && block.header.proposer_round == round
+            })
+            .map(|(hash, _)| *hash)
+    }
+
     fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
         if block.header.height != self.engine.state.height + 1
             || block.header.prev_hash != self.engine.state.tip_hash
         {
+            return vec![DriverAction::None];
+        }
+
+        if self.engine.state.validators.active_count() > 0
+            && (block.header.proposer_vrf_output != Bytes32::ZERO
+                || !block.header.proposer_vrf_proof.as_slice().is_empty())
+            && verify_proposer_vrf(&block, &self.engine.state, false).is_err()
+        {
+            eprintln!(
+                "[vote] rejecting proposal {} at height={} round={} because it does not verify as the elected proposer block",
+                hex::encode(&block.header.block_hash().0[..4]),
+                block.header.height,
+                block.header.proposer_round,
+            );
             return vec![DriverAction::None];
         }
 
@@ -209,6 +233,20 @@ impl ConsensusDriver {
         }
 
         let block_hash = block.header.block_hash();
+        if let Some(existing_hash) =
+            self.pending_block_for_slot(block.header.height, block.header.proposer_round)
+        {
+            if existing_hash != block_hash {
+                eprintln!(
+                    "[vote] ignoring competing proposal {} for existing slot height={} round={} (accepted {})",
+                    hex::encode(&block_hash.0[..4]),
+                    block.header.height,
+                    block.header.proposer_round,
+                    hex::encode(&existing_hash.0[..4]),
+                );
+                return vec![DriverAction::None];
+            }
+        }
         if self.pending_blocks.contains_key(&block_hash) {
             return vec![DriverAction::None];
         }
@@ -785,6 +823,33 @@ mod tests {
 
         assert!(!actions.iter().any(|a| matches!(a, DriverAction::BroadcastVote(_))));
         assert_eq!(driver.height(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_ignores_competing_proposal_for_same_height_and_round() {
+        let dir = temp_dir("f");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&[0x42u8; 32]).unwrap();
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+        install_single_active_validator(&mut driver, [0x42u8; 32]);
+        let _remote = install_active_validator(&mut driver, [0x43u8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let first = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let mut second = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        second.header.timestamp += 1;
+
+        let actions_first = driver.process(DriverEvent::InboundBlock { from: None, block: first.clone() });
+        let actions_second = driver.process(DriverEvent::InboundBlock { from: None, block: second.clone() });
+
+        assert!(actions_first.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
+        assert!(actions_second.iter().all(|a| matches!(a, DriverAction::None)));
+        assert!(driver.pending_blocks.contains_key(&first.header.block_hash()));
+        assert!(!driver.pending_blocks.contains_key(&second.header.block_hash()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

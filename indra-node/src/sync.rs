@@ -80,7 +80,7 @@ pub fn import_block(
     Ok(())
 }
 
-fn verify_proposer_vrf(
+pub(crate) fn verify_proposer_vrf(
     block: &BlockV1,
     state: &ChainState,
     strict: bool,

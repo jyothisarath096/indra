@@ -85,6 +85,8 @@ pub fn produce_block(
         .into_iter()
         .map(|e| e.tx.clone())
         .collect();
+    let mut selected = selected;
+    selected.sort_by_key(|tx| tx.tx_hash().0);
 
     // Build VRF proof bytes for header
     let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)

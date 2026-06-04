@@ -248,6 +248,7 @@ mod tests {
         Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
         types::{
             crypto::HybridSignature,
+            primitives::DUST_LIMIT_SPARK,
             transaction::{InputV1, OutputV1, TransactionV1},
         },
     };
@@ -261,7 +262,7 @@ mod tests {
                 nullifier: Bytes32::from([nullifier_byte; 32]),
             }],
             outputs: vec![OutputV1 {
-                value_spark: 1_000,
+                value_spark: DUST_LIMIT_SPARK,
                 commitment:   CommitmentV1 { compressed_point: Bytes32::ZERO },
                 owner_pubkey: HybridPubKey {
                     classical_pk: Bytes32::ZERO,
