@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use indra_cli::{build_transaction, TxParams, Wallet};
+use indra_cli::{build_transaction, KeysFile, TxParams, Wallet};
 use indra_core::types::{
     crypto::HybridPubKey,
     primitives::{Bytes32, VariableBytes},
@@ -34,12 +34,11 @@ fn usage_and_exit() -> ! {
 
 fn cmd_address(args: &[String]) {
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
-    let keys = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
-        eprintln!("Error reading {}: {}", keys_path, e);
+    let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let classical_pk = extract_hex_field_required(&keys, "hybrid_classical_pk");
-    let address = sha256(&classical_pk);
+    let address = sha256(&keys.public.hybrid_classical_pk);
     println!("{}", hex::encode(address));
 }
 
@@ -65,14 +64,14 @@ fn cmd_send(args: &[String]) {
     });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
 
-    let keys = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
-        eprintln!("Error reading {}: {}", keys_path, e);
+    let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let hybrid_seed = extract_hex32(&keys, "hybrid_seed");
-    let pq_sk_bytes = extract_hex_field_required(&keys, "pq_sk");
-    let classical_pk = extract_hex_field_required(&keys, "hybrid_classical_pk");
-    let pq_pk = extract_hex_field_required(&keys, "hybrid_pq_pk");
+    let hybrid_seed = keys.hybrid_seed;
+    let pq_sk_bytes = keys.pq_sk.clone();
+    let classical_pk = keys.public.hybrid_classical_pk;
+    let pq_pk = keys.public.hybrid_pq_pk.clone();
     let sender_address = hex::encode(sha256(&classical_pk));
 
     let utxos_raw = rpc_call(&rpc, "indra_getUtxos", &[sender_address.clone()]);
@@ -86,7 +85,7 @@ fn cmd_send(args: &[String]) {
     );
 
     let sender_pubkey = HybridPubKey {
-        classical_pk: Bytes32::from(copy32(&classical_pk)),
+        classical_pk: Bytes32::from(classical_pk),
         pq_pk: VariableBytes::from_slice(&pq_pk).unwrap_or_else(|_| {
             eprintln!("Error: invalid sender pq key length");
             std::process::exit(1);
@@ -228,17 +227,6 @@ fn extract_hex_string(json: &str, field: &str) -> Option<Vec<u8>> {
     let after = &json[pos + key.len()..];
     let end = after.find('"')?;
     hex::decode(&after[..end]).ok()
-}
-
-fn extract_hex_field_required(json: &str, field: &str) -> Vec<u8> {
-    extract_hex_string(json, field).unwrap_or_else(|| {
-        eprintln!("Error: field {} missing or invalid", field);
-        std::process::exit(1);
-    })
-}
-
-fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
-    copy32(&extract_hex_field_required(json, field))
 }
 
 fn copy32(bytes: &[u8]) -> [u8; 32] {

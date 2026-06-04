@@ -110,6 +110,106 @@ impl KeysFile {
             pq_sk        = hex::encode(&self.pq_sk),
         )
     }
+
+    /// Parse a `keys.json` string produced by `indra-keygen`.
+    pub fn from_json(json: &str) -> CliResult<Self> {
+        let public = extract_object(json, "public")?;
+        let private = extract_object(json, "private")?;
+
+        let name = extract_string(json, "name").unwrap_or_default();
+        let validator_id = extract_hex32(json, "validator_id")?;
+        let hybrid_classical_pk = extract_hex32(public, "hybrid_classical_pk")?;
+        let hybrid_pq_pk = extract_hex(public, "hybrid_pq_pk")?;
+        let bls_pk = extract_hex_fixed::<48>(public, "bls_pk")?;
+        let vrf_pk = extract_hex32(public, "vrf_pk")?;
+        let hybrid_seed = extract_hex32(private, "hybrid_seed")?;
+        let bls_seed = extract_hex32(private, "bls_seed")?;
+        let vrf_seed = extract_hex32(private, "vrf_seed")?;
+        let pq_sk = extract_hex(private, "pq_sk")?;
+
+        Ok(Self {
+            name,
+            public: ValidatorKeys {
+                validator_id,
+                hybrid_classical_pk,
+                hybrid_pq_pk,
+                bls_pk,
+                vrf_pk,
+            },
+            hybrid_seed,
+            bls_seed,
+            vrf_seed,
+            pq_sk,
+        })
+    }
+
+    /// Load and parse a `keys.json` file from disk.
+    pub fn load(path: &str) -> CliResult<Self> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
+        Self::from_json(&json)
+    }
+}
+
+fn extract_object<'a>(json: &'a str, field: &str) -> CliResult<&'a str> {
+    let key = format!("\"{}\":", field);
+    let pos = json.find(&key)
+        .ok_or_else(|| CliError::Parse(format!("missing object '{}'", field)))?;
+    let after = json[pos + key.len()..].trim_start();
+    if !after.starts_with('{') {
+        return Err(CliError::Parse(format!("field '{}' is not an object", field)));
+    }
+
+    let mut depth = 0usize;
+    for (idx, ch) in after.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok(&after[..=idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(CliError::Parse(format!("unterminated object '{}'", field)))
+}
+
+fn extract_string(json: &str, field: &str) -> Option<String> {
+    let key = format!("\"{}\":", field);
+    let pos = json.find(&key)?;
+    let after = json[pos + key.len()..].trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn extract_hex(json: &str, field: &str) -> CliResult<Vec<u8>> {
+    let value = extract_string(json, field)
+        .ok_or_else(|| CliError::Parse(format!("missing field '{}'", field)))?;
+    hex::decode(&value)
+        .map_err(|e| CliError::InvalidHex(format!("{}: {}", field, e)))
+}
+
+fn extract_hex32(json: &str, field: &str) -> CliResult<[u8; 32]> {
+    extract_hex_fixed::<32>(json, field)
+}
+
+fn extract_hex_fixed<const N: usize>(json: &str, field: &str) -> CliResult<[u8; N]> {
+    let bytes = extract_hex(json, field)?;
+    if bytes.len() != N {
+        return Err(CliError::Parse(format!(
+            "field '{}' must be {} bytes, got {}",
+            field,
+            N,
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Generate a complete set of validator keypairs from three seeds.
@@ -279,6 +379,27 @@ mod tests {
         assert!(json.contains("bls_pk"));
         assert!(json.contains("vrf_pk"));
         assert!(json.contains("WARNING"));
+    }
+
+    #[test]
+    fn keys_json_round_trips_with_nested_public_private_sections() {
+        let keys = generate_keypairs(
+            "validator".to_string(),
+            [0x01u8; 32],
+            [0x02u8; 32],
+            [0x03u8; 32],
+        )
+        .unwrap();
+        let json = keys.to_json();
+        let parsed = KeysFile::from_json(&json).unwrap();
+        assert_eq!(parsed.name, keys.name);
+        assert_eq!(parsed.public.validator_id, keys.public.validator_id);
+        assert_eq!(parsed.public.hybrid_classical_pk, keys.public.hybrid_classical_pk);
+        assert_eq!(parsed.public.hybrid_pq_pk, keys.public.hybrid_pq_pk);
+        assert_eq!(parsed.hybrid_seed, keys.hybrid_seed);
+        assert_eq!(parsed.bls_seed, keys.bls_seed);
+        assert_eq!(parsed.vrf_seed, keys.vrf_seed);
+        assert_eq!(parsed.pq_sk, keys.pq_sk);
     }
 
     #[test]
