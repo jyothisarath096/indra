@@ -114,6 +114,8 @@ pub struct ConsensusDriver {
     last_qc_bytes: Vec<u8>,
     /// Registered voters for the current epoch.
     registered_voters: Vec<RegisteredVoter>,
+    /// Current consensus round for the next block height.
+    current_round: u32,
 }
 
 impl ConsensusDriver {
@@ -126,6 +128,7 @@ impl ConsensusDriver {
             pending_blocks: HashMap::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
+            current_round: 0,
         };
         driver.refresh_registered_voters();
         driver
@@ -145,6 +148,21 @@ impl ConsensusDriver {
     /// Return the previously finalised QC bytes for the next proposal header.
     pub fn last_qc_bytes(&self) -> Vec<u8> {
         self.last_qc_bytes.clone()
+    }
+
+    /// Current consensus round for the next block height.
+    pub fn current_round(&self) -> u32 {
+        self.current_round
+    }
+
+    /// Advance to the next consensus round if the current height remains unfinalized.
+    pub fn advance_round(&mut self) {
+        self.current_round = self.current_round.saturating_add(1);
+    }
+
+    /// Reset the consensus round after height advancement/finalization.
+    pub fn reset_round(&mut self) {
+        self.current_round = 0;
     }
 
     /// Process one inbound event. Returns a list of actions to take.
@@ -181,7 +199,12 @@ impl ConsensusDriver {
         self.pending_blocks.insert(block_hash, block.clone());
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
-        if let Ok(local_vote) = self.engine.sign_vote(block.header.height, 0, VoteStep::Precommit, block_hash) {
+        if let Ok(local_vote) = self.engine.sign_vote(
+            block.header.height,
+            block.header.proposer_round,
+            VoteStep::Precommit,
+            block_hash,
+        ) {
             actions.extend(self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote));
         }
 
@@ -256,6 +279,7 @@ impl ConsensusDriver {
                 self.vote_collectors.remove(&key);
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
+                self.reset_round();
                 vec![DriverAction::BroadcastBlock(block)]
             }
             Err(NodeError::BlockInvalid { .. }) => vec![DriverAction::None],
@@ -338,6 +362,7 @@ mod tests {
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
                 base_fee,
+                proposer_round:      0,
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
                 quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),

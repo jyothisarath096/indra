@@ -51,6 +51,12 @@ pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 /// Hard ceiling on total round time — immutable, not governable.
 pub const MAX_ROUND_TIME_MS: u64 = 15_000;
 
+/// Maximum logical rounds tracked per height when deriving proposer slots.
+///
+/// This is used only to derive a unique deterministic slot index from
+/// `(height, round)` and is not a runtime cap on retries.
+pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
+
 /// Epochs delay before a governance-approved timeout change takes effect.
 pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 

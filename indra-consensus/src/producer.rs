@@ -70,7 +70,8 @@ pub fn produce_block(
             .ok_or(ConsensusError::WrongProposer)?,
         &template.proposer_vrf_keypair,
         &template.epoch_seed,
-        election.slot,
+        election.height,
+        election.round,
     );
 
     let elected = elect_proposer(election)?;
@@ -110,6 +111,7 @@ pub fn produce_block(
         validator_set_root:  Bytes32::ZERO,
         mempool_set_root:    compute_mempool_root(mempool, state.height),
         base_fee:            state.base_fee,
+        proposer_round:      election.round,
         proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
         proposer_vrf_proof:  vrf_proof_bytes,
         quorum_certificate:  qc_bytes,
@@ -151,12 +153,13 @@ mod tests {
         mempool::Mempool,
     };
 
-    fn make_election(seed: &[u8; 32], slot: u64, vrf_seed: [u8; 32], stake: u64) -> ProposerElection {
+    fn make_election(seed: &[u8; 32], height: u64, round: u32, vrf_seed: [u8; 32], stake: u64) -> ProposerElection {
         let vrf_pubkey = VrfKeypair::from_seed(&vrf_seed).public_key();
         let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
         ProposerElection {
             epoch_seed: Bytes32::from(*seed),
-            slot,
+            height,
+            round,
             candidates: vec![
                 crate::proposer::ProposerCandidate {
                     validator_id,
@@ -172,7 +175,7 @@ mod tests {
         let state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x42u8; 32];
-        let election = make_election(&seed, 1, seed, 1_000_000);
+        let election = make_election(&seed, 1, 0, seed, 1_000_000);
 
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
@@ -195,7 +198,7 @@ mod tests {
         let wrong_seed = [0x99u8; 32];
 
         // Election uses seed 0x42, but template uses wrong_seed
-        let election = make_election(&seed, 1, seed, 1_000_000);
+        let election = make_election(&seed, 1, 0, seed, 1_000_000);
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&wrong_seed),
             epoch_seed: Bytes32::from(seed),
@@ -214,7 +217,7 @@ mod tests {
         let state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x10u8; 32];
-        let election = make_election(&seed, 1, seed, 1_000_000);
+        let election = make_election(&seed, 1, 0, seed, 1_000_000);
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
             epoch_seed: Bytes32::from(seed),

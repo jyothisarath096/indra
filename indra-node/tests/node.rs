@@ -35,6 +35,7 @@ fn make_block(height: u64, prev_hash: Bytes32, base_fee: u64) -> BlockV1 {
             validator_set_root:  Bytes32::ZERO,
             mempool_set_root:    Bytes32::ZERO,
             base_fee,
+            proposer_round:      0,
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
             quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),

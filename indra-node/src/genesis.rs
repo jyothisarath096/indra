@@ -34,6 +34,7 @@ pub fn build_genesis_block() -> BlockV1 {
             validator_set_root:  Bytes32::ZERO,
             mempool_set_root:    Bytes32::ZERO,
             base_fee:            INITIAL_BASE_FEE_SPARK_PER_KB,
+            proposer_round:      0,
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::default(),
             quorum_certificate:  VariableBytes::<MAX_QC_SIZE_BYTES>::default(),

@@ -374,6 +374,7 @@ mod tests {
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
                 base_fee:            state.base_fee,
+                proposer_round:      0,
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 quorum_certificate:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),

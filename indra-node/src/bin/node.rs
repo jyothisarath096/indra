@@ -26,7 +26,6 @@ use indra_network::{
     transport::{RecvStatus, Transport},
     gossip::GossipEngine,
 };
-use indra_consensus::proposer::election_slot_from_timestamp;
 use indra_node::{
     NodeConfig, NodeEngine,
     driver::{ConsensusDriver, DriverAction, DriverEvent},
@@ -479,18 +478,14 @@ fn main() {
                             continue;
                         }
 
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let slot = election_slot_from_timestamp(now_secs);
-
                         // VRF-based proposer election
-                        let should_propose = {
+                        let (should_propose, start_height) = {
                             let d = driver.lock().unwrap();
                             let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                 indra_crypto::sha256(&d.engine.state.tip_hash.0)
                             );
+                            let height = d.engine.state.height + 1;
+                            let round = d.current_round();
 
                             // Build candidate list from active validators
                             let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
@@ -504,14 +499,15 @@ fn main() {
 
                             if candidates.is_empty() {
                                 // No validators loaded — fall back to bootstrap behaviour
-                                d.engine.config.bootstrap_peers.is_empty()
+                                (d.engine.config.bootstrap_peers.is_empty(), d.engine.state.height)
                             } else {
                                 let election = indra_consensus::proposer::ProposerElection {
                                     epoch_seed,
-                                    slot,
+                                    height,
+                                    round,
                                     candidates,
                                 };
-                                d.engine.is_proposer(&election)
+                                (d.engine.is_proposer(&election), d.engine.state.height)
                             }
                         };
 
@@ -521,6 +517,8 @@ fn main() {
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                     indra_crypto::sha256(&d.engine.state.tip_hash.0)
                                 );
+                                let height = d.engine.state.height + 1;
+                                let round = d.current_round();
                                 let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
                                     d.engine.state.validators.active_validators()
                                         .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
@@ -531,10 +529,15 @@ fn main() {
                                         .collect();
                                 let election = indra_consensus::proposer::ProposerElection {
                                     epoch_seed,
-                                    slot,
+                                    height,
+                                    round,
                                     candidates,
                                 };
-                                match d.engine.propose(&election, now_secs, d.last_qc_bytes()) {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                match d.engine.propose(&election, timestamp, d.last_qc_bytes()) {
                                     Ok(block) => {
                                         let actions = d.process(DriverEvent::InboundBlock {
                                             from: None,
@@ -562,6 +565,15 @@ fn main() {
                                     hex::encode(block.header.block_hash().0),
                                     new_h
                                 );
+                            }
+                        }
+
+                        {
+                            let mut d = driver.lock().unwrap();
+                            if d.height() == start_height && !sync_state.lock().unwrap().am_syncing {
+                                d.advance_round();
+                            } else if d.height() > start_height {
+                                d.reset_round();
                             }
                         }
                     }
