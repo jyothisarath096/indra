@@ -43,6 +43,8 @@ struct SyncState {
     sync_target_height: u64,
     sync_peer: Option<SocketAddr>,
     requested_to_height: u64,
+    best_peer_tip: u64,
+    caught_up_ticks: u8,
 }
 
 impl SyncState {
@@ -52,6 +54,8 @@ impl SyncState {
             sync_target_height: 0,
             sync_peer: None,
             requested_to_height: 0,
+            best_peer_tip: 0,
+            caught_up_ticks: 0,
         }
     }
 
@@ -59,9 +63,27 @@ impl SyncState {
         self.am_syncing = true;
         self.sync_target_height = target_height;
         self.sync_peer = Some(peer);
+        self.best_peer_tip = self.best_peer_tip.max(target_height);
+        self.caught_up_ticks = 0;
         let to_height = target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
         self.requested_to_height = to_height;
         (from_height, to_height)
+    }
+
+    fn observe_peer_tip(&mut self, peer: SocketAddr, peer_height: u64, local_height: u64, bootstrap_node: bool) {
+        if bootstrap_node {
+            self.reset(local_height);
+            return;
+        }
+
+        self.best_peer_tip = self.best_peer_tip.max(peer_height);
+        if peer_height > local_height {
+            self.sync_peer = Some(peer);
+            self.sync_target_height = self.sync_target_height.max(peer_height);
+            self.caught_up_ticks = 0;
+        }
+
+        self.finish_if_caught_up(local_height);
     }
 
     fn request_next_batch(
@@ -70,8 +92,7 @@ impl SyncState {
     ) -> Option<(SocketAddr, u64, u64)> {
         let peer = self.sync_peer?;
         if !self.am_syncing || current_height >= self.sync_target_height {
-            self.am_syncing = false;
-            self.requested_to_height = current_height;
+            self.reset(current_height);
             return None;
         }
         if current_height < self.requested_to_height {
@@ -86,12 +107,39 @@ impl SyncState {
         Some((peer, from_height, to_height))
     }
 
-    fn finish_if_caught_up(&mut self, current_height: u64) {
-        if self.am_syncing && current_height >= self.sync_target_height {
-            self.am_syncing = false;
-            self.sync_peer = None;
-            self.requested_to_height = current_height;
+    fn on_tick(&mut self, current_height: u64, bootstrap_node: bool) {
+        if bootstrap_node {
+            self.reset(current_height);
+            return;
         }
+
+        if !self.am_syncing {
+            return;
+        }
+
+        if current_height >= self.best_peer_tip {
+            self.caught_up_ticks = self.caught_up_ticks.saturating_add(1);
+            if self.caught_up_ticks >= 3 {
+                self.reset(current_height);
+            }
+        } else {
+            self.caught_up_ticks = 0;
+        }
+    }
+
+    fn finish_if_caught_up(&mut self, current_height: u64) {
+        if self.am_syncing && current_height >= self.best_peer_tip.max(self.sync_target_height) {
+            self.reset(current_height);
+        }
+    }
+
+    fn reset(&mut self, current_height: u64) {
+        self.am_syncing = false;
+        self.sync_target_height = current_height;
+        self.sync_peer = None;
+        self.requested_to_height = current_height;
+        self.best_peer_tip = current_height;
+        self.caught_up_ticks = 0;
     }
 }
 
@@ -325,6 +373,18 @@ fn main() {
                         // Score the peer
                         gossip.lock().unwrap().score_event(&addr, ScoreEvent::ValidBlock);
 
+                        if let Message::Status { height: peer_height, .. } = &msg {
+                            let (local_height, bootstrap_node) = {
+                                let d = driver.lock().unwrap();
+                                (
+                                    d.height(),
+                                    d.engine.config.bootstrap_peers.is_empty(),
+                                )
+                            };
+                            sync_state.lock().unwrap()
+                                .observe_peer_tip(addr, *peer_height, local_height, bootstrap_node);
+                        }
+
                         match &msg {
                             Message::GetBlocks { from_height, to_height } => {
                                 let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
@@ -394,6 +454,13 @@ fn main() {
                                             let _ = gossip.lock().unwrap().broadcast(&out_msg);
                                         }
                                         if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
+                                            let bootstrap_node = {
+                                                let d = driver.lock().unwrap();
+                                                d.engine.config.bootstrap_peers.is_empty()
+                                            };
+                                            if bootstrap_node {
+                                                continue;
+                                            }
                                             let peer_tip = *to_height;
                                             let (req_from, req_to) = {
                                                 let mut sync = sync_state.lock().unwrap();
@@ -421,6 +488,13 @@ fn main() {
                                 }
                                 // Handle sync request
                                 if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
+                                    let bootstrap_node = {
+                                        let d = driver.lock().unwrap();
+                                        d.engine.config.bootstrap_peers.is_empty()
+                                    };
+                                    if bootstrap_node {
+                                        continue;
+                                    }
                                     let (req_from, req_to) = {
                                         let mut sync = sync_state.lock().unwrap();
                                         sync.begin(*from, *from_height, *to_height)
@@ -471,6 +545,15 @@ fn main() {
                         let tip_hash = driver.lock().unwrap().engine.state.tip_hash;
                         let status = Message::Status { height, tip_hash };
                         let _ = gossip.lock().unwrap().broadcast(&status);
+
+                        let bootstrap_node = {
+                            let d = driver.lock().unwrap();
+                            d.engine.config.bootstrap_peers.is_empty()
+                        };
+                        {
+                            let mut sync = sync_state.lock().unwrap();
+                            sync.on_tick(height, bootstrap_node);
+                        }
 
                         if sync_state.lock().unwrap().am_syncing {
                             println!("[consensus] height={} sync in progress — not proposing", height);
