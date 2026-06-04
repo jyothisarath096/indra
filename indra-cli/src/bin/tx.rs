@@ -134,33 +134,78 @@ fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
 
 fn wallet_from_utxos_json(json: &str) -> Wallet {
     let mut wallet = Wallet::new();
+    let Some(utxos_json) = extract_array(json, "utxos") else {
+        return wallet;
+    };
+
     let mut pos = 0usize;
-    while let Some(start_rel) = json[pos..].find("{\"utxo_id\":\"") {
+    while let Some(start_rel) = utxos_json[pos..].find('{') {
         let start = pos + start_rel;
-        let end = json[start..].find('}').map(|i| start + i + 1).unwrap_or(json.len());
-        let obj = &json[start..end];
-        let utxo_id = extract_hex_string(obj, "utxo_id").unwrap_or_default();
+        let Some(end) = find_matching_brace(utxos_json, start) else {
+            break;
+        };
+        let obj = &utxos_json[start..=end];
+        let Some(utxo_id) = extract_hex_string(obj, "utxo_id") else {
+            pos = end + 1;
+            continue;
+        };
         let amount = extract_number(obj, "amount").unwrap_or(0);
         let created_height = extract_number(obj, "created_height").unwrap_or(0);
         let tx_index = extract_number(obj, "tx_index").unwrap_or(0) as u32;
         let out_index = extract_number(obj, "out_index").unwrap_or(0) as u32;
         let mut utxo_id_arr = [0u8; 32];
-        if let Ok(decoded) = hex::decode(&utxo_id) {
-            if decoded.len() == 32 {
-                utxo_id_arr.copy_from_slice(&decoded);
-                wallet.add_utxo(
-                    Bytes32::from(utxo_id_arr),
-                    amount,
-                    [0u8; 32],
-                    created_height,
-                    tx_index,
-                    out_index,
-                );
-            }
+        if utxo_id.len() == 32 {
+            utxo_id_arr.copy_from_slice(&utxo_id);
+            wallet.add_utxo(
+                Bytes32::from(utxo_id_arr),
+                amount,
+                [0u8; 32],
+                created_height,
+                tx_index,
+                out_index,
+            );
         }
-        pos = end;
+        pos = end + 1;
     }
     wallet
+}
+
+fn extract_array<'a>(json: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{}\":", field);
+    let pos = json.find(&key)?;
+    let after = json[pos + key.len()..].trim_start();
+    let after = after.strip_prefix('[')?;
+    let mut depth = 1usize;
+    for (idx, ch) in after.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after[..idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_matching_brace(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn rpc_call(url: &str, method: &str, params: &[String]) -> String {
@@ -222,9 +267,10 @@ fn extract_number(json: &str, field: &str) -> Option<u64> {
 }
 
 fn extract_hex_string(json: &str, field: &str) -> Option<Vec<u8>> {
-    let key = format!("\"{}\":\"", field);
+    let key = format!("\"{}\":", field);
     let pos = json.find(&key)?;
-    let after = &json[pos + key.len()..];
+    let after = json[pos + key.len()..].trim_start();
+    let after = after.strip_prefix('"')?;
     let end = after.find('"')?;
     hex::decode(&after[..end]).ok()
 }
@@ -237,4 +283,16 @@ fn copy32(bytes: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes[..32]);
     arr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_from_nested_utxos_response_parses_balance() {
+        let json = r#"{"jsonrpc":"2.0","result":{"address":"28ce6ab9565c324950a4308ccd1187c473fa737d4e687e12121c04b0e4c8c1b6","utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","amount":1000000000000,"created_height":0,"tx_index":0,"out_index":0,"lock_height":0}]},"id":1}"#;
+        let wallet = wallet_from_utxos_json(json);
+        assert_eq!(wallet.balance(), 1_000_000_000_000);
+    }
 }
