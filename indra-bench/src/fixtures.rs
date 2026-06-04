@@ -28,6 +28,7 @@ pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
             nullifier: Bytes32::from([nonce; 32]),
         }],
         outputs: vec![OutputV1 {
+            value_spark: 1_000_000,
             commitment:   CommitmentV1 { compressed_point: Bytes32::ZERO },
             owner_pubkey: HybridPubKey {
                 classical_pk: Bytes32::ZERO,

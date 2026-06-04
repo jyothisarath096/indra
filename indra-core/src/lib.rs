@@ -32,6 +32,6 @@ pub use types::{
     primitives::{Bytes32, ProtocolVersion, VariableBytes},
     qc::QuorumCertificateV1,
     slashing::SlashEvidenceV1,
-    transaction::{InputV1, OutputV1, TransactionV1},
+    transaction::{InputV1, OutputV1, TransactionV1, TxId},
     vote::VoteV1,
 };

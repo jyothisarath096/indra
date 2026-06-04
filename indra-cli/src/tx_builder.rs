@@ -139,6 +139,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     ).map_err(|e| CliError::Transaction(format!("range proof failed: {e}")))?;
 
     outputs.push(OutputV1 {
+        value_spark: params.amount_spark,
         commitment: CommitmentV1 {
             compressed_point: Bytes32::from(recipient_commitment.0),
         },
@@ -155,6 +156,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
             .map_err(|e| CliError::Transaction(format!("change range proof failed: {e}")))?;
 
         outputs.push(OutputV1 {
+            value_spark: change_spark,
             commitment: CommitmentV1 {
                 compressed_point: Bytes32::from(change_commitment.0),
             },
@@ -183,8 +185,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     };
 
     // 9. Sign: compute tx hash (all fields except signature), then sign
-    let tx_bytes_unsigned = encode_for_signing(&tx);
-    let tx_hash = sha256(&tx_bytes_unsigned);
+    let tx_bytes_unsigned = tx.signing_bytes();
 
     let classical = ClassicalKeypair::from_seed(&params.hybrid_seed);
     let pq = PqKeypair::from_bytes(
@@ -193,7 +194,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         &params.pq_sk_bytes,
     ).map_err(|e| CliError::Crypto(e.to_string()))?;
     let keypair = HybridKeypair::new(classical, pq);
-    let sig = keypair.sign(&tx_hash)
+    let sig = keypair.sign(&tx_bytes_unsigned)
         .map_err(|e| CliError::Crypto(e.to_string()))?;
 
     let classical_sig_bytes = sig.classical.0.to_vec();
@@ -220,21 +221,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         change_blinding,
         spent_utxo_ids: spent_ids,
     })
-}
-
-
-
-/// Encode transaction fields for signing (everything except the signature field).
-fn encode_for_signing(tx: &TransactionV1) -> Vec<u8> {
-    let mut buf = Vec::new();
-    tx.version.encode(&mut buf);
-    tx.signature_module_id.encode(&mut buf);
-    indra_core::codec::encode_list(&tx.inputs, &mut buf);
-    indra_core::codec::encode_list(&tx.outputs, &mut buf);
-    tx.fee_amount.encode(&mut buf);
-    tx.fee_blinding.encode(&mut buf);
-    tx.fee_commitment.encode(&mut buf);
-    buf
 }
 
 /// Parse a hex-encoded hybrid public key.

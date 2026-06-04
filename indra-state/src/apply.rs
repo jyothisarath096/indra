@@ -210,6 +210,9 @@ fn validate_transaction(
     if tx.inputs.is_empty()  { return Err(StateError::ZeroInputs);  }
     if tx.outputs.is_empty() { return Err(StateError::ZeroOutputs); }
 
+    let mut total_input_value = 0u64;
+    let mut owner_pubkey: Option<indra_core::types::crypto::HybridPubKey> = None;
+
     for input in &tx.inputs {
         // Duplicate nullifier within this transaction
         if block_nullifiers.contains(&input.nullifier) {
@@ -224,6 +227,17 @@ fn validate_transaction(
         // Referenced UTXO must exist
         let entry = state.utxos.get(&input.utxo_id)
             .ok_or(StateError::UnknownUtxo)?;
+
+        total_input_value = total_input_value.saturating_add(entry.output.value_spark);
+        match &owner_pubkey {
+            Some(existing) if existing != &entry.output.owner_pubkey => {
+                return Err(StateError::InvariantViolation {
+                    message: "all transaction inputs must belong to the same owner",
+                });
+            }
+            None => owner_pubkey = Some(entry.output.owner_pubkey.clone()),
+            _ => {}
+        }
 
         // UTXO must be past its lock height
         if entry.output.lock_height > current_height {
@@ -249,7 +263,22 @@ fn validate_transaction(
         });
     }
 
+    let total_output_value = tx.outputs.iter().fold(0u64, |acc, output| {
+        acc.saturating_add(output.value_spark)
+    });
+    let required_total = total_output_value.saturating_add(tx.fee_amount);
+    if total_input_value != required_total {
+        return Err(StateError::InvariantViolation {
+            message: "transaction inputs must equal outputs plus fee",
+        });
+    }
+
     for (idx, output) in tx.outputs.iter().enumerate() {
+        if output.value_spark < indra_core::types::primitives::DUST_LIMIT_SPARK {
+            return Err(StateError::InvariantViolation {
+                message: "transaction output below dust limit",
+            });
+        }
         let commitment_bytes = output.commitment.compressed_point.0;
         let proof_bytes = output.range_proof.as_slice();
         verify_range(&commitment_bytes, proof_bytes)
@@ -310,6 +339,8 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
     use crate::chain::ChainState;
 
+    const TEST_INPUT_VALUE: u64 = 1_000_000;
+
     // ── Test helpers ──────────────────────────────────────────────────────
 
     fn dummy_sig() -> HybridSignature {
@@ -327,13 +358,14 @@ mod tests {
     }
 
     fn dummy_output(byte: u8) -> OutputV1 {
-        let value = 1_000u64 + byte as u64;
+        let value = TEST_INPUT_VALUE + byte as u64;
         let blinding = [byte; 32];
         let commitment = commit(value, &blinding);
         let mut rng = StdRng::from_seed([byte; 32]);
         let proof = prove_range(value, &blinding, &mut rng).unwrap();
 
         OutputV1 {
+            value_spark: value,
             commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
             owner_pubkey: dummy_pubkey(),
             range_proof:  VariableBytes::from_slice(&proof).unwrap(),
@@ -350,12 +382,24 @@ mod tests {
     }
 
     fn make_tx(utxo_id: Bytes32, nullifier: Bytes32) -> TransactionV1 {
+        let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
+        let output_value = TEST_INPUT_VALUE + 1 - fee;
+        let blinding = [0x02u8; 32];
+        let commitment = commit(output_value, &blinding);
+        let mut rng = StdRng::from_seed([0x02u8; 32]);
+        let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
         TransactionV1 {
             version:             ProtocolVersion::CURRENT,
             signature_module_id: 1,
             inputs:  vec![InputV1 { utxo_id, nullifier }],
-            outputs: vec![dummy_output(0x02)],
-            fee_amount:     INITIAL_BASE_FEE_SPARK_PER_KB * 10, // covers 10 KB
+            outputs: vec![OutputV1 {
+                value_spark: output_value,
+                commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+                owner_pubkey: dummy_pubkey(),
+                range_proof: VariableBytes::from_slice(&proof).unwrap(),
+                lock_height: 0,
+            }],
+            fee_amount:     fee,
             fee_blinding:   Bytes32::ZERO,
             fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
             signature:      dummy_sig(),

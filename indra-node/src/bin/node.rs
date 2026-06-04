@@ -917,16 +917,46 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
             "indra_getMempoolSize" => {
                 format!(r#"{{"size":{}}}"#, mempool_size)
             }
+            "indra_getValidator" => {
+                let validator_hex = first_param.clone().unwrap_or_default();
+                let response = if validator_hex.len() == 64 {
+                    let mut validator_bytes = [0u8; 32];
+                    if let Ok(decoded) = hex::decode(&validator_hex) {
+                        if decoded.len() == 32 {
+                            validator_bytes.copy_from_slice(&decoded);
+                        }
+                    }
+                    let validator_id = indra_core::Bytes32::from(validator_bytes);
+                    match s.validators.get(&validator_id) {
+                        Some(v) => format!(
+                            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"{}","epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}"}}"#,
+                            hex::encode(v.validator_id.0),
+                            v.name,
+                            v.stake_spark,
+                            if v.is_active() { "active" } else { "inactive" },
+                            v.registered_epoch,
+                            v.hybrid_classical_pk.map(hex::encode).unwrap_or_default(),
+                            v.hybrid_pq_pk.as_ref().map(hex::encode).unwrap_or_default(),
+                        ),
+                        None => "null".to_string(),
+                    }
+                } else {
+                    "null".to_string()
+                };
+                response
+            }
             "indra_getValidatorSet" => {
                 let entries: Vec<String> = s.validators.active_validators().map(|v| {
                     format!(
-                        r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{}}}"#,
+                        r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}"}}"#,
                         hex::encode(v.validator_id.0),
                         v.name,
                         v.stake_spark,
                         v.commission_bps,
                         v.pending_rewards,
                         v.registered_epoch,
+                        v.hybrid_classical_pk.map(hex::encode).unwrap_or_default(),
+                        v.hybrid_pq_pk.as_ref().map(hex::encode).unwrap_or_default(),
                     )
                 }).collect();
                 format!(r#"{{"validators":[{}]}}"#, entries.join(","))
@@ -998,44 +1028,30 @@ Connection: close
                 }
             }
             "indra_getBalance" => {
-                // Params: ["<classical_pubkey_hex>"]
-                let pubkey_hex = first_param.clone().unwrap_or_default();
+                // Params: ["<address_hex>"] where address = SHA-256(classical_pk)
+                let address_hex = first_param.clone().unwrap_or_default();
                 let mut balance: u64 = 0;
-                if pubkey_hex.len() == 64 {
-                    if let Ok(pk_bytes) = hex::decode(&pubkey_hex) {
-                        for entry in s.utxos.all_entries() {
-                            let owner = hex::encode(entry.output.owner_pubkey.classical_pk.0);
-                            if owner == pubkey_hex {
-                                balance = balance.saturating_add(
-                                    // value is hidden in commitment — return 0 for now
-                                    // wallet tracks actual values locally
-                                    0u64
-                                );
-                            }
-                            let _ = pk_bytes.len(); // suppress unused warning
+                if address_hex.len() == 64 {
+                    for entry in s.utxos.all_entries() {
+                        let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
+                        if hex::encode(owner_address) == address_hex {
+                            balance = balance.saturating_add(entry.output.value_spark);
                         }
                     }
                 }
-                // Note: values are confidential — balance must be tracked by wallet
-                // This endpoint returns UTXO count only
-                let utxo_count = if pubkey_hex.len() == 64 {
-                    s.utxos.all_entries()
-                        .filter(|e| hex::encode(e.output.owner_pubkey.classical_pk.0) == pubkey_hex)
-                        .count()
-                } else { 0 };
-                format!(r#"{{"pubkey":"{}","utxo_count":{},"note":"values are confidential — use wallet scan for balance"}}"#,
-                    pubkey_hex, utxo_count)
+                format!(r#"{{"address":"{}","balance":{}}}"#, address_hex, balance)
             }
             "indra_getUtxos" => {
-                // Params: ["<classical_pubkey_hex>"]
-                let pubkey_hex = first_param.clone().unwrap_or_default();
-                let entries: Vec<String> = if pubkey_hex.len() == 64 {
+                // Params: ["<address_hex>"] where address = SHA-256(classical_pk)
+                let address_hex = first_param.clone().unwrap_or_default();
+                let entries: Vec<String> = if address_hex.len() == 64 {
                     s.utxos.all_entries()
-                        .filter(|e| hex::encode(e.output.owner_pubkey.classical_pk.0) == pubkey_hex)
+                        .filter(|e| hex::encode(indra_crypto::sha256(&e.output.owner_pubkey.classical_pk.0)) == address_hex)
                         .map(|e| {
                             format!(
-                                r#"{{"utxo_id":"{}","created_height":{},"tx_index":{},"out_index":{},"lock_height":{}}}"#,
+                                r#"{{"utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{}}}"#,
                                 hex::encode(e.utxo_id.0),
+                                e.output.value_spark,
                                 e.created_height,
                                 e.tx_index,
                                 e.output_index,
@@ -1044,8 +1060,8 @@ Connection: close
                         })
                         .collect()
                 } else { vec![] };
-                format!(r#"{{"pubkey":"{}","utxos":[{}]}}"#,
-                    pubkey_hex, entries.join(","))
+                format!(r#"{{"address":"{}","utxos":[{}]}}"#,
+                    address_hex, entries.join(","))
             }
             _ => {
                 let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found: {}"}},"id":{}}}"#, method, id_raw);

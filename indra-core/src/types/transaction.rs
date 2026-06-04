@@ -14,11 +14,15 @@ use crate::{
     types::{
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes,
-            MAX_INPUTS, MAX_OUTPUTS, MAX_RANGE_PROOF_BYTES,
+            DUST_LIMIT_SPARK, MAX_INPUTS, MAX_OUTPUTS, MAX_RANGE_PROOF_BYTES,
         },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     },
 };
+use indra_crypto::sha256;
+
+/// Transaction ID = SHA-256 of the canonical transaction encoding.
+pub type TxId = Bytes32;
 
 /// A transaction input: a spent UTXO reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +50,11 @@ impl Decode for InputV1 {
 /// A transaction output: a new UTXO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputV1 {
+    /// Public amount in Spark.
+    ///
+    /// This preserves simple balance accounting for the current node/RPC
+    /// implementation while commitments/range proofs still bind the value.
+    pub value_spark: u64,
     /// Pedersen commitment to the output value.
     pub commitment:  CommitmentV1,
     /// Owner's hybrid public key (required to spend this output).
@@ -58,13 +67,15 @@ pub struct OutputV1 {
 
 impl Encode for OutputV1 {
     fn encode(&self, buf: &mut Vec<u8>) {
+        self.value_spark.encode(buf);
         self.commitment.encode(buf);
         self.owner_pubkey.encode(buf);
         self.range_proof.encode(buf);
         self.lock_height.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        self.commitment.encoded_len()
+        8
+            + self.commitment.encoded_len()
             + self.owner_pubkey.encoded_len()
             + self.range_proof.encoded_len()
             + 8
@@ -74,6 +85,7 @@ impl Encode for OutputV1 {
 impl Decode for OutputV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
+            value_spark: u64::decode(r)?,
             commitment:  CommitmentV1::decode(r)?,
             owner_pubkey: HybridPubKey::decode(r)?,
             range_proof: VariableBytes::decode(r)?,
@@ -124,6 +136,14 @@ impl TransactionV1 {
                 field: "outputs", max: MAX_OUTPUTS, actual: self.outputs.len(),
             });
         }
+        for output in &self.outputs {
+            if output.value_spark < DUST_LIMIT_SPARK {
+                return Err(IndraError::BelowDustLimit {
+                    value: output.value_spark,
+                    limit: DUST_LIMIT_SPARK,
+                });
+            }
+        }
         // No duplicate nullifiers within this transaction
         let mut seen: BTreeSet<Bytes32> = BTreeSet::new();
         for input in &self.inputs {
@@ -149,6 +169,24 @@ impl TransactionV1 {
             });
         }
         Ok(())
+    }
+
+    /// Canonical bytes covered by the transaction signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.version.encode(&mut buf);
+        self.signature_module_id.encode(&mut buf);
+        encode_list(&self.inputs, &mut buf);
+        encode_list(&self.outputs, &mut buf);
+        self.fee_amount.encode(&mut buf);
+        self.fee_blinding.encode(&mut buf);
+        self.fee_commitment.encode(&mut buf);
+        buf
+    }
+
+    /// Canonical transaction hash including signatures.
+    pub fn tx_hash(&self) -> TxId {
+        TxId::from(sha256(&self.encode_to_vec()))
     }
 }
 
@@ -216,6 +254,7 @@ mod tests {
                 nullifier: Bytes32::from([0x02u8; 32]),
             }],
             outputs: vec![OutputV1 {
+                value_spark: 100_000,
                 commitment:   CommitmentV1 { compressed_point: Bytes32::from([0x03u8; 32]) },
                 owner_pubkey: dummy_pubkey(),
                 range_proof:  VariableBytes::from_slice(&[0u8; 674]).unwrap(),
@@ -272,5 +311,11 @@ mod tests {
     #[test]
     fn weight_is_nonzero() {
         assert!(minimal_tx().weight_kb() >= 1);
+    }
+
+    #[test]
+    fn tx_hash_is_deterministic() {
+        let tx = minimal_tx();
+        assert_eq!(tx.tx_hash(), tx.tx_hash());
     }
 }

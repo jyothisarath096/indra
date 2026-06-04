@@ -22,6 +22,8 @@ use indra_state::{
 };
 use rand::{SeedableRng, rngs::StdRng};
 
+const TEST_INPUT_VALUE: u64 = 1_000_000;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn dummy_sig() -> HybridSignature {
@@ -39,13 +41,14 @@ fn dummy_pubkey() -> HybridPubKey {
 }
 
 fn make_output(byte: u8) -> OutputV1 {
-    let value = 10_000u64 + byte as u64;
+    let value = TEST_INPUT_VALUE + byte as u64;
     let blinding = [byte; 32];
     let commitment = commit(value, &blinding);
     let mut rng = StdRng::from_seed([byte; 32]);
     let proof = prove_range(value, &blinding, &mut rng).unwrap();
 
     OutputV1 {
+        value_spark: value,
         commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
         owner_pubkey: dummy_pubkey(),
         range_proof:  VariableBytes::from_slice(&proof).unwrap(),
@@ -53,7 +56,13 @@ fn make_output(byte: u8) -> OutputV1 {
     }
 }
 
-fn make_tx(utxo_id: Bytes32, nullifier_byte: u8, out_byte: u8) -> TransactionV1 {
+fn make_tx(utxo_id: Bytes32, input_value: u64, nullifier_byte: u8, out_byte: u8) -> TransactionV1 {
+    let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
+    let output_value = input_value - fee;
+    let blinding = [out_byte; 32];
+    let commitment = commit(output_value, &blinding);
+    let mut rng = StdRng::from_seed([out_byte; 32]);
+    let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
     TransactionV1 {
         version:             ProtocolVersion::CURRENT,
         signature_module_id: 1,
@@ -61,8 +70,14 @@ fn make_tx(utxo_id: Bytes32, nullifier_byte: u8, out_byte: u8) -> TransactionV1 
             utxo_id,
             nullifier: Bytes32::from([nullifier_byte; 32]),
         }],
-        outputs: vec![make_output(out_byte)],
-        fee_amount:     INITIAL_BASE_FEE_SPARK_PER_KB * 10,
+        outputs: vec![OutputV1 {
+            value_spark: output_value,
+            commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+            owner_pubkey: dummy_pubkey(),
+            range_proof: VariableBytes::from_slice(&proof).unwrap(),
+            lock_height: 0,
+        }],
+        fee_amount:     fee,
         fee_blinding:   Bytes32::ZERO,
         fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
         signature:      dummy_sig(),
@@ -121,7 +136,8 @@ fn utxo_lifecycle_across_blocks() {
     let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
 
     // Block 1: spend that UTXO, create a new one
-    let tx = make_tx(utxo_id, 0xAA, 0x02);
+    let block1_output_value = (TEST_INPUT_VALUE + 0x01u64) - (INITIAL_BASE_FEE_SPARK_PER_KB * 10);
+    let tx = make_tx(utxo_id, TEST_INPUT_VALUE + 0x01u64, 0xAA, 0x02);
     let block1 = make_block(&state, vec![tx]);
     apply_block(&mut state, &block1).unwrap();
 
@@ -131,8 +147,23 @@ fn utxo_lifecycle_across_blocks() {
 
     // Block 2: spend the new UTXO
     // Find the new UTXO id — it was inserted at height 1, tx 0, output 0
-    let new_utxo_id = UtxoSet::compute_utxo_id(&make_output(0x02), 1, 0, 0);
-    let tx2 = make_tx(new_utxo_id, 0xBB, 0x03);
+    let blinding = [0x02u8; 32];
+    let commitment = commit(block1_output_value, &blinding);
+    let mut rng = StdRng::from_seed([0x02u8; 32]);
+    let proof = prove_range(block1_output_value, &blinding, &mut rng).unwrap();
+    let new_utxo_id = UtxoSet::compute_utxo_id(&OutputV1 {
+        value_spark: block1_output_value,
+        commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+        owner_pubkey: dummy_pubkey(),
+        range_proof: VariableBytes::from_slice(&proof).unwrap(),
+        lock_height: 0,
+    }, 1, 0, 0);
+    let tx2 = make_tx(
+        new_utxo_id,
+        block1_output_value,
+        0xBB,
+        0x03,
+    );
     let block2 = make_block(&state, vec![tx2]);
     apply_block(&mut state, &block2).unwrap();
 
@@ -206,7 +237,7 @@ fn fees_are_burned() {
     let supply_before = state.total_supply;
 
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-    let tx = make_tx(utxo_id, 0xCC, 0x02);
+    let tx = make_tx(utxo_id, TEST_INPUT_VALUE + 0x01u64, 0xCC, 0x02);
     assert_eq!(tx.fee_amount, fee);
 
     let block = make_block(&state, vec![tx]);

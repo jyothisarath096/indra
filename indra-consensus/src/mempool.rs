@@ -128,13 +128,9 @@ impl Mempool {
         current_base_fee: u64,
         current_height: u64,
     ) -> ConsensusResult<Bytes32> {
-        // Structural check
-        if tx.inputs.is_empty() {
-            return Err(ConsensusError::InvalidTransaction { reason: "zero inputs" });
-        }
-        if tx.outputs.is_empty() {
-            return Err(ConsensusError::InvalidTransaction { reason: "zero outputs" });
-        }
+        tx.validate_structure().map_err(|_| {
+            ConsensusError::InvalidTransaction { reason: "transaction structure invalid" }
+        })?;
 
         let tx_id = Self::tx_id(&tx);
 
@@ -265,6 +261,7 @@ mod tests {
                 nullifier: Bytes32::from([nullifier_byte; 32]),
             }],
             outputs: vec![OutputV1 {
+                value_spark: 1_000,
                 commitment:   CommitmentV1 { compressed_point: Bytes32::ZERO },
                 owner_pubkey: HybridPubKey {
                     classical_pk: Bytes32::ZERO,

@@ -151,6 +151,7 @@ mod tests {
 
     fn dummy_output(byte: u8) -> OutputV1 {
         OutputV1 {
+            value_spark: 1_000 + byte as u64,
             commitment: CommitmentV1 {
                 compressed_point: Bytes32::from([byte; 32]),
             },

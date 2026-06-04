@@ -53,6 +53,7 @@ fn input(utxo_byte: u8, null_byte: u8) -> InputV1 {
 
 fn output(c: u8) -> OutputV1 {
     OutputV1 {
+        value_spark: 100_000 + c as u64,
         commitment:   commitment(c),
         owner_pubkey: pubkey(),
         range_proof:  VariableBytes::from_slice(&[0u8; 674]).unwrap(),

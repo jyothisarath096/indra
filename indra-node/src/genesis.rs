@@ -11,14 +11,19 @@
 use indra_core::{
     types::{
         block::{BlockHeaderV1, BlockV1},
+        crypto::{CommitmentV1, HybridPubKey},
         primitives::{
             Bytes32, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK, ProtocolVersion, VariableBytes,
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
         },
+        transaction::OutputV1,
     },
 };
 use indra_state::ChainState;
-use indra_crypto::sha256;
+use indra_crypto::{commit, prove_range, sha256};
+use rand::{rngs::StdRng, SeedableRng};
+
+const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
 
 /// Build the genesis block.
 ///
@@ -170,6 +175,31 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         };
 
         let _ = state.validators.upsert(entry);
+        if let (Some(classical_pk), Some(hybrid_pq_pk)) =
+            (parse_fixed_hex::<32>(v.get("hybrid_classical_pk")), parse_vec_hex(v.get("hybrid_pq_pk")))
+        {
+            let blinding = sha256(&[
+                b"genesis-utxo-blinding".as_slice(),
+                validator_id.0.as_slice(),
+            ].concat());
+            let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
+            let mut rng = StdRng::from_seed(validator_id.0);
+            if let Ok(proof) = prove_range(GENESIS_VALIDATOR_UTXO_SPARK, &blinding, &mut rng) {
+                let output = OutputV1 {
+                    value_spark: GENESIS_VALIDATOR_UTXO_SPARK,
+                    commitment: CommitmentV1 {
+                        compressed_point: Bytes32::from(commitment.0),
+                    },
+                    owner_pubkey: HybridPubKey {
+                        classical_pk: Bytes32::from(classical_pk),
+                        pq_pk: VariableBytes::from_slice(&hybrid_pq_pk).unwrap_or_default(),
+                    },
+                    range_proof: VariableBytes::from_slice(&proof).unwrap_or_default(),
+                    lock_height: 0,
+                };
+                let _ = state.utxos.insert(output, 0, 0, state.utxos.len() as u32);
+            }
+        }
         // NOTE: startup logging for node bootstrap; replace with structured tracing later.
         println!("[genesis]   + {} ({}...) stake={} Spark", name, &id_hex[..8], stake);
     }
