@@ -514,7 +514,12 @@ fn main() {
                             let d = driver.lock().unwrap();
                             let cand_count = d.engine.state.validators.active_validators()
                                 .filter(|v| v.vrf_pk.is_some()).count();
-                            eprintln!("[proposer] candidates={} should_propose={}", cand_count, should_propose);
+                            let my_id = d.engine.validator_id()
+                                .map(|id| hex::encode(&id.0[..4]))
+                                .unwrap_or("none".to_string());
+                            let has_vrf = d.engine.has_vrf_keypair();
+                            eprintln!("[proposer] id={} has_vrf={} candidates={} should_propose={}", 
+                                my_id, has_vrf, cand_count, should_propose);
                         }
 
                         if should_propose {

@@ -85,10 +85,8 @@ impl NodeEngine {
 
         // Build validator keypairs if configured
         let (hybrid_keypair, vrf_keypair, validator_id) =
-            if let (Some(vs), Some(vrfs)) = (
-                config.validator_seed,
-                config.vrf_seed,
-            ) {
+            match (config.validator_seed, config.vrf_seed) {
+                (Some(vs), Some(vrfs)) => {
                 let classical = ClassicalKeypair::from_seed(&vs);
                 let pq = if let (Some(pk), Some(sk)) = (
                     config.pq_pk.as_deref(),
@@ -104,8 +102,18 @@ impl NodeEngine {
                 let pk = hybrid.public_key();
                 let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
                 (Some(hybrid), Some(vrf), Some(id))
-            } else {
-                (None, None, None)
+                }
+                (Some(_), None) => {
+                    return Err(NodeError::ValidatorConfigIncomplete {
+                        detail: "validator_seed was provided but vrf_seed was missing".to_string(),
+                    });
+                }
+                (None, Some(_)) => {
+                    return Err(NodeError::ValidatorConfigIncomplete {
+                        detail: "vrf_seed was provided but validator_seed was missing".to_string(),
+                    });
+                }
+                (None, None) => (None, None, None),
             };
 
         Ok(Self {
@@ -130,6 +138,11 @@ impl NodeEngine {
         self.validator_id
     }
 
+    /// True if this node has a local VRF keypair loaded.
+    pub fn has_vrf_keypair(&self) -> bool {
+        self.vrf_keypair.is_some()
+    }
+
     /// Rebuild the current chain state by replaying the block log on top of
     /// the current genesis-equivalent state.
     ///
@@ -146,14 +159,51 @@ impl NodeEngine {
 
     /// Check if this node is the elected proposer for the next height.
     pub fn is_proposer(&self, election: &ProposerElection) -> bool {
-        let Some(vrf_kp) = &self.vrf_keypair else { return false; };
-        let Some(validator_id) = self.validator_id else { return false; };
+        let my_id = self.validator_id
+            .map(|id| hex::encode(&id.0[..4]))
+            .unwrap_or_else(|| "none".to_string());
+        let has_vrf = self.vrf_keypair.is_some();
+        let cand_count = election.candidates.len();
+        let in_candidates = self.validator_id
+            .map(|validator_id| election.candidates.iter().any(|candidate| candidate.validator_id == validator_id))
+            .unwrap_or(false);
+
+        let Some(vrf_kp) = &self.vrf_keypair else {
+            eprintln!(
+                "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected=none should_propose=false",
+                my_id, has_vrf, in_candidates, cand_count
+            );
+            return false;
+        };
+        let Some(validator_id) = self.validator_id else {
+            eprintln!(
+                "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected=none should_propose=false",
+                my_id, has_vrf, in_candidates, cand_count
+            );
+            return false;
+        };
         let slot = compute_proposer_vrf(validator_id, vrf_kp, &election.epoch_seed, self.state.height + 1);
         let elected = match elect_proposer(election) {
             Ok(id) => id,
-            Err(_) => return false,
+            Err(_) => {
+                eprintln!(
+                    "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected=err should_propose=false",
+                    my_id, has_vrf, in_candidates, cand_count
+                );
+                return false;
+            }
         };
-        elected == slot.proposer_id
+        let should_propose = elected == slot.proposer_id;
+        eprintln!(
+            "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected={} should_propose={}",
+            my_id,
+            has_vrf,
+            in_candidates,
+            cand_count,
+            hex::encode(&elected.0[..4]),
+            should_propose
+        );
+        should_propose
     }
 
     /// Propose a block for the next height (only if this node is the proposer).
@@ -284,6 +334,18 @@ mod tests {
         let config = NodeConfig::full_node(dir.clone());
         let engine = NodeEngine::init(config).unwrap();
         assert!(engine.validator_id().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validator_init_requires_vrf_seed() {
+        let dir = temp_dir("b_missing_vrf");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.vrf_seed = None;
+        assert!(matches!(
+            NodeEngine::init(config),
+            Err(NodeError::ValidatorConfigIncomplete { .. })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

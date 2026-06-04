@@ -37,6 +37,13 @@ pub enum NodeError {
         height: u64,
     },
 
+    /// Validator configuration is incomplete.
+    #[error("validator configuration is incomplete: {detail}")]
+    ValidatorConfigIncomplete {
+        /// Which required fields were missing or inconsistent.
+        detail: String,
+    },
+
     /// The node is not configured as a validator for local signing.
     #[error("node is not configured as a validator")]
     NotValidator,
