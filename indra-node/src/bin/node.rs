@@ -624,6 +624,13 @@ fn main() {
                                     .as_secs();
                                 match d.engine.propose(&election, timestamp, d.last_qc_bytes()) {
                                     Ok(block) => {
+                                        if !block.transactions.is_empty() {
+                                            eprintln!(
+                                                "[mempool] including {} txs in block at height={}",
+                                                block.transactions.len(),
+                                                block.header.height,
+                                            );
+                                        }
                                         let actions = d.process(DriverEvent::InboundBlock {
                                             from: None,
                                             block: block.clone(),
@@ -747,6 +754,13 @@ fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction
             eprintln!(
                 "[vote] sent vote for {} to {} peers",
                 hex::encode(&vote.block_hash.0[..4]),
+                peers,
+            );
+        }
+        DriverAction::BroadcastTx(tx) => {
+            eprintln!(
+                "[mempool] broadcasting tx {} to {} peers",
+                hex::encode(&tx.tx_hash().0[..4]),
                 peers,
             );
         }
@@ -996,8 +1010,9 @@ Connection: close
                     Ok(tx) => {
                         let base_fee = guard.engine.state.base_fee;
                         let height = guard.engine.state.height;
-                        match guard.engine.mempool.submit(tx, base_fee, height) {
+                        match guard.engine.mempool.submit(tx.clone(), base_fee, height) {
                             Ok(tx_id) => {
+                                let _ = gossip_rpc.lock().unwrap().broadcast(&Message::Tx(tx));
                                 format!(r#"{{"tx_id":"{}","status":"accepted"}}"#,
                                     hex::encode(tx_id.0))
                             }

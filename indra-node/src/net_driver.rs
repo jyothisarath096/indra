@@ -37,6 +37,7 @@ pub fn action_to_message(action: &DriverAction) -> Option<Message> {
     match action {
         DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
         DriverAction::BroadcastVote(vote)   => Some(Message::Vote(vote.clone())),
+        DriverAction::BroadcastTx(tx)       => Some(Message::Tx(tx.clone())),
         _ => None,
     }
 }

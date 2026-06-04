@@ -30,6 +30,7 @@ use indra_core::codec::Encode;
 use indra_core::types::{
     block::BlockV1,
     primitives::Bytes32,
+    transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
 };
 use indra_consensus::{
@@ -86,6 +87,8 @@ pub enum DriverAction {
     BroadcastBlock(BlockV1),
     /// Broadcast this vote to all peers.
     BroadcastVote(VoteV1),
+    /// Broadcast this transaction to peers.
+    BroadcastTx(TransactionV1),
     /// Request blocks from a specific peer.
     RequestBlocks {
         /// The peer to ask.
@@ -546,8 +549,10 @@ impl ConsensusDriver {
 
         let base_fee = self.engine.state.base_fee;
         let height   = self.engine.state.height;
-        let _ = self.engine.mempool.submit(tx, base_fee, height);
-        vec![DriverAction::None]
+        match self.engine.mempool.submit(tx.clone(), base_fee, height) {
+            Ok(_) => vec![DriverAction::BroadcastTx(tx)],
+            Err(_) => vec![DriverAction::None],
+        }
     }
 
     fn process_status(

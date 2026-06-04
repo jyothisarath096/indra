@@ -111,7 +111,7 @@ pub fn produce_block(
         // (in Phase 5 when we have persistent Merkle tries)
         state_root:          Bytes32::ZERO,
         validator_set_root:  Bytes32::ZERO,
-        mempool_set_root:    compute_mempool_root(mempool, state.height),
+        mempool_set_root:    compute_selected_tx_root(&selected),
         base_fee:            state.base_fee,
         proposer_round:      election.round,
         proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
@@ -127,15 +127,14 @@ pub fn produce_block(
     })
 }
 
-/// Compute a simple mempool root: SHA-256 of all tx_ids sorted and hashed.
+/// Compute a simple selected-transaction root: SHA-256 of all selected tx_ids sorted and hashed.
 ///
-/// In Phase 5 this becomes a proper Merkle root. For now it's a
-/// commitment to the mempool state that enables basic censorship detection.
-fn compute_mempool_root(mempool: &Mempool, _current_height: u64) -> Bytes32 {
+/// This binds the header hash to the exact transaction set included in the block.
+fn compute_selected_tx_root(transactions: &[TransactionV1]) -> Bytes32 {
     use indra_crypto::sha256;
-    let mut tx_ids: Vec<[u8; 32]> = mempool
+    let mut tx_ids: Vec<[u8; 32]> = transactions
         .iter()
-        .map(|e| e.tx_id.0)
+        .map(|tx| tx.tx_hash().0)
         .collect();
     tx_ids.sort();
 
