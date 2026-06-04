@@ -196,7 +196,22 @@ impl ConsensusDriver {
         }
 
         let block_hash = block.header.block_hash();
+        eprintln!(
+            "[vote] received proposal {} from {} at height={} round={}, staging block",
+            hex::encode(&block_hash.0[..4]),
+            _from.map(|addr| addr.to_string()).unwrap_or_else(|| "local".to_string()),
+            block.header.height,
+            block.header.proposer_round,
+        );
         self.pending_blocks.insert(block_hash, block.clone());
+
+        if let Some(action) = self.maybe_finalize_existing_quorum(
+            block.header.height,
+            block.header.proposer_round,
+            block_hash,
+        ) {
+            return vec![action];
+        }
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
         if let Ok(local_vote) = self.engine.sign_vote(
@@ -205,14 +220,35 @@ impl ConsensusDriver {
             VoteStep::Precommit,
             block_hash,
         ) {
+            eprintln!(
+                "[vote] sending local precommit for {} at height={} round={}",
+                hex::encode(&block_hash.0[..4]),
+                block.header.height,
+                block.header.proposer_round,
+            );
             actions.extend(self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote));
+        } else {
+            eprintln!(
+                "[vote] failed to sign local precommit for {} at height={} round={}",
+                hex::encode(&block_hash.0[..4]),
+                block.header.height,
+                block.header.proposer_round,
+            );
         }
 
         actions
     }
 
-    fn process_vote(&mut self, _from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+    fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
+
+        eprintln!(
+            "[vote] received vote from {} for {} at height={} round={}",
+            from,
+            hex::encode(&vote.block_hash.0[..4]),
+            vote.height,
+            vote.round,
+        );
 
         // Check for slash conditions
         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
@@ -220,11 +256,11 @@ impl ConsensusDriver {
         }
 
         // Route to appropriate vote collector
-        actions.extend(self.record_vote_and_actions(_from, vote));
+        actions.extend(self.record_vote_and_actions(from, vote));
         actions
     }
 
-    fn record_vote_and_actions(&mut self, _from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+    fn record_vote_and_actions(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
         let key = (vote.height, vote.round);
         let collector = self.vote_collectors
@@ -238,29 +274,93 @@ impl ConsensusDriver {
 
         match collector.add_vote(vote.clone()) {
             Ok(VoteDecision::QuorumReached { block_hash, stake_bps: _ }) => {
+                eprintln!(
+                    "[vote] collected {}/{} votes for {} at height={} round={} — quorum",
+                    collector.vote_count(),
+                    self.registered_voters.len(),
+                    hex::encode(&block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                );
                 actions.push(DriverAction::BroadcastVote(vote.clone()));
                 actions.extend(self.finalize_block_on_quorum(vote.height, vote.round, block_hash));
             }
             Ok(VoteDecision::Waiting) => {
+                eprintln!(
+                    "[vote] collected {}/{} votes for {} at height={} round={} — waiting",
+                    collector.vote_count(),
+                    self.registered_voters.len(),
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                );
                 actions.push(DriverAction::BroadcastVote(vote));
             }
-            Err(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "[vote] rejected vote from {} for {} at height={} round={}: {}",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                    err,
+                );
+            }
         }
 
         actions
     }
 
+    fn maybe_finalize_existing_quorum(
+        &mut self,
+        height: u64,
+        round: u32,
+        block_hash: Bytes32,
+    ) -> Option<DriverAction> {
+        let key = (height, round);
+        let Some(collector) = self.vote_collectors.get(&key) else {
+            return None;
+        };
+
+        match collector.current_decision() {
+            VoteDecision::QuorumReached { block_hash: quorum_hash, .. } if quorum_hash == block_hash => {
+                self.finalize_block_on_quorum(height, round, block_hash)
+                    .into_iter()
+                    .find(|action| !matches!(action, DriverAction::None))
+            }
+            _ => None,
+        }
+    }
+
     fn finalize_block_on_quorum(&mut self, height: u64, round: u32, block_hash: Bytes32) -> Vec<DriverAction> {
         let Some(block) = self.pending_blocks.remove(&block_hash) else {
+            eprintln!(
+                "[commit] quorum reached for {} at height={} round={}, but block is not staged yet",
+                hex::encode(&block_hash.0[..4]),
+                height,
+                round,
+            );
             return vec![DriverAction::None];
         };
         let key = (height, round);
         let Some(collector) = self.vote_collectors.get(&key) else {
+            eprintln!(
+                "[commit] quorum reached for {} at height={} round={}, but collector is missing",
+                hex::encode(&block_hash.0[..4]),
+                height,
+                round,
+            );
             return vec![DriverAction::None];
         };
 
         let qc_validators = self.engine.qc_validators();
         if qc_validators.len() != self.registered_voters.len() {
+            eprintln!(
+                "[commit] cannot finalize {} at height={} round={} because QC validator set is incomplete",
+                hex::encode(&block_hash.0[..4]),
+                height,
+                round,
+            );
             return vec![DriverAction::None];
         }
         let quorum_votes: Vec<&VoteV1> = collector
@@ -270,11 +370,26 @@ impl ConsensusDriver {
             .collect();
         let qc = match build_qc(height, round, block_hash, &qc_validators, quorum_votes) {
             Ok(qc) => qc,
-            Err(_) => return vec![DriverAction::None],
+            Err(err) => {
+                eprintln!(
+                    "[commit] failed to build QC for {} at height={} round={}: {}",
+                    hex::encode(&block_hash.0[..4]),
+                    height,
+                    round,
+                    err,
+                );
+                return vec![DriverAction::None];
+            }
         };
 
         match self.engine.commit_block(&block) {
             Ok(_) => {
+                eprintln!(
+                    "[commit] quorum reached for {} at height={} round={}, finalizing",
+                    hex::encode(&block_hash.0[..4]),
+                    height,
+                    round,
+                );
                 self.last_qc_bytes = qc.encode_to_vec();
                 self.vote_collectors.remove(&key);
                 self.slash_detector.prune_below(height.saturating_sub(100));
@@ -282,8 +397,25 @@ impl ConsensusDriver {
                 self.reset_round();
                 vec![DriverAction::BroadcastBlock(block)]
             }
-            Err(NodeError::BlockInvalid { .. }) => vec![DriverAction::None],
-            Err(_) => vec![DriverAction::None],
+            Err(NodeError::BlockInvalid { height, reason }) => {
+                eprintln!(
+                    "[commit] failed to finalize {} at height={}: {}",
+                    hex::encode(&block_hash.0[..4]),
+                    height,
+                    reason,
+                );
+                vec![DriverAction::None]
+            }
+            Err(err) => {
+                eprintln!(
+                    "[commit] failed to finalize {} at height={} round={}: {}",
+                    hex::encode(&block_hash.0[..4]),
+                    height,
+                    round,
+                    err,
+                );
+                vec![DriverAction::None]
+            }
         }
     }
 
@@ -399,6 +531,32 @@ mod tests {
         driver.refresh_registered_voters();
     }
 
+    fn install_active_validator(driver: &mut ConsensusDriver, seed: [u8; 32], name: &str) -> HybridKeypair {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let hybrid = HybridKeypair::new(classical, pq);
+        let public = hybrid.public_key();
+        let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+
+        driver.engine.state.validators.upsert(ValidatorEntry {
+            validator_id,
+            name: name.to_string(),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.clone()),
+            vrf_pk: Some(vrf_pk),
+            stake_spark: 1_000_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: DEFAULT_COMMISSION_BPS,
+            min_delegation_spark: DUST_LIMIT_SPARK,
+        }).unwrap();
+        hybrid
+    }
+
     #[test]
     fn driver_commits_valid_block() {
         let dir = temp_dir("a");
@@ -474,6 +632,48 @@ mod tests {
         let actions = driver.process(DriverEvent::InboundVote { from: peer, vote: vote_b });
 
         assert!(actions.iter().any(|a| matches!(a, DriverAction::SlashDetected(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_finalizes_when_votes_arrive_before_block() {
+        let dir = temp_dir("d");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let local_seed = [0x42u8; 32];
+        let pq = PqKeypair::from_seed(&local_seed).unwrap();
+        config.validator_seed = Some(local_seed);
+        config.vrf_seed = Some(local_seed);
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+
+        let remote_a = install_active_validator(&mut driver, [0x43u8; 32], "remote-a");
+        let remote_b = install_active_validator(&mut driver, [0x44u8; 32], "remote-b");
+        let _local = install_active_validator(&mut driver, local_seed, "local");
+        driver.refresh_registered_voters();
+
+        let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let block_hash = block.header.block_hash();
+
+        let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
+        let remote_b_id = Bytes32::from(indra_crypto::sha256(&remote_b.public_key().classical.0));
+        let vote_a = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Precommit, block_hash, remote_a_id, &remote_a
+        ).unwrap();
+        let vote_b = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Precommit, block_hash, remote_b_id, &remote_b
+        ).unwrap();
+
+        let peer_a: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:9102".parse().unwrap();
+        let _ = driver.process(DriverEvent::InboundVote { from: peer_a, vote: vote_a });
+        let _ = driver.process(DriverEvent::InboundVote { from: peer_b, vote: vote_b });
+
+        let actions = driver.process(DriverEvent::InboundBlock { from: Some(peer_a), block });
+
+        assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
+        assert_eq!(driver.height(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

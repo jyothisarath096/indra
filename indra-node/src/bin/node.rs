@@ -451,6 +451,7 @@ fn main() {
                                     let actions = driver.lock().unwrap().process(event);
                                     for action in actions {
                                         if let Some(out_msg) = action_to_message(&action) {
+                                            log_broadcast_action(&gossip, &action);
                                             let _ = gossip.lock().unwrap().broadcast(&out_msg);
                                         }
                                         if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
@@ -484,6 +485,7 @@ fn main() {
                             let actions = driver.lock().unwrap().process(event);
                             for action in actions {
                                 if let Some(out_msg) = action_to_message(&action) {
+                                    log_broadcast_action(&gossip, &action);
                                     let _ = gossip.lock().unwrap().broadcast(&out_msg);
                                 }
                                 // Handle sync request
@@ -638,6 +640,7 @@ fn main() {
                             if let Some((block, actions)) = proposal {
                                 for action in actions {
                                     if let Some(out_msg) = action_to_message(&action) {
+                                        log_broadcast_action(&gossip, &action);
                                         let _ = gossip.lock().unwrap().broadcast(&out_msg);
                                     }
                                 }
@@ -727,6 +730,27 @@ fn main() {
         }
 
         last_height = height;
+    }
+}
+
+fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction) {
+    let peers = gossip.lock().unwrap().connection_count();
+    match action {
+        DriverAction::BroadcastBlock(block) => {
+            eprintln!(
+                "[gossip] broadcasting proposal {} to {} peers",
+                hex::encode(&block.header.block_hash().0[..4]),
+                peers,
+            );
+        }
+        DriverAction::BroadcastVote(vote) => {
+            eprintln!(
+                "[vote] sent vote for {} to {} peers",
+                hex::encode(&vote.block_hash.0[..4]),
+                peers,
+            );
+        }
+        _ => {}
     }
 }
 
