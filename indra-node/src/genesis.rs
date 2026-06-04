@@ -198,6 +198,11 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
                     lock_height: 0,
                 };
                 let _ = state.utxos.insert(output, 0, 0, state.utxos.len() as u32);
+                eprintln!(
+                    "[genesis] created UTXO {} Spark for {}",
+                    GENESIS_VALIDATOR_UTXO_SPARK,
+                    name
+                );
             }
         }
         // NOTE: startup logging for node bootstrap; replace with structured tracing later.

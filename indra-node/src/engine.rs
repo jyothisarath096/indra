@@ -152,6 +152,8 @@ impl NodeEngine {
         let mut rebuilt = ChainState::new_genesis();
         rebuilt.validators = self.state.validators.clone();
         rebuilt.delegations = self.state.delegations.clone();
+        rebuilt.utxos = self.state.utxos.clone();
+        rebuilt.nullifiers = self.state.nullifiers.clone();
         rebuild_state_from_block_log(&mut rebuilt, &mut self.block_store)?;
         self.state = rebuilt;
         Ok(())
@@ -430,6 +432,35 @@ mod tests {
         let restarted = NodeEngine::init(config).unwrap();
         assert_eq!(restarted.state.height, 3);
         assert_eq!(restarted.state.tip_hash, engine.state.tip_hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebuild_preserves_preloaded_genesis_utxos() {
+        let dir = temp_dir("genesis_utxo");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+
+        let classical = ClassicalKeypair::from_seed(&[0x11u8; 32]);
+        let pq = PqKeypair::from_seed(&[0x11u8; 32]).unwrap();
+        let vrf = VrfKeypair::from_seed(&[0x22u8; 32]);
+        let validator_id = indra_crypto::sha256(&classical.public_key().0);
+        let genesis_path = dir.join("genesis.toml");
+        let genesis = format!(
+            "[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 100000000000\n",
+            hex::encode(validator_id),
+            hex::encode(classical.public_key().0),
+            hex::encode(pq.public_key().0),
+            hex::encode(vrf.public_key()),
+        );
+        std::fs::write(&genesis_path, genesis).unwrap();
+
+        crate::genesis::load_genesis_validators(genesis_path.to_str().unwrap(), &mut engine.state);
+        assert_eq!(engine.state.utxos.len(), 1);
+
+        engine.rebuild_state_from_block_log().unwrap();
+        assert_eq!(engine.state.utxos.len(), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
