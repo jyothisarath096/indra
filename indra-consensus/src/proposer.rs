@@ -60,13 +60,20 @@ pub fn proposer_slot_index(height: u64, round: u32) -> u64 {
         .saturating_add(round as u64)
 }
 
+/// Encode the shared proposer-election input.
+pub fn vrf_election_input(height: u64, round: u32, epoch_seed: &[u8; 32]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + 4 + 8);
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(&round.to_le_bytes());
+    data.extend_from_slice(&epoch_seed[..8]);
+    data
+}
+
 /// Compute the VRF input deterministically.
 pub fn compute_vrf_input(epoch_seed: &[u8; 32], height: u64, round: u32) -> [u8; 32] {
     use indra_crypto::hash::domains::VRF_INPUT;
     let mut data = VRF_INPUT.to_vec();
-    data.extend_from_slice(&height.to_le_bytes());
-    data.extend_from_slice(&round.to_le_bytes());
-    data.extend_from_slice(&epoch_seed[..8]);
+    data.extend_from_slice(&vrf_election_input(height, round, epoch_seed));
     sha256(&data)
 }
 
@@ -238,6 +245,16 @@ mod tests {
     fn slot_index_depends_on_height_and_round() {
         assert_ne!(proposer_slot_index(5, 0), proposer_slot_index(5, 1));
         assert_ne!(proposer_slot_index(5, 0), proposer_slot_index(6, 0));
+    }
+
+    #[test]
+    fn election_input_encoding_is_stable() {
+        let epoch_seed = [0xABu8; 32];
+        let input = vrf_election_input(9, 3, &epoch_seed);
+        assert_eq!(&input[..8], &9u64.to_le_bytes());
+        assert_eq!(&input[8..12], &3u32.to_le_bytes());
+        assert_eq!(&input[12..20], &epoch_seed[..8]);
+        assert_eq!(input.len(), 20);
     }
 
     #[test]

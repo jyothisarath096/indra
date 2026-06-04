@@ -124,8 +124,11 @@ fn verify_proposer_vrf(
         return Ok(());
     }
 
+    // Bind VRF verification to the block's declared parent hash so the
+    // verifier uses the same epoch seed the proposer saw when building
+    // this header, even if the local node's mutable state has moved.
     let epoch_seed = indra_core::types::primitives::Bytes32::from(
-        indra_crypto::sha256(&state.tip_hash.0)
+        indra_crypto::sha256(&block.header.prev_hash.0)
     );
     let vrf_input = compute_vrf_input(&epoch_seed.0, block.header.height, block.header.proposer_round);
     let proof = VrfProof(proof_bytes.to_vec());

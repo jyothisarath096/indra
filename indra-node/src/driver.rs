@@ -23,7 +23,7 @@
 //!     └── Status → peer_table.update_height → if behind: send GetBlocks
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use indra_core::codec::Encode;
@@ -110,6 +110,8 @@ pub struct ConsensusDriver {
     vote_collectors: HashMap<(u64, u32), VoteCollector>,
     /// Pending blocks by block hash until precommit quorum forms.
     pending_blocks: HashMap<Bytes32, BlockV1>,
+    /// Blocks whose quorum arrived before the proposal was staged locally.
+    pending_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Serialised QC for the most recently finalised height.
     last_qc_bytes: Vec<u8>,
     /// Registered voters for the current epoch.
@@ -126,6 +128,7 @@ impl ConsensusDriver {
             slash_detector: SlashDetector::new(),
             vote_collectors: HashMap::new(),
             pending_blocks: HashMap::new(),
+            pending_quorum: HashSet::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
             current_round: 0,
@@ -205,12 +208,18 @@ impl ConsensusDriver {
         );
         self.pending_blocks.insert(block_hash, block.clone());
 
-        if let Some(action) = self.maybe_finalize_existing_quorum(
-            block.header.height,
-            block.header.proposer_round,
-            block_hash,
-        ) {
-            return vec![action];
+        if self
+            .pending_quorum
+            .remove(&(block.header.height, block.header.proposer_round, block_hash))
+        {
+            let actions = self.finalize_block_on_quorum(
+                block.header.height,
+                block.header.proposer_round,
+                block_hash,
+            );
+            if actions.iter().any(|action| !matches!(action, DriverAction::None)) {
+                return actions;
+            }
         }
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
@@ -311,27 +320,6 @@ impl ConsensusDriver {
         actions
     }
 
-    fn maybe_finalize_existing_quorum(
-        &mut self,
-        height: u64,
-        round: u32,
-        block_hash: Bytes32,
-    ) -> Option<DriverAction> {
-        let key = (height, round);
-        let Some(collector) = self.vote_collectors.get(&key) else {
-            return None;
-        };
-
-        match collector.current_decision() {
-            VoteDecision::QuorumReached { block_hash: quorum_hash, .. } if quorum_hash == block_hash => {
-                self.finalize_block_on_quorum(height, round, block_hash)
-                    .into_iter()
-                    .find(|action| !matches!(action, DriverAction::None))
-            }
-            _ => None,
-        }
-    }
-
     fn finalize_block_on_quorum(&mut self, height: u64, round: u32, block_hash: Bytes32) -> Vec<DriverAction> {
         let Some(block) = self.pending_blocks.remove(&block_hash) else {
             eprintln!(
@@ -340,8 +328,10 @@ impl ConsensusDriver {
                 height,
                 round,
             );
+            self.pending_quorum.insert((height, round, block_hash));
             return vec![DriverAction::None];
         };
+        self.pending_quorum.remove(&(height, round, block_hash));
         let key = (height, round);
         let Some(collector) = self.vote_collectors.get(&key) else {
             eprintln!(
@@ -392,6 +382,7 @@ impl ConsensusDriver {
                 );
                 self.last_qc_bytes = qc.encode_to_vec();
                 self.vote_collectors.remove(&key);
+                self.pending_quorum.remove(&(height, round, block_hash));
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
                 self.reset_round();
