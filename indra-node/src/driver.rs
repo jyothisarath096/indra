@@ -286,6 +286,33 @@ impl ConsensusDriver {
         if self.pending_blocks.contains_key(&block_hash) {
             return vec![DriverAction::None];
         }
+
+        let incoming_round = block.header.proposer_round;
+        let incoming_height = block.header.height;
+        let higher_round_hashes: Vec<Bytes32> = self.pending_blocks
+            .iter()
+            .filter(|(_, staged_block)| {
+                staged_block.header.height == incoming_height
+                    && staged_block.header.proposer_round > incoming_round
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        if !higher_round_hashes.is_empty() {
+            for hash in &higher_round_hashes {
+                self.pending_blocks.remove(hash);
+                eprintln!(
+                    "[consensus] evicting later-round proposal {} in favor of round-{}",
+                    hex::encode(hash.0),
+                    incoming_round
+                );
+            }
+            self.buffered_votes.retain(|(height, round, _), _| {
+                !(*height == incoming_height && *round > incoming_round)
+            });
+            self.accepted_proposal_height = None;
+        }
+
         eprintln!(
             "[vote] received proposal {} from {} at height={} round={}, staging block",
             hex::encode(&block_hash.0[..4]),
@@ -1018,6 +1045,49 @@ mod tests {
             Some(&hash_a)
         );
         assert_eq!(driver.buffered_votes.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn earlier_round_proposal_evicts_later_round_pending_block() {
+        let dir = temp_dir("h");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&[0x81u8; 32]).unwrap();
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+        install_single_active_validator(&mut driver, [0x81u8; 32]);
+        let _remote = install_active_validator(&mut driver, [0x82u8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let mut later = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        later.header.proposer_round = 8;
+        later.header.timestamp += 8;
+
+        let mut earlier = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        earlier.header.proposer_round = 1;
+        earlier.header.timestamp += 1;
+
+        let later_hash = later.header.block_hash();
+        let earlier_hash = earlier.header.block_hash();
+
+        let later_actions = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: later.clone(),
+        });
+        assert!(later_actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
+        assert!(driver.pending_blocks.contains_key(&later_hash));
+
+        let earlier_actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9501".parse().unwrap()),
+            block: earlier.clone(),
+        });
+
+        assert!(earlier_actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
+        assert!(!driver.pending_blocks.contains_key(&later_hash));
+        assert!(driver.pending_blocks.contains_key(&earlier_hash));
+        assert_eq!(driver.accepted_proposal_height, Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
