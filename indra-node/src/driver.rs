@@ -125,8 +125,8 @@ pub struct ConsensusDriver {
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
     /// First accepted vote hash per (validator, height, round) slot.
     seen_round_votes: HashMap<(Bytes32, u64, u32), Bytes32>,
-    /// Height for which we have already accepted a valid proposal.
-    accepted_proposal_height: Option<u64>,
+    /// Accepted proposal slot currently suppressing local proposals.
+    accepted_proposal: Option<(u64, u32)>,
     /// Blocks whose quorum arrived before the proposal was staged locally.
     pending_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Serialised QC for the most recently finalised height.
@@ -149,7 +149,7 @@ impl ConsensusDriver {
             pending_blocks: HashMap::new(),
             buffered_votes: HashMap::new(),
             seen_round_votes: HashMap::new(),
-            accepted_proposal_height: None,
+            accepted_proposal: None,
             pending_quorum: HashSet::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
@@ -198,7 +198,12 @@ impl ConsensusDriver {
 
     /// True if we have already accepted a valid proposal for `height`.
     pub fn has_accepted_proposal_for_height(&self, height: u64) -> bool {
-        self.accepted_proposal_height == Some(height)
+        match self.accepted_proposal {
+            Some((accepted_height, accepted_round)) => {
+                accepted_height == height && accepted_round >= self.current_round
+            }
+            None => false,
+        }
     }
 
     /// Advance to the next consensus round if the current height remains unfinalized.
@@ -317,7 +322,7 @@ impl ConsensusDriver {
             self.buffered_votes.retain(|(height, round, _), _| {
                 !(*height == incoming_height && *round > incoming_round)
             });
-            self.accepted_proposal_height = None;
+            self.accepted_proposal = None;
         }
 
         eprintln!(
@@ -342,7 +347,7 @@ impl ConsensusDriver {
                 self.current_round
             );
         }
-        self.accepted_proposal_height = Some(block.header.height);
+        self.accepted_proposal = Some((block.header.height, block.header.proposer_round));
         eprintln!(
             "[consensus] accepted proposal for height={}, suppressing local proposal",
             block.header.height
@@ -667,7 +672,7 @@ impl ConsensusDriver {
                 self.refresh_registered_voters();
                 self.sync.mark_caught_up(self.engine.state.height);
                 if self.engine.state.height > old_height {
-                    self.accepted_proposal_height = None;
+                    self.accepted_proposal = None;
                     eprintln!(
                         "[timing] t={}ms HEIGHT ADVANCED to {} (was {})",
                         now_ms(),
@@ -1140,7 +1145,39 @@ mod tests {
         assert!(earlier_actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
         assert!(!driver.pending_blocks.contains_key(&later_hash));
         assert!(driver.pending_blocks.contains_key(&earlier_hash));
-        assert_eq!(driver.accepted_proposal_height, Some(1));
+        assert_eq!(driver.accepted_proposal, Some((1, 1)));
+        assert!(driver.has_accepted_proposal_for_height(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_proposal_latch_expires_after_round_advances_past_it() {
+        let dir = temp_dir("i");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&[0x91u8; 32]).unwrap();
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+        install_single_active_validator(&mut driver, [0x91u8; 32]);
+        let _remote = install_active_validator(&mut driver, [0x92u8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let mut block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        block.header.proposer_round = 2;
+        block.header.timestamp += 2;
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9601".parse().unwrap()),
+            block,
+        });
+
+        assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
+        assert_eq!(driver.accepted_proposal, Some((1, 2)));
+        assert!(driver.has_accepted_proposal_for_height(1));
+
+        driver.current_round = 3;
+        assert!(!driver.has_accepted_proposal_for_height(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
