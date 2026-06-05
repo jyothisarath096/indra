@@ -8,7 +8,7 @@
 //!   gossip_recv   — reads messages from all connected peers, routes to driver
 //!   consensus     — every 6s: check if proposer, propose block, broadcast votes
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ const BLOCK_TIME: Duration = Duration::from_secs(6);
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const SYNC_BATCH_SIZE: u64 = 50;
+const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
 
 #[derive(Debug, Clone)]
 struct SyncState {
@@ -163,7 +164,7 @@ fn main() {
     let keys_path  = get_arg("--keys").unwrap_or_else(|| "keys.json".to_string());
     let data_dir   = get_arg("--data-dir").unwrap_or_else(|| "./indra-data".to_string());
     let p2p_addr   = get_arg("--p2p-addr").unwrap_or_else(|| "0.0.0.0:30303".to_string());
-    let bootstrap  = get_arg("--bootstrap-peers").unwrap_or_default();
+    let bootstrap  = get_arg("--bootstrap-peers");
     let archive    = args.iter().any(|arg| arg == "--archive");
     let prune_keep = get_arg("--prune-keep")
         .and_then(|value| value.parse::<u64>().ok())
@@ -176,7 +177,6 @@ fn main() {
     println!("Keys:      {}", keys_path);
     println!("Data:      {}", data_dir);
     println!("P2P:       {}", p2p_addr);
-    println!("Bootstrap: {}", if bootstrap.is_empty() { "(bootstrap node)" } else { &bootstrap });
     println!("Mode:      {}", if archive { "archive" } else { "pruned" });
     if !archive {
         println!("Retain:    {} blocks", prune_keep);
@@ -193,11 +193,24 @@ fn main() {
     let pq_sk       = extract_hex_field(&keys_str, "pq_sk");
     let pq_pk       = extract_hex_field(&keys_str, "hybrid_pq_pk");
 
-    let bootstrap_peers: Vec<String> = if bootstrap.is_empty() {
-        vec![]
-    } else {
-        bootstrap.split(',').map(|s| s.trim().to_string()).collect()
+    let bootstrap_peers: Vec<String> = match bootstrap.as_deref() {
+        Some(value) => value.split(',').map(|s| s.trim().to_string()).collect(),
+        None => {
+            if should_skip_default_bootstrap(&p2p_addr, DEFAULT_BOOTSTRAP_PEER) {
+                println!("Bootstrap: (bootstrap node)");
+                vec![]
+            } else {
+                println!("[p2p] using default bootstrap peer: {}", DEFAULT_BOOTSTRAP_PEER);
+                println!("Bootstrap: {}", DEFAULT_BOOTSTRAP_PEER);
+                vec![DEFAULT_BOOTSTRAP_PEER.to_string()]
+            }
+        }
     };
+    if bootstrap_peers.is_empty() && bootstrap.is_some() {
+        println!("Bootstrap: (bootstrap node)");
+    } else if let Some(raw_bootstrap) = &bootstrap {
+        println!("Bootstrap: {}", raw_bootstrap);
+    }
 
     let config = NodeConfig {
         data_dir:          std::path::PathBuf::from(&data_dir),
@@ -782,6 +795,44 @@ fn check_disk_space(data_dir: &Path) -> u64 {
         );
     }
     available
+}
+
+fn should_skip_default_bootstrap(local_p2p_addr: &str, default_peer: &str) -> bool {
+    if local_p2p_addr == default_peer {
+        return true;
+    }
+
+    let Some(default_socket) = resolve_first_socket_addr(default_peer) else {
+        return false;
+    };
+
+    if let Ok(local_addrs) = local_p2p_addr.to_socket_addrs() {
+        for addr in local_addrs {
+            if addr == default_socket {
+                return true;
+            }
+        }
+    }
+
+    if let Some(local_port) = local_p2p_addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+        if local_port == default_socket.port() {
+            if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+                if sock.connect(default_socket).is_ok() {
+                    if let Ok(local_outbound) = sock.local_addr() {
+                        if local_outbound.ip() == default_socket.ip() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn resolve_first_socket_addr(addr: &str) -> Option<SocketAddr> {
+    addr.to_socket_addrs().ok()?.next()
 }
 
 fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
