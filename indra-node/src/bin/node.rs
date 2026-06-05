@@ -563,6 +563,7 @@ fn main() {
                             } else if d.height() > start_height {
                                 proposed_at_height = None;
                                 d.reset_round();
+                                last_block_time = Instant::now() - BLOCK_TIME;
                             }
                         }
                     }
