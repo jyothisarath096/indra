@@ -285,6 +285,10 @@ impl ConsensusDriver {
             block.header.height,
             block.header.proposer_round,
         );
+        if block.header.proposer_round > self.current_round {
+            self.current_round = block.header.proposer_round;
+            eprintln!("[consensus] syncing round to {}", self.current_round);
+        }
         self.pending_blocks.insert(block_hash, block.clone());
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];

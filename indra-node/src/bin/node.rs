@@ -407,6 +407,7 @@ fn main() {
             std::thread::sleep(Duration::from_secs(3));
 
             let mut last_block_time = Instant::now();
+            let mut proposed_at_height: Option<u64> = None;
 
             loop {
                 // Every BLOCK_TIME: attempt to propose a block
@@ -470,7 +471,7 @@ fn main() {
                             }
                         };
 
-                        if should_propose {
+                        if should_propose && proposed_at_height != Some(start_height) {
                             let proposal = {
                                 let mut d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
@@ -519,6 +520,7 @@ fn main() {
                             };
 
                             if let Some((block, actions)) = proposal {
+                                proposed_at_height = Some(start_height);
                                 for action in actions {
                                     if let Some(out_msg) = action_to_message(&action) {
                                         log_broadcast_action(&gossip, &action);
@@ -540,6 +542,7 @@ fn main() {
                             if d.height() == start_height && d.sync().is_caught_up() {
                                 d.advance_round();
                             } else if d.height() > start_height {
+                                proposed_at_height = None;
                                 d.reset_round();
                             }
                         }
