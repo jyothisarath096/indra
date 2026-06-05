@@ -471,7 +471,13 @@ fn main() {
                             }
                         };
 
-                        if should_propose && proposed_at_height != Some(start_height) {
+                        let already_have_proposal = proposed_at_height == Some(start_height)
+                            || driver
+                                .lock()
+                                .unwrap()
+                                .has_accepted_proposal_for_height(start_height + 1);
+
+                        if should_propose && !already_have_proposal {
                             let proposal = {
                                 let mut d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(

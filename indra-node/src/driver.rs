@@ -118,6 +118,8 @@ pub struct ConsensusDriver {
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
     /// First accepted vote hash per (validator, height, round) slot.
     seen_round_votes: HashMap<(Bytes32, u64, u32), Bytes32>,
+    /// Height for which we have already accepted a valid proposal.
+    accepted_proposal_height: Option<u64>,
     /// Blocks whose quorum arrived before the proposal was staged locally.
     pending_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Serialised QC for the most recently finalised height.
@@ -140,6 +142,7 @@ impl ConsensusDriver {
             pending_blocks: HashMap::new(),
             buffered_votes: HashMap::new(),
             seen_round_votes: HashMap::new(),
+            accepted_proposal_height: None,
             pending_quorum: HashSet::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
@@ -184,6 +187,11 @@ impl ConsensusDriver {
     /// Mutable synchronization state.
     pub fn sync_mut(&mut self) -> &mut SyncState {
         &mut self.sync
+    }
+
+    /// True if we have already accepted a valid proposal for `height`.
+    pub fn has_accepted_proposal_for_height(&self, height: u64) -> bool {
+        self.accepted_proposal_height == Some(height)
     }
 
     /// Advance to the next consensus round if the current height remains unfinalized.
@@ -285,10 +293,18 @@ impl ConsensusDriver {
             block.header.height,
             block.header.proposer_round,
         );
-        if block.header.proposer_round > self.current_round {
+        if block.header.proposer_round != self.current_round {
             self.current_round = block.header.proposer_round;
-            eprintln!("[consensus] syncing round to {}", self.current_round);
+            eprintln!(
+                "[consensus] adopted round {} from received proposal",
+                self.current_round
+            );
         }
+        self.accepted_proposal_height = Some(block.header.height);
+        eprintln!(
+            "[consensus] accepted proposal for height={}, suppressing local proposal",
+            block.header.height
+        );
         self.pending_blocks.insert(block_hash, block.clone());
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
@@ -558,6 +574,7 @@ impl ConsensusDriver {
 
         match self.engine.commit_block(&block) {
             Ok(_) => {
+                let old_height = self.engine.state.height;
                 eprintln!(
                     "[commit] quorum reached for {} at height={} round={}, finalizing",
                     hex::encode(&block_hash.0[..4]),
@@ -575,6 +592,9 @@ impl ConsensusDriver {
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
                 self.sync.mark_caught_up(self.engine.state.height);
+                if self.engine.state.height > old_height {
+                    self.accepted_proposal_height = None;
+                }
                 self.reset_round();
                 vec![DriverAction::BroadcastBlock(block)]
             }
