@@ -116,6 +116,8 @@ pub struct ConsensusDriver {
     pending_blocks: HashMap<Bytes32, BlockV1>,
     /// Votes received before the matching proposal was staged locally.
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
+    /// First accepted vote hash per (validator, height, round) slot.
+    seen_round_votes: HashMap<(Bytes32, u64, u32), Bytes32>,
     /// Blocks whose quorum arrived before the proposal was staged locally.
     pending_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Serialised QC for the most recently finalised height.
@@ -137,6 +139,7 @@ impl ConsensusDriver {
             vote_collectors: HashMap::new(),
             pending_blocks: HashMap::new(),
             buffered_votes: HashMap::new(),
+            seen_round_votes: HashMap::new(),
             pending_quorum: HashSet::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
@@ -394,10 +397,35 @@ impl ConsensusDriver {
             vote.round,
         );
 
-        // Check for slash conditions
+        // Check for slash conditions before dedup-gating so equivocations still
+        // surface as evidence even when the second vote is rejected.
         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
             actions.push(DriverAction::SlashDetected(evidence));
         }
+
+        let slot_key = (vote.validator_id, vote.height, vote.round);
+        if let Some(existing_hash) = self.seen_round_votes.get(&slot_key).copied() {
+            if existing_hash == vote.block_hash {
+                eprintln!(
+                    "[vote] ignoring duplicate vote from {} for {} at height={} round={}",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                );
+            } else {
+                eprintln!(
+                    "[vote] rejected equivocating vote from {} for {} at height={} round={} (already saw {})",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                    hex::encode(&existing_hash.0[..4]),
+                );
+            }
+            return actions;
+        }
+        self.seen_round_votes.insert(slot_key, vote.block_hash);
 
         if vote.height == self.engine.state.height + 1
             && !self.pending_blocks.contains_key(&vote.block_hash)
@@ -535,6 +563,10 @@ impl ConsensusDriver {
                 self.last_qc_bytes = qc.encode_to_vec();
                 self.vote_collectors.remove(&key);
                 self.buffered_votes.remove(&(height, round, block_hash));
+                self.seen_round_votes
+                    .retain(|(_, vote_height, vote_round), _| {
+                        !(*vote_height == height && *vote_round == round)
+                    });
                 self.pending_quorum.remove(&(height, round, block_hash));
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
@@ -925,6 +957,43 @@ mod tests {
             .get(&(1, 0))
             .expect("collector must still exist after ignoring echo");
         assert_eq!(collector.vote_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conflicting_vote_same_validator_same_round_rejected() {
+        let dir = temp_dir("g");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&[0x71u8; 32]).unwrap();
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+
+        let remote = install_active_validator(&mut driver, [0x72u8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let remote_validator_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let hash_a = Bytes32::from([0xAAu8; 32]);
+        let hash_b = Bytes32::from([0xBBu8; 32]);
+        let vote_a = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Precommit, hash_a, remote_validator_id, &remote
+        ).unwrap();
+        let vote_b = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Precommit, hash_b, remote_validator_id, &remote
+        ).unwrap();
+
+        let peer: SocketAddr = "127.0.0.1:9401".parse().unwrap();
+        let actions_a = driver.process(DriverEvent::InboundVote { from: peer, vote: vote_a });
+        let actions_b = driver.process(DriverEvent::InboundVote { from: peer, vote: vote_b });
+
+        assert!(actions_a.is_empty());
+        assert!(actions_b.iter().any(|a| matches!(a, DriverAction::SlashDetected(_))));
+        assert_eq!(
+            driver.seen_round_votes.get(&(remote_validator_id, 1, 0)),
+            Some(&hash_a)
+        );
+        assert_eq!(driver.buffered_votes.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
