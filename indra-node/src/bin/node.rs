@@ -1012,7 +1012,7 @@ Connection: close
                         let height = guard.engine.state.height;
                         match guard.engine.mempool.submit(tx.clone(), base_fee, height) {
                             Ok(tx_id) => {
-                                let _ = gossip_rpc.lock().unwrap().broadcast(&Message::Tx(tx));
+                                let _ = gossip.lock().unwrap().broadcast(&Message::Tx(tx));
                                 format!(r#"{{"tx_id":"{}","status":"accepted"}}"#,
                                     hex::encode(tx_id.0))
                             }
