@@ -9,6 +9,8 @@
 //!   5. Evicts spent transactions from the mempool
 //!   6. Optionally takes a state snapshot
 
+use std::net::SocketAddr;
+
 use indra_core::types::block::BlockV1;
 use indra_core::codec::Decode;
 use indra_state::{apply_block, ChainState};
@@ -27,6 +29,152 @@ use crate::{
     error::{NodeError, NodeResult},
     state_root::{compute_state_root, compute_validator_set_root},
 };
+
+/// Maximum blocks to request in one sync batch.
+pub const SYNC_BATCH_SIZE: u64 = 50;
+
+/// Current synchronization phase for a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// Have not yet heard from any peer.
+    AwaitingPeers,
+    /// Downloading missing blocks from a peer.
+    Downloading {
+        /// The peer currently serving us blocks.
+        peer: SocketAddr,
+        /// Highest height we know we must reach.
+        target_height: u64,
+        /// Next block height expected from the response stream.
+        next_expected: u64,
+    },
+    /// Local height matches the best known peer height.
+    CaughtUp,
+}
+
+/// Driver-owned synchronization state machine.
+#[derive(Debug, Clone)]
+pub struct SyncState {
+    phase: SyncPhase,
+    best_peer_height: u64,
+}
+
+impl SyncState {
+    /// Create the bootstrap node sync state.
+    pub fn bootstrap(local_height: u64) -> Self {
+        Self {
+            phase: SyncPhase::CaughtUp,
+            best_peer_height: local_height,
+        }
+    }
+
+    /// Create the follower node sync state.
+    pub fn follower(local_height: u64) -> Self {
+        Self {
+            phase: SyncPhase::AwaitingPeers,
+            best_peer_height: local_height,
+        }
+    }
+
+    /// Return the current phase.
+    pub fn phase(&self) -> &SyncPhase {
+        &self.phase
+    }
+
+    /// True when the node may participate in consensus.
+    pub fn is_caught_up(&self) -> bool {
+        matches!(self.phase, SyncPhase::CaughtUp)
+    }
+
+    /// Current sync target height, if any.
+    pub fn target_height(&self) -> Option<u64> {
+        match self.phase {
+            SyncPhase::Downloading { target_height, .. } => Some(target_height),
+            SyncPhase::CaughtUp | SyncPhase::AwaitingPeers => None,
+        }
+    }
+
+    /// Observe a peer's status and return a download request if we need one.
+    pub fn observe_status(
+        &mut self,
+        peer: SocketAddr,
+        peer_height: u64,
+        local_height: u64,
+    ) -> Option<(SocketAddr, u64, u64)> {
+        self.best_peer_height = self.best_peer_height.max(peer_height);
+
+        if peer_height <= local_height {
+            if matches!(self.phase, SyncPhase::AwaitingPeers) {
+                self.phase = SyncPhase::CaughtUp;
+            }
+            if peer_height == local_height && matches!(self.phase, SyncPhase::Downloading { .. }) {
+                self.phase = SyncPhase::CaughtUp;
+            }
+            return None;
+        }
+
+        let from_height = local_height.saturating_add(1);
+        let to_height = peer_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+
+        self.phase = SyncPhase::Downloading {
+            peer,
+            target_height: peer_height,
+            next_expected: from_height,
+        };
+
+        Some((peer, from_height, to_height))
+    }
+
+    /// Record one imported block while downloading.
+    pub fn on_block_imported(
+        &mut self,
+        imported_height: u64,
+    ) {
+        if let SyncPhase::Downloading {
+            target_height,
+            next_expected,
+            ..
+        } = &mut self.phase
+        {
+            if imported_height >= *next_expected {
+                *next_expected = imported_height.saturating_add(1);
+            }
+            if imported_height >= *target_height {
+                self.phase = SyncPhase::CaughtUp;
+            }
+        }
+    }
+
+    /// After handling a block response, decide whether we need another batch.
+    pub fn next_request_after_response(
+        &mut self,
+        local_height: u64,
+    ) -> Option<(SocketAddr, u64, u64)> {
+        match self.phase {
+            SyncPhase::Downloading {
+                peer,
+                target_height,
+                next_expected,
+            } => {
+                if local_height >= target_height || next_expected > target_height {
+                    self.phase = SyncPhase::CaughtUp;
+                    None
+                } else {
+                    let from_height = next_expected.max(local_height.saturating_add(1));
+                    let to_height =
+                        target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+                    Some((peer, from_height, to_height))
+                }
+            }
+            SyncPhase::AwaitingPeers | SyncPhase::CaughtUp => None,
+        }
+    }
+
+    /// Reset round state after catching up to a new height.
+    pub fn mark_caught_up(&mut self, local_height: u64) {
+        self.best_peer_height = self.best_peer_height.max(local_height);
+        self.phase = SyncPhase::CaughtUp;
+    }
+}
 
 /// Import a block into the chain.
 ///

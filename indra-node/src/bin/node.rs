@@ -30,119 +30,13 @@ use indra_node::{
     NodeConfig, NodeEngine,
     driver::{ConsensusDriver, DriverAction, DriverEvent},
     net_driver::{message_to_event, action_to_message},
+    sync::SYNC_BATCH_SIZE,
 };
 
 const BLOCK_TIME: Duration = Duration::from_secs(6);
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
-const SYNC_BATCH_SIZE: u64 = 50;
 const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
-
-#[derive(Debug, Clone)]
-struct SyncState {
-    am_syncing: bool,
-    sync_target_height: u64,
-    sync_peer: Option<SocketAddr>,
-    requested_to_height: u64,
-    best_peer_tip: u64,
-    caught_up_ticks: u8,
-}
-
-impl SyncState {
-    fn idle() -> Self {
-        Self {
-            am_syncing: false,
-            sync_target_height: 0,
-            sync_peer: None,
-            requested_to_height: 0,
-            best_peer_tip: 0,
-            caught_up_ticks: 0,
-        }
-    }
-
-    fn begin(&mut self, peer: SocketAddr, from_height: u64, target_height: u64) -> (u64, u64) {
-        self.am_syncing = true;
-        self.sync_target_height = target_height;
-        self.sync_peer = Some(peer);
-        self.best_peer_tip = self.best_peer_tip.max(target_height);
-        self.caught_up_ticks = 0;
-        let to_height = target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
-        self.requested_to_height = to_height;
-        (from_height, to_height)
-    }
-
-    fn observe_peer_tip(&mut self, peer: SocketAddr, peer_height: u64, local_height: u64, bootstrap_node: bool) {
-        if bootstrap_node {
-            self.reset(local_height);
-            return;
-        }
-
-        self.best_peer_tip = self.best_peer_tip.max(peer_height);
-        if peer_height > local_height {
-            self.sync_peer = Some(peer);
-            self.sync_target_height = self.sync_target_height.max(peer_height);
-            self.caught_up_ticks = 0;
-        }
-
-        self.finish_if_caught_up(local_height);
-    }
-
-    fn request_next_batch(
-        &mut self,
-        current_height: u64,
-    ) -> Option<(SocketAddr, u64, u64)> {
-        let peer = self.sync_peer?;
-        if !self.am_syncing || current_height >= self.sync_target_height {
-            self.reset(current_height);
-            return None;
-        }
-        if current_height < self.requested_to_height {
-            return None;
-        }
-
-        let from_height = current_height.saturating_add(1);
-        let to_height = self
-            .sync_target_height
-            .min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
-        self.requested_to_height = to_height;
-        Some((peer, from_height, to_height))
-    }
-
-    fn on_tick(&mut self, current_height: u64, bootstrap_node: bool) {
-        if bootstrap_node {
-            self.reset(current_height);
-            return;
-        }
-
-        if !self.am_syncing {
-            return;
-        }
-
-        if current_height >= self.best_peer_tip {
-            self.caught_up_ticks = self.caught_up_ticks.saturating_add(1);
-            if self.caught_up_ticks >= 3 {
-                self.reset(current_height);
-            }
-        } else {
-            self.caught_up_ticks = 0;
-        }
-    }
-
-    fn finish_if_caught_up(&mut self, current_height: u64) {
-        if self.am_syncing && current_height >= self.best_peer_tip.max(self.sync_target_height) {
-            self.reset(current_height);
-        }
-    }
-
-    fn reset(&mut self, current_height: u64) {
-        self.am_syncing = false;
-        self.sync_target_height = current_height;
-        self.sync_peer = None;
-        self.requested_to_height = current_height;
-        self.best_peer_tip = current_height;
-        self.caught_up_ticks = 0;
-    }
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -258,7 +152,6 @@ fn main() {
     // Shared state between threads
     let driver    = Arc::new(Mutex::new(driver));
     let gossip    = Arc::new(Mutex::new(GossipEngine::new()));
-    let sync_state = Arc::new(Mutex::new(SyncState::idle()));
 
     // ── Thread 1: P2P listener ──────────────────────────────────────────────
     {
@@ -357,7 +250,6 @@ fn main() {
     {
         let gossip  = Arc::clone(&gossip);
         let driver  = Arc::clone(&driver);
-        let sync_state = Arc::clone(&sync_state);
 
         std::thread::spawn(move || {
             loop {
@@ -389,20 +281,8 @@ fn main() {
                         // Score the peer
                         gossip.lock().unwrap().score_event(&addr, ScoreEvent::ValidBlock);
 
-                        if let Message::Status { height: peer_height, .. } = &msg {
-                            let (local_height, bootstrap_node) = {
-                                let d = driver.lock().unwrap();
-                                (
-                                    d.height(),
-                                    d.engine.config.bootstrap_peers.is_empty(),
-                                )
-                            };
-                            sync_state.lock().unwrap()
-                                .observe_peer_tip(addr, *peer_height, local_height, bootstrap_node);
-                        }
-
                         match &msg {
-                            Message::GetBlocks { from_height, to_height } => {
+                            Message::RequestBlocks { from_height, to_height } => {
                                 let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
                                 let blocks_to_send = {
                                     let mut d = driver.lock().unwrap();
@@ -415,81 +295,64 @@ fn main() {
                                     }
                                     blocks
                                 };
-
-                                for block in blocks_to_send {
-                                    let _ = gossip.lock().unwrap().send_to(&addr, &Message::Block(block));
-                                }
+                                eprintln!("[sync] serving blocks {}..{} to {}", from_height, upper, addr);
+                                let _ = gossip.lock().unwrap().send_to(
+                                    &addr,
+                                    &Message::BlockResponse { blocks: blocks_to_send },
+                                );
                                 continue;
                             }
-                            Message::Block(block) => {
-                                let mut request_more = None;
-                                let maybe_event = {
+                            Message::BlockResponse { blocks } => {
+                                let response_blocks = blocks.clone();
+                                let request_more;
+                                let mut caught_up_height = None;
+                                let mut imported_any = false;
+                                {
                                     let mut d = driver.lock().unwrap();
-                                    let my_height = d.height();
-                                    let block_height = block.header.height;
-                                    let syncing = sync_state.lock().unwrap().am_syncing;
+                                    for block in response_blocks {
+                                        if block.header.height != d.height() + 1 {
+                                            continue;
+                                        }
 
-                                    if block_height <= my_height {
-                                        None
-                                    } else if syncing && block_height == my_height + 1 {
                                         match d.engine.commit_block(&block) {
                                             Ok(()) => {
+                                                imported_any = true;
                                                 d.refresh_registered_voters();
-                                                let new_height = d.height();
-                                                {
-                                                    let mut sync = sync_state.lock().unwrap();
-                                                    sync.finish_if_caught_up(new_height);
-                                                    request_more = sync.request_next_batch(new_height);
-                                                }
-                                                None
+                                                d.sync_mut().on_block_imported(block.header.height);
+                                                d.reset_round();
+                                                eprintln!(
+                                                    "[sync] imported block at height={} from {}",
+                                                    block.header.height,
+                                                    addr
+                                                );
                                             }
                                             Err(e) => {
                                                 eprintln!(
                                                     "[sync] failed to import block {} from {}: {}",
-                                                    block_height, addr, e
+                                                    block.header.height,
+                                                    addr,
+                                                    e
                                                 );
-                                                None
+                                                break;
                                             }
                                         }
-                                    } else if block_height == my_height + 1 {
-                                        message_to_event(Message::Block(block.clone()), addr)
-                                    } else {
-                                        None
                                     }
-                                };
-
-                                if let Some((peer, from_height, to_height)) = request_more {
-                                    let req = Message::GetBlocks { from_height, to_height };
-                                    let _ = gossip.lock().unwrap().send_to(&peer, &req);
+                                    let new_height = d.height();
+                                    request_more = d.sync_mut().next_request_after_response(new_height);
+                                    if d.sync().is_caught_up() && imported_any {
+                                        caught_up_height = Some(new_height);
+                                    }
                                 }
 
-                                if let Some(event) = maybe_event {
-                                    let actions = driver.lock().unwrap().process(event);
-                                    for action in actions {
-                                        if let Some(out_msg) = action_to_message(&action) {
-                                            log_broadcast_action(&gossip, &action);
-                                            let _ = gossip.lock().unwrap().broadcast(&out_msg);
-                                        }
-                                        if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
-                                            let bootstrap_node = {
-                                                let d = driver.lock().unwrap();
-                                                d.engine.config.bootstrap_peers.is_empty()
-                                            };
-                                            if bootstrap_node {
-                                                continue;
-                                            }
-                                            let peer_tip = *to_height;
-                                            let (req_from, req_to) = {
-                                                let mut sync = sync_state.lock().unwrap();
-                                                sync.begin(*from, *from_height, peer_tip)
-                                            };
-                                            let req = Message::GetBlocks {
-                                                from_height: req_from,
-                                                to_height: req_to,
-                                            };
-                                            let _ = gossip.lock().unwrap().send_to(from, &req);
-                                        }
-                                    }
+                                if let Some((peer, from_height, to_height)) = request_more {
+                                    let req = Message::RequestBlocks { from_height, to_height };
+                                    let _ = gossip.lock().unwrap().send_to(&peer, &req);
+                                }
+                                if imported_any {
+                                    broadcast_status(&driver, &gossip);
+                                }
+                                if let Some(height) = caught_up_height {
+                                    eprintln!("[sync] caught up to height={}, joining consensus", height);
                                 }
                                 continue;
                             }
@@ -498,6 +361,7 @@ fn main() {
 
                         // Convert to driver event and process
                         if let Some(event) = message_to_event(msg, addr) {
+                            let previous_height = driver.lock().unwrap().height();
                             let actions = driver.lock().unwrap().process(event);
                             for action in actions {
                                 if let Some(out_msg) = action_to_message(&action) {
@@ -506,23 +370,23 @@ fn main() {
                                 }
                                 // Handle sync request
                                 if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
-                                    let bootstrap_node = {
-                                        let d = driver.lock().unwrap();
-                                        d.engine.config.bootstrap_peers.is_empty()
-                                    };
-                                    if bootstrap_node {
-                                        continue;
-                                    }
-                                    let (req_from, req_to) = {
-                                        let mut sync = sync_state.lock().unwrap();
-                                        sync.begin(*from, *from_height, *to_height)
-                                    };
-                                    let req = Message::GetBlocks {
-                                        from_height: req_from,
-                                        to_height: req_to,
+                                    eprintln!(
+                                        "[sync] peer at height={}, local behind, requesting blocks {}..{} from {}",
+                                        to_height,
+                                        from_height,
+                                        to_height,
+                                        from
+                                    );
+                                    let req = Message::RequestBlocks {
+                                        from_height: *from_height,
+                                        to_height: *to_height,
                                     };
                                     let _ = gossip.lock().unwrap().send_to(from, &req);
                                 }
+                            }
+                            let new_height = driver.lock().unwrap().height();
+                            if new_height > previous_height {
+                                broadcast_status(&driver, &gossip);
                             }
                         }
                     }
@@ -537,7 +401,6 @@ fn main() {
     {
         let driver  = Arc::clone(&driver);
         let gossip  = Arc::clone(&gossip);
-        let sync_state = Arc::clone(&sync_state);
 
         std::thread::spawn(move || {
             // Wait for peer connections to establish
@@ -564,17 +427,12 @@ fn main() {
                         let status = Message::Status { height, tip_hash };
                         let _ = gossip.lock().unwrap().broadcast(&status);
 
-                        let bootstrap_node = {
+                        let sync_target = {
                             let d = driver.lock().unwrap();
-                            d.engine.config.bootstrap_peers.is_empty()
+                            d.sync().target_height()
                         };
-                        {
-                            let mut sync = sync_state.lock().unwrap();
-                            sync.on_tick(height, bootstrap_node);
-                        }
-
-                        if sync_state.lock().unwrap().am_syncing {
-                            println!("[consensus] height={} sync in progress — not proposing", height);
+                        if let Some(target) = sync_target {
+                            println!("[consensus] syncing — height={} target={}", height, target);
                             std::thread::sleep(Duration::from_millis(100));
                             continue;
                         }
@@ -679,7 +537,7 @@ fn main() {
 
                         {
                             let mut d = driver.lock().unwrap();
-                            if d.height() == start_height && !sync_state.lock().unwrap().am_syncing {
+                            if d.height() == start_height && d.sync().is_caught_up() {
                                 d.advance_round();
                             } else if d.height() > start_height {
                                 d.reset_round();
@@ -782,6 +640,15 @@ fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction
         }
         _ => {}
     }
+}
+
+fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<Mutex<GossipEngine>>) {
+    let (height, tip_hash) = {
+        let d = driver.lock().unwrap();
+        (d.height(), d.engine.state.tip_hash)
+    };
+    let status = Message::Status { height, tip_hash };
+    let _ = gossip.lock().unwrap().broadcast(&status);
 }
 
 fn check_disk_space(data_dir: &Path) -> u64 {

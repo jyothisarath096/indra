@@ -40,9 +40,11 @@ pub enum MessageType {
     /// Liveness pong.
     Pong      = 0x06,
     /// Request blocks by height range.
-    GetBlocks = 0x07,
+    RequestBlocks = 0x07,
+    /// Respond with a batch of blocks.
+    BlockResponse = 0x08,
     /// Announce current chain tip.
-    Status    = 0x08,
+    Status        = 0x09,
 }
 
 impl MessageType {
@@ -55,8 +57,9 @@ impl MessageType {
             0x04 => Ok(Self::PeerList),
             0x05 => Ok(Self::Ping),
             0x06 => Ok(Self::Pong),
-            0x07 => Ok(Self::GetBlocks),
-            0x08 => Ok(Self::Status),
+            0x07 => Ok(Self::RequestBlocks),
+            0x08 => Ok(Self::BlockResponse),
+            0x09 => Ok(Self::Status),
             other => Err(NetworkError::UnexpectedMessage { got: other }),
         }
     }
@@ -78,11 +81,16 @@ pub enum Message {
     /// Liveness pong matching a ping nonce.
     Pong(u64),
     /// Request blocks from `from_height` to `to_height` (inclusive).
-    GetBlocks {
+    RequestBlocks {
         /// First height requested.
         from_height: u64,
         /// Last height requested (inclusive).
         to_height: u64,
+    },
+    /// Response containing blocks in ascending height order.
+    BlockResponse {
+        /// Blocks returned to the requester.
+        blocks: Vec<BlockV1>,
     },
     /// Announce current chain tip.
     Status {
@@ -103,8 +111,9 @@ impl Message {
             Self::PeerList(_)  => MessageType::PeerList,
             Self::Ping(_)      => MessageType::Ping,
             Self::Pong(_)      => MessageType::Pong,
-            Self::GetBlocks { .. } => MessageType::GetBlocks,
-            Self::Status { .. }    => MessageType::Status,
+            Self::RequestBlocks { .. } => MessageType::RequestBlocks,
+            Self::BlockResponse { .. } => MessageType::BlockResponse,
+            Self::Status { .. }        => MessageType::Status,
         }
     }
 
@@ -160,10 +169,20 @@ impl Message {
             }
             Self::Ping(nonce) => nonce.to_le_bytes().to_vec(),
             Self::Pong(nonce) => nonce.to_le_bytes().to_vec(),
-            Self::GetBlocks { from_height, to_height } => {
+            Self::RequestBlocks { from_height, to_height } => {
                 let mut buf = Vec::with_capacity(16);
                 buf.extend_from_slice(&from_height.to_le_bytes());
                 buf.extend_from_slice(&to_height.to_le_bytes());
+                buf
+            }
+            Self::BlockResponse { blocks } => {
+                let mut buf = Vec::new();
+                (blocks.len() as u32).encode(&mut buf);
+                for block in blocks {
+                    let block_bytes = block.encode_to_vec();
+                    (block_bytes.len() as u32).encode(&mut buf);
+                    buf.extend_from_slice(&block_bytes);
+                }
                 buf
             }
             Self::Status { height, tip_hash } => {
@@ -261,7 +280,7 @@ impl Message {
                 let nonce = u64::from_le_bytes(nonce_bytes);
                 Ok(Self::Pong(nonce))
             }
-            MessageType::GetBlocks => {
+            MessageType::RequestBlocks => {
                 let from_height_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -282,7 +301,30 @@ impl Message {
                     })?;
                 let from_height = u64::from_le_bytes(from_height_bytes);
                 let to_height = u64::from_le_bytes(to_height_bytes);
-                Ok(Self::GetBlocks { from_height, to_height })
+                Ok(Self::RequestBlocks { from_height, to_height })
+            }
+            MessageType::BlockResponse => {
+                let mut reader = ByteReader::new(payload);
+                let count = u32::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                    reason: e.to_string(),
+                })? as usize;
+                let mut blocks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let len = u32::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })? as usize;
+                    let bytes = reader.read_bytes(len).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
+                    let mut block_reader = ByteReader::new(bytes);
+                    let block = BlockV1::decode(&mut block_reader).map_err(|e| {
+                        NetworkError::DecodeFailed {
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    blocks.push(block);
+                }
+                Ok(Self::BlockResponse { blocks })
             }
             MessageType::Status => {
                 let height_bytes: [u8; 8] = payload
@@ -332,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn get_blocks_round_trip() {
-        let msg = Message::GetBlocks { from_height: 100, to_height: 200 };
+    fn request_blocks_round_trip() {
+        let msg = Message::RequestBlocks { from_height: 100, to_height: 200 };
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
-        assert!(matches!(decoded, Message::GetBlocks { from_height: 100, to_height: 200 }));
+        assert!(matches!(decoded, Message::RequestBlocks { from_height: 100, to_height: 200 }));
     }
 
     #[test]

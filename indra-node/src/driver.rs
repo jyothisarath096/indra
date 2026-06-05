@@ -42,7 +42,7 @@ use crate::{
     engine::NodeEngine,
     error::NodeError,
     slash::{SlashDetector, SlashEvidence},
-    sync::verify_proposer_vrf,
+    sync::{SyncState, verify_proposer_vrf},
 };
 
 /// An inbound event for the driver to process.
@@ -124,6 +124,8 @@ pub struct ConsensusDriver {
     registered_voters: Vec<RegisteredVoter>,
     /// Current consensus round for the next block height.
     current_round: u32,
+    /// Synchronization phase for this node.
+    sync: SyncState,
 }
 
 impl ConsensusDriver {
@@ -139,6 +141,12 @@ impl ConsensusDriver {
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
             current_round: 0,
+            sync: SyncState::follower(0),
+        };
+        driver.sync = if driver.engine.config.bootstrap_peers.is_empty() {
+            SyncState::bootstrap(driver.engine.state.height)
+        } else {
+            SyncState::follower(driver.engine.state.height)
         };
         driver.refresh_registered_voters();
         driver
@@ -163,6 +171,16 @@ impl ConsensusDriver {
     /// Current consensus round for the next block height.
     pub fn current_round(&self) -> u32 {
         self.current_round
+    }
+
+    /// Current synchronization state.
+    pub fn sync(&self) -> &SyncState {
+        &self.sync
+    }
+
+    /// Mutable synchronization state.
+    pub fn sync_mut(&mut self) -> &mut SyncState {
+        &mut self.sync
     }
 
     /// Advance to the next consensus round if the current height remains unfinalized.
@@ -210,6 +228,10 @@ impl ConsensusDriver {
     }
 
     fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
+        if !self.sync.is_caught_up() {
+            return vec![DriverAction::None];
+        }
+
         if block.header.height != self.engine.state.height + 1
             || block.header.prev_hash != self.engine.state.tip_hash
         {
@@ -331,6 +353,10 @@ impl ConsensusDriver {
 
     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
+
+        if !self.sync.is_caught_up() {
+            return actions;
+        }
 
         if self
             .engine
@@ -512,6 +538,7 @@ impl ConsensusDriver {
                 self.pending_quorum.remove(&(height, round, block_hash));
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
+                self.sync.mark_caught_up(self.engine.state.height);
                 self.reset_round();
                 vec![DriverAction::BroadcastBlock(block)]
             }
@@ -562,15 +589,13 @@ impl ConsensusDriver {
         _tip_hash: Bytes32,
     ) -> Vec<DriverAction> {
         let our_height = self.engine.height();
-        if height > our_height + 1 {
-            // We're behind — request missing blocks
-            vec![DriverAction::RequestBlocks {
-                from,
-                from_height: our_height + 1,
-                to_height: height,
-            }]
-        } else {
-            vec![DriverAction::None]
+        match self.sync.observe_status(from, height, our_height) {
+            Some((peer, from_height, to_height)) => vec![DriverAction::RequestBlocks {
+                from: peer,
+                from_height,
+                to_height,
+            }],
+            None => vec![DriverAction::None],
         }
     }
 
