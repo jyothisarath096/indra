@@ -45,6 +45,13 @@ use crate::{
     sync::{SyncState, verify_proposer_vrf},
 };
 
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// An inbound event for the driver to process.
 #[derive(Debug)]
 pub enum DriverEvent {
@@ -320,6 +327,14 @@ impl ConsensusDriver {
             block.header.height,
             block.header.proposer_round,
         );
+        eprintln!(
+            "[timing] t={}ms received+staged proposal {} at height={} round={} from={}",
+            now_ms(),
+            hex::encode(block_hash.0),
+            block.header.height,
+            block.header.proposer_round,
+            _from.map(|addr| addr.to_string()).unwrap_or_else(|| "local".to_string()),
+        );
         if block.header.proposer_round != self.current_round {
             self.current_round = block.header.proposer_round;
             eprintln!(
@@ -385,6 +400,13 @@ impl ConsensusDriver {
             eprintln!(
                 "[vote] sending local precommit for {} at height={} round={}",
                 hex::encode(&block_hash.0[..4]),
+                block.header.height,
+                block.header.proposer_round,
+            );
+            eprintln!(
+                "[timing] t={}ms sent vote for {} at height={} round={}",
+                now_ms(),
+                hex::encode(block_hash.0),
                 block.header.height,
                 block.header.proposer_round,
             );
@@ -510,11 +532,27 @@ impl ConsensusDriver {
 
         match collector.add_vote(vote.clone()) {
             Ok(VoteDecision::QuorumReached { block_hash, stake_bps: _ }) => {
+                let current_count = collector.vote_count();
+                eprintln!(
+                    "[timing] t={}ms received vote for {} at height={} round={} count={}/4",
+                    now_ms(),
+                    hex::encode(block_hash.0),
+                    vote.height,
+                    vote.round,
+                    current_count,
+                );
                 eprintln!(
                     "[vote] collected {}/{} votes for {} at height={} round={} — quorum",
-                    collector.vote_count(),
+                    current_count,
                     self.registered_voters.len(),
                     hex::encode(&block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                );
+                eprintln!(
+                    "[timing] t={}ms QUORUM {} at height={} round={} — commit",
+                    now_ms(),
+                    hex::encode(block_hash.0),
                     vote.height,
                     vote.round,
                 );
@@ -522,9 +560,18 @@ impl ConsensusDriver {
                 actions.extend(self.finalize_block_on_quorum(vote.height, vote.round, block_hash));
             }
             Ok(VoteDecision::Waiting) => {
+                let current_count = collector.vote_count();
+                eprintln!(
+                    "[timing] t={}ms received vote for {} at height={} round={} count={}/4",
+                    now_ms(),
+                    hex::encode(vote.block_hash.0),
+                    vote.height,
+                    vote.round,
+                    current_count,
+                );
                 eprintln!(
                     "[vote] collected {}/{} votes for {} at height={} round={} — waiting",
-                    collector.vote_count(),
+                    current_count,
                     self.registered_voters.len(),
                     hex::encode(&vote.block_hash.0[..4]),
                     vote.height,
@@ -599,9 +646,9 @@ impl ConsensusDriver {
             }
         };
 
+        let old_height = self.engine.state.height;
         match self.engine.commit_block(&block) {
             Ok(_) => {
-                let old_height = self.engine.state.height;
                 eprintln!(
                     "[commit] quorum reached for {} at height={} round={}, finalizing",
                     hex::encode(&block_hash.0[..4]),
@@ -621,6 +668,12 @@ impl ConsensusDriver {
                 self.sync.mark_caught_up(self.engine.state.height);
                 if self.engine.state.height > old_height {
                     self.accepted_proposal_height = None;
+                    eprintln!(
+                        "[timing] t={}ms HEIGHT ADVANCED to {} (was {})",
+                        now_ms(),
+                        self.engine.state.height,
+                        old_height,
+                    );
                 }
                 self.reset_round();
                 vec![DriverAction::BroadcastBlock(block)]

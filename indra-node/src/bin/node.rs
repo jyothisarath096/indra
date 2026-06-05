@@ -527,6 +527,13 @@ fn main() {
 
                             if let Some((block, actions)) = proposal {
                                 proposed_at_height = Some(start_height);
+                                eprintln!(
+                                    "[timing] t={}ms proposed block {} at height={} round={}",
+                                    now_ms(),
+                                    hex::encode(block.header.block_hash().0),
+                                    block.header.height,
+                                    block.header.proposer_round,
+                                );
                                 for action in actions {
                                     if let Some(out_msg) = action_to_message(&action) {
                                         log_broadcast_action(&gossip, &action);
@@ -547,6 +554,12 @@ fn main() {
                             let mut d = driver.lock().unwrap();
                             if d.height() == start_height && d.sync().is_caught_up() {
                                 d.advance_round();
+                                eprintln!(
+                                    "[timing] t={}ms ROUND ADVANCED to {} at height={}",
+                                    now_ms(),
+                                    d.current_round(),
+                                    d.height(),
+                                );
                             } else if d.height() > start_height {
                                 proposed_at_height = None;
                                 d.reset_round();
@@ -649,6 +662,13 @@ fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction
         }
         _ => {}
     }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<Mutex<GossipEngine>>) {
