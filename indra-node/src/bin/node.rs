@@ -318,9 +318,12 @@ fn main() {
 
             loop {
                 for peer_addr_str in &peers {
-                    let addr: SocketAddr = match peer_addr_str.parse() {
-                        Ok(a) => a,
-                        Err(_) => { eprintln!("[dialer] invalid addr: {}", peer_addr_str); continue; }
+                    let addr = match resolve_peer_addr(peer_addr_str) {
+                        Some(addr) => addr,
+                        None => {
+                            eprintln!("[dialer] invalid addr: {}", peer_addr_str);
+                            continue;
+                        }
                     };
 
                     // Skip if already connected
@@ -833,6 +836,16 @@ fn should_skip_default_bootstrap(local_p2p_addr: &str, default_peer: &str) -> bo
 
 fn resolve_first_socket_addr(addr: &str) -> Option<SocketAddr> {
     addr.to_socket_addrs().ok()?.next()
+}
+
+fn resolve_peer_addr(addr: &str) -> Option<SocketAddr> {
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        return Some(socket_addr);
+    }
+
+    let resolved = resolve_first_socket_addr(addr)?;
+    println!("[p2p] resolved {} -> {}", addr, resolved);
+    Some(resolved)
 }
 
 fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
