@@ -152,6 +152,7 @@ fn main() {
     // Shared state between threads
     let driver    = Arc::new(Mutex::new(driver));
     let gossip    = Arc::new(Mutex::new(GossipEngine::new()));
+    let (height_tx, height_rx) = std::sync::mpsc::channel::<()>();
 
     // ── Thread 1: P2P listener ──────────────────────────────────────────────
     {
@@ -250,6 +251,7 @@ fn main() {
     {
         let gossip  = Arc::clone(&gossip);
         let driver  = Arc::clone(&driver);
+        let height_tx = height_tx.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -349,6 +351,7 @@ fn main() {
                                     let _ = gossip.lock().unwrap().send_to(&peer, &req);
                                 }
                                 if imported_any {
+                                    let _ = height_tx.send(());
                                     broadcast_status(&driver, &gossip);
                                 }
                                 if let Some(height) = caught_up_height {
@@ -386,6 +389,7 @@ fn main() {
                             }
                             let new_height = driver.lock().unwrap().height();
                             if new_height > previous_height {
+                                let _ = height_tx.send(());
                                 broadcast_status(&driver, &gossip);
                             }
                         }
@@ -401,6 +405,7 @@ fn main() {
     {
         let driver  = Arc::clone(&driver);
         let gossip  = Arc::clone(&gossip);
+        let height_rx = height_rx;
 
         std::thread::spawn(move || {
             // Wait for peer connections to establish
@@ -569,7 +574,12 @@ fn main() {
                     }
                 }
 
-                std::thread::sleep(Duration::from_millis(100));
+                match height_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) => {
+                        last_block_time = Instant::now() - BLOCK_TIME;
+                    }
+                    Err(_) => {}
+                }
             }
         });
     }
