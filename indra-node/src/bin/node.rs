@@ -304,6 +304,28 @@ fn main() {
                                 );
                                 continue;
                             }
+                            Message::RequestProposal { height, round, hash } => {
+                                let proposal = {
+                                    let mut d = driver.lock().unwrap();
+                                    d.pending_block(hash)
+                                        .or_else(|| d.engine.block_store.get(*height).ok())
+                                        .filter(|block| {
+                                            block.header.height == *height
+                                                && block.header.proposer_round == *round
+                                                && block.header.block_hash() == *hash
+                                        })
+                                };
+                                if let Some(block) = proposal {
+                                    eprintln!(
+                                        "[gossip] received proposal request for {} at height={} round={} — sending block",
+                                        hex::encode(&hash.0[..4]),
+                                        height,
+                                        round,
+                                    );
+                                    let _ = gossip.lock().unwrap().send_to(&addr, &Message::Block(block));
+                                }
+                                continue;
+                            }
                             Message::BlockResponse { blocks } => {
                                 let response_blocks = blocks.clone();
                                 let request_more;
@@ -383,6 +405,14 @@ fn main() {
                                     let req = Message::RequestBlocks {
                                         from_height: *from_height,
                                         to_height: *to_height,
+                                    };
+                                    let _ = gossip.lock().unwrap().send_to(from, &req);
+                                }
+                                if let DriverAction::RequestProposal { from, height, round, hash } = &action {
+                                    let req = Message::RequestProposal {
+                                        height: *height,
+                                        round: *round,
+                                        hash: *hash,
                                     };
                                     let _ = gossip.lock().unwrap().send_to(from, &req);
                                 }

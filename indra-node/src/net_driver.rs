@@ -28,7 +28,7 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
         Message::Status { height, tip_hash } => {
             Some(DriverEvent::PeerStatus { from, height, tip_hash })
         }
-        _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse handled elsewhere
+        _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse, RequestProposal handled elsewhere
     }
 }
 

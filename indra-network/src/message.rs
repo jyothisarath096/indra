@@ -45,6 +45,8 @@ pub enum MessageType {
     BlockResponse = 0x08,
     /// Announce current chain tip.
     Status        = 0x09,
+    /// Request a specific proposal block by slot and hash.
+    RequestProposal = 0x0A,
 }
 
 impl MessageType {
@@ -60,6 +62,7 @@ impl MessageType {
             0x07 => Ok(Self::RequestBlocks),
             0x08 => Ok(Self::BlockResponse),
             0x09 => Ok(Self::Status),
+            0x0A => Ok(Self::RequestProposal),
             other => Err(NetworkError::UnexpectedMessage { got: other }),
         }
     }
@@ -99,6 +102,15 @@ pub enum Message {
         /// The sender's current tip hash.
         tip_hash: Bytes32,
     },
+    /// Request a specific proposal block by slot and hash.
+    RequestProposal {
+        /// Proposal height.
+        height: u64,
+        /// Proposal round.
+        round: u32,
+        /// Proposal block hash.
+        hash: Bytes32,
+    },
 }
 
 impl Message {
@@ -114,6 +126,7 @@ impl Message {
             Self::RequestBlocks { .. } => MessageType::RequestBlocks,
             Self::BlockResponse { .. } => MessageType::BlockResponse,
             Self::Status { .. }        => MessageType::Status,
+            Self::RequestProposal { .. } => MessageType::RequestProposal,
         }
     }
 
@@ -189,6 +202,13 @@ impl Message {
                 let mut buf = Vec::with_capacity(40);
                 buf.extend_from_slice(&height.to_le_bytes());
                 buf.extend_from_slice(&tip_hash.0);
+                buf
+            }
+            Self::RequestProposal { height, round, hash } => {
+                let mut buf = Vec::with_capacity(44);
+                buf.extend_from_slice(&height.to_le_bytes());
+                buf.extend_from_slice(&round.to_le_bytes());
+                buf.extend_from_slice(&hash.0);
                 buf
             }
         }
@@ -348,6 +368,40 @@ impl Message {
                 let height = u64::from_le_bytes(height_bytes);
                 Ok(Self::Status { height, tip_hash: Bytes32::from(tip) })
             }
+            MessageType::RequestProposal => {
+                let height_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short request_proposal".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid request_proposal height".to_string(),
+                    })?;
+                let round_bytes: [u8; 4] = payload
+                    .get(8..12)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short request_proposal".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid request_proposal round".to_string(),
+                    })?;
+                let hash: [u8; 32] = payload
+                    .get(12..44)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short request_proposal".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid request_proposal hash".to_string(),
+                    })?;
+                Ok(Self::RequestProposal {
+                    height: u64::from_le_bytes(height_bytes),
+                    round: u32::from_le_bytes(round_bytes),
+                    hash: Bytes32::from(hash),
+                })
+            }
         }
     }
 }
@@ -379,6 +433,18 @@ mod tests {
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         assert!(matches!(decoded, Message::RequestBlocks { from_height: 100, to_height: 200 }));
+    }
+
+    #[test]
+    fn request_proposal_round_trip() {
+        let hash = Bytes32::from([0x55u8; 32]);
+        let msg = Message::RequestProposal { height: 7, round: 3, hash };
+        let wire = msg.encode_wire().unwrap();
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::RequestProposal { height: 7, round: 3, hash: decoded_hash } if decoded_hash == hash
+        ));
     }
 
     #[test]

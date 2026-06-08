@@ -105,6 +105,17 @@ pub enum DriverAction {
         /// Last height needed.
         to_height: u64,
     },
+    /// Request a missing proposal block from a peer whose vote referenced it.
+    RequestProposal {
+        /// The peer to ask.
+        from: SocketAddr,
+        /// Proposal height.
+        height: u64,
+        /// Proposal round.
+        round: u32,
+        /// Proposal block hash.
+        hash: Bytes32,
+    },
     /// Slash evidence was detected.
     SlashDetected(SlashEvidence),
     /// No action needed.
@@ -123,6 +134,8 @@ pub struct ConsensusDriver {
     pending_blocks: HashMap<Bytes32, BlockV1>,
     /// Votes received before the matching proposal was staged locally.
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
+    /// Missing proposals already requested from peers.
+    requested_proposals: HashSet<(u64, u32, Bytes32)>,
     /// First accepted vote hash per (validator, height, round) slot.
     seen_round_votes: HashMap<(Bytes32, u64, u32), Bytes32>,
     /// Accepted proposal slot currently suppressing local proposals.
@@ -148,6 +161,7 @@ impl ConsensusDriver {
             vote_collectors: HashMap::new(),
             pending_blocks: HashMap::new(),
             buffered_votes: HashMap::new(),
+            requested_proposals: HashSet::new(),
             seen_round_votes: HashMap::new(),
             accepted_proposal: None,
             pending_quorum: HashSet::new(),
@@ -248,6 +262,11 @@ impl ConsensusDriver {
                 block.header.height == height && block.header.proposer_round == round
             })
             .map(|(hash, _)| *hash)
+    }
+
+    /// Return a staged proposal by hash if it is still pending locally.
+    pub fn pending_block(&self, hash: &Bytes32) -> Option<BlockV1> {
+        self.pending_blocks.get(hash).cloned()
     }
 
     fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
@@ -352,6 +371,7 @@ impl ConsensusDriver {
             "[consensus] accepted proposal for height={}, suppressing local proposal",
             block.header.height
         );
+        self.requested_proposals.remove(&(block.header.height, block.header.proposer_round, block_hash));
         self.pending_blocks.insert(block_hash, block.clone());
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
@@ -504,13 +524,31 @@ impl ConsensusDriver {
         if vote.height == self.engine.state.height + 1
             && !self.pending_blocks.contains_key(&vote.block_hash)
         {
-            eprintln!(
-                "[vote] buffering vote from {} for {} at height={} round={} until proposal is staged",
-                from,
-                hex::encode(&vote.block_hash.0[..4]),
-                vote.height,
-                vote.round,
-            );
+            let request_key = (vote.height, vote.round, vote.block_hash);
+            let should_request = self.requested_proposals.insert(request_key);
+            if should_request {
+                eprintln!(
+                    "[vote] buffering vote from {} for {} at height={} round={} until proposal is staged — requesting proposal from peer",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                );
+                actions.push(DriverAction::RequestProposal {
+                    from,
+                    height: vote.height,
+                    round: vote.round,
+                    hash: vote.block_hash,
+                });
+            } else {
+                eprintln!(
+                    "[vote] buffering vote from {} for {} at height={} round={} until proposal is staged",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                );
+            }
             self.buffered_votes
                 .entry((vote.height, vote.round, vote.block_hash))
                 .or_default()
