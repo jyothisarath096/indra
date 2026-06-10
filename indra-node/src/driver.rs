@@ -359,7 +359,7 @@ impl ConsensusDriver {
             block.header.proposer_round,
             _from.map(|addr| addr.to_string()).unwrap_or_else(|| "local".to_string()),
         );
-        if block.header.proposer_round != self.current_round {
+        if block.header.proposer_round > self.current_round {
             self.current_round = block.header.proposer_round;
             eprintln!(
                 "[consensus] adopted round {} from received proposal",
