@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread;
 
 use indra_core::types::primitives::Bytes32;
 use indra_crypto::sha256;
@@ -87,9 +89,41 @@ pub enum GossipEvent {
 /// The gossip engine.
 pub struct GossipEngine {
     peers:        PeerTable,
-    connections:  HashMap<SocketAddr, Connection>,
+    connections:  HashMap<SocketAddr, PeerConnection>,
     seen_msgs:    VecDeque<[u8; 32]>,
     seen_set:     HashSet<[u8; 32]>,
+}
+
+struct PeerConnection {
+    recv: Connection,
+    sender: PeerSender,
+}
+
+struct PeerSender {
+    tx: SyncSender<Vec<u8>>,
+}
+
+impl PeerSender {
+    fn new(addr: SocketAddr, mut conn: Connection) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(128);
+        thread::spawn(move || {
+            while let Ok(bytes) = rx.recv() {
+                if let Err(err) = conn.write_raw(&bytes) {
+                    eprintln!("[gossip] sender thread for {} exiting: {}", addr, err);
+                    break;
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn send(&self, wire: Vec<u8>) -> bool {
+        match self.tx.try_send(wire) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
 }
 
 impl GossipEngine {
@@ -105,9 +139,14 @@ impl GossipEngine {
 
     /// Add a connection for a peer.
     pub fn add_connection(&mut self, addr: SocketAddr, conn: Connection) -> NetworkResult<()> {
+        let send_conn = Connection::from_stream(conn.clone_stream()?)?;
+        let peer_conn = PeerConnection {
+            sender: PeerSender::new(addr, send_conn),
+            recv: conn,
+        };
         self.peers.add(addr)?;
         self.peers.mark_connected(&addr);
-        self.connections.insert(addr, conn);
+        self.connections.insert(addr, peer_conn);
         Ok(())
     }
 
@@ -123,7 +162,9 @@ impl GossipEngine {
     pub fn broadcast(&mut self, msg: &Message) -> NetworkResult<()> {
         let wire = msg.encode_wire()?;
         let hash = sha256(&wire);
-        self.mark_seen(hash);
+        if !self.mark_seen_new(hash) {
+            return Ok(());
+        }
 
         // Choose top-scored peers
         let targets: Vec<SocketAddr> = {
@@ -136,8 +177,8 @@ impl GossipEngine {
         };
 
         for addr in &targets {
-            if let Some(conn) = self.connections.get_mut(addr) {
-                if conn.send(msg).is_err() {
+            if let Some(conn) = self.connections.get(addr) {
+                if !conn.sender.send(wire.clone()) {
                     // Connection failed — mark disconnected, score penalty applied elsewhere
                     self.peers.mark_disconnected(addr);
                 }
@@ -146,17 +187,31 @@ impl GossipEngine {
         Ok(())
     }
 
+    /// Broadcast a message through the non-blocking sender path.
+    ///
+    /// Today proposals use the same queue as other messages; the dedicated
+    /// per-peer writer thread still removes blocking from the caller.
+    pub fn broadcast_priority(&mut self, msg: &Message) -> NetworkResult<()> {
+        self.broadcast(msg)
+    }
+
     /// Send a message to one specific peer.
     pub fn send_to(&mut self, addr: &SocketAddr, msg: &Message) -> NetworkResult<()> {
-        let conn = self.connections.get_mut(addr)
+        let wire = msg.encode_wire()?;
+        let conn = self.connections.get(addr)
             .ok_or(NetworkError::NoPeers)?;
-        conn.send(msg)
+        if conn.sender.send(wire) {
+            Ok(())
+        } else {
+            self.peers.mark_disconnected(addr);
+            Err(NetworkError::NoPeers)
+        }
     }
 
     /// Receive one message from a specific peer connection.
     pub fn recv_from(&mut self, addr: &SocketAddr) -> NetworkResult<RecvStatus> {
         if let Some(conn) = self.connections.get_mut(addr) {
-            conn.recv()
+            conn.recv.recv()
         } else {
             Ok(RecvStatus::NoData)
         }
@@ -170,6 +225,15 @@ impl GossipEngine {
     /// Check if a message hash has been seen recently.
     pub fn is_seen(&self, hash: &[u8; 32]) -> bool {
         self.seen_set.contains(hash)
+    }
+
+    /// Mark a message hash as seen and report whether it was newly inserted.
+    pub fn mark_seen_new(&mut self, hash: [u8; 32]) -> bool {
+        if self.seen_set.contains(&hash) {
+            return false;
+        }
+        self.mark_seen(hash);
+        true
     }
 
     /// Mark a message hash as seen.

@@ -393,7 +393,7 @@ fn main() {
                             for action in actions {
                                 if let Some(out_msg) = action_to_message(&action) {
                                     log_broadcast_action(&gossip, &action);
-                                    let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                    broadcast_driver_message(&gossip, &action, &out_msg);
                                 }
                                 // Handle sync request
                                 if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
@@ -580,7 +580,7 @@ fn main() {
                                     for action in actions {
                                         if let Some(out_msg) = action_to_message(&action) {
                                             log_broadcast_action(&gossip, &action);
-                                            let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                            broadcast_driver_message(&gossip, &action, &out_msg);
                                         }
                                     }
 
@@ -597,7 +597,7 @@ fn main() {
                                 for action in actions {
                                     if let Some(out_msg) = action_to_message(&action) {
                                         log_broadcast_action(&gossip, &action);
-                                        let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                        broadcast_driver_message(&gossip, &action, &out_msg);
                                     }
                                 }
                                 phase_started_at = Instant::now();
@@ -609,7 +609,7 @@ fn main() {
                                 for action in actions {
                                     if let Some(out_msg) = action_to_message(&action) {
                                         log_broadcast_action(&gossip, &action);
-                                        let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                        broadcast_driver_message(&gossip, &action, &out_msg);
                                     }
                                 }
                                 phase_started_at = Instant::now();
@@ -739,6 +739,14 @@ fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction
         }
         _ => {}
     }
+}
+
+fn broadcast_driver_message(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction, msg: &Message) {
+    let mut g = gossip.lock().unwrap();
+    let _ = match action {
+        DriverAction::BroadcastBlock(_) => g.broadcast_priority(msg),
+        _ => g.broadcast(msg),
+    };
 }
 
 fn now_ms() -> u128 {

@@ -50,12 +50,22 @@ impl Connection {
         Ok(Self { stream, remote_addr })
     }
 
+    /// Clone the underlying stream for a dedicated writer thread.
+    pub fn clone_stream(&self) -> NetworkResult<TcpStream> {
+        Ok(self.stream.try_clone()?)
+    }
+
+    /// Write raw framed bytes to this peer.
+    pub fn write_raw(&mut self, bytes: &[u8]) -> NetworkResult<()> {
+        self.stream.write_all(bytes)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
     /// Send a message to this peer.
     pub fn send(&mut self, msg: &Message) -> NetworkResult<()> {
         let wire = msg.encode_wire()?;
-        self.stream.write_all(&wire)?;
-        self.stream.flush()?;
-        Ok(())
+        self.write_raw(&wire)
     }
 
     /// Receive one message from this peer.
