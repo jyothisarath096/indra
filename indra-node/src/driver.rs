@@ -350,12 +350,6 @@ impl ConsensusDriver {
         if step == VoteStep::Prevote && block_hash != Bytes32::ZERO {
             if let Some(locked_hash) = self.locked_value {
                 if locked_hash != block_hash && self.locked_round.is_some() {
-                    eprintln!(
-                        "[vote] locked to {} at height={}, refusing to prevote {}",
-                        hex::encode(locked_hash.0),
-                        height,
-                        hex::encode(block_hash.0),
-                    );
                     return vec![];
                 }
             }
