@@ -866,7 +866,20 @@ impl ConsensusDriver {
                     );
                 }
                 self.reset_round();
-                vec![DriverAction::BroadcastBlock(block)]
+                let mut actions = vec![DriverAction::BroadcastBlock(block)];
+                let new_height = self.engine.state.height + 1;
+                let staged = self.pending_blocks
+                    .values()
+                    .filter(|pending| pending.header.height == new_height)
+                    .min_by_key(|pending| pending.header.proposer_round)
+                    .cloned();
+                if let Some(block) = staged {
+                    eprintln!(
+                        "[consensus] height advanced — found staged proposal for new height, prevoting immediately"
+                    );
+                    actions.extend(self.maybe_cast_prevote_for_block(&block));
+                }
+                actions
             }
             Err(NodeError::BlockInvalid { height, reason }) => {
                 eprintln!(
@@ -930,10 +943,26 @@ impl ConsensusDriver {
         if !self.sync.is_caught_up() {
             return vec![];
         }
+        let next_height = self.engine.state.height + 1;
+        let current_round = self.current_round;
+
+        let staged = self.pending_blocks
+            .values()
+            .find(|block| {
+                block.header.height == next_height
+                    && block.header.proposer_round == current_round
+            })
+            .cloned();
+
+        if let Some(block) = staged {
+            eprintln!("[consensus] propose timeout but proposal already staged — prevoting");
+            return self.maybe_cast_prevote_for_block(&block);
+        }
+
         self.current_phase = RoundPhase::Prevote;
         self.sign_and_record_local_vote(
-            self.engine.state.height + 1,
-            self.current_round,
+            next_height,
+            current_round,
             VoteStep::Prevote,
             Bytes32::ZERO,
         )
