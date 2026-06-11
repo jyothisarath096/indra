@@ -73,10 +73,10 @@ impl Encode for BlockHeaderV1 {
         self.mempool_set_root.encode(buf);
         self.base_fee.encode(buf);
         self.proposer_round.encode(buf);
-        self.polc_round.encode(buf);
         self.proposer_vrf_output.encode(buf);
         self.proposer_vrf_proof.encode(buf);
         self.quorum_certificate.encode(buf);
+        self.polc_round.encode(buf);
     }
     fn encoded_len(&self) -> usize {
         2 + 8 + 32 + 8 + 32 + 32 + 32 + 8 + 4 + 4 + 32
@@ -97,10 +97,10 @@ impl Decode for BlockHeaderV1 {
             mempool_set_root:    Bytes32::decode(r)?,
             base_fee:            u64::decode(r)?,
             proposer_round:      u32::decode(r)?,
-            polc_round:          u32::decode(r)?,
             proposer_vrf_output: Bytes32::decode(r)?,
             proposer_vrf_proof:  VariableBytes::decode(r)?,
             quorum_certificate:  VariableBytes::decode(r)?,
+            polc_round:          u32::decode(r).unwrap_or(NO_POLC_ROUND),
         })
     }
 }
@@ -171,6 +171,39 @@ mod tests {
     fn header_round_trip() {
         let h = dummy_header();
         assert_eq!(h, BlockHeaderV1::decode_exact(&h.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn old_header_encoding_without_polc_still_decodes() {
+        let h = dummy_header();
+        let mut legacy = Vec::new();
+        h.protocol_version.encode(&mut legacy);
+        h.height.encode(&mut legacy);
+        h.prev_hash.encode(&mut legacy);
+        h.timestamp.encode(&mut legacy);
+        h.state_root.encode(&mut legacy);
+        h.validator_set_root.encode(&mut legacy);
+        h.mempool_set_root.encode(&mut legacy);
+        h.base_fee.encode(&mut legacy);
+        h.proposer_round.encode(&mut legacy);
+        h.proposer_vrf_output.encode(&mut legacy);
+        h.proposer_vrf_proof.encode(&mut legacy);
+        h.quorum_certificate.encode(&mut legacy);
+
+        let decoded = BlockHeaderV1::decode_exact(&legacy).unwrap();
+        assert_eq!(decoded.protocol_version, h.protocol_version);
+        assert_eq!(decoded.height, h.height);
+        assert_eq!(decoded.prev_hash, h.prev_hash);
+        assert_eq!(decoded.timestamp, h.timestamp);
+        assert_eq!(decoded.state_root, h.state_root);
+        assert_eq!(decoded.validator_set_root, h.validator_set_root);
+        assert_eq!(decoded.mempool_set_root, h.mempool_set_root);
+        assert_eq!(decoded.base_fee, h.base_fee);
+        assert_eq!(decoded.proposer_round, h.proposer_round);
+        assert_eq!(decoded.proposer_vrf_output, h.proposer_vrf_output);
+        assert_eq!(decoded.proposer_vrf_proof, h.proposer_vrf_proof);
+        assert_eq!(decoded.quorum_certificate, h.quorum_certificate);
+        assert_eq!(decoded.polc_round, NO_POLC_ROUND);
     }
 
     #[test]
