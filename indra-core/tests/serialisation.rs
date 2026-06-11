@@ -85,6 +85,7 @@ fn dummy_header() -> BlockHeaderV1 {
         mempool_set_root:    Bytes32::from([0x33u8; 32]),
         base_fee:            100,
         proposer_round:      0,
+        polc_round:          indra_core::types::block::NO_POLC_ROUND,
         proposer_vrf_output: Bytes32::from([0x44u8; 32]),
         proposer_vrf_proof:  VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
         quorum_certificate:  VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),

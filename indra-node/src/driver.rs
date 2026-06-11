@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 
 use indra_core::codec::Encode;
 use indra_core::types::{
-    block::BlockV1,
+    block::{BlockV1, NO_POLC_ROUND},
     primitives::Bytes32,
     transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
@@ -50,6 +50,17 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Current Tendermint phase of the local round state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundPhase {
+    /// Waiting for / sending a proposal.
+    Propose,
+    /// Collecting prevotes for the current round.
+    Prevote,
+    /// Collecting precommits for the current round.
+    Precommit,
 }
 
 /// An inbound event for the driver to process.
@@ -128,16 +139,20 @@ pub struct ConsensusDriver {
     pub engine: NodeEngine,
     /// Slash evidence detector.
     slash_detector: SlashDetector,
-    /// Vote collectors keyed by (height, round).
-    vote_collectors: HashMap<(u64, u32), VoteCollector>,
+    /// Vote collectors keyed by (height, round, step).
+    vote_collectors: HashMap<(u64, u32, VoteStep), VoteCollector>,
     /// Pending blocks by block hash until precommit quorum forms.
     pending_blocks: HashMap<Bytes32, BlockV1>,
     /// Votes received before the matching proposal was staged locally.
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
     /// Missing proposals already requested from peers.
     requested_proposals: HashSet<(u64, u32, Bytes32)>,
-    /// First accepted vote hash per (validator, height, round) slot.
-    seen_round_votes: HashMap<(Bytes32, u64, u32), Bytes32>,
+    /// First accepted vote hash per (validator, height, round, step) slot.
+    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), Bytes32>,
+    /// Tendermint lock round for the next block height.
+    locked_round: Option<u32>,
+    /// Tendermint locked value for the next block height.
+    locked_value: Option<Bytes32>,
     /// Accepted proposal slot currently suppressing local proposals.
     accepted_proposal: Option<(u64, u32)>,
     /// Blocks whose quorum arrived before the proposal was staged locally.
@@ -148,6 +163,8 @@ pub struct ConsensusDriver {
     registered_voters: Vec<RegisteredVoter>,
     /// Current consensus round for the next block height.
     current_round: u32,
+    /// Current Tendermint phase within the round.
+    current_phase: RoundPhase,
     /// Synchronization phase for this node.
     sync: SyncState,
 }
@@ -163,11 +180,14 @@ impl ConsensusDriver {
             buffered_votes: HashMap::new(),
             requested_proposals: HashSet::new(),
             seen_round_votes: HashMap::new(),
+            locked_round: None,
+            locked_value: None,
             accepted_proposal: None,
             pending_quorum: HashSet::new(),
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
             current_round: 0,
+            current_phase: RoundPhase::Propose,
             sync: SyncState::follower(0),
         };
         driver.sync = if driver.engine.config.bootstrap_peers.is_empty() {
@@ -200,6 +220,11 @@ impl ConsensusDriver {
         self.current_round
     }
 
+    /// Current Tendermint phase for the next block height.
+    pub fn current_phase(&self) -> RoundPhase {
+        self.current_phase
+    }
+
     /// Current synchronization state.
     pub fn sync(&self) -> &SyncState {
         &self.sync
@@ -223,11 +248,13 @@ impl ConsensusDriver {
     /// Advance to the next consensus round if the current height remains unfinalized.
     pub fn advance_round(&mut self) {
         self.current_round = self.current_round.saturating_add(1);
+        self.current_phase = RoundPhase::Propose;
     }
 
     /// Reset the consensus round after height advancement/finalization.
     pub fn reset_round(&mut self) {
         self.current_round = 0;
+        self.current_phase = RoundPhase::Propose;
     }
 
     /// Process one inbound event. Returns a list of actions to take.
@@ -248,9 +275,15 @@ impl ConsensusDriver {
         }
     }
 
-    fn collector_has_vote_from(&self, height: u64, round: u32, validator_id: Bytes32) -> bool {
+    fn collector_has_vote_from(
+        &self,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        validator_id: Bytes32,
+    ) -> bool {
         self.vote_collectors
-            .get(&(height, round))
+            .get(&(height, round, step))
             .map(|collector| collector.has_vote_from(&validator_id))
             .unwrap_or(false)
     }
@@ -267,6 +300,120 @@ impl ConsensusDriver {
     /// Return a staged proposal by hash if it is still pending locally.
     pub fn pending_block(&self, hash: &Bytes32) -> Option<BlockV1> {
         self.pending_blocks.get(hash).cloned()
+    }
+
+    /// PoLC round to include in our next proposal, if we are locked.
+    pub fn proposal_polc_round(&self, height: u64) -> Option<u32> {
+        if self.engine.state.height + 1 != height {
+            return None;
+        }
+        self.locked_round
+    }
+
+    fn collector_key(height: u64, round: u32, step: VoteStep) -> (u64, u32, VoteStep) {
+        (height, round, step)
+    }
+
+    fn can_prevote_value(&self, block: &BlockV1) -> bool {
+        match self.locked_value {
+            None => true,
+            Some(locked_hash) if locked_hash == block.header.block_hash() => true,
+            Some(_) if block.header.polc_round != NO_POLC_ROUND => true,
+            Some(_) => false,
+        }
+    }
+
+    fn record_local_lock(&mut self, round: u32, hash: Bytes32) {
+        if hash == Bytes32::ZERO {
+            self.locked_round = None;
+            self.locked_value = None;
+        } else {
+            self.locked_round = Some(round);
+            self.locked_value = Some(hash);
+        }
+    }
+
+    fn sign_and_record_local_vote(
+        &mut self,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) -> Vec<DriverAction> {
+        let Some(local_validator_id) = self.engine.validator_id() else {
+            return vec![];
+        };
+        if self.collector_has_vote_from(height, round, step, local_validator_id) {
+            return vec![];
+        }
+
+        if step == VoteStep::Prevote && block_hash != Bytes32::ZERO {
+            if let Some(locked_hash) = self.locked_value {
+                if locked_hash != block_hash && self.locked_round.is_some() {
+                    eprintln!(
+                        "[vote] locked to {} at height={}, refusing to prevote {}",
+                        hex::encode(locked_hash.0),
+                        height,
+                        hex::encode(block_hash.0),
+                    );
+                    return vec![];
+                }
+            }
+        }
+
+        match self.engine.sign_vote(height, round, step, block_hash) {
+            Ok(local_vote) => {
+                if step == VoteStep::Prevote {
+                    eprintln!(
+                        "[vote] sending local prevote for {} at height={} round={}",
+                        hex::encode(&block_hash.0[..4]),
+                        height,
+                        round,
+                    );
+                } else {
+                    eprintln!(
+                        "[vote] sending local precommit for {} at height={} round={}",
+                        hex::encode(&block_hash.0[..4]),
+                        height,
+                        round,
+                    );
+                }
+                eprintln!(
+                    "[timing] t={}ms sent vote for {} at height={} round={}",
+                    now_ms(),
+                    hex::encode(block_hash.0),
+                    height,
+                    round,
+                );
+                self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote)
+            }
+            Err(err) => {
+                eprintln!(
+                    "[vote] failed to sign local {:?} for {} at height={} round={}: {}",
+                    step,
+                    hex::encode(&block_hash.0[..4]),
+                    height,
+                    round,
+                    err,
+                );
+                vec![]
+            }
+        }
+    }
+
+    fn maybe_cast_prevote_for_block(&mut self, block: &BlockV1) -> Vec<DriverAction> {
+        let vote_hash = if self.can_prevote_value(block) {
+            block.header.block_hash()
+        } else {
+            Bytes32::ZERO
+        };
+        self.current_phase = RoundPhase::Prevote;
+        self.sign_and_record_local_vote(
+            block.header.height,
+            block.header.proposer_round,
+            VoteStep::Prevote,
+            vote_hash,
+        )
     }
 
     fn process_block(&mut self, _from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
@@ -341,6 +488,8 @@ impl ConsensusDriver {
             self.buffered_votes.retain(|(height, round, _), _| {
                 !(*height == incoming_height && *round > incoming_round)
             });
+            self.locked_round = None;
+            self.locked_value = None;
             self.accepted_proposal = None;
         }
 
@@ -404,46 +553,14 @@ impl ConsensusDriver {
             if self.collector_has_vote_from(
                 block.header.height,
                 block.header.proposer_round,
+                VoteStep::Prevote,
                 local_validator_id,
             ) {
-                eprintln!(
-                    "[vote] local precommit already counted for {} at height={} round={}, skipping duplicate",
-                    hex::encode(&block_hash.0[..4]),
-                    block.header.height,
-                    block.header.proposer_round,
-                );
                 return actions;
             }
         }
 
-        if let Ok(local_vote) = self.engine.sign_vote(
-            block.header.height,
-            block.header.proposer_round,
-            VoteStep::Precommit,
-            block_hash,
-        ) {
-            eprintln!(
-                "[vote] sending local precommit for {} at height={} round={}",
-                hex::encode(&block_hash.0[..4]),
-                block.header.height,
-                block.header.proposer_round,
-            );
-            eprintln!(
-                "[timing] t={}ms sent vote for {} at height={} round={}",
-                now_ms(),
-                hex::encode(block_hash.0),
-                block.header.height,
-                block.header.proposer_round,
-            );
-            actions.extend(self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote));
-        } else {
-            eprintln!(
-                "[vote] failed to sign local precommit for {} at height={} round={}",
-                hex::encode(&block_hash.0[..4]),
-                block.header.height,
-                block.header.proposer_round,
-            );
-        }
+        actions.extend(self.maybe_cast_prevote_for_block(&block));
 
         actions
     }
@@ -459,7 +576,7 @@ impl ConsensusDriver {
             .engine
             .validator_id()
             .is_some_and(|local_id| local_id == vote.validator_id)
-            && self.collector_has_vote_from(vote.height, vote.round, vote.validator_id)
+            && self.collector_has_vote_from(vote.height, vote.round, vote.step, vote.validator_id)
         {
             eprintln!(
                 "[vote] ignoring echoed local vote from {} for {} at height={} round={}",
@@ -497,7 +614,7 @@ impl ConsensusDriver {
             actions.push(DriverAction::SlashDetected(evidence));
         }
 
-        let slot_key = (vote.validator_id, vote.height, vote.round);
+        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
         if let Some(existing_hash) = self.seen_round_votes.get(&slot_key).copied() {
             if existing_hash == vote.block_hash {
                 eprintln!(
@@ -521,7 +638,8 @@ impl ConsensusDriver {
         }
         self.seen_round_votes.insert(slot_key, vote.block_hash);
 
-        if vote.height == self.engine.state.height + 1
+        if !vote.is_nil()
+            && vote.height == self.engine.state.height + 1
             && !self.pending_blocks.contains_key(&vote.block_hash)
         {
             let request_key = (vote.height, vote.round, vote.block_hash);
@@ -563,19 +681,23 @@ impl ConsensusDriver {
 
     fn record_vote_and_actions(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
-        let key = (vote.height, vote.round);
-        let collector = self.vote_collectors
-            .entry(key)
-            .or_insert_with(|| VoteCollector::new(
-                vote.height,
-                vote.round,
-                vote.step,
-                self.registered_voters.clone(),
-            ));
+        let key = Self::collector_key(vote.height, vote.round, vote.step);
+        let (decision, current_count) = {
+            let collector = self.vote_collectors
+                .entry(key)
+                .or_insert_with(|| VoteCollector::new(
+                    vote.height,
+                    vote.round,
+                    vote.step,
+                    self.registered_voters.clone(),
+                ));
+            let decision = collector.add_vote(vote.clone());
+            let current_count = collector.vote_count();
+            (decision, current_count)
+        };
 
-        match collector.add_vote(vote.clone()) {
+        match decision {
             Ok(VoteDecision::QuorumReached { block_hash, stake_bps: _ }) => {
-                let current_count = collector.vote_count();
                 eprintln!(
                     "[timing] t={}ms received vote for {} at height={} round={} count={}/4",
                     now_ms(),
@@ -593,17 +715,39 @@ impl ConsensusDriver {
                     vote.round,
                 );
                 eprintln!(
-                    "[timing] t={}ms QUORUM {} at height={} round={} — commit",
+                    "[timing] t={}ms QUORUM {} at height={} round={} — {}",
                     now_ms(),
                     hex::encode(block_hash.0),
                     vote.height,
                     vote.round,
+                    match vote.step {
+                        VoteStep::Prevote => "precommit",
+                        VoteStep::Precommit => "commit",
+                    },
                 );
                 actions.push(DriverAction::BroadcastVote(vote.clone()));
-                actions.extend(self.finalize_block_on_quorum(vote.height, vote.round, block_hash));
+                match vote.step {
+                    VoteStep::Prevote => {
+                        self.current_phase = RoundPhase::Precommit;
+                        self.record_local_lock(vote.round, block_hash);
+                        actions.extend(self.sign_and_record_local_vote(
+                            vote.height,
+                            vote.round,
+                            VoteStep::Precommit,
+                            block_hash,
+                        ));
+                    }
+                    VoteStep::Precommit => {
+                        if block_hash != Bytes32::ZERO {
+                            actions.extend(self.finalize_block_on_quorum(vote.height, vote.round, block_hash));
+                        } else {
+                            self.locked_round = None;
+                            self.locked_value = None;
+                        }
+                    }
+                }
             }
             Ok(VoteDecision::Waiting) => {
-                let current_count = collector.vote_count();
                 eprintln!(
                     "[timing] t={}ms received vote for {} at height={} round={} count={}/4",
                     now_ms(),
@@ -649,7 +793,7 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         };
         self.pending_quorum.remove(&(height, round, block_hash));
-        let key = (height, round);
+        let key = Self::collector_key(height, round, VoteStep::Precommit);
         let Some(collector) = self.vote_collectors.get(&key) else {
             eprintln!(
                 "[commit] quorum reached for {} at height={} round={}, but collector is missing",
@@ -700,15 +844,18 @@ impl ConsensusDriver {
                 );
                 self.last_qc_bytes = qc.encode_to_vec();
                 self.vote_collectors.remove(&key);
+                self.vote_collectors.remove(&Self::collector_key(height, round, VoteStep::Prevote));
                 self.buffered_votes.remove(&(height, round, block_hash));
                 self.seen_round_votes
-                    .retain(|(_, vote_height, vote_round), _| {
+                    .retain(|(_, vote_height, vote_round, _), _| {
                         !(*vote_height == height && *vote_round == round)
                     });
                 self.pending_quorum.remove(&(height, round, block_hash));
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
                 self.sync.mark_caught_up(self.engine.state.height);
+                self.locked_round = None;
+                self.locked_value = None;
                 if self.engine.state.height > old_height {
                     self.accepted_proposal = None;
                     eprintln!(
@@ -778,6 +925,42 @@ impl ConsensusDriver {
         }
     }
 
+    /// Fire when proposal timeout expires without a usable proposal.
+    pub fn on_propose_timeout(&mut self) -> Vec<DriverAction> {
+        if !self.sync.is_caught_up() {
+            return vec![];
+        }
+        self.current_phase = RoundPhase::Prevote;
+        self.sign_and_record_local_vote(
+            self.engine.state.height + 1,
+            self.current_round,
+            VoteStep::Prevote,
+            Bytes32::ZERO,
+        )
+    }
+
+    /// Fire when prevote timeout expires without a prevote quorum.
+    pub fn on_prevote_timeout(&mut self) -> Vec<DriverAction> {
+        if !self.sync.is_caught_up() {
+            return vec![];
+        }
+        self.current_phase = RoundPhase::Precommit;
+        self.sign_and_record_local_vote(
+            self.engine.state.height + 1,
+            self.current_round,
+            VoteStep::Precommit,
+            Bytes32::ZERO,
+        )
+    }
+
+    /// Fire when precommit timeout expires without a commit.
+    pub fn on_precommit_timeout(&mut self) {
+        if !self.sync.is_caught_up() {
+            return;
+        }
+        self.advance_round();
+    }
+
     /// Current chain height.
     pub fn height(&self) -> u64 {
         self.engine.height()
@@ -819,6 +1002,7 @@ mod tests {
                 mempool_set_root:    Bytes32::ZERO,
                 base_fee,
                 proposer_round:      0,
+                polc_round:          NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
                 quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
@@ -982,19 +1166,27 @@ mod tests {
 
         let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
         let remote_b_id = Bytes32::from(indra_crypto::sha256(&remote_b.public_key().classical.0));
-        let vote_a = indra_consensus::vote::produce_vote(
+        let prevote_a = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Prevote, block_hash, remote_a_id, &remote_a
+        ).unwrap();
+        let prevote_b = indra_consensus::vote::produce_vote(
+            1, 0, VoteStep::Prevote, block_hash, remote_b_id, &remote_b
+        ).unwrap();
+        let precommit_a = indra_consensus::vote::produce_vote(
             1, 0, VoteStep::Precommit, block_hash, remote_a_id, &remote_a
         ).unwrap();
-        let vote_b = indra_consensus::vote::produce_vote(
+        let precommit_b = indra_consensus::vote::produce_vote(
             1, 0, VoteStep::Precommit, block_hash, remote_b_id, &remote_b
         ).unwrap();
 
         let peer_a: SocketAddr = "127.0.0.1:9101".parse().unwrap();
         let peer_b: SocketAddr = "127.0.0.1:9102".parse().unwrap();
-        let _ = driver.process(DriverEvent::InboundVote { from: peer_a, vote: vote_a });
-        let _ = driver.process(DriverEvent::InboundVote { from: peer_b, vote: vote_b });
+        let _ = driver.process(DriverEvent::InboundVote { from: peer_a, vote: prevote_a });
+        let _ = driver.process(DriverEvent::InboundVote { from: peer_b, vote: prevote_b });
 
-        let actions = driver.process(DriverEvent::InboundBlock { from: Some(peer_a), block });
+        let mut actions = driver.process(DriverEvent::InboundBlock { from: Some(peer_a), block });
+        actions.extend(driver.process(DriverEvent::InboundVote { from: peer_a, vote: precommit_a }));
+        actions.extend(driver.process(DriverEvent::InboundVote { from: peer_b, vote: precommit_b }));
 
         assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
         assert_eq!(driver.height(), 1);
@@ -1087,13 +1279,13 @@ mod tests {
         let local_validator_id = Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
         let collector = driver
             .vote_collectors
-            .get(&(1, 0))
-            .expect("collector must exist after local precommit");
+            .get(&(1, 0, VoteStep::Prevote))
+            .expect("collector must exist after local prevote");
         assert!(collector.has_vote_from(&local_validator_id));
         assert_eq!(collector.vote_count(), 1);
 
         let echoed_local_vote = indra_consensus::vote::produce_vote(
-            1, 0, VoteStep::Precommit, block_hash, local_validator_id, &local
+            1, 0, VoteStep::Prevote, block_hash, local_validator_id, &local
         ).unwrap();
         let peer: SocketAddr = "127.0.0.1:9301".parse().unwrap();
         let echo_actions = driver.process(DriverEvent::InboundVote { from: peer, vote: echoed_local_vote });
@@ -1101,7 +1293,7 @@ mod tests {
 
         let collector = driver
             .vote_collectors
-            .get(&(1, 0))
+            .get(&(1, 0, VoteStep::Prevote))
             .expect("collector must still exist after ignoring echo");
         assert_eq!(collector.vote_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1134,10 +1326,10 @@ mod tests {
         let actions_a = driver.process(DriverEvent::InboundVote { from: peer, vote: vote_a });
         let actions_b = driver.process(DriverEvent::InboundVote { from: peer, vote: vote_b });
 
-        assert!(actions_a.is_empty());
+        assert!(actions_a.iter().any(|a| matches!(a, DriverAction::RequestProposal { .. })));
         assert!(actions_b.iter().any(|a| matches!(a, DriverAction::SlashDetected(_))));
         assert_eq!(
-            driver.seen_round_votes.get(&(remote_validator_id, 1, 0)),
+            driver.seen_round_votes.get(&(remote_validator_id, 1, 0, VoteStep::Precommit)),
             Some(&hash_a)
         );
         assert_eq!(driver.buffered_votes.len(), 1);
@@ -1184,7 +1376,7 @@ mod tests {
         assert!(!driver.pending_blocks.contains_key(&later_hash));
         assert!(driver.pending_blocks.contains_key(&earlier_hash));
         assert_eq!(driver.accepted_proposal, Some((1, 1)));
-        assert!(driver.has_accepted_proposal_for_height(1));
+        assert_eq!(driver.current_phase, RoundPhase::Prevote);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1216,6 +1408,34 @@ mod tests {
 
         driver.current_round = 3;
         assert!(!driver.has_accepted_proposal_for_height(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_validator_rejects_conflicting_prevote_value() {
+        let dir = temp_dir("j");
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&[0xA1u8; 32]).unwrap();
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let mut driver = ConsensusDriver::new(engine);
+        let _local = install_active_validator(&mut driver, [0xA1u8; 32], "local");
+        let _remote = install_active_validator(&mut driver, [0xA2u8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let first = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let first_hash = first.header.block_hash();
+        driver.locked_round = Some(0);
+        driver.locked_value = Some(first_hash);
+
+        let mut second = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        second.header.proposer_round = 1;
+        second.header.timestamp += 1;
+        let second_hash = second.header.block_hash();
+        assert!(!driver.can_prevote_value(&second));
+        assert_ne!(first_hash, second_hash);
+        assert_eq!(driver.locked_value, Some(first_hash));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -122,6 +122,7 @@ fn mempool_to_block_pipeline() {
         epoch_seed:           Bytes32::from(seed),
         prev_qc_bytes:        vec![],
         timestamp:            1_700_000_001,
+        polc_round:           None,
     };
 
     let block = produce_block(&template, &state, &mempool, &election).unwrap();

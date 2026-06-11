@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// Which consensus phase this vote belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum VoteStep {
     /// Prevote phase.
@@ -75,6 +75,13 @@ impl Decode for VoteV1 {
             validator_id: Bytes32::decode(r)?,
             signature:    HybridSignature::decode(r)?,
         })
+    }
+}
+
+impl VoteV1 {
+    /// True when this vote is a Tendermint nil vote.
+    pub fn is_nil(&self) -> bool {
+        self.block_hash == Bytes32::ZERO
     }
 }
 

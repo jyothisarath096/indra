@@ -64,6 +64,7 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockV1 
             mempool_set_root:    Bytes32::ZERO,
             base_fee:            INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_round:      0,
+            polc_round:          indra_core::types::block::NO_POLC_ROUND,
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
             quorum_certificate:  VariableBytes::from_slice(&[]).unwrap(),

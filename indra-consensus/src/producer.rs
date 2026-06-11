@@ -21,7 +21,7 @@ use indra_core::{
             Bytes32, ProtocolVersion, VariableBytes,
             MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
         },
-        block::{BlockV1, BlockHeaderV1},
+        block::{BlockV1, BlockHeaderV1, NO_POLC_ROUND},
         transaction::TransactionV1,
     },
 };
@@ -45,6 +45,8 @@ pub struct BlockTemplate {
     pub prev_qc_bytes: Vec<u8>,
     /// Unix timestamp for the new block.
     pub timestamp: u64,
+    /// Round whose prevote quorum justified re-proposal of this value.
+    pub polc_round: Option<u32>,
 }
 
 /// Produce a block from the current state and mempool.
@@ -114,6 +116,7 @@ pub fn produce_block(
         mempool_set_root:    compute_selected_tx_root(&selected),
         base_fee:            state.base_fee,
         proposer_round:      election.round,
+        polc_round:          template.polc_round.unwrap_or(NO_POLC_ROUND),
         proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
         proposer_vrf_proof:  vrf_proof_bytes,
         quorum_certificate:  qc_bytes,
@@ -183,6 +186,7 @@ mod tests {
             epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
+            polc_round: None,
         };
 
         let block = produce_block(&template, &state, &mempool, &election).unwrap();
@@ -205,6 +209,7 @@ mod tests {
             epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
+            polc_round: None,
         };
 
         assert_eq!(
@@ -224,6 +229,7 @@ mod tests {
             epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
+            polc_round: None,
         };
         let block = produce_block(&template, &state, &mempool, &election).unwrap();
         assert_eq!(block.header.height, state.height + 1);

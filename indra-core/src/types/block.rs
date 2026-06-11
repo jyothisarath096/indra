@@ -16,6 +16,9 @@ use crate::{
     ssz::sha256,
 };
 
+/// Sentinel value meaning a proposal did not carry a prior PoLC round.
+pub const NO_POLC_ROUND: u32 = u32::MAX;
+
 /// INDRA v1 block header.
 ///
 /// block_hash = SHA-256(encode(BlockHeaderV1))
@@ -40,6 +43,10 @@ pub struct BlockHeaderV1 {
     pub base_fee:            u64,
     /// Consensus round in which this block was proposed.
     pub proposer_round:      u32,
+    /// Round whose prevote quorum justified re-proposing this value.
+    ///
+    /// `NO_POLC_ROUND` means no prior PoLC was attached.
+    pub polc_round:          u32,
     /// Proposer's VRF output (32 bytes).
     pub proposer_vrf_output: Bytes32,
     /// Proposer's VRF proof.
@@ -66,12 +73,13 @@ impl Encode for BlockHeaderV1 {
         self.mempool_set_root.encode(buf);
         self.base_fee.encode(buf);
         self.proposer_round.encode(buf);
+        self.polc_round.encode(buf);
         self.proposer_vrf_output.encode(buf);
         self.proposer_vrf_proof.encode(buf);
         self.quorum_certificate.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        2 + 8 + 32 + 8 + 32 + 32 + 32 + 8 + 4 + 32
+        2 + 8 + 32 + 8 + 32 + 32 + 32 + 8 + 4 + 4 + 32
             + self.proposer_vrf_proof.encoded_len()
             + self.quorum_certificate.encoded_len()
     }
@@ -89,6 +97,7 @@ impl Decode for BlockHeaderV1 {
             mempool_set_root:    Bytes32::decode(r)?,
             base_fee:            u64::decode(r)?,
             proposer_round:      u32::decode(r)?,
+            polc_round:          u32::decode(r)?,
             proposer_vrf_output: Bytes32::decode(r)?,
             proposer_vrf_proof:  VariableBytes::decode(r)?,
             quorum_certificate:  VariableBytes::decode(r)?,
@@ -151,6 +160,7 @@ mod tests {
             mempool_set_root:    Bytes32::from([0x33u8; 32]),
             base_fee:            100,
             proposer_round:      0,
+            polc_round:          NO_POLC_ROUND,
             proposer_vrf_output: Bytes32::from([0x44u8; 32]),
             proposer_vrf_proof:  VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
             quorum_certificate:  VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),

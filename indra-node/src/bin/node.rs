@@ -28,12 +28,14 @@ use indra_network::{
 };
 use indra_node::{
     NodeConfig, NodeEngine,
-    driver::{ConsensusDriver, DriverAction, DriverEvent},
+    driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     net_driver::{message_to_event, action_to_message},
     sync::SYNC_BATCH_SIZE,
 };
 
-const BLOCK_TIME: Duration = Duration::from_secs(6);
+const PROPOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const PREVOTE_TIMEOUT: Duration = Duration::from_secs(2);
+const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
@@ -441,80 +443,49 @@ fn main() {
             // Wait for peer connections to establish
             std::thread::sleep(Duration::from_secs(3));
 
-            let mut last_block_time = Instant::now();
-            let mut proposed_at_height: Option<u64> = None;
+            let mut proposed_at_slot: Option<(u64, u32)> = None;
+            let mut phase_started_at = Instant::now();
+            let mut last_observed = None::<(u64, u32, RoundPhase)>;
+            let mut last_status_at = Instant::now() - STATUS_INTERVAL;
 
             loop {
-                // Every BLOCK_TIME: attempt to propose a block
-                if last_block_time.elapsed() >= BLOCK_TIME {
-                    last_block_time = Instant::now();
+                let (height, round, phase, sync_target, connected, tip_hash) = {
+                    let d = driver.lock().unwrap();
+                    (
+                        d.height(),
+                        d.current_round(),
+                        d.current_phase(),
+                        d.sync().target_height(),
+                        gossip.lock().unwrap().connection_count(),
+                        d.engine.state.tip_hash,
+                    )
+                };
 
-                    let connected = gossip.lock().unwrap().connection_count();
-                    let height    = driver.lock().unwrap().height();
+                let observed = (height, round, phase);
+                if last_observed != Some(observed) {
+                    phase_started_at = Instant::now();
+                    if last_observed.map(|(h, r, _)| (h, r)) != Some((height, round)) {
+                        proposed_at_slot = None;
+                    }
+                    last_observed = Some(observed);
+                }
 
-                    if connected == 0 {
-                        // No peers yet — print waiting message
-                        println!("[consensus] height={} waiting for peers...", height);
-                    } else {
-                        println!("[consensus] height={} peers={} tick", height, connected);
+                if connected == 0 {
+                    println!("[consensus] height={} waiting for peers...", height);
+                } else if last_status_at.elapsed() >= STATUS_INTERVAL {
+                    println!("[consensus] height={} peers={} round={} phase={:?}", height, connected, round, phase);
+                    let status = Message::Status { height, tip_hash };
+                    let _ = gossip.lock().unwrap().broadcast(&status);
+                    last_status_at = Instant::now();
+                }
 
-                        // Broadcast our status to all peers
-                        let tip_hash = driver.lock().unwrap().engine.state.tip_hash;
-                        let status = Message::Status { height, tip_hash };
-                        let _ = gossip.lock().unwrap().broadcast(&status);
-
-                        let sync_target = {
-                            let d = driver.lock().unwrap();
-                            d.sync().target_height()
-                        };
-                        if let Some(target) = sync_target {
-                            println!("[consensus] syncing — height={} target={}", height, target);
-                            std::thread::sleep(Duration::from_millis(100));
-                            continue;
-                        }
-
-                        // VRF-based proposer election
-                        let (should_propose, start_height) = {
-                            let d = driver.lock().unwrap();
-                            let epoch_seed = indra_core::types::primitives::Bytes32::from(
-                                indra_crypto::sha256(&d.engine.state.tip_hash.0)
-                            );
-                            let height = d.engine.state.height + 1;
-                            let round = d.current_round();
-
-                            // Build candidate list from active validators
-                            let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
-                                d.engine.state.validators.active_validators()
-                                    .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
-                                        validator_id: v.validator_id,
-                                        vrf_pubkey: vrf_pk,
-                                        stake: v.stake_spark,
-                                    }))
-                                    .collect();
-
-                            if candidates.is_empty() {
-                                // No validators loaded — fall back to bootstrap behaviour
-                                (d.engine.config.bootstrap_peers.is_empty(), d.engine.state.height)
-                            } else {
-                                let election = indra_consensus::proposer::ProposerElection {
-                                    epoch_seed,
-                                    height,
-                                    round,
-                                    candidates,
-                                };
-                                (d.engine.is_proposer(&election), d.engine.state.height)
-                            }
-                        };
-
-                        let already_have_proposal = proposed_at_height == Some(start_height)
-                            || driver
-                                .lock()
-                                .unwrap()
-                                .has_accepted_proposal_for_height(start_height + 1);
-
-                        if should_propose && !already_have_proposal {
-                            let proposal = {
-                                let mut d = driver.lock().unwrap();
+                if let Some(target) = sync_target {
+                    println!("[consensus] syncing — height={} target={}", height, target);
+                } else {
+                    match phase {
+                        RoundPhase::Propose => {
+                            let (should_propose, next_height) = {
+                                let d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                     indra_crypto::sha256(&d.engine.state.tip_hash.0)
                                 );
@@ -528,77 +499,141 @@ fn main() {
                                             stake: v.stake_spark,
                                         }))
                                         .collect();
-                                let election = indra_consensus::proposer::ProposerElection {
-                                    epoch_seed,
-                                    height,
-                                    round,
-                                    candidates,
-                                };
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                match d.engine.propose(&election, timestamp, d.last_qc_bytes()) {
-                                    Ok(block) => {
-                                        if !block.transactions.is_empty() {
-                                            eprintln!(
-                                                "[mempool] including {} txs in block at height={}",
-                                                block.transactions.len(),
-                                                block.header.height,
-                                            );
-                                        }
-                                        let actions = d.process(DriverEvent::InboundBlock {
-                                            from: None,
-                                            block: block.clone(),
-                                        });
-                                        Some((block, actions))
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[consensus] proposal failed: {}", e);
-                                        None
-                                    }
+
+                                if candidates.is_empty() {
+                                    (d.engine.config.bootstrap_peers.is_empty(), height)
+                                } else {
+                                    let election = indra_consensus::proposer::ProposerElection {
+                                        epoch_seed,
+                                        height,
+                                        round,
+                                        candidates,
+                                    };
+                                    (d.engine.is_proposer(&election), height)
                                 }
                             };
 
-                            if let Some((block, actions)) = proposal {
-                                proposed_at_height = Some(start_height);
-                                eprintln!(
-                                    "[timing] t={}ms proposed block {} at height={} round={}",
-                                    now_ms(),
-                                    hex::encode(block.header.block_hash().0),
-                                    block.header.height,
-                                    block.header.proposer_round,
-                                );
+                            let already_have_proposal = proposed_at_slot == Some((next_height, round))
+                                || driver
+                                    .lock()
+                                    .unwrap()
+                                    .has_accepted_proposal_for_height(next_height);
+
+                            if should_propose && !already_have_proposal {
+                                let proposal = {
+                                    let mut d = driver.lock().unwrap();
+                                    let epoch_seed = indra_core::types::primitives::Bytes32::from(
+                                        indra_crypto::sha256(&d.engine.state.tip_hash.0)
+                                    );
+                                    let height = d.engine.state.height + 1;
+                                    let round = d.current_round();
+                                    let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
+                                        d.engine.state.validators.active_validators()
+                                            .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
+                                                validator_id: v.validator_id,
+                                                vrf_pubkey: vrf_pk,
+                                                stake: v.stake_spark,
+                                            }))
+                                            .collect();
+                                    let election = indra_consensus::proposer::ProposerElection {
+                                        epoch_seed,
+                                        height,
+                                        round,
+                                        candidates,
+                                    };
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let polc_round = d.proposal_polc_round(height);
+                                    match d.engine.propose(&election, timestamp, d.last_qc_bytes(), polc_round) {
+                                        Ok(block) => {
+                                            if !block.transactions.is_empty() {
+                                                eprintln!(
+                                                    "[mempool] including {} txs in block at height={}",
+                                                    block.transactions.len(),
+                                                    block.header.height,
+                                                );
+                                            }
+                                            let actions = d.process(DriverEvent::InboundBlock {
+                                                from: None,
+                                                block: block.clone(),
+                                            });
+                                            Some((block, actions))
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[consensus] proposal failed: {}", e);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                if let Some((block, actions)) = proposal {
+                                    proposed_at_slot = Some((block.header.height, block.header.proposer_round));
+                                    eprintln!(
+                                        "[timing] t={}ms proposed block {} at height={} round={}",
+                                        now_ms(),
+                                        hex::encode(block.header.block_hash().0),
+                                        block.header.height,
+                                        block.header.proposer_round,
+                                    );
+                                    for action in actions {
+                                        if let Some(out_msg) = action_to_message(&action) {
+                                            log_broadcast_action(&gossip, &action);
+                                            let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                        }
+                                    }
+
+                                    println!(
+                                        "[consensus] ✓ proposed block {} → height={}",
+                                        hex::encode(block.header.block_hash().0),
+                                        driver.lock().unwrap().height()
+                                    );
+                                }
+                            }
+
+                            if phase_started_at.elapsed() >= PROPOSE_TIMEOUT {
+                                let actions = driver.lock().unwrap().on_propose_timeout();
                                 for action in actions {
                                     if let Some(out_msg) = action_to_message(&action) {
                                         log_broadcast_action(&gossip, &action);
                                         let _ = gossip.lock().unwrap().broadcast(&out_msg);
                                     }
                                 }
-
-                                let new_h = driver.lock().unwrap().height();
-                                println!(
-                                    "[consensus] ✓ proposed block {} → height={}",
-                                    hex::encode(block.header.block_hash().0),
-                                    new_h
-                                );
+                                phase_started_at = Instant::now();
                             }
                         }
-
-                        {
-                            let mut d = driver.lock().unwrap();
-                            if d.height() == start_height && d.sync().is_caught_up() {
-                                d.advance_round();
-                                eprintln!(
-                                    "[timing] t={}ms ROUND ADVANCED to {} at height={}",
-                                    now_ms(),
-                                    d.current_round(),
-                                    d.height(),
-                                );
-                            } else if d.height() > start_height {
-                                proposed_at_height = None;
-                                d.reset_round();
-                                last_block_time = Instant::now() - BLOCK_TIME;
+                        RoundPhase::Prevote => {
+                            if phase_started_at.elapsed() >= PREVOTE_TIMEOUT {
+                                let actions = driver.lock().unwrap().on_prevote_timeout();
+                                for action in actions {
+                                    if let Some(out_msg) = action_to_message(&action) {
+                                        log_broadcast_action(&gossip, &action);
+                                        let _ = gossip.lock().unwrap().broadcast(&out_msg);
+                                    }
+                                }
+                                phase_started_at = Instant::now();
+                            }
+                        }
+                        RoundPhase::Precommit => {
+                            if phase_started_at.elapsed() >= PRECOMMIT_TIMEOUT {
+                                let (old_round, height_before) = {
+                                    let d = driver.lock().unwrap();
+                                    (d.current_round(), d.height())
+                                };
+                                {
+                                    let mut d = driver.lock().unwrap();
+                                    d.on_precommit_timeout();
+                                    if d.current_round() != old_round {
+                                        eprintln!(
+                                            "[timing] t={}ms ROUND ADVANCED to {} at height={}",
+                                            now_ms(),
+                                            d.current_round(),
+                                            height_before,
+                                        );
+                                    }
+                                }
+                                phase_started_at = Instant::now();
                             }
                         }
                     }
@@ -606,7 +641,8 @@ fn main() {
 
                 match height_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(()) => {
-                        last_block_time = Instant::now() - BLOCK_TIME;
+                        phase_started_at = Instant::now();
+                        proposed_at_slot = None;
                     }
                     Err(_) => {}
                 }
