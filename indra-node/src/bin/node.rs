@@ -33,9 +33,9 @@ use indra_node::{
     sync::SYNC_BATCH_SIZE,
 };
 
-const PROPOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const PREVOTE_TIMEOUT: Duration = Duration::from_secs(2);
-const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROPOSE_TIMEOUT: Duration = Duration::from_secs(4);
+const PREVOTE_TIMEOUT: Duration = Duration::from_secs(3);
+const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
