@@ -123,6 +123,8 @@ pub struct ConsensusDriver {
     vote_collectors: HashMap<(u64, u32, VoteStep), VoteCollector>,
     /// Pending blocks by block hash.
     pending_blocks: HashMap<Bytes32, BlockV1>,
+    /// Proposals buffered because they arrived before their parent tip was committed locally.
+    future_proposals: HashMap<(u64, Bytes32), Vec<BlockV1>>,
     /// Votes received before the matching proposal was staged locally.
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
     /// Missing proposals already requested from peers.
@@ -157,6 +159,7 @@ impl ConsensusDriver {
             slash_detector: SlashDetector::new(),
             vote_collectors: HashMap::new(),
             pending_blocks: HashMap::new(),
+            future_proposals: HashMap::new(),
             buffered_votes: HashMap::new(),
             requested_proposals: HashSet::new(),
             seen_round_votes: HashMap::new(),
@@ -225,11 +228,13 @@ impl ConsensusDriver {
 
     /// External compatibility hook used by the node loop.
     pub fn advance_round(&mut self) {
+        self.prune_future_proposals();
         self.start_round(self.current_round.saturating_add(1));
     }
 
     /// External compatibility hook used after height advancement.
     pub fn reset_round(&mut self) {
+        self.prune_future_proposals();
         self.start_round(0);
     }
 
@@ -256,6 +261,12 @@ impl ConsensusDriver {
 
     fn next_height(&self) -> u64 {
         self.engine.state.height + 1
+    }
+
+    fn prune_future_proposals(&mut self) {
+        let next_height = self.next_height();
+        self.future_proposals
+            .retain(|(height, _), _| *height >= next_height && *height <= next_height.saturating_add(2));
     }
 
     fn pending_block_for_slot(&self, height: u64, round: u32) -> Option<Bytes32> {
@@ -410,10 +421,28 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         }
 
-        if block.header.height != self.next_height() || block.header.prev_hash != self.engine.state.tip_hash {
+        let next_height = self.next_height();
+        if block.header.height < next_height {
+            return vec![DriverAction::None];
+        }
+        if block.header.height > next_height.saturating_add(2) {
+            return vec![DriverAction::None];
+        }
+        if block.header.height > next_height || block.header.prev_hash != self.engine.state.tip_hash {
+            let key = (block.header.height, block.header.prev_hash);
+            let entry = self.future_proposals.entry(key).or_default();
+            let block_hash = block.header.block_hash();
+            if !entry.iter().any(|existing| existing.header.block_hash() == block_hash) {
+                entry.push(block);
+            }
+            self.prune_future_proposals();
             return vec![DriverAction::None];
         }
 
+        self.process_block_internal(from, block)
+    }
+
+    fn process_block_internal(&mut self, from: Option<SocketAddr>, block: BlockV1) -> Vec<DriverAction> {
         if self.engine.state.validators.active_count() > 0
             && (block.header.proposer_vrf_output != Bytes32::ZERO
                 || !block.header.proposer_vrf_proof.as_slice().is_empty())
@@ -494,6 +523,25 @@ impl ConsensusDriver {
         // Rules 2 and 3 — if this is the proposal for our current slot, react
         // immediately instead of waiting for the propose timeout.
         actions.extend(self.maybe_prevote_current_round_proposal());
+        actions
+    }
+
+    fn activate_buffered_proposals_for_new_tip(&mut self) -> Vec<DriverAction> {
+        let key = (self.next_height(), self.engine.state.tip_hash);
+        let Some(buffered) = self.future_proposals.remove(&key) else {
+            self.prune_future_proposals();
+            return vec![];
+        };
+
+        let mut candidates = buffered;
+        candidates.sort_by_key(|block| block.header.proposer_round);
+
+        let mut actions = Vec::new();
+        for block in candidates {
+            actions.extend(self.process_block_internal(None, block));
+        }
+
+        self.prune_future_proposals();
         actions
     }
 
@@ -813,6 +861,7 @@ impl ConsensusDriver {
         let old_height = self.engine.state.height;
         match self.engine.commit_block(&block) {
             Ok(()) => {
+                let mut actions = vec![DriverAction::BroadcastBlock(block)];
                 eprintln!(
                     "[commit] quorum reached for {} at height={} round={}, finalizing",
                     hex::encode(&block_hash.0[..4]),
@@ -831,11 +880,15 @@ impl ConsensusDriver {
                 self.valid_round = None;
                 self.valid_value = None;
                 self.start_round(0);
+                actions.extend(self.activate_buffered_proposals_for_new_tip());
 
                 self.vote_collectors
                     .retain(|(vote_height, _, _), _| *vote_height > height);
                 self.pending_blocks
                     .retain(|_, pending| pending.header.height > height);
+                let next_height = self.next_height();
+                self.future_proposals
+                    .retain(|(proposal_height, _), _| *proposal_height >= next_height);
                 self.buffered_votes
                     .retain(|(vote_height, _, _), _| *vote_height > height);
                 self.seen_round_votes
@@ -852,7 +905,6 @@ impl ConsensusDriver {
                     );
                 }
 
-                let mut actions = vec![DriverAction::BroadcastBlock(block)];
                 actions.extend(self.maybe_prevote_current_round_proposal());
                 actions
             }
