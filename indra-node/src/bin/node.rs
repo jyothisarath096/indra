@@ -1123,6 +1123,39 @@ Connection: close
                 format!(r#"{{"address":"{}","utxos":[{}]}}"#,
                     address_hex, entries.join(","))
             }
+            "indra_getUtxoProof" => {
+                // Params: ["<utxo_id_hex>"]
+                let utxo_hex = first_param.clone().unwrap_or_default();
+                if utxo_hex.len() != 64 {
+                    "null".to_string()
+                } else if let Ok(decoded) = hex::decode(&utxo_hex) {
+                    if decoded.len() != 32 {
+                        "null".to_string()
+                    } else {
+                        let mut raw = [0u8; 32];
+                        raw.copy_from_slice(&decoded);
+                        let utxo_id = indra_core::Bytes32::from(raw);
+                        let proof = s.utxos.prove(&utxo_id);
+                        let siblings = proof.siblings
+                            .iter()
+                            .map(|sibling| format!(r#""{}""#, hex::encode(sibling)))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let value_hash = proof.value.map(hex::encode).unwrap_or_default();
+                        let state_root = indra_state::compute_state_root(s);
+                        format!(
+                            r#"{{"utxo_id":"{}","present":{},"value_hash":"{}","siblings":[{}],"state_root":"{}"}}"#,
+                            hex::encode(utxo_id.0),
+                            if proof.value.is_some() { "true" } else { "false" },
+                            value_hash,
+                            siblings,
+                            hex::encode(state_root.0),
+                        )
+                    }
+                } else {
+                    "null".to_string()
+                }
+            }
             _ => {
                 let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found: {}"}},"id":{}}}"#, method, id_raw);
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);

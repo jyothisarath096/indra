@@ -378,26 +378,10 @@ fn verify_block_qc(
 fn verify_block_state_root(
     block: &BlockV1,
     state: &ChainState,
-    strict: bool,
+    _strict: bool,
 ) -> NodeResult<()> {
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
-
-    if expected_state_root == indra_core::Bytes32::ZERO
-        && expected_validator_root == indra_core::Bytes32::ZERO
-    {
-        if strict {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: "missing state_root and validator_set_root".to_string(),
-            });
-        }
-        eprintln!(
-            "[sync] warning: skipping state-root verification at height {} because the header uses placeholder roots",
-            block.header.height
-        );
-        return Ok(());
-    }
 
     let mut projected = state.clone();
     apply_block(&mut projected, block).map_err(|e| NodeError::BlockInvalid {
@@ -406,7 +390,7 @@ fn verify_block_state_root(
     })?;
 
     let actual_state_root = compute_state_root(&projected);
-    if expected_state_root != indra_core::Bytes32::ZERO && actual_state_root != expected_state_root {
+    if actual_state_root != expected_state_root {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: "state_root mismatch".to_string(),
@@ -414,9 +398,7 @@ fn verify_block_state_root(
     }
 
     let actual_validator_root = compute_validator_set_root(&projected);
-    if expected_validator_root != indra_core::Bytes32::ZERO
-        && actual_validator_root != expected_validator_root
-    {
+    if actual_validator_root != expected_validator_root {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: "validator_set_root mismatch".to_string(),
@@ -433,9 +415,10 @@ mod tests {
         Bytes32, ProtocolVersion, VariableBytes,
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES},
+            primitives::MAX_VRF_PROOF_BYTES,
         },
     };
+    use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
     use indra_storage::StateStore;
     use std::path::PathBuf;
 
@@ -445,17 +428,17 @@ mod tests {
         p
     }
 
-    fn make_block(height: u64, prev_hash: Bytes32, base_fee: u64) -> BlockV1 {
-        BlockV1 {
+    fn make_block(state: &ChainState) -> BlockV1 {
+        let mut block = BlockV1 {
             header: BlockHeaderV1 {
                 protocol_version:    ProtocolVersion::CURRENT,
-                height,
-                prev_hash,
-                timestamp:           1_700_000_000 + height,
+                height:              state.height + 1,
+                prev_hash:           state.tip_hash,
+                timestamp:           1_700_000_000 + state.height + 1,
                 state_root:          Bytes32::ZERO,
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
-                base_fee,
+                base_fee:            state.base_fee,
                 proposer_round:      0,
                 polc_round:          indra_core::types::block::NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
@@ -465,7 +448,13 @@ mod tests {
             transactions:      vec![],
             slashing_evidence: vec![],
             governance_ops:    vec![],
-        }
+        };
+
+        let mut projected = state.clone();
+        apply_block(&mut projected, &block).unwrap();
+        block.header.state_root = compute_state_root(&projected);
+        block.header.validator_set_root = compute_validator_set_root(&projected);
+        block
     }
 
     #[test]
@@ -481,7 +470,7 @@ mod tests {
         ).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
-        let block = make_block(1, state.tip_hash, INITIAL_BASE_FEE_SPARK_PER_KB);
+        let block = make_block(&state);
         import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
 
         assert_eq!(state.height, 1);
@@ -504,8 +493,9 @@ mod tests {
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         for i in 1..=10u64 {
-            let block = make_block(i, state.tip_hash, state.base_fee);
+            let block = make_block(&state);
             import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+            assert_eq!(state.height, i);
         }
 
         assert_eq!(state.height, 10);
@@ -528,7 +518,8 @@ mod tests {
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         // Try to import height 5 when we're at genesis (height 0)
-        let block = make_block(5, state.tip_hash, state.base_fee);
+        let mut block = make_block(&state);
+        block.header.height = 5;
         assert!(import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store, false).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);

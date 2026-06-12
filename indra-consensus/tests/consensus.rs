@@ -11,9 +11,11 @@ use indra_core::{
     },
 };
 use indra_crypto::{
+    commit, prove_range,
     hybrid::HybridKeypair,
     VrfKeypair,
 };
+use rand::{SeedableRng, rngs::StdRng};
 use indra_state::ChainState;
 use indra_consensus::{
     mempool::Mempool,
@@ -25,24 +27,33 @@ use indra_consensus::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn dummy_tx(fee: u64, nonce: u8) -> TransactionV1 {
+fn dummy_output(nonce: u8, value_spark: u64) -> OutputV1 {
+    let blinding = [nonce; 32];
+    let commitment = commit(value_spark, &blinding);
+    let mut rng = StdRng::from_seed([nonce; 32]);
+    let proof = prove_range(value_spark, &blinding, &mut rng).unwrap();
+    OutputV1 {
+        value_spark,
+        commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+        owner_pubkey: HybridPubKey {
+            classical_pk: Bytes32::ZERO,
+            pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+        },
+        range_proof:  VariableBytes::from_slice(&proof).unwrap(),
+        lock_height:  0,
+    }
+}
+
+fn dummy_tx(utxo_id: Bytes32, fee: u64, nonce: u8) -> TransactionV1 {
+    let output_value = 1_100_000u64.saturating_sub(fee);
     TransactionV1 {
         version: ProtocolVersion::CURRENT,
         signature_module_id: 1,
         inputs: vec![InputV1 {
-            utxo_id:   Bytes32::from([nonce; 32]),
+            utxo_id,
             nullifier: Bytes32::from([nonce; 32]),
         }],
-        outputs: vec![OutputV1 {
-            value_spark: 1_000_000,
-            commitment:   CommitmentV1 { compressed_point: Bytes32::ZERO },
-            owner_pubkey: HybridPubKey {
-                classical_pk: Bytes32::ZERO,
-                pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-            },
-            range_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-            lock_height:  0,
-        }],
+        outputs: vec![dummy_output(nonce, output_value)],
         fee_amount:     fee,
         fee_blinding:   Bytes32::ZERO,
         fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
@@ -94,12 +105,13 @@ impl TestValidator {
 
 #[test]
 fn mempool_to_block_pipeline() {
-    let state = ChainState::new_genesis();
+    let mut state = ChainState::new_genesis();
     let mut mempool = Mempool::default_config();
 
-    // Submit some transactions
+    // Seed spendable UTXOs, then submit some transactions that consume them.
     for i in 1..=5u8 {
-        mempool.submit(dummy_tx(10_000 * i as u64, i), state.base_fee, state.height).unwrap();
+        let utxo_id = state.utxos.insert(dummy_output(i, 1_100_000), 0, 0, i as u32).unwrap();
+        mempool.submit(dummy_tx(utxo_id, 10_000 * i as u64, i), state.base_fee, state.height).unwrap();
     }
     assert_eq!(mempool.len(), 5);
 
@@ -183,9 +195,9 @@ fn age_eligible_txs_included_first() {
     let mut mempool = Mempool::default_config();
 
     // Old tx (age-eligible) with low fee
-    mempool.submit(dummy_tx(1_000, 0x01), state.base_fee, 1).unwrap();
+    mempool.submit(dummy_tx(Bytes32::from([0x01; 32]), 1_000, 0x01), state.base_fee, 1).unwrap();
     // New tx with high fee
-    mempool.submit(dummy_tx(999_000, 0x02), state.base_fee, 100).unwrap();
+    mempool.submit(dummy_tx(Bytes32::from([0x02; 32]), 999_000, 0x02), state.base_fee, 100).unwrap();
 
     // At height 51+ the first tx is age-eligible
     let selected = mempool.select_for_block(

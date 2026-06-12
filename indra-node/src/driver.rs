@@ -973,7 +973,7 @@ mod tests {
         VrfKeypair,
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     };
-    use indra_state::{ValidatorEntry, ValidatorStatus};
+    use indra_state::{ChainState, ValidatorEntry, ValidatorStatus, apply_block, compute_state_root, compute_validator_set_root};
     use std::path::PathBuf;
 
     fn temp_dir(suffix: &str) -> PathBuf {
@@ -982,17 +982,17 @@ mod tests {
         p
     }
 
-    fn make_block(height: u64, prev_hash: Bytes32, base_fee: u64) -> BlockV1 {
-        BlockV1 {
+    fn make_block(state: &ChainState) -> BlockV1 {
+        let mut block = BlockV1 {
             header: BlockHeaderV1 {
                 protocol_version: ProtocolVersion::CURRENT,
-                height,
-                prev_hash,
-                timestamp: 1_700_000_000 + height,
+                height: state.height + 1,
+                prev_hash: state.tip_hash,
+                timestamp: 1_700_000_000 + state.height + 1,
                 state_root: Bytes32::ZERO,
                 validator_set_root: Bytes32::ZERO,
                 mempool_set_root: Bytes32::ZERO,
-                base_fee,
+                base_fee: state.base_fee,
                 proposer_round: 0,
                 polc_round: NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
@@ -1002,7 +1002,13 @@ mod tests {
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
-        }
+        };
+
+        let mut projected = state.clone();
+        apply_block(&mut projected, &block).unwrap();
+        block.header.state_root = compute_state_root(&projected);
+        block.header.validator_set_root = compute_validator_set_root(&projected);
+        block
     }
 
     fn install_active_validator(
@@ -1058,7 +1064,7 @@ mod tests {
         let _local = install_active_validator(&mut driver, [0x41u8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let block = make_block(&driver.engine.state);
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
 
         assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
@@ -1074,7 +1080,7 @@ mod tests {
         let remote_b = install_active_validator(&mut driver, [0x44u8; 32], "remote-b");
         driver.refresh_registered_voters();
 
-        let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let block = make_block(&driver.engine.state);
         let block_hash = block.header.block_hash();
 
         let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
@@ -1119,7 +1125,7 @@ mod tests {
         let _local = install_active_validator(&mut driver, [0x45u8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block = make_block(1, driver.engine.state.tip_hash, driver.engine.state.base_fee);
+        let block = make_block(&driver.engine.state);
         let block_hash = block.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9201".parse().unwrap()),

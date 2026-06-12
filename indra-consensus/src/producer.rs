@@ -6,7 +6,7 @@
 //!   1. Selects transactions from the mempool (age-eligible first, then by fee)
 //!   2. Computes the proposer's VRF output and proof
 //!   3. Fills the block header (height, prev_hash, base_fee, VRF fields)
-//!   4. Leaves state_root, validator_set_root as zero (computed post-application)
+//!   4. Projects post-block state and fills real state_root / validator_set_root
 //!   5. Embeds the QC for the previous height
 //!
 //! ## What the producer does NOT do
@@ -26,7 +26,7 @@ use indra_core::{
     },
 };
 use indra_crypto::VrfKeypair;
-use indra_state::ChainState;
+use indra_state::{ChainState, apply_block, compute_state_root, compute_validator_set_root};
 
 use crate::{
     error::{ConsensusError, ConsensusResult},
@@ -109,8 +109,6 @@ pub fn produce_block(
         height,
         prev_hash:           state.tip_hash,
         timestamp:           template.timestamp,
-        // state_root and validator_set_root are computed AFTER block application
-        // (in Phase 5 when we have persistent Merkle tries)
         state_root:          Bytes32::ZERO,
         validator_set_root:  Bytes32::ZERO,
         mempool_set_root:    compute_selected_tx_root(&selected),
@@ -122,12 +120,21 @@ pub fn produce_block(
         quorum_certificate:  qc_bytes,
     };
 
-    Ok(BlockV1 {
+    let mut block = BlockV1 {
         header,
         transactions:      selected,
         slashing_evidence: vec![],
         governance_ops:    vec![],
-    })
+    };
+
+    let mut projected = state.clone();
+    apply_block(&mut projected, &block).map_err(|err| ConsensusError::CryptoError {
+        detail: format!("failed to project roots for produced block: {err}"),
+    })?;
+    block.header.state_root = compute_state_root(&projected);
+    block.header.validator_set_root = compute_validator_set_root(&projected);
+
+    Ok(block)
 }
 
 /// Compute a simple selected-transaction root: SHA-256 of all selected tx_ids sorted and hashed.

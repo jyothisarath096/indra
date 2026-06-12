@@ -359,28 +359,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn engine_commit_block() {
-        let dir = temp_dir("c");
-        let config = NodeConfig::local_test(dir.clone());
-        let mut engine = NodeEngine::init(config).unwrap();
-
+    fn make_block(state: &indra_state::ChainState) -> indra_core::types::block::BlockV1 {
         use indra_core::{
             Bytes32, ProtocolVersion, VariableBytes,
             types::block::{BlockHeaderV1, BlockV1},
-            types::primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES},
+            types::primitives::MAX_VRF_PROOF_BYTES,
         };
+        use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
 
-        let block = BlockV1 {
+        let mut block = BlockV1 {
             header: BlockHeaderV1 {
                 protocol_version:    ProtocolVersion::CURRENT,
-                height:              1,
-                prev_hash:           engine.state.tip_hash,
-                timestamp:           1_700_000_001,
+                height:              state.height + 1,
+                prev_hash:           state.tip_hash,
+                timestamp:           1_700_000_000 + state.height + 1,
                 state_root:          Bytes32::ZERO,
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
-                base_fee:            INITIAL_BASE_FEE_SPARK_PER_KB,
+                base_fee:            state.base_fee,
                 proposer_round:      0,
                 polc_round:          indra_core::types::block::NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
@@ -391,6 +387,20 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops:    vec![],
         };
+
+        let mut projected = state.clone();
+        apply_block(&mut projected, &block).unwrap();
+        block.header.state_root = compute_state_root(&projected);
+        block.header.validator_set_root = compute_validator_set_root(&projected);
+        block
+    }
+
+    #[test]
+    fn engine_commit_block() {
+        let dir = temp_dir("c");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let block = make_block(&engine.state);
 
         engine.commit_block(&block).unwrap();
         assert_eq!(engine.height(), 1);
@@ -403,34 +413,10 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config.clone()).unwrap();
 
-        use indra_core::{
-            Bytes32, ProtocolVersion, VariableBytes,
-            types::block::{BlockHeaderV1, BlockV1},
-            types::primitives::MAX_VRF_PROOF_BYTES,
-        };
-
         for height in 1..=3u64 {
-            let block = BlockV1 {
-                header: BlockHeaderV1 {
-                    protocol_version:    ProtocolVersion::CURRENT,
-                    height,
-                    prev_hash:           engine.state.tip_hash,
-                    timestamp:           1_700_000_000 + height,
-                    state_root:          Bytes32::ZERO,
-                    validator_set_root:  Bytes32::ZERO,
-                    mempool_set_root:    Bytes32::ZERO,
-                    base_fee:            engine.state.base_fee,
-                    proposer_round:      0,
-                    polc_round:          indra_core::types::block::NO_POLC_ROUND,
-                    proposer_vrf_output: Bytes32::ZERO,
-                    proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-                    quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
-                },
-                transactions:      vec![],
-                slashing_evidence: vec![],
-                governance_ops:    vec![],
-            };
+            let block = make_block(&engine.state);
             engine.commit_block(&block).unwrap();
+            assert_eq!(engine.state.height, height);
         }
 
         let restarted = NodeEngine::init(config).unwrap();

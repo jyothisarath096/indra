@@ -30,7 +30,10 @@ use indra_core::{
 };
 use indra_crypto::sha256;
 
-use crate::error::{StateError, StateResult};
+use crate::{
+    error::{StateError, StateResult},
+    smt::{MerkleProof, SparseMerkleTree},
+};
 
 /// A UTXO entry in the set: the output itself plus metadata.
 #[derive(Debug, Clone)]
@@ -54,12 +57,16 @@ pub struct UtxoEntry {
 #[derive(Debug, Clone, Default)]
 pub struct UtxoSet {
     entries: HashMap<Bytes32, UtxoEntry>,
+    smt: SparseMerkleTree,
 }
 
 impl UtxoSet {
     /// Create an empty UTXO set.
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+            smt: SparseMerkleTree::new(),
+        }
     }
 
     /// Number of UTXOs currently in the set.
@@ -114,6 +121,12 @@ impl UtxoSet {
             tx_index,
             output_index,
         });
+        let smt_value = self
+            .entries
+            .get(&id)
+            .map(Self::leaf_value)
+            .unwrap_or([0u8; 32]);
+        self.smt.insert(id.0, smt_value);
         Ok(id)
     }
 
@@ -126,7 +139,11 @@ impl UtxoSet {
     ///
     /// Returns the entry if it existed, None if it was already absent.
     pub fn spend(&mut self, id: &Bytes32) -> Option<UtxoEntry> {
-        self.entries.remove(id)
+        let removed = self.entries.remove(id);
+        if removed.is_some() {
+            self.smt.delete(id.0);
+        }
+        removed
     }
 
     /// Check whether a UTXO exists (is unspent).
@@ -138,6 +155,29 @@ impl UtxoSet {
     /// True if a UTXO with the given ID exists in the set.
     pub fn contains(&self, id: &Bytes32) -> bool {
         self.entries.contains_key(id)
+    }
+
+    /// Current SMT root for all unspent outputs.
+    pub fn root(&self) -> [u8; 32] {
+        self.smt.root()
+    }
+
+    /// Inclusion or exclusion proof for a specific UTXO ID.
+    pub fn prove(&self, id: &Bytes32) -> MerkleProof {
+        self.smt.prove(id.0)
+    }
+
+    /// Deterministic 32-byte value committed at a UTXO leaf.
+    pub fn value_hash(&self, id: &Bytes32) -> Option<[u8; 32]> {
+        self.entries.get(id).map(Self::leaf_value)
+    }
+
+    fn leaf_value(entry: &UtxoEntry) -> [u8; 32] {
+        let mut data = entry.output.encode_to_vec();
+        data.extend_from_slice(&entry.created_height.to_le_bytes());
+        data.extend_from_slice(&entry.tx_index.to_le_bytes());
+        data.extend_from_slice(&entry.output_index.to_le_bytes());
+        sha256(&data)
     }
 }
 
@@ -220,5 +260,20 @@ mod tests {
         assert_eq!(set.len(), 2);
         set.spend(&id1);
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn root_and_proof_track_membership() {
+        let mut set = UtxoSet::new();
+        let id = set.insert(dummy_output(0x11), 2, 1, 0).unwrap();
+        let proof = set.prove(&id);
+        let value = set.value_hash(&id).unwrap();
+        assert_eq!(proof.value, Some(value));
+        assert!(SparseMerkleTree::verify_proof(set.root(), id.0, &proof));
+
+        set.spend(&id);
+        let missing = set.prove(&id);
+        assert_eq!(missing.value, None);
+        assert!(SparseMerkleTree::verify_proof(set.root(), id.0, &missing));
     }
 }

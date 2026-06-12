@@ -16,3 +16,4 @@ thiserror.workspace = true
 indra-core   = { path = "../indra-core" }
 indra-crypto = { path = "../indra-crypto" }
 indra-state  = { path = "../indra-state" }
+rand.workspace = true

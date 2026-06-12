@@ -319,6 +319,7 @@ dependencies = [
  "indra-core",
  "indra-crypto",
  "indra-state",
+ "rand 0.8.6",
  "thiserror",
 ]
 

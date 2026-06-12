@@ -15,6 +15,9 @@
 use std::collections::HashSet;
 
 use indra_core::types::primitives::Bytes32;
+use indra_crypto::sha256;
+
+use crate::smt::{MerkleProof, SparseMerkleTree};
 
 /// The complete set of spent nullifiers.
 ///
@@ -23,12 +26,16 @@ use indra_core::types::primitives::Bytes32;
 #[derive(Debug, Clone, Default)]
 pub struct NullifierSet {
     spent: HashSet<Bytes32>,
+    smt: SparseMerkleTree,
 }
 
 impl NullifierSet {
     /// Create an empty nullifier set.
     pub fn new() -> Self {
-        Self { spent: HashSet::new() }
+        Self {
+            spent: HashSet::new(),
+            smt: SparseMerkleTree::new(),
+        }
     }
 
     /// Number of nullifiers in the set.
@@ -54,7 +61,11 @@ impl NullifierSet {
     /// Returns true if the nullifier was newly inserted.
     /// Returns false if it was already present (double-spend attempt).
     pub fn insert(&mut self, nullifier: Bytes32) -> bool {
-        self.spent.insert(nullifier)
+        let inserted = self.spent.insert(nullifier);
+        if inserted {
+            self.smt.insert(nullifier.0, sha256(&nullifier.0));
+        }
+        inserted
     }
 
     /// Insert a nullifier, returning an error if it was already present.
@@ -68,6 +79,16 @@ impl NullifierSet {
             return Err(crate::error::StateError::DoubleSpend);
         }
         Ok(())
+    }
+
+    /// Current SMT root for all spent nullifiers.
+    pub fn root(&self) -> [u8; 32] {
+        self.smt.root()
+    }
+
+    /// Inclusion or exclusion proof for a nullifier.
+    pub fn prove(&self, nullifier: &Bytes32) -> MerkleProof {
+        self.smt.prove(nullifier.0)
     }
 }
 
@@ -127,5 +148,21 @@ mod tests {
         set.insert(n);
         // No remove method exists. Verify it's still there.
         assert!(set.contains(&n));
+    }
+
+    #[test]
+    fn proof_matches_membership() {
+        let mut set = NullifierSet::new();
+        let present = nullifier(0x33);
+        let missing = nullifier(0x34);
+        set.insert(present);
+
+        let included = set.prove(&present);
+        assert_eq!(included.value, Some(sha256(&present.0)));
+        assert!(SparseMerkleTree::verify_proof(set.root(), present.0, &included));
+
+        let excluded = set.prove(&missing);
+        assert_eq!(excluded.value, None);
+        assert!(SparseMerkleTree::verify_proof(set.root(), missing.0, &excluded));
     }
 }
