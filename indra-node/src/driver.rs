@@ -108,6 +108,8 @@ pub enum DriverAction {
         /// Proposal block hash.
         hash: Bytes32,
     },
+    /// Re-process a buffered future proposal after the local tip advances.
+    ActivateBufferedProposal(BlockV1),
     /// Slash evidence was detected.
     SlashDetected(SlashEvidence),
     /// No action needed.
@@ -535,14 +537,11 @@ impl ConsensusDriver {
 
         let mut candidates = buffered;
         candidates.sort_by_key(|block| block.header.proposer_round);
-
-        let mut actions = Vec::new();
-        for block in candidates {
-            actions.extend(self.process_block_internal(None, block));
-        }
-
         self.prune_future_proposals();
-        actions
+        candidates
+            .into_iter()
+            .map(DriverAction::ActivateBufferedProposal)
+            .collect()
     }
 
     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {

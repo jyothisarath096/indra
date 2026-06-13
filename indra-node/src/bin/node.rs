@@ -390,35 +390,7 @@ fn main() {
                         if let Some(event) = message_to_event(msg, addr) {
                             let previous_height = driver.lock().unwrap().height();
                             let actions = driver.lock().unwrap().process(event);
-                            for action in actions {
-                                if let Some(out_msg) = action_to_message(&action) {
-                                    log_broadcast_action(&gossip, &action);
-                                    broadcast_driver_message(&gossip, &action, &out_msg);
-                                }
-                                // Handle sync request
-                                if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
-                                    eprintln!(
-                                        "[sync] peer at height={}, local behind, requesting blocks {}..{} from {}",
-                                        to_height,
-                                        from_height,
-                                        to_height,
-                                        from
-                                    );
-                                    let req = Message::RequestBlocks {
-                                        from_height: *from_height,
-                                        to_height: *to_height,
-                                    };
-                                    let _ = gossip.lock().unwrap().send_to(from, &req);
-                                }
-                                if let DriverAction::RequestProposal { from, height, round, hash } = &action {
-                                    let req = Message::RequestProposal {
-                                        height: *height,
-                                        round: *round,
-                                        hash: *hash,
-                                    };
-                                    let _ = gossip.lock().unwrap().send_to(from, &req);
-                                }
-                            }
+                            process_driver_actions(&driver, &gossip, &height_tx, previous_height, actions);
                             let new_height = driver.lock().unwrap().height();
                             if new_height > previous_height {
                                 let _ = height_tx.send(());
@@ -577,12 +549,7 @@ fn main() {
                                         block.header.height,
                                         block.header.proposer_round,
                                     );
-                                    for action in actions {
-                                        if let Some(out_msg) = action_to_message(&action) {
-                                            log_broadcast_action(&gossip, &action);
-                                            broadcast_driver_message(&gossip, &action, &out_msg);
-                                        }
-                                    }
+                                    process_driver_actions(&driver, &gossip, &height_tx, height, actions);
 
                                     println!(
                                         "[consensus] ✓ proposed block {} → height={}",
@@ -594,24 +561,14 @@ fn main() {
 
                             if phase_started_at.elapsed() >= PROPOSE_TIMEOUT {
                                 let actions = driver.lock().unwrap().on_propose_timeout();
-                                for action in actions {
-                                    if let Some(out_msg) = action_to_message(&action) {
-                                        log_broadcast_action(&gossip, &action);
-                                        broadcast_driver_message(&gossip, &action, &out_msg);
-                                    }
-                                }
+                                process_driver_actions(&driver, &gossip, &height_tx, height, actions);
                                 phase_started_at = Instant::now();
                             }
                         }
                         RoundPhase::Prevote => {
                             if phase_started_at.elapsed() >= PREVOTE_TIMEOUT {
                                 let actions = driver.lock().unwrap().on_prevote_timeout();
-                                for action in actions {
-                                    if let Some(out_msg) = action_to_message(&action) {
-                                        log_broadcast_action(&gossip, &action);
-                                        broadcast_driver_message(&gossip, &action, &out_msg);
-                                    }
-                                }
+                                process_driver_actions(&driver, &gossip, &height_tx, height, actions);
                                 phase_started_at = Instant::now();
                             }
                         }
@@ -747,6 +704,59 @@ fn broadcast_driver_message(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAc
         DriverAction::BroadcastBlock(_) => g.broadcast_priority(msg),
         _ => g.broadcast(msg),
     };
+}
+
+fn process_driver_actions(
+    driver: &Arc<Mutex<ConsensusDriver>>,
+    gossip: &Arc<Mutex<GossipEngine>>,
+    height_tx: &std::sync::mpsc::Sender<()>,
+    previous_height: u64,
+    actions: Vec<DriverAction>,
+) {
+    for action in actions {
+        if let DriverAction::ActivateBufferedProposal(block) = action {
+            let actions2 = driver.lock().unwrap().process(DriverEvent::InboundBlock {
+                from: None,
+                block,
+            });
+            process_driver_actions(driver, gossip, height_tx, previous_height, actions2);
+            let new_height = driver.lock().unwrap().height();
+            if new_height > previous_height {
+                let _ = height_tx.send(());
+                broadcast_status(driver, gossip);
+            }
+            continue;
+        }
+
+        if let Some(out_msg) = action_to_message(&action) {
+            log_broadcast_action(gossip, &action);
+            broadcast_driver_message(gossip, &action, &out_msg);
+        }
+
+        if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
+            eprintln!(
+                "[sync] peer at height={}, local behind, requesting blocks {}..{} from {}",
+                to_height,
+                from_height,
+                to_height,
+                from
+            );
+            let req = Message::RequestBlocks {
+                from_height: *from_height,
+                to_height: *to_height,
+            };
+            let _ = gossip.lock().unwrap().send_to(from, &req);
+        }
+
+        if let DriverAction::RequestProposal { from, height, round, hash } = &action {
+            let req = Message::RequestProposal {
+                height: *height,
+                round: *round,
+                hash: *hash,
+            };
+            let _ = gossip.lock().unwrap().send_to(from, &req);
+        }
+    }
 }
 
 fn now_ms() -> u128 {
