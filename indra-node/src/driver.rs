@@ -365,6 +365,35 @@ impl ConsensusDriver {
         self.sign_and_record_local_vote(height, self.current_round, VoteStep::Prevote, vote_hash)
     }
 
+    /// If a proposal is staged after the reactor already moved us into the
+    /// Prevote step for this round, we may still cast the round's first
+    /// prevote as long as we have not prevoted yet.
+    fn maybe_prevote_staged_proposal_in_prevote_phase(&mut self) -> Vec<DriverAction> {
+        if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Prevote {
+            return vec![];
+        }
+
+        let height = self.next_height();
+        let round = self.current_round;
+        let Some(local_validator_id) = self.engine.validator_id() else {
+            return vec![];
+        };
+        if self.collector_has_vote_from(height, round, VoteStep::Prevote, local_validator_id) {
+            return vec![];
+        }
+
+        let Some(hash) = self.pending_block_for_slot(height, round) else {
+            return vec![];
+        };
+        let vote_hash = if self.locked_round.is_none() || self.locked_value == Some(hash) {
+            hash
+        } else {
+            Bytes32::ZERO
+        };
+
+        self.sign_and_record_local_vote(height, round, VoteStep::Prevote, vote_hash)
+    }
+
     fn sign_and_record_local_vote(
         &mut self,
         height: u64,
@@ -525,10 +554,15 @@ impl ConsensusDriver {
         // Rules 2 and 3 — if this is the proposal for our current slot, react
         // immediately instead of waiting for the propose timeout.
         actions.extend(self.maybe_prevote_current_round_proposal());
+        if self.current_phase == RoundPhase::Prevote {
+            actions.extend(self.maybe_prevote_staged_proposal_in_prevote_phase());
+        }
         actions
     }
 
-    fn activate_buffered_proposals_for_new_tip(&mut self) -> Vec<DriverAction> {
+    /// Return buffered proposals that became valid after the local tip
+    /// advanced to a new parent block.
+    pub fn activate_buffered_proposals_for_new_tip(&mut self) -> Vec<DriverAction> {
         let key = (self.next_height(), self.engine.state.tip_hash);
         let Some(buffered) = self.future_proposals.remove(&key) else {
             self.prune_future_proposals();
