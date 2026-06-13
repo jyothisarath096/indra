@@ -352,12 +352,14 @@ fn main() {
     {
         let snapshot = Arc::clone(&snapshot);
         let event_tx_reactor = event_tx.clone();
+        let gossip_reactor = Arc::clone(&gossip);
         std::thread::spawn(move || {
             let reactor = ConsensusReactor::new(
                 driver_state,
                 event_tx_reactor,
                 event_rx,
                 action_tx,
+                gossip_reactor,
                 snapshot,
             );
             reactor.run();

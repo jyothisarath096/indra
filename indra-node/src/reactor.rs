@@ -19,6 +19,7 @@ use indra_core::types::{
     transaction::TransactionV1,
     vote::VoteV1,
 };
+use indra_network::gossip::GossipEngine;
 use indra_network::message::Message;
 use indra_state::ChainState;
 
@@ -199,6 +200,7 @@ pub struct ConsensusReactor {
     driver: ConsensusDriver,
     event_rx: Receiver<ConsensusEvent>,
     action_tx: Sender<ConsensusAction>,
+    gossip: Arc<Mutex<GossipEngine>>,
     snapshot: Arc<Mutex<ChainSnapshot>>,
     pending_timeouts: HashMap<TimeoutId, Instant>,
     timer_tx: Sender<(TimeoutId, Duration)>,
@@ -214,6 +216,7 @@ impl ConsensusReactor {
         event_tx: Sender<ConsensusEvent>,
         event_rx: Receiver<ConsensusEvent>,
         action_tx: Sender<ConsensusAction>,
+        gossip: Arc<Mutex<GossipEngine>>,
         snapshot: Arc<Mutex<ChainSnapshot>>,
     ) -> Self {
         let (timer_tx, timer_rx) = mpsc::channel::<(TimeoutId, Duration)>();
@@ -226,6 +229,7 @@ impl ConsensusReactor {
             driver,
             event_rx,
             action_tx,
+            gossip,
             snapshot,
             pending_timeouts: HashMap::new(),
             timer_tx,
@@ -359,10 +363,24 @@ impl ConsensusReactor {
         for action in actions {
             match action {
                 DriverAction::BroadcastBlock(block) => {
-                    self.emit_action(ConsensusAction::BroadcastBlock(block));
+                    let mut gossip = self.gossip.lock().unwrap();
+                    let peers = gossip.connection_count();
+                    eprintln!(
+                        "[gossip] broadcasting proposal {} to {} peers",
+                        hex::encode(&block.header.block_hash().0[..4]),
+                        peers,
+                    );
+                    let _ = gossip.broadcast_priority(&Message::Block(block));
                 }
                 DriverAction::BroadcastVote(vote) => {
-                    self.emit_action(ConsensusAction::BroadcastVote(vote));
+                    let mut gossip = self.gossip.lock().unwrap();
+                    let peers = gossip.connection_count();
+                    eprintln!(
+                        "[vote] sent vote for {} to {} peers",
+                        hex::encode(&vote.block_hash.0[..4]),
+                        peers,
+                    );
+                    let _ = gossip.broadcast(&Message::Vote(vote));
                 }
                 DriverAction::BroadcastTx(tx) => {
                     self.emit_action(ConsensusAction::BroadcastTx(tx));
