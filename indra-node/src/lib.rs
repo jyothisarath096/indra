@@ -37,6 +37,7 @@ pub mod sync;
 pub mod slash;
 pub mod driver;
 pub mod net_driver;
+pub mod reactor;
 
 pub use config::NodeConfig;
 pub use error::{NodeError, NodeResult};
@@ -46,3 +47,10 @@ pub use sync::import_block;
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};
 pub use driver::{ConsensusDriver, DriverEvent, DriverAction};
 pub use net_driver::{message_to_event, action_to_message};
+pub use reactor::{
+    ChainSnapshot,
+    ConsensusAction,
+    ConsensusEvent,
+    ConsensusReactor,
+    TimeoutKind,
+};
