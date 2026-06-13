@@ -285,12 +285,18 @@ impl ConsensusDriver {
         self.pending_blocks.get(hash).cloned()
     }
 
-    /// The proposer includes the latest valid-round in its header.
+    /// Return the PoLC round to advertise in a proposal header.
+    ///
+    /// INDRA's current proposer path always constructs a fresh block for the
+    /// target round, so it cannot safely claim a prior PoLC unless it is able
+    /// to re-propose the exact same value that reached prevote quorum. Until
+    /// exact-value re-proposal exists, advertising `polc_round` causes later
+    /// rounds to nil-prevote otherwise valid staged proposals under Rule 3.
     pub fn proposal_polc_round(&self, height: u64) -> Option<u32> {
         if self.next_height() != height || self.valid_value.is_none() {
             return None;
         }
-        self.valid_round
+        None
     }
 
     fn quorum_size(&self) -> usize {
@@ -1278,15 +1284,15 @@ mod tests {
     }
 
     #[test]
-    fn polc_round_exposes_valid_round_for_reproposal() {
-        let (mut driver, dir) = local_driver([0x4Au8; 32], "valid_round");
+    fn polc_round_not_advertised_without_exact_reproposal_support() {
+        let (mut driver, dir) = local_driver([0x4Au8; 32], "valid_round_disabled");
         let _local = install_active_validator(&mut driver, [0x4Au8; 32], "local");
         driver.refresh_registered_voters();
 
         driver.valid_round = Some(2);
         driver.valid_value = Some(Bytes32::from([0x11u8; 32]));
 
-        assert_eq!(driver.proposal_polc_round(1), Some(2));
+        assert_eq!(driver.proposal_polc_round(1), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
