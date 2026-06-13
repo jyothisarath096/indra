@@ -34,7 +34,7 @@ fn now_ms() -> u128 {
 }
 
 /// Current Tendermint phase of the local round state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoundPhase {
     /// Waiting for the proposal of the current height/round.
     Propose,

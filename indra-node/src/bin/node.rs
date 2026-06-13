@@ -351,8 +351,15 @@ fn main() {
 
     {
         let snapshot = Arc::clone(&snapshot);
+        let event_tx_reactor = event_tx.clone();
         std::thread::spawn(move || {
-            let reactor = ConsensusReactor::new(driver_state, event_rx, action_tx, snapshot);
+            let reactor = ConsensusReactor::new(
+                driver_state,
+                event_tx_reactor,
+                event_rx,
+                action_tx,
+                snapshot,
+            );
             reactor.run();
         });
     }

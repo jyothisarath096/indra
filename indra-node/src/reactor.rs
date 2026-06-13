@@ -6,9 +6,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
-    mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender},
+    mpsc::{self, Receiver, Sender, SyncSender},
     Arc, Mutex,
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 use indra_core::codec::Encode;
@@ -72,6 +73,19 @@ pub enum TimeoutKind {
     Prevote,
     /// Waiting for enough precommits in the current round.
     Precommit,
+}
+
+/// A scheduled timeout generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TimeoutId {
+    /// Timeout category.
+    pub kind: TimeoutKind,
+    /// Height the timeout was scheduled for.
+    pub height: u64,
+    /// Round the timeout was scheduled for.
+    pub round: u32,
+    /// Phase that scheduled this timeout.
+    pub phase: RoundPhase,
 }
 
 /// An event delivered into the consensus reactor.
@@ -138,26 +152,11 @@ pub enum ConsensusEvent {
         /// One-shot reply with the tx id or rejection reason.
         reply: SyncSender<Result<Bytes32, String>>,
     },
-    /// Propose timeout fired for the given slot.
-    ProposeTimeout {
-        /// Target height.
-        height: u64,
-        /// Target round.
-        round: u32,
-    },
-    /// Prevote timeout fired for the given slot.
-    PrevoteTimeout {
-        /// Target height.
-        height: u64,
-        /// Target round.
-        round: u32,
-    },
-    /// Precommit timeout fired for the given slot.
-    PrecommitTimeout {
-        /// Target height.
-        height: u64,
-        /// Target round.
-        round: u32,
+    /// A scheduled timeout fired and was delivered through the same mailbox
+    /// as proposals and votes.
+    TimeoutFired {
+        /// Timeout generation identifier.
+        id: TimeoutId,
     },
     /// Periodic housekeeping tick.
     Tick,
@@ -201,7 +200,8 @@ pub struct ConsensusReactor {
     event_rx: Receiver<ConsensusEvent>,
     action_tx: Sender<ConsensusAction>,
     snapshot: Arc<Mutex<ChainSnapshot>>,
-    pending_timeouts: HashMap<(TimeoutKind, u64, u32), Instant>,
+    pending_timeouts: HashMap<TimeoutId, Instant>,
+    timer_tx: Sender<(TimeoutId, Duration)>,
     internal_event_queue: VecDeque<ConsensusEvent>,
     proposed_at_slot: Option<(u64, u32)>,
     last_status_at: Instant,
@@ -211,10 +211,14 @@ impl ConsensusReactor {
     /// Create a reactor from its owned driver and channels.
     pub fn new(
         driver: ConsensusDriver,
+        event_tx: Sender<ConsensusEvent>,
         event_rx: Receiver<ConsensusEvent>,
         action_tx: Sender<ConsensusAction>,
         snapshot: Arc<Mutex<ChainSnapshot>>,
     ) -> Self {
+        let (timer_tx, timer_rx) = mpsc::channel::<(TimeoutId, Duration)>();
+        run_timer_thread(timer_rx, event_tx.clone());
+        run_tick_thread(event_tx.clone());
         if let Ok(mut guard) = snapshot.lock() {
             *guard = ChainSnapshot::from_driver(&driver);
         }
@@ -224,6 +228,7 @@ impl ConsensusReactor {
             action_tx,
             snapshot,
             pending_timeouts: HashMap::new(),
+            timer_tx,
             internal_event_queue: VecDeque::new(),
             proposed_at_slot: None,
             last_status_at: Instant::now() - STATUS_INTERVAL,
@@ -232,17 +237,15 @@ impl ConsensusReactor {
 
     /// Run the event loop forever.
     pub fn run(mut self) {
-        self.sync_timeouts();
         self.maybe_propose_current_slot();
-        self.sync_timeouts();
+        self.maybe_schedule_timeout();
 
         loop {
-            self.drain_internal_events();
+            if self.drain_internal_events() {
+                continue;
+            }
 
-            let deadline = self.next_deadline();
-            let wait = deadline.saturating_duration_since(Instant::now());
-
-            match self.event_rx.recv_timeout(wait) {
+            match self.event_rx.recv() {
                 Ok(event) => {
                     self.process_event(event);
                     self.drain_internal_events();
@@ -251,22 +254,7 @@ impl ConsensusReactor {
                         self.drain_internal_events();
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    let mut drained_event = false;
-                    while let Ok(queued) = self.event_rx.try_recv() {
-                        drained_event = true;
-                        self.process_event(queued);
-                        self.drain_internal_events();
-                    }
-                    if drained_event {
-                        continue;
-                    }
-                    if let Some(event) = self.pop_due_timeout_or_tick() {
-                        self.process_event(event);
-                        self.drain_internal_events();
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(_) => break,
             }
         }
     }
@@ -318,43 +306,7 @@ impl ConsensusReactor {
                 self.handle_submit_tx(tx, reply);
                 Vec::new()
             }
-            ConsensusEvent::ProposeTimeout { height, round } => {
-                if self.driver.height() + 1 == height
-                    && self.driver.current_round() == round
-                    && self.driver.current_phase() == RoundPhase::Propose
-                {
-                    self.driver.on_propose_timeout()
-                } else {
-                    Vec::new()
-                }
-            }
-            ConsensusEvent::PrevoteTimeout { height, round } => {
-                if self.driver.height() + 1 == height
-                    && self.driver.current_round() == round
-                    && self.driver.current_phase() == RoundPhase::Prevote
-                {
-                    self.driver.on_prevote_timeout()
-                } else {
-                    Vec::new()
-                }
-            }
-            ConsensusEvent::PrecommitTimeout { height, round } => {
-                if self.driver.height() + 1 == height
-                    && self.driver.current_round() == round
-                    && self.driver.current_phase() == RoundPhase::Precommit
-                {
-                    self.driver.on_precommit_timeout();
-                    if self.driver.current_round() != before_round {
-                        eprintln!(
-                            "[timing] t={}ms ROUND ADVANCED to {} at height={}",
-                            now_ms(),
-                            self.driver.current_round(),
-                            self.driver.height(),
-                        );
-                    }
-                }
-                Vec::new()
-            }
+            ConsensusEvent::TimeoutFired { id } => self.handle_timeout_fired(id, before_round),
             ConsensusEvent::Tick => {
                 self.emit_action(ConsensusAction::BroadcastStatus {
                     height: self.driver.height(),
@@ -368,7 +320,39 @@ impl ConsensusReactor {
         self.handle_driver_actions(actions);
         self.maybe_propose_current_slot();
         self.after_state_change(before_height, before_tip, before_mempool);
-        self.sync_timeouts();
+        self.maybe_schedule_timeout();
+    }
+
+    fn handle_timeout_fired(&mut self, id: TimeoutId, before_round: u32) -> Vec<DriverAction> {
+        self.pending_timeouts.remove(&id);
+
+        if !self.driver.sync().is_caught_up() {
+            return Vec::new();
+        }
+
+        let current_height = self.driver.height() + 1;
+        let current_round = self.driver.current_round();
+        let current_phase = self.driver.current_phase();
+        if id.height != current_height || id.round != current_round || id.phase != current_phase {
+            return Vec::new();
+        }
+
+        match id.kind {
+            TimeoutKind::Propose => self.driver.on_propose_timeout(),
+            TimeoutKind::Prevote => self.driver.on_prevote_timeout(),
+            TimeoutKind::Precommit => {
+                self.driver.on_precommit_timeout();
+                if self.driver.current_round() != before_round {
+                    eprintln!(
+                        "[timing] t={}ms ROUND ADVANCED to {} at height={}",
+                        now_ms(),
+                        self.driver.current_round(),
+                        self.driver.height(),
+                    );
+                }
+                Vec::new()
+            }
+        }
     }
 
     fn handle_driver_actions(&mut self, actions: Vec<DriverAction>) {
@@ -561,7 +545,7 @@ impl ConsensusReactor {
         }
     }
 
-    fn sync_timeouts(&mut self) {
+    fn maybe_schedule_timeout(&mut self) {
         if !self.driver.sync().is_caught_up() {
             self.pending_timeouts.clear();
             return;
@@ -569,68 +553,30 @@ impl ConsensusReactor {
 
         let height = self.driver.height() + 1;
         let round = self.driver.current_round();
-        let (kind, delay) = match self.driver.current_phase() {
-            RoundPhase::Propose => (TimeoutKind::Propose, PROPOSE_TIMEOUT),
-            RoundPhase::Prevote => (TimeoutKind::Prevote, PREVOTE_TIMEOUT),
-            RoundPhase::Precommit => (TimeoutKind::Precommit, PRECOMMIT_TIMEOUT),
+        let phase = self.driver.current_phase();
+        let id = TimeoutId {
+            kind: phase_to_timeout_kind(phase),
+            height,
+            round,
+            phase,
         };
-
-        let key = (kind, height, round);
-        self.pending_timeouts
-            .retain(|existing, _| *existing == key);
-        self.pending_timeouts
-            .entry(key)
-            .or_insert_with(|| Instant::now() + delay);
-    }
-
-    fn next_deadline(&self) -> Instant {
-        let status_deadline = self.last_status_at + STATUS_INTERVAL;
-        self.pending_timeouts
-            .values()
-            .copied()
-            .min()
-            .map(|timeout_deadline| timeout_deadline.min(status_deadline))
-            .unwrap_or(status_deadline)
-    }
-
-    fn pop_due_timeout_or_tick(&mut self) -> Option<ConsensusEvent> {
-        let now = Instant::now();
-
-        if let Some((key, _)) = self
-            .pending_timeouts
-            .iter()
-            .filter(|(_, deadline)| now >= **deadline)
-            .min_by_key(|(_, deadline)| **deadline)
-            .map(|(key, deadline)| (*key, *deadline))
-        {
-            self.pending_timeouts.remove(&key);
-            return Some(match key.0 {
-                TimeoutKind::Propose => ConsensusEvent::ProposeTimeout {
-                    height: key.1,
-                    round: key.2,
-                },
-                TimeoutKind::Prevote => ConsensusEvent::PrevoteTimeout {
-                    height: key.1,
-                    round: key.2,
-                },
-                TimeoutKind::Precommit => ConsensusEvent::PrecommitTimeout {
-                    height: key.1,
-                    round: key.2,
-                },
-            });
+        if self.pending_timeouts.contains_key(&id) {
+            return;
         }
 
-        if self.last_status_at.elapsed() >= STATUS_INTERVAL {
-            return Some(ConsensusEvent::Tick);
-        }
-
-        None
+        let delay = phase_timeout(phase);
+        self.pending_timeouts
+            .insert(id.clone(), Instant::now() + delay);
+        let _ = self.timer_tx.send((id, delay));
     }
 
-    fn drain_internal_events(&mut self) {
+    fn drain_internal_events(&mut self) -> bool {
+        let mut drained = false;
         while let Some(event) = self.internal_event_queue.pop_front() {
+            drained = true;
             self.process_event(event);
         }
+        drained
     }
 
     fn handle_blocks_requested(&mut self, from: SocketAddr, from_height: u64, to_height: u64) {
@@ -745,4 +691,44 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn phase_to_timeout_kind(phase: RoundPhase) -> TimeoutKind {
+    match phase {
+        RoundPhase::Propose => TimeoutKind::Propose,
+        RoundPhase::Prevote => TimeoutKind::Prevote,
+        RoundPhase::Precommit => TimeoutKind::Precommit,
+    }
+}
+
+fn phase_timeout(phase: RoundPhase) -> Duration {
+    match phase {
+        RoundPhase::Propose => PROPOSE_TIMEOUT,
+        RoundPhase::Prevote => PREVOTE_TIMEOUT,
+        RoundPhase::Precommit => PRECOMMIT_TIMEOUT,
+    }
+}
+
+fn run_timer_thread(
+    pending_rx: Receiver<(TimeoutId, Duration)>,
+    event_tx: Sender<ConsensusEvent>,
+) {
+    thread::spawn(move || {
+        while let Ok((id, delay)) = pending_rx.recv() {
+            let event_tx = event_tx.clone();
+            thread::spawn(move || {
+                thread::sleep(delay);
+                let _ = event_tx.send(ConsensusEvent::TimeoutFired { id });
+            });
+        }
+    });
+}
+
+fn run_tick_thread(event_tx: Sender<ConsensusEvent>) {
+    thread::spawn(move || loop {
+        thread::sleep(STATUS_INTERVAL);
+        if event_tx.send(ConsensusEvent::Tick).is_err() {
+            break;
+        }
+    });
 }
