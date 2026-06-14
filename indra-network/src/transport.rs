@@ -77,10 +77,7 @@ impl Connection {
         let mut len_buf = [0u8; 4];
         match self.stream.read_exact(&mut len_buf) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(RecvStatus::Disconnected),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(RecvStatus::NoData),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(RecvStatus::NoData),
-            Err(e) => return Err(NetworkError::Io(e)),
+            Err(e) => return map_read_err(e),
         }
 
         let total_len = u32::from_le_bytes(len_buf) as usize;
@@ -92,7 +89,10 @@ impl Connection {
         }
 
         let mut payload = vec![0u8; total_len];
-        self.stream.read_exact(&mut payload)?;
+        match self.stream.read_exact(&mut payload) {
+            Ok(_) => {}
+            Err(e) => return map_read_err(e),
+        }
 
         let msg = Message::decode_wire(&payload)?;
         Ok(RecvStatus::Message(msg))
@@ -102,6 +102,16 @@ impl Connection {
     pub fn close(self) -> NetworkResult<()> {
         self.stream.shutdown(std::net::Shutdown::Both)?;
         Ok(())
+    }
+}
+
+fn map_read_err(err: std::io::Error) -> NetworkResult<RecvStatus> {
+    match err.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Ok(RecvStatus::NoData),
+        std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::BrokenPipe => Ok(RecvStatus::Disconnected),
+        _ => Err(NetworkError::Io(err)),
     }
 }
 
