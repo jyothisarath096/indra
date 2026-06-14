@@ -62,6 +62,7 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockV1 
             state_root:          Bytes32::ZERO,
             validator_set_root:  Bytes32::ZERO,
             mempool_set_root:    Bytes32::ZERO,
+            value_hash:          Bytes32::ZERO,
             base_fee:            INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_round:      0,
             polc_round:          indra_core::types::block::NO_POLC_ROUND,

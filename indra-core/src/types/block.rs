@@ -39,6 +39,8 @@ pub struct BlockHeaderV1 {
     pub validator_set_root:  Bytes32,
     /// Mempool commitment root.
     pub mempool_set_root:    Bytes32,
+    /// Stable consensus value hash shared across rounds for the same block content.
+    pub value_hash:          Bytes32,
     /// Current base fee in Spark/KB (updated each block via EIP-1559 formula).
     pub base_fee:            u64,
     /// Consensus round in which this block was proposed.
@@ -60,6 +62,29 @@ impl BlockHeaderV1 {
     pub fn block_hash(&self) -> Bytes32 {
         Bytes32::from(sha256(&self.encode_to_vec()))
     }
+
+    /// Compute the stable consensus value hash for a block.
+    pub fn compute_value_hash(
+        height: u64,
+        prev_hash: Bytes32,
+        timestamp: u64,
+        state_root: Bytes32,
+        validator_set_root: Bytes32,
+        mempool_set_root: Bytes32,
+        base_fee: u64,
+        total_supply: u64,
+    ) -> Bytes32 {
+        let mut buf = Vec::with_capacity(8 + 32 + 8 + 32 + 32 + 32 + 8 + 8);
+        height.encode(&mut buf);
+        prev_hash.encode(&mut buf);
+        timestamp.encode(&mut buf);
+        state_root.encode(&mut buf);
+        validator_set_root.encode(&mut buf);
+        mempool_set_root.encode(&mut buf);
+        base_fee.encode(&mut buf);
+        total_supply.encode(&mut buf);
+        Bytes32::from(sha256(&buf))
+    }
 }
 
 impl Encode for BlockHeaderV1 {
@@ -77,9 +102,10 @@ impl Encode for BlockHeaderV1 {
         self.proposer_vrf_proof.encode(buf);
         self.quorum_certificate.encode(buf);
         self.polc_round.encode(buf);
+        self.value_hash.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        2 + 8 + 32 + 8 + 32 + 32 + 32 + 8 + 4 + 4 + 32
+        2 + 8 + 32 + 8 + 32 + 32 + 32 + 32 + 8 + 4 + 4 + 32
             + self.proposer_vrf_proof.encoded_len()
             + self.quorum_certificate.encoded_len()
     }
@@ -101,6 +127,7 @@ impl Decode for BlockHeaderV1 {
             proposer_vrf_proof:  VariableBytes::decode(r)?,
             quorum_certificate:  VariableBytes::decode(r)?,
             polc_round:          u32::decode(r).unwrap_or(NO_POLC_ROUND),
+            value_hash:          Bytes32::decode(r).unwrap_or(Bytes32::ZERO),
         })
     }
 }
@@ -144,6 +171,23 @@ impl Decode for BlockV1 {
     }
 }
 
+impl BlockV1 {
+    /// Recompute this block's stable consensus value hash from its stable
+    /// content fields and projected post-state total supply.
+    pub fn compute_value_hash(&self, total_supply: u64) -> Bytes32 {
+        BlockHeaderV1::compute_value_hash(
+            self.header.height,
+            self.header.prev_hash,
+            self.header.timestamp,
+            self.header.state_root,
+            self.header.validator_set_root,
+            self.header.mempool_set_root,
+            self.header.base_fee,
+            total_supply,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +202,7 @@ mod tests {
             state_root:          Bytes32::from([0x11u8; 32]),
             validator_set_root:  Bytes32::from([0x22u8; 32]),
             mempool_set_root:    Bytes32::from([0x33u8; 32]),
+            value_hash:          Bytes32::from([0x34u8; 32]),
             base_fee:            100,
             proposer_round:      0,
             polc_round:          NO_POLC_ROUND,
@@ -174,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn old_header_encoding_without_polc_still_decodes() {
+    fn old_header_encoding_without_value_hash_and_polc_still_decodes() {
         let h = dummy_header();
         let mut legacy = Vec::new();
         h.protocol_version.encode(&mut legacy);
@@ -198,6 +243,7 @@ mod tests {
         assert_eq!(decoded.state_root, h.state_root);
         assert_eq!(decoded.validator_set_root, h.validator_set_root);
         assert_eq!(decoded.mempool_set_root, h.mempool_set_root);
+        assert_eq!(decoded.value_hash, Bytes32::ZERO);
         assert_eq!(decoded.base_fee, h.base_fee);
         assert_eq!(decoded.proposer_round, h.proposer_round);
         assert_eq!(decoded.proposer_vrf_output, h.proposer_vrf_output);
@@ -219,6 +265,39 @@ mod tests {
         h1.height = 1;
         h2.height = 2;
         assert_ne!(h1.block_hash(), h2.block_hash());
+    }
+
+    #[test]
+    fn value_hash_is_stable_across_round_metadata_changes() {
+        let h = dummy_header();
+        let base = BlockHeaderV1::compute_value_hash(
+            h.height,
+            h.prev_hash,
+            h.timestamp,
+            h.state_root,
+            h.validator_set_root,
+            h.mempool_set_root,
+            h.base_fee,
+            123,
+        );
+
+        let mut changed = h.clone();
+        changed.proposer_round = 7;
+        changed.polc_round = 3;
+        changed.proposer_vrf_output = Bytes32::from([0x55u8; 32]);
+
+        let changed_hash = BlockHeaderV1::compute_value_hash(
+            changed.height,
+            changed.prev_hash,
+            changed.timestamp,
+            changed.state_root,
+            changed.validator_set_root,
+            changed.mempool_set_root,
+            changed.base_fee,
+            123,
+        );
+
+        assert_eq!(base, changed_hash);
     }
 
     #[test]

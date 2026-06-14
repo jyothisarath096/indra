@@ -532,17 +532,36 @@ impl ConsensusReactor {
             round,
             candidates,
         };
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let polc_round = self.driver.proposal_polc_round(next_height);
 
-        match self
+        let reproposal = self
             .driver
-            .engine
-            .propose(&election, timestamp, self.driver.last_qc_bytes(), polc_round)
-        {
+            .valid_value()
+            .zip(self.driver.valid_round())
+            .and_then(|(valid_hash, valid_round)| {
+                self.driver
+                    .get_pending_block(valid_hash)
+                    .map(|block| (block, valid_round))
+            });
+
+        match if let Some((block, valid_round)) = reproposal {
+            self.driver.engine.repropose(
+                &block,
+                round,
+                Some(valid_round),
+                &election,
+                block.header.timestamp,
+                self.driver.last_qc_bytes(),
+            )
+        } else {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let polc_round = self.driver.proposal_polc_round(next_height);
+            self.driver
+                .engine
+                .propose(&election, timestamp, self.driver.last_qc_bytes(), polc_round)
+        } {
             Ok(block) => {
                 if !block.transactions.is_empty() {
                     eprintln!(
@@ -628,7 +647,7 @@ impl ConsensusReactor {
             .filter(|block| {
                 block.header.height == height
                     && block.header.proposer_round == round
-                    && block.header.block_hash() == hash
+                    && block.header.value_hash == hash
             });
         if let Some(block) = proposal {
             eprintln!(

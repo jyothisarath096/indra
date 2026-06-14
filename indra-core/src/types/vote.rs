@@ -43,11 +43,15 @@ pub struct VoteV1 {
     pub round:        u32,
     /// Prevote or Precommit.
     pub step:         VoteStep,
-    /// Hash of the block being voted for.
+    /// Stable value hash being voted for.
+    ///
+    /// The field name remains `block_hash` for wire compatibility, but the
+    /// payload now carries `BlockHeaderV1::value_hash` rather than the full
+    /// per-round proposal hash.
     pub block_hash:   Bytes32,
     /// Validator's identity.
     pub validator_id: Bytes32,
-    /// Hybrid signature over (height || round || step || block_hash || validator_id).
+    /// Hybrid signature over (height || round || step || value_hash || validator_id).
     pub signature:    HybridSignature,
 }
 

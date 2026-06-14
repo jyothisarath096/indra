@@ -339,6 +339,7 @@ mod tests {
                 state_root:          Bytes32::ZERO,
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
+                value_hash:          Bytes32::ZERO,
                 base_fee:            100,
                 proposer_round:      0,
                 polc_round:          indra_core::types::block::NO_POLC_ROUND,

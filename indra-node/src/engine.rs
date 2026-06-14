@@ -14,7 +14,11 @@
 //!   6. Import the committed block via sync::import_block
 //!   7. Advance to next height
 
-use indra_core::types::primitives::Bytes32;
+use indra_core::types::{
+    block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    primitives::{Bytes32, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES, VariableBytes},
+    vote::VoteStep,
+};
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
@@ -221,7 +225,7 @@ impl NodeEngine {
         timestamp: u64,
         prev_qc_bytes: Vec<u8>,
         polc_round: Option<u32>,
-    ) -> NodeResult<indra_core::types::block::BlockV1> {
+    ) -> NodeResult<BlockV1> {
         let _vrf_kp = self.vrf_keypair.as_ref()
             .ok_or(NodeError::NotProposer { height: self.state.height + 1 })?;
 
@@ -236,6 +240,82 @@ impl NodeEngine {
 
         produce_block(&template, &self.state, &self.mempool, election)
             .map_err(NodeError::Consensus)
+    }
+
+    /// Re-propose an already validated value in a later round while keeping
+    /// its stable consensus value hash unchanged.
+    pub fn repropose(
+        &self,
+        original_block: &BlockV1,
+        new_round: u32,
+        valid_round: Option<u32>,
+        election: &ProposerElection,
+        timestamp: u64,
+        last_qc: Vec<u8>,
+    ) -> NodeResult<BlockV1> {
+        let vrf_kp = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
+            height: self.state.height + 1,
+        })?;
+        let validator_id = self.validator_id.ok_or(NodeError::NotProposer {
+            height: self.state.height + 1,
+        })?;
+        let slot = compute_proposer_vrf(
+            validator_id,
+            vrf_kp,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let elected = elect_proposer(election).map_err(NodeError::Consensus)?;
+        if elected != slot.proposer_id {
+            return Err(NodeError::NotProposer {
+                height: self.state.height + 1,
+            });
+        }
+
+        let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
+            .map_err(|_| NodeError::Consensus(indra_consensus::error::ConsensusError::CryptoError {
+                detail: "VRF proof too large".to_string(),
+            }))?;
+        let qc_bytes = VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&last_qc).map_err(|_| {
+            NodeError::Consensus(indra_consensus::error::ConsensusError::CryptoError {
+                detail: "QC bytes too large".to_string(),
+            })
+        })?;
+
+        let mut block = BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: original_block.header.protocol_version,
+                height: original_block.header.height,
+                prev_hash: original_block.header.prev_hash,
+                timestamp,
+                state_root: original_block.header.state_root,
+                validator_set_root: original_block.header.validator_set_root,
+                mempool_set_root: original_block.header.mempool_set_root,
+                value_hash: original_block.header.value_hash,
+                base_fee: original_block.header.base_fee,
+                proposer_round: new_round,
+                polc_round: valid_round.unwrap_or(NO_POLC_ROUND),
+                proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
+                proposer_vrf_proof: vrf_proof_bytes,
+                quorum_certificate: qc_bytes,
+            },
+            transactions: original_block.transactions.clone(),
+            slashing_evidence: original_block.slashing_evidence.clone(),
+            governance_ops: original_block.governance_ops.clone(),
+        };
+
+        let mut projected = self.state.clone();
+        indra_state::apply_block(&mut projected, &block)?;
+        let expected_value_hash = block.compute_value_hash(projected.total_supply);
+        if expected_value_hash != original_block.header.value_hash {
+            return Err(NodeError::BlockInvalid {
+                height: block.header.height,
+                reason: "reproposal changed stable value hash".to_string(),
+            });
+        }
+        block.header.value_hash = expected_value_hash;
+        Ok(block)
     }
 
     /// Build the current epoch voter list from active validators.
@@ -272,7 +352,7 @@ impl NodeEngine {
         &self,
         height: u64,
         round: u32,
-        step: indra_core::types::vote::VoteStep,
+        step: VoteStep,
         block_hash: Bytes32,
     ) -> NodeResult<indra_core::types::vote::VoteV1> {
         let validator_id = self.validator_id.ok_or(NodeError::NotValidator)?;
@@ -376,6 +456,7 @@ mod tests {
                 state_root:          Bytes32::ZERO,
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
+                value_hash:          Bytes32::ZERO,
                 base_fee:            state.base_fee,
                 proposer_round:      0,
                 polc_round:          indra_core::types::block::NO_POLC_ROUND,
@@ -392,6 +473,7 @@ mod tests {
         apply_block(&mut projected, &block).unwrap();
         block.header.state_root = compute_state_root(&projected);
         block.header.validator_set_root = compute_validator_set_root(&projected);
+        block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }
 

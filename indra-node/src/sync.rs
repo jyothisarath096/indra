@@ -405,6 +405,14 @@ fn verify_block_state_root(
         });
     }
 
+    let actual_value_hash = block.compute_value_hash(projected.total_supply);
+    if actual_value_hash != block.header.value_hash {
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: "value_hash mismatch".to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -438,6 +446,7 @@ mod tests {
                 state_root:          Bytes32::ZERO,
                 validator_set_root:  Bytes32::ZERO,
                 mempool_set_root:    Bytes32::ZERO,
+                value_hash:          Bytes32::ZERO,
                 base_fee:            state.base_fee,
                 proposer_round:      0,
                 polc_round:          indra_core::types::block::NO_POLC_ROUND,
@@ -454,6 +463,7 @@ mod tests {
         apply_block(&mut projected, &block).unwrap();
         block.header.state_root = compute_state_root(&projected);
         block.header.validator_set_root = compute_validator_set_root(&projected);
+        block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }
 

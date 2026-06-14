@@ -83,6 +83,7 @@ fn dummy_header() -> BlockHeaderV1 {
         state_root:          Bytes32::from([0x11u8; 32]),
         validator_set_root:  Bytes32::from([0x22u8; 32]),
         mempool_set_root:    Bytes32::from([0x33u8; 32]),
+        value_hash:          Bytes32::from([0x34u8; 32]),
         base_fee:            100,
         proposer_round:      0,
         polc_round:          indra_core::types::block::NO_POLC_ROUND,

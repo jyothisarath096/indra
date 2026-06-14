@@ -22,7 +22,10 @@ pub struct QuorumCertificateV1 {
     pub height: u64,
     /// Round in which finalisation occurred.
     pub round: u32,
-    /// Certified block hash.
+    /// Certified consensus value hash.
+    ///
+    /// The field name remains `block_hash` for compatibility with existing QC
+    /// encoding, but it now carries the stable `value_hash`.
     pub block_hash: Bytes32,
     /// Bitfield: bit i = 1 → validator at slot i signed.
     pub signer_bitfield: [u8; SIGNER_BITFIELD_BYTES],

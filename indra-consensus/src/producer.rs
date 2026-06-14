@@ -112,6 +112,7 @@ pub fn produce_block(
         state_root:          Bytes32::ZERO,
         validator_set_root:  Bytes32::ZERO,
         mempool_set_root:    compute_selected_tx_root(&selected),
+        value_hash:          Bytes32::ZERO,
         base_fee:            state.base_fee,
         proposer_round:      election.round,
         polc_round:          template.polc_round.unwrap_or(NO_POLC_ROUND),
@@ -133,6 +134,7 @@ pub fn produce_block(
     })?;
     block.header.state_root = compute_state_root(&projected);
     block.header.validator_set_root = compute_validator_set_root(&projected);
+    block.header.value_hash = block.compute_value_hash(projected.total_supply);
 
     Ok(block)
 }
