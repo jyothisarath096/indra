@@ -29,11 +29,11 @@ use crate::{
 };
 
 /// Tendermint propose timeout used by the reactor.
-pub const PROPOSE_TIMEOUT: Duration = Duration::from_secs(4);
+pub const PROPOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tendermint prevote timeout used by the reactor.
-pub const PREVOTE_TIMEOUT: Duration = Duration::from_secs(4);
+pub const PREVOTE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Tendermint precommit timeout used by the reactor.
-pub const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(4);
+pub const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Periodic status broadcast interval.
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 
@@ -268,6 +268,7 @@ impl ConsensusReactor {
         let before_tip = self.driver.engine.state.tip_hash;
         let before_mempool = self.driver.engine.mempool.len();
         let before_round = self.driver.current_round();
+        let before_phase = self.driver.current_phase();
 
         let actions = match event {
             ConsensusEvent::ProposalReceived { from, block } => {
@@ -323,8 +324,34 @@ impl ConsensusReactor {
 
         self.handle_driver_actions(actions);
         self.maybe_propose_current_slot();
+        self.cancel_superseded_timeout(before_height, before_round, before_phase);
         self.after_state_change(before_height, before_tip, before_mempool);
         self.maybe_schedule_timeout();
+    }
+
+    fn cancel_superseded_timeout(
+        &mut self,
+        before_height: u64,
+        before_round: u32,
+        before_phase: RoundPhase,
+    ) {
+        let after_height = self.driver.height();
+        let after_round = self.driver.current_round();
+        let after_phase = self.driver.current_phase();
+
+        if before_phase == RoundPhase::Propose
+            && after_height == before_height
+            && after_round == before_round
+            && after_phase == RoundPhase::Prevote
+        {
+            let cancel_id = TimeoutId {
+                kind: TimeoutKind::Propose,
+                height: before_height.saturating_add(1),
+                round: before_round,
+                phase: RoundPhase::Propose,
+            };
+            self.pending_timeouts.remove(&cancel_id);
+        }
     }
 
     fn handle_timeout_fired(&mut self, id: TimeoutId, before_round: u32) -> Vec<DriverAction> {
