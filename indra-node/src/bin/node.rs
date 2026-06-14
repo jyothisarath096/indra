@@ -193,7 +193,6 @@ fn main() {
                             Err(_) => continue,
                         };
                         println!("[P2P] Inbound connection from {}", addr);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
                         if let Ok(conn) = Connection::from_stream(stream) {

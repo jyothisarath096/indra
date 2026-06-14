@@ -22,7 +22,9 @@ use crate::{
 /// Default connection timeout.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default read timeout.
-pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub const READ_TIMEOUT: Duration = Duration::from_millis(1);
+/// Default write timeout.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Result of polling a connection for one inbound message.
 pub enum RecvStatus {
@@ -46,7 +48,7 @@ impl Connection {
     pub fn from_stream(stream: TcpStream) -> NetworkResult<Self> {
         let remote_addr = stream.peer_addr()?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
-        stream.set_write_timeout(Some(READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         Ok(Self { stream, remote_addr })
     }
 
