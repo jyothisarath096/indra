@@ -12,7 +12,7 @@
 //! ## Vote signing
 //!
 //! A vote is signed with the validator's hybrid keypair over:
-//!   SHA-256(DOMAIN_VOTE || height || round || step || block_hash || validator_id)
+//!   SHA-256(DOMAIN_VOTE || height || round || step || value_hash || validator_id)
 //!
 //! Both Ed25519 and Dilithium2 components are required.
 
@@ -51,9 +51,9 @@ pub struct RegisteredVoter {
 pub enum VoteDecision {
     /// Not enough votes yet.
     Waiting,
-    /// Quorum reached for this block hash.
+    /// Quorum reached for this vote hash.
     QuorumReached {
-        /// The block hash that received quorum.
+        /// The value hash that received quorum.
         block_hash: Bytes32,
         /// Basis points of stake that voted.
         stake_bps: u64,
@@ -168,7 +168,7 @@ impl VoteCollector {
             return VoteDecision::Waiting;
         }
 
-        // Count stake per block_hash
+        // Count stake per vote hash (INDRA now carries stable `value_hash` here).
         let mut stake_by_hash: HashMap<Bytes32, u64> = HashMap::new();
         for (vote, stake) in self.received.values() {
             *stake_by_hash.entry(vote.block_hash).or_insert(0) += stake;

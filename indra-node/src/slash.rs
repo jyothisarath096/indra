@@ -1,6 +1,6 @@
 //! Slash evidence detection.
 //!
-//! Detects two types of slashable offences:
+//! Detects slashable offences for INDRA's Tendermint-style vote flow.
 //!
 //! ## Double precommit (equivocation)
 //!
@@ -10,22 +10,13 @@
 //!
 //! Penalty: SLASH_DOUBLE_PRECOMMIT_BPS (5%) of stake.
 //!
-//! ## Surround vote
-//!
-//! A validator's outer vote (h1, r1) surrounds an inner vote (h2, r2)
-//! where h1 < h2 and r1 > r2. This is the Ethereum-style long-range
-//! attack vector.
-//!
-//! Penalty: SLASH_SURROUND_VOTE_BPS (100%) of stake.
-//!
 //! ## Evidence format
 //!
 //! Evidence is a pair of conflicting votes from the same validator.
 //! The verifier checks:
 //!   1. Both votes have the same validator_id
 //!   2. Both signatures are valid
-//!   3. The votes are actually conflicting (different hashes at same height/round,
-//!      or surround relationship)
+//!   3. The votes are actually conflicting for the same Tendermint slot
 
 use std::collections::HashMap;
 
@@ -39,8 +30,6 @@ use indra_core::types::{
 pub enum SlashOffence {
     /// Two precommits at the same height/round for different blocks.
     DoublePrecommit,
-    /// An outer vote surrounds an inner vote.
-    SurroundVote,
 }
 
 /// A detected slashable offence with supporting evidence.
@@ -60,7 +49,7 @@ pub struct SlashEvidence {
 pub struct SlashDetector {
     /// validator_id → list of observed precommits
     precommits: HashMap<Bytes32, Vec<VoteV1>>,
-    /// validator_id → list of observed prevotes (for surround detection)
+    /// validator_id → list of observed prevotes for same-slot dedupe/upgrade handling.
     prevotes:   HashMap<Bytes32, Vec<VoteV1>>,
 }
 
@@ -121,12 +110,23 @@ impl SlashDetector {
             .entry(vote.validator_id)
             .or_default();
 
-        // Check for double precommit: same height+round, different block hash
-        for prev in existing.iter() {
-            if prev.height == vote.height
-                && prev.round == vote.round
-                && prev.block_hash != vote.block_hash
-            {
+        // Allow the protocol's nil -> real upgrade path for the same slot, but
+        // still slash conflicting real-block precommits.
+        for prev in existing.iter_mut() {
+            if prev.height == vote.height && prev.round == vote.round {
+                if prev.block_hash == vote.block_hash {
+                    return None;
+                }
+
+                let nil_upgrade = (prev.block_hash == Bytes32::ZERO && vote.block_hash != Bytes32::ZERO)
+                    || (prev.block_hash != Bytes32::ZERO && vote.block_hash == Bytes32::ZERO);
+                if nil_upgrade {
+                    if vote.block_hash != Bytes32::ZERO {
+                        *prev = vote;
+                    }
+                    return None;
+                }
+
                 return Some(SlashEvidence {
                     validator_id: vote.validator_id,
                     offence: SlashOffence::DoublePrecommit,
@@ -145,16 +145,19 @@ impl SlashDetector {
             .entry(vote.validator_id)
             .or_default();
 
-        // Check for surround vote:
-        // outer (h1, r1) surrounds inner (h2, r2) if h1 < h2 and r1 > r2
-        for prev in existing.iter() {
-            if is_surround(prev, &vote) || is_surround(&vote, prev) {
-                return Some(SlashEvidence {
-                    validator_id: vote.validator_id,
-                    offence: SlashOffence::SurroundVote,
-                    vote_a: prev.clone(),
-                    vote_b: vote,
-                });
+        // Tendermint prevotes across different heights/rounds are not slashable.
+        // For the same slot, allow nil -> real upgrade and ignore duplicates.
+        for prev in existing.iter_mut() {
+            if prev.height == vote.height && prev.round == vote.round {
+                if prev.block_hash == vote.block_hash {
+                    return None;
+                }
+                let nil_upgrade = (prev.block_hash == Bytes32::ZERO && vote.block_hash != Bytes32::ZERO)
+                    || (prev.block_hash != Bytes32::ZERO && vote.block_hash == Bytes32::ZERO);
+                if nil_upgrade && vote.block_hash != Bytes32::ZERO {
+                    *prev = vote;
+                }
+                return None;
             }
         }
 
@@ -178,12 +181,6 @@ impl SlashDetector {
         ids.extend(self.prevotes.keys().copied());
         ids.len()
     }
-}
-
-/// Check if vote `outer` surrounds vote `inner`.
-/// outer surrounds inner if outer.height < inner.height && outer.round > inner.round
-fn is_surround(outer: &VoteV1, inner: &VoteV1) -> bool {
-    outer.height < inner.height && outer.round > inner.round
 }
 
 impl Default for SlashDetector {
@@ -261,17 +258,23 @@ mod tests {
     }
 
     #[test]
-    fn surround_vote_detected() {
+    fn cross_height_prevotes_are_not_slashed() {
         let mut detector = SlashDetector::new();
         let v = [0x04u8; 32];
 
-        // Outer: height=1, round=10
         detector.observe_vote(dummy_vote(v, 1, 10, VoteStep::Prevote, [0xAAu8; 32]));
-        // Inner: height=5, round=2 — surrounded by outer (1 < 5, 10 > 2)
         let evidence = detector.observe_vote(dummy_vote(v, 5, 2, VoteStep::Prevote, [0xBBu8; 32]));
+        assert!(evidence.is_none());
+    }
 
-        assert!(evidence.is_some());
-        assert_eq!(evidence.unwrap().offence, SlashOffence::SurroundVote);
+    #[test]
+    fn nil_to_real_precommit_upgrade_is_not_slashed() {
+        let mut detector = SlashDetector::new();
+        let v = [0x06u8; 32];
+
+        detector.observe_vote(dummy_vote(v, 5, 0, VoteStep::Precommit, [0x00u8; 32]));
+        let evidence = detector.observe_vote(dummy_vote(v, 5, 0, VoteStep::Precommit, [0xAAu8; 32]));
+        assert!(evidence.is_none());
     }
 
     #[test]
