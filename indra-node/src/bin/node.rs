@@ -442,6 +442,13 @@ fn main() {
                     last_observed = Some(observed);
                 }
 
+                if connected < 2 {
+                    eprintln!("[consensus] waiting for peers (have {}, need 2)", connected);
+                    phase_started_at = Instant::now();
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
                 if connected == 0 {
                     println!("[consensus] height={} waiting for peers...", height);
                 } else if last_status_at.elapsed() >= STATUS_INTERVAL {
