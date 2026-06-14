@@ -82,6 +82,40 @@ impl SlashDetector {
         }
     }
 
+    /// Remove a previously observed vote so local upgrade paths can replace a
+    /// nil vote with the final real-block vote for the same slot.
+    pub fn remove_vote(
+        &mut self,
+        validator_id: Bytes32,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) {
+        match step {
+            VoteStep::Precommit => {
+                if let Some(existing) = self.precommits.get_mut(&validator_id) {
+                    existing.retain(|seen| {
+                        !(seen.height == height
+                            && seen.round == round
+                            && seen.step == step
+                            && seen.block_hash == block_hash)
+                    });
+                }
+            }
+            VoteStep::Prevote => {
+                if let Some(existing) = self.prevotes.get_mut(&validator_id) {
+                    existing.retain(|seen| {
+                        !(seen.height == height
+                            && seen.round == round
+                            && seen.step == step
+                            && seen.block_hash == block_hash)
+                    });
+                }
+            }
+        }
+    }
+
     fn observe_precommit(&mut self, vote: VoteV1) -> Option<SlashEvidence> {
         let existing = self.precommits
             .entry(vote.validator_id)

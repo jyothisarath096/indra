@@ -421,7 +421,14 @@ impl ConsensusReactor {
                         });
                 }
                 DriverAction::SlashDetected(evidence) => {
-                    eprintln!("[slash] detected {:?}", evidence);
+                    eprintln!(
+                        "[slash] detected {:?} at heights {} and {} rounds {} and {}",
+                        evidence.offence,
+                        evidence.vote_a.height,
+                        evidence.vote_b.height,
+                        evidence.vote_a.round,
+                        evidence.vote_b.round,
+                    );
                 }
                 DriverAction::None => {}
             }
