@@ -142,6 +142,11 @@ impl NodeEngine {
         self.validator_id
     }
 
+    /// Load the last committed QC bytes persisted on disk, if any.
+    pub fn load_persisted_qc(&self) -> NodeResult<Option<Vec<u8>>> {
+        indra_storage::load_last_qc(&self.config.state_dir()).map_err(NodeError::Storage)
+    }
+
     /// True if this node has a local VRF keypair loaded.
     pub fn has_vrf_keypair(&self) -> bool {
         self.vrf_keypair.is_some()
@@ -226,12 +231,23 @@ impl NodeEngine {
         prev_qc_bytes: Vec<u8>,
         polc_round: Option<u32>,
     ) -> NodeResult<BlockV1> {
+        let proposal_height = self.state.height + 1;
+        if proposal_height > 1 && prev_qc_bytes.is_empty() {
+            eprintln!(
+                "[proposer] cannot produce block at height {}: no QC for previous block — waiting for peer proposal",
+                proposal_height,
+            );
+            return Err(NodeError::MissingQc {
+                height: proposal_height,
+            });
+        }
+
         let _vrf_kp = self.vrf_keypair.as_ref()
-            .ok_or(NodeError::NotProposer { height: self.state.height + 1 })?;
+            .ok_or(NodeError::NotProposer { height: proposal_height })?;
 
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&self.config.vrf_seed
-                .ok_or(NodeError::NotProposer { height: self.state.height + 1 })?),
+                .ok_or(NodeError::NotProposer { height: proposal_height })?),
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp,
@@ -253,11 +269,22 @@ impl NodeEngine {
         timestamp: u64,
         last_qc: Vec<u8>,
     ) -> NodeResult<BlockV1> {
+        let proposal_height = self.state.height + 1;
+        if proposal_height > 1 && last_qc.is_empty() {
+            eprintln!(
+                "[proposer] cannot produce block at height {}: no QC for previous block — waiting for peer proposal",
+                proposal_height,
+            );
+            return Err(NodeError::MissingQc {
+                height: proposal_height,
+            });
+        }
+
         let vrf_kp = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
-            height: self.state.height + 1,
+            height: proposal_height,
         })?;
         let validator_id = self.validator_id.ok_or(NodeError::NotProposer {
-            height: self.state.height + 1,
+            height: proposal_height,
         })?;
         let slot = compute_proposer_vrf(
             validator_id,
@@ -269,7 +296,7 @@ impl NodeEngine {
         let elected = elect_proposer(election).map_err(NodeError::Consensus)?;
         if elected != slot.proposer_id {
             return Err(NodeError::NotProposer {
-                height: self.state.height + 1,
+                height: proposal_height,
             });
         }
 
@@ -381,14 +408,19 @@ fn rebuild_state_from_block_log(
     state: &mut ChainState,
     block_store: &mut BlockStore,
 ) -> NodeResult<()> {
+    let canonical_genesis = build_genesis_block();
     if block_store.is_empty() {
+        state.tip_hash = canonical_genesis.header.block_hash();
         return Ok(());
     }
 
     let genesis = block_store.get(0)?;
-    if genesis.header.height != build_genesis_block().header.height {
+    if genesis.header.height != canonical_genesis.header.height {
         return Err(NodeError::GenesisMismatch);
     }
+    // Anchor replay to the persisted genesis hash so block 1 must chain to
+    // the exact genesis block stored on disk rather than an all-zero tip.
+    state.tip_hash = genesis.header.block_hash();
 
     for height in 1..block_store.next_height() {
         let block = block_store.get(height)?;
@@ -401,11 +433,41 @@ fn rebuild_state_from_block_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_state::{ValidatorEntry, ValidatorStatus};
+    use indra_core::types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK};
 
     fn temp_dir(suffix: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("indra_engine_test_{}_{}", suffix, std::process::id()));
         p
+    }
+
+    fn install_active_validator(engine: &mut NodeEngine, seed: [u8; 32], name: &str) {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let public = HybridKeypair::new(classical, pq).public_key();
+        let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+
+        engine
+            .state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: name.to_string(),
+                hybrid_classical_pk: Some(public.classical.0),
+                hybrid_pq_pk: Some(public.pq.0.clone()),
+                vrf_pk: Some(vrf_pk),
+                stake_spark: 1_000_000,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: DEFAULT_COMMISSION_BPS,
+                min_delegation_spark: DUST_LIMIT_SPARK,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -532,6 +594,40 @@ mod tests {
 
         engine.rebuild_state_from_block_log().unwrap();
         assert_eq!(engine.state.utxos.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn propose_rejects_missing_previous_qc_above_height_one() {
+        let dir = temp_dir("missing_qc");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        install_active_validator(&mut engine, [0x71u8; 32], "local");
+        engine.state.height = 2;
+        engine.state.tip_hash = Bytes32::from([0x33u8; 32]);
+
+        let candidate = engine
+            .state
+            .validators
+            .active_validators()
+            .next()
+            .unwrap();
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from(indra_crypto::sha256(&engine.state.tip_hash.0)),
+            height: 3,
+            round: 0,
+            candidates: vec![indra_consensus::proposer::ProposerCandidate {
+                validator_id: candidate.validator_id,
+                vrf_pubkey: candidate.vrf_pk.unwrap(),
+                stake: candidate.stake_spark,
+            }],
+        };
+
+        let err = engine
+            .propose(&election, 1_700_000_003, Vec::new(), None)
+            .unwrap_err();
+        assert!(matches!(err, NodeError::MissingQc { height: 3 }));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -21,8 +21,18 @@ pub const NO_POLC_ROUND: u32 = u32::MAX;
 
 /// INDRA v1 block header.
 ///
-/// block_hash = SHA-256(encode(BlockHeaderV1))
-/// Field order is fixed and canonical. Any reordering is a consensus break.
+/// `block_hash` is the SHA-256 of the canonical on-disk/on-wire header
+/// encoding. That byte order is consensus-critical and must remain bit-for-bit
+/// compatible with the historical `57398f5` chain data: protocol_version,
+/// height, prev_hash, timestamp, state_root, validator_set_root,
+/// mempool_set_root, base_fee, proposer_round, proposer_vrf_output,
+/// proposer_vrf_proof, quorum_certificate, polc_round, value_hash.
+///
+/// `value_hash` is a separate consensus-layer identity that is stable across
+/// rounds for the same block content, but it is still serialized inside the
+/// header and therefore contributes to `block_hash()` for backwards
+/// compatibility with the existing chain. Changing that relationship would
+/// require a protocol-versioned hard fork.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeaderV1 {
     /// Must equal PROTOCOL_VERSION.
@@ -58,7 +68,7 @@ pub struct BlockHeaderV1 {
 }
 
 impl BlockHeaderV1 {
-    /// Compute the block hash as SHA-256 of the canonical encoding.
+    /// Compute the canonical block hash from the historical header encoding.
     pub fn block_hash(&self) -> Bytes32 {
         Bytes32::from(sha256(&self.encode_to_vec()))
     }

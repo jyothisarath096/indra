@@ -165,7 +165,11 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
 
     // prev_hash must match our current tip
     if block.header.prev_hash != state.tip_hash {
-        return Err(StateError::PrevHashMismatch);
+        return Err(StateError::PrevHashMismatchDetailed {
+            height: block.header.height,
+            expected: state.tip_hash,
+            got: block.header.prev_hash,
+        });
     }
 
     // Block size
@@ -518,7 +522,14 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.prev_hash = Bytes32::from([0xFFu8; 32]); // wrong
-        assert_eq!(apply_block(&mut state, &block), Err(StateError::PrevHashMismatch));
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::PrevHashMismatchDetailed {
+                height: 1,
+                expected: Bytes32::ZERO,
+                got: Bytes32::from([0xFFu8; 32]),
+            })
+        );
     }
 
     #[test]

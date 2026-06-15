@@ -181,6 +181,29 @@ impl ConsensusDriver {
         } else {
             SyncState::follower(driver.engine.state.height)
         };
+        if driver.engine.state.height > 0 {
+            match driver.engine.load_persisted_qc() {
+                Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
+                    eprintln!(
+                        "[driver] restored last_qc_bytes ({} bytes) for height {}",
+                        qc_bytes.len(),
+                        driver.engine.state.height,
+                    );
+                    driver.last_qc_bytes = qc_bytes;
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    eprintln!(
+                        "[driver] WARNING: no persisted QC found at height {} — node will not propose until another validator proposes first",
+                        driver.engine.state.height,
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[driver] WARNING: failed to load persisted QC: {e} — node will not propose until another validator proposes first"
+                    );
+                }
+            }
+        }
         driver.refresh_registered_voters();
         driver
     }
@@ -199,6 +222,12 @@ impl ConsensusDriver {
     /// Return the serialised QC to place in the next proposal header.
     pub fn last_qc_bytes(&self) -> Vec<u8> {
         self.last_qc_bytes.clone()
+    }
+
+    /// Proposal eligibility is enforced inside block construction, where the
+    /// node can see the exact height and QC bytes being embedded.
+    pub fn can_propose(&self) -> bool {
+        true
     }
 
     /// Current round for the next block height.
@@ -869,6 +898,12 @@ impl ConsensusDriver {
                 );
 
                 self.last_qc_bytes = qc.encode_to_vec();
+                if let Err(e) = indra_storage::save_last_qc(
+                    &self.engine.config.state_dir(),
+                    &self.last_qc_bytes,
+                ) {
+                    eprintln!("[driver] WARNING: failed to persist last_qc_bytes: {e}");
+                }
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
                 self.sync.mark_caught_up(self.engine.state.height);
@@ -1043,6 +1078,7 @@ mod tests {
                 state_root: Bytes32::ZERO,
                 validator_set_root: Bytes32::ZERO,
                 mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
                 base_fee: state.base_fee,
                 proposer_round: 0,
                 polc_round: NO_POLC_ROUND,
@@ -1253,6 +1289,85 @@ mod tests {
         driver.valid_value = Some(Bytes32::from([0x11u8; 32]));
 
         assert_eq!(driver.proposal_polc_round(1), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_qc_persisted_after_commit() {
+        let (mut driver, dir) = local_driver([0x61u8; 32], "persist_qc");
+        let _local = install_active_validator(&mut driver, [0x61u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let block = make_block(&driver.engine.state);
+        let _ = driver.process(DriverEvent::InboundBlock { from: None, block });
+
+        let qc_path = driver.engine.config.state_dir().join("last_qc.bin");
+        assert!(qc_path.exists(), "expected last_qc.bin to be created");
+        let bytes = std::fs::read(qc_path).unwrap();
+        assert!(!bytes.is_empty(), "persisted QC must be non-empty");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_qc_restored_on_restart() {
+        let dir = temp_dir("restore_qc");
+        let seed = [0x62u8; 32];
+        {
+            let mut config = NodeConfig::local_test(dir.clone());
+            let pq = PqKeypair::from_seed(&seed).unwrap();
+            config.validator_seed = Some(seed);
+            config.vrf_seed = Some(seed);
+            config.pq_pk = Some(pq.public_key().0.clone());
+            config.pq_sk = Some(pq.secret_key_bytes());
+            let engine = NodeEngine::init(config).unwrap();
+            let mut driver = ConsensusDriver::new(engine);
+            let _local = install_active_validator(&mut driver, seed, "local");
+            driver.refresh_registered_voters();
+            let block = make_block(&driver.engine.state);
+            let _ = driver.process(DriverEvent::InboundBlock { from: None, block });
+            assert!(!driver.last_qc_bytes().is_empty());
+        }
+
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        config.validator_seed = Some(seed);
+        config.vrf_seed = Some(seed);
+        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let restarted = ConsensusDriver::new(engine);
+        assert!(
+            !restarted.last_qc_bytes().is_empty(),
+            "restarted driver should restore persisted QC"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_can_enter_proposer_path_without_qc() {
+        let (mut driver, dir) = local_driver([0x63u8; 32], "no_qc_no_propose");
+        driver.engine.state.height = 2;
+        driver.engine.state.tip_hash = Bytes32::from([0x11; 32]);
+        assert!(
+            driver.can_propose(),
+            "proposal gating should be enforced during block construction, not before proposer selection"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_qc_file_does_not_panic() {
+        let (mut driver, dir) = local_driver([0x64u8; 32], "missing_qc");
+        driver.engine.state.height = 2;
+        driver.engine.state.tip_hash = Bytes32::from([0x22; 32]);
+        let engine = driver.engine;
+
+        let restarted = ConsensusDriver::new(engine);
+        assert!(restarted.last_qc_bytes().is_empty());
+        assert!(restarted.can_propose());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

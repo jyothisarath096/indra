@@ -120,7 +120,7 @@ fn main() {
         snapshot_interval: 300,
         mempool_capacity:  5_000,
         prune_keep_blocks: if archive { None } else { Some(prune_keep) },
-        strict_header_verification: false,
+        strict_header_verification: true,
     };
 
     // Init node engine + consensus driver
@@ -493,7 +493,10 @@ fn main() {
                                         .collect();
 
                                 if candidates.is_empty() {
-                                    (d.engine.config.bootstrap_peers.is_empty(), height)
+                                    (
+                                        d.can_propose() && d.engine.config.bootstrap_peers.is_empty(),
+                                        height,
+                                    )
                                 } else {
                                     let election = indra_consensus::proposer::ProposerElection {
                                         epoch_seed,
@@ -501,7 +504,10 @@ fn main() {
                                         round,
                                         candidates,
                                     };
-                                    (d.engine.is_proposer(&election), height)
+                                    (
+                                        d.can_propose() && d.engine.is_proposer(&election),
+                                        height,
+                                    )
                                 }
                             };
 
@@ -552,6 +558,13 @@ fn main() {
                                                 block: block.clone(),
                                             });
                                             Some((block, actions))
+                                        }
+                                        Err(indra_node::error::NodeError::MissingQc { height }) => {
+                                            eprintln!(
+                                                "[consensus] proposal skipped at height {}: no QC for previous block",
+                                                height
+                                            );
+                                            None
                                         }
                                         Err(e) => {
                                             eprintln!("[consensus] proposal failed: {}", e);

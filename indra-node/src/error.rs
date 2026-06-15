@@ -48,6 +48,14 @@ pub enum NodeError {
     #[error("node is not configured as a validator")]
     NotValidator,
 
+    /// No quorum certificate is available for the previous block, so this
+    /// node cannot construct the next proposal yet.
+    #[error("no QC available for height {height} proposal")]
+    MissingQc {
+        /// The height this node attempted to propose.
+        height: u64,
+    },
+
     /// Genesis state mismatch.
     #[error("genesis mismatch: stored genesis differs from configured genesis")]
     GenesisMismatch,

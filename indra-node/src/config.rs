@@ -50,10 +50,11 @@ pub struct NodeConfig {
     /// `None` means archive mode.
     pub prune_keep_blocks: Option<u64>,
 
-    /// Enforce QC, VRF, and state-root verification on imported block headers.
+    /// Whether to enforce strict cryptographic header verification on block import.
     ///
-    /// Testnet can keep this disabled while legacy placeholder headers are still
-    /// in use. Mainnet must enable it.
+    /// Must be `true` on all validator and full nodes in production.
+    /// `false` is only appropriate during local development and testing
+    /// where blocks are produced without complete validator sets or QCs.
     pub strict_header_verification: bool,
 }
 
@@ -90,7 +91,7 @@ impl NodeConfig {
             snapshot_interval: 300,
             mempool_capacity:  5_000,
             prune_keep_blocks: None,
-            strict_header_verification: false,
+            strict_header_verification: true,
         }
     }
 

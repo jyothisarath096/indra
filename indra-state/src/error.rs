@@ -17,8 +17,15 @@ pub enum StateError {
     },
 
     /// Block's prev_hash does not match the current tip hash.
-    #[error("block prev_hash does not match current tip")]
-    PrevHashMismatch,
+    #[error("block prev_hash does not match current tip at height {height}: expected {expected}, got {got}")]
+    PrevHashMismatchDetailed {
+        /// Block height being applied.
+        height: u64,
+        /// The local state's current tip hash.
+        expected: indra_core::Bytes32,
+        /// The prev_hash carried by the block.
+        got: indra_core::Bytes32,
+    },
 
     /// Block's protocol version is not supported.
     #[error("unsupported protocol version {version}")]
