@@ -190,6 +190,7 @@ fn main() {
                         let status = Message::Status { height, tip_hash: tip };
                         if let Ok(mut g) = gossip.lock() {
                             let _ = g.send_to(&addr, &status);
+                            let _ = g.send_to(&addr, &Message::Ping(now_ms() as u64));
                         }
                     }
                     Err(e) => eprintln!("[listener] accept error: {}", e),
@@ -238,6 +239,7 @@ fn main() {
                             let tip_hash = driver.lock().unwrap().engine.state.tip_hash;
                             let status = Message::Status { height, tip_hash };
                             let _ = gossip.lock().unwrap().send_to(&addr, &status);
+                            let _ = gossip.lock().unwrap().send_to(&addr, &Message::Ping(now_ms() as u64));
                         }
                         Err(e) => {
                             eprintln!("[dialer] failed to connect to {}: {}", addr, e);
@@ -381,6 +383,17 @@ fn main() {
                                 if let Some(height) = caught_up_height {
                                     eprintln!("[sync] caught up to height={}, joining consensus", height);
                                 }
+                                continue;
+                            }
+                            Message::Ping(_) => {
+                                let (height, tip_hash) = {
+                                    let d = driver.lock().unwrap();
+                                    (d.height(), d.engine.state.tip_hash)
+                                };
+                                let _ = gossip.lock().unwrap().send_to(
+                                    &addr,
+                                    &Message::Status { height, tip_hash },
+                                );
                                 continue;
                             }
                             _ => {}

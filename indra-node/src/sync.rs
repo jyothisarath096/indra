@@ -101,23 +101,25 @@ impl SyncState {
         local_height: u64,
     ) -> Option<(SocketAddr, u64, u64)> {
         self.best_peer_height = self.best_peer_height.max(peer_height);
+        let catchup_threshold = self.best_peer_height.saturating_sub(2);
 
-        if peer_height <= local_height {
+        if local_height >= catchup_threshold {
             if matches!(self.phase, SyncPhase::AwaitingPeers) {
                 self.phase = SyncPhase::CaughtUp;
             }
-            if peer_height == local_height && matches!(self.phase, SyncPhase::Downloading { .. }) {
+            if matches!(self.phase, SyncPhase::Downloading { .. }) {
                 self.phase = SyncPhase::CaughtUp;
             }
             return None;
         }
 
         let from_height = local_height.saturating_add(1);
-        let to_height = peer_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+        let target_height = self.best_peer_height;
+        let to_height = target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
 
         self.phase = SyncPhase::Downloading {
             peer,
-            target_height: peer_height,
+            target_height,
             next_expected: from_height,
         };
 
@@ -138,7 +140,8 @@ impl SyncState {
             if imported_height >= *next_expected {
                 *next_expected = imported_height.saturating_add(1);
             }
-            if imported_height >= *target_height {
+            *target_height = (*target_height).max(self.best_peer_height);
+            if imported_height >= self.best_peer_height.saturating_sub(2) {
                 self.phase = SyncPhase::CaughtUp;
             }
         }
@@ -155,7 +158,8 @@ impl SyncState {
                 target_height,
                 next_expected,
             } => {
-                if local_height >= target_height || next_expected > target_height {
+                let target_height = target_height.max(self.best_peer_height);
+                if local_height >= self.best_peer_height.saturating_sub(2) {
                     self.phase = SyncPhase::CaughtUp;
                     None
                 } else {
