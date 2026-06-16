@@ -67,20 +67,45 @@ impl NodeEngine {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(indra_storage::StorageError::Io)?;
 
-        let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
-        let state_store = StateStore::open(config.state_dir())?;
-
-        if block_store.lowest_height() > 0 {
-            return Err(NodeError::PrunedReplayUnsupported {
-                lowest_height: block_store.lowest_height(),
-            });
+        if let Some(keep) = config.prune_keep_blocks {
+            assert!(
+                keep > config.snapshot_interval * 2,
+                "prune_keep_blocks ({}) must be greater than 2x snapshot_interval ({}) to guarantee snapshot-based restart is always possible",
+                keep,
+                config.snapshot_interval
+            );
         }
 
-        // Snapshots currently store only summary fields, so rebuild the
-        // authoritative state from the append-only block log on startup.
-        let _latest_snapshot = state_store.load_latest()?;
-        let mut state = ChainState::new_genesis();
-        rebuild_state_from_block_log(&mut state, &mut block_store)?;
+        let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
+        let state_store = StateStore::open(config.state_dir())?;
+        let startup_log;
+        let state = if let Some(snapshot) = state_store.load_latest()? {
+            let replay_start = snapshot.height.saturating_add(1);
+            if !block_store.is_empty() && block_store.lowest_height() > replay_start {
+                return Err(NodeError::SnapshotReplayGap {
+                    snapshot_height: snapshot.height,
+                    lowest_block: block_store.lowest_height(),
+                    gap: block_store.lowest_height().saturating_sub(replay_start),
+                });
+            }
+
+            startup_log = startup_mode_message(Some(snapshot.height), replay_start, block_store.next_height());
+            let mut state = snapshot;
+            rebuild_state_from_height(&mut state, &mut block_store, replay_start)?;
+            state
+        } else {
+            if block_store.lowest_height() > 0 {
+                return Err(NodeError::PrunedReplayUnsupported {
+                    lowest_height: block_store.lowest_height(),
+                });
+            }
+
+            startup_log = startup_mode_message(None, 1, block_store.next_height());
+            let mut state = ChainState::new_genesis();
+            rebuild_state_from_height(&mut state, &mut block_store, 1)?;
+            state
+        };
+        eprintln!("{startup_log}");
 
         let mempool = Mempool::new(indra_consensus::mempool::MempoolConfig {
             capacity: config.mempool_capacity,
@@ -163,7 +188,7 @@ impl NodeEngine {
         rebuilt.delegations = self.state.delegations.clone();
         rebuilt.utxos = self.state.utxos.clone();
         rebuilt.nullifiers = self.state.nullifiers.clone();
-        rebuild_state_from_block_log(&mut rebuilt, &mut self.block_store)?;
+        rebuild_state_from_height(&mut rebuilt, &mut self.block_store, 1)?;
         self.state = rebuilt;
         Ok(())
     }
@@ -404,25 +429,55 @@ impl NodeEngine {
     }
 }
 
-fn rebuild_state_from_block_log(
+fn startup_mode_message(snapshot_height: Option<u64>, replay_start: u64, next_height: u64) -> String {
+    match snapshot_height {
+        Some(snapshot_height) => {
+            let replay_blocks = next_height.saturating_sub(replay_start);
+            let replay_end = if replay_blocks == 0 {
+                replay_start
+            } else {
+                next_height.saturating_sub(1)
+            };
+            format!(
+                "[engine] startup: snapshot at height={}, replaying {} blocks from height={} to height={}",
+                snapshot_height,
+                replay_blocks,
+                replay_start,
+                replay_end,
+            )
+        }
+        None => format!(
+            "[engine] startup: no snapshot, replaying from genesis ({} blocks)",
+            next_height.saturating_sub(1),
+        ),
+    }
+}
+
+fn rebuild_state_from_height(
     state: &mut ChainState,
     block_store: &mut BlockStore,
+    start_height: u64,
 ) -> NodeResult<()> {
     let canonical_genesis = build_genesis_block();
     if block_store.is_empty() {
-        state.tip_hash = canonical_genesis.header.block_hash();
+        if start_height <= 1 {
+            state.tip_hash = canonical_genesis.header.block_hash();
+        }
         return Ok(());
     }
 
-    let genesis = block_store.get(0)?;
-    if genesis.header.height != canonical_genesis.header.height {
-        return Err(NodeError::GenesisMismatch);
-    }
-    // Anchor replay to the persisted genesis hash so block 1 must chain to
-    // the exact genesis block stored on disk rather than an all-zero tip.
-    state.tip_hash = genesis.header.block_hash();
+    if start_height <= 1 {
+        let genesis = block_store.get(0)?;
+        if genesis.header.height != canonical_genesis.header.height {
+            return Err(NodeError::GenesisMismatch);
+        }
 
-    for height in 1..block_store.next_height() {
+        // Anchor replay to the persisted genesis hash so block 1 must chain to
+        // the exact genesis block stored on disk rather than an all-zero tip.
+        state.tip_hash = genesis.header.block_hash();
+    }
+
+    for height in start_height.max(1)..block_store.next_height() {
         let block = block_store.get(height)?;
         indra_state::apply_block(state, &block)?;
     }
@@ -567,6 +622,96 @@ mod tests {
         assert_eq!(restarted.state.height, 3);
         assert_eq!(restarted.state.tip_hash, engine.state.tip_hash);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_from_snapshot_with_pruned_log() {
+        let dir = temp_dir("snapshot_pruned");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.prune_keep_blocks = Some(650);
+
+        let final_tip_hash = {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            for height in 1..=1_000u64 {
+                let block = make_block(&engine.state);
+                engine.commit_block(&block).unwrap();
+                assert_eq!(engine.state.height, height);
+            }
+            assert!(engine.block_store.lowest_height() > 0);
+            engine.state.tip_hash
+        };
+
+        let restarted = NodeEngine::init(config).unwrap();
+        assert_eq!(restarted.state.height, 1_000);
+        assert_eq!(restarted.state.tip_hash, final_tip_hash);
+        assert!(restarted.block_store.lowest_height() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_fails_on_snapshot_replay_gap() {
+        let dir = temp_dir("snapshot_gap");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.prune_keep_blocks = Some(1_000);
+
+        {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            for _ in 0..1_600u64 {
+                let block = make_block(&engine.state);
+                engine.commit_block(&block).unwrap();
+            }
+        }
+
+        let state_dir = dir.join("state");
+        for entry in std::fs::read_dir(&state_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("snap") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        let state_store = StateStore::open(&state_dir).unwrap();
+        let mut snapshot = ChainState::new_genesis();
+        snapshot.height = 100;
+        snapshot.tip_hash = Bytes32::from([0x55; 32]);
+        state_store.save(&snapshot).unwrap();
+
+        match NodeEngine::init(config) {
+            Err(NodeError::SnapshotReplayGap {
+                snapshot_height,
+                lowest_block,
+                gap,
+            }) => {
+                assert_eq!(snapshot_height, 100);
+                assert_eq!(lowest_block, 601);
+                assert_eq!(gap, 500);
+            }
+            Err(other) => panic!("expected SnapshotReplayGap, got {other}"),
+            Ok(_) => panic!("expected SnapshotReplayGap, got successful startup"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[should_panic(expected = "prune_keep_blocks (100) must be greater than 2x snapshot_interval (150)")]
+    fn prune_alignment_assertion_fires() {
+        let dir = temp_dir("prune_alignment");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.snapshot_interval = 150;
+        config.prune_keep_blocks = Some(100);
+        let _ = NodeEngine::init(config);
+    }
+
+    #[test]
+    fn startup_logs_mode_correctly() {
+        let snapshot_message = startup_mode_message(Some(300), 301, 601);
+        assert!(snapshot_message.contains("snapshot at height=300"));
+        assert!(snapshot_message.contains("replaying 300 blocks from height=301 to height=600"));
+
+        let genesis_message = startup_mode_message(None, 1, 11);
+        assert!(genesis_message.contains("no snapshot"));
+        assert!(genesis_message.contains("replaying from genesis (10 blocks)"));
     }
 
     #[test]

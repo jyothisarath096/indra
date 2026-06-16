@@ -47,6 +47,10 @@ pub enum MessageType {
     Status        = 0x09,
     /// Request a specific proposal block by slot and hash.
     RequestProposal = 0x0A,
+    /// Request the QC for a committed height.
+    RequestQC = 0x0B,
+    /// Respond with encoded QC bytes for a committed height.
+    QCResponse = 0x0C,
 }
 
 impl MessageType {
@@ -63,6 +67,8 @@ impl MessageType {
             0x08 => Ok(Self::BlockResponse),
             0x09 => Ok(Self::Status),
             0x0A => Ok(Self::RequestProposal),
+            0x0B => Ok(Self::RequestQC),
+            0x0C => Ok(Self::QCResponse),
             other => Err(NetworkError::UnexpectedMessage { got: other }),
         }
     }
@@ -111,6 +117,18 @@ pub enum Message {
         /// Proposal block hash.
         hash: Bytes32,
     },
+    /// Request the QC that certifies the current committed tip height.
+    RequestQC {
+        /// The committed height whose QC is requested.
+        height: u64,
+    },
+    /// Return encoded QC bytes for a committed height.
+    QCResponse {
+        /// The committed height whose QC is being returned.
+        height: u64,
+        /// Raw encoded QC bytes.
+        qc_bytes: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -127,6 +145,8 @@ impl Message {
             Self::BlockResponse { .. } => MessageType::BlockResponse,
             Self::Status { .. }        => MessageType::Status,
             Self::RequestProposal { .. } => MessageType::RequestProposal,
+            Self::RequestQC { .. } => MessageType::RequestQC,
+            Self::QCResponse { .. } => MessageType::QCResponse,
         }
     }
 
@@ -209,6 +229,14 @@ impl Message {
                 buf.extend_from_slice(&height.to_le_bytes());
                 buf.extend_from_slice(&round.to_le_bytes());
                 buf.extend_from_slice(&hash.0);
+                buf
+            }
+            Self::RequestQC { height } => height.to_le_bytes().to_vec(),
+            Self::QCResponse { height, qc_bytes } => {
+                let mut buf = Vec::with_capacity(12 + qc_bytes.len());
+                buf.extend_from_slice(&height.to_le_bytes());
+                buf.extend_from_slice(&(qc_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(qc_bytes);
                 buf
             }
         }
@@ -402,6 +430,51 @@ impl Message {
                     hash: Bytes32::from(hash),
                 })
             }
+            MessageType::RequestQC => {
+                let height_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short request_qc".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid request_qc height".to_string(),
+                    })?;
+                Ok(Self::RequestQC {
+                    height: u64::from_le_bytes(height_bytes),
+                })
+            }
+            MessageType::QCResponse => {
+                let height_bytes: [u8; 8] = payload
+                    .get(..8)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short qc_response".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid qc_response height".to_string(),
+                    })?;
+                let len_bytes: [u8; 4] = payload
+                    .get(8..12)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "short qc_response".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid qc_response length".to_string(),
+                    })?;
+                let len = u32::from_le_bytes(len_bytes) as usize;
+                let qc_bytes = payload
+                    .get(12..12 + len)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "truncated qc_response bytes".to_string(),
+                    })?
+                    .to_vec();
+                Ok(Self::QCResponse {
+                    height: u64::from_le_bytes(height_bytes),
+                    qc_bytes,
+                })
+            }
         }
     }
 }
@@ -444,6 +517,25 @@ mod tests {
         assert!(matches!(
             decoded,
             Message::RequestProposal { height: 7, round: 3, hash: decoded_hash } if decoded_hash == hash
+        ));
+    }
+
+    #[test]
+    fn qc_request_response_round_trip() {
+        let request = Message::RequestQC { height: 42 };
+        let request_wire = request.encode_wire().unwrap();
+        let decoded_request = Message::decode_wire(&request_wire[4..]).unwrap();
+        assert!(matches!(decoded_request, Message::RequestQC { height: 42 }));
+
+        let response = Message::QCResponse {
+            height: 42,
+            qc_bytes: vec![1, 2, 3],
+        };
+        let response_wire = response.encode_wire().unwrap();
+        let decoded_response = Message::decode_wire(&response_wire[4..]).unwrap();
+        assert!(matches!(
+            decoded_response,
+            Message::QCResponse { height: 42, qc_bytes } if qc_bytes == vec![1, 2, 3]
         ));
     }
 

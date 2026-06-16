@@ -17,9 +17,11 @@ fn message_encode_decode_all_types() {
     let messages = vec![
         Message::Ping(999),
         Message::Pong(999),
-        Message::GetBlocks { from_height: 0, to_height: 100 },
+        Message::RequestBlocks { from_height: 0, to_height: 100 },
         Message::Status { height: 42, tip_hash: Bytes32::from([0xAAu8; 32]) },
         Message::PeerList(vec!["127.0.0.1:30303".to_string()]),
+        Message::RequestQC { height: 42 },
+        Message::QCResponse { height: 42, qc_bytes: vec![1, 2, 3] },
     ];
 
     for msg in messages {
@@ -32,6 +34,25 @@ fn message_encode_decode_all_types() {
             "message type mismatch"
         );
     }
+}
+
+#[test]
+fn qc_request_response_round_trip() {
+    let request = Message::RequestQC { height: 42 };
+    let request_wire = request.encode_wire().unwrap();
+    let decoded_request = Message::decode_wire(&request_wire[4..]).unwrap();
+    assert!(matches!(decoded_request, Message::RequestQC { height: 42 }));
+
+    let response = Message::QCResponse {
+        height: 42,
+        qc_bytes: vec![1, 2, 3],
+    };
+    let response_wire = response.encode_wire().unwrap();
+    let decoded_response = Message::decode_wire(&response_wire[4..]).unwrap();
+    assert!(matches!(
+        decoded_response,
+        Message::QCResponse { height: 42, qc_bytes } if qc_bytes == vec![1, 2, 3]
+    ));
 }
 
 #[test]

@@ -22,7 +22,8 @@
 use std::collections::HashMap;
 
 use indra_core::{
-    codec::Encode,
+    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    error::{IndraError, IndraResult},
     types::{
         primitives::Bytes32,
         transaction::OutputV1,
@@ -36,7 +37,7 @@ use crate::{
 };
 
 /// A UTXO entry in the set: the output itself plus metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtxoEntry {
     /// The UTXO ID (key in the set — stored here for convenience).
     pub utxo_id: Bytes32,
@@ -50,6 +51,36 @@ pub struct UtxoEntry {
     pub output_index: u32,
 }
 
+impl Encode for UtxoEntry {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.utxo_id.encode(buf);
+        self.output.encode(buf);
+        self.created_height.encode(buf);
+        self.tx_index.encode(buf);
+        self.output_index.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.utxo_id.encoded_len()
+            + self.output.encoded_len()
+            + self.created_height.encoded_len()
+            + self.tx_index.encoded_len()
+            + self.output_index.encoded_len()
+    }
+}
+
+impl Decode for UtxoEntry {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            utxo_id: Bytes32::decode(r)?,
+            output: OutputV1::decode(r)?,
+            created_height: u64::decode(r)?,
+            tx_index: u32::decode(r)?,
+            output_index: u32::decode(r)?,
+        })
+    }
+}
+
 /// The complete set of unspent transaction outputs.
 ///
 /// Keyed by UTXO ID (32-byte hash). Supports insert, lookup, and spend.
@@ -58,6 +89,46 @@ pub struct UtxoEntry {
 pub struct UtxoSet {
     entries: HashMap<Bytes32, UtxoEntry>,
     smt: SparseMerkleTree,
+}
+
+impl PartialEq for UtxoSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.smt.root() == other.smt.root()
+    }
+}
+
+impl Eq for UtxoSet {}
+
+impl Encode for UtxoSet {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        let mut entries: Vec<_> = self.entries.values().cloned().collect();
+        entries.sort_by_key(|entry| entry.utxo_id.0);
+        encode_list(&entries, buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        let mut entries: Vec<_> = self.entries.values().cloned().collect();
+        entries.sort_by_key(|entry| entry.utxo_id.0);
+        list_encoded_len(&entries)
+    }
+}
+
+impl Decode for UtxoSet {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let entries: Vec<UtxoEntry> = decode_list(r, usize::MAX, "snapshot.utxos")?;
+        let mut set = Self::new();
+        for entry in entries {
+            if set.entries.contains_key(&entry.utxo_id) {
+                return Err(IndraError::DuplicateEntries {
+                    field: "snapshot.utxos",
+                });
+            }
+            let leaf_value = Self::leaf_value(&entry);
+            set.smt.insert(entry.utxo_id.0, leaf_value);
+            set.entries.insert(entry.utxo_id, entry);
+        }
+        Ok(set)
+    }
 }
 
 impl UtxoSet {

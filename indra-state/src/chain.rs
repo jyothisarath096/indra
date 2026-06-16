@@ -3,6 +3,9 @@
 //! This is everything a node needs to validate the next block.
 //! It is the input and output of `apply_block`.
 
+use indra_core::codec::{ByteReader, Decode, Encode};
+use indra_core::error::IndraResult;
+
 use indra_core::types::primitives::{
     Bytes32,
     GENESIS_SUPPLY_SPARK,
@@ -20,7 +23,7 @@ use crate::{
 /// Two `ChainState` values are equivalent if and only if they represent
 /// the same chain history. The `state_root` field (once implemented in
 /// Phase 5) will be a cryptographic commitment to this entire structure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainState {
     /// Height of the most recently applied block (0 = genesis, before block 1).
     pub height: u64,
@@ -56,6 +59,67 @@ pub struct ChainState {
 
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
+}
+
+impl Encode for ChainState {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        // Included: the applied height determines the next valid block height.
+        self.height.encode(buf);
+        // Included: the next block must chain to the exact committed tip hash.
+        self.tip_hash.encode(buf);
+        // Included: fee validation for the next block depends on the current base fee.
+        self.base_fee.encode(buf);
+        // Included: block value hashing and supply accounting depend on total supply.
+        self.total_supply.encode(buf);
+        // Included: treasury accounting is part of consensus state and affects rewards.
+        self.treasury_balance.encode(buf);
+        // Included: burn-buffer accounting is consensus-visible and must survive restart.
+        self.burn_buffer.encode(buf);
+        // Included: pending fee rewards affect future epoch distribution.
+        self.fee_reward_pool.encode(buf);
+        // Included: the full UTXO set is required to validate spends after restart.
+        self.utxos.encode(buf);
+        // Included: nullifiers are the double-spend guard and cannot be reconstructed from summaries.
+        self.nullifiers.encode(buf);
+        // Included: validator metadata is needed for proposer election and signature/QC verification.
+        self.validators.encode(buf);
+        // Included: delegations affect validator power and epoch transitions.
+        self.delegations.encode(buf);
+        // Omitted: no extra cached fields live on ChainState itself; nested SMT caches are
+        // intentionally reconstructed by the set decoders from the serialized canonical entries.
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.height.encoded_len()
+            + self.tip_hash.encoded_len()
+            + self.base_fee.encoded_len()
+            + self.total_supply.encoded_len()
+            + self.treasury_balance.encoded_len()
+            + self.burn_buffer.encoded_len()
+            + self.fee_reward_pool.encoded_len()
+            + self.utxos.encoded_len()
+            + self.nullifiers.encoded_len()
+            + self.validators.encoded_len()
+            + self.delegations.encoded_len()
+    }
+}
+
+impl Decode for ChainState {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            height: u64::decode(r)?,
+            tip_hash: Bytes32::decode(r)?,
+            base_fee: u64::decode(r)?,
+            total_supply: u64::decode(r)?,
+            treasury_balance: u64::decode(r)?,
+            burn_buffer: u64::decode(r)?,
+            fee_reward_pool: u64::decode(r)?,
+            utxos: UtxoSet::decode(r)?,
+            nullifiers: NullifierSet::decode(r)?,
+            validators: ValidatorSet::decode(r)?,
+            delegations: DelegationMap::decode(r)?,
+        })
+    }
 }
 
 impl ChainState {

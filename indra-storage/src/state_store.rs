@@ -19,12 +19,15 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_state::ChainState;
 
 use crate::error::{StorageError, StorageResult};
 
 /// How often to take a state snapshot (in blocks).
 pub const SNAPSHOT_INTERVAL: u64 = 300;
+const SNAPSHOT_VERSION_V1_SUMMARY: u8 = 0x01;
+const SNAPSHOT_VERSION_V2_COMPLETE: u8 = 0x02;
 
 /// Manages chain state snapshots on disk.
 pub struct StateStore {
@@ -95,12 +98,10 @@ impl StateStore {
                 let mut state_bytes = vec![0u8; length];
                 f.read_exact(&mut state_bytes)?;
 
-                deserialise_chain_state(&state_bytes, height)
-                    .map(Some)
-                    .map_err(|e| StorageError::Corruption {
-                        height,
-                        detail: e,
-                    })
+                deserialise_chain_state(&state_bytes, height).map_err(|e| StorageError::Corruption {
+                    height,
+                    detail: e,
+                })
             }
         }
     }
@@ -150,48 +151,69 @@ impl StateStore {
     }
 }
 
-/// Serialise a ChainState to bytes.
-/// Format: height(8) || base_fee(8) || tip_hash(32) || total_supply(8)
-///      || treasury(8) || fee_reward_pool(8)
-/// This is a minimal snapshot — the full UTXO/nullifier/validator sets
-/// are rebuilt from block replay in Phase 6. For now we store the summary fields.
+/// Serialise a complete chain state snapshot.
+///
+/// Payload format:
+/// - `0x02` version discriminator for the complete-state format
+/// - canonical `ChainState` encoding
 fn serialise_chain_state(state: &ChainState) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(72);
-    buf.extend_from_slice(&state.height.to_le_bytes());
-    buf.extend_from_slice(&state.base_fee.to_le_bytes());
-    buf.extend_from_slice(&state.tip_hash.0);
-    buf.extend_from_slice(&state.total_supply.to_le_bytes());
-    buf.extend_from_slice(&state.treasury_balance.to_le_bytes());
-    buf.extend_from_slice(&state.fee_reward_pool.to_le_bytes());
+    let mut buf = Vec::with_capacity(1 + state.encoded_len());
+    buf.push(SNAPSHOT_VERSION_V2_COMPLETE);
+    state.encode(&mut buf);
     buf
 }
 
-/// Deserialise a ChainState from bytes (minimal snapshot format).
-fn deserialise_chain_state(bytes: &[u8], _height: u64) -> Result<ChainState, String> {
-    if bytes.len() < 64 {
-        return Err(format!("snapshot too short: {} bytes", bytes.len()));
+/// Deserialise a chain state snapshot.
+///
+/// Returns `Ok(None)` for legacy/incomplete snapshot payloads so startup can
+/// gracefully fall back to full replay when possible.
+fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<ChainState>, String> {
+    if bytes.len() == 72 {
+        eprintln!(
+            "[storage] warning: ignoring legacy unversioned summary snapshot at height {}",
+            file_height
+        );
+        return Ok(None);
     }
 
-    let height = u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| "bad height")?);
-    let base_fee = u64::from_le_bytes(bytes[8..16].try_into().map_err(|_| "bad base_fee")?);
-    let tip_hash: [u8; 32] = bytes[16..48].try_into().map_err(|_| "bad tip_hash")?;
-    let total_supply = u64::from_le_bytes(bytes[48..56].try_into().map_err(|_| "bad total_supply")?);
-    let treasury = u64::from_le_bytes(bytes[56..64].try_into().map_err(|_| "bad treasury")?);
-    let fee_reward_pool = if bytes.len() >= 72 {
-        u64::from_le_bytes(bytes[64..72].try_into().map_err(|_| "bad fee_reward_pool")?)
-    } else {
-        0
+    let Some((&version, payload)) = bytes.split_first() else {
+        return Err("snapshot payload is empty".to_string());
     };
 
-    use indra_core::types::primitives::Bytes32;
-    let mut state = ChainState::new_genesis();
-    state.height       = height;
-    state.base_fee     = base_fee;
-    state.tip_hash     = Bytes32::from(tip_hash);
-    state.total_supply = total_supply;
-    state.treasury_balance = treasury;
-    state.fee_reward_pool = fee_reward_pool;
-    Ok(state)
+    match version {
+        SNAPSHOT_VERSION_V1_SUMMARY => {
+            eprintln!(
+                "[storage] warning: ignoring legacy v1 summary snapshot at height {}",
+                file_height
+            );
+            Ok(None)
+        }
+        SNAPSHOT_VERSION_V2_COMPLETE => {
+            let mut reader = ByteReader::new(payload);
+            let state = ChainState::decode(&mut reader).map_err(|e| e.to_string())?;
+            if reader.remaining() != 0 {
+                return Err(format!(
+                    "snapshot at height {} has {} trailing bytes",
+                    file_height,
+                    reader.remaining()
+                ));
+            }
+            if state.height != file_height {
+                return Err(format!(
+                    "snapshot height mismatch: file says {}, payload says {}",
+                    file_height, state.height
+                ));
+            }
+            Ok(Some(state))
+        }
+        other => {
+            eprintln!(
+                "[storage] warning: ignoring incompatible snapshot version 0x{other:02x} at height {}",
+                file_height
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -217,9 +239,7 @@ mod tests {
         store.save(&state).unwrap();
 
         let loaded = store.load_latest().unwrap().unwrap();
-        assert_eq!(loaded.height, 42);
-        assert_eq!(loaded.base_fee, 500);
-        assert_eq!(loaded.fee_reward_pool, 777);
+        assert_eq!(loaded, state);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -245,6 +265,111 @@ mod tests {
 
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded.height, 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn complete_snapshot_round_trip() {
+        use indra_core::types::primitives::{Bytes32, DUST_LIMIT_SPARK};
+        use indra_state::{ValidatorEntry, ValidatorStatus};
+
+        let dir = temp_dir("round_trip");
+        let store = StateStore::open(&dir).unwrap();
+
+        let mut state = ChainState::new_genesis();
+        state.height = 512;
+        state.tip_hash = Bytes32::from([0x11; 32]);
+        state.base_fee = 4242;
+        state.total_supply = 9_999_999;
+        state.treasury_balance = 123_456;
+        state.burn_buffer = 654_321;
+        state.fee_reward_pool = 888;
+
+        state
+            .utxos
+            .insert(
+                indra_core::types::transaction::OutputV1 {
+                    value_spark: 50_000,
+                    commitment: indra_core::CommitmentV1 {
+                        compressed_point: Bytes32::from([0x21; 32]),
+                    },
+                    owner_pubkey: indra_core::HybridPubKey {
+                        classical_pk: Bytes32::from([0x22; 32]),
+                        pq_pk: indra_core::VariableBytes::from_slice(&[0x23; 64]).unwrap(),
+                    },
+                    range_proof: indra_core::VariableBytes::from_slice(&[0x24; 96]).unwrap(),
+                    lock_height: 77,
+                },
+                512,
+                0,
+                0,
+            )
+            .unwrap();
+        state.nullifiers.insert(Bytes32::from([0x31; 32]));
+
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id: Bytes32::from([0x41; 32]),
+                name: "validator-one".to_string(),
+                hybrid_classical_pk: Some([0x42; 32]),
+                hybrid_pq_pk: Some(vec![0x43; 80]),
+                vrf_pk: Some([0x44; 32]),
+                stake_spark: 1_000_000,
+                status: ValidatorStatus::Active,
+                registered_epoch: 7,
+                pending_rewards: 12,
+                rewards_last_epoch: 6,
+                self_report_count: 1,
+                commission_bps: 900,
+                min_delegation_spark: DUST_LIMIT_SPARK,
+            })
+            .unwrap();
+        state.delegations.add_delegation(
+            Bytes32::from([0x41; 32]),
+            Bytes32::from([0x51; 32]),
+            25_000,
+            7,
+        );
+        state
+            .delegations
+            .begin_undelegate(
+                &Bytes32::from([0x41; 32]),
+                &Bytes32::from([0x51; 32]),
+                5_000,
+                9,
+            )
+            .unwrap();
+
+        store.save(&state).unwrap();
+        let loaded = store.load_latest().unwrap().unwrap();
+        assert_eq!(loaded, state);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_v1_snapshot_rejected_gracefully() {
+        let dir = temp_dir("old_v1");
+        let store = StateStore::open(&dir).unwrap();
+        let path = dir.join("state_300.snap");
+
+        let mut payload = Vec::with_capacity(72);
+        payload.extend_from_slice(&300u64.to_le_bytes());
+        payload.extend_from_slice(&500u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&1_000u64.to_le_bytes());
+        payload.extend_from_slice(&200u64.to_le_bytes());
+        payload.extend_from_slice(&300u64.to_le_bytes());
+
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&300u64.to_le_bytes()).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&payload).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        assert!(store.load_latest().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

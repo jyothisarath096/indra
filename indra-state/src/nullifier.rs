@@ -14,7 +14,11 @@
 
 use std::collections::HashSet;
 
-use indra_core::types::primitives::Bytes32;
+use indra_core::{
+    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    error::{IndraError, IndraResult},
+    types::primitives::Bytes32,
+};
 use indra_crypto::sha256;
 
 use crate::smt::{MerkleProof, SparseMerkleTree};
@@ -27,6 +31,44 @@ use crate::smt::{MerkleProof, SparseMerkleTree};
 pub struct NullifierSet {
     spent: HashSet<Bytes32>,
     smt: SparseMerkleTree,
+}
+
+impl PartialEq for NullifierSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.spent == other.spent && self.smt.root() == other.smt.root()
+    }
+}
+
+impl Eq for NullifierSet {}
+
+impl Encode for NullifierSet {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        let mut spent: Vec<_> = self.spent.iter().copied().collect();
+        spent.sort_by_key(|nullifier| nullifier.0);
+        encode_list(&spent, buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        let mut spent: Vec<_> = self.spent.iter().copied().collect();
+        spent.sort_by_key(|nullifier| nullifier.0);
+        list_encoded_len(&spent)
+    }
+}
+
+impl Decode for NullifierSet {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let spent: Vec<Bytes32> = decode_list(r, usize::MAX, "snapshot.nullifiers")?;
+        let mut set = Self::new();
+        for nullifier in spent {
+            if !set.spent.insert(nullifier) {
+                return Err(IndraError::DuplicateEntries {
+                    field: "snapshot.nullifiers",
+                });
+            }
+            set.smt.insert(nullifier.0, sha256(&nullifier.0));
+        }
+        Ok(set)
+    }
 }
 
 impl NullifierSet {

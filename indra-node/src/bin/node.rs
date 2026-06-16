@@ -149,6 +149,7 @@ fn main() {
 
     let mut driver_state = ConsensusDriver::new(engine);
     driver_state.refresh_registered_voters();
+    let startup_qc_request = driver_state.request_qc_if_needed();
     let driver = driver_state;
 
     // Shared state between threads
@@ -160,6 +161,7 @@ fn main() {
     {
         let gossip  = Arc::clone(&gossip);
         let driver  = Arc::clone(&driver);
+        let height_tx = height_tx.clone();
         let p2p     = p2p_addr.clone();
 
         std::thread::spawn(move || {
@@ -192,6 +194,9 @@ fn main() {
                             let _ = g.send_to(&addr, &status);
                             let _ = g.send_to(&addr, &Message::Ping(now_ms() as u64));
                         }
+
+                        let actions = driver.lock().unwrap().request_qc_if_needed();
+                        process_driver_actions(&driver, &gossip, &height_tx, height, actions);
                     }
                     Err(e) => eprintln!("[listener] accept error: {}", e),
                 }
@@ -203,6 +208,7 @@ fn main() {
     {
         let gossip   = Arc::clone(&gossip);
         let driver   = Arc::clone(&driver);
+        let height_tx = height_tx.clone();
         let peers    = bootstrap_peers.clone();
         std::thread::spawn(move || {
             // Wait a moment for the listener to start
@@ -240,6 +246,9 @@ fn main() {
                             let status = Message::Status { height, tip_hash };
                             let _ = gossip.lock().unwrap().send_to(&addr, &status);
                             let _ = gossip.lock().unwrap().send_to(&addr, &Message::Ping(now_ms() as u64));
+
+                            let actions = driver.lock().unwrap().request_qc_if_needed();
+                            process_driver_actions(&driver, &gossip, &height_tx, height, actions);
                         }
                         Err(e) => {
                             eprintln!("[dialer] failed to connect to {}: {}", addr, e);
@@ -327,6 +336,26 @@ fn main() {
                                         round,
                                     );
                                     let _ = gossip.lock().unwrap().send_to(&addr, &Message::Block(block));
+                                }
+                                continue;
+                            }
+                            Message::RequestQC { height } => {
+                                let qc_bytes = {
+                                    let d = driver.lock().unwrap();
+                                    if d.height() == *height && !d.last_qc_bytes().is_empty() {
+                                        Some(d.last_qc_bytes())
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(qc_bytes) = qc_bytes {
+                                    let _ = gossip.lock().unwrap().send_to(
+                                        &addr,
+                                        &Message::QCResponse {
+                                            height: *height,
+                                            qc_bytes,
+                                        },
+                                    );
                                 }
                                 continue;
                             }
@@ -422,6 +451,7 @@ fn main() {
     {
         let driver  = Arc::clone(&driver);
         let gossip  = Arc::clone(&gossip);
+        let height_tx = height_tx.clone();
         let height_rx = height_rx;
 
         std::thread::spawn(move || {
@@ -640,6 +670,11 @@ fn main() {
         });
     }
 
+    if !startup_qc_request.is_empty() {
+        let current_height = driver.lock().unwrap().height();
+        process_driver_actions(&driver, &gossip, &height_tx, current_height, startup_qc_request);
+    }
+
     // ── Thread 5: RPC server ────────────────────────────────────────────────
     // Inline HTTP/JSON-RPC handler — avoids circular dependency with indra-rpc.
     // Reads chain state directly from the driver under a brief lock.
@@ -726,6 +761,9 @@ fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction
                 hex::encode(&tx.tx_hash().0[..4]),
                 peers,
             );
+        }
+        DriverAction::RequestQC { height } => {
+            eprintln!("[driver] requesting QC for height {} from {} peers", height, peers);
         }
         _ => {}
     }

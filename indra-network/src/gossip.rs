@@ -84,6 +84,22 @@ pub enum GossipEvent {
         /// Last height requested.
         to_height: u64,
     },
+    /// A peer requested the QC for a committed height.
+    QCRequest {
+        /// The requesting peer.
+        from: SocketAddr,
+        /// The committed height whose QC is requested.
+        height: u64,
+    },
+    /// A peer responded with QC bytes for a committed height.
+    QCResponse {
+        /// The responding peer.
+        from: SocketAddr,
+        /// The committed height whose QC is provided.
+        height: u64,
+        /// Raw encoded QC bytes.
+        qc_bytes: Vec<u8>,
+    },
 }
 
 /// The gossip engine.

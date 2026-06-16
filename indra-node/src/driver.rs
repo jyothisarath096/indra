@@ -9,12 +9,14 @@ use std::net::SocketAddr;
 
 use indra_consensus::{
     build_qc,
+    verify_qc,
     vote::{RegisteredVoter, VoteCollector, VoteDecision},
 };
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
     primitives::Bytes32,
+    qc::QuorumCertificateV1,
     transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
 };
@@ -77,6 +79,15 @@ pub enum DriverEvent {
         /// The peer's tip hash.
         tip_hash: Bytes32,
     },
+    /// A peer responded with raw QC bytes for the current committed tip.
+    QcResponse {
+        /// The sender.
+        from: SocketAddr,
+        /// The committed height the QC should certify.
+        height: u64,
+        /// Raw encoded QC bytes.
+        qc_bytes: Vec<u8>,
+    },
 }
 
 /// An action the driver wants to perform in response to an event.
@@ -107,6 +118,11 @@ pub enum DriverAction {
         round: u32,
         /// Proposal block hash.
         hash: Bytes32,
+    },
+    /// Ask peers for the QC that certifies the current committed tip.
+    RequestQC {
+        /// The committed height whose QC is needed.
+        height: u64,
     },
     /// Re-process a buffered future proposal after the local tip advances.
     ActivateBufferedProposal(BlockV1),
@@ -230,6 +246,18 @@ impl ConsensusDriver {
         true
     }
 
+    /// Request the QC for the currently committed tip if restart recovery left
+    /// us without persisted `last_qc_bytes`.
+    pub fn request_qc_if_needed(&self) -> Vec<DriverAction> {
+        if self.engine.state.height > 0 && self.last_qc_bytes.is_empty() {
+            vec![DriverAction::RequestQC {
+                height: self.engine.state.height,
+            }]
+        } else {
+            vec![]
+        }
+    }
+
     /// Current round for the next block height.
     pub fn current_round(&self) -> u32 {
         self.current_round
@@ -277,6 +305,9 @@ impl ConsensusDriver {
             DriverEvent::InboundTx { from, tx_bytes } => self.process_tx(from, tx_bytes),
             DriverEvent::PeerStatus { from, height, tip_hash } => {
                 self.process_status(from, height, tip_hash)
+            }
+            DriverEvent::QcResponse { from, height, qc_bytes } => {
+                self.handle_qc_response(from, height, qc_bytes)
             }
         }
     }
@@ -996,6 +1027,60 @@ impl ConsensusDriver {
         }
     }
 
+    fn handle_qc_response(
+        &mut self,
+        from: SocketAddr,
+        height: u64,
+        qc_bytes: Vec<u8>,
+    ) -> Vec<DriverAction> {
+        if height != self.engine.state.height || !self.last_qc_bytes.is_empty() {
+            return vec![];
+        }
+
+        let mut reader = ByteReader::new(&qc_bytes);
+        let qc = match QuorumCertificateV1::decode(&mut reader) {
+            Ok(qc) => qc,
+            Err(err) => {
+                eprintln!(
+                    "[driver] WARNING: received invalid QC encoding from {} at height {}: {}",
+                    from,
+                    height,
+                    err,
+                );
+                return vec![];
+            }
+        };
+
+        if qc.height != height {
+            return vec![];
+        }
+
+        let validators = self.engine.qc_validators();
+        let total_stake = self.engine.state.validators.total_active_stake();
+        if let Err(err) = verify_qc(&qc, &validators, total_stake) {
+            eprintln!(
+                "[driver] WARNING: received invalid QC from {} at height {}: {}",
+                from,
+                height,
+                err,
+            );
+            return vec![];
+        }
+
+        self.last_qc_bytes = qc_bytes;
+        if let Err(err) = indra_storage::save_last_qc(
+            &self.engine.config.state_dir(),
+            &self.last_qc_bytes,
+        ) {
+            eprintln!("[driver] WARNING: failed to persist recovered last_qc_bytes: {err}");
+        }
+        eprintln!(
+            "[driver] recovered last_qc_bytes from peer at height {}",
+            height
+        );
+        vec![]
+    }
+
     /// Rule 11 — on propose timeout, prevote nil unless the proposal for the
     /// current round is already staged locally.
     pub fn on_propose_timeout(&mut self) -> Vec<DriverAction> {
@@ -1368,6 +1453,98 @@ mod tests {
         assert!(restarted.last_qc_bytes().is_empty());
         assert!(restarted.can_propose());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_qc_response_accepts_valid_qc() {
+        let (mut driver, dir) = local_driver([0x65u8; 32], "qc_response_valid");
+        let local = install_active_validator(&mut driver, [0x65u8; 32], "local");
+        driver.engine.state.height = 7;
+        driver.engine.state.tip_hash = Bytes32::from([0x31; 32]);
+        driver.refresh_registered_voters();
+
+        let validator_id = Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
+        let value_hash = Bytes32::from([0x44u8; 32]);
+        let vote = indra_consensus::vote::produce_vote(
+            7,
+            0,
+            VoteStep::Precommit,
+            value_hash,
+            validator_id,
+            &local,
+        )
+        .unwrap();
+        let validators = driver.engine.qc_validators();
+        let qc = indra_consensus::build_qc(7, 0, value_hash, &validators, vec![&vote]).unwrap();
+        let qc_bytes = qc.encode_to_vec();
+
+        let _ = driver.process(DriverEvent::QcResponse {
+            from: "127.0.0.1:9501".parse().unwrap(),
+            height: 7,
+            qc_bytes: qc_bytes.clone(),
+        });
+
+        assert_eq!(driver.last_qc_bytes(), qc_bytes);
+        assert!(driver.engine.config.state_dir().join("last_qc.bin").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_qc_response_rejects_invalid_qc() {
+        let (mut driver, dir) = local_driver([0x66u8; 32], "qc_response_invalid");
+        let local = install_active_validator(&mut driver, [0x66u8; 32], "local");
+        driver.engine.state.height = 7;
+        driver.refresh_registered_voters();
+
+        let validator_id = Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
+        let value_hash = Bytes32::from([0x45u8; 32]);
+        let vote = indra_consensus::vote::produce_vote(
+            7,
+            0,
+            VoteStep::Precommit,
+            value_hash,
+            validator_id,
+            &local,
+        )
+        .unwrap();
+        let validators = driver.engine.qc_validators();
+        let qc = indra_consensus::build_qc(7, 0, value_hash, &validators, vec![&vote]).unwrap();
+        let mut qc_bytes = qc.encode_to_vec();
+        let last = qc_bytes.len() - 1;
+        qc_bytes[last] ^= 0x01;
+
+        let _ = driver.process(DriverEvent::QcResponse {
+            from: "127.0.0.1:9502".parse().unwrap(),
+            height: 7,
+            qc_bytes,
+        });
+
+        assert!(driver.last_qc_bytes().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_qc_response_ignores_wrong_height() {
+        let (mut driver, dir) = local_driver([0x67u8; 32], "qc_response_height");
+        driver.engine.state.height = 100;
+        let _ = driver.process(DriverEvent::QcResponse {
+            from: "127.0.0.1:9503".parse().unwrap(),
+            height: 50,
+            qc_bytes: vec![1, 2, 3],
+        });
+        assert!(driver.last_qc_bytes().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qc_request_not_sent_when_qc_present() {
+        let (mut driver, dir) = local_driver([0x68u8; 32], "qc_request_present");
+        driver.engine.state.height = 9;
+        driver.last_qc_bytes = vec![1, 2, 3];
+        assert!(driver.request_qc_if_needed().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

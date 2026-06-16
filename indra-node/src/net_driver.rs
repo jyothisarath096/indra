@@ -28,6 +28,9 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
         Message::Status { height, tip_hash } => {
             Some(DriverEvent::PeerStatus { from, height, tip_hash })
         }
+        Message::QCResponse { height, qc_bytes } => {
+            Some(DriverEvent::QcResponse { from, height, qc_bytes })
+        }
         _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse, RequestProposal handled elsewhere
     }
 }
@@ -38,6 +41,7 @@ pub fn action_to_message(action: &DriverAction) -> Option<Message> {
         DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
         DriverAction::BroadcastVote(vote)   => Some(Message::Vote(vote.clone())),
         DriverAction::BroadcastTx(tx)       => Some(Message::Tx(tx.clone())),
+        DriverAction::RequestQC { height }  => Some(Message::RequestQC { height: *height }),
         _ => None,
     }
 }

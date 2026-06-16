@@ -66,6 +66,17 @@ pub enum NodeError {
         /// Lowest block height still present in the local block store.
         lowest_height: u64,
     },
+
+    /// Snapshot exists but the retained block log no longer covers the replay gap.
+    #[error("snapshot at height {snapshot_height} cannot be replayed: block log starts at {lowest_block}, gap of {gap} blocks")]
+    SnapshotReplayGap {
+        /// Height encoded in the loaded snapshot.
+        snapshot_height: u64,
+        /// Lowest block height currently retained on disk.
+        lowest_block: u64,
+        /// Number of missing blocks between the snapshot and retained block window.
+        gap: u64,
+    },
 }
 
 /// Convenience alias.
