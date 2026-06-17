@@ -7,13 +7,16 @@ use indra_core::{
     types::{
         block::{BlockHeaderV1, BlockV1},
         primitives::MAX_VRF_PROOF_BYTES,
+        vote::VoteStep,
     },
 };
 use indra_state::{ChainState, apply_block, compute_validator_set_root};
 use indra_consensus::mempool::Mempool;
+use indra_crypto::{hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair}, VrfKeypair};
 use indra_storage::{BlockStore, PruneConfig, StateStore};
 use indra_node::{
     NodeConfig, NodeEngine,
+    driver::{ConsensusDriver, DriverAction, DriverEvent},
     genesis::{build_genesis_state, genesis_block_hash},
     state_root::compute_state_root,
     sync::{import_block, SyncState},
@@ -60,6 +63,53 @@ fn make_block(state: &ChainState) -> BlockV1 {
     block.header.validator_set_root = compute_validator_set_root(&projected);
     block.header.value_hash = block.compute_value_hash(projected.total_supply);
     block
+}
+
+fn install_active_validator(
+    driver: &mut ConsensusDriver,
+    seed: [u8; 32],
+    name: &str,
+) -> HybridKeypair {
+    let classical = ClassicalKeypair::from_seed(&seed);
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    let hybrid = HybridKeypair::new(classical, pq);
+    let public = hybrid.public_key();
+    let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+    let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+
+    driver
+        .engine
+        .state
+        .validators
+        .upsert(indra_state::ValidatorEntry {
+            validator_id,
+            name: name.to_string(),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.clone()),
+            vrf_pk: Some(vrf_pk),
+            stake_spark: 1_000_000,
+            status: indra_state::ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+        })
+        .unwrap();
+    hybrid
+}
+
+fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
+    let dir = temp_dir(suffix);
+    let mut config = NodeConfig::local_test(dir.clone());
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    config.validator_seed = Some(seed);
+    config.vrf_seed = Some(seed);
+    config.pq_pk = Some(pq.public_key().0.clone());
+    config.pq_sk = Some(pq.secret_key_bytes());
+    let engine = NodeEngine::init(config).unwrap();
+    (ConsensusDriver::new(engine), dir)
 }
 
 fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {
@@ -327,5 +377,109 @@ fn full_node_pipeline() {
 
     assert_eq!(state.height, 10);
     assert_eq!(block_store.len(), 11); // genesis + 10 blocks
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn node_syncs_before_joining_consensus() {
+    let (mut driver, dir) = local_driver([0x71u8; 32], "join_after_sync");
+    let _local = install_active_validator(&mut driver, [0x71u8; 32], "local");
+    let remote = install_active_validator(&mut driver, [0x72u8; 32], "remote");
+    driver.refresh_registered_voters();
+
+    let peer: std::net::SocketAddr = "127.0.0.1:30303".parse().unwrap();
+    let local_height = driver.height();
+    let _ = driver.sync_mut().observe_status(peer, 10, local_height);
+    assert!(!driver.sync().is_caught_up());
+
+    let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+    let vote = indra_consensus::vote::produce_vote(
+        1,
+        0,
+        VoteStep::Prevote,
+        Bytes32::from([0xCCu8; 32]),
+        remote_id,
+        &remote,
+    )
+    .unwrap();
+
+    let actions = driver.process(DriverEvent::InboundVote { from: peer, vote });
+    assert!(
+        !actions.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+        "node must not vote before catching up"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn full_restart_recovery_end_to_end() {
+    let dir = temp_dir("restart_recovery");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source_log = dir.join("source.log");
+    let follower_a_log = dir.join("follower_a.log");
+    let follower_b_log = dir.join("follower_b.log");
+    let source_state_dir = dir.join("source_state");
+    let follower_a_state_dir = dir.join("follower_a_state");
+    let follower_b_state_dir = dir.join("follower_b_state");
+
+    let mut source_state = anchored_genesis_state();
+    let mut source_mempool = Mempool::default_config();
+    let mut source_store = BlockStore::open(&source_log, PruneConfig::archive()).unwrap();
+    let source_state_store = StateStore::open(&source_state_dir).unwrap();
+
+    for _ in 0..2u64 {
+        let block = make_block(&source_state);
+        import_block(
+            &block,
+            &mut source_state,
+            &mut source_mempool,
+            &mut source_store,
+            &source_state_store,
+            false,
+        )
+        .unwrap();
+    }
+
+    for (follower_log, follower_state_dir) in [
+        (&follower_a_log, &follower_a_state_dir),
+        (&follower_b_log, &follower_b_state_dir),
+    ] {
+        let mut follower_state = anchored_genesis_state();
+        let mut follower_mempool = Mempool::default_config();
+        let mut follower_store = BlockStore::open(follower_log, PruneConfig::archive()).unwrap();
+        let follower_state_store = StateStore::open(follower_state_dir).unwrap();
+
+        let block1 = source_store.get(1).unwrap();
+        import_block(
+            &block1,
+            &mut follower_state,
+            &mut follower_mempool,
+            &mut follower_store,
+            &follower_state_store,
+            false,
+        )
+        .unwrap();
+
+        let peer: std::net::SocketAddr = "127.0.0.1:30304".parse().unwrap();
+        let mut sync = SyncState::follower(follower_state.height);
+        assert_eq!(sync.observe_status(peer, source_state.height, follower_state.height), Some((peer, 2, 2)));
+
+        let block2 = source_store.get(2).unwrap();
+        import_block(
+            &block2,
+            &mut follower_state,
+            &mut follower_mempool,
+            &mut follower_store,
+            &follower_state_store,
+            false,
+        )
+        .unwrap();
+        sync.on_block_imported(2);
+        assert!(sync.is_caught_up());
+        assert_eq!(follower_state.height, source_state.height);
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }

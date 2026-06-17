@@ -36,6 +36,7 @@ use indra_node::{
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(4);
 const PREVOTE_TIMEOUT: Duration = Duration::from_secs(3);
 const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
+const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
@@ -185,18 +186,7 @@ fn main() {
                         if let Ok(conn) = indra_network::transport::Connection::from_stream(stream) {
                             let _ = gossip.lock().unwrap().add_connection(addr, conn);
                         }
-
-                        // Send our status
-                        let height = driver.lock().unwrap().height();
-                        let tip = driver.lock().unwrap().engine.state.tip_hash;
-                        let status = Message::Status { height, tip_hash: tip };
-                        if let Ok(mut g) = gossip.lock() {
-                            let _ = g.send_to(&addr, &status);
-                            let _ = g.send_to(&addr, &Message::Ping(now_ms() as u64));
-                        }
-
-                        let actions = driver.lock().unwrap().request_qc_if_needed();
-                        process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                        announce_status_and_recovery(&driver, &gossip, &height_tx, addr);
                     }
                     Err(e) => eprintln!("[listener] accept error: {}", e),
                 }
@@ -239,16 +229,7 @@ fn main() {
                         Ok(conn) => {
                             println!("[P2P] Connected to {}", addr);
                             let _ = gossip.lock().unwrap().add_connection(addr, conn);
-
-                            // Send status
-                            let height   = driver.lock().unwrap().height();
-                            let tip_hash = driver.lock().unwrap().engine.state.tip_hash;
-                            let status = Message::Status { height, tip_hash };
-                            let _ = gossip.lock().unwrap().send_to(&addr, &status);
-                            let _ = gossip.lock().unwrap().send_to(&addr, &Message::Ping(now_ms() as u64));
-
-                            let actions = driver.lock().unwrap().request_qc_if_needed();
-                            process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                            announce_status_and_recovery(&driver, &gossip, &height_tx, addr);
                         }
                         Err(e) => {
                             eprintln!("[dialer] failed to connect to {}: {}", addr, e);
@@ -296,6 +277,25 @@ fn main() {
                         // Score the peer
                         gossip.lock().unwrap().score_event(&addr, ScoreEvent::ValidBlock);
 
+                        // QC recovery message ingress logging — remove after confirmed working
+                        match &msg {
+                            Message::RequestQC { height } => {
+                                eprintln!(
+                                    "[qc-ingress] received RequestQC for height {} from {}",
+                                    height, addr
+                                );
+                            }
+                            Message::QCResponse { height, qc_bytes } => {
+                                eprintln!(
+                                    "[qc-ingress] received QCResponse for height {} ({} bytes) from {}",
+                                    height,
+                                    qc_bytes.len(),
+                                    addr
+                                );
+                            }
+                            _ => {}
+                        }
+
                         match &msg {
                             Message::RequestBlocks { from_height, to_height } => {
                                 let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
@@ -339,26 +339,6 @@ fn main() {
                                 }
                                 continue;
                             }
-                            Message::RequestQC { height } => {
-                                let qc_bytes = {
-                                    let d = driver.lock().unwrap();
-                                    if d.height() == *height && !d.last_qc_bytes().is_empty() {
-                                        Some(d.last_qc_bytes())
-                                    } else {
-                                        None
-                                    }
-                                };
-                                if let Some(qc_bytes) = qc_bytes {
-                                    let _ = gossip.lock().unwrap().send_to(
-                                        &addr,
-                                        &Message::QCResponse {
-                                            height: *height,
-                                            qc_bytes,
-                                        },
-                                    );
-                                }
-                                continue;
-                            }
                             Message::BlockResponse { blocks } => {
                                 let response_blocks = blocks.clone();
                                 let request_more;
@@ -394,9 +374,14 @@ fn main() {
                                             }
                                         }
                                     }
+                                    if !imported_any {
+                                        let current_height = d.height();
+                                        d.sync_mut().on_empty_response(current_height);
+                                    }
                                     let new_height = d.height();
                                     request_more = d.sync_mut().next_request_after_response(new_height);
-                                    if d.sync().is_caught_up() && imported_any {
+                                    if d.sync().is_caught_up() {
+                                        d.on_sync_caught_up();
                                         caught_up_height = Some(new_height);
                                     }
                                 }
@@ -459,22 +444,44 @@ fn main() {
             std::thread::sleep(Duration::from_secs(3));
 
             let mut proposed_at_slot: Option<(u64, u32)> = None;
+            let mut last_commit_time: Option<std::time::SystemTime> = None;
+            let mut last_observed_height = 0u64;
             let mut phase_started_at = Instant::now();
             let mut last_observed = None::<(u64, u32, RoundPhase)>;
             let mut last_status_at = Instant::now() - STATUS_INTERVAL;
 
             loop {
-                let (height, round, phase, sync_target, connected, tip_hash) = {
+                let (height, round, phase, sync_target, sync_caught_up, connected, tip_hash) = {
                     let d = driver.lock().unwrap();
                     (
                         d.height(),
                         d.current_round(),
                         d.current_phase(),
                         d.sync().target_height(),
+                        d.sync().is_caught_up(),
                         gossip.lock().unwrap().connection_count(),
                         d.engine.state.tip_hash,
                     )
                 };
+                let last_qc_bytes_empty = driver.lock().unwrap().last_qc_bytes().is_empty();
+                if round == 0 || round % 10 == 0 {
+                    eprintln!(
+                        "[qc-debug] height={} round={} last_qc_bytes_empty={}",
+                        height, round, last_qc_bytes_empty
+                    );
+                }
+
+                if height > last_observed_height {
+                    last_commit_time = Some(std::time::SystemTime::now());
+                    last_observed_height = height;
+                }
+
+                if last_qc_bytes_empty && round % 10 == 0 {
+                    let actions = driver.lock().unwrap().request_qc_if_needed();
+                    if !actions.is_empty() {
+                        process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                    }
+                }
 
                 let observed = (height, round, phase);
                 if last_observed != Some(observed) {
@@ -499,6 +506,20 @@ fn main() {
                     let status = Message::Status { height, tip_hash };
                     let _ = gossip.lock().unwrap().broadcast(&status);
                     last_status_at = Instant::now();
+                }
+
+                if !sync_caught_up {
+                    if let Some(target) = sync_target {
+                        println!("[consensus] syncing — height={} target={}", height, target);
+                    }
+                    match height_rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(()) => {
+                            phase_started_at = Instant::now();
+                            proposed_at_slot = None;
+                        }
+                        Err(_) => {}
+                    }
+                    continue;
                 }
 
                 if let Some(target) = sync_target {
@@ -548,6 +569,24 @@ fn main() {
                                     .has_accepted_proposal_for_height(next_height);
 
                             if should_propose && !already_have_proposal {
+                                let time_since_last_commit = last_commit_time
+                                    .and_then(|t| t.elapsed().ok())
+                                    .unwrap_or(Duration::from_secs(MIN_BLOCK_INTERVAL_SECS));
+
+                                if time_since_last_commit < Duration::from_secs(MIN_BLOCK_INTERVAL_SECS)
+                                    && time_since_last_commit
+                                        < Duration::from_secs(MIN_BLOCK_INTERVAL_SECS * 2)
+                                {
+                                    match height_rx.recv_timeout(Duration::from_millis(100)) {
+                                        Ok(()) => {
+                                            phase_started_at = Instant::now();
+                                            proposed_at_slot = None;
+                                        }
+                                        Err(_) => {}
+                                    }
+                                    continue;
+                                }
+
                                 let proposal = {
                                     let mut d = driver.lock().unwrap();
                                     let epoch_seed = indra_core::types::primitives::Bytes32::from(
@@ -574,7 +613,24 @@ fn main() {
                                         .unwrap_or_default()
                                         .as_secs();
                                     let polc_round = d.proposal_polc_round(height);
-                                    match d.engine.propose(&election, timestamp, d.last_qc_bytes(), polc_round) {
+                                    let valid_reproposal = if polc_round.is_some() {
+                                        d.take_valid_block_for_reproposal()
+                                    } else {
+                                        None
+                                    };
+                                    let proposal_result = if let Some((valid_block, valid_round)) = valid_reproposal {
+                                        d.engine.repropose(
+                                            &valid_block,
+                                            round,
+                                            Some(valid_round),
+                                            &election,
+                                            valid_block.header.timestamp,
+                                            d.last_qc_bytes(),
+                                        )
+                                    } else {
+                                        d.engine.propose(&election, timestamp, d.last_qc_bytes(), polc_round)
+                                    };
+                                    match proposal_result {
                                         Ok(block) => {
                                             if !block.transactions.is_empty() {
                                                 eprintln!(
@@ -762,9 +818,6 @@ fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction
                 peers,
             );
         }
-        DriverAction::RequestQC { height } => {
-            eprintln!("[driver] requesting QC for height {} from {} peers", height, peers);
-        }
         _ => {}
     }
 }
@@ -799,6 +852,20 @@ fn process_driver_actions(
             continue;
         }
 
+        if let DriverAction::RequestQC { height } = &action {
+            let peers: Vec<SocketAddr> = gossip.lock().unwrap().connected_addrs();
+            eprintln!(
+                "[driver] requesting QC for height {} from {} peers",
+                height,
+                peers.len()
+            );
+            let msg = Message::RequestQC { height: *height };
+            for peer in &peers {
+                let _ = gossip.lock().unwrap().send_to(peer, &msg);
+            }
+            continue;
+        }
+
         if let Some(out_msg) = action_to_message(&action) {
             log_broadcast_action(gossip, &action);
             broadcast_driver_message(gossip, &action, &out_msg);
@@ -827,7 +894,45 @@ fn process_driver_actions(
             };
             let _ = gossip.lock().unwrap().send_to(from, &req);
         }
+
+        if let DriverAction::SendQCResponse { to, height, qc_bytes } = &action {
+            let msg = Message::QCResponse {
+                height: *height,
+                qc_bytes: qc_bytes.clone(),
+            };
+            if let Err(e) = gossip.lock().unwrap().send_to(to, &msg) {
+                eprintln!("[driver] failed to send QCResponse to {}: {}", to, e);
+            }
+        }
     }
+}
+
+fn announce_status_and_recovery(
+    driver: &Arc<Mutex<ConsensusDriver>>,
+    gossip: &Arc<Mutex<GossipEngine>>,
+    height_tx: &std::sync::mpsc::Sender<()>,
+    addr: SocketAddr,
+) {
+    let (height, tip_hash) = {
+        let d = driver.lock().unwrap();
+        (d.height(), d.engine.state.tip_hash)
+    };
+    let [status, ping] = startup_peer_messages(height, tip_hash);
+    if let Ok(mut g) = gossip.lock() {
+        let _ = g.send_to(&addr, &status);
+        let _ = g.send_to(&addr, &ping);
+    }
+    broadcast_status(driver, gossip);
+
+    let actions = driver.lock().unwrap().request_qc_if_needed();
+    process_driver_actions(driver, gossip, height_tx, height, actions);
+}
+
+fn startup_peer_messages(height: u64, tip_hash: indra_core::Bytes32) -> [Message; 2] {
+    [
+        Message::Status { height, tip_hash },
+        Message::Ping(now_ms() as u64),
+    ]
 }
 
 fn now_ms() -> u128 {
@@ -1300,4 +1405,18 @@ fn extract_json_id(json: &str) -> String {
         }
     }
     "null".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_broadcast_on_first_peer_connection() {
+        let tip_hash = indra_core::Bytes32::from([0x55u8; 32]);
+        let [first, second] = startup_peer_messages(42, tip_hash);
+
+        assert!(matches!(first, Message::Status { height: 42, tip_hash: got } if got == tip_hash));
+        assert!(matches!(second, Message::Ping(_)));
+    }
 }

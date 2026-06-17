@@ -56,14 +56,22 @@ pub enum SyncPhase {
 pub struct SyncState {
     phase: SyncPhase,
     best_peer_height: u64,
+    received_peer_status: bool,
+    is_bootstrap_node: bool,
 }
 
 impl SyncState {
     /// Create the bootstrap node sync state.
     pub fn bootstrap(local_height: u64) -> Self {
         Self {
-            phase: SyncPhase::CaughtUp,
+            phase: if local_height == 0 {
+                SyncPhase::CaughtUp
+            } else {
+                SyncPhase::AwaitingPeers
+            },
             best_peer_height: local_height,
+            received_peer_status: local_height == 0,
+            is_bootstrap_node: true,
         }
     }
 
@@ -72,6 +80,8 @@ impl SyncState {
         Self {
             phase: SyncPhase::AwaitingPeers,
             best_peer_height: local_height,
+            received_peer_status: false,
+            is_bootstrap_node: false,
         }
     }
 
@@ -82,6 +92,9 @@ impl SyncState {
 
     /// True when the node may participate in consensus.
     pub fn is_caught_up(&self) -> bool {
+        if !self.received_peer_status && !self.is_bootstrap_node {
+            return false;
+        }
         matches!(self.phase, SyncPhase::CaughtUp)
     }
 
@@ -100,10 +113,10 @@ impl SyncState {
         peer_height: u64,
         local_height: u64,
     ) -> Option<(SocketAddr, u64, u64)> {
+        self.received_peer_status = true;
         self.best_peer_height = self.best_peer_height.max(peer_height);
-        let catchup_threshold = self.best_peer_height.saturating_sub(2);
 
-        if local_height >= catchup_threshold {
+        if local_height >= self.best_peer_height {
             if matches!(self.phase, SyncPhase::AwaitingPeers) {
                 self.phase = SyncPhase::CaughtUp;
             }
@@ -141,7 +154,7 @@ impl SyncState {
                 *next_expected = imported_height.saturating_add(1);
             }
             *target_height = (*target_height).max(self.best_peer_height);
-            if imported_height >= self.best_peer_height.saturating_sub(2) {
+            if imported_height >= self.best_peer_height {
                 self.phase = SyncPhase::CaughtUp;
             }
         }
@@ -159,7 +172,7 @@ impl SyncState {
                 next_expected,
             } => {
                 let target_height = target_height.max(self.best_peer_height);
-                if local_height >= self.best_peer_height.saturating_sub(2) {
+                if local_height >= self.best_peer_height {
                     self.phase = SyncPhase::CaughtUp;
                     None
                 } else {
@@ -170,6 +183,16 @@ impl SyncState {
                 }
             }
             SyncPhase::AwaitingPeers | SyncPhase::CaughtUp => None,
+        }
+    }
+
+    /// Handle a block response that imported nothing.
+    pub fn on_empty_response(&mut self, local_height: u64) {
+        if let SyncPhase::Downloading { .. } = self.phase {
+            if local_height >= self.best_peer_height.saturating_sub(1) {
+                self.best_peer_height = local_height;
+                self.phase = SyncPhase::CaughtUp;
+            }
         }
     }
 
@@ -682,6 +705,52 @@ mod tests {
             Some((peer_b, 551, 600))
         );
         assert!(!sync.is_caught_up());
+    }
+
+    #[test]
+    fn follower_waits_for_first_peer_status() {
+        let peer: SocketAddr = "127.0.0.1:30004".parse().unwrap();
+        let mut sync = SyncState::follower(10);
+
+        assert!(!sync.is_caught_up());
+        assert_eq!(sync.observe_status(peer, 10, 10), None);
+        assert!(sync.is_caught_up());
+    }
+
+    #[test]
+    fn bootstrap_node_at_nonzero_height_waits_for_peer_status() {
+        let peer: SocketAddr = "127.0.0.1:30005".parse().unwrap();
+        let mut sync = SyncState::bootstrap(10);
+
+        assert!(!sync.is_caught_up());
+        assert_eq!(sync.observe_status(peer, 10, 10), None);
+        assert!(sync.is_caught_up());
+    }
+
+    #[test]
+    fn empty_block_response_does_not_stall_sync() {
+        let peer: SocketAddr = "127.0.0.1:30006".parse().unwrap();
+        let mut sync = SyncState::follower(10);
+
+        assert_eq!(sync.observe_status(peer, 11, 10), Some((peer, 11, 11)));
+        assert!(!sync.is_caught_up());
+
+        sync.on_empty_response(10);
+        assert!(sync.is_caught_up());
+        assert!(sync.next_request_after_response(10).is_none());
+    }
+
+    #[test]
+    fn one_block_behind_recovers_automatically() {
+        let peer: SocketAddr = "127.0.0.1:30003".parse().unwrap();
+        let mut sync = SyncState::follower(530);
+
+        assert_eq!(sync.observe_status(peer, 531, 530), Some((peer, 531, 531)));
+        assert!(!sync.is_caught_up());
+
+        sync.on_block_imported(531);
+        assert!(sync.is_caught_up());
+        assert!(sync.next_request_after_response(531).is_none());
     }
 
     #[test]

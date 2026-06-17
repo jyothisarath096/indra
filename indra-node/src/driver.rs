@@ -88,6 +88,13 @@ pub enum DriverEvent {
         /// Raw encoded QC bytes.
         qc_bytes: Vec<u8>,
     },
+    /// A peer is requesting our last QC for the given height.
+    QcRequest {
+        /// The requesting peer.
+        from: SocketAddr,
+        /// The committed height the peer wants certified.
+        height: u64,
+    },
 }
 
 /// An action the driver wants to perform in response to an event.
@@ -124,6 +131,15 @@ pub enum DriverAction {
         /// The committed height whose QC is needed.
         height: u64,
     },
+    /// Send a QC response directly to one peer.
+    SendQCResponse {
+        /// The peer to answer.
+        to: SocketAddr,
+        /// The committed height certified by the QC.
+        height: u64,
+        /// Raw encoded QC bytes.
+        qc_bytes: Vec<u8>,
+    },
     /// Re-process a buffered future proposal after the local tip advances.
     ActivateBufferedProposal(BlockV1),
     /// Slash evidence was detected.
@@ -157,6 +173,7 @@ pub struct ConsensusDriver {
     /// Tendermint valid value / valid round for reproposal.
     valid_round: Option<u32>,
     valid_value: Option<Bytes32>,
+    valid_block: Option<BlockV1>,
     /// Serialised QC for the most recently finalised height.
     last_qc_bytes: Vec<u8>,
     /// Registered voters for the current epoch.
@@ -186,6 +203,7 @@ impl ConsensusDriver {
             locked_value: None,
             valid_round: None,
             valid_value: None,
+            valid_block: None,
             last_qc_bytes: Vec::new(),
             registered_voters: Vec::new(),
             current_round: 0,
@@ -294,6 +312,26 @@ impl ConsensusDriver {
     /// External compatibility hook used after height advancement.
     pub fn reset_round(&mut self) {
         self.prune_future_proposals();
+        self.valid_block = None;
+        self.start_round(0);
+    }
+
+    /// Re-enter consensus cleanly after block download catchup.
+    pub fn on_sync_caught_up(&mut self) {
+        self.sync.mark_caught_up(self.engine.state.height);
+        self.refresh_registered_voters();
+        self.pending_blocks.clear();
+        self.future_proposals.clear();
+        self.buffered_votes.clear();
+        self.requested_proposals.clear();
+        self.pending_precommit_quorum.clear();
+        self.vote_collectors.clear();
+        self.seen_round_votes.clear();
+        self.locked_round = None;
+        self.locked_value = None;
+        self.valid_round = None;
+        self.valid_value = None;
+        self.valid_block = None;
         self.start_round(0);
     }
 
@@ -309,6 +347,7 @@ impl ConsensusDriver {
             DriverEvent::QcResponse { from, height, qc_bytes } => {
                 self.handle_qc_response(from, height, qc_bytes)
             }
+            DriverEvent::QcRequest { from, height } => self.handle_qc_request(from, height),
         }
     }
 
@@ -351,6 +390,14 @@ impl ConsensusDriver {
             return None;
         }
         self.valid_round
+    }
+
+    /// Return the current valid block and round, if available for reproposal.
+    pub fn take_valid_block_for_reproposal(&self) -> Option<(BlockV1, u32)> {
+        match (&self.valid_block, self.valid_round) {
+            (Some(block), Some(round)) => Some((block.clone(), round)),
+            _ => None,
+        }
     }
 
     fn quorum_size(&self) -> usize {
@@ -607,10 +654,6 @@ impl ConsensusDriver {
     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
 
-        if !self.sync.is_caught_up() {
-            return actions;
-        }
-
         if self
             .engine
             .validator_id()
@@ -675,6 +718,11 @@ impl ConsensusDriver {
         }
         self.seen_round_votes.insert(slot_key, vote.block_hash);
 
+        if !self.sync.is_caught_up() {
+            self.record_vote_passive(from, vote);
+            return actions;
+        }
+
         if !vote.is_nil()
             && vote.height == self.next_height()
             && !self.pending_blocks.contains_key(&vote.block_hash)
@@ -713,6 +761,54 @@ impl ConsensusDriver {
 
         actions.extend(self.record_vote_and_actions(from, vote));
         actions
+    }
+
+    fn record_vote_passive(&mut self, from: SocketAddr, vote: VoteV1) {
+        let key = Self::collector_key(vote.height, vote.round, vote.step);
+        let collector = self
+            .vote_collectors
+            .entry(key)
+            .or_insert_with(|| {
+                VoteCollector::new(
+                    vote.height,
+                    vote.round,
+                    vote.step,
+                    self.registered_voters.clone(),
+                )
+            });
+
+        match collector.add_vote(vote.clone()) {
+            Ok(decision) => {
+                let count = collector.vote_count();
+                eprintln!(
+                    "[sync] passively recorded vote from {} for {} at height={} round={} count={}/{}",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                    count,
+                    self.registered_voters.len(),
+                );
+                if matches!(decision, VoteDecision::QuorumReached { .. }) {
+                    eprintln!(
+                        "[sync] quorum observed while downloading for {} at height={} round={}",
+                        hex::encode(&vote.block_hash.0[..4]),
+                        vote.height,
+                        vote.round,
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[vote] rejected vote from {} for {} at height={} round={}: {}",
+                    from,
+                    hex::encode(&vote.block_hash.0[..4]),
+                    vote.height,
+                    vote.round,
+                    err,
+                );
+            }
+        }
     }
 
     fn record_vote_and_actions(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
@@ -776,6 +872,7 @@ impl ConsensusDriver {
                                     // Rule 5 — a value got 2f+1 prevotes.
                                     self.valid_round = Some(vote.round);
                                     self.valid_value = Some(block_hash);
+                                    self.valid_block = self.pending_blocks.get(&block_hash).cloned();
                                 }
 
                                 if vote.height == self.next_height()
@@ -1027,6 +1124,59 @@ impl ConsensusDriver {
         }
     }
 
+    fn handle_qc_request(&mut self, from: SocketAddr, height: u64) -> Vec<DriverAction> {
+        let local_height = self.engine.state.height;
+
+        if height == local_height {
+            if self.last_qc_bytes.is_empty() {
+                return vec![];
+            }
+            eprintln!("[driver] serving QC for height {} to {}", height, from);
+            return vec![DriverAction::SendQCResponse {
+                to: from,
+                height,
+                qc_bytes: self.last_qc_bytes.clone(),
+            }];
+        }
+
+        if height == local_height.saturating_sub(1) && local_height > 0 {
+            match self.engine.block_store.get(local_height) {
+                Ok(block) => {
+                    let qc_bytes = block.header.quorum_certificate.as_slice().to_vec();
+                    if qc_bytes.is_empty() {
+                        eprintln!(
+                            "[driver] cannot serve QC for height {} — block {} has empty QC",
+                            height, local_height
+                        );
+                        return vec![];
+                    }
+                    eprintln!(
+                        "[driver] serving QC for height {} to {} (from block {} header)",
+                        height, from, local_height
+                    );
+                    return vec![DriverAction::SendQCResponse {
+                        to: from,
+                        height,
+                        qc_bytes,
+                    }];
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[driver] cannot serve QC for height {}: failed to read block {}: {}",
+                        height, local_height, e
+                    );
+                    return vec![];
+                }
+            }
+        }
+
+        eprintln!(
+            "[driver] ignoring QC request for height {} from {} (our height={})",
+            height, from, local_height,
+        );
+        vec![]
+    }
+
     fn handle_qc_response(
         &mut self,
         from: SocketAddr,
@@ -1180,6 +1330,7 @@ mod tests {
         apply_block(&mut projected, &block).unwrap();
         block.header.state_root = compute_state_root(&projected);
         block.header.validator_set_root = compute_validator_set_root(&projected);
+        block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }
 
@@ -1545,6 +1696,198 @@ mod tests {
         driver.engine.state.height = 9;
         driver.last_qc_bytes = vec![1, 2, 3];
         assert!(driver.request_qc_if_needed().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qc_request_served_when_height_matches() {
+        let (mut driver, dir) = local_driver([0x69u8; 32], "qc_request_served");
+        let from: SocketAddr = "127.0.0.1:9504".parse().unwrap();
+        driver.engine.state.height = 12;
+        driver.last_qc_bytes = vec![7, 8, 9];
+
+        let actions = driver.process(DriverEvent::QcRequest { from, height: 12 });
+
+        assert!(matches!(
+            actions.as_slice(),
+            [DriverAction::SendQCResponse { to, height, qc_bytes }]
+                if *to == from && *height == 12 && *qc_bytes == vec![7, 8, 9]
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qc_request_served_from_block_header_when_one_ahead() {
+        let (mut driver, dir) = local_driver([0x6Au8; 32], "qc_request_one_ahead");
+        let _local = install_active_validator(&mut driver, [0x6Au8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let block1 = make_block(&driver.engine.state);
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1,
+        });
+        let qc_for_height_1 = driver.last_qc_bytes();
+        assert!(!qc_for_height_1.is_empty());
+
+        let mut block2 = make_block(&driver.engine.state);
+        block2.header.quorum_certificate =
+            indra_core::VariableBytes::from_slice(&qc_for_height_1).unwrap();
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block2,
+        });
+
+        let from: SocketAddr = "127.0.0.1:9505".parse().unwrap();
+        let actions = driver.process(DriverEvent::QcRequest { from, height: 1 });
+
+        assert!(matches!(
+            actions.as_slice(),
+            [DriverAction::SendQCResponse { to, height, qc_bytes }]
+                if *to == from && *height == 1 && *qc_bytes == qc_for_height_1
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposer_reproposes_valid_value_after_prevote_quorum() {
+        let (mut driver, dir) = local_driver([0x73u8; 32], "valid_reproposal");
+        let _local = install_active_validator(&mut driver, [0x73u8; 32], "local");
+        let remote_a = install_active_validator(&mut driver, [0x74u8; 32], "remote-a");
+        let remote_b = install_active_validator(&mut driver, [0x75u8; 32], "remote-b");
+        let _remote_c = install_active_validator(&mut driver, [0x76u8; 32], "remote-c");
+        driver.refresh_registered_voters();
+
+        let block = make_block(&driver.engine.state);
+        let block_hash = block.header.block_hash();
+        let value_hash = block.header.value_hash;
+        let height = block.header.height;
+        let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
+        assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastVote(vote) if vote.step == VoteStep::Prevote)));
+
+        let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
+        let remote_b_id = Bytes32::from(indra_crypto::sha256(&remote_b.public_key().classical.0));
+        let prevote_a = indra_consensus::vote::produce_vote(
+            height, 0, VoteStep::Prevote, block_hash, remote_a_id, &remote_a,
+        ).unwrap();
+        let prevote_b = indra_consensus::vote::produce_vote(
+            height, 0, VoteStep::Prevote, block_hash, remote_b_id, &remote_b,
+        ).unwrap();
+
+        let _ = driver.process(DriverEvent::InboundVote {
+            from: "127.0.0.1:9701".parse().unwrap(),
+            vote: prevote_a,
+        });
+        let _ = driver.process(DriverEvent::InboundVote {
+            from: "127.0.0.1:9702".parse().unwrap(),
+            vote: prevote_b,
+        });
+
+        assert_eq!(driver.valid_round, Some(0));
+        assert_eq!(driver.valid_value, Some(block_hash));
+        let (valid_block, valid_round) = driver
+            .take_valid_block_for_reproposal()
+            .expect("valid block should be stored for reproposal");
+        assert_eq!(valid_round, 0);
+        assert_eq!(valid_block.header.value_hash, value_hash);
+
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&driver.engine.state.tip_hash.0));
+        let local_validator_id = driver.engine.validator_id().expect("local validator id");
+        let candidates: Vec<indra_consensus::proposer::ProposerCandidate> = driver
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .filter(|v| v.validator_id == local_validator_id)
+            .filter_map(|v| {
+                v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
+                    validator_id: v.validator_id,
+                    vrf_pubkey: vrf_pk,
+                    stake: v.stake_spark,
+                })
+            })
+            .collect();
+        let election = indra_consensus::proposer::ProposerElection {
+            epoch_seed,
+            height,
+            round: 1,
+            candidates,
+        };
+
+        let reproposed = driver
+            .engine
+            .repropose(
+                &valid_block,
+                1,
+                Some(valid_round),
+                &election,
+                valid_block.header.timestamp,
+                driver.last_qc_bytes(),
+            )
+            .expect("reproposal should succeed");
+
+        assert_eq!(reproposed.header.value_hash, value_hash);
+        assert_eq!(reproposed.header.proposer_round, 1);
+        assert_eq!(reproposed.header.polc_round, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_syncs_before_joining_consensus() {
+        let (mut driver, dir) = local_driver([0x6Bu8; 32], "sync_before_consensus");
+        let _local = install_active_validator(&mut driver, [0x6Bu8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let peer: SocketAddr = "127.0.0.1:9601".parse().unwrap();
+        let _ = driver.sync.observe_status(peer, 10, driver.height());
+        assert!(!driver.sync.is_caught_up());
+
+        let block = make_block(&driver.engine.state);
+        let hash = block.header.block_hash();
+        driver.pending_blocks.insert(hash, block);
+
+        let actions = driver.maybe_prevote_current_round_proposal();
+        assert!(actions.is_empty(), "syncing nodes must not join consensus");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn consensus_gate_blocks_votes_during_sync() {
+        let (mut driver, dir) = local_driver([0x6Cu8; 32], "sync_vote_gate");
+        let _local = install_active_validator(&mut driver, [0x6Cu8; 32], "local");
+        let remote = install_active_validator(&mut driver, [0x6Du8; 32], "remote");
+        driver.refresh_registered_voters();
+
+        let peer: SocketAddr = "127.0.0.1:9602".parse().unwrap();
+        let _ = driver.sync.observe_status(peer, 10, driver.height());
+        assert!(!driver.sync.is_caught_up());
+
+        let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let vote = indra_consensus::vote::produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            Bytes32::from([0xABu8; 32]),
+            remote_id,
+            &remote,
+        )
+        .unwrap();
+
+        let actions = driver.process(DriverEvent::InboundVote { from: peer, vote });
+        assert!(
+            !actions.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "syncing nodes must not emit votes"
+        );
+        let collector = driver
+            .vote_collectors
+            .get(&(1, 0, VoteStep::Prevote))
+            .expect("vote should be recorded while syncing");
+        assert_eq!(collector.vote_count(), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
