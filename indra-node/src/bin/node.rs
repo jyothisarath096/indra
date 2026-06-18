@@ -33,13 +33,39 @@ use indra_node::{
     sync::SYNC_BATCH_SIZE,
 };
 
-const PROPOSE_TIMEOUT: Duration = Duration::from_secs(4);
+const PROPOSE_TIMEOUT: Duration = Duration::from_secs(8);
 const PREVOTE_TIMEOUT: Duration = Duration::from_secs(3);
 const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposalMode {
+    None,
+    Fresh,
+    Reproposal,
+}
+
+fn choose_proposal_mode(
+    should_propose: bool,
+    valid_reproposal_available: bool,
+    proposed_at_slot: Option<(u64, u32)>,
+    next_height: u64,
+    round: u32,
+    already_have_proposal: bool,
+) -> ProposalMode {
+    if !should_propose {
+        ProposalMode::None
+    } else if valid_reproposal_available && proposed_at_slot != Some((next_height, round)) {
+        ProposalMode::Reproposal
+    } else if !already_have_proposal {
+        ProposalMode::Fresh
+    } else {
+        ProposalMode::None
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -325,7 +351,8 @@ fn main() {
                                         .filter(|block| {
                                             block.header.height == *height
                                                 && block.header.proposer_round == *round
-                                                && block.header.block_hash() == *hash
+                                                && (block.header.block_hash() == *hash
+                                                    || block.header.value_hash == *hash)
                                         })
                                 };
                                 if let Some(block) = proposal {
@@ -567,8 +594,21 @@ fn main() {
                                     .lock()
                                     .unwrap()
                                     .has_accepted_proposal_for_height(next_height);
+                            let valid_reproposal = if should_propose {
+                                driver.lock().unwrap().take_valid_block_for_reproposal()
+                            } else {
+                                None
+                            };
+                            let proposal_mode = choose_proposal_mode(
+                                should_propose,
+                                valid_reproposal.is_some(),
+                                proposed_at_slot,
+                                next_height,
+                                round,
+                                already_have_proposal,
+                            );
 
-                            if should_propose && !already_have_proposal {
+                            if matches!(proposal_mode, ProposalMode::Fresh | ProposalMode::Reproposal) {
                                 let time_since_last_commit = last_commit_time
                                     .and_then(|t| t.elapsed().ok())
                                     .unwrap_or(Duration::from_secs(MIN_BLOCK_INTERVAL_SECS));
@@ -613,12 +653,9 @@ fn main() {
                                         .unwrap_or_default()
                                         .as_secs();
                                     let polc_round = d.proposal_polc_round(height);
-                                    let valid_reproposal = if polc_round.is_some() {
-                                        d.take_valid_block_for_reproposal()
-                                    } else {
-                                        None
-                                    };
-                                    let proposal_result = if let Some((valid_block, valid_round)) = valid_reproposal {
+                                    let proposal_result = if matches!(proposal_mode, ProposalMode::Reproposal) {
+                                        let (valid_block, valid_round) = valid_reproposal
+                                            .expect("reproposal mode requires a valid block");
                                         d.engine.repropose(
                                             &valid_block,
                                             round,
@@ -1418,5 +1455,19 @@ mod tests {
 
         assert!(matches!(first, Message::Status { height: 42, tip_hash: got } if got == tip_hash));
         assert!(matches!(second, Message::Ping(_)));
+    }
+
+    #[test]
+    fn stale_staged_proposal_does_not_block_valid_reproposal() {
+        let mode = choose_proposal_mode(
+            true,
+            true,
+            None,
+            10,
+            3,
+            true,
+        );
+
+        assert_eq!(mode, ProposalMode::Reproposal);
     }
 }
