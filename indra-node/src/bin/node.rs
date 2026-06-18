@@ -302,26 +302,6 @@ fn main() {
                     if let Some(msg) = msg {
                         // Score the peer
                         gossip.lock().unwrap().score_event(&addr, ScoreEvent::ValidBlock);
-
-                        // QC recovery message ingress logging — remove after confirmed working
-                        match &msg {
-                            Message::RequestQC { height } => {
-                                eprintln!(
-                                    "[qc-ingress] received RequestQC for height {} from {}",
-                                    height, addr
-                                );
-                            }
-                            Message::QCResponse { height, qc_bytes } => {
-                                eprintln!(
-                                    "[qc-ingress] received QCResponse for height {} ({} bytes) from {}",
-                                    height,
-                                    qc_bytes.len(),
-                                    addr
-                                );
-                            }
-                            _ => {}
-                        }
-
                         match &msg {
                             Message::RequestBlocks { from_height, to_height } => {
                                 let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
@@ -491,13 +471,6 @@ fn main() {
                     )
                 };
                 let last_qc_bytes_empty = driver.lock().unwrap().last_qc_bytes().is_empty();
-                if round == 0 || round % 10 == 0 {
-                    eprintln!(
-                        "[qc-debug] height={} round={} last_qc_bytes_empty={}",
-                        height, round, last_qc_bytes_empty
-                    );
-                }
-
                 if height > last_observed_height {
                     last_commit_time = Some(std::time::SystemTime::now());
                     last_observed_height = height;
