@@ -40,6 +40,14 @@ pub fn apply_epoch_transition(
     state: &mut ChainState,
     current_epoch: u64,
 ) -> StateResult<()> {
+    eprintln!(
+        "[epoch] transition at height={} epoch={} validators={} total_stake={} fee_pool={}",
+        state.height,
+        current_epoch,
+        state.validators.active_count(),
+        state.validators.total_active_stake(),
+        state.fee_reward_pool,
+    );
     let current_height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
     let reward_per_block = block_reward_at_height(current_height);
     let epoch_block_reward = reward_per_block.saturating_mul(EPOCH_DURATION_BLOCKS);
@@ -68,6 +76,12 @@ pub fn apply_epoch_transition(
         .saturating_add(state.delegations.total_staked());
     state.validators.select_active_set(&state.delegations, total_staked);
 
+    eprintln!(
+        "[epoch] complete epoch={} total_supply={} treasury={}",
+        current_epoch,
+        state.total_supply,
+        state.treasury_balance,
+    );
     Ok(())
 }
 
@@ -141,6 +155,12 @@ fn distribute_block_rewards(
             .get(id)
             .map(|v| v.commission_bps)
             .unwrap_or(1_000);
+        eprintln!(
+            "[epoch] validator {} reward={} Spark commission={}bps",
+            hex::encode(&id.0[..4]),
+            adjusted_reward,
+            commission_bps,
+        );
         let delegated = state.delegations.total_delegated(id);
 
         let (validator_share, delegator_pool) = if delegated == 0 {
