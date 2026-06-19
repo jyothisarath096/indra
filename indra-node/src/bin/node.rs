@@ -134,9 +134,11 @@ fn main() {
     } else if let Some(raw_bootstrap) = &bootstrap {
         println!("Bootstrap: {}", raw_bootstrap);
     }
+    let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
 
     let config = NodeConfig {
         data_dir:          std::path::PathBuf::from(&data_dir),
+        genesis_path:      Some(genesis_path),
         validator_seed:    Some(hybrid_seed),
         bls_seed:          Some(bls_seed),
         vrf_seed:          Some(vrf_seed),
@@ -151,20 +153,11 @@ fn main() {
     };
 
     // Init node engine + consensus driver
-    let mut engine = NodeEngine::init(config)
+    let engine = NodeEngine::init(config)
         .unwrap_or_else(|e| panic!("Node init failed: {}", e));
 
-    // Load validator set from genesis.toml
-    let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
-    if std::path::Path::new(&genesis_path).exists() {
-        indra_node::load_genesis_validators(&genesis_path, &mut engine.state);
-        engine.rebuild_state_from_block_log()
-            .unwrap_or_else(|e| panic!("State replay failed after loading genesis validators: {}", e));
-        println!("Validator set: {} active validators",
-            engine.state.validators.active_count());
-    } else {
-        println!("[warning] genesis.toml not found at {} — validator set empty", genesis_path);
-    }
+    println!("Validator set: {} active validators",
+        engine.state.validators.active_count());
 
     let validator_id = engine.validator_id()
         .map(|id| hex::encode(id.0))

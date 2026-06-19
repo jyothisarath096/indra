@@ -36,7 +36,7 @@ use indra_storage::{BlockStore, StateStore};
 use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
-    genesis::build_genesis_block,
+    genesis::{build_genesis_block, load_genesis_validators},
     sync::import_block,
 };
 
@@ -78,6 +78,10 @@ impl NodeEngine {
 
         let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
         let state_store = StateStore::open(config.state_dir())?;
+        let mut genesis_base = ChainState::new_genesis();
+        if let Some(ref genesis_path) = config.genesis_path {
+            load_genesis_validators(genesis_path, &mut genesis_base);
+        }
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
             let replay_start = snapshot.height.saturating_add(1);
@@ -101,9 +105,8 @@ impl NodeEngine {
             }
 
             startup_log = startup_mode_message(None, 1, block_store.next_height());
-            let mut state = ChainState::new_genesis();
-            rebuild_state_from_height(&mut state, &mut block_store, 1)?;
-            state
+            rebuild_state_from_height(&mut genesis_base, &mut block_store, 1)?;
+            genesis_base
         };
         eprintln!("{startup_log}");
 
@@ -177,17 +180,13 @@ impl NodeEngine {
         self.vrf_keypair.is_some()
     }
 
-    /// Rebuild the current chain state by replaying the block log on top of
-    /// the current genesis-equivalent state.
-    ///
-    /// Callers should pre-load any genesis validators before invoking this so
-    /// replay starts from the correct validator set.
+    /// Rebuild the current chain state by replaying the block log on top of a
+    /// fresh genesis-equivalent state seeded from the configured genesis file.
     pub fn rebuild_state_from_block_log(&mut self) -> NodeResult<()> {
         let mut rebuilt = ChainState::new_genesis();
-        rebuilt.validators = self.state.validators.clone();
-        rebuilt.delegations = self.state.delegations.clone();
-        rebuilt.utxos = self.state.utxos.clone();
-        rebuilt.nullifiers = self.state.nullifiers.clone();
+        if let Some(ref genesis_path) = self.config.genesis_path {
+            load_genesis_validators(genesis_path, &mut rebuilt);
+        }
         rebuild_state_from_height(&mut rebuilt, &mut self.block_store, 1)?;
         self.state = rebuilt;
         Ok(())
@@ -649,6 +648,49 @@ mod tests {
     }
 
     #[test]
+    fn restart_from_snapshot_produces_same_state_as_continuous() {
+        let dir = temp_dir("snapshot_state_root");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.prune_keep_blocks = Some(650);
+
+        let (continuous_state, next_block) = {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            for height in 1..=610u64 {
+                let block = make_block(&engine.state);
+                engine.commit_block(&block).unwrap();
+                assert_eq!(engine.state.height, height);
+            }
+            let next_block = make_block(&engine.state);
+            (engine.state.clone(), next_block)
+        };
+
+        let restarted = NodeEngine::init(config).unwrap();
+        assert_eq!(restarted.state.height, continuous_state.height);
+        assert_eq!(restarted.state.tip_hash, continuous_state.tip_hash);
+        assert_eq!(
+            indra_state::compute_state_root(&restarted.state),
+            indra_state::compute_state_root(&continuous_state)
+        );
+
+        let mut continuous_next = continuous_state.clone();
+        let mut restarted_next = restarted.state.clone();
+        indra_state::apply_block(&mut continuous_next, &next_block).unwrap();
+        indra_state::apply_block(&mut restarted_next, &next_block).unwrap();
+
+        assert_eq!(
+            indra_state::compute_state_root(&continuous_next),
+            indra_state::compute_state_root(&restarted_next)
+        );
+        assert_eq!(
+            indra_state::compute_validator_set_root(&continuous_next),
+            indra_state::compute_validator_set_root(&restarted_next)
+        );
+        assert_eq!(continuous_next, restarted_next);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn startup_fails_on_snapshot_replay_gap() {
         let dir = temp_dir("snapshot_gap");
         let mut config = NodeConfig::local_test(dir.clone());
@@ -715,10 +757,10 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_preserves_preloaded_genesis_utxos() {
+    fn init_loads_genesis_utxos_once() {
         let dir = temp_dir("genesis_utxo");
-        let config = NodeConfig::local_test(dir.clone());
-        let mut engine = NodeEngine::init(config).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = NodeConfig::local_test(dir.clone());
 
         let classical = ClassicalKeypair::from_seed(&[0x11u8; 32]);
         let pq = PqKeypair::from_seed(&[0x11u8; 32]).unwrap();
@@ -733,8 +775,9 @@ mod tests {
             hex::encode(vrf.public_key()),
         );
         std::fs::write(&genesis_path, genesis).unwrap();
+        config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
 
-        crate::genesis::load_genesis_validators(genesis_path.to_str().unwrap(), &mut engine.state);
+        let mut engine = NodeEngine::init(config).unwrap();
         assert_eq!(engine.state.utxos.len(), 1);
 
         engine.rebuild_state_from_block_log().unwrap();

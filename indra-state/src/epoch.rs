@@ -119,11 +119,12 @@ fn distribute_block_rewards(
         return;
     }
 
-    let active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
+    let mut active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
         .validators
         .active_validators()
         .map(|v| (v.validator_id, v.stake_spark))
         .collect();
+    active.sort_by_key(|(id, _)| id.0);
     let active_validator_count = active.len() as u64;
 
     for (id, stake) in &active {
@@ -176,11 +177,12 @@ fn distribute_fee_rewards(
 
     state.fee_reward_pool = 0;
 
-    let active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
+    let mut active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
         .validators
         .active_validators()
         .map(|v| (v.validator_id, v.stake_spark))
         .collect();
+    active.sort_by_key(|(id, _)| id.0);
 
     let mut distributed = 0u64;
 
@@ -218,7 +220,7 @@ fn distribute_fee_rewards(
 }
 
 fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
-    let ids: Vec<indra_core::types::primitives::Bytes32> = state
+    let mut ids: Vec<indra_core::types::primitives::Bytes32> = state
         .validators
         .all_validators()
         .filter(|v| matches!(
@@ -228,6 +230,7 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
         ))
         .map(|v| v.validator_id)
         .collect();
+    ids.sort_by_key(|id| id.0);
 
     for id in ids {
         if let Some(entry) = state.validators.get_mut(&id) {
@@ -251,12 +254,32 @@ pub fn epoch_for_height(height: u64) -> u64 {
 mod tests {
     use super::*;
     use indra_core::types::primitives::{
+        Bytes32, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
         ERA_1_2_DURATION_BLOCKS,
         ERA_1_BLOCK_REWARD_SPARK,
         ERA_2_BLOCK_REWARD_SPARK,
         ERA_3_BLOCK_REWARD_SPARK,
         ERA_3_PLUS_DURATION_BLOCKS,
     };
+    use crate::{compute_state_root, validator::{ValidatorEntry, ValidatorStatus}};
+
+    fn make_validator(id_byte: u8, stake: u64) -> ValidatorEntry {
+        ValidatorEntry {
+            validator_id: Bytes32::from([id_byte; 32]),
+            name: format!("validator-{id_byte}"),
+            hybrid_classical_pk: None,
+            hybrid_pq_pk: None,
+            vrf_pk: None,
+            stake_spark: stake,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: DEFAULT_COMMISSION_BPS,
+            min_delegation_spark: DUST_LIMIT_SPARK,
+        }
+    }
 
     #[test]
     fn epoch_boundary_detection() {
@@ -362,5 +385,44 @@ mod tests {
         apply_epoch_transition(&mut s2, 1).unwrap();
         assert_eq!(s1.total_supply, s2.total_supply);
         assert_eq!(s1.treasury_balance, s2.treasury_balance);
+    }
+
+    #[test]
+    fn epoch_transition_is_order_independent() {
+        let validators = [
+            make_validator(0x01, 1_000_000),
+            make_validator(0x02, 2_000_000),
+            make_validator(0x03, 3_000_000),
+            make_validator(0x04, 4_000_000),
+        ];
+
+        let mut s1 = crate::chain::ChainState::new_genesis();
+        let mut s2 = crate::chain::ChainState::new_genesis();
+        s1.fee_reward_pool = 123_456;
+        s2.fee_reward_pool = 123_456;
+
+        for validator in validators.iter().cloned() {
+            s1.validators.upsert(validator).unwrap();
+        }
+        for validator in validators.iter().cloned().rev() {
+            s2.validators.upsert(validator).unwrap();
+        }
+
+        apply_epoch_transition(&mut s1, 1).unwrap();
+        apply_epoch_transition(&mut s2, 1).unwrap();
+
+        for validator in validators {
+            let id = validator.validator_id;
+            assert_eq!(
+                s1.validators.get(&id).unwrap().pending_rewards,
+                s2.validators.get(&id).unwrap().pending_rewards
+            );
+            assert_eq!(
+                s1.validators.get(&id).unwrap().status,
+                s2.validators.get(&id).unwrap().status
+            );
+        }
+
+        assert_eq!(compute_state_root(&s1), compute_state_root(&s2));
     }
 }

@@ -13,6 +13,13 @@ pub struct NodeConfig {
     /// Directory for persistent data (blocks, state snapshots, WAL).
     pub data_dir: PathBuf,
 
+    /// Optional path to `genesis.toml` for seeding the initial validator set.
+    ///
+    /// This is applied exactly once when building the base genesis state
+    /// before any block replay. Snapshot-based restarts do not reload genesis
+    /// into an already-populated state.
+    pub genesis_path: Option<String>,
+
     /// The node's validator identity (32-byte Ed25519 seed).
     /// If None, this node is a full node (validates but does not propose).
     pub validator_seed: Option<[u8; 32]>,
@@ -63,6 +70,7 @@ impl NodeConfig {
     pub fn local_test(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
+            genesis_path:      None,
             validator_seed:   Some([0x42u8; 32]),
             bls_seed:         Some([0x42u8; 32]),
             vrf_seed:         Some([0x42u8; 32]),
@@ -81,6 +89,7 @@ impl NodeConfig {
     pub fn full_node(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
+            genesis_path:      None,
             validator_seed:   None,
             bls_seed:         None,
             vrf_seed:         None,
