@@ -198,6 +198,13 @@ fn main() {
                             Ok(a) => a,
                             Err(_) => continue,
                         };
+                        if gossip.lock().unwrap().is_connected_ip(&addr) {
+                            eprintln!(
+                                "[P2P] Already connected to {} — dropping duplicate",
+                                addr.ip()
+                            );
+                            continue;
+                        }
                         println!("[P2P] Inbound connection from {}", addr);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -239,7 +246,11 @@ fn main() {
                     };
 
                     // Skip if already connected
-                    if gossip.lock().unwrap().peers().connected().iter().any(|p| p.addr == addr) {
+                    if gossip.lock().unwrap().is_connected_ip(&addr) {
+                        eprintln!(
+                            "[P2P] Already connected to {} — dropping duplicate",
+                            addr.ip()
+                        );
                         continue;
                     }
 

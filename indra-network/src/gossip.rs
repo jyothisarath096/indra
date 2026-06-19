@@ -155,6 +155,14 @@ impl GossipEngine {
 
     /// Add a connection for a peer.
     pub fn add_connection(&mut self, addr: SocketAddr, conn: Connection) -> NetworkResult<()> {
+        if self.is_connected_ip(&addr) {
+            eprintln!(
+                "[P2P] Dropping duplicate connection from {} (already connected to this IP)",
+                addr.ip()
+            );
+            let _ = conn.close();
+            return Ok(());
+        }
         let send_conn = Connection::from_stream(conn.clone_stream()?)?;
         let peer_conn = PeerConnection {
             sender: PeerSender::new(addr, send_conn),
@@ -238,6 +246,16 @@ impl GossipEngine {
         self.connections.keys().cloned().collect()
     }
 
+    /// True if a connection to this socket address is already active.
+    pub fn is_connected(&self, addr: &SocketAddr) -> bool {
+        self.connections.contains_key(addr)
+    }
+
+    /// True if a connection to this peer IP is already active, regardless of port.
+    pub fn is_connected_ip(&self, addr: &SocketAddr) -> bool {
+        self.connections.keys().any(|key| key.ip() == addr.ip())
+    }
+
     /// Check if a message hash has been seen recently.
     pub fn is_seen(&self, hash: &[u8; 32]) -> bool {
         self.seen_set.contains(hash)
@@ -289,7 +307,11 @@ impl GossipEngine {
 
     /// Number of active connections.
     pub fn connection_count(&self) -> usize {
-        self.connections.len()
+        let mut unique_ips = HashSet::new();
+        for addr in self.connections.keys() {
+            unique_ips.insert(addr.ip());
+        }
+        unique_ips.len()
     }
 }
 
@@ -302,6 +324,8 @@ impl Default for GossipEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Transport;
+    use std::thread;
 
     #[test]
     fn seen_cache_deduplicates() {
@@ -340,5 +364,42 @@ mod tests {
             engine.score_event(&addr, ScoreEvent::EquivocatingBlock);
         }
         assert!(engine.peers.get(&addr).unwrap().is_banned());
+    }
+
+    #[test]
+    fn duplicate_connection_same_ip_is_ignored() {
+        let listener = Transport::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr;
+        let dialer_a = Transport::bind("127.0.0.1:0").unwrap();
+        let dialer_b = Transport::bind("127.0.0.1:0").unwrap();
+
+        let outbound_a = dialer_a.dial(addr).unwrap();
+        let accepted_a = loop {
+            if let Some(conn) = listener.accept().unwrap() {
+                break conn;
+            }
+            thread::yield_now();
+        };
+
+        let outbound_b = dialer_b.dial(addr).unwrap();
+        let accepted_b = loop {
+            if let Some(conn) = listener.accept().unwrap() {
+                break conn;
+            }
+            thread::yield_now();
+        };
+
+        assert_ne!(accepted_a.remote_addr, accepted_b.remote_addr);
+        assert_eq!(accepted_a.remote_addr.ip(), accepted_b.remote_addr.ip());
+
+        let mut engine = GossipEngine::new();
+        engine.add_connection(accepted_a.remote_addr, accepted_a).unwrap();
+        assert!(engine.is_connected_ip(&accepted_b.remote_addr));
+
+        engine.add_connection(accepted_b.remote_addr, accepted_b).unwrap();
+        assert_eq!(engine.connection_count(), 1);
+
+        let _ = outbound_a.close();
+        let _ = outbound_b.close();
     }
 }
