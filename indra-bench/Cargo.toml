@@ -22,6 +22,7 @@ indra-consensus = { path = "../indra-consensus" }
 indra-storage   = { path = "../indra-storage" }
 indra-node      = { path = "../indra-node" }
 
-[[test]]
-name = "full_bench"
-path = "benches/full_bench.rs"
+[[bench]]
+name    = "full_bench"
+path    = "benches/full_bench.rs"
+harness = false

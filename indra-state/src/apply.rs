@@ -301,17 +301,6 @@ fn apply_transaction(
     height: u64,
     tx_index: u32,
 ) -> StateResult<()> {
-    let sender_address = tx.inputs.first().and_then(|input| {
-        state.utxos.get(&input.utxo_id).map(|entry| {
-            hex::encode(indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0))
-        })
-    }).unwrap_or_else(|| "unknown".to_string());
-    let recipient_address = tx.outputs.first().map(|output| {
-        hex::encode(indra_crypto::sha256(&output.owner_pubkey.classical_pk.0))
-    }).unwrap_or_else(|| "unknown".to_string());
-    let amount = tx.outputs.first().map(|output| output.value_spark).unwrap_or(0);
-
-    // Spend inputs: remove UTXOs, record nullifiers
     for input in &tx.inputs {
         state.utxos.spend(&input.utxo_id);
         state.nullifiers.insert_or_double_spend(input.nullifier)?;
@@ -331,15 +320,6 @@ fn apply_transaction(
     let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
     state.total_supply = state.total_supply.saturating_sub(burn_amount);
     state.fee_reward_pool = state.fee_reward_pool.saturating_add(validator_amount);
-
-    eprintln!(
-        "[tx] applied tx {} at height={}: {} -> {} {} Spark",
-        hex::encode(tx.tx_hash().0),
-        height,
-        sender_address,
-        recipient_address,
-        amount,
-    );
 
     Ok(())
 }
