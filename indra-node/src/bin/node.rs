@@ -94,15 +94,15 @@ fn main() {
         .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS)
         .max(MIN_PRUNE_KEEP_BLOCKS);
 
-    println!("╔══════════════════════════════════════════╗");
-    println!("║      INDRA v2 — Phase 8 Node Starting     ║");
-    println!("╚══════════════════════════════════════════╝");
-    println!("Keys:      {}", keys_path);
-    println!("Data:      {}", data_dir);
-    println!("P2P:       {}", p2p_addr);
-    println!("Mode:      {}", if archive { "archive" } else { "pruned" });
+    eprintln!("╔══════════════════════════════════════════╗");
+    eprintln!("║      INDRA v2 — Phase 8 Node Starting     ║");
+    eprintln!("╚══════════════════════════════════════════╝");
+    eprintln!("Keys:      {}", keys_path);
+    eprintln!("Data:      {}", data_dir);
+    eprintln!("P2P:       {}", p2p_addr);
+    eprintln!("Mode:      {}", if archive { "archive" } else { "pruned" });
     if !archive {
-        println!("Retain:    {} blocks", prune_keep);
+        eprintln!("Retain:    {} blocks", prune_keep);
     }
 
     check_disk_space(Path::new(&data_dir));
@@ -120,19 +120,19 @@ fn main() {
         Some(value) => value.split(',').map(|s| s.trim().to_string()).collect(),
         None => {
             if should_skip_default_bootstrap(&p2p_addr, DEFAULT_BOOTSTRAP_PEER) {
-                println!("Bootstrap: (bootstrap node)");
+                eprintln!("Bootstrap: (bootstrap node)");
                 vec![]
             } else {
                 println!("[p2p] using default bootstrap peer: {}", DEFAULT_BOOTSTRAP_PEER);
-                println!("Bootstrap: {}", DEFAULT_BOOTSTRAP_PEER);
+                eprintln!("Bootstrap: {}", DEFAULT_BOOTSTRAP_PEER);
                 vec![DEFAULT_BOOTSTRAP_PEER.to_string()]
             }
         }
     };
     if bootstrap_peers.is_empty() && bootstrap.is_some() {
-        println!("Bootstrap: (bootstrap node)");
+        eprintln!("Bootstrap: (bootstrap node)");
     } else if let Some(raw_bootstrap) = &bootstrap {
-        println!("Bootstrap: {}", raw_bootstrap);
+        eprintln!("Bootstrap: {}", raw_bootstrap);
     }
     let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
 
@@ -156,16 +156,17 @@ fn main() {
     let engine = NodeEngine::init(config)
         .unwrap_or_else(|e| panic!("Node init failed: {}", e));
 
-    println!("Validator set: {} active validators",
+    eprintln!("Validator set: {} active validators",
         engine.state.validators.active_count());
 
     let validator_id = engine.validator_id()
         .map(|id| hex::encode(id.0))
         .unwrap_or_else(|| "full-node".to_string());
 
-    println!("\nValidator: {}...", &validator_id[..16]);
-    println!("Height:    {}", engine.height());
-    println!("\nStarting P2P and consensus...\n");
+    eprintln!("\nChain:     {}", engine.state.chain_id);
+    eprintln!("Validator: {}...", &validator_id[..16]);
+    eprintln!("Height:    {}", engine.height());
+    eprintln!("\nStarting P2P and consensus...\n");
 
     let mut driver_state = ConsensusDriver::new(engine);
     driver_state.refresh_registered_voters();
@@ -1025,7 +1026,7 @@ fn resolve_peer_addr(addr: &str) -> Option<SocketAddr> {
     }
 
     let resolved = resolve_first_socket_addr(addr)?;
-    println!("[p2p] resolved {} -> {}", addr, resolved);
+    eprintln!("[p2p] resolved {} -> {}", addr, resolved);
     Some(resolved)
 }
 
