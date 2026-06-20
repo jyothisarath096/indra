@@ -12,9 +12,12 @@
 use std::collections::HashMap;
 
 use indra_core::{
+    codec::{Decode, Encode},
     types::primitives::Bytes32,
+    types::transaction::OutputV1,
 };
 use indra_crypto::sha256;
+use indra_state::UtxoSet;
 
 use crate::error::{CliError, CliResult};
 
@@ -50,16 +53,29 @@ impl WalletEntry {
     }
 }
 
+/// A locally tracked change output waiting to be confirmed on-chain.
+#[derive(Debug, Clone)]
+pub struct PendingChange {
+    /// The change output exactly as constructed in the signed transaction.
+    pub output: OutputV1,
+    /// The blinding factor for the output commitment.
+    pub blinding: [u8; 32],
+}
+
 /// The wallet: a collection of UTXO entries keyed by UTXO ID.
 #[derive(Debug, Clone, Default)]
 pub struct Wallet {
     entries: HashMap<Bytes32, WalletEntry>,
+    pending_changes: Vec<PendingChange>,
 }
 
 impl Wallet {
     /// Create an empty wallet.
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+            pending_changes: Vec::new(),
+        }
     }
 
     /// Add a new UTXO to the wallet.
@@ -88,6 +104,47 @@ impl Wallet {
         if let Some(entry) = self.entries.get_mut(utxo_id) {
             entry.spent = true;
         }
+    }
+
+    /// True if the wallet already tracks this UTXO.
+    pub fn contains(&self, utxo_id: &Bytes32) -> bool {
+        self.entries.contains_key(utxo_id)
+    }
+
+    /// Record a change output until it is mined and can be assigned a real UTXO ID.
+    pub fn add_pending_change(&mut self, output: OutputV1, blinding: [u8; 32]) {
+        self.pending_changes.push(PendingChange { output, blinding });
+    }
+
+    /// Number of pending change outputs awaiting confirmation.
+    pub fn pending_change_count(&self) -> usize {
+        self.pending_changes.len()
+    }
+
+    /// Reconcile a mined UTXO against pending change outputs and add it if matched.
+    pub fn reconcile_pending_change(
+        &mut self,
+        utxo_id: Bytes32,
+        created_height: u64,
+        tx_index: u32,
+        out_index: u32,
+    ) -> bool {
+        let Some(index) = self.pending_changes.iter().position(|pending| {
+            UtxoSet::compute_utxo_id(&pending.output, created_height, tx_index, out_index) == utxo_id
+        }) else {
+            return false;
+        };
+
+        let pending = self.pending_changes.remove(index);
+        self.add_utxo(
+            utxo_id,
+            pending.output.value_spark,
+            pending.blinding,
+            created_height,
+            tx_index,
+            out_index,
+        );
+        true
     }
 
     /// Total spendable balance in Spark.
@@ -147,26 +204,38 @@ impl Wallet {
                 e.spent,
             )
         }).collect();
-        format!("[\n{}\n]", entries.join(",\n"))
+        let pending: Vec<String> = self.pending_changes.iter().map(|pending| {
+            format!(
+                r#"  {{"output_hex":"{}","blinding":"{}"}}"#,
+                hex::encode(pending.output.encode_to_vec()),
+                hex::encode(pending.blinding),
+            )
+        }).collect();
+
+        format!(
+            "{{\n  \"entries\": [\n{}\n  ],\n  \"pending_changes\": [\n{}\n  ]\n}}",
+            entries.join(",\n"),
+            pending.join(",\n"),
+        )
     }
 
     /// Load wallet from JSON string.
     pub fn from_json(json: &str) -> CliResult<Self> {
         let mut wallet = Self::new();
-        // Simple parser — find each { object } block containing utxo_id
+        let entries_json = extract_array(json, "entries").unwrap_or(json);
         let mut pos = 0;
-        while pos < json.len() {
+        while pos < entries_json.len() {
             // Find next opening brace
-            let obj_start = match json[pos..].find('{') {
+            let obj_start = match entries_json[pos..].find('{') {
                 Some(i) => pos + i,
                 None => break,
             };
             // Find matching closing brace
-            let obj_end = match json[obj_start..].find('}') {
+            let obj_end = match entries_json[obj_start..].find('}') {
                 Some(i) => obj_start + i + 1,
                 None => break,
             };
-            let obj = &json[obj_start..obj_end];
+            let obj = &entries_json[obj_start..obj_end];
             pos = obj_end;
 
             // Only process objects that contain utxo_id
@@ -207,6 +276,38 @@ impl Wallet {
                 spent,
             });
         }
+
+        if let Some(pending_json) = extract_array(json, "pending_changes") {
+            let mut pos = 0;
+            while pos < pending_json.len() {
+                let obj_start = match pending_json[pos..].find('{') {
+                    Some(i) => pos + i,
+                    None => break,
+                };
+                let obj_end = match pending_json[obj_start..].find('}') {
+                    Some(i) => obj_start + i + 1,
+                    None => break,
+                };
+                let obj = &pending_json[obj_start..obj_end];
+                pos = obj_end;
+
+                let output_hex = parse_str_field(obj, "output_hex")?;
+                let blinding_hex = parse_str_field(obj, "blinding")?;
+                let output_bytes = hex::decode(&output_hex)
+                    .map_err(|_| CliError::Parse("bad pending output hex".into()))?;
+                let blinding_bytes = hex::decode(&blinding_hex)
+                    .map_err(|_| CliError::Parse("bad pending blinding hex".into()))?;
+                if blinding_bytes.len() != 32 {
+                    return Err(CliError::Parse("wrong pending blinding length".into()));
+                }
+                let output = OutputV1::decode_exact(&output_bytes)
+                    .map_err(|_| CliError::Parse("bad pending output encoding".into()))?;
+                let mut blinding = [0u8; 32];
+                blinding.copy_from_slice(&blinding_bytes);
+                wallet.pending_changes.push(PendingChange { output, blinding });
+            }
+        }
+
         Ok(wallet)
     }
 
@@ -224,6 +325,27 @@ impl Wallet {
             Err(e) => Err(CliError::Io(e.to_string())),
         }
     }
+}
+
+fn extract_array<'a>(json: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{field}\":");
+    let pos = json.find(&key)?;
+    let after = json[pos + key.len()..].trim_start();
+    let after = after.strip_prefix('[')?;
+    let mut depth = 1usize;
+    for (idx, ch) in after.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after[..idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_str_field(json: &str, field: &str) -> CliResult<String> {
@@ -297,5 +419,32 @@ mod tests {
         let json = w.to_json();
         let w2 = Wallet::from_json(&json).unwrap();
         assert_eq!(w2.balance(), 999_000);
+    }
+
+    #[test]
+    fn pending_change_round_trip() {
+        let mut wallet = Wallet::new();
+        let output = OutputV1 {
+            value_spark: 123_456,
+            commitment: indra_core::types::crypto::CommitmentV1 {
+                compressed_point: Bytes32::from([0x11; 32]),
+            },
+            owner_pubkey: indra_core::types::crypto::HybridPubKey {
+                classical_pk: Bytes32::from([0x22; 32]),
+                pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0x33; 32]).unwrap(),
+            },
+            range_proof: indra_core::types::primitives::VariableBytes::from_slice(&[0x44; 32]).unwrap(),
+            lock_height: 0,
+        };
+        wallet.add_pending_change(output.clone(), [0x55; 32]);
+
+        let restored = Wallet::from_json(&wallet.to_json()).unwrap();
+        assert_eq!(restored.pending_change_count(), 1);
+
+        let utxo_id = UtxoSet::compute_utxo_id(&output, 7, 1, 1);
+        let mut reconciled = restored.clone();
+        assert!(reconciled.reconcile_pending_change(utxo_id, 7, 1, 1));
+        assert!(reconciled.contains(&utxo_id));
+        assert_eq!(reconciled.pending_change_count(), 0);
     }
 }

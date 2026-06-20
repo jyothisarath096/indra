@@ -115,6 +115,50 @@ fn main() {
     match query_utxos(&node_url, &pubkey_hex) {
         Ok(response) => {
             println!("Node response: {}", response);
+            let discovered = parse_utxos_json(&response);
+            let genesis_blinding = derive_genesis_blinding(&hybrid_seed);
+            let mut added = 0usize;
+            let mut reconciled = 0usize;
+            for utxo in discovered {
+                if wallet.contains(&utxo.utxo_id) {
+                    continue;
+                }
+                if utxo.created_height == 0 {
+                    wallet.add_utxo(
+                        utxo.utxo_id,
+                        utxo.value,
+                        genesis_blinding,
+                        utxo.created_height,
+                        utxo.tx_index,
+                        utxo.out_index,
+                    );
+                    added += 1;
+                    continue;
+                }
+                if wallet.reconcile_pending_change(
+                    utxo.utxo_id,
+                    utxo.created_height,
+                    utxo.tx_index,
+                    utxo.out_index,
+                ) {
+                    reconciled += 1;
+                }
+            }
+
+            if added > 0 || reconciled > 0 {
+                wallet.save(&wallet_path).unwrap_or_else(|e| {
+                    eprintln!("Error saving wallet: {}", e);
+                    std::process::exit(1);
+                });
+            }
+
+            if added > 0 {
+                println!("Added {} genesis UTXO(s) automatically.", added);
+            }
+            if reconciled > 0 {
+                println!("Reconciled {} pending change UTXO(s).", reconciled);
+            }
+
             println!("\nNote: UTXO values are confidential (Pedersen commitments).");
             println!("To add a known UTXO to your wallet use:");
             println!("  indra-wallet-scan --keys keys.json --wallet wallet.json \\");
@@ -178,7 +222,79 @@ fn http_post(url: &str, body: &str) -> Result<String, String> {
 /// Derive the genesis blinding factor for this validator's initial stake UTXO.
 /// This is deterministic from the hybrid seed.
 fn derive_genesis_blinding(hybrid_seed: &[u8; 32]) -> [u8; 32] {
-    indra_crypto::sha256(&[hybrid_seed.as_slice(), b"genesis-utxo-blinding"].concat())
+    use indra_crypto::hybrid::ClassicalKeypair;
+
+    let classical = ClassicalKeypair::from_seed(hybrid_seed);
+    let classical_pk = classical.public_key().0;
+    let validator_id = indra_crypto::sha256(&classical_pk);
+    indra_crypto::sha256(&[b"genesis-utxo-blinding".as_slice(), &validator_id].concat())
+}
+
+struct RpcUtxo {
+    utxo_id: indra_core::Bytes32,
+    value: u64,
+    created_height: u64,
+    tx_index: u32,
+    out_index: u32,
+}
+
+fn parse_utxos_json(json: &str) -> Vec<RpcUtxo> {
+    let Some(start) = json.find("\"utxos\":[") else {
+        return vec![];
+    };
+    let after = &json[start + 9..];
+    let Some(end) = after.find(']') else {
+        return vec![];
+    };
+    let array = &after[..end];
+
+    let mut utxos = Vec::new();
+    let mut pos = 0usize;
+    while let Some(obj_start_rel) = array[pos..].find('{') {
+        let obj_start = pos + obj_start_rel;
+        let Some(obj_end_rel) = array[obj_start..].find('}') else {
+            break;
+        };
+        let obj_end = obj_start + obj_end_rel + 1;
+        let obj = &array[obj_start..obj_end];
+        pos = obj_end;
+
+        let Some(utxo_hex) = extract_json_str(obj, "utxo_id") else {
+            continue;
+        };
+        let Ok(decoded) = hex::decode(utxo_hex) else {
+            continue;
+        };
+        if decoded.len() != 32 {
+            continue;
+        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&decoded);
+        utxos.push(RpcUtxo {
+            utxo_id: indra_core::Bytes32::from(raw),
+            value: extract_json_num(obj, "amount").unwrap_or(0),
+            created_height: extract_json_num(obj, "created_height").unwrap_or(0),
+            tx_index: extract_json_num(obj, "tx_index").unwrap_or(0) as u32,
+            out_index: extract_json_num(obj, "out_index").unwrap_or(0) as u32,
+        });
+    }
+    utxos
+}
+
+fn extract_json_str(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let pos = json.find(&needle)?;
+    let after = &json[pos + needle.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn extract_json_num(json: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{}\":", key);
+    let pos = json.find(&needle)?;
+    let after = json[pos + needle.len()..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 fn extract_hex32(json: &str, field: &str) -> [u8; 32] {

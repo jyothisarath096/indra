@@ -29,7 +29,7 @@ use indra_crypto::{
 
 use crate::{
     error::{CliError, CliResult},
-    wallet::Wallet,
+    wallet::{PendingChange, Wallet},
 };
 
 /// Minimum fee in Spark.
@@ -74,6 +74,8 @@ pub struct BuiltTransaction {
     pub change_blinding: Option<[u8; 32]>,
     /// The UTXO IDs that were spent.
     pub spent_utxo_ids: Vec<Bytes32>,
+    /// Pending change output to persist until the transaction is mined.
+    pub pending_change: Option<PendingChange>,
 }
 
 /// Build and sign a transaction.
@@ -161,12 +163,13 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     });
 
     // Change output (if above dust)
+    let mut pending_change = None;
     if let Some(cb) = change_blinding {
         let change_commitment = commit(change_spark, &cb);
         let change_proof = indra_crypto::prove_range(change_spark, &cb, &mut rng)
             .map_err(|e| CliError::Transaction(format!("change range proof failed: {e}")))?;
 
-        outputs.push(OutputV1 {
+        let change_output = OutputV1 {
             value_spark: change_spark,
             commitment: CommitmentV1 {
                 compressed_point: Bytes32::from(change_commitment.0),
@@ -175,7 +178,12 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
             range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&change_proof)
                 .map_err(|_| CliError::Transaction("change range proof too large".into()))?,
             lock_height: 0,
+        };
+        pending_change = Some(PendingChange {
+            output: change_output.clone(),
+            blinding: cb,
         });
+        outputs.push(change_output);
     }
 
     // 7. Build fee commitment
@@ -231,6 +239,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         recipient_blinding,
         change_blinding,
         spent_utxo_ids: spent_ids,
+        pending_change,
     })
 }
 

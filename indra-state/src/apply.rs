@@ -214,7 +214,7 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
 ///
 /// `block_nullifiers` accumulates nullifiers seen so far in THIS block,
 /// allowing detection of intra-block double spends.
-fn validate_transaction(
+pub fn validate_transaction(
     state: &ChainState,
     tx: &TransactionV1,
     chain_id: &str,

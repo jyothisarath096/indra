@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   indra-send --keys keys.json --wallet wallet.json \
-//!              --to <classical_pubkey_hex> \
+//!              --to <validator_address_or_pubkey> \
 //!              --amount <INDRA> \
 //!              --fee <INDRA> \
 //!              --node http://127.0.0.1:8545
@@ -89,10 +89,12 @@ fn main() {
         std::process::exit(1);
     }
 
+    let recipient = resolve_recipient(&node_url, &to);
+
     // Build transaction
     let params = indra_cli::tx_builder::TxParams {
         chain_id: &chain_id,
-        recipient_pubkey_hex: &to,
+        recipient_pubkey_hex: &recipient,
         amount_spark,
         fee_spark,
         wallet: &wallet,
@@ -143,6 +145,13 @@ fn main() {
             for id in &built.spent_utxo_ids {
                 wallet.mark_spent(id);
             }
+            if let Some(change) = built.pending_change {
+                wallet.add_pending_change(change.output.clone(), change.blinding);
+                eprintln!(
+                    "[wallet] saved pending change output: {} Spark",
+                    change.output.value_spark
+                );
+            }
             wallet.save(&wallet_path).unwrap_or_else(|e| {
                 eprintln!("Warning: could not save wallet: {}", e);
             });
@@ -157,13 +166,41 @@ fn main() {
     }
 }
 
+fn resolve_recipient(node_url: &str, to: &str) -> String {
+    if to.contains(':') {
+        return to.to_string();
+    }
+
+    if to.len() == 64 {
+        if let Some(pubkey_hex) = lookup_validator_pubkey(node_url, to) {
+            return pubkey_hex;
+        }
+    }
+
+    to.to_string()
+}
+
+fn lookup_validator_pubkey(node_url: &str, address: &str) -> Option<String> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","method":"indra_getValidator","params":["{}"],"id":1}}"#,
+        address
+    );
+    let response = submit_raw_rpc(node_url, &body).ok()?;
+    let classical = extract_json_field(&response, "hybrid_classical_pk")?;
+    let pq = extract_json_field(&response, "hybrid_pq_pk")?;
+    Some(format!("{classical}:{pq}"))
+}
+
 /// Submit a hex-encoded transaction to the node via JSON-RPC.
 fn submit_transaction(node_url: &str, tx_hex: &str) -> Result<String, String> {
     let body = format!(
         r#"{{"jsonrpc":"2.0","method":"indra_sendTransaction","params":["{}"],"id":1}}"#,
         tx_hex
     );
+    submit_raw_rpc(node_url, &body)
+}
 
+fn submit_raw_rpc(node_url: &str, body: &str) -> Result<String, String> {
     // Use std::net for HTTP — no external HTTP crate needed
     let url = node_url.trim_start_matches("http://");
     let (host, path) = if let Some(pos) = url.find('/') {
@@ -196,6 +233,14 @@ fn submit_transaction(node_url: &str, tx_hex: &str) -> Result<String, String> {
     } else {
         Ok(response)
     }
+}
+
+fn extract_json_field(json: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\":\"");
+    let pos = json.find(&key)?;
+    let after = &json[pos + key.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
 }
 
 fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {

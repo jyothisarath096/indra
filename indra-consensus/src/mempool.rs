@@ -20,7 +20,7 @@
 //! In-memory HashMap keyed by tx_id = SHA-256(encode(tx)).
 //! Phase 5 adds WAL-backed persistence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indra_core::{
     codec::Encode,
@@ -195,6 +195,24 @@ impl Mempool {
         });
     }
 
+    /// Remove transactions that are no longer valid against the current state.
+    pub fn evict_invalid(&mut self, state: &indra_state::ChainState) {
+        self.entries.retain(|tx_id, entry| {
+            let mut block_nullifiers = HashSet::new();
+            let keep = indra_state::apply::validate_transaction(
+                state,
+                &entry.tx,
+                &state.chain_id,
+                &mut block_nullifiers,
+                state.height.saturating_add(1),
+            ).is_ok();
+            if !keep {
+                eprintln!("[mempool] evicting invalid tx {:?}", tx_id);
+            }
+            keep
+        });
+    }
+
     /// Return transactions for block production.
     ///
     /// Returns up to `max_count` transactions, prioritising:
@@ -351,5 +369,18 @@ mod tests {
         // The 1_000 fee tx should have been evicted
         let fees: Vec<u64> = mp.iter().map(|e| e.tx.fee_amount).collect();
         assert!(!fees.contains(&1_000));
+    }
+
+    #[test]
+    fn evict_invalid_drops_transactions_that_fail_state_validation() {
+        let mut mp = Mempool::default_config();
+        let tx = dummy_tx(100_000, 0x01);
+        let tx_id = mp.submit(tx, 100, 1).unwrap();
+        assert!(mp.contains(&tx_id));
+
+        let state = indra_state::ChainState::new_genesis();
+        mp.evict_invalid(&state);
+
+        assert!(!mp.contains(&tx_id));
     }
 }

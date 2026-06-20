@@ -51,5 +51,5 @@ pub use keygen::{
 };
 pub use genesis_cmd::{GenesisEntry, build_genesis_config, GenesisConfig};
 pub use query::{rpc_call, QueryResult};
-pub use wallet::{Wallet, WalletEntry};
+pub use wallet::{PendingChange, Wallet, WalletEntry};
 pub use tx_builder::{build_transaction, TxParams, BuiltTransaction};

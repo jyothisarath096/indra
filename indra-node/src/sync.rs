@@ -246,6 +246,7 @@ pub fn import_block(
 
     // 4. Evict spent transactions from mempool
     mempool.evict_spent(&state.nullifiers);
+    mempool.evict_invalid(state);
 
     // 5. Take snapshot if on interval
     if height > 0 && height.is_multiple_of(SNAPSHOT_INTERVAL) {
