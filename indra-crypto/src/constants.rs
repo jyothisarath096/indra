@@ -9,13 +9,16 @@ pub const CLASSICAL_SIG_BYTES: usize = 64;
 /// Ed25519 public key size in bytes.
 pub const CLASSICAL_PK_BYTES: usize = 32;
 
-/// Dilithium2 signature size in bytes.
-/// Actual NIST Dilithium2 signature = 2420 bytes. We keep a small margin.
-pub const PQ_SIG_BYTES: usize = 2_500;
+/// ML-DSA-87 signature size in bytes.
+pub const PQ_SIG_BYTES: usize = 4_627;
 
-/// Dilithium2 public key size in bytes.
-/// Actual NIST Dilithium2 public key = 1312 bytes.
-pub const PQ_PK_BYTES: usize = 1_400;
+/// ML-DSA-87 verifying key size in bytes.
+pub const PQ_PK_BYTES: usize = 2_592;
+
+/// ML-DSA-87 secret key storage size in bytes.
+///
+/// INDRA stores the canonical 32-byte seed, not the expanded signing key.
+pub const PQ_SK_BYTES: usize = 32;
 
 /// BLS12-381 aggregate signature size in bytes (G1-compressed point).
 pub const BLS_SIG_BYTES: usize = 48;

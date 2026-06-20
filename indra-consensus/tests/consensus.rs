@@ -89,7 +89,7 @@ fn dummy_tx(
         fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
+            pq_sig:        VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         },
     };
     let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
@@ -121,7 +121,7 @@ impl TestValidator {
         RegisteredVoter {
             validator_id: self.id,
             classical_pk: pk.classical.0,
-            pq_pk:        pk.pq.0.clone(),
+            pq_pk:        pk.pq.0.to_vec(),
             stake:        self.stake,
         }
     }
@@ -131,7 +131,7 @@ impl TestValidator {
         QcValidator {
             validator_id: self.id,
             position,
-            pq_pk:        pk.pq.0.clone(),
+            pq_pk:        pk.pq.0.to_vec(),
             stake:        self.stake,
         }
     }

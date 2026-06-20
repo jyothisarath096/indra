@@ -2,19 +2,17 @@ use std::time::Instant;
 
 #[test]
 fn bench_qc_verification_timing() {
-    use pqcrypto_dilithium::dilithium2;
-    use pqcrypto_traits::sign::SignedMessage;
-
     let message = b"indra-qc-vote-signing-message-32";
-    let (pk, sk) = dilithium2::keypair();
-    let signed = dilithium2::sign(message, &sk);
+    let kp = indra_crypto::PqKeypair::generate();
+    let pk = kp.public_key();
+    let sig = kp.sign(message).expect("sign failed");
 
-    println!("\n=== Dilithium2 QC Verification Benchmark (Apple M-series) ===");
+    println!("\n=== ML-DSA-87 QC Verification Benchmark (Apple M-series) ===");
 
     for n in [10usize, 50, 100, 150, 200] {
         let start = Instant::now();
         for _ in 0..n {
-            let _ = dilithium2::open(&signed, &pk).expect("verify failed");
+            indra_crypto::verify_pq(message, &sig, &pk).expect("verify failed");
         }
         let elapsed = start.elapsed();
         let per_us = elapsed.as_micros() / n as u128;
@@ -28,7 +26,7 @@ fn bench_qc_verification_timing() {
 
     let start = Instant::now();
     for _ in 0..150 {
-        let _ = dilithium2::open(&signed, &pk).unwrap();
+        indra_crypto::verify_pq(message, &sig, &pk).unwrap();
     }
     let elapsed_150 = start.elapsed();
     println!("\n  Block time:              6000ms");
@@ -38,5 +36,5 @@ fn bench_qc_verification_timing() {
     println!("===================================================");
 
     assert!(elapsed_150.as_millis() < 2000,
-        "150 Dilithium2 verifications took {}ms", elapsed_150.as_millis());
+        "150 ML-DSA-87 verifications took {}ms", elapsed_150.as_millis());
 }

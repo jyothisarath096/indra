@@ -29,8 +29,8 @@ use errors::{error_string, IndraError};
 
 const CLASSICAL_PK_BYTES: usize = 32;
 const CLASSICAL_SK_BYTES: usize = 32;
-const PQ_PK_BYTES: usize = 1312;
-const PQ_SK_BYTES: usize = 2560;
+const PQ_PK_BYTES: usize = 2592;
+const PQ_SK_BYTES: usize = 32;
 const BYTES32_LEN: usize = 32;
 
 /// FFI keypair bundle returned to Swift.
@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(result, INDRA_OK);
         assert_ne!(out.validator_id, [0u8; 32]);
         assert_ne!(out.classical_pk, [0u8; 32]);
-        assert_ne!(out.pq_pk, [0u8; 1312]);
+        assert_ne!(out.pq_pk, [0u8; 2592]);
     }
 
     #[test]

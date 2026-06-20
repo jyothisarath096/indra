@@ -1,4 +1,4 @@
-//! Hybrid signature system: Ed25519 (classical) + Dilithium2 (post-quantum).
+//! Hybrid signature system: Ed25519 (classical) + ML-DSA-87 (post-quantum).
 //!
 //! Both schemes must verify independently for any signature to be accepted.
 //! This is the core cryptographic invariant of the INDRA protocol:
@@ -7,26 +7,28 @@
 use ed25519_dalek::{
     Signature as Ed25519Sig,
     SigningKey,
-    VerifyingKey,
     Signer,
     Verifier,
+    VerifyingKey,
 };
-use pqcrypto_dilithium::dilithium2;
-use pqcrypto_traits::sign::{
-    PublicKey as PqPubKeyTrait,
-    SecretKey as PqSecretKeyTrait,
-    SignedMessage as PqSignedMsg,
+use ml_dsa::{
+    EncodedVerifyingKey,
+    Generate,
+    Keypair,
+    KeyExport,
+    MlDsa87,
+    Signature as MlDsaSignature,
+    SignatureEncoding,
+    SigningKey as MlDsaSigningKey,
+    Signer as MlDsaSigner,
+    Verifier as MlDsaVerifier,
+    VerifyingKey as MlDsaVerifyingKey,
 };
 
 use crate::{
-    constants::{CLASSICAL_SIG_BYTES, CLASSICAL_PK_BYTES},
+    constants::{CLASSICAL_PK_BYTES, CLASSICAL_SIG_BYTES, PQ_PK_BYTES, PQ_SIG_BYTES, PQ_SK_BYTES},
     error::{CryptoError, CryptoResult},
 };
-
-#[allow(unsafe_code)]
-unsafe extern "C" {
-    fn indra_dilithium2_seed_keypair(pk: *mut u8, sk: *mut u8, seed: *const u8) -> i32;
-}
 
 // ── Classical (Ed25519) ───────────────────────────────────────────────────────
 
@@ -69,164 +71,135 @@ pub fn verify_classical(
     sig: &ClassicalSignature,
     pk: &ClassicalPublicKey,
 ) -> CryptoResult<()> {
-    let vk = VerifyingKey::from_bytes(&pk.0)
-        .map_err(|_| CryptoError::MalformedPublicKey {
-            scheme: "Ed25519",
-            actual: CLASSICAL_PK_BYTES,
-        })?;
+    let vk = VerifyingKey::from_bytes(&pk.0).map_err(|_| CryptoError::MalformedPublicKey {
+        scheme: "Ed25519",
+        actual: CLASSICAL_PK_BYTES,
+    })?;
     let ed_sig = Ed25519Sig::from_bytes(&sig.0);
     vk.verify(message, &ed_sig)
         .map_err(|_| CryptoError::ClassicalVerifyFailed)
 }
 
-// ── Post-Quantum (Dilithium2) ─────────────────────────────────────────────────
+// ── Post-Quantum (ML-DSA-87) ─────────────────────────────────────────────────
 
-/// A Dilithium2 public key (~1312 bytes, stored in a Vec for flexibility).
+/// An ML-DSA-87 verifying key (2592 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PqPublicKey(pub Vec<u8>);
+pub struct PqPublicKey(pub [u8; PQ_PK_BYTES]);
 
-/// A Dilithium2 signature (~2420 bytes, stored in a Vec).
+/// An ML-DSA-87 signature (4627 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PqSignature(pub Vec<u8>);
+pub struct PqSignature(pub [u8; PQ_SIG_BYTES]);
 
-/// A Dilithium2 signing keypair.
+/// An ML-DSA-87 signing keypair represented canonically by its 32-byte seed.
 pub struct PqKeypair {
-    pk: dilithium2::PublicKey,
-    sk: dilithium2::SecretKey,
+    seed: [u8; PQ_SK_BYTES],
 }
 
 impl PqKeypair {
-    /// Generate a deterministic Dilithium2 keypair from a 32-byte seed.
+    /// Generate a deterministic ML-DSA-87 keypair from a 32-byte seed.
     pub fn from_seed(seed: &[u8; 32]) -> CryptoResult<Self> {
-        let mut pk_bytes = [0u8; 1312];
-        let mut sk_bytes = [0u8; 2560];
-        #[allow(unsafe_code)]
-        let rc = unsafe {
-            indra_dilithium2_seed_keypair(
-                pk_bytes.as_mut_ptr(),
-                sk_bytes.as_mut_ptr(),
-                seed.as_ptr(),
-            )
-        };
-        if rc != 0 {
+        Ok(Self { seed: *seed })
+    }
+
+    /// Generate a fresh ML-DSA-87 keypair using the library RNG.
+    pub fn generate() -> Self {
+        let sk = MlDsaSigningKey::<MlDsa87>::generate();
+        Self {
+            seed: sk.to_seed().into(),
+        }
+    }
+
+    /// Load an ML-DSA-87 keypair from raw public key and seed bytes.
+    pub fn from_bytes(pk_bytes: &[u8], sk_bytes: &[u8]) -> CryptoResult<Self> {
+        if sk_bytes.len() != PQ_SK_BYTES {
             return Err(CryptoError::MalformedPublicKey {
-                scheme: "dilithium2-seeded",
-                actual: rc as usize,
+                scheme: "ML-DSA-87-seed",
+                actual: sk_bytes.len(),
             });
         }
-        let pk = dilithium2::PublicKey::from_bytes(&pk_bytes)
-            .map_err(|_| CryptoError::MalformedPublicKey {
-                scheme: "dilithium2",
-                actual: pk_bytes.len(),
-            })?;
-        let sk = dilithium2::SecretKey::from_bytes(&sk_bytes)
-            .map_err(|_| CryptoError::MalformedPublicKey {
-                scheme: "dilithium2-sk",
-                actual: sk_bytes.len(),
-            })?;
-        Ok(Self { pk, sk })
+
+        let mut seed = [0u8; PQ_SK_BYTES];
+        seed.copy_from_slice(sk_bytes);
+        let keypair = Self { seed };
+
+        if !pk_bytes.is_empty() {
+            if pk_bytes.len() != PQ_PK_BYTES {
+                return Err(CryptoError::MalformedPublicKey {
+                    scheme: "ML-DSA-87",
+                    actual: pk_bytes.len(),
+                });
+            }
+
+            if keypair.public_key().0 != pk_bytes {
+                return Err(CryptoError::MalformedPublicKey {
+                    scheme: "ML-DSA-87-public-mismatch",
+                    actual: pk_bytes.len(),
+                });
+            }
+        }
+
+        Ok(keypair)
     }
 
-    /// Generate a new Dilithium2 keypair using the library's secure RNG.
-    pub fn generate() -> Self {
-        let (pk, sk) = dilithium2::keypair();
-        Self { pk, sk }
-    }
-
-    /// Load a Dilithium2 keypair from raw byte slices.
-    ///
-    /// Use this to restore a previously generated keypair from stored bytes.
-    /// The bytes must have been produced by a prior call to `generate()`.
-    pub fn from_bytes(pk_bytes: &[u8], sk_bytes: &[u8]) -> CryptoResult<Self> {
-        use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
-        let pk = dilithium2::PublicKey::from_bytes(pk_bytes)
-            .map_err(|_| CryptoError::MalformedPublicKey {
-                scheme: "dilithium2",
-                actual: pk_bytes.len(),
-            })?;
-        let sk = dilithium2::SecretKey::from_bytes(sk_bytes)
-            .map_err(|_| CryptoError::MalformedPublicKey {
-                scheme: "dilithium2-sk",
-                actual: sk_bytes.len(),
-            })?;
-        Ok(Self { pk, sk })
-    }
-
-    /// Return the raw secret key bytes (for storage in keys.json).
+    /// Return the raw seed bytes (for storage in keys.json).
     pub fn secret_key_bytes(&self) -> Vec<u8> {
-        use pqcrypto_traits::sign::SecretKey as _;
-        self.sk.as_bytes().to_vec()
+        self.seed.to_vec()
     }
 
     /// Return the public key.
     pub fn public_key(&self) -> PqPublicKey {
-        PqPublicKey(self.pk.as_bytes().to_vec())
+        let sk = MlDsaSigningKey::<MlDsa87>::from_seed(&self.seed.into());
+        let vk = sk.verifying_key();
+        PqPublicKey(vk.to_bytes().into())
     }
 
-    /// Sign a message with Dilithium2.
+    /// Sign a message with ML-DSA-87.
     pub fn sign(&self, message: &[u8]) -> CryptoResult<PqSignature> {
-        let sm = dilithium2::sign(message, &self.sk);
-        let sig_len = dilithium2::signature_bytes();
-        let raw = sm.as_bytes();
-        if raw.len() < sig_len {
-            return Err(CryptoError::MalformedSignature {
-                scheme: "Dilithium2",
-                actual: raw.len(),
-            });
-        }
-        // pqcrypto prepends the detached signature to the message
-        Ok(PqSignature(raw[..sig_len].to_vec()))
+        let sk = MlDsaSigningKey::<MlDsa87>::from_seed(&self.seed.into());
+        let sig = MlDsaSigner::sign(&sk, message);
+        Ok(PqSignature(sig.to_bytes().into()))
     }
 }
 
-/// Verify a Dilithium2 signature.
+/// Verify an ML-DSA-87 signature.
 pub fn verify_pq(
     message: &[u8],
     sig: &PqSignature,
     pk: &PqPublicKey,
 ) -> CryptoResult<()> {
-    let pk_obj = dilithium2::PublicKey::from_bytes(&pk.0)
-        .map_err(|_| CryptoError::MalformedPublicKey {
-            scheme: "Dilithium2",
+    let enc_vk = EncodedVerifyingKey::<MlDsa87>::try_from(pk.0.as_slice()).map_err(|_| {
+        CryptoError::MalformedPublicKey {
+            scheme: "ML-DSA-87",
             actual: pk.0.len(),
-        })?;
-    // Reconstruct the signed message format pqcrypto expects: sig || message
-    let sig_len = dilithium2::signature_bytes();
-    let mut combined = sig.0.clone();
-    combined.extend_from_slice(message);
-    if combined.len() < sig_len {
-        return Err(CryptoError::MalformedSignature {
-            scheme: "Dilithium2",
+        }
+    })?;
+    let vk = MlDsaVerifyingKey::<MlDsa87>::decode(&enc_vk);
+    let sig_obj = MlDsaSignature::<MlDsa87>::try_from(sig.0.as_slice()).map_err(|_| {
+        CryptoError::MalformedSignature {
+            scheme: "ML-DSA-87",
             actual: sig.0.len(),
-        });
-    }
-    let sm = dilithium2::SignedMessage::from_bytes(&combined)
-        .map_err(|_| CryptoError::MalformedSignature {
-            scheme: "Dilithium2",
-            actual: sig.0.len(),
-        })?;
-    dilithium2::open(&sm, &pk_obj)
-        .map(|_| ())
-        .map_err(|_| CryptoError::PqVerifyFailed)
+        }
+    })?;
+    MlDsaVerifier::verify(&vk, message, &sig_obj).map_err(|_| CryptoError::PqVerifyFailed)
 }
 
 // ── Hybrid ────────────────────────────────────────────────────────────────────
 
-/// A hybrid public key: Ed25519 + Dilithium2.
+/// A hybrid public key: Ed25519 + ML-DSA-87.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridPublicKey {
     /// Ed25519 component (32 bytes).
     pub classical: ClassicalPublicKey,
-    /// Dilithium2 component (~1312 bytes).
+    /// ML-DSA-87 component (2592 bytes).
     pub pq: PqPublicKey,
 }
 
-/// A hybrid signature: Ed25519 + Dilithium2.
+/// A hybrid signature: Ed25519 + ML-DSA-87.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridSignature {
     /// Ed25519 component (64 bytes).
     pub classical: ClassicalSignature,
-    /// Dilithium2 component (~2420 bytes).
+    /// ML-DSA-87 component (4627 bytes).
     pub pq: PqSignature,
 }
 

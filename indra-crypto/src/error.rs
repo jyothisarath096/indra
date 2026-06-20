@@ -9,8 +9,8 @@ pub enum CryptoError {
     #[error("Ed25519 signature verification failed")]
     ClassicalVerifyFailed,
 
-    /// Dilithium2 signature verification failed.
-    #[error("Dilithium2 signature verification failed")]
+    /// ML-DSA-87 signature verification failed.
+    #[error("ML-DSA-87 signature verification failed")]
     PqVerifyFailed,
 
     /// BLS operation failed.

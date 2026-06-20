@@ -502,7 +502,7 @@ mod tests {
                 validator_id,
                 name: name.to_string(),
                 hybrid_classical_pk: Some(public.classical.0),
-                hybrid_pq_pk: Some(public.pq.0.clone()),
+                hybrid_pq_pk: Some(public.pq.0.to_vec()),
                 vrf_pk: Some(vrf_pk),
                 stake_spark: 1_000_000,
                 status: ValidatorStatus::Active,
@@ -571,7 +571,7 @@ mod tests {
             &[QcValidator {
                 validator_id,
                 position: 0,
-                pq_pk: public.pq.0.clone(),
+                pq_pk: public.pq.0.to_vec(),
                 stake: 1_000_000,
             }],
             vec![&vote],

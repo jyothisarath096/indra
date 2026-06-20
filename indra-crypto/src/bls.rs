@@ -3,7 +3,7 @@
 //! N validator Ed25519-equivalent signatures → 48 bytes total.
 //! This makes QC overhead viable at 1500 validators on 50 Mbps.
 //!
-//! Only used for the classical component of QCs. The PQ (Dilithium2)
+//! Only used for the classical component of QCs. The PQ (ML-DSA-87)
 //! component uses individual sigs because Dilithium is not aggregatable.
 
 use blst::min_pk::{PublicKey, SecretKey, Signature, AggregateSignature};

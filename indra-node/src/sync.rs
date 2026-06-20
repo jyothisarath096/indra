@@ -511,7 +511,7 @@ mod tests {
             validator_id,
             name: format!("validator-{seed}"),
             hybrid_classical_pk: Some(public.classical.0),
-            hybrid_pq_pk: with_pq_key.then(|| public.pq.0.clone()),
+            hybrid_pq_pk: with_pq_key.then(|| public.pq.0.to_vec()),
             vrf_pk: with_vrf_key.then(|| vrf.public_key()),
             stake_spark: stake,
             status: ValidatorStatus::Active,
@@ -657,7 +657,7 @@ mod tests {
         let pq = indra_crypto::hybrid::PqKeypair::from_seed(&[0x41; 32]).unwrap();
         let hybrid = indra_crypto::hybrid::HybridKeypair::new(classical, pq);
         let validator_id = Bytes32::from(indra_crypto::sha256(&hybrid.public_key().classical.0));
-        let pq_pk = hybrid.public_key().pq.0.clone();
+        let pq_pk = hybrid.public_key().pq.0.to_vec();
         let mut prev_qc = Vec::new();
         for i in 1..=10u64 {
             let block = make_strict_block(&state, 0x41, 0, prev_qc.clone());
@@ -885,7 +885,7 @@ mod tests {
             &state_store,
         ).unwrap();
 
-        let pq_pk = hybrid.public_key().pq.0.clone();
+        let pq_pk = hybrid.public_key().pq.0.to_vec();
         let qc_bytes = build_qc_bytes(
             block1.header.height,
             block1.header.proposer_round,

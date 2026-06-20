@@ -54,7 +54,7 @@ pub struct TxParams<'a> {
     pub wallet: &'a Wallet,
     /// Sender's hybrid seed (for Ed25519 signing).
     pub hybrid_seed: [u8; 32],
-    /// Sender's Dilithium2 secret key bytes (from keys.json).
+    /// Sender's ML-DSA-87 seed bytes (from keys.json).
     pub pq_sk_bytes: Vec<u8>,
     /// Sender's own pubkey (for change output).
     pub sender_pubkey: HybridPubKey,
@@ -217,7 +217,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         .map_err(|e| CliError::Crypto(e.to_string()))?;
 
     let classical_sig_bytes = sig.classical.0.to_vec();
-    let pq_sig_bytes = sig.pq.0.clone();
+    let pq_sig_bytes = sig.pq.0.to_vec();
 
     tx.signature = HybridSignature {
         classical_sig: VariableBytes::from_slice(&classical_sig_bytes)
@@ -265,7 +265,7 @@ fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
         hex::decode(parts[1])
             .map_err(|_| CliError::InvalidHex("bad pq pubkey hex".into()))?
     } else {
-        vec![0u8; 1312] // zeroed pq key — not recommended for mainnet
+        vec![0u8; 2592] // zeroed pq key — not recommended for mainnet
     };
 
     Ok(HybridPubKey {
@@ -280,7 +280,7 @@ fn dummy_signature() -> CliResult<HybridSignature> {
     Ok(HybridSignature {
         classical_sig: VariableBytes::from_slice(&[0u8; 64])
             .map_err(|_| CliError::Transaction("dummy classical signature exceeded max length".into()))?,
-        pq_sig: VariableBytes::from_slice(&[0u8; 2420])
+        pq_sig: VariableBytes::from_slice(&[0u8; 4627])
             .map_err(|_| CliError::Transaction("dummy PQ signature exceeded max length".into()))?,
     })
 }

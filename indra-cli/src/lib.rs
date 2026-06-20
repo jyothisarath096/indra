@@ -6,7 +6,7 @@
 //!
 //! ### `keygen`
 //! Generate a complete validator keypair set:
-//! - Ed25519 + Dilithium2 hybrid keypair (for signing transactions and votes)
+//! - Ed25519 + ML-DSA-87 hybrid keypair (for signing transactions and votes)
 //! - Legacy BLS12-381 keypair metadata (retained for backward compatibility)
 //! - VRF keypair (for proposer election)
 //!

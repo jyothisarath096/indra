@@ -22,8 +22,8 @@ extern "C" {
 
 #define INDRA_CLASSICAL_PK_BYTES  32
 #define INDRA_CLASSICAL_SK_BYTES  32
-#define INDRA_PQ_PK_BYTES       1312
-#define INDRA_PQ_SK_BYTES       2560
+#define INDRA_PQ_PK_BYTES       2592
+#define INDRA_PQ_SK_BYTES         32
 #define INDRA_VALIDATOR_ID_BYTES  32
 #define INDRA_BYTES32_LEN         32
 #define INDRA_TX_ID_BYTES         32

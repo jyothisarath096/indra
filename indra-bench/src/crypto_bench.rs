@@ -35,10 +35,10 @@ pub fn bench_ed25519(iterations: u64) {
     r.assert_faster_than(Duration::from_micros(400));
 }
 
-/// Benchmark Dilithium2 sign + verify.
+/// Benchmark ML-DSA-87 sign + verify.
 pub fn bench_dilithium2(iterations: u64) {
     let kp = PqKeypair::generate();
-    let msg = b"INDRA benchmark message for Dilithium2 signing";
+    let msg = b"INDRA benchmark message for ML-DSA-87 signing";
 
     let r = bench("dilithium2_sign", iterations, || {
         let _ = kp.sign(msg);
@@ -56,7 +56,7 @@ pub fn bench_dilithium2(iterations: u64) {
     r.assert_faster_than(Duration::from_millis(1));
 }
 
-/// Benchmark full hybrid sign + verify (Ed25519 + Dilithium2 together).
+/// Benchmark full hybrid sign + verify (Ed25519 + ML-DSA-87 together).
 pub fn bench_hybrid(iterations: u64) {
     let kp = hybrid_keypair(0x01);
     let msg = b"INDRA benchmark message for hybrid signing";

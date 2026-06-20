@@ -79,7 +79,7 @@ pub const SLASH_GRACE_PERIOD_EPOCHS: u64 = 5;
 // ── Block and Transaction Limits ──────────────────────────────────────────────
 
 /// Maximum block size in bytes.
-pub const MAX_BLOCK_SIZE_BYTES: usize = 1_048_576; // 1 MB
+pub const MAX_BLOCK_SIZE_BYTES: usize = 12_582_912; // 12 MB
 
 /// Maximum transactions per block.
 pub const MAX_TX_PER_BLOCK: usize = 200;
@@ -91,7 +91,7 @@ pub const MAX_INPUTS: usize = 16;
 pub const MAX_OUTPUTS: usize = 16;
 
 /// Maximum quorum certificate size in bytes.
-pub const MAX_QC_SIZE_BYTES: usize = 2_097_152; // 2 MB
+pub const MAX_QC_SIZE_BYTES: usize = 10_485_760; // 10 MB
 
 /// Maximum slash evidence entries per block.
 pub const MAX_SLASHES_PER_BLOCK: usize = 10;
@@ -104,11 +104,11 @@ pub const MAX_GOV_OPS_PER_BLOCK: usize = 5;
 /// Maximum Ed25519 signature size (bytes).
 pub const MAX_CLASSICAL_SIG_BYTES: usize = 64;
 
-/// Maximum Dilithium2 signature size (bytes).
-pub const MAX_PQ_SIG_BYTES: usize = 2_500;
+/// Maximum ML-DSA-87 signature size (bytes).
+pub const MAX_PQ_SIG_BYTES: usize = 4_627;
 
-/// Maximum Dilithium2 public key size (bytes).
-pub const MAX_PQ_PK_BYTES: usize = 1_400;
+/// Maximum ML-DSA-87 public key size (bytes).
+pub const MAX_PQ_PK_BYTES: usize = 2_592;
 
 /// Maximum length of a chain ID string in bytes.
 pub const MAX_CHAIN_ID_BYTES: usize = 64;

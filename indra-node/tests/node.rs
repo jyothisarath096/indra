@@ -94,7 +94,7 @@ fn install_active_validator(
             validator_id,
             name: name.to_string(),
             hybrid_classical_pk: Some(public.classical.0),
-            hybrid_pq_pk: Some(public.pq.0.clone()),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
             vrf_pk: Some(vrf_pk),
             stake_spark: 1_000_000,
             status: indra_state::ValidatorStatus::Active,
@@ -123,7 +123,7 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             validator_id,
             name: name.to_string(),
             hybrid_classical_pk: Some(public.classical.0),
-            hybrid_pq_pk: Some(public.pq.0.clone()),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
             vrf_pk: Some(vrf_pk),
             stake_spark: 1_000_000,
             status: indra_state::ValidatorStatus::Active,
@@ -157,7 +157,7 @@ fn build_single_validator_qc_bytes(
         &[QcValidator {
             validator_id,
             position: 0,
-            pq_pk: public.pq.0.clone(),
+            pq_pk: public.pq.0.to_vec(),
             stake: 1_000_000,
         }],
         vec![&vote],
@@ -172,7 +172,7 @@ fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
     let pq = PqKeypair::from_seed(&seed).unwrap();
     config.validator_seed = Some(seed);
     config.vrf_seed = Some(seed);
-    config.pq_pk = Some(pq.public_key().0.clone());
+    config.pq_pk = Some(pq.public_key().0.to_vec());
     config.pq_sk = Some(pq.secret_key_bytes());
     let engine = NodeEngine::init(config).unwrap();
     (ConsensusDriver::new(engine), dir)

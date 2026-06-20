@@ -20,7 +20,7 @@ pub const MNEMONIC_WORD_COUNT: usize = 24;
 pub struct DerivedSeeds {
     /// Master seed (32 bytes). This is what the mnemonic encodes.
     pub master_seed: [u8; 32],
-    /// Ed25519 + Dilithium2 hybrid keypair seed.
+    /// Ed25519 + ML-DSA-87 hybrid keypair seed.
     pub hybrid_seed: [u8; 32],
     /// VRF keypair seed.
     pub vrf_seed: [u8; 32],

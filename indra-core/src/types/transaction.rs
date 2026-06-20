@@ -238,14 +238,14 @@ mod tests {
     fn dummy_pubkey() -> HybridPubKey {
         HybridPubKey {
             classical_pk: Bytes32::ZERO,
-            pq_pk: VariableBytes::from_slice(&[0u8; 1312]).unwrap(),
+            pq_pk: VariableBytes::from_slice(&[0u8; 2592]).unwrap(),
         }
     }
 
     fn dummy_sig() -> HybridSignature {
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
+            pq_sig:        VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         }
     }
 
@@ -301,14 +301,14 @@ mod tests {
     #[test]
     fn fee_too_low_rejected() {
         let tx = minimal_tx();
-        // fee_amount=500, weight=1KB, so base_fee=1000 should fail
-        assert!(tx.validate_fee(1_000).is_err());
+        let base_fee = tx.fee_amount.saturating_add(1);
+        assert!(tx.validate_fee(base_fee).is_err());
     }
 
     #[test]
     fn fee_sufficient_passes() {
-        let tx = minimal_tx();
-        // fee_amount=500, weight=1KB, base_fee=100 → 100 Spark/KB → required=100
+        let mut tx = minimal_tx();
+        tx.fee_amount = tx.weight_kb().saturating_mul(100);
         assert!(tx.validate_fee(100).is_ok());
     }
 

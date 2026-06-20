@@ -33,11 +33,11 @@ pub struct NodeConfig {
     /// Required if validator_seed is set.
     pub vrf_seed: Option<[u8; 32]>,
 
-    /// The node's Dilithium2 secret key bytes (from keys.json).
+    /// The node's ML-DSA-87 seed bytes (from keys.json).
     /// Required if validator_seed is set.
     pub pq_sk: Option<Vec<u8>>,
 
-    /// The node's Dilithium2 public key bytes (from keys.json).
+    /// The node's ML-DSA-87 public key bytes (from keys.json).
     pub pq_pk: Option<Vec<u8>>,
 
     /// Listen address for P2P (Phase 6).

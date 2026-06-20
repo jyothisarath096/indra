@@ -1,6 +1,6 @@
 //! Quorum Certificate — proof that ≥ 2/3 stake precommitted to a block.
 //!
-//! INDRA QCs are now fully post-quantum: they contain one Dilithium2 signature
+//! INDRA QCs are now fully post-quantum: they contain one ML-DSA-87 signature
 //! per signer plus a signer bitfield, and no BLS aggregate signature.
 
 use crate::{
@@ -29,7 +29,7 @@ pub struct QuorumCertificateV1 {
     pub block_hash: Bytes32,
     /// Bitfield: bit i = 1 → validator at slot i signed.
     pub signer_bitfield: [u8; SIGNER_BITFIELD_BYTES],
-    /// Individual Dilithium2 signatures for included validators.
+    /// Individual ML-DSA-87 signatures for included validators.
     pub pq_signatures: Vec<PQVoteSig>,
 }
 

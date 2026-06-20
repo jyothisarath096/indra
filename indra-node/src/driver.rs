@@ -1201,7 +1201,7 @@ mod tests {
                 validator_id,
                 name: name.to_string(),
                 hybrid_classical_pk: Some(public.classical.0),
-                hybrid_pq_pk: Some(public.pq.0.clone()),
+                hybrid_pq_pk: Some(public.pq.0.to_vec()),
                 vrf_pk: Some(vrf_pk),
                 stake_spark: 1_000_000,
                 status: ValidatorStatus::Active,
@@ -1222,7 +1222,7 @@ mod tests {
         let pq = PqKeypair::from_seed(&seed).unwrap();
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
-        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_pk = Some(pq.public_key().0.to_vec());
         config.pq_sk = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         (ConsensusDriver::new(engine), dir)
@@ -1512,7 +1512,7 @@ mod tests {
             let pq = PqKeypair::from_seed(&seed).unwrap();
             config.validator_seed = Some(seed);
             config.vrf_seed = Some(seed);
-            config.pq_pk = Some(pq.public_key().0.clone());
+            config.pq_pk = Some(pq.public_key().0.to_vec());
             config.pq_sk = Some(pq.secret_key_bytes());
             let engine = NodeEngine::init(config).unwrap();
             let mut driver = ConsensusDriver::new(engine);
@@ -1527,7 +1527,7 @@ mod tests {
         let pq = PqKeypair::from_seed(&seed).unwrap();
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
-        config.pq_pk = Some(pq.public_key().0.clone());
+        config.pq_pk = Some(pq.public_key().0.to_vec());
         config.pq_sk = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         let restarted = ConsensusDriver::new(engine);

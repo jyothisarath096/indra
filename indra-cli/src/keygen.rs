@@ -1,7 +1,7 @@
 //! Validator keypair generation.
 //!
 //! Generates all three keypairs a validator needs:
-//!   1. Hybrid (Ed25519 + Dilithium2) — for transaction and vote signatures
+//!   1. Hybrid (Ed25519 + ML-DSA-87) — for transaction and vote signatures
 //!   2. Legacy BLS12-381 metadata — retained for backward compatibility only
 //!   3. VRF — for proposer election
 //!
@@ -50,7 +50,7 @@ pub struct ValidatorKeys {
     pub validator_id: [u8; 32],
     /// Ed25519 public key (32 bytes).
     pub hybrid_classical_pk: [u8; 32],
-    /// Dilithium2 public key bytes.
+    /// ML-DSA-87 public key bytes.
     pub hybrid_pq_pk: Vec<u8>,
     /// BLS12-381 public key (48 bytes).
     pub bls_pk: [u8; 48],
@@ -71,7 +71,7 @@ pub struct KeysFile {
     pub bls_seed: [u8; 32],
     /// VRF keypair seed (keep secret).
     pub vrf_seed: [u8; 32],
-    /// Dilithium2 secret key bytes (keep secret).
+    /// ML-DSA-87 seed bytes (keep secret).
     pub pq_sk: Vec<u8>,
 }
 
@@ -242,7 +242,7 @@ pub fn generate_keypairs(
         public: ValidatorKeys {
             validator_id,
             hybrid_classical_pk: pk.classical.0,
-            hybrid_pq_pk:        pk.pq.0,
+            hybrid_pq_pk:        pk.pq.0.to_vec(),
             bls_pk:              bls_pk_bytes,
             vrf_pk:              vrf_pk_bytes,
         },

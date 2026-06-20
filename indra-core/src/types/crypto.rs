@@ -12,12 +12,12 @@ use crate::{
     },
 };
 
-/// Hybrid signature on the wire: Ed25519 + Dilithium2.
+/// Hybrid signature on the wire: Ed25519 + ML-DSA-87.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridSignature {
     /// Ed25519 signature (64 bytes).
     pub classical_sig: VariableBytes<MAX_CLASSICAL_SIG_BYTES>,
-    /// Dilithium2 signature (~2420 bytes).
+    /// ML-DSA-87 signature (4627 bytes).
     pub pq_sig:        VariableBytes<MAX_PQ_SIG_BYTES>,
 }
 
@@ -43,7 +43,12 @@ impl Decode for HybridSignature {
 impl HybridSignature {
     /// Convert the wire signature into the crypto-layer representation.
     pub fn to_crypto_sig(&self) -> Result<indra_crypto::HybridSignature, String> {
-        use indra_crypto::{ClassicalSignature, HybridSignature as CryptoSig, PqSignature};
+        use indra_crypto::{
+            ClassicalSignature,
+            HybridSignature as CryptoSig,
+            PqSignature,
+            PQ_SIG_BYTES,
+        };
 
         let classical_arr: [u8; 64] = self.classical_sig.as_slice()
             .try_into()
@@ -54,19 +59,29 @@ impl HybridSignature {
                 )
             })?;
 
+        let pq_arr: [u8; PQ_SIG_BYTES] = self.pq_sig.as_slice()
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "pq signature must be {} bytes, got {}",
+                    PQ_SIG_BYTES,
+                    self.pq_sig.len()
+                )
+            })?;
+
         Ok(CryptoSig {
             classical: ClassicalSignature(classical_arr),
-            pq: PqSignature(self.pq_sig.as_slice().to_vec()),
+            pq: PqSignature(pq_arr),
         })
     }
 }
 
-/// Hybrid public key on the wire: Ed25519 + Dilithium2.
+/// Hybrid public key on the wire: Ed25519 + ML-DSA-87.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridPubKey {
     /// Ed25519 public key (32 bytes, fixed).
     pub classical_pk: Bytes32,
-    /// Dilithium2 public key (~1312 bytes).
+    /// ML-DSA-87 public key (2592 bytes).
     pub pq_pk:        VariableBytes<MAX_PQ_PK_BYTES>,
 }
 
@@ -90,11 +105,26 @@ impl Decode for HybridPubKey {
 impl HybridPubKey {
     /// Convert the wire public key into the crypto-layer representation.
     pub fn to_crypto_pubkey(&self) -> Result<indra_crypto::HybridPublicKey, String> {
-        use indra_crypto::{ClassicalPublicKey, HybridPublicKey as CryptoPk, PqPublicKey};
+        use indra_crypto::{
+            ClassicalPublicKey,
+            HybridPublicKey as CryptoPk,
+            PqPublicKey,
+            PQ_PK_BYTES,
+        };
+
+        let pq_arr: [u8; PQ_PK_BYTES] = self.pq_pk.as_slice()
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "pq public key must be {} bytes, got {}",
+                    PQ_PK_BYTES,
+                    self.pq_pk.len()
+                )
+            })?;
 
         Ok(CryptoPk {
             classical: ClassicalPublicKey(self.classical_pk.0),
-            pq: PqPublicKey(self.pq_pk.as_slice().to_vec()),
+            pq: PqPublicKey(pq_arr),
         })
     }
 }
@@ -125,7 +155,7 @@ impl Decode for CommitmentV1 {
 pub struct PQVoteSig {
     /// Validator ID (SHA-256 of their hybrid public key bytes).
     pub validator_id: Bytes32,
-    /// Dilithium2 signature (~2420 bytes).
+    /// ML-DSA-87 signature (4627 bytes).
     pub pq_sig:       VariableBytes<MAX_PQ_SIG_BYTES>,
 }
 
@@ -155,7 +185,7 @@ mod tests {
     fn hybrid_signature_round_trip() {
         let s = HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0xAAu8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0xBBu8; 2420]).unwrap(),
+            pq_sig:        VariableBytes::from_slice(&[0xBBu8; 4627]).unwrap(),
         };
         assert_eq!(s, HybridSignature::decode_exact(&s.encode_to_vec()).unwrap());
     }
@@ -172,7 +202,7 @@ mod tests {
     fn pq_vote_sig_round_trip() {
         let s = PQVoteSig {
             validator_id: Bytes32::from([0x11u8; 32]),
-            pq_sig:       VariableBytes::from_slice(&[0xCCu8; 2420]).unwrap(),
+            pq_sig:       VariableBytes::from_slice(&[0xCCu8; 4627]).unwrap(),
         };
         assert_eq!(s, PQVoteSig::decode_exact(&s.encode_to_vec()).unwrap());
     }

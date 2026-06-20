@@ -44,7 +44,7 @@ fn make_test_keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
 fn dummy_sig() -> HybridSignature {
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-        pq_sig: VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
+        pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
     }
 }
 

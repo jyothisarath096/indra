@@ -14,7 +14,7 @@
 //! A vote is signed with the validator's hybrid keypair over:
 //!   SHA-256(DOMAIN_VOTE || height || round || step || value_hash || validator_id)
 //!
-//! Both Ed25519 and Dilithium2 components are required.
+//! Both Ed25519 and ML-DSA-87 components are required.
 
 use std::collections::HashMap;
 
@@ -40,7 +40,7 @@ pub struct RegisteredVoter {
     pub validator_id: Bytes32,
     /// Ed25519 public key (32 bytes).
     pub classical_pk: [u8; 32],
-    /// Dilithium2 public key bytes.
+    /// ML-DSA-87 public key bytes.
     pub pq_pk: Vec<u8>,
     /// Stake in Spark.
     pub stake: u64,
@@ -141,14 +141,25 @@ impl VoteCollector {
                 detail: "malformed classical sig".to_string(),
             })?;
 
+        let sig_pq: [u8; indra_crypto::PQ_SIG_BYTES] = vote.signature.pq_sig.as_slice()
+            .try_into()
+            .map_err(|_| ConsensusError::CryptoError {
+                detail: "malformed pq sig".to_string(),
+            })?;
+        let pk_pq: [u8; indra_crypto::PQ_PK_BYTES] = voter.pq_pk.as_slice()
+            .try_into()
+            .map_err(|_| ConsensusError::CryptoError {
+                detail: "malformed pq pk".to_string(),
+            })?;
+
         let sig = HybridSignature {
             classical: ClassicalSignature(sig_classical),
-            pq: PqSignature(vote.signature.pq_sig.as_slice().to_vec()),
+            pq: PqSignature(sig_pq),
         };
 
         let pk = HybridPublicKey {
             classical: ClassicalPublicKey(voter.classical_pk),
-            pq: PqPublicKey(voter.pq_pk.clone()),
+            pq: PqPublicKey(pk_pq),
         };
 
         verify_hybrid(&signing_bytes, &sig, &pk)
@@ -269,7 +280,7 @@ mod tests {
         let voter = RegisteredVoter {
             validator_id: id,
             classical_pk: pk.classical.0,
-            pq_pk:        pk.pq.0.clone(),
+            pq_pk:        pk.pq.0.to_vec(),
             stake,
         };
         (voter, kp)

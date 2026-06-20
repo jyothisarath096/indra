@@ -185,7 +185,7 @@ mod tests {
     fn dummy_pubkey(seed: u8) -> HybridPubKey {
         HybridPubKey {
             classical_pk: Bytes32::from([seed; 32]),
-            pq_pk: VariableBytes::from_slice(&[seed; 1312]).unwrap(),
+            pq_pk: VariableBytes::from_slice(&[seed; 2592]).unwrap(),
         }
     }
 

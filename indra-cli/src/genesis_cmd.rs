@@ -34,7 +34,7 @@ pub struct GenesisEntry {
     pub validator_id: String,
     /// Ed25519 public key (hex).
     pub hybrid_classical_pk: String,
-    /// Dilithium2 public key (hex).
+    /// ML-DSA-87 public key (hex).
     pub hybrid_pq_pk: String,
     /// BLS12-381 public key (hex).
     pub bls_pk: String,

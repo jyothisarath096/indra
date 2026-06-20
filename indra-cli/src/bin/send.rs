@@ -68,7 +68,7 @@ fn main() {
     let sender_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(classical.public_key().0),
         pq_pk: VariableBytes::from_slice(&pq_pk_bytes).unwrap_or_else(|_| {
-            VariableBytes::from_slice(&[0u8; 1312]).unwrap()
+            VariableBytes::from_slice(&[0u8; 2592]).unwrap()
         }),
     };
 
@@ -247,12 +247,12 @@ fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
     let key = format!("\"{}\":", field);
     let pos = match json.find(&key) {
         Some(p) => p,
-        None => return vec![0u8; 1312],
+        None => return vec![0u8; 2592],
     };
     let after = &json[pos + key.len()..];
     let start = after.find('"').unwrap_or(0) + 1;
     let end   = after[start..].find('"').unwrap_or(0) + start;
-    hex::decode(&after[start..end]).unwrap_or_else(|_| vec![0u8; 1312])
+    hex::decode(&after[start..end]).unwrap_or_else(|_| vec![0u8; 2592])
 }
 
 fn extract_hex32(json: &str, field: &str) -> [u8; 32] {

@@ -3,8 +3,8 @@ use indra_crypto::{derive_all_seeds, generate_mnemonic, validate_mnemonic};
 
 use crate::{errors::IndraError, IndraKeyPair};
 
-const PQ_PK_BYTES: usize = 1312;
-const PQ_SK_BYTES: usize = 2560;
+const PQ_PK_BYTES: usize = 2592;
+const PQ_SK_BYTES: usize = 32;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
 pub fn generate(seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {

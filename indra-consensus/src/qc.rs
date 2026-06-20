@@ -25,7 +25,7 @@ pub struct QcValidator {
     pub validator_id: Bytes32,
     /// Position in the epoch's sorted validator list (0-indexed).
     pub position: usize,
-    /// Dilithium2 public key bytes.
+    /// ML-DSA-87 public key bytes.
     pub pq_pk: Vec<u8>,
     /// Stake in Spark.
     pub stake: u64,
@@ -205,7 +205,7 @@ fn signer_validators<'a>(
     Ok(signers)
 }
 
-/// Verify a QC using Dilithium2 signatures only.
+/// Verify a QC using ML-DSA-87 signatures only.
 pub fn verify_qc(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
@@ -254,10 +254,20 @@ pub fn verify_qc(
             &qc.block_hash,
             &validator.validator_id,
         );
+        let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] = pq_sig.pq_sig.as_slice()
+            .try_into()
+            .map_err(|_| ConsensusError::InvalidPQSignature {
+                validator_id: validator.validator_id,
+            })?;
+        let pq_pk_bytes: [u8; indra_crypto::PQ_PK_BYTES] = validator.pq_pk.as_slice()
+            .try_into()
+            .map_err(|_| ConsensusError::InvalidPQSignature {
+                validator_id: validator.validator_id,
+            })?;
         verify_pq(
             &signing_bytes,
-            &PqSignature(pq_sig.pq_sig.as_slice().to_vec()),
-            &PqPublicKey(validator.pq_pk.clone()),
+            &PqSignature(pq_sig_bytes),
+            &PqPublicKey(pq_pk_bytes),
         )
         .map_err(|_| ConsensusError::InvalidPQSignature {
             validator_id: validator.validator_id,
@@ -267,7 +277,7 @@ pub fn verify_qc(
     Ok(())
 }
 
-/// Strict QC verification now aliases the same Dilithium-only path.
+/// Strict QC verification now aliases the same ML-DSA-only path.
 pub fn verify_qc_strict(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
@@ -292,7 +302,7 @@ mod tests {
         let v = QcValidator {
             validator_id: id,
             position,
-            pq_pk: pk.pq.0.clone(),
+            pq_pk: pk.pq.0.to_vec(),
             stake,
         };
         (v, hybrid_kp)

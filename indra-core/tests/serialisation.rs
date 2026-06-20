@@ -29,14 +29,14 @@ use indra_core::IndraError;
 fn sig() -> HybridSignature {
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&[0xAAu8; 64]).unwrap(),
-        pq_sig:        VariableBytes::from_slice(&[0xBBu8; 2420]).unwrap(),
+        pq_sig:        VariableBytes::from_slice(&[0xBBu8; 4627]).unwrap(),
     }
 }
 
 fn pubkey() -> HybridPubKey {
     HybridPubKey {
         classical_pk: Bytes32::from([0xCCu8; 32]),
-        pq_pk:        VariableBytes::from_slice(&[0xDDu8; 1312]).unwrap(),
+        pq_pk:        VariableBytes::from_slice(&[0xDDu8; 2592]).unwrap(),
     }
 }
 
