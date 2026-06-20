@@ -1,16 +1,13 @@
-//! INDRA v2 node binary — Phase 8: live P2P consensus.
+//! INDRA v2 node binary.
 //!
-//! Thread layout:
-//!
-//!   main          — status printer (every 6s)
-//!   listener      — accepts inbound TCP connections from peers
-//!   dialer        — connects to bootstrap peers, sends Status
-//!   gossip_recv   — reads messages from all connected peers, routes to driver
-//!   consensus     — every 6s: check if proposer, propose block, broadcast votes
+//! Networking runs on a Tokio runtime with authenticated encrypted transport.
+//! Consensus and state transition logic remain synchronous on dedicated threads.
 
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
+use std::collections::HashSet;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fs2::available_space;
@@ -21,17 +18,25 @@ use indra_core::types::primitives::{
     MIN_PRUNE_KEEP_BLOCKS,
 };
 use indra_network::{
+    HandshakeConfig,
+    NetworkCommand,
+    NetworkEvent,
+    PeerManagerConfig,
+    PeerManagerHandle,
     message::Message,
-    peer::ScoreEvent,
-    transport::{RecvStatus, Transport},
-    gossip::GossipEngine,
+    perform_handshake_initiator,
+    perform_handshake_responder,
+    spawn_peer_manager,
 };
+use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_node::{
     NodeConfig, NodeEngine,
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     net_driver::{message_to_event, action_to_message},
     sync::SYNC_BATCH_SIZE,
 };
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::sync::mpsc as tokio_mpsc;
 
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(8);
 const PREVOTE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -46,6 +51,59 @@ enum ProposalMode {
     None,
     Fresh,
     Reproposal,
+}
+
+#[derive(Clone)]
+struct NetworkBridge {
+    handle: PeerManagerHandle,
+    connected_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
+    peer_count: Arc<AtomicUsize>,
+}
+
+impl NetworkBridge {
+    fn new(
+        handle: PeerManagerHandle,
+        connected_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
+        peer_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            handle,
+            connected_addrs,
+            peer_count,
+        }
+    }
+
+    fn broadcast(&self, msg: &Message) {
+        let _ = self.handle.send_blocking(NetworkCommand::Broadcast(msg.clone()));
+    }
+
+    fn send_to(&self, addr: &SocketAddr, msg: &Message) {
+        let _ = self.handle.send_blocking(NetworkCommand::SendTo {
+            addr: *addr,
+            msg: msg.clone(),
+        });
+    }
+
+    fn connection_count(&self) -> usize {
+        self.peer_count.load(Ordering::Relaxed)
+    }
+
+    fn connected_addrs(&self) -> Vec<SocketAddr> {
+        self.connected_addrs
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+fn has_connected_ip(connected_addrs: &Arc<Mutex<HashSet<SocketAddr>>>, addr: &SocketAddr) -> bool {
+    connected_addrs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|connected| connected.ip() == addr.ip())
 }
 
 fn choose_proposal_mode(
@@ -65,6 +123,172 @@ fn choose_proposal_mode(
     } else {
         ProposalMode::None
     }
+}
+
+fn build_handshake_config(engine: &NodeEngine) -> Option<HandshakeConfig> {
+    let my_validator_id = engine.validator_id()?;
+    let pq_keypair = match (
+        engine.config.pq_pk.as_deref(),
+        engine.config.pq_sk.as_deref(),
+    ) {
+        (Some(pk), Some(sk)) => PqKeypair::from_bytes(pk, sk).ok()?,
+        _ => return None,
+    };
+
+    let known_validators = engine
+        .state
+        .validators
+        .active_validators()
+        .filter_map(|validator| {
+            let pq_pk: [u8; indra_crypto::PQ_PK_BYTES] =
+                validator.hybrid_pq_pk.as_deref()?.try_into().ok()?;
+            Some((validator.validator_id, PqPublicKey(pq_pk)))
+        })
+        .collect::<Vec<_>>();
+
+    Some(HandshakeConfig {
+        my_validator_id,
+        my_signing_key: pq_keypair,
+        known_validators,
+        timeout: Duration::from_secs(10),
+    })
+}
+
+fn start_network_runtime(
+    p2p_addr: String,
+    bootstrap_peers: Vec<String>,
+    handshake_config: HandshakeConfig,
+) -> (Arc<NetworkBridge>, std::sync::mpsc::Receiver<NetworkEvent>) {
+    let connected_addrs = Arc::new(Mutex::new(HashSet::new()));
+    let peer_count = Arc::new(AtomicUsize::new(0));
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<NetworkEvent>();
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<PeerManagerHandle>();
+
+    std::thread::spawn({
+        let connected_addrs = Arc::clone(&connected_addrs);
+        let peer_count = Arc::clone(&peer_count);
+        move || {
+            let runtime = TokioRuntimeBuilder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+
+            runtime.block_on(async move {
+                let (async_event_tx, mut async_event_rx) = tokio_mpsc::channel::<NetworkEvent>(1024);
+                let peer_manager = spawn_peer_manager(PeerManagerConfig {
+                    local_validator_id: handshake_config.my_validator_id,
+                    event_tx: async_event_tx,
+                    command_buffer: 1024,
+                    per_peer_write_buffer: 256,
+                });
+                let _ = handle_tx.send(peer_manager.clone());
+
+                let network_bridge = PeerManagerHandle::clone(&peer_manager);
+                let handshake_config = Arc::new(handshake_config);
+
+                tokio::spawn({
+                    let connected_addrs = Arc::clone(&connected_addrs);
+                    let peer_count = Arc::clone(&peer_count);
+                    async move {
+                        while let Some(event) = async_event_rx.recv().await {
+                            match &event {
+                                NetworkEvent::PeerConnected { addr, .. } => {
+                                    connected_addrs.lock().unwrap().insert(*addr);
+                                    peer_count.store(connected_addrs.lock().unwrap().len(), Ordering::Relaxed);
+                                }
+                                NetworkEvent::PeerDisconnected { addr, .. } => {
+                                    connected_addrs.lock().unwrap().remove(addr);
+                                    peer_count.store(connected_addrs.lock().unwrap().len(), Ordering::Relaxed);
+                                }
+                                NetworkEvent::Message { .. } => {}
+                            }
+                            let _ = event_tx.send(event);
+                        }
+                    }
+                });
+
+                tokio::spawn({
+                    let handshake_config = Arc::clone(&handshake_config);
+                    let peer_manager = PeerManagerHandle::clone(&network_bridge);
+                    async move {
+                        let listener = match tokio::net::TcpListener::bind(&p2p_addr).await {
+                            Ok(listener) => listener,
+                            Err(e) => {
+                                eprintln!("[listener] bind failed: {}", e);
+                                return;
+                            }
+                        };
+                        eprintln!("[p2p] listening on {}", p2p_addr);
+
+                        loop {
+                            let Ok((stream, addr)) = listener.accept().await else {
+                                continue;
+                            };
+                            let peer_manager = PeerManagerHandle::clone(&peer_manager);
+                            let handshake_config = Arc::clone(&handshake_config);
+                            tokio::spawn(async move {
+                                match perform_handshake_responder(stream, handshake_config.as_ref()).await {
+                                    Ok(handshake) => {
+                                        let _ = peer_manager.register_peer(addr, handshake).await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[p2p] inbound handshake failed from {}: {}", addr, e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+
+                tokio::spawn({
+                    let handshake_config = Arc::clone(&handshake_config);
+                    let peer_manager = PeerManagerHandle::clone(&network_bridge);
+                    let connected_addrs = Arc::clone(&connected_addrs);
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        loop {
+                            for peer_addr_str in &bootstrap_peers {
+                                let Some(addr) = resolve_peer_addr(peer_addr_str) else {
+                                    eprintln!("[dialer] invalid addr: {}", peer_addr_str);
+                                    continue;
+                                };
+                                if has_connected_ip(&connected_addrs, &addr) {
+                                    continue;
+                                }
+                                match tokio::net::TcpStream::connect(addr).await {
+                                    Ok(stream) => {
+                                        let peer_manager = PeerManagerHandle::clone(&peer_manager);
+                                        let handshake_config = Arc::clone(&handshake_config);
+                                        tokio::spawn(async move {
+                                            match perform_handshake_initiator(stream, handshake_config.as_ref()).await {
+                                                Ok(handshake) => {
+                                                    let _ = peer_manager.register_peer(addr, handshake).await;
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[dialer] handshake failed with {}: {}", addr, e);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[dialer] failed to connect to {}: {}", addr, e);
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(DIAL_RETRY).await;
+                        }
+                    }
+                });
+
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let peer_manager = handle_rx.recv().expect("peer manager handle");
+    let bridge = Arc::new(NetworkBridge::new(peer_manager, connected_addrs, peer_count));
+
+    (bridge, event_rx)
 }
 
 fn main() {
@@ -169,133 +393,35 @@ fn main() {
     let mut driver_state = ConsensusDriver::new(engine);
     driver_state.refresh_registered_voters();
     let startup_qc_request = driver_state.request_qc_if_needed();
+    let handshake_config = build_handshake_config(&driver_state.engine);
     let driver = driver_state;
 
     // Shared state between threads
     let driver    = Arc::new(Mutex::new(driver));
-    let gossip    = Arc::new(Mutex::new(GossipEngine::new()));
     let (height_tx, height_rx) = std::sync::mpsc::channel::<()>();
+    let (gossip, network_events) = if let Some(handshake_config) = handshake_config {
+        start_network_runtime(p2p_addr.clone(), bootstrap_peers.clone(), handshake_config)
+    } else {
+        panic!("authenticated transport requires validator networking keys");
+    };
 
-    // ── Thread 1: P2P listener ──────────────────────────────────────────────
+    // ── Thread 3: Authenticated network event loop ──────────────────────────
     {
-        let gossip  = Arc::clone(&gossip);
-        let driver  = Arc::clone(&driver);
+        let gossip = Arc::clone(&gossip);
+        let driver = Arc::clone(&driver);
         let height_tx = height_tx.clone();
-        let p2p     = p2p_addr.clone();
 
         std::thread::spawn(move || {
-            let listener = match TcpListener::bind(&p2p) {
-                Ok(l) => l,
-                Err(e) => { eprintln!("[listener] bind failed: {}", e); return; }
-            };
-            eprintln!("[p2p] listening on {}", p2p);
-
-            for stream in listener.incoming() {
-                        match stream {
-                    Ok(stream) => {
-                        let addr = match stream.peer_addr() {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
-                        if gossip.lock().unwrap().is_connected_ip(&addr) {
-                            continue;
-                        }
-                        eprintln!("[p2p] inbound connection from {}", addr);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-
-                        if let Ok(conn) = indra_network::transport::Connection::from_stream(stream) {
-                            let _ = gossip.lock().unwrap().add_connection(addr, conn);
-                        }
+            while let Ok(event) = network_events.recv() {
+                match event {
+                    NetworkEvent::PeerConnected { addr, .. } => {
+                        eprintln!("[p2p] authenticated peer connected: {}", addr);
                         announce_status_and_recovery(&driver, &gossip, &height_tx, addr);
                     }
-                    Err(e) => eprintln!("[listener] accept error: {}", e),
-                }
-            }
-        });
-    }
-
-    // ── Thread 2: Peer dialer ───────────────────────────────────────────────
-    {
-        let gossip   = Arc::clone(&gossip);
-        let driver   = Arc::clone(&driver);
-        let height_tx = height_tx.clone();
-        let peers    = bootstrap_peers.clone();
-        std::thread::spawn(move || {
-            // Wait a moment for the listener to start
-            std::thread::sleep(Duration::from_millis(500));
-
-            let transport = match Transport::bind("0.0.0.0:0") {
-                Ok(t) => t,
-                Err(e) => { eprintln!("[dialer] transport bind failed: {}", e); return; }
-            };
-
-            loop {
-                for peer_addr_str in &peers {
-                    let addr = match resolve_peer_addr(peer_addr_str) {
-                        Some(addr) => addr,
-                        None => {
-                            eprintln!("[dialer] invalid addr: {}", peer_addr_str);
-                            continue;
-                        }
-                    };
-
-                    // Skip if already connected
-                    if gossip.lock().unwrap().is_connected_ip(&addr) {
-                        continue;
+                    NetworkEvent::PeerDisconnected { addr, .. } => {
+                        eprintln!("[p2p] peer disconnected: {}", addr);
                     }
-
-                    match transport.dial(addr) {
-                        Ok(conn) => {
-                            eprintln!("[p2p] connected to {}", addr);
-                            let _ = gossip.lock().unwrap().add_connection(addr, conn);
-                            announce_status_and_recovery(&driver, &gossip, &height_tx, addr);
-                        }
-                        Err(e) => {
-                            eprintln!("[dialer] failed to connect to {}: {}", addr, e);
-                        }
-                    }
-                }
-                std::thread::sleep(DIAL_RETRY);
-            }
-        });
-    }
-
-    // ── Thread 3: Gossip receive loop ───────────────────────────────────────
-    {
-        let gossip  = Arc::clone(&gossip);
-        let driver  = Arc::clone(&driver);
-        let height_tx = height_tx.clone();
-
-        std::thread::spawn(move || {
-            loop {
-                let addrs = gossip.lock().unwrap().connected_addrs();
-
-                for addr in addrs {
-                    let msg = {
-                        let mut g = gossip.lock().unwrap();
-                        match g.recv_from(&addr) {
-                            Ok(RecvStatus::Message(m)) => Some(m),
-                            Ok(RecvStatus::NoData) => {
-                                // No data yet — keep connection alive
-                                None
-                            }
-                            Ok(RecvStatus::Disconnected) => {
-                                eprintln!("[gossip] peer {} disconnected", addr);
-                                g.remove_connection(&addr);
-                                None
-                            }
-                            Err(e) => {
-                                eprintln!("[gossip] peer {} disconnected: {}", addr, e);
-                                g.remove_connection(&addr);
-                                None
-                            }
-                        }
-                    };
-
-                    if let Some(msg) = msg {
-                        // Score the peer
-                        gossip.lock().unwrap().score_event(&addr, ScoreEvent::ValidBlock);
+                    NetworkEvent::Message { from: addr, msg, .. } => {
                         match &msg {
                             Message::RequestBlocks { from_height, to_height } => {
                                 let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
@@ -310,10 +436,7 @@ fn main() {
                                     }
                                     blocks
                                 };
-                                let _ = gossip.lock().unwrap().send_to(
-                                    &addr,
-                                    &Message::BlockResponse { blocks: blocks_to_send },
-                                );
+                                gossip.send_to(&addr, &Message::BlockResponse { blocks: blocks_to_send });
                                 continue;
                             }
                             Message::RequestProposal { height, round, hash } => {
@@ -329,7 +452,7 @@ fn main() {
                                         })
                                 };
                                 if let Some(block) = proposal {
-                                    let _ = gossip.lock().unwrap().send_to(&addr, &Message::Block(block));
+                                    gossip.send_to(&addr, &Message::Block(block));
                                 }
                                 continue;
                             }
@@ -384,7 +507,7 @@ fn main() {
 
                                 if let Some((peer, from_height, to_height)) = request_more {
                                     let req = Message::RequestBlocks { from_height, to_height };
-                                    let _ = gossip.lock().unwrap().send_to(&peer, &req);
+                                    gossip.send_to(&peer, &req);
                                 }
                                 if imported_any {
                                     let _ = height_tx.send(());
@@ -400,16 +523,12 @@ fn main() {
                                     let d = driver.lock().unwrap();
                                     (d.height(), d.engine.state.tip_hash)
                                 };
-                                let _ = gossip.lock().unwrap().send_to(
-                                    &addr,
-                                    &Message::Status { height, tip_hash },
-                                );
+                                gossip.send_to(&addr, &Message::Status { height, tip_hash });
                                 continue;
                             }
                             _ => {}
                         }
 
-                        // Convert to driver event and process
                         if let Some(event) = message_to_event(msg, addr) {
                             let previous_height = driver.lock().unwrap().height();
                             let actions = driver.lock().unwrap().process(event);
@@ -422,8 +541,6 @@ fn main() {
                         }
                     }
                 }
-
-                std::thread::sleep(Duration::from_millis(50));
             }
         });
     }
@@ -456,7 +573,7 @@ fn main() {
                         d.current_phase(),
                         d.sync().target_height(),
                         d.sync().is_caught_up(),
-                        gossip.lock().unwrap().connection_count(),
+                        gossip.connection_count(),
                         d.engine.state.tip_hash,
                     )
                 };
@@ -495,7 +612,7 @@ fn main() {
 
                 if last_status_at.elapsed() >= STATUS_INTERVAL {
                     let status = Message::Status { height, tip_hash };
-                    let _ = gossip.lock().unwrap().broadcast(&status);
+                    gossip.broadcast(&status);
                     last_status_at = Instant::now();
                 }
 
@@ -746,8 +863,7 @@ fn main() {
 
         let (height, base_fee, mempool, peers) = {
             let d = driver.lock().unwrap();
-            let g = gossip.lock().unwrap();
-            (d.height(), d.engine.state.base_fee, d.engine.mempool.len(), g.connection_count())
+            (d.height(), d.engine.state.base_fee, d.engine.mempool.len(), gossip.connection_count())
         };
 
         let new_blocks = height.saturating_sub(last_height);
@@ -770,17 +886,13 @@ fn main() {
     }
 }
 
-fn broadcast_driver_message(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction, msg: &Message) {
-    let mut g = gossip.lock().unwrap();
-    let _ = match action {
-        DriverAction::BroadcastBlock(_) => g.broadcast_priority(msg),
-        _ => g.broadcast(msg),
-    };
+fn broadcast_driver_message(gossip: &Arc<NetworkBridge>, _action: &DriverAction, msg: &Message) {
+    gossip.broadcast(msg);
 }
 
 fn process_driver_actions(
     driver: &Arc<Mutex<ConsensusDriver>>,
-    gossip: &Arc<Mutex<GossipEngine>>,
+    gossip: &Arc<NetworkBridge>,
     height_tx: &std::sync::mpsc::Sender<()>,
     previous_height: u64,
     actions: Vec<DriverAction>,
@@ -801,7 +913,7 @@ fn process_driver_actions(
         }
 
         if let DriverAction::RequestQC { height } = &action {
-            let peers: Vec<SocketAddr> = gossip.lock().unwrap().connected_addrs();
+            let peers: Vec<SocketAddr> = gossip.connected_addrs();
             eprintln!(
                 "[driver] requesting QC for height {} from {} peers",
                 height,
@@ -809,7 +921,7 @@ fn process_driver_actions(
             );
             let msg = Message::RequestQC { height: *height };
             for peer in &peers {
-                let _ = gossip.lock().unwrap().send_to(peer, &msg);
+                gossip.send_to(peer, &msg);
             }
             continue;
         }
@@ -831,7 +943,7 @@ fn process_driver_actions(
                 from_height: *from_height,
                 to_height: *to_height,
             };
-            let _ = gossip.lock().unwrap().send_to(from, &req);
+            gossip.send_to(from, &req);
         }
 
         if let DriverAction::RequestProposal { from, height, round, hash } = &action {
@@ -840,7 +952,7 @@ fn process_driver_actions(
                 round: *round,
                 hash: *hash,
             };
-            let _ = gossip.lock().unwrap().send_to(from, &req);
+            gossip.send_to(from, &req);
         }
 
         if let DriverAction::SendQCResponse { to, height, qc_bytes } = &action {
@@ -848,16 +960,14 @@ fn process_driver_actions(
                 height: *height,
                 qc_bytes: qc_bytes.clone(),
             };
-            if let Err(e) = gossip.lock().unwrap().send_to(to, &msg) {
-                eprintln!("[driver] failed to send QCResponse to {}: {}", to, e);
-            }
+            gossip.send_to(to, &msg);
         }
     }
 }
 
 fn announce_status_and_recovery(
     driver: &Arc<Mutex<ConsensusDriver>>,
-    gossip: &Arc<Mutex<GossipEngine>>,
+    gossip: &Arc<NetworkBridge>,
     height_tx: &std::sync::mpsc::Sender<()>,
     addr: SocketAddr,
 ) {
@@ -866,10 +976,8 @@ fn announce_status_and_recovery(
         (d.height(), d.engine.state.tip_hash)
     };
     let [status, ping] = startup_peer_messages(height, tip_hash);
-    if let Ok(mut g) = gossip.lock() {
-        let _ = g.send_to(&addr, &status);
-        let _ = g.send_to(&addr, &ping);
-    }
+    gossip.send_to(&addr, &status);
+    gossip.send_to(&addr, &ping);
     broadcast_status(driver, gossip);
 
     let actions = driver.lock().unwrap().request_qc_if_needed();
@@ -894,13 +1002,13 @@ fn should_log_sync_height(height: u64) -> bool {
     height <= 5 || height.is_multiple_of(100)
 }
 
-fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<Mutex<GossipEngine>>) {
+fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<NetworkBridge>) {
     let (height, tip_hash) = {
         let d = driver.lock().unwrap();
         (d.height(), d.engine.state.tip_hash)
     };
     let status = Message::Status { height, tip_hash };
-    let _ = gossip.lock().unwrap().broadcast(&status);
+    gossip.broadcast(&status);
 }
 
 fn check_disk_space(data_dir: &Path) -> u64 {
@@ -997,7 +1105,7 @@ fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
 /// Reads one HTTP request, dispatches to the appropriate chain query,
 /// and writes the JSON response. Locks the driver only for the duration
 /// of the state read — not while writing the HTTP response.
-fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>, gossip: &Arc<Mutex<indra_network::GossipEngine>>) {
+fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>, gossip: &Arc<NetworkBridge>) {
     use std::io::{BufRead, BufReader, Write, Read};
 
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -1106,7 +1214,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     guard.engine.block_store.len(),
                     block_reward_spark,
                     era,
-                    gossip.lock().unwrap().connection_count(),
+                    gossip.connection_count(),
                     s.chain_id,
                 )
             }
@@ -1194,7 +1302,7 @@ Connection: close
                         let height = guard.engine.state.height;
                         match guard.engine.mempool.submit(tx.clone(), base_fee, height) {
                             Ok(tx_id) => {
-                                let _ = gossip.lock().unwrap().broadcast(&Message::Tx(tx));
+                                gossip.broadcast(&Message::Tx(tx));
                                 format!(r#"{{"tx_id":"{}","status":"accepted"}}"#,
                                     hex::encode(tx_id.0))
                             }

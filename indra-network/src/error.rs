@@ -1,5 +1,6 @@
 //! Network error types.
 
+use indra_core::types::primitives::Bytes32;
 use thiserror::Error;
 
 /// All errors that can occur in the networking layer.
@@ -57,6 +58,63 @@ pub enum NetworkError {
     PeerTableFull {
         /// Maximum capacity.
         capacity: usize,
+    },
+
+    /// The peer did not complete the authenticated handshake in time.
+    #[error("handshake timed out")]
+    HandshakeTimeout,
+
+    /// A peer sent the wrong protocol magic.
+    #[error("invalid transport magic")]
+    InvalidMagic,
+
+    /// A peer announced an unsupported protocol version.
+    #[error("unsupported transport version {got}")]
+    UnsupportedVersion {
+        /// Version announced by the peer.
+        got: u16,
+    },
+
+    /// The peer claimed a validator identity we do not trust.
+    #[error("unknown validator {validator_id}")]
+    UnknownValidator {
+        /// The unknown validator identity.
+        validator_id: Bytes32,
+    },
+
+    /// The peer's ML-DSA transport authentication signature was invalid.
+    #[error("invalid transport authentication signature")]
+    InvalidSignature,
+
+    /// The peer sent malformed or invalid ML-KEM key material.
+    #[error("invalid ML-KEM key material")]
+    InvalidKem,
+
+    /// An encrypted frame failed integrity verification or used a bad nonce.
+    #[error("invalid encrypted frame: {reason}")]
+    InvalidFrame {
+        /// Why the frame was rejected.
+        reason: String,
+    },
+
+    /// A peer replayed or reordered a frame nonce.
+    #[error("unexpected frame nonce: expected {expected}, got {got}")]
+    UnexpectedNonce {
+        /// Next nonce expected by the receiver.
+        expected: u64,
+        /// Nonce observed on the wire.
+        got: u64,
+    },
+
+    /// The transport exhausted its per-direction nonce space.
+    #[error("transport nonce space exhausted")]
+    NonceExhausted,
+
+    /// A local cryptographic operation failed while preparing or verifying transport state.
+    #[error("transport crypto error: {reason}")]
+    Crypto {
+        /// Human-readable failure detail.
+        reason: String,
     },
 }
 

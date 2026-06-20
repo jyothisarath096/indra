@@ -7,9 +7,14 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = "1.8.5"
+chacha20poly1305 = "0.10.1"
 indra-core   = { path = "../indra-core" }
 indra-crypto = { path = "../indra-crypto" }
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
 thiserror.workspace = true
+tokio = { version = "1.52.3", features = ["full"] }
+x25519-dalek = { version = "2.0.1", features = ["getrandom"] }
 
 [dev-dependencies]
 indra-core   = { path = "../indra-core" }

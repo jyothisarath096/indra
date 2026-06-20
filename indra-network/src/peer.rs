@@ -27,6 +27,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use indra_core::types::primitives::Bytes32;
+
 use crate::error::{NetworkError, NetworkResult};
 
 /// Maximum number of peers in the table.
@@ -58,6 +60,8 @@ pub enum PeerStatus {
 /// Information about a single peer.
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
+    /// Authenticated validator identity, once the handshake completes.
+    pub validator_id: Option<Bytes32>,
     /// The peer's address.
     pub addr: SocketAddr,
     /// Current connection status.
@@ -80,6 +84,7 @@ impl PeerInfo {
     /// Create a new peer entry.
     pub fn new(addr: SocketAddr) -> Self {
         Self {
+            validator_id: None,
             addr,
             status: PeerStatus::Known,
             score: INITIAL_SCORE,
@@ -187,6 +192,14 @@ impl PeerTable {
     pub fn mark_connected(&mut self, addr: &SocketAddr) {
         if let Some(peer) = self.peers.get_mut(addr) {
             peer.status = PeerStatus::Connected;
+            peer.last_seen = Some(Instant::now());
+        }
+    }
+
+    /// Bind an authenticated validator identity to a connected peer.
+    pub fn set_validator_id(&mut self, addr: &SocketAddr, validator_id: Bytes32) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.validator_id = Some(validator_id);
             peer.last_seen = Some(Instant::now());
         }
     }

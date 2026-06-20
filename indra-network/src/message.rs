@@ -6,7 +6,7 @@
 //!   [u32 total_length LE] [u8 message_type] [payload bytes]
 //!
 //! `total_length` includes the type byte but NOT the 4-byte length prefix itself.
-//! Maximum message size: MAX_MSG_BYTES (4 MB).
+//! Maximum message size: MAX_MSG_BYTES.
 
 use indra_core::{
     codec::{Decode, Encode, ByteReader},
@@ -20,8 +20,11 @@ use indra_core::{
 
 use crate::error::{NetworkError, NetworkResult};
 
-/// Maximum wire message size: 4 MB.
-pub const MAX_MSG_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum wire message size: 14 MB.
+///
+/// This must accommodate the current block/QC limits plus transport framing
+/// overhead during sync responses and proposal propagation.
+pub const MAX_MSG_BYTES: usize = 14_680_064;
 
 /// Message type discriminant bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

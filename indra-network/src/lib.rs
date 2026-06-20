@@ -37,13 +37,10 @@
 //! timeouts, sending duplicate votes) decreases it. Score drops to
 //! zero → peer is banned for BAN_DURATION_BLOCKS blocks.
 //!
-//! ## Phase 7 upgrade
-//!
-//! Phase 6 uses synchronous TCP. Phase 7 wraps this in Tokio for
-//! fully async I/O and adds:
-//! - Noise protocol handshake for encrypted connections
-//! - Peer discovery via Kademlia DHT
-//! - Connection multiplexing via yamux
+//! The workspace is currently transitioning from a blocking plaintext
+//! transport to an authenticated encrypted Tokio transport. The new framing,
+//! handshake, and peer-manager modules coexist with the legacy transport while
+//! `indra-node` is migrated.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -52,13 +49,21 @@
 #![deny(clippy::panic)]
 
 pub mod error;
+pub mod frame;
+pub mod handshake;
 pub mod message;
+pub mod net_types;
 pub mod peer;
+pub mod peer_manager;
 pub mod gossip;
 pub mod transport;
 
 pub use error::{NetworkError, NetworkResult};
+pub use frame::{FrameReader, FrameWriter};
+pub use handshake::{HandshakeConfig, HandshakeResult, perform_handshake_initiator, perform_handshake_responder};
 pub use message::{Message, MessageType};
+pub use net_types::{NetworkCommand, NetworkEvent};
 pub use peer::{PeerInfo, PeerTable, PeerStatus};
+pub use peer_manager::{PeerManagerConfig, PeerManagerHandle, spawn_peer_manager};
 pub use gossip::{GossipEngine, GossipEvent};
 pub use transport::{Transport, Connection};
