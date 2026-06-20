@@ -204,17 +204,9 @@ impl NodeEngine {
             .unwrap_or(false);
 
         let Some(vrf_kp) = &self.vrf_keypair else {
-            eprintln!(
-                "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected=none should_propose=false",
-                my_id, has_vrf, in_candidates, cand_count
-            );
             return false;
         };
         let Some(validator_id) = self.validator_id else {
-            eprintln!(
-                "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected=none should_propose=false",
-                my_id, has_vrf, in_candidates, cand_count
-            );
             return false;
         };
         let slot = compute_proposer_vrf(
@@ -234,17 +226,7 @@ impl NodeEngine {
                 return false;
             }
         };
-        let should_propose = elected == slot.proposer_id;
-        eprintln!(
-            "[proposer] id={} has_vrf={} in_candidates={} candidates={} elected={} should_propose={}",
-            my_id,
-            has_vrf,
-            in_candidates,
-            cand_count,
-            hex::encode(&elected.0[..4]),
-            should_propose
-        );
-        should_propose
+        elected == slot.proposer_id
     }
 
     /// Propose a block for the next height (only if this node is the proposer).
@@ -278,6 +260,7 @@ impl NodeEngine {
             polc_round,
         };
 
+        eprintln!("[proposer] producing block at height={} round={}", proposal_height, election.round);
         produce_block(&template, &self.state, &self.mempool, election)
             .map_err(NodeError::Consensus)
     }

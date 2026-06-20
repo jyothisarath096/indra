@@ -123,7 +123,6 @@ fn main() {
                 eprintln!("Bootstrap: (bootstrap node)");
                 vec![]
             } else {
-                println!("[p2p] using default bootstrap peer: {}", DEFAULT_BOOTSTRAP_PEER);
                 eprintln!("Bootstrap: {}", DEFAULT_BOOTSTRAP_PEER);
                 vec![DEFAULT_BOOTSTRAP_PEER.to_string()]
             }
@@ -190,7 +189,7 @@ fn main() {
                 Ok(l) => l,
                 Err(e) => { eprintln!("[listener] bind failed: {}", e); return; }
             };
-            println!("[P2P] Listening on {}", p2p);
+            eprintln!("[p2p] listening on {}", p2p);
 
             for stream in listener.incoming() {
                         match stream {
@@ -200,13 +199,9 @@ fn main() {
                             Err(_) => continue,
                         };
                         if gossip.lock().unwrap().is_connected_ip(&addr) {
-                            eprintln!(
-                                "[P2P] Already connected to {} — dropping duplicate",
-                                addr.ip()
-                            );
                             continue;
                         }
-                        println!("[P2P] Inbound connection from {}", addr);
+                        eprintln!("[p2p] inbound connection from {}", addr);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
@@ -248,17 +243,12 @@ fn main() {
 
                     // Skip if already connected
                     if gossip.lock().unwrap().is_connected_ip(&addr) {
-                        eprintln!(
-                            "[P2P] Already connected to {} — dropping duplicate",
-                            addr.ip()
-                        );
                         continue;
                     }
 
-                    println!("[P2P] Dialing {}...", addr);
                     match transport.dial(addr) {
                         Ok(conn) => {
-                            println!("[P2P] Connected to {}", addr);
+                            eprintln!("[p2p] connected to {}", addr);
                             let _ = gossip.lock().unwrap().add_connection(addr, conn);
                             announce_status_and_recovery(&driver, &gossip, &height_tx, addr);
                         }
@@ -321,7 +311,6 @@ fn main() {
                                     }
                                     blocks
                                 };
-                                eprintln!("[sync] serving blocks {}..{} to {}", from_height, upper, addr);
                                 let _ = gossip.lock().unwrap().send_to(
                                     &addr,
                                     &Message::BlockResponse { blocks: blocks_to_send },
@@ -341,12 +330,6 @@ fn main() {
                                         })
                                 };
                                 if let Some(block) = proposal {
-                                    eprintln!(
-                                        "[gossip] received proposal request for {} at height={} round={} — sending block",
-                                        hex::encode(&hash.0[..4]),
-                                        height,
-                                        round,
-                                    );
                                     let _ = gossip.lock().unwrap().send_to(&addr, &Message::Block(block));
                                 }
                                 continue;
@@ -369,11 +352,13 @@ fn main() {
                                                 d.refresh_registered_voters();
                                                 d.sync_mut().on_block_imported(block.header.height);
                                                 d.reset_round();
-                                                eprintln!(
-                                                    "[sync] imported block at height={} from {}",
-                                                    block.header.height,
-                                                    addr
-                                                );
+                                                if should_log_sync_height(block.header.height) {
+                                                    eprintln!(
+                                                        "[sync] imported block at height={} from {}",
+                                                        block.header.height,
+                                                        addr
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
                                                 eprintln!(
@@ -461,6 +446,7 @@ fn main() {
             let mut phase_started_at = Instant::now();
             let mut last_observed = None::<(u64, u32, RoundPhase)>;
             let mut last_status_at = Instant::now() - STATUS_INTERVAL;
+            let mut last_peer_wait_log = None::<usize>;
 
             loop {
                 let (height, round, phase, sync_target, sync_caught_up, connected, tip_hash) = {
@@ -498,25 +484,23 @@ fn main() {
                 }
 
                 if connected < 2 {
-                    eprintln!("[consensus] waiting for peers (have {}, need 2)", connected);
+                    if last_peer_wait_log != Some(connected) {
+                        eprintln!("[consensus] waiting for peers (have {}, need 2)", connected);
+                        last_peer_wait_log = Some(connected);
+                    }
                     phase_started_at = Instant::now();
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
+                last_peer_wait_log = None;
 
-                if connected == 0 {
-                    println!("[consensus] height={} waiting for peers...", height);
-                } else if last_status_at.elapsed() >= STATUS_INTERVAL {
-                    println!("[consensus] height={} peers={} round={} phase={:?}", height, connected, round, phase);
+                if last_status_at.elapsed() >= STATUS_INTERVAL {
                     let status = Message::Status { height, tip_hash };
                     let _ = gossip.lock().unwrap().broadcast(&status);
                     last_status_at = Instant::now();
                 }
 
                 if !sync_caught_up {
-                    if let Some(target) = sync_target {
-                        println!("[consensus] syncing — height={} target={}", height, target);
-                    }
                     match height_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(()) => {
                             phase_started_at = Instant::now();
@@ -527,9 +511,7 @@ fn main() {
                     continue;
                 }
 
-                if let Some(target) = sync_target {
-                    println!("[consensus] syncing — height={} target={}", height, target);
-                } else {
+                if sync_target.is_none() {
                     match phase {
                         RoundPhase::Propose => {
                             let (should_propose, next_height) = {
@@ -647,13 +629,6 @@ fn main() {
                                     };
                                     match proposal_result {
                                         Ok(block) => {
-                                            if !block.transactions.is_empty() {
-                                                eprintln!(
-                                                    "[mempool] including {} txs in block at height={}",
-                                                    block.transactions.len(),
-                                                    block.header.height,
-                                                );
-                                            }
                                             let actions = d.process(DriverEvent::InboundBlock {
                                                 from: None,
                                                 block: block.clone(),
@@ -676,20 +651,7 @@ fn main() {
 
                                 if let Some((block, actions)) = proposal {
                                     proposed_at_slot = Some((block.header.height, block.header.proposer_round));
-                                    eprintln!(
-                                        "[timing] t={}ms proposed block {} at height={} round={}",
-                                        now_ms(),
-                                        hex::encode(block.header.block_hash().0),
-                                        block.header.height,
-                                        block.header.proposer_round,
-                                    );
                                     process_driver_actions(&driver, &gossip, &height_tx, height, actions);
-
-                                    println!(
-                                        "[consensus] ✓ proposed block {} → height={}",
-                                        hex::encode(block.header.block_hash().0),
-                                        driver.lock().unwrap().height()
-                                    );
                                 }
                             }
 
@@ -715,7 +677,7 @@ fn main() {
                                 {
                                     let mut d = driver.lock().unwrap();
                                     d.on_precommit_timeout();
-                                    if d.current_round() != old_round {
+                                    if d.current_round() != old_round && d.current_round() > 0 {
                                         eprintln!(
                                             "[timing] t={}ms ROUND ADVANCED to {} at height={}",
                                             now_ms(),
@@ -753,7 +715,7 @@ fn main() {
         let driver_rpc = Arc::clone(&driver);
         let gossip_rpc = Arc::clone(&gossip);
         let rpc_addr = get_arg("--rpc-addr").unwrap_or_else(|| "127.0.0.1:8545".to_string());
-        println!("[RPC] Listening on {}", rpc_addr);
+        eprintln!("[rpc] listening on {}", rpc_addr);
 
         std::thread::spawn(move || {
             let listener = match std::net::TcpListener::bind(&rpc_addr) {
@@ -809,34 +771,6 @@ fn main() {
     }
 }
 
-fn log_broadcast_action(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction) {
-    let peers = gossip.lock().unwrap().connection_count();
-    match action {
-        DriverAction::BroadcastBlock(block) => {
-            eprintln!(
-                "[gossip] broadcasting proposal {} to {} peers",
-                hex::encode(&block.header.block_hash().0[..4]),
-                peers,
-            );
-        }
-        DriverAction::BroadcastVote(vote) => {
-            eprintln!(
-                "[vote] sent vote for {} to {} peers",
-                hex::encode(&vote.block_hash.0[..4]),
-                peers,
-            );
-        }
-        DriverAction::BroadcastTx(tx) => {
-            eprintln!(
-                "[mempool] broadcasting tx {} to {} peers",
-                hex::encode(&tx.tx_hash().0[..4]),
-                peers,
-            );
-        }
-        _ => {}
-    }
-}
-
 fn broadcast_driver_message(gossip: &Arc<Mutex<GossipEngine>>, action: &DriverAction, msg: &Message) {
     let mut g = gossip.lock().unwrap();
     let _ = match action {
@@ -882,18 +816,18 @@ fn process_driver_actions(
         }
 
         if let Some(out_msg) = action_to_message(&action) {
-            log_broadcast_action(gossip, &action);
             broadcast_driver_message(gossip, &action, &out_msg);
         }
 
         if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
-            eprintln!(
-                "[sync] peer at height={}, local behind, requesting blocks {}..{} from {}",
-                to_height,
-                from_height,
-                to_height,
-                from
-            );
+            if should_log_sync_height(*from_height) || to_height.saturating_sub(*from_height) < SYNC_BATCH_SIZE {
+                eprintln!(
+                    "[sync] requesting blocks {}..{} from {}",
+                    from_height,
+                    to_height,
+                    from
+                );
+            }
             let req = Message::RequestBlocks {
                 from_height: *from_height,
                 to_height: *to_height,
@@ -955,6 +889,10 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn should_log_sync_height(height: u64) -> bool {
+    height <= 5 || height.is_multiple_of(100)
 }
 
 fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<Mutex<GossipEngine>>) {
@@ -1025,9 +963,7 @@ fn resolve_peer_addr(addr: &str) -> Option<SocketAddr> {
         return Some(socket_addr);
     }
 
-    let resolved = resolve_first_socket_addr(addr)?;
-    eprintln!("[p2p] resolved {} -> {}", addr, resolved);
-    Some(resolved)
+    resolve_first_socket_addr(addr)
 }
 
 fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
@@ -1151,7 +1087,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                         / indra_core::types::primitives::ERA_3_PLUS_DURATION_BLOCKS)
                 };
                 format!(
-                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"max_active_validators":{},"total_staked_spark":{},"effective_min_stake_spark":{},"validator_set_phase":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{},"peers":{}}}"#,
+                    r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"treasury_balance":{},"burn_buffer":{},"fee_reward_pool":{},"active_validators":{},"max_active_validators":{},"total_staked_spark":{},"effective_min_stake_spark":{},"validator_set_phase":{},"mempool_size":{},"epoch":{},"pruned_mode":{},"lowest_block":{},"blocks_retained":{},"block_reward_spark":{},"era":{},"peers":{},"chain_id":"{}"}}"#,
                     s.height,
                     hex::encode(s.tip_hash.0),
                     s.base_fee,
@@ -1172,6 +1108,7 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     block_reward_spark,
                     era,
                     gossip.lock().unwrap().connection_count(),
+                    s.chain_id,
                 )
             }
             "indra_getMempoolSize" => {
