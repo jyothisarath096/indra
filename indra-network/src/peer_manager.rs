@@ -170,7 +170,9 @@ impl PeerManagerActor {
                     Ok(bytes) => bytes,
                     Err(_) => break,
                 };
-                let msg = match Message::decode_wire(&plaintext) {
+                // encode_wire() includes a 4-byte length prefix; strip it before decode
+                let payload = if plaintext.len() >= 4 { &plaintext[4..] } else { &plaintext[..] };
+                let msg = match Message::decode_wire(payload) {
                     Ok(msg) => msg,
                     Err(_) => break,
                 };
