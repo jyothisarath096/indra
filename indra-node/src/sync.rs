@@ -213,19 +213,18 @@ pub fn import_block(
     mempool: &mut Mempool,
     block_store: &mut BlockStore,
     state_store: &StateStore,
-    strict_header_verification: bool,
 ) -> NodeResult<()> {
     let height = block.header.height;
 
-    if strict_header_verification && state.validators.active_count() > 0 {
-        verify_proposer_vrf(block, state, true)?;
+    if state.validators.active_count() > 0 {
+        verify_proposer_vrf(block, state)?;
     }
 
-    if strict_header_verification && height > 1 {
+    if height > 1 {
         verify_block_qc(block, state)?;
     }
 
-    verify_block_state_root(block, state, strict_header_verification)?;
+    verify_block_state_root(block, state)?;
 
     // 1. Apply block to state (validates everything)
     apply_block(state, block).map_err(|e| NodeError::BlockInvalid {
@@ -259,7 +258,6 @@ pub fn import_block(
 pub(crate) fn verify_proposer_vrf(
     block: &BlockV1,
     state: &ChainState,
-    _strict: bool,
 ) -> NodeResult<()> {
     let proof_bytes = block.header.proposer_vrf_proof.as_slice();
     let output = block.header.proposer_vrf_output;
@@ -404,7 +402,6 @@ fn verify_block_qc(
 fn verify_block_state_root(
     block: &BlockV1,
     state: &ChainState,
-    _strict: bool,
 ) -> NodeResult<()> {
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
@@ -634,7 +631,7 @@ mod tests {
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         let block = make_block(&state);
-        import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+        import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
 
         assert_eq!(state.height, 1);
         assert_eq!(block_store.len(), 2); // genesis (0) + block 1
@@ -648,6 +645,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut state = ChainState::new_genesis();
+        let _ = install_active_validator(&mut state, 0x41, 10_000, true, true);
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
             dir.join("blocks.log"),
@@ -655,9 +653,24 @@ mod tests {
         ).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
+        let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[0x41; 32]);
+        let pq = indra_crypto::hybrid::PqKeypair::from_seed(&[0x41; 32]).unwrap();
+        let hybrid = indra_crypto::hybrid::HybridKeypair::new(classical, pq);
+        let validator_id = Bytes32::from(indra_crypto::sha256(&hybrid.public_key().classical.0));
+        let pq_pk = hybrid.public_key().pq.0.clone();
+        let mut prev_qc = Vec::new();
         for i in 1..=10u64 {
-            let block = make_block(&state);
-            import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+            let block = make_strict_block(&state, 0x41, 0, prev_qc.clone());
+            import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            prev_qc = build_qc_bytes(
+                block.header.height,
+                block.header.proposer_round,
+                block.header.value_hash,
+                validator_id,
+                &hybrid,
+                pq_pk.clone(),
+                10_000,
+            );
             assert_eq!(state.height, i);
         }
 
@@ -683,7 +696,7 @@ mod tests {
         // Try to import height 5 when we're at genesis (height 0)
         let mut block = make_block(&state);
         block.header.height = 5;
-        assert!(import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store, false).is_err());
+        assert!(import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -760,9 +773,9 @@ mod tests {
         let (_validator_id, _hybrid) = install_active_validator(&mut state, 0x11, 10_000, true, true);
         let block = make_strict_block(&state, 0x11, 0, vec![]);
 
-        assert!(verify_proposer_vrf(&block, &state, true).is_ok());
+        assert!(verify_proposer_vrf(&block, &state).is_ok());
         assert!(verify_block_qc(&block, &state).is_ok());
-        assert!(verify_block_state_root(&block, &state, true).is_ok());
+        assert!(verify_block_state_root(&block, &state).is_ok());
     }
 
     #[test]
@@ -844,7 +857,7 @@ mod tests {
         );
         tampered.header.proposer_vrf_output = Bytes32::from(slot.vrf_output.0);
         tampered.header.proposer_vrf_proof = VariableBytes::from_slice(&slot.vrf_proof.0).unwrap();
-        let err = verify_proposer_vrf(&tampered, &state, true).unwrap_err();
+        let err = verify_proposer_vrf(&tampered, &state).unwrap_err();
         match err {
             NodeError::BlockInvalid { reason, .. } => {
                 assert!(reason.contains("proposer VRF mismatch"));
@@ -870,7 +883,6 @@ mod tests {
             &mut mempool,
             &mut block_store,
             &state_store,
-            true,
         ).unwrap();
 
         let pq_pk = hybrid.public_key().pq.0.clone();
@@ -885,9 +897,9 @@ mod tests {
         );
         let block2 = make_strict_block(&state, 0x31, 0, qc_bytes);
 
-        assert!(verify_proposer_vrf(&block2, &state, true).is_ok());
+        assert!(verify_proposer_vrf(&block2, &state).is_ok());
         assert!(verify_block_qc(&block2, &state).is_ok());
-        assert!(verify_block_state_root(&block2, &state, true).is_ok());
+        assert!(verify_block_state_root(&block2, &state).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -406,7 +406,6 @@ impl NodeEngine {
             &mut self.mempool,
             &mut self.block_store,
             &self.state_store,
-            self.config.strict_header_verification,
         )
     }
 }
@@ -470,6 +469,15 @@ fn rebuild_state_from_height(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::codec::Encode;
+    use indra_consensus::{
+        build_qc,
+        producer::{produce_block, BlockTemplate},
+        proposer::ProposerCandidate,
+        qc::QcValidator,
+        vote::produce_vote,
+    };
+    use indra_core::types::vote::VoteStep;
     use indra_state::{ValidatorEntry, ValidatorStatus};
     use indra_core::types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK};
 
@@ -479,10 +487,11 @@ mod tests {
         p
     }
 
-    fn install_active_validator(engine: &mut NodeEngine, seed: [u8; 32], name: &str) {
+    fn install_active_validator(engine: &mut NodeEngine, seed: [u8; 32], name: &str) -> HybridKeypair {
         let classical = ClassicalKeypair::from_seed(&seed);
         let pq = PqKeypair::from_seed(&seed).unwrap();
-        let public = HybridKeypair::new(classical, pq).public_key();
+        let hybrid = HybridKeypair::new(classical, pq);
+        let public = hybrid.public_key();
         let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
         let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
 
@@ -505,6 +514,70 @@ mod tests {
                 min_delegation_spark: DUST_LIMIT_SPARK,
             })
             .unwrap();
+        hybrid
+    }
+
+    fn make_strict_block(
+        state: &indra_state::ChainState,
+        proposer_seed: [u8; 32],
+        prev_qc_bytes: Vec<u8>,
+    ) -> indra_core::types::block::BlockV1 {
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&state.tip_hash.0));
+        let mut candidates: Vec<_> = state
+            .validators
+            .active_validators()
+            .filter_map(|validator| {
+                validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                    validator_id: validator.validator_id,
+                    vrf_pubkey: vrf_pk,
+                    stake: validator.stake_spark,
+                })
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| candidate.validator_id.0);
+        let election = indra_consensus::proposer::ProposerElection {
+            epoch_seed,
+            height: state.height + 1,
+            round: 0,
+            candidates,
+        };
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+            epoch_seed: election.epoch_seed,
+            prev_qc_bytes,
+            timestamp: 1_700_000_000 + state.height + 1,
+            polc_round: None,
+        };
+        produce_block(&template, state, &indra_consensus::mempool::Mempool::default_config(), &election)
+            .unwrap()
+    }
+
+    fn build_single_validator_qc_bytes(
+        height: u64,
+        round: u32,
+        value_hash: Bytes32,
+        seed: [u8; 32],
+    ) -> Vec<u8> {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let hybrid = HybridKeypair::new(classical, pq);
+        let public = hybrid.public_key();
+        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let vote = produce_vote(height, round, VoteStep::Precommit, value_hash, validator_id, &hybrid).unwrap();
+        let qc = build_qc(
+            height,
+            round,
+            value_hash,
+            &[QcValidator {
+                validator_id,
+                position: 0,
+                pq_pk: public.pq.0.clone(),
+                stake: 1_000_000,
+            }],
+            vec![&vote],
+        )
+        .unwrap();
+        qc.encode_to_vec()
     }
 
     #[test]
@@ -538,50 +611,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn make_block(state: &indra_state::ChainState) -> indra_core::types::block::BlockV1 {
-        use indra_core::{
-            Bytes32, ProtocolVersion, VariableBytes,
-            types::block::{BlockHeaderV1, BlockV1},
-            types::primitives::MAX_VRF_PROOF_BYTES,
-        };
-        use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
-
-        let mut block = BlockV1 {
-            header: BlockHeaderV1 {
-                protocol_version:    ProtocolVersion::CURRENT,
-                height:              state.height + 1,
-                prev_hash:           state.tip_hash,
-                timestamp:           1_700_000_000 + state.height + 1,
-                state_root:          Bytes32::ZERO,
-                validator_set_root:  Bytes32::ZERO,
-                mempool_set_root:    Bytes32::ZERO,
-                value_hash:          Bytes32::ZERO,
-                base_fee:            state.base_fee,
-                proposer_round:      0,
-                polc_round:          indra_core::types::block::NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-                quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
-            },
-            transactions:      vec![],
-            slashing_evidence: vec![],
-            governance_ops:    vec![],
-        };
-
-        let mut projected = state.clone();
-        apply_block(&mut projected, &block).unwrap();
-        block.header.state_root = compute_state_root(&projected);
-        block.header.validator_set_root = compute_validator_set_root(&projected);
-        block.header.value_hash = block.compute_value_hash(projected.total_supply);
-        block
-    }
-
     #[test]
     fn engine_commit_block() {
         let dir = temp_dir("c");
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
-        let block = make_block(&engine.state);
+        install_active_validator(&mut engine, [0x42u8; 32], "local");
+        let block = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
 
         engine.commit_block(&block).unwrap();
         assert_eq!(engine.height(), 1);
@@ -593,10 +629,13 @@ mod tests {
         let dir = temp_dir("d");
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config.clone()).unwrap();
+        install_active_validator(&mut engine, [0x42u8; 32], "local");
+        let mut last_qc = Vec::new();
 
         for height in 1..=3u64 {
-            let block = make_block(&engine.state);
+            let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
+            last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
             assert_eq!(engine.state.height, height);
         }
 
@@ -614,9 +653,12 @@ mod tests {
 
         let final_tip_hash = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
+            install_active_validator(&mut engine, [0x42u8; 32], "local");
+            let mut last_qc = Vec::new();
             for height in 1..=1_000u64 {
-                let block = make_block(&engine.state);
+                let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
+                last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
                 assert_eq!(engine.state.height, height);
             }
             assert!(engine.block_store.lowest_height() > 0);
@@ -638,12 +680,15 @@ mod tests {
 
         let (continuous_state, next_block) = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
+            install_active_validator(&mut engine, [0x42u8; 32], "local");
+            let mut last_qc = Vec::new();
             for height in 1..=610u64 {
-                let block = make_block(&engine.state);
+                let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
+                last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
                 assert_eq!(engine.state.height, height);
             }
-            let next_block = make_block(&engine.state);
+            let next_block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             (engine.state.clone(), next_block)
         };
 
@@ -698,9 +743,13 @@ mod tests {
 
         {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
+            install_active_validator(&mut engine, [0x42u8; 32], "local");
+            let mut last_qc = Vec::new();
             for _ in 0..1_600u64 {
-                let block = make_block(&engine.state);
+                let height = engine.state.height + 1;
+                let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
+                last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
             }
         }
 

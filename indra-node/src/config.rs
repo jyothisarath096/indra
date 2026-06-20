@@ -57,12 +57,6 @@ pub struct NodeConfig {
     /// `None` means archive mode.
     pub prune_keep_blocks: Option<u64>,
 
-    /// Whether to enforce strict cryptographic header verification on block import.
-    ///
-    /// Must be `true` on all validator and full nodes in production.
-    /// `false` is only appropriate during local development and testing
-    /// where blocks are produced without complete validator sets or QCs.
-    pub strict_header_verification: bool,
 }
 
 impl NodeConfig {
@@ -81,7 +75,6 @@ impl NodeConfig {
             snapshot_interval: 300,
             mempool_capacity:  5_000,
             prune_keep_blocks: None,
-            strict_header_verification: false,
         }
     }
 
@@ -100,7 +93,6 @@ impl NodeConfig {
             snapshot_interval: 300,
             mempool_capacity:  5_000,
             prune_keep_blocks: None,
-            strict_header_verification: true,
         }
     }
 

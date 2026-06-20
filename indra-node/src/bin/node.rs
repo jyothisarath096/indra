@@ -148,7 +148,6 @@ fn main() {
         snapshot_interval: 300,
         mempool_capacity:  5_000,
         prune_keep_blocks: if archive { None } else { Some(prune_keep) },
-        strict_header_verification: true,
     };
 
     // Init node engine + consensus driver

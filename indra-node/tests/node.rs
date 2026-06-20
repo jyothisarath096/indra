@@ -2,15 +2,14 @@
 
 use std::path::PathBuf;
 use indra_core::{
-    Bytes32, ProtocolVersion, VariableBytes,
-    codec::Decode,
+    Bytes32,
+    codec::{Decode, Encode},
     types::{
-        block::{BlockHeaderV1, BlockV1},
-        primitives::MAX_VRF_PROOF_BYTES,
+        block::BlockV1,
         vote::VoteStep,
     },
 };
-use indra_state::{ChainState, apply_block, compute_validator_set_root};
+use indra_state::ChainState;
 use indra_consensus::mempool::Mempool;
 use indra_crypto::{hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair}, VrfKeypair};
 use indra_storage::{BlockStore, PruneConfig, StateStore};
@@ -20,6 +19,13 @@ use indra_node::{
     genesis::{build_genesis_state, genesis_block_hash},
     state_root::compute_state_root,
     sync::{import_block, SyncState},
+};
+use indra_consensus::{
+    build_qc,
+    producer::{produce_block, BlockTemplate},
+    proposer::ProposerCandidate,
+    qc::QcValidator,
+    vote::produce_vote,
 };
 
 fn temp_dir(suffix: &str) -> PathBuf {
@@ -34,35 +40,38 @@ fn anchored_genesis_state() -> ChainState {
     state
 }
 
-fn make_block(state: &ChainState) -> BlockV1 {
-    let mut block = BlockV1 {
-        header: BlockHeaderV1 {
-            protocol_version:    ProtocolVersion::CURRENT,
-            height:              state.height + 1,
-            prev_hash:           state.tip_hash,
-            timestamp:           1_700_000_000 + state.height + 1,
-            state_root:          Bytes32::ZERO,
-            validator_set_root:  Bytes32::ZERO,
-            mempool_set_root:    Bytes32::ZERO,
-            value_hash:          Bytes32::ZERO,
-            base_fee:            state.base_fee,
-            proposer_round:      0,
-            polc_round:          indra_core::types::block::NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-            quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
-        },
-        transactions:      vec![],
-        slashing_evidence: vec![],
-        governance_ops:    vec![],
+fn make_strict_block(
+    state: &ChainState,
+    proposer_seed: [u8; 32],
+    prev_qc_bytes: Vec<u8>,
+) -> BlockV1 {
+    let epoch_seed = Bytes32::from(indra_crypto::sha256(&state.tip_hash.0));
+    let mut candidates: Vec<_> = state
+        .validators
+        .active_validators()
+        .filter_map(|validator| {
+            validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                validator_id: validator.validator_id,
+                vrf_pubkey: vrf_pk,
+                stake: validator.stake_spark,
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| candidate.validator_id.0);
+    let election = indra_consensus::proposer::ProposerElection {
+        epoch_seed,
+        height: state.height + 1,
+        round: 0,
+        candidates,
     };
-
-    let mut projected = state.clone();
-    apply_block(&mut projected, &block).unwrap();
-    block.header.state_root = compute_state_root(&projected);
-    block.header.validator_set_root = compute_validator_set_root(&projected);
-    block.header.value_hash = block.compute_value_hash(projected.total_supply);
-    block
+    let template = BlockTemplate {
+        proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+        epoch_seed: election.epoch_seed,
+        prev_qc_bytes,
+        timestamp: 1_700_000_000 + state.height + 1,
+        polc_round: None,
+    };
+    produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
 }
 
 fn install_active_validator(
@@ -98,6 +107,63 @@ fn install_active_validator(
         })
         .unwrap();
     hybrid
+}
+
+fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -> HybridKeypair {
+    let classical = ClassicalKeypair::from_seed(&seed);
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    let hybrid = HybridKeypair::new(classical, pq);
+    let public = hybrid.public_key();
+    let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+    let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+
+    state
+        .validators
+        .upsert(indra_state::ValidatorEntry {
+            validator_id,
+            name: name.to_string(),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.clone()),
+            vrf_pk: Some(vrf_pk),
+            stake_spark: 1_000_000,
+            status: indra_state::ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+        })
+        .unwrap();
+    hybrid
+}
+
+fn build_single_validator_qc_bytes(
+    height: u64,
+    round: u32,
+    value_hash: Bytes32,
+    seed: [u8; 32],
+) -> Vec<u8> {
+    let classical = ClassicalKeypair::from_seed(&seed);
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    let hybrid = HybridKeypair::new(classical, pq);
+    let public = hybrid.public_key();
+    let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+    let vote = produce_vote(height, round, VoteStep::Precommit, value_hash, validator_id, &hybrid).unwrap();
+    let qc = build_qc(
+        height,
+        round,
+        value_hash,
+        &[QcValidator {
+            validator_id,
+            position: 0,
+            pq_pk: public.pq.0.clone(),
+            stake: 1_000_000,
+        }],
+        vec![&vote],
+    )
+    .unwrap();
+    qc.encode_to_vec()
 }
 
 fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
@@ -147,13 +213,16 @@ fn node_engine_init_and_commit() {
     let dir = temp_dir("engine");
     let config = NodeConfig::local_test(dir.clone());
     let mut engine = NodeEngine::init(config).unwrap();
+    install_state_validator(&mut engine.state, [0x42u8; 32], "local");
 
     assert_eq!(engine.height(), 0);
 
     // Commit 5 blocks
+    let mut last_qc = Vec::new();
     for i in 1..=5u64 {
-        let block = make_block(&engine.state);
+        let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
         engine.commit_block(&block).unwrap();
+        last_qc = build_single_validator_qc_bytes(i, 0, block.header.value_hash, [0x42u8; 32]);
         assert_eq!(engine.height(), i);
     }
 
@@ -168,18 +237,20 @@ fn state_root_changes_after_each_block() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut state = anchored_genesis_state();
+    install_state_validator(&mut state, [0x11u8; 32], "local");
     let mut mempool = Mempool::default_config();
     let mut block_store = BlockStore::open(dir.join("blocks.log"), PruneConfig::archive()).unwrap();
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
     let root0 = compute_state_root(&state);
 
-    let b1 = make_block(&state);
-    import_block(&b1, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+    let b1 = make_strict_block(&state, [0x11u8; 32], vec![]);
+    import_block(&b1, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
     let root1 = compute_state_root(&state);
 
-    let b2 = make_block(&state);
-    import_block(&b2, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+    let qc1 = build_single_validator_qc_bytes(1, 0, b1.header.value_hash, [0x11u8; 32]);
+    let b2 = make_strict_block(&state, [0x11u8; 32], qc1);
+    import_block(&b2, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
     let root2 = compute_state_root(&state);
 
     assert_ne!(root0, root1);
@@ -195,13 +266,16 @@ fn block_store_survives_reopen() {
 
     {
         let mut state = anchored_genesis_state();
+        install_state_validator(&mut state, [0x12u8; 32], "local");
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(&log_path, PruneConfig::archive()).unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
+        let mut last_qc = Vec::new();
         for i in 1..=3u64 {
-            let b = make_block(&state);
-            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+            let b = make_strict_block(&state, [0x12u8; 32], last_qc.clone());
+            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x12u8; 32]);
             assert_eq!(state.height, i);
         }
     }
@@ -222,9 +296,13 @@ fn restarted_block_store_preserves_hash_chain() {
 
     {
         let mut engine = NodeEngine::init(config.clone()).unwrap();
+        install_state_validator(&mut engine.state, [0x42u8; 32], "local");
+        let mut last_qc = Vec::new();
         for _ in 0..5u64 {
-            let block = make_block(&engine.state);
+            let height = engine.state.height + 1;
+            let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
+            last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
         }
     }
 
@@ -247,25 +325,29 @@ fn sync_state_downloads_full_chain_from_genesis() {
     let follower_state_dir = dir.join("follower_state");
 
     let mut source_state = anchored_genesis_state();
+    install_state_validator(&mut source_state, [0x13u8; 32], "source");
     let mut source_mempool = Mempool::default_config();
     let mut source_store = BlockStore::open(&source_log, PruneConfig::archive()).unwrap();
     let source_state_store = StateStore::open(&source_state_dir).unwrap();
 
+    let mut source_last_qc = Vec::new();
     for _ in 0..6u64 {
-        let block = make_block(&source_state);
+        let height = source_state.height + 1;
+        let block = make_strict_block(&source_state, [0x13u8; 32], source_last_qc.clone());
         import_block(
             &block,
             &mut source_state,
             &mut source_mempool,
             &mut source_store,
             &source_state_store,
-            false,
         )
         .unwrap();
+        source_last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x13u8; 32]);
     }
 
     let peer: std::net::SocketAddr = "127.0.0.1:30303".parse().unwrap();
     let mut follower_state = anchored_genesis_state();
+    install_state_validator(&mut follower_state, [0x13u8; 32], "source");
     let mut follower_mempool = Mempool::default_config();
     let mut follower_store = BlockStore::open(&follower_log, PruneConfig::archive()).unwrap();
     let follower_state_store = StateStore::open(&follower_state_dir).unwrap();
@@ -282,7 +364,6 @@ fn sync_state_downloads_full_chain_from_genesis() {
             &mut follower_mempool,
             &mut follower_store,
             &follower_state_store,
-            false,
         )
         .unwrap();
         sync.on_block_imported(height);
@@ -304,9 +385,13 @@ fn current_binary_hashes_workspace_block_log_consistently() {
     let config = NodeConfig::local_test(dir.clone());
     {
         let mut engine = NodeEngine::init(config.clone()).unwrap();
+        install_state_validator(&mut engine.state, [0x42u8; 32], "local");
+        let mut last_qc = Vec::new();
         for _ in 0..3u64 {
-            let block = make_block(&engine.state);
+            let height = engine.state.height + 1;
+            let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
+            last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
         }
     }
 
@@ -359,13 +444,16 @@ fn full_node_pipeline() {
 
     let mut state = build_genesis_state();
     state.tip_hash = genesis_block_hash();
+    install_state_validator(&mut state, [0x14u8; 32], "local");
     let mut mempool = Mempool::default_config();
     let mut block_store = BlockStore::open(dir.join("blocks.log"), PruneConfig::archive()).unwrap();
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
+    let mut last_qc = Vec::new();
     let roots: Vec<Bytes32> = (1..=10u64).map(|i| {
-        let b = make_block(&state);
-        import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store, false).unwrap();
+        let b = make_strict_block(&state, [0x14u8; 32], last_qc.clone());
+        import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+        last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x14u8; 32]);
         assert_eq!(state.height, i);
         compute_state_root(&state)
     }).collect();
@@ -425,21 +513,24 @@ fn full_restart_recovery_end_to_end() {
     let follower_b_state_dir = dir.join("follower_b_state");
 
     let mut source_state = anchored_genesis_state();
+    install_state_validator(&mut source_state, [0x15u8; 32], "source");
     let mut source_mempool = Mempool::default_config();
     let mut source_store = BlockStore::open(&source_log, PruneConfig::archive()).unwrap();
     let source_state_store = StateStore::open(&source_state_dir).unwrap();
 
+    let mut source_last_qc = Vec::new();
     for _ in 0..2u64 {
-        let block = make_block(&source_state);
+        let height = source_state.height + 1;
+        let block = make_strict_block(&source_state, [0x15u8; 32], source_last_qc.clone());
         import_block(
             &block,
             &mut source_state,
             &mut source_mempool,
             &mut source_store,
             &source_state_store,
-            false,
         )
         .unwrap();
+        source_last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x15u8; 32]);
     }
 
     for (follower_log, follower_state_dir) in [
@@ -447,6 +538,7 @@ fn full_restart_recovery_end_to_end() {
         (&follower_b_log, &follower_b_state_dir),
     ] {
         let mut follower_state = anchored_genesis_state();
+        install_state_validator(&mut follower_state, [0x15u8; 32], "source");
         let mut follower_mempool = Mempool::default_config();
         let mut follower_store = BlockStore::open(follower_log, PruneConfig::archive()).unwrap();
         let follower_state_store = StateStore::open(follower_state_dir).unwrap();
@@ -458,7 +550,6 @@ fn full_restart_recovery_end_to_end() {
             &mut follower_mempool,
             &mut follower_store,
             &follower_state_store,
-            false,
         )
         .unwrap();
 
@@ -473,7 +564,6 @@ fn full_restart_recovery_end_to_end() {
             &mut follower_mempool,
             &mut follower_store,
             &follower_state_store,
-            false,
         )
         .unwrap();
         sync.on_block_imported(2);

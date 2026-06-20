@@ -533,7 +533,7 @@ impl ConsensusDriver {
         if self.engine.state.validators.active_count() > 0
             && (block.header.proposer_vrf_output != Bytes32::ZERO
                 || !block.header.proposer_vrf_proof.as_slice().is_empty())
-            && verify_proposer_vrf(&block, &self.engine.state, false).is_err()
+            && verify_proposer_vrf(&block, &self.engine.state).is_err()
         {
             eprintln!(
                 "[vote] rejecting proposal {} at height={} round={} because it does not verify as the elected proposer block",
@@ -1128,6 +1128,10 @@ impl ConsensusDriver {
 mod tests {
     use super::*;
     use crate::NodeConfig;
+    use indra_consensus::{
+        producer::{produce_block, BlockTemplate},
+        proposer::ProposerCandidate,
+    };
     use indra_core::{
         Bytes32, ProtocolVersion, VariableBytes,
         types::block::{BlockHeaderV1, BlockV1},
@@ -1224,6 +1228,43 @@ mod tests {
         (ConsensusDriver::new(engine), dir)
     }
 
+    fn make_strict_block(
+        driver: &ConsensusDriver,
+        proposer_seed: [u8; 32],
+        round: u32,
+        prev_qc_bytes: Vec<u8>,
+    ) -> BlockV1 {
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&driver.engine.state.tip_hash.0));
+        let mut candidates: Vec<_> = driver
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .filter_map(|v| {
+                v.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                    validator_id: v.validator_id,
+                    vrf_pubkey: vrf_pk,
+                    stake: v.stake_spark,
+                })
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| candidate.validator_id.0);
+        let election = indra_consensus::proposer::ProposerElection {
+            epoch_seed,
+            height: driver.engine.state.height + 1,
+            round,
+            candidates,
+        };
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+            epoch_seed: election.epoch_seed,
+            prev_qc_bytes,
+            timestamp: 1_700_000_000 + driver.engine.state.height + 1,
+            polc_round: None,
+        };
+        produce_block(&template, &driver.engine.state, &driver.engine.mempool, &election).unwrap()
+    }
+
     fn election_for_round(
         driver: &ConsensusDriver,
         height: u64,
@@ -1302,7 +1343,7 @@ mod tests {
         let _local = install_active_validator(&mut driver, [0x41u8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block = make_block(&driver.engine.state);
+        let block = make_strict_block(&driver, [0x41u8; 32], 0, vec![]);
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
 
         assert!(actions.iter().any(|a| matches!(a, DriverAction::BroadcastBlock(_))));
@@ -1317,8 +1358,10 @@ mod tests {
         let remote_a = install_active_validator(&mut driver, [0x43u8; 32], "remote-a");
         let remote_b = install_active_validator(&mut driver, [0x44u8; 32], "remote-b");
         driver.refresh_registered_voters();
-
-        let block = make_block(&driver.engine.state);
+        let local_id = driver.engine.validator_id().unwrap();
+        driver.engine.state.tip_hash =
+            pick_tip_hash_for_round_winners(&driver, 1, local_id, local_id);
+        let block = make_strict_block(&driver, [0x42u8; 32], 0, vec![]);
         let value_hash = block.header.value_hash;
 
         let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
@@ -1363,7 +1406,7 @@ mod tests {
         let _local = install_active_validator(&mut driver, [0x45u8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block = make_block(&driver.engine.state);
+        let block = make_strict_block(&driver, [0x45u8; 32], 0, vec![]);
         let value_hash = block.header.value_hash;
         let actions = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9201".parse().unwrap()),
@@ -1449,7 +1492,7 @@ mod tests {
         let _local = install_active_validator(&mut driver, [0x61u8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block = make_block(&driver.engine.state);
+        let block = make_strict_block(&driver, [0x61u8; 32], 0, vec![]);
         let _ = driver.process(DriverEvent::InboundBlock { from: None, block });
 
         let qc_path = driver.engine.config.state_dir().join("last_qc.bin");
@@ -1475,7 +1518,7 @@ mod tests {
             let mut driver = ConsensusDriver::new(engine);
             let _local = install_active_validator(&mut driver, seed, "local");
             driver.refresh_registered_voters();
-            let block = make_block(&driver.engine.state);
+            let block = make_strict_block(&driver, seed, 0, vec![]);
             let _ = driver.process(DriverEvent::InboundBlock { from: None, block });
             assert!(!driver.last_qc_bytes().is_empty());
         }
@@ -1638,7 +1681,7 @@ mod tests {
         let _local = install_active_validator(&mut driver, [0x6Au8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block1 = make_block(&driver.engine.state);
+        let block1 = make_strict_block(&driver, [0x6Au8; 32], 0, vec![]);
         let _ = driver.process(DriverEvent::InboundBlock {
             from: None,
             block: block1,
@@ -1646,7 +1689,7 @@ mod tests {
         let qc_for_height_1 = driver.last_qc_bytes();
         assert!(!qc_for_height_1.is_empty());
 
-        let mut block2 = make_block(&driver.engine.state);
+        let mut block2 = make_strict_block(&driver, [0x6Au8; 32], 0, qc_for_height_1.clone());
         block2.header.quorum_certificate =
             indra_core::VariableBytes::from_slice(&qc_for_height_1).unwrap();
         let _ = driver.process(DriverEvent::InboundBlock {
