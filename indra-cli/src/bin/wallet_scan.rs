@@ -44,7 +44,9 @@ fn main() {
     // Derive classical pubkey
     use indra_crypto::hybrid::ClassicalKeypair;
     let classical = ClassicalKeypair::from_seed(&hybrid_seed);
-    let pubkey_hex = hex::encode(classical.public_key().0);
+    let classical_pk = classical.public_key().0;
+    let address_hex = hex::encode(indra_crypto::sha256(&classical_pk));
+    let pubkey_hex = hex::encode(classical_pk);
 
     println!("Scanning for UTXOs owned by: {}...", &pubkey_hex[..16]);
 
@@ -112,7 +114,7 @@ fn main() {
 
     // Query node for UTXOs
     println!("\nQuerying node for UTXOs...");
-    match query_utxos(&node_url, &pubkey_hex) {
+    match query_utxos(&node_url, &address_hex) {
         Ok(response) => {
             println!("Node response: {}", response);
             let discovered = parse_utxos_json(&response);
