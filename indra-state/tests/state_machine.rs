@@ -15,7 +15,8 @@ use indra_core::{
         },
     },
 };
-use indra_crypto::{commit, prove_range};
+use curve25519_dalek::scalar::Scalar;
+use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, commit, prove_range};
 use indra_state::{
     apply_block, ChainState,
     utxo::UtxoSet,
@@ -26,21 +27,46 @@ const TEST_INPUT_VALUE: u64 = 1_000_000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn make_test_keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
+    let classical = ClassicalKeypair::from_seed(&seed);
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    let keypair = HybridKeypair::new(classical, pq);
+    let public = keypair.public_key();
+    (
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        },
+        keypair,
+    )
+}
+
 fn dummy_sig() -> HybridSignature {
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-        pq_sig:        VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
+        pq_sig: VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
     }
 }
 
-fn dummy_pubkey() -> HybridPubKey {
-    HybridPubKey {
-        classical_pk: Bytes32::ZERO,
-        pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+fn sign_transaction(keypair: &HybridKeypair, chain_id: &str, tx: &TransactionV1) -> HybridSignature {
+    let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+    HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
     }
 }
 
-fn make_output(byte: u8) -> OutputV1 {
+fn derive_fee_blinding(input_blindings: &[[u8; 32]], output_blindings: &[[u8; 32]]) -> [u8; 32] {
+    let input_sum = input_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
+        acc + Scalar::from_bytes_mod_order(*blinding)
+    });
+    let output_sum = output_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
+        acc + Scalar::from_bytes_mod_order(*blinding)
+    });
+    (input_sum - output_sum).to_bytes()
+}
+
+fn make_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
     let value = TEST_INPUT_VALUE + byte as u64;
     let blinding = [byte; 32];
     let commitment = commit(value, &blinding);
@@ -50,20 +76,31 @@ fn make_output(byte: u8) -> OutputV1 {
     OutputV1 {
         value_spark: value,
         commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-        owner_pubkey: dummy_pubkey(),
+        owner_pubkey,
         range_proof:  VariableBytes::from_slice(&proof).unwrap(),
         lock_height:  0,
     }
 }
 
-fn make_tx(utxo_id: Bytes32, input_value: u64, nullifier_byte: u8, out_byte: u8) -> TransactionV1 {
+fn make_tx(
+    state: &ChainState,
+    keypair: &HybridKeypair,
+    owner_pubkey: HybridPubKey,
+    utxo_id: Bytes32,
+    input_value: u64,
+    input_blinding: [u8; 32],
+    nullifier_byte: u8,
+    out_byte: u8,
+) -> TransactionV1 {
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
     let output_value = input_value - fee;
     let blinding = [out_byte; 32];
+    let fee_blinding = derive_fee_blinding(&[input_blinding], &[blinding]);
     let commitment = commit(output_value, &blinding);
+    let fee_commitment = commit(fee, &fee_blinding);
     let mut rng = StdRng::from_seed([out_byte; 32]);
     let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
-    TransactionV1 {
+    let mut tx = TransactionV1 {
         version:             ProtocolVersion::CURRENT,
         signature_module_id: 1,
         inputs:  vec![InputV1 {
@@ -73,15 +110,17 @@ fn make_tx(utxo_id: Bytes32, input_value: u64, nullifier_byte: u8, out_byte: u8)
         outputs: vec![OutputV1 {
             value_spark: output_value,
             commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-            owner_pubkey: dummy_pubkey(),
+            owner_pubkey,
             range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }],
         fee_amount:     fee,
-        fee_blinding:   Bytes32::ZERO,
-        fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
+        fee_blinding:   Bytes32::from(fee_blinding),
+        fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
         signature:      dummy_sig(),
-    }
+    };
+    tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
+    tx
 }
 
 fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
@@ -132,14 +171,24 @@ fn one_hundred_empty_blocks() {
 #[test]
 fn utxo_lifecycle_across_blocks() {
     let mut state = ChainState::new_genesis();
+    let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
 
     // Create a UTXO by inserting it at genesis
-    let output = make_output(0x01);
+    let output = make_output(0x01, owner_pubkey.clone());
     let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
 
     // Block 1: spend that UTXO, create a new one
     let block1_output_value = (TEST_INPUT_VALUE + 0x01u64) - (INITIAL_BASE_FEE_SPARK_PER_KB * 10);
-    let tx = make_tx(utxo_id, TEST_INPUT_VALUE + 0x01u64, 0xAA, 0x02);
+    let tx = make_tx(
+        &state,
+        &keypair,
+        owner_pubkey.clone(),
+        utxo_id,
+        TEST_INPUT_VALUE + 0x01u64,
+        [0x01; 32],
+        0xAA,
+        0x02,
+    );
     let block1 = make_block(&state, vec![tx]);
     apply_block(&mut state, &block1).unwrap();
 
@@ -156,13 +205,17 @@ fn utxo_lifecycle_across_blocks() {
     let new_utxo_id = UtxoSet::compute_utxo_id(&OutputV1 {
         value_spark: block1_output_value,
         commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-        owner_pubkey: dummy_pubkey(),
+        owner_pubkey: owner_pubkey.clone(),
         range_proof: VariableBytes::from_slice(&proof).unwrap(),
         lock_height: 0,
     }, 1, 0, 0);
     let tx2 = make_tx(
+        &state,
+        &keypair,
+        owner_pubkey,
         new_utxo_id,
         block1_output_value,
+        [0x02; 32],
         0xBB,
         0x03,
     );
@@ -232,14 +285,24 @@ fn two_epochs_preserve_supply() {
 #[test]
 fn fees_are_burned() {
     let mut state = ChainState::new_genesis();
+    let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
 
     // Insert a spendable UTXO
-    let output = make_output(0x01);
+    let output = make_output(0x01, owner_pubkey.clone());
     let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
     let supply_before = state.total_supply;
 
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-    let tx = make_tx(utxo_id, TEST_INPUT_VALUE + 0x01u64, 0xCC, 0x02);
+    let tx = make_tx(
+        &state,
+        &keypair,
+        owner_pubkey,
+        utxo_id,
+        TEST_INPUT_VALUE + 0x01u64,
+        [0x01; 32],
+        0xCC,
+        0x02,
+    );
     assert_eq!(tx.fee_amount, fee);
 
     let block = make_block(&state, vec![tx]);

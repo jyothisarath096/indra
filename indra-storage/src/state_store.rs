@@ -219,6 +219,12 @@ fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<Chai
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::{
+        Bytes32, ProtocolVersion, VariableBytes,
+        types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+        types::primitives::MAX_VRF_PROOF_BYTES,
+    };
+    use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -344,6 +350,75 @@ mod tests {
         store.save(&state).unwrap();
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded, state);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_block(state: &ChainState) -> BlockV1 {
+        let mut block = BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion::CURRENT,
+                height: state.height + 1,
+                prev_hash: state.tip_hash,
+                timestamp: 1_700_000_000 + state.height + 1,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: state.base_fee,
+                proposer_round: 0,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::ZERO,
+                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+        };
+
+        let mut projected = state.clone();
+        apply_block(&mut projected, &block).unwrap();
+        block.header.state_root = compute_state_root(&projected);
+        block.header.validator_set_root = compute_validator_set_root(&projected);
+        block.header.value_hash = block.compute_value_hash(projected.total_supply);
+        block
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_next_state_root() {
+        let dir = temp_dir("next_state_root");
+        let store = StateStore::open(&dir).unwrap();
+
+        let mut original = ChainState::new_genesis();
+        for _ in 1u8..=12u8 {
+            let block = make_block(&original);
+            apply_block(&mut original, &block).unwrap();
+        }
+
+        store.save(&original).unwrap();
+        let decoded = store.load_latest().unwrap().unwrap();
+
+        assert_eq!(decoded, original);
+        assert_eq!(compute_state_root(&decoded), compute_state_root(&original));
+        assert_eq!(decoded.utxos.root(), original.utxos.root());
+        assert_eq!(decoded.nullifiers.root(), original.nullifiers.root());
+        assert_eq!(
+            compute_validator_set_root(&decoded),
+            compute_validator_set_root(&original)
+        );
+
+        let next_block = make_block(&original);
+        let mut original_next = original.clone();
+        let mut decoded_next = decoded.clone();
+        apply_block(&mut original_next, &next_block).unwrap();
+        apply_block(&mut decoded_next, &next_block).unwrap();
+
+        assert_eq!(original_next, decoded_next);
+        assert_eq!(
+            compute_state_root(&original_next),
+            compute_state_root(&decoded_next)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

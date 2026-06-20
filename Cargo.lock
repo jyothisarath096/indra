@@ -300,6 +300,7 @@ name = "indra-cli"
 version = "0.1.0"
 dependencies = [
  "bip39",
+ "curve25519-dalek",
  "hex",
  "indra-bulletproofs",
  "indra-consensus",
@@ -316,6 +317,7 @@ dependencies = [
 name = "indra-consensus"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "indra-core",
  "indra-crypto",
  "indra-state",
@@ -410,6 +412,7 @@ dependencies = [
 name = "indra-state"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "hex",
  "indra-core",
  "indra-crypto",

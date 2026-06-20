@@ -34,13 +34,16 @@
 
 use std::collections::HashSet;
 
-use indra_crypto::verify_range;
+use indra_crypto::{
+    PedersenCommitment, PedersenOpening, verify_balance, verify_hybrid,
+    verify_opening, verify_range,
+};
 use indra_core::{
     codec::Encode,
     types::{
         primitives::{
             Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_TX_PER_BLOCK,
-            PROTOCOL_VERSION,
+            PROTOCOL_VERSION, ProtocolVersion,
         },
         block::BlockV1,
         transaction::TransactionV1,
@@ -112,7 +115,13 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
     let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
 
     for tx in &block.transactions {
-        validate_transaction(state, tx, &mut block_nullifiers, block.header.height)?;
+        validate_transaction(
+            state,
+            tx,
+            &state.chain_id,
+            &mut block_nullifiers,
+            block.header.height,
+        )?;
     }
 
     // ── Phase 3: State mutation (all validation passed) ───────────────────
@@ -208,14 +217,26 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
 fn validate_transaction(
     state: &ChainState,
     tx: &TransactionV1,
+    chain_id: &str,
     block_nullifiers: &mut HashSet<Bytes32>,
     current_height: u64,
 ) -> StateResult<()> {
     if tx.inputs.is_empty()  { return Err(StateError::ZeroInputs);  }
     if tx.outputs.is_empty() { return Err(StateError::ZeroOutputs); }
+    if tx.version != ProtocolVersion::CURRENT {
+        return Err(StateError::UnsupportedTxVersion {
+            version: tx.version.0,
+        });
+    }
+    if tx.signature_module_id != 1 {
+        return Err(StateError::UnsupportedSignatureModule {
+            module_id: tx.signature_module_id,
+        });
+    }
 
     let mut total_input_value = 0u64;
     let mut owner_pubkey: Option<indra_core::types::crypto::HybridPubKey> = None;
+    let mut input_commitments = Vec::with_capacity(tx.inputs.len());
 
     for input in &tx.inputs {
         // Duplicate nullifier within this transaction
@@ -231,6 +252,7 @@ fn validate_transaction(
         // Referenced UTXO must exist
         let entry = state.utxos.get(&input.utxo_id)
             .ok_or(StateError::UnknownUtxo)?;
+        input_commitments.push(PedersenCommitment(entry.output.commitment.compressed_point.0));
 
         total_input_value = total_input_value.saturating_add(entry.output.value_spark);
         match &owner_pubkey {
@@ -253,6 +275,28 @@ fn validate_transaction(
 
         block_nullifiers.insert(input.nullifier);
     }
+
+    let owner_pubkey = owner_pubkey.ok_or(StateError::UnknownUtxo)?;
+    let crypto_pk = owner_pubkey
+        .to_crypto_pubkey()
+        .map_err(|reason| StateError::SignatureInvalid { reason })?;
+    let crypto_sig = tx.signature
+        .to_crypto_sig()
+        .map_err(|reason| StateError::SignatureInvalid { reason })?;
+    let signing_bytes = tx.signing_bytes(chain_id);
+    verify_hybrid(&signing_bytes, &crypto_sig, &crypto_pk)
+        .map_err(|e| StateError::SignatureInvalid {
+            reason: e.to_string(),
+        })?;
+
+    verify_opening(
+        &PedersenCommitment(tx.fee_commitment.compressed_point.0),
+        &PedersenOpening {
+            value: tx.fee_amount,
+            blinding: tx.fee_blinding.0,
+        },
+    )
+    .map_err(|_| StateError::FeeCommitmentMismatch)?;
 
     // Fee check: fee_amount must cover base_fee × weight
     let weight_kb = {
@@ -277,17 +321,26 @@ fn validate_transaction(
         });
     }
 
+    let mut output_commitments = Vec::with_capacity(tx.outputs.len());
     for (idx, output) in tx.outputs.iter().enumerate() {
         if output.value_spark < indra_core::types::primitives::DUST_LIMIT_SPARK {
             return Err(StateError::InvariantViolation {
                 message: "transaction output below dust limit",
             });
         }
+        output_commitments.push(PedersenCommitment(output.commitment.compressed_point.0));
         let commitment_bytes = output.commitment.compressed_point.0;
         let proof_bytes = output.range_proof.as_slice();
         verify_range(&commitment_bytes, proof_bytes)
             .map_err(|_| StateError::RangeProofInvalid { index: idx })?;
     }
+
+    verify_balance(
+        &input_commitments,
+        &output_commitments,
+        &PedersenCommitment(tx.fee_commitment.compressed_point.0),
+    )
+    .map_err(|_| StateError::CommitmentBalanceInvalid)?;
 
     Ok(())
 }
@@ -327,7 +380,10 @@ fn apply_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_crypto::{commit, prove_range};
+    use curve25519_dalek::scalar::Scalar;
+    use indra_crypto::{
+        ClassicalKeypair, HybridKeypair, PqKeypair, commit, prove_range,
+    };
     use indra_core::{
         Bytes32, CommitmentV1, HybridPubKey, HybridSignature, VariableBytes,
         ProtocolVersion,
@@ -346,21 +402,48 @@ mod tests {
 
     // ── Test helpers ──────────────────────────────────────────────────────
 
+    fn make_test_keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let keypair = HybridKeypair::new(classical, pq);
+        let public = keypair.public_key();
+        let wire = HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        };
+        (wire, keypair)
+    }
+
     fn dummy_sig() -> HybridSignature {
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
         }
     }
 
-    fn dummy_pubkey() -> HybridPubKey {
-        HybridPubKey {
-            classical_pk: Bytes32::ZERO,
-            pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+    fn sign_transaction(
+        keypair: &HybridKeypair,
+        chain_id: &str,
+        tx: &TransactionV1,
+    ) -> HybridSignature {
+        let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
         }
     }
 
-    fn dummy_output(byte: u8) -> OutputV1 {
+    fn derive_fee_blinding(input_blindings: &[[u8; 32]], output_blindings: &[[u8; 32]]) -> [u8; 32] {
+        let input_sum = input_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
+            acc + Scalar::from_bytes_mod_order(*blinding)
+        });
+        let output_sum = output_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
+            acc + Scalar::from_bytes_mod_order(*blinding)
+        });
+        (input_sum - output_sum).to_bytes()
+    }
+
+    fn dummy_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
         let value = TEST_INPUT_VALUE + byte as u64;
         let blinding = [byte; 32];
         let commitment = commit(value, &blinding);
@@ -370,43 +453,56 @@ mod tests {
         OutputV1 {
             value_spark: value,
             commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-            owner_pubkey: dummy_pubkey(),
+            owner_pubkey,
             range_proof:  VariableBytes::from_slice(&proof).unwrap(),
             lock_height:  0,
         }
     }
 
     /// Build a state that has one pre-existing UTXO ready to be spent.
-    fn state_with_utxo() -> (ChainState, Bytes32) {
+    fn state_with_utxo() -> (ChainState, Bytes32, HybridKeypair, [u8; 32], u64) {
         let mut state = ChainState::new_genesis();
-        let output = dummy_output(0x01);
+        let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
+        let output = dummy_output(0x01, owner_pubkey);
         let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
-        (state, utxo_id)
+        (state, utxo_id, keypair, [0x01; 32], TEST_INPUT_VALUE + 1)
     }
 
-    fn make_tx(utxo_id: Bytes32, nullifier: Bytes32) -> TransactionV1 {
+    fn make_tx(
+        state: &ChainState,
+        keypair: &HybridKeypair,
+        utxo_id: Bytes32,
+        input_value: u64,
+        input_blinding: [u8; 32],
+        nullifier: Bytes32,
+    ) -> TransactionV1 {
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-        let output_value = TEST_INPUT_VALUE + 1 - fee;
+        let output_value = input_value - fee;
         let blinding = [0x02u8; 32];
+        let fee_blinding = derive_fee_blinding(&[input_blinding], &[blinding]);
         let commitment = commit(output_value, &blinding);
+        let fee_commitment = commit(fee, &fee_blinding);
         let mut rng = StdRng::from_seed([0x02u8; 32]);
         let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
-        TransactionV1 {
+        let (owner_pubkey, _) = make_test_keypair([0x11; 32]);
+        let mut tx = TransactionV1 {
             version:             ProtocolVersion::CURRENT,
             signature_module_id: 1,
             inputs:  vec![InputV1 { utxo_id, nullifier }],
             outputs: vec![OutputV1 {
                 value_spark: output_value,
                 commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-                owner_pubkey: dummy_pubkey(),
+                owner_pubkey,
                 range_proof: VariableBytes::from_slice(&proof).unwrap(),
                 lock_height: 0,
             }],
             fee_amount:     fee,
-            fee_blinding:   Bytes32::ZERO,
-            fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
+            fee_blinding:   Bytes32::from(fee_blinding),
+            fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
             signature:      dummy_sig(),
-        }
+        };
+        tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
+        tx
     }
 
     fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
@@ -455,9 +551,9 @@ mod tests {
 
     #[test]
     fn apply_block_with_tx_spends_utxo() {
-        let (mut state, utxo_id) = state_with_utxo();
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let nullifier = Bytes32::from([0x99u8; 32]);
-        let tx = make_tx(utxo_id, nullifier);
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier);
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block).unwrap();
 
@@ -471,18 +567,21 @@ mod tests {
 
     #[test]
     fn double_spend_rejected() {
-        let (mut state, utxo_id) = state_with_utxo();
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let nullifier = Bytes32::from([0xAAu8; 32]);
-        let tx = make_tx(utxo_id, nullifier);
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier);
         let block1 = make_block(&state, vec![tx.clone()]);
         apply_block(&mut state, &block1).unwrap();
 
         // Re-insert the output so the utxo_id exists again
         // but the nullifier is already spent
-        let output = dummy_output(0x01);
+        let output = dummy_output(0x01, make_test_keypair([0x11; 32]).0);
         state.utxos.insert(output, 0, 0, 0).unwrap();
 
-        let block2 = make_block(&state, vec![make_tx(utxo_id, nullifier)]);
+        let block2 = make_block(
+            &state,
+            vec![make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier)],
+        );
         assert_eq!(apply_block(&mut state, &block2), Err(StateError::DoubleSpend));
     }
 
@@ -528,16 +627,29 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let fake_utxo = Bytes32::from([0xDEu8; 32]);
         let nullifier  = Bytes32::from([0xADu8; 32]);
-        let tx = make_tx(fake_utxo, nullifier);
+        let (_, keypair) = make_test_keypair([0x22; 32]);
+        let tx = make_tx(&state, &keypair, fake_utxo, TEST_INPUT_VALUE + 1, [0x01; 32], nullifier);
         let block = make_block(&state, vec![tx]);
         assert_eq!(apply_block(&mut state, &block), Err(StateError::UnknownUtxo));
     }
 
     #[test]
     fn fee_too_low_rejected() {
-        let (mut state, utxo_id) = state_with_utxo();
-        let mut tx = make_tx(utxo_id, Bytes32::from([0x01u8; 32]));
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x01u8; 32]),
+        );
         tx.fee_amount = 0; // too low
+        let fee_commitment = commit(tx.fee_amount, &tx.fee_blinding.0);
+        tx.fee_commitment = CommitmentV1 {
+            compressed_point: Bytes32::from(fee_commitment.0),
+        };
+        tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
             apply_block(&mut state, &block),
@@ -547,10 +659,17 @@ mod tests {
 
     #[test]
     fn fee_burns_supply() {
-        let (mut state, utxo_id) = state_with_utxo();
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let initial_supply = state.total_supply;
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-        let tx = make_tx(utxo_id, Bytes32::from([0x11u8; 32]));
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x11u8; 32]),
+        );
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block).unwrap();
         assert_eq!(state.total_supply, initial_supply - (fee / 2));
@@ -576,11 +695,11 @@ mod tests {
 
     #[test]
     fn consecutive_blocks_chain_correctly() {
-        let (mut state, utxo_id) = state_with_utxo();
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
 
         // Block 1: spend the UTXO
         let nullifier = Bytes32::from([0x55u8; 32]);
-        let tx = make_tx(utxo_id, nullifier);
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier);
         let block1 = make_block(&state, vec![tx]);
         apply_block(&mut state, &block1).unwrap();
         assert_eq!(state.height, 1);
@@ -594,15 +713,181 @@ mod tests {
     #[test]
     fn locked_utxo_rejected_before_unlock() {
         let mut state = ChainState::new_genesis();
-        let mut output = dummy_output(0x01);
+        let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
+        let mut output = dummy_output(0x01, owner_pubkey);
         output.lock_height = 100; // locked until height 100
         let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
 
-        let tx = make_tx(utxo_id, Bytes32::from([0x01u8; 32]));
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            TEST_INPUT_VALUE + 1,
+            [0x01; 32],
+            Bytes32::from([0x01u8; 32]),
+        );
         let block = make_block(&state, vec![tx]); // height will be 1 < 100
         assert!(matches!(
             apply_block(&mut state, &block),
             Err(StateError::OutputLocked { .. })
         ));
+    }
+
+    #[test]
+    fn valid_signature_accepted() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x44; 32]),
+        );
+        let block = make_block(&state, vec![tx]);
+        apply_block(&mut state, &block).unwrap();
+        assert_eq!(state.height, 1);
+    }
+
+    #[test]
+    fn wrong_signature_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x45; 32]),
+        );
+        let (_, wrong_keypair) = make_test_keypair([0x33; 32]);
+        tx.signature = sign_transaction(&wrong_keypair, &state.chain_id, &tx);
+        let block = make_block(&state, vec![tx]);
+        assert!(matches!(
+            apply_block(&mut state, &block),
+            Err(StateError::SignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn zeroed_signature_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x46; 32]),
+        );
+        tx.signature = dummy_sig();
+        let block = make_block(&state, vec![tx]);
+        assert!(matches!(
+            apply_block(&mut state, &block),
+            Err(StateError::SignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn wrong_chain_id_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x47; 32]),
+        );
+        tx.signature = sign_transaction(&keypair, "indra-mainnet-1", &tx);
+        let block = make_block(&state, vec![tx]);
+        assert!(matches!(
+            apply_block(&mut state, &block),
+            Err(StateError::SignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn wrong_version_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x48; 32]),
+        );
+        tx.version = ProtocolVersion(99);
+        let block = make_block(&state, vec![tx]);
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::UnsupportedTxVersion { version: 99 })
+        );
+    }
+
+    #[test]
+    fn wrong_module_id_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x49; 32]),
+        );
+        tx.signature_module_id = 7;
+        let block = make_block(&state, vec![tx]);
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::UnsupportedSignatureModule { module_id: 7 })
+        );
+    }
+
+    #[test]
+    fn fee_commitment_mismatch_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x4A; 32]),
+        );
+        tx.fee_commitment = CommitmentV1 {
+            compressed_point: Bytes32::from([0x77; 32]),
+        };
+        tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
+        let block = make_block(&state, vec![tx]);
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::FeeCommitmentMismatch)
+        );
+    }
+
+    #[test]
+    fn commitment_balance_mismatch_rejected() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x4B; 32]),
+        );
+        tx.fee_blinding = Bytes32::from([0x09; 32]);
+        let fee_commitment = commit(tx.fee_amount, &tx.fee_blinding.0);
+        tx.fee_commitment = CommitmentV1 {
+            compressed_point: Bytes32::from(fee_commitment.0),
+        };
+        tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
+        let block = make_block(&state, vec![tx]);
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::CommitmentBalanceInvalid)
+        );
     }
 }

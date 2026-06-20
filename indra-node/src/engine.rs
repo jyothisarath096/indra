@@ -691,6 +691,23 @@ mod tests {
     }
 
     #[test]
+    fn chain_id_survives_snapshot_restart() {
+        let dir = temp_dir("chain_id_snapshot");
+        let config = NodeConfig::local_test(dir.clone());
+
+        {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            engine.state.chain_id = "indra-custom-testnet".to_string();
+            engine.state_store.save(&engine.state).unwrap();
+        }
+
+        let restarted = NodeEngine::init(config).unwrap();
+        assert_eq!(restarted.state.chain_id, "indra-custom-testnet");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn startup_fails_on_snapshot_replay_gap() {
         let dir = temp_dir("snapshot_gap");
         let mut config = NodeConfig::local_test(dir.clone());

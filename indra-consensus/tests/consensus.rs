@@ -10,9 +10,9 @@ use indra_core::{
         vote::VoteStep,
     },
 };
+use curve25519_dalek::scalar::Scalar;
 use indra_crypto::{
-    commit, prove_range,
-    hybrid::HybridKeypair,
+    ClassicalKeypair, HybridKeypair, PqKeypair, commit, prove_range,
     VrfKeypair,
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -27,7 +27,30 @@ use indra_consensus::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn dummy_output(nonce: u8, value_spark: u64) -> OutputV1 {
+fn make_user_keypair(seed: u8) -> (HybridPubKey, HybridKeypair) {
+    let seed_bytes = [seed; 32];
+    let classical = ClassicalKeypair::from_seed(&seed_bytes);
+    let pq = PqKeypair::from_seed(&seed_bytes).unwrap();
+    let keypair = HybridKeypair::new(classical, pq);
+    let public = keypair.public_key();
+    (
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        },
+        keypair,
+    )
+}
+
+fn derive_fee_blinding(input_blinding: [u8; 32], output_blinding: [u8; 32]) -> [u8; 32] {
+    (
+        Scalar::from_bytes_mod_order(input_blinding)
+            - Scalar::from_bytes_mod_order(output_blinding)
+    )
+    .to_bytes()
+}
+
+fn dummy_output(nonce: u8, value_spark: u64, owner_pubkey: HybridPubKey) -> OutputV1 {
     let blinding = [nonce; 32];
     let commitment = commit(value_spark, &blinding);
     let mut rng = StdRng::from_seed([nonce; 32]);
@@ -35,33 +58,46 @@ fn dummy_output(nonce: u8, value_spark: u64) -> OutputV1 {
     OutputV1 {
         value_spark,
         commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-        owner_pubkey: HybridPubKey {
-            classical_pk: Bytes32::ZERO,
-            pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-        },
+        owner_pubkey,
         range_proof:  VariableBytes::from_slice(&proof).unwrap(),
         lock_height:  0,
     }
 }
 
-fn dummy_tx(utxo_id: Bytes32, fee: u64, nonce: u8) -> TransactionV1 {
+fn dummy_tx(
+    chain_id: &str,
+    keypair: &HybridKeypair,
+    owner_pubkey: HybridPubKey,
+    utxo_id: Bytes32,
+    fee: u64,
+    nonce: u8,
+) -> TransactionV1 {
     let output_value = 1_100_000u64.saturating_sub(fee);
-    TransactionV1 {
+    let output_blinding = [nonce; 32];
+    let fee_blinding = derive_fee_blinding([nonce; 32], output_blinding);
+    let fee_commitment = commit(fee, &fee_blinding);
+    let mut tx = TransactionV1 {
         version: ProtocolVersion::CURRENT,
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id,
             nullifier: Bytes32::from([nonce; 32]),
         }],
-        outputs: vec![dummy_output(nonce, output_value)],
+        outputs: vec![dummy_output(nonce, output_value, owner_pubkey)],
         fee_amount:     fee,
-        fee_blinding:   Bytes32::ZERO,
-        fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
+        fee_blinding:   Bytes32::from(fee_blinding),
+        fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            pq_sig:        VariableBytes::from_slice(&[0u8; 2420]).unwrap(),
         },
-    }
+    };
+    let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+    tx.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+    };
+    tx
 }
 
 struct TestValidator {
@@ -107,11 +143,16 @@ impl TestValidator {
 fn mempool_to_block_pipeline() {
     let mut state = ChainState::new_genesis();
     let mut mempool = Mempool::default_config();
+    let (owner_pubkey, owner_keypair) = make_user_keypair(0x55);
 
     // Seed spendable UTXOs, then submit some transactions that consume them.
     for i in 1..=5u8 {
-        let utxo_id = state.utxos.insert(dummy_output(i, 1_100_000), 0, 0, i as u32).unwrap();
-        mempool.submit(dummy_tx(utxo_id, 10_000 * i as u64, i), state.base_fee, state.height).unwrap();
+        let utxo_id = state.utxos.insert(dummy_output(i, 1_100_000, owner_pubkey.clone()), 0, 0, i as u32).unwrap();
+        mempool.submit(
+            dummy_tx(&state.chain_id, &owner_keypair, owner_pubkey.clone(), utxo_id, 10_000 * i as u64, i),
+            state.base_fee,
+            state.height,
+        ).unwrap();
     }
     assert_eq!(mempool.len(), 5);
 
@@ -193,11 +234,20 @@ fn full_consensus_round() {
 fn age_eligible_txs_included_first() {
     let state = ChainState::new_genesis();
     let mut mempool = Mempool::default_config();
+    let (owner_pubkey, owner_keypair) = make_user_keypair(0x66);
 
     // Old tx (age-eligible) with low fee
-    mempool.submit(dummy_tx(Bytes32::from([0x01; 32]), 1_000, 0x01), state.base_fee, 1).unwrap();
+    mempool.submit(
+        dummy_tx(&state.chain_id, &owner_keypair, owner_pubkey.clone(), Bytes32::from([0x01; 32]), 1_000, 0x01),
+        state.base_fee,
+        1,
+    ).unwrap();
     // New tx with high fee
-    mempool.submit(dummy_tx(Bytes32::from([0x02; 32]), 999_000, 0x02), state.base_fee, 100).unwrap();
+    mempool.submit(
+        dummy_tx(&state.chain_id, &owner_keypair, owner_pubkey, Bytes32::from([0x02; 32]), 999_000, 0x02),
+        state.base_fee,
+        100,
+    ).unwrap();
 
     // At height 51+ the first tx is age-eligible
     let selected = mempool.select_for_block(

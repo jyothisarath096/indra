@@ -8,8 +8,11 @@ use indra_core::error::IndraResult;
 
 use indra_core::types::primitives::{
     Bytes32,
+    DEFAULT_CHAIN_ID,
     GENESIS_SUPPLY_SPARK,
     INITIAL_BASE_FEE_SPARK_PER_KB,
+    MAX_CHAIN_ID_BYTES,
+    VariableBytes,
 };
 
 use crate::{
@@ -25,6 +28,9 @@ use crate::{
 /// Phase 5) will be a cryptographic commitment to this entire structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainState {
+    /// Chain identifier loaded from genesis and included in consensus-visible state.
+    pub chain_id: String,
+
     /// Height of the most recently applied block (0 = genesis, before block 1).
     pub height: u64,
 
@@ -63,6 +69,10 @@ pub struct ChainState {
 
 impl Encode for ChainState {
     fn encode(&self, buf: &mut Vec<u8>) {
+        // Included: transaction signing and state-root computation depend on the configured chain.
+        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(self.chain_id.as_bytes())
+            .unwrap_or_default()
+            .encode(buf);
         // Included: the applied height determines the next valid block height.
         self.height.encode(buf);
         // Included: the next block must chain to the exact committed tip hash.
@@ -90,7 +100,10 @@ impl Encode for ChainState {
     }
 
     fn encoded_len(&self) -> usize {
-        self.height.encoded_len()
+        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(self.chain_id.as_bytes())
+            .unwrap_or_default()
+            .encoded_len()
+            + self.height.encoded_len()
             + self.tip_hash.encoded_len()
             + self.base_fee.encoded_len()
             + self.total_supply.encoded_len()
@@ -106,7 +119,10 @@ impl Encode for ChainState {
 
 impl Decode for ChainState {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
         Ok(Self {
+            chain_id: String::from_utf8(chain_id_bytes.as_slice().to_vec())
+                .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string()),
             height: u64::decode(r)?,
             tip_hash: Bytes32::decode(r)?,
             base_fee: u64::decode(r)?,
@@ -128,6 +144,7 @@ impl ChainState {
     /// This is the canonical starting point for every INDRA node.
     pub fn new_genesis() -> Self {
         Self {
+            chain_id:         DEFAULT_CHAIN_ID.to_string(),
             height:           0,
             tip_hash:         Bytes32::ZERO,
             base_fee:         INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -164,6 +181,7 @@ mod tests {
     fn genesis_state_is_correct() {
         let state = ChainState::new_genesis();
         assert_eq!(state.height, 0);
+        assert_eq!(state.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(state.tip_hash, Bytes32::ZERO);
         assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
         assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);

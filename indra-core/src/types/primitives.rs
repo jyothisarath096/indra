@@ -110,6 +110,9 @@ pub const MAX_PQ_SIG_BYTES: usize = 2_500;
 /// Maximum Dilithium2 public key size (bytes).
 pub const MAX_PQ_PK_BYTES: usize = 1_400;
 
+/// Maximum length of a chain ID string in bytes.
+pub const MAX_CHAIN_ID_BYTES: usize = 64;
+
 /// Maximum VRF proof size (bytes).
 pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
 
@@ -123,6 +126,9 @@ pub const MAX_GOV_PAYLOAD_BYTES: usize = 4_096;
 
 /// Genesis supply in INDRA (human-readable unit).
 pub const GENESIS_SUPPLY_INDRA: u64 = 1_000_000_000;
+
+/// Default testnet chain ID — matches genesis.toml.example.
+pub const DEFAULT_CHAIN_ID: &str = "indra-testnet-1";
 
 /// Spark per INDRA — 8 decimal places (matches Bitcoin's satoshi model).
 pub const SPARK_PER_INDRA: u64 = 100_000_000;

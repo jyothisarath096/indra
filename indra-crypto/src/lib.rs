@@ -36,4 +36,5 @@ pub use hybrid::{
 pub use bls::{BlsKeypair, BlsPublicKey, BlsSignature, BlsAggregateSignature, aggregate_signatures, verify_aggregate};
 pub use pedersen::{PedersenCommitment, PedersenOpening, commit, verify_opening};
 pub use commitment::verify_balance;
+pub use constants::{CLASSICAL_SIG_BYTES, PQ_PK_BYTES, PQ_SIG_BYTES};
 pub use vrf::{VrfKeypair, VrfOutput, VrfProof, vrf_prove, vrf_verify};

@@ -40,6 +40,27 @@ impl Decode for HybridSignature {
     }
 }
 
+impl HybridSignature {
+    /// Convert the wire signature into the crypto-layer representation.
+    pub fn to_crypto_sig(&self) -> Result<indra_crypto::HybridSignature, String> {
+        use indra_crypto::{ClassicalSignature, HybridSignature as CryptoSig, PqSignature};
+
+        let classical_arr: [u8; 64] = self.classical_sig.as_slice()
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "classical signature must be 64 bytes, got {}",
+                    self.classical_sig.len()
+                )
+            })?;
+
+        Ok(CryptoSig {
+            classical: ClassicalSignature(classical_arr),
+            pq: PqSignature(self.pq_sig.as_slice().to_vec()),
+        })
+    }
+}
+
 /// Hybrid public key on the wire: Ed25519 + Dilithium2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridPubKey {
@@ -62,6 +83,18 @@ impl Decode for HybridPubKey {
         Ok(Self {
             classical_pk: Bytes32::decode(r)?,
             pq_pk:        VariableBytes::decode(r)?,
+        })
+    }
+}
+
+impl HybridPubKey {
+    /// Convert the wire public key into the crypto-layer representation.
+    pub fn to_crypto_pubkey(&self) -> Result<indra_crypto::HybridPublicKey, String> {
+        use indra_crypto::{ClassicalPublicKey, HybridPublicKey as CryptoPk, PqPublicKey};
+
+        Ok(CryptoPk {
+            classical: ClassicalPublicKey(self.classical_pk.0),
+            pq: PqPublicKey(self.pq_pk.as_slice().to_vec()),
         })
     }
 }

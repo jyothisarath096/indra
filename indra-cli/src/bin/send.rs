@@ -24,6 +24,9 @@ fn main() {
     let amount_str  = get("--amount").unwrap_or_else(|| { eprintln!("Error: --amount required"); std::process::exit(1); });
     let fee_str     = get("--fee").unwrap_or_else(|| "0.0001".to_string());
     let node_url    = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let chain_id    = get("--chain-id").unwrap_or_else(|| {
+        indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string()
+    });
 
     // Parse amounts (accept INDRA as decimal, convert to Spark)
     let amount_indra: f64 = amount_str.parse().unwrap_or_else(|_| {
@@ -88,6 +91,7 @@ fn main() {
 
     // Build transaction
     let params = indra_cli::tx_builder::TxParams {
+        chain_id: &chain_id,
         recipient_pubkey_hex: &to,
         amount_spark,
         fee_spark,

@@ -92,6 +92,27 @@ pub enum StateError {
     #[error("transaction contains duplicate nullifiers")]
     DuplicateNullifier,
 
+    /// Transaction signature verification failed.
+    #[error("transaction signature invalid: {reason}")]
+    SignatureInvalid {
+        /// Specific reason the signature could not be verified.
+        reason: String,
+    },
+
+    /// Transaction version is not supported by this state machine.
+    #[error("transaction version {version} not supported")]
+    UnsupportedTxVersion {
+        /// Unsupported version value.
+        version: u16,
+    },
+
+    /// Transaction declared an unsupported signature module.
+    #[error("unsupported signature module {module_id}")]
+    UnsupportedSignatureModule {
+        /// The unsupported signature module ID.
+        module_id: u16,
+    },
+
     /// A block contains the same transaction twice.
     #[error("block contains duplicate transaction")]
     DuplicateTransaction,
@@ -118,6 +139,22 @@ pub enum StateError {
         /// Output index within the transaction.
         index: usize,
     },
+
+    /// The public fee commitment does not match the fee amount and opening.
+    #[error("fee commitment mismatch")]
+    FeeCommitmentMismatch,
+
+    /// The transaction nullifier does not match the expected derivation.
+    #[error("nullifier derivation invalid")]
+    NullifierInvalid,
+
+    /// An output commitment failed validation.
+    #[error("output commitment invalid")]
+    CommitmentInvalid,
+
+    /// Confidential commitments do not balance.
+    #[error("commitment balance invalid")]
+    CommitmentBalanceInvalid,
 
     // ── State integrity errors ─────────────────────────────────────────────
 

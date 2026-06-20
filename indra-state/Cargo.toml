@@ -11,6 +11,7 @@ hex.workspace = true
 indra-core   = { path = "../indra-core" }
 indra-crypto = { path = "../indra-crypto" }
 thiserror.workspace = true
+curve25519-dalek.workspace = true
 
 [dev-dependencies]
 indra-core = { path = "../indra-core" }

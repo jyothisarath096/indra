@@ -18,6 +18,7 @@ hex.workspace = true
 bip39.workspace = true
 rand.workspace = true
 indra-bulletproofs = { path = "../indra-bulletproofs" }
+curve25519-dalek.workspace = true
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }

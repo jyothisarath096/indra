@@ -14,7 +14,8 @@ use crate::{
     types::{
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes,
-            DUST_LIMIT_SPARK, MAX_INPUTS, MAX_OUTPUTS, MAX_RANGE_PROOF_BYTES,
+            DUST_LIMIT_SPARK, MAX_CHAIN_ID_BYTES, MAX_INPUTS, MAX_OUTPUTS,
+            MAX_RANGE_PROOF_BYTES,
         },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     },
@@ -172,8 +173,11 @@ impl TransactionV1 {
     }
 
     /// Canonical bytes covered by the transaction signature.
-    pub fn signing_bytes(&self) -> Vec<u8> {
+    pub fn signing_bytes(&self, chain_id: &str) -> Vec<u8> {
         let mut buf = Vec::new();
+        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(chain_id.as_bytes())
+            .unwrap_or_default()
+            .encode(&mut buf);
         self.version.encode(&mut buf);
         self.signature_module_id.encode(&mut buf);
         encode_list(&self.inputs, &mut buf);

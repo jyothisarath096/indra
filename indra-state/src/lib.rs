@@ -9,9 +9,9 @@
 //! protocol: everything else (networking, storage, consensus) exists to
 //! feed blocks into this function.
 //!
-//! ## What this crate does NOT do (yet)
+//! ## What this crate does NOT do
 //!
-//! - Cryptographic verification (signatures, range proofs, VRF) — Phase 3
+//! - VRF / proposer-election verification (handled by block import and consensus layers)
 //! - Disk persistence — Phase 5
 //! - P2P networking — Phase 4
 //!

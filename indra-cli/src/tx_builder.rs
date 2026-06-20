@@ -13,12 +13,14 @@ use indra_core::{
     codec::Encode,
     types::{
         primitives::{
-            Bytes32, MAX_RANGE_PROOF_BYTES, ProtocolVersion, VariableBytes,
+            Bytes32, MAX_RANGE_PROOF_BYTES, ProtocolVersion,
+            VariableBytes,
         },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
+use curve25519_dalek::scalar::Scalar;
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     pedersen::commit,
@@ -40,6 +42,8 @@ pub const DUST_LIMIT_SPARK: u64 = 100_000;
 
 /// Parameters for building a transaction.
 pub struct TxParams<'a> {
+    /// Chain identifier used in transaction signing.
+    pub chain_id: &'a str,
     /// Recipient's hybrid public key (hex-encoded).
     pub recipient_pubkey_hex: &'a str,
     /// Amount to send in Spark.
@@ -123,9 +127,16 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         None
     };
 
-    let mut fee_blinding_buf = [0u8; 32];
-    rng.fill_bytes(&mut fee_blinding_buf);
-    let fee_blinding = fee_blinding_buf;
+    let input_blinding_sum = selected.iter().fold(Scalar::ZERO, |acc, entry| {
+        acc + Scalar::from_bytes_mod_order(entry.blinding)
+    });
+    let recipient_blinding_scalar = Scalar::from_bytes_mod_order(recipient_blinding);
+    let change_blinding_scalar = change_blinding
+        .map(Scalar::from_bytes_mod_order)
+        .unwrap_or(Scalar::ZERO);
+    let fee_blinding = (
+        input_blinding_sum - recipient_blinding_scalar - change_blinding_scalar
+    ).to_bytes();
 
     // 6. Build outputs with Pedersen commitments + range proofs
     let mut outputs = Vec::new();
@@ -185,7 +196,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     };
 
     // 9. Sign: compute tx hash (all fields except signature), then sign
-    let tx_bytes_unsigned = tx.signing_bytes();
+    let tx_bytes_unsigned = tx.signing_bytes(params.chain_id);
 
     let classical = ClassicalKeypair::from_seed(&params.hybrid_seed);
     let pq = PqKeypair::from_bytes(
@@ -265,11 +276,12 @@ fn dummy_signature() -> CliResult<HybridSignature> {
     })
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wallet::Wallet;
-    use indra_core::types::primitives::Bytes32;
+    use indra_core::types::primitives::{Bytes32, DEFAULT_CHAIN_ID};
 
     fn make_wallet_with_funds() -> (Wallet, [u8; 32], Vec<u8>, HybridPubKey) {
         let seed = [0x42u8; 32];
@@ -296,6 +308,7 @@ mod tests {
         let recipient_hex = hex::encode(spk.classical_pk.0);
 
         let params = TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
@@ -318,6 +331,7 @@ mod tests {
         let recipient_hex = hex::encode(spk.classical_pk.0);
 
         let params = TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 100_000_000,
             fee_spark: MIN_FEE_SPARK,
@@ -336,6 +350,7 @@ mod tests {
         let recipient_hex = hex::encode(spk.classical_pk.0);
 
         let params = TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
             recipient_pubkey_hex: &recipient_hex,
             amount_spark: 1,
             fee_spark: MIN_FEE_SPARK,

@@ -26,6 +26,7 @@ pub fn build(
 ) -> Result<BuiltTxOwned, IndraError> {
     let recipient_pubkey_hex = hex::encode(recipient_classical_pk);
     let params = TxParams {
+        chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
         recipient_pubkey_hex: &recipient_pubkey_hex,
         amount_spark,
         fee_spark,

@@ -9,7 +9,10 @@
 //! circular dependency: block hashes include `state_root`, and post-state
 //! `tip_hash` becomes that same block hash after commit.
 
-use indra_core::types::primitives::Bytes32;
+use indra_core::{
+    codec::Encode,
+    types::primitives::{Bytes32, MAX_CHAIN_ID_BYTES, VariableBytes},
+};
 use indra_crypto::sha256;
 
 use crate::ChainState;
@@ -20,7 +23,10 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
     let nullifier_root = state.nullifiers.root();
     let validator_root = compute_validator_set_root(state);
 
-    let mut metadata = Vec::with_capacity(48);
+    let chain_id = VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
+        .unwrap_or_default();
+    let mut metadata = Vec::with_capacity(48 + chain_id.encoded_len());
+    chain_id.encode(&mut metadata);
     metadata.extend_from_slice(&state.height.to_le_bytes());
     metadata.extend_from_slice(&state.total_supply.to_le_bytes());
     metadata.extend_from_slice(&state.base_fee.to_le_bytes());
@@ -182,5 +188,15 @@ mod tests {
     fn validator_root_empty_is_zero() {
         let state = ChainState::new_genesis();
         assert_eq!(compute_validator_set_root(&state), Bytes32::ZERO);
+    }
+
+    #[test]
+    fn chain_id_changes_state_root() {
+        let mut a = ChainState::new_genesis();
+        let mut b = ChainState::new_genesis();
+        b.chain_id = "indra-mainnet-1".to_string();
+        assert_ne!(compute_state_root(&a), compute_state_root(&b));
+        a.chain_id = "indra-mainnet-1".to_string();
+        assert_eq!(compute_state_root(&a), compute_state_root(&b));
     }
 }

@@ -97,6 +97,21 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         }
     };
 
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "chain_id" {
+                state.chain_id = value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_end_matches(',')
+                    .trim_matches('"')
+                    .to_string();
+                break;
+            }
+        }
+    }
+
     // Parse each [[validators]] block
     let mut in_validator = false;
     let mut current: std::collections::HashMap<String, String> = std::collections::HashMap::new();

@@ -63,6 +63,9 @@ fn cmd_send(args: &[String]) {
         std::process::exit(1);
     });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let chain_id = get_arg(args, "--chain-id").unwrap_or_else(|| {
+        indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string()
+    });
 
     let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
@@ -93,6 +96,7 @@ fn cmd_send(args: &[String]) {
     };
 
     let built = build_transaction(&TxParams {
+        chain_id: &chain_id,
         recipient_pubkey_hex: &recipient_hex,
         amount_spark,
         fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
