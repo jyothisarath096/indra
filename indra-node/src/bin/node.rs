@@ -186,7 +186,6 @@ fn start_network_runtime(
                     local_validator_id: handshake_config.my_validator_id,
                     event_tx: async_event_tx,
                     command_buffer: 1024,
-                    per_peer_write_buffer: 256,
                 });
                 let _ = handle_tx.send(peer_manager.clone());
 

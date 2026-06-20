@@ -41,6 +41,8 @@ pub const BAN_SCORE: i32 = 0;
 pub const MAX_SCORE: i32 = 200;
 /// How long a banned peer stays banned.
 pub const BAN_DURATION: Duration = Duration::from_secs(3600); // 1 hour
+/// Shorter ban duration for rate-limit violations.
+pub const BAN_DURATION_RATE_LIMIT: Duration = Duration::from_secs(600); // 10 minutes
 
 /// Current status of a peer connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +117,15 @@ impl PeerInfo {
             self.ban_until = Some(Instant::now() + BAN_DURATION);
         }
     }
+
+    /// Apply a score delta with a custom ban duration.
+    pub fn adjust_score_with_duration(&mut self, delta: i32, ban_duration: Duration) {
+        self.score = (self.score + delta).clamp(BAN_SCORE, MAX_SCORE);
+        if self.score <= BAN_SCORE {
+            self.status = PeerStatus::Banned;
+            self.ban_until = Some(Instant::now() + ban_duration);
+        }
+    }
 }
 
 /// Score adjustment reasons.
@@ -185,6 +196,18 @@ impl PeerTable {
     pub fn score_event(&mut self, addr: &SocketAddr, event: ScoreEvent) {
         if let Some(peer) = self.peers.get_mut(addr) {
             peer.adjust_score(event.delta());
+        }
+    }
+
+    /// Apply a custom score delta with a caller-provided ban duration.
+    pub fn adjust_score_with_duration(
+        &mut self,
+        addr: &SocketAddr,
+        delta: i32,
+        ban_duration: Duration,
+    ) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.adjust_score_with_duration(delta, ban_duration);
         }
     }
 

@@ -55,6 +55,7 @@ pub mod message;
 pub mod net_types;
 pub mod peer;
 pub mod peer_manager;
+pub mod rate_limit;
 pub mod gossip;
 pub mod transport;
 
@@ -65,5 +66,6 @@ pub use message::{Message, MessageType};
 pub use net_types::{NetworkCommand, NetworkEvent};
 pub use peer::{PeerInfo, PeerTable, PeerStatus};
 pub use peer_manager::{PeerManagerConfig, PeerManagerHandle, spawn_peer_manager};
+pub use rate_limit::{GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket};
 pub use gossip::{GossipEngine, GossipEvent};
 pub use transport::{Transport, Connection};

@@ -21,8 +21,12 @@ use crate::{
     handshake::HandshakeResult,
     message::Message,
     net_types::{NetworkCommand, NetworkEvent},
-    peer::{PeerTable, ScoreEvent},
+    peer::{BAN_DURATION_RATE_LIMIT, PeerTable, ScoreEvent},
+    rate_limit::{GlobalRateLimiter, MessageClass, PeerRateLimiter},
 };
+
+const SMALL_QUEUE_CAPACITY: usize = 256;
+const LARGE_QUEUE_CAPACITY: usize = 4;
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -39,11 +43,23 @@ enum PeerManagerMessage {
         validator_id: Bytes32,
         addr: SocketAddr,
     },
+    RateLimitViolation {
+        validator_id: Bytes32,
+        addr: SocketAddr,
+        penalty: i32,
+    },
+    InboundMessage {
+        validator_id: Bytes32,
+        addr: SocketAddr,
+        msg: Message,
+        msg_size: usize,
+    },
 }
 
 struct ManagedPeer {
     addr: SocketAddr,
-    write_tx: mpsc::Sender<OutboundMessage>,
+    small_tx: mpsc::Sender<OutboundMessage>,
+    large_tx: mpsc::Sender<OutboundMessage>,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
@@ -58,11 +74,39 @@ struct PeerManagerActor {
     peers_by_validator: HashMap<Bytes32, ManagedPeer>,
     validator_by_addr: HashMap<SocketAddr, Bytes32>,
     connected_peers: Arc<AtomicUsize>,
-    per_peer_write_buffer: usize,
+    global_limiter: GlobalRateLimiter,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QueueType {
+    Small,
+    Large,
 }
 
 fn short_validator_id(id: &Bytes32) -> String {
-    id.0[..4].iter().map(|byte| format!("{:02x}", byte)).collect()
+    id.0[..4]
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+fn message_queue(msg: &Message) -> QueueType {
+    match msg {
+        Message::Block(_) | Message::BlockResponse { .. } | Message::QCResponse { .. } => {
+            QueueType::Large
+        }
+        _ => QueueType::Small,
+    }
+}
+
+async fn write_message(
+    writer: &mut FrameWriter<tokio::net::tcp::OwnedWriteHalf>,
+    outbound: OutboundMessage,
+) -> Result<(), ()> {
+    let Ok(wire) = outbound.msg.encode_wire() else {
+        return Ok(());
+    };
+    writer.write_frame(&wire).await.map_err(|_| ())
 }
 
 impl PeerManagerActor {
@@ -90,17 +134,25 @@ impl PeerManagerActor {
             NetworkCommand::Broadcast(msg) => {
                 let validators: Vec<Bytes32> = self.peers_by_validator.keys().copied().collect();
                 for validator_id in validators {
-                    self.try_send_to_validator(validator_id, OutboundMessage {
-                        msg: msg.clone(),
-                        point_to_point: false,
-                    }).await;
+                    self.try_send_to_validator(
+                        validator_id,
+                        OutboundMessage {
+                            msg: msg.clone(),
+                            point_to_point: false,
+                        },
+                    )
+                    .await;
                 }
             }
             NetworkCommand::SendTo { validator_id, msg } => {
-                self.try_send_to_validator(validator_id, OutboundMessage {
-                    msg,
-                    point_to_point: true,
-                }).await;
+                self.try_send_to_validator(
+                    validator_id,
+                    OutboundMessage {
+                        msg,
+                        point_to_point: true,
+                    },
+                )
+                .await;
             }
             NetworkCommand::Disconnect { validator_id } => {
                 if let Some(peer) = self.peers_by_validator.get(&validator_id) {
@@ -118,6 +170,52 @@ impl PeerManagerActor {
             PeerManagerMessage::Disconnected { validator_id, addr } => {
                 self.drop_peer(validator_id, addr).await;
             }
+            PeerManagerMessage::RateLimitViolation {
+                validator_id,
+                addr,
+                penalty,
+            } => {
+                self.peer_table
+                    .adjust_score_with_duration(&addr, -penalty, BAN_DURATION_RATE_LIMIT);
+                if self.peer_table.get(&addr).map(|peer| peer.is_banned()).unwrap_or(false) {
+                    eprintln!(
+                        "[p2p] peer {} ({}) banned 10min for sustained rate limit violations",
+                        short_validator_id(&validator_id),
+                        addr,
+                    );
+                    self.drop_peer(validator_id, addr).await;
+                } else {
+                    eprintln!(
+                        "[p2p] rate limit: dropped message from {} (validator {}), penalty=-{}",
+                        addr,
+                        short_validator_id(&validator_id),
+                        penalty,
+                    );
+                }
+            }
+            PeerManagerMessage::InboundMessage {
+                validator_id,
+                addr,
+                msg,
+                msg_size,
+            } => {
+                if MessageClass::needs_global_byte_limit(&msg)
+                    && !self.global_limiter.check_large_payload(msg_size)
+                {
+                    eprintln!("[p2p] global rate limit: dropped large payload from {}", addr);
+                    self.peer_table
+                        .adjust_score_with_duration(&addr, -1, BAN_DURATION_RATE_LIMIT);
+                    return;
+                }
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::Message {
+                        from: addr,
+                        validator_id,
+                        msg,
+                    })
+                    .await;
+            }
         }
     }
 
@@ -125,8 +223,6 @@ impl PeerManagerActor {
         let peer_validator_id = handshake.peer_validator_id;
 
         if let Some(existing) = self.peers_by_validator.get(&peer_validator_id) {
-            // Tie-breaking: keep connection where initiator_id < responder_id.
-            // This is deterministic — both sides compute the same outcome.
             let (initiator_id, responder_id) = if handshake.is_initiator {
                 (self.local_validator_id, peer_validator_id)
             } else {
@@ -134,7 +230,6 @@ impl PeerManagerActor {
             };
             let keep_new = initiator_id < responder_id;
             if keep_new {
-                // Drop old connection, register new one below
                 let existing_addr = existing.addr;
                 eprintln!(
                     "[p2p] tie-break: replacing connection to {} with new {} (validator {})",
@@ -144,7 +239,6 @@ impl PeerManagerActor {
                 );
                 self.drop_peer(peer_validator_id, existing_addr).await;
             } else {
-                // Keep old connection, drop new one
                 eprintln!(
                     "[p2p] tie-break: keeping existing connection to {} (validator {}), dropping new {}",
                     existing.addr,
@@ -159,28 +253,44 @@ impl PeerManagerActor {
         let send_key = handshake.send_key;
         let recv_key = handshake.recv_key;
         let (reader_half, writer_half) = stream.into_split();
-        let (write_tx, write_rx) = mpsc::channel(self.per_peer_write_buffer);
+        let (small_tx, small_rx) = mpsc::channel(SMALL_QUEUE_CAPACITY);
+        let (large_tx, large_rx) = mpsc::channel(LARGE_QUEUE_CAPACITY);
         let control_tx = self.control_tx.clone();
-        let event_tx = self.event_tx.clone();
 
         let read_task = tokio::spawn(async move {
             let mut reader = FrameReader::new(reader_half, recv_key);
+            let mut rate_limiter = PeerRateLimiter::new();
             loop {
                 let plaintext = match reader.read_frame().await {
                     Ok(bytes) => bytes,
                     Err(_) => break,
                 };
-                // encode_wire() includes a 4-byte length prefix; strip it before decode
-                let payload = if plaintext.len() >= 4 { &plaintext[4..] } else { &plaintext[..] };
+                let msg_size = plaintext.len();
+                let payload = if plaintext.len() >= 4 {
+                    &plaintext[4..]
+                } else {
+                    &plaintext[..]
+                };
                 let msg = match Message::decode_wire(payload) {
                     Ok(msg) => msg,
                     Err(_) => break,
                 };
-                if event_tx
-                    .send(NetworkEvent::Message {
-                        from: addr,
+                if let Some(penalty) = rate_limiter.check(&msg, msg_size) {
+                    let _ = control_tx
+                        .send(PeerManagerMessage::RateLimitViolation {
+                            validator_id: peer_validator_id,
+                            addr,
+                            penalty,
+                        })
+                        .await;
+                    continue;
+                }
+                if control_tx
+                    .send(PeerManagerMessage::InboundMessage {
                         validator_id: peer_validator_id,
+                        addr,
                         msg,
+                        msg_size,
                     })
                     .await
                     .is_err()
@@ -198,13 +308,7 @@ impl PeerManagerActor {
 
         let control_tx = self.control_tx.clone();
         let write_task = tokio::spawn(async move {
-            let mut writer = FrameWriter::new(writer_half, send_key);
-            run_write_loop(&mut writer, write_rx).await;
-            let _ = control_tx
-                .send(PeerManagerMessage::Disconnected {
-                    validator_id: peer_validator_id,
-                    addr,
-                })
+            run_write_loop(writer_half, send_key, small_rx, large_rx, control_tx, peer_validator_id, addr)
                 .await;
         });
 
@@ -216,12 +320,14 @@ impl PeerManagerActor {
             peer_validator_id,
             ManagedPeer {
                 addr,
-                write_tx,
+                small_tx,
+                large_tx,
                 read_task,
                 write_task,
             },
         );
-        self.connected_peers.store(self.peers_by_validator.len(), Ordering::Relaxed);
+        self.connected_peers
+            .store(self.peers_by_validator.len(), Ordering::Relaxed);
         let _ = self
             .event_tx
             .send(NetworkEvent::PeerConnected {
@@ -235,7 +341,12 @@ impl PeerManagerActor {
         let Some(peer) = self.peers_by_validator.get(&validator_id) else {
             return;
         };
-        match peer.write_tx.try_send(outbound) {
+        let queue_type = message_queue(&outbound.msg);
+        let result = match queue_type {
+            QueueType::Small => peer.small_tx.try_send(outbound),
+            QueueType::Large => peer.large_tx.try_send(outbound),
+        };
+        match result {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(message)) => {
                 if message.point_to_point {
@@ -251,9 +362,6 @@ impl PeerManagerActor {
     }
 
     async fn drop_peer(&mut self, validator_id: Bytes32, addr: SocketAddr) {
-        // Only remove if the stored peer matches the given addr.
-        // This prevents a stale Disconnected message from a replaced connection
-        // from removing the new connection that took its validator_id slot.
         if let Some(peer) = self.peers_by_validator.get(&validator_id) {
             if peer.addr == addr {
                 let peer = self.peers_by_validator.remove(&validator_id).unwrap();
@@ -271,7 +379,8 @@ impl PeerManagerActor {
         }
         self.validator_by_addr.remove(&addr);
         self.peer_table.mark_disconnected(&addr);
-        self.connected_peers.store(self.peers_by_validator.len(), Ordering::Relaxed);
+        self.connected_peers
+            .store(self.peers_by_validator.len(), Ordering::Relaxed);
         let _ = self
             .event_tx
             .send(NetworkEvent::PeerDisconnected { validator_id, addr })
@@ -280,17 +389,42 @@ impl PeerManagerActor {
 }
 
 async fn run_write_loop(
-    writer: &mut FrameWriter<tokio::net::tcp::OwnedWriteHalf>,
-    mut write_rx: mpsc::Receiver<OutboundMessage>,
+    writer_half: tokio::net::tcp::OwnedWriteHalf,
+    send_key: [u8; 32],
+    mut small_rx: mpsc::Receiver<OutboundMessage>,
+    mut large_rx: mpsc::Receiver<OutboundMessage>,
+    control_tx: mpsc::Sender<PeerManagerMessage>,
+    validator_id: Bytes32,
+    addr: SocketAddr,
 ) {
-    while let Some(outbound) = write_rx.recv().await {
-        let Ok(wire) = outbound.msg.encode_wire() else {
-            continue;
-        };
-        if writer.write_frame(&wire).await.is_err() {
-            break;
+    let mut writer = FrameWriter::new(writer_half, send_key);
+    loop {
+        tokio::select! {
+            msg = small_rx.recv() => {
+                match msg {
+                    Some(m) => {
+                        if write_message(&mut writer, m).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            msg = large_rx.recv() => {
+                match msg {
+                    Some(m) => {
+                        if write_message(&mut writer, m).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
         }
     }
+    let _ = control_tx
+        .send(PeerManagerMessage::Disconnected { validator_id, addr })
+        .await;
 }
 
 /// Static configuration for the peer-manager actor.
@@ -302,8 +436,6 @@ pub struct PeerManagerConfig {
     pub event_tx: mpsc::Sender<NetworkEvent>,
     /// Maximum buffered commands from the node into the actor.
     pub command_buffer: usize,
-    /// Maximum buffered outbound messages per peer.
-    pub per_peer_write_buffer: usize,
 }
 
 /// Handle returned to callers that need to enqueue network commands or attach peers.
@@ -324,7 +456,10 @@ impl PeerManagerHandle {
     }
 
     /// Queue a node-originated network command from synchronous code.
-    pub fn send_blocking(&self, command: NetworkCommand) -> Result<(), mpsc::error::SendError<NetworkCommand>> {
+    pub fn send_blocking(
+        &self,
+        command: NetworkCommand,
+    ) -> Result<(), mpsc::error::SendError<NetworkCommand>> {
         self.command_tx.blocking_send(command)
     }
 
@@ -361,7 +496,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         peers_by_validator: HashMap::new(),
         validator_by_addr: HashMap::new(),
         connected_peers: Arc::clone(&connected_peers),
-        per_peer_write_buffer: config.per_peer_write_buffer,
+        global_limiter: GlobalRateLimiter::new(),
     };
     tokio::spawn(actor.run());
     PeerManagerHandle {
@@ -374,7 +509,6 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
     use tokio::net::{TcpListener, TcpStream};
 
     async fn stream_pair() -> (TcpStream, TcpStream) {
@@ -385,7 +519,10 @@ mod tests {
         (client, server)
     }
 
-    fn test_actor(event_tx: mpsc::Sender<NetworkEvent>, local_validator_id: Bytes32) -> PeerManagerActor {
+    fn test_actor(
+        event_tx: mpsc::Sender<NetworkEvent>,
+        local_validator_id: Bytes32,
+    ) -> PeerManagerActor {
         let (_command_tx, command_rx) = mpsc::channel(16);
         let (control_tx, control_rx) = mpsc::channel(16);
         PeerManagerActor {
@@ -398,13 +535,12 @@ mod tests {
             peers_by_validator: HashMap::new(),
             validator_by_addr: HashMap::new(),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            per_peer_write_buffer: 4,
+            global_limiter: GlobalRateLimiter::new(),
         }
     }
 
     async fn handshake_result(
         peer_validator_id: Bytes32,
-        _addr: SocketAddr,
         is_initiator: bool,
     ) -> (HandshakeResult, TcpStream) {
         let (owned, keepalive) = stream_pair().await;
@@ -429,10 +565,8 @@ mod tests {
 
         let addr_old: SocketAddr = "127.0.0.1:30001".parse().unwrap();
         let addr_new: SocketAddr = "127.0.0.1:30002".parse().unwrap();
-        let ((old_hs, _old_keepalive), (new_hs, _new_keepalive)) = tokio::join!(
-            handshake_result(peer, addr_old, false),
-            handshake_result(peer, addr_new, true),
-        );
+        let ((old_hs, _old_keepalive), (new_hs, _new_keepalive)) =
+            tokio::join!(handshake_result(peer, false), handshake_result(peer, true),);
 
         actor.register_peer(addr_old, old_hs).await;
         actor.register_peer(addr_new, new_hs).await;
@@ -465,10 +599,8 @@ mod tests {
 
         let addr_old: SocketAddr = "127.0.0.1:31001".parse().unwrap();
         let addr_new: SocketAddr = "127.0.0.1:31002".parse().unwrap();
-        let ((old_hs, _old_keepalive), (new_hs, _new_keepalive)) = tokio::join!(
-            handshake_result(peer, addr_old, false),
-            handshake_result(peer, addr_new, true),
-        );
+        let ((old_hs, _old_keepalive), (new_hs, _new_keepalive)) =
+            tokio::join!(handshake_result(peer, false), handshake_result(peer, true),);
 
         actor.register_peer(addr_old, old_hs).await;
         actor.register_peer(addr_new, new_hs).await;
