@@ -65,6 +65,8 @@ pub struct HandshakeResult {
     pub recv_key: [u8; 32],
     /// Established transport stream.
     pub stream: TcpStream,
+    /// True if this node was the handshake initiator (dialed out).
+    pub is_initiator: bool,
 }
 
 fn lookup_validator_pk(config: &HandshakeConfig, validator_id: Bytes32) -> NetworkResult<PqPublicKey> {
@@ -296,6 +298,7 @@ async fn perform_handshake_inner(
             send_key,
             recv_key,
             stream,
+            is_initiator: true,
         })
     } else {
         let mut step1 = vec![0u8; STEP1_LEN];
@@ -341,6 +344,7 @@ async fn perform_handshake_inner(
             send_key,
             recv_key,
             stream,
+            is_initiator: false,
         })
     }
 }
@@ -514,5 +518,59 @@ mod tests {
         let _idle = TcpStream::connect(addr).await.expect("connect");
         let result = responder.await.expect("join");
         assert!(matches!(result, Err(NetworkError::HandshakeTimeout)));
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_invalid_signature() {
+        let (initiator_id, initiator_sk, initiator_pk) = make_validator(0x61, 0xA1);
+        let (responder_id, responder_sk, responder_pk) = make_validator(0x62, 0xB2);
+        let (_, wrong_sk, _) = make_validator(0x63, 0xC3);
+
+        let initiator_cfg = make_config(
+            initiator_id,
+            initiator_sk,
+            vec![(initiator_id, initiator_pk.clone()), (responder_id, responder_pk.clone())],
+            Duration::from_secs(2),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut step1 = vec![0u8; STEP1_LEN];
+            stream.read_exact(&mut step1).await.expect("read step1");
+            let (peer_x_pk_bytes, peer_kem_ek_bytes, peer_validator_id) = parse_step1(&step1).expect("parse step1");
+            assert_eq!(peer_validator_id, initiator_id);
+
+            let x_secret = EphemeralSecret::random();
+            let x_public = PublicKey::from(&x_secret).to_bytes();
+            let peer_kem_ek = EncapsulationKey1024::new((&peer_kem_ek_bytes).into()).expect("kem ek");
+            let (kem_ct, kem_secret) = peer_kem_ek.encapsulate();
+            let step2 = build_step2(x_public, kem_ct.as_ref(), responder_id).expect("build step2");
+            stream.write_all(&step2).await.expect("write step2");
+            stream.flush().await.expect("flush");
+
+            let peer_x_pk = PublicKey::from(peer_x_pk_bytes);
+            let x_secret_bytes = x_secret.diffie_hellman(&peer_x_pk).to_bytes();
+            let transcript = transcript_hash(&step1, &step2);
+            let kem_secret_bytes: [u8; 32] = kem_secret.into();
+            let (send_key, recv_key) =
+                derive_directional_keys(&x_secret_bytes, &kem_secret_bytes, &transcript, false);
+
+            let bad_sig = wrong_sk
+                .sign(&auth_plaintext(&transcript, responder_id))
+                .expect("sign");
+            write_auth_frame(&mut stream, &send_key, &bad_sig)
+                .await
+                .expect("write auth");
+            let _ = read_auth_frame(&mut stream, &recv_key).await;
+            let _ = responder_sk;
+        });
+
+        let initiator_stream = TcpStream::connect(addr).await.expect("connect");
+        let result = perform_handshake_initiator(initiator_stream, &initiator_cfg).await;
+        responder.await.expect("join");
+        assert!(matches!(result, Err(NetworkError::InvalidSignature)));
     }
 }

@@ -61,6 +61,10 @@ struct PeerManagerActor {
     per_peer_write_buffer: usize,
 }
 
+fn short_validator_id(id: &Bytes32) -> String {
+    id.0[..4].iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
 impl PeerManagerActor {
     async fn run(mut self) {
         loop {
@@ -92,17 +96,15 @@ impl PeerManagerActor {
                     }).await;
                 }
             }
-            NetworkCommand::SendTo { addr, msg } => {
-                if let Some(validator_id) = self.validator_by_addr.get(&addr).copied() {
-                    self.try_send_to_validator(validator_id, OutboundMessage {
-                        msg,
-                        point_to_point: true,
-                    }).await;
-                }
+            NetworkCommand::SendTo { validator_id, msg } => {
+                self.try_send_to_validator(validator_id, OutboundMessage {
+                    msg,
+                    point_to_point: true,
+                }).await;
             }
-            NetworkCommand::Disconnect { addr } => {
-                if let Some(validator_id) = self.validator_by_addr.get(&addr).copied() {
-                    self.drop_peer(validator_id, addr).await;
+            NetworkCommand::Disconnect { validator_id } => {
+                if let Some(peer) = self.peers_by_validator.get(&validator_id) {
+                    self.drop_peer(validator_id, peer.addr).await;
                 }
             }
         }
@@ -123,10 +125,32 @@ impl PeerManagerActor {
         let peer_validator_id = handshake.peer_validator_id;
 
         if let Some(existing) = self.peers_by_validator.get(&peer_validator_id) {
-            if self.local_validator_id < peer_validator_id {
+            // Tie-breaking: keep connection where initiator_id < responder_id.
+            // This is deterministic — both sides compute the same outcome.
+            let (initiator_id, responder_id) = if handshake.is_initiator {
+                (self.local_validator_id, peer_validator_id)
+            } else {
+                (peer_validator_id, self.local_validator_id)
+            };
+            let keep_new = initiator_id < responder_id;
+            if keep_new {
+                // Drop old connection, register new one below
                 let existing_addr = existing.addr;
+                eprintln!(
+                    "[p2p] tie-break: replacing connection to {} with new {} (validator {})",
+                    existing_addr,
+                    addr,
+                    short_validator_id(&peer_validator_id),
+                );
                 self.drop_peer(peer_validator_id, existing_addr).await;
             } else {
+                // Keep old connection, drop new one
+                eprintln!(
+                    "[p2p] tie-break: keeping existing connection to {} (validator {}), dropping new {}",
+                    existing.addr,
+                    short_validator_id(&peer_validator_id),
+                    addr,
+                );
                 return;
             }
         }
@@ -225,9 +249,23 @@ impl PeerManagerActor {
     }
 
     async fn drop_peer(&mut self, validator_id: Bytes32, addr: SocketAddr) {
-        if let Some(peer) = self.peers_by_validator.remove(&validator_id) {
-            peer.read_task.abort();
-            peer.write_task.abort();
+        // Only remove if the stored peer matches the given addr.
+        // This prevents a stale Disconnected message from a replaced connection
+        // from removing the new connection that took its validator_id slot.
+        if let Some(peer) = self.peers_by_validator.get(&validator_id) {
+            if peer.addr == addr {
+                let peer = self.peers_by_validator.remove(&validator_id).unwrap();
+                peer.read_task.abort();
+                peer.write_task.abort();
+            } else {
+                eprintln!(
+                    "[p2p] ignoring stale disconnect for {} (validator {}, current addr is {})",
+                    addr,
+                    short_validator_id(&validator_id),
+                    peer.addr,
+                );
+                return;
+            }
         }
         self.validator_by_addr.remove(&addr);
         self.peer_table.mark_disconnected(&addr);
@@ -328,5 +366,139 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         command_tx,
         control_tx,
         connected_peers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        (client, server)
+    }
+
+    fn test_actor(event_tx: mpsc::Sender<NetworkEvent>, local_validator_id: Bytes32) -> PeerManagerActor {
+        let (_command_tx, command_rx) = mpsc::channel(16);
+        let (control_tx, control_rx) = mpsc::channel(16);
+        PeerManagerActor {
+            local_validator_id,
+            event_tx,
+            command_rx,
+            control_rx,
+            control_tx,
+            peer_table: PeerTable::new(),
+            peers_by_validator: HashMap::new(),
+            validator_by_addr: HashMap::new(),
+            connected_peers: Arc::new(AtomicUsize::new(0)),
+            per_peer_write_buffer: 4,
+        }
+    }
+
+    async fn handshake_result(
+        peer_validator_id: Bytes32,
+        _addr: SocketAddr,
+        is_initiator: bool,
+    ) -> (HandshakeResult, TcpStream) {
+        let (owned, keepalive) = stream_pair().await;
+        (
+            HandshakeResult {
+                peer_validator_id,
+                send_key: [0x11; 32],
+                recv_key: [0x22; 32],
+                stream: owned,
+                is_initiator,
+            },
+            keepalive,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_connection_tie_breaking() {
+        let local = Bytes32::from([0x01; 32]);
+        let peer = Bytes32::from([0x02; 32]);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, local);
+
+        let addr_old: SocketAddr = "127.0.0.1:30001".parse().unwrap();
+        let addr_new: SocketAddr = "127.0.0.1:30002".parse().unwrap();
+        let ((old_hs, _old_keepalive), (new_hs, _new_keepalive)) = tokio::join!(
+            handshake_result(peer, addr_old, false),
+            handshake_result(peer, addr_new, true),
+        );
+
+        actor.register_peer(addr_old, old_hs).await;
+        actor.register_peer(addr_new, new_hs).await;
+
+        assert_eq!(actor.peers_by_validator.len(), 1);
+        assert_eq!(actor.connected_peers.load(Ordering::Relaxed), 1);
+        assert_eq!(actor.peers_by_validator.get(&peer).unwrap().addr, addr_new);
+        assert!(!actor.validator_by_addr.contains_key(&addr_old));
+        assert_eq!(actor.validator_by_addr.get(&addr_new), Some(&peer));
+
+        let mut connected = 0;
+        let mut disconnected = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                NetworkEvent::PeerConnected { .. } => connected += 1,
+                NetworkEvent::PeerDisconnected { .. } => disconnected += 1,
+                NetworkEvent::Message { .. } => {}
+            }
+        }
+        assert_eq!(connected, 2);
+        assert_eq!(disconnected, 1);
+    }
+
+    #[tokio::test]
+    async fn test_stale_disconnect_preserves_replacement() {
+        let local = Bytes32::from([0x01; 32]);
+        let peer = Bytes32::from([0x02; 32]);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, local);
+
+        let addr_old: SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        let addr_new: SocketAddr = "127.0.0.1:31002".parse().unwrap();
+        let ((old_hs, _old_keepalive), (new_hs, _new_keepalive)) = tokio::join!(
+            handshake_result(peer, addr_old, false),
+            handshake_result(peer, addr_new, true),
+        );
+
+        actor.register_peer(addr_old, old_hs).await;
+        actor.register_peer(addr_new, new_hs).await;
+        let before = actor.connected_peers.load(Ordering::Relaxed);
+        actor.drop_peer(peer, addr_old).await;
+
+        assert_eq!(actor.connected_peers.load(Ordering::Relaxed), before);
+        assert_eq!(actor.peers_by_validator.get(&peer).unwrap().addr, addr_new);
+        assert!(!actor.validator_by_addr.contains_key(&addr_old));
+        assert_eq!(actor.validator_by_addr.get(&addr_new), Some(&peer));
+
+        let mut disconnected = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, NetworkEvent::PeerDisconnected { .. }) {
+                disconnected += 1;
+            }
+        }
+        assert_eq!(disconnected, 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_to_unknown_validator() {
+        let local = Bytes32::from([0x01; 32]);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, local);
+        actor
+            .handle_command(NetworkCommand::SendTo {
+                validator_id: Bytes32::from([0xFF; 32]),
+                msg: Message::Ping(1),
+            })
+            .await;
+        assert_eq!(actor.connected_peers.load(Ordering::Relaxed), 0);
+        assert!(actor.peers_by_validator.is_empty());
     }
 }

@@ -39,16 +39,16 @@ pub enum NetworkEvent {
 pub enum NetworkCommand {
     /// Broadcast a message to all connected peers.
     Broadcast(Message),
-    /// Send a message to one specific peer address.
+    /// Send a message to one authenticated validator.
     SendTo {
-        /// Destination peer socket address.
-        addr: SocketAddr,
+        /// Destination peer validator identity.
+        validator_id: Bytes32,
         /// Message to send.
         msg: Message,
     },
     /// Disconnect a peer.
     Disconnect {
-        /// Remote socket address to drop.
-        addr: SocketAddr,
+        /// Remote validator identity to drop.
+        validator_id: Bytes32,
     },
 }

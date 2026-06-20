@@ -3,11 +3,10 @@
 //! Networking runs on a Tokio runtime with authenticated encrypted transport.
 //! Consensus and state transition logic remain synchronous on dedicated threads.
 
-use std::collections::HashSet;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fs2::available_space;
@@ -56,20 +55,20 @@ enum ProposalMode {
 #[derive(Clone)]
 struct NetworkBridge {
     handle: PeerManagerHandle,
-    connected_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
-    peer_count: Arc<AtomicUsize>,
+    peer_addrs: Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
+    addr_validators: Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
 }
 
 impl NetworkBridge {
     fn new(
         handle: PeerManagerHandle,
-        connected_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
-        peer_count: Arc<AtomicUsize>,
+        peer_addrs: Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
+        addr_validators: Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
     ) -> Self {
         Self {
             handle,
-            connected_addrs,
-            peer_count,
+            peer_addrs,
+            addr_validators,
         }
     }
 
@@ -77,33 +76,33 @@ impl NetworkBridge {
         let _ = self.handle.send_blocking(NetworkCommand::Broadcast(msg.clone()));
     }
 
-    fn send_to(&self, addr: &SocketAddr, msg: &Message) {
+    fn send_to_validator(&self, validator_id: indra_core::Bytes32, msg: &Message) {
         let _ = self.handle.send_blocking(NetworkCommand::SendTo {
-            addr: *addr,
+            validator_id,
             msg: msg.clone(),
         });
     }
 
     fn connection_count(&self) -> usize {
-        self.peer_count.load(Ordering::Relaxed)
+        self.handle.connected_peer_count()
     }
 
     fn connected_addrs(&self) -> Vec<SocketAddr> {
-        self.connected_addrs
+        self.peer_addrs
             .lock()
             .unwrap()
-            .iter()
+            .values()
             .copied()
             .collect()
     }
+
+    fn validator_for_addr(&self, addr: &SocketAddr) -> Option<indra_core::Bytes32> {
+        self.addr_validators.lock().unwrap().get(addr).copied()
+    }
 }
 
-fn has_connected_ip(connected_addrs: &Arc<Mutex<HashSet<SocketAddr>>>, addr: &SocketAddr) -> bool {
-    connected_addrs
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|connected| connected.ip() == addr.ip())
+fn has_connected_ip(connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>, addr: &SocketAddr) -> bool {
+    connected_addrs.lock().unwrap().contains_key(&addr.ip())
 }
 
 fn choose_proposal_mode(
@@ -159,14 +158,22 @@ fn start_network_runtime(
     bootstrap_peers: Vec<String>,
     handshake_config: HandshakeConfig,
 ) -> (Arc<NetworkBridge>, std::sync::mpsc::Receiver<NetworkEvent>) {
-    let connected_addrs = Arc::new(Mutex::new(HashSet::new()));
-    let peer_count = Arc::new(AtomicUsize::new(0));
+    let connected_addrs = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
+    let peer_addrs = Arc::new(Mutex::new(HashMap::new()));
+    let addr_validators = Arc::new(Mutex::new(HashMap::new()));
     let (event_tx, event_rx) = std::sync::mpsc::channel::<NetworkEvent>();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<PeerManagerHandle>();
+    let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
+    let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
+    let handshake_sem = Arc::new(tokio::sync::Semaphore::new(50));
 
     std::thread::spawn({
         let connected_addrs = Arc::clone(&connected_addrs);
-        let peer_count = Arc::clone(&peer_count);
+        let peer_addrs = Arc::clone(&peer_addrs);
+        let addr_validators = Arc::clone(&addr_validators);
+        let retry_after = Arc::clone(&retry_after);
+        let retry_delay = Arc::clone(&retry_delay);
+        let handshake_sem = Arc::clone(&handshake_sem);
         move || {
             let runtime = TokioRuntimeBuilder::new_multi_thread()
                 .enable_all()
@@ -188,17 +195,34 @@ fn start_network_runtime(
 
                 tokio::spawn({
                     let connected_addrs = Arc::clone(&connected_addrs);
-                    let peer_count = Arc::clone(&peer_count);
+                    let peer_addrs = Arc::clone(&peer_addrs);
+                    let addr_validators = Arc::clone(&addr_validators);
+                    let retry_after = Arc::clone(&retry_after);
+                    let retry_delay = Arc::clone(&retry_delay);
                     async move {
                         while let Some(event) = async_event_rx.recv().await {
                             match &event {
-                                NetworkEvent::PeerConnected { addr, .. } => {
-                                    connected_addrs.lock().unwrap().insert(*addr);
-                                    peer_count.store(connected_addrs.lock().unwrap().len(), Ordering::Relaxed);
+                                NetworkEvent::PeerConnected { validator_id, addr } => {
+                                    *connected_addrs.lock().unwrap().entry(addr.ip()).or_insert(0) += 1;
+                                    peer_addrs.lock().unwrap().insert(*validator_id, *addr);
+                                    addr_validators.lock().unwrap().insert(*addr, *validator_id);
+                                    retry_after.lock().unwrap().remove(&addr.ip().to_string());
+                                    retry_delay.lock().unwrap().remove(&addr.ip().to_string());
                                 }
-                                NetworkEvent::PeerDisconnected { addr, .. } => {
-                                    connected_addrs.lock().unwrap().remove(addr);
-                                    peer_count.store(connected_addrs.lock().unwrap().len(), Ordering::Relaxed);
+                                NetworkEvent::PeerDisconnected { validator_id, addr } => {
+                                    {
+                                        let mut ca = connected_addrs.lock().unwrap();
+                                        let count = ca.entry(addr.ip()).or_insert(0);
+                                        if *count <= 1 {
+                                            ca.remove(&addr.ip());
+                                            retry_after.lock().unwrap().insert(addr.ip().to_string(), Instant::now() + Duration::from_secs(2));
+                                            retry_delay.lock().unwrap().insert(addr.ip().to_string(), Duration::from_secs(2));
+                                        } else {
+                                            *count -= 1;
+                                        }
+                                    }
+                                    peer_addrs.lock().unwrap().remove(validator_id);
+                                    addr_validators.lock().unwrap().remove(addr);
                                 }
                                 NetworkEvent::Message { .. } => {}
                             }
@@ -210,6 +234,7 @@ fn start_network_runtime(
                 tokio::spawn({
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
+                    let handshake_sem = Arc::clone(&handshake_sem);
                     async move {
                         let listener = match tokio::net::TcpListener::bind(&p2p_addr).await {
                             Ok(listener) => listener,
@@ -224,9 +249,18 @@ fn start_network_runtime(
                             let Ok((stream, addr)) = listener.accept().await else {
                                 continue;
                             };
+                            let permit = match handshake_sem.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    eprintln!("[p2p] handshake limit reached, rejecting connection from {}", addr);
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             let peer_manager = PeerManagerHandle::clone(&peer_manager);
                             let handshake_config = Arc::clone(&handshake_config);
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 match perform_handshake_responder(stream, handshake_config.as_ref()).await {
                                     Ok(handshake) => {
                                         let _ = peer_manager.register_peer(addr, handshake).await;
@@ -244,8 +278,13 @@ fn start_network_runtime(
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
                     let connected_addrs = Arc::clone(&connected_addrs);
+                    let retry_after = Arc::clone(&retry_after);
+                    let retry_delay = Arc::clone(&retry_delay);
+                    let handshake_sem = Arc::clone(&handshake_sem);
                     async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
+                        const MIN_BACKOFF: Duration = Duration::from_secs(2);
+                        const MAX_BACKOFF: Duration = Duration::from_secs(60);
                         loop {
                             for peer_addr_str in &bootstrap_peers {
                                 let Some(addr) = resolve_peer_addr(peer_addr_str) else {
@@ -253,25 +292,61 @@ fn start_network_runtime(
                                     continue;
                                 };
                                 if has_connected_ip(&connected_addrs, &addr) {
+                                    retry_after.lock().unwrap().remove(peer_addr_str);
+                                    retry_delay.lock().unwrap().remove(peer_addr_str);
                                     continue;
+                                }
+                                if let Some(next_attempt) = retry_after.lock().unwrap().get(peer_addr_str).copied() {
+                                    if Instant::now() < next_attempt {
+                                        continue;
+                                    }
                                 }
                                 match tokio::net::TcpStream::connect(addr).await {
                                     Ok(stream) => {
+                                        let permit = match handshake_sem.clone().try_acquire_owned() {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                eprintln!("[p2p] handshake limit reached, deferring outbound connection to {}", addr);
+                                                retry_after.lock().unwrap().insert(peer_addr_str.clone(), Instant::now() + MIN_BACKOFF);
+                                                continue;
+                                            }
+                                        };
+                                        retry_after.lock().unwrap().remove(peer_addr_str);
+                                        retry_delay.lock().unwrap().remove(peer_addr_str);
                                         let peer_manager = PeerManagerHandle::clone(&peer_manager);
                                         let handshake_config = Arc::clone(&handshake_config);
+                                        let retry_after = Arc::clone(&retry_after);
+                                        let retry_delay = Arc::clone(&retry_delay);
+                                        let peer_key = peer_addr_str.clone();
                                         tokio::spawn(async move {
+                                            let _permit = permit;
                                             match perform_handshake_initiator(stream, handshake_config.as_ref()).await {
                                                 Ok(handshake) => {
                                                     let _ = peer_manager.register_peer(addr, handshake).await;
                                                 }
                                                 Err(e) => {
                                                     eprintln!("[dialer] handshake failed with {}: {}", addr, e);
+                                                    let mut delays = retry_delay.lock().unwrap();
+                                                    let current = delays.get(&peer_key).copied().unwrap_or(MIN_BACKOFF);
+                                                    let next = (current * 2).min(MAX_BACKOFF);
+                                                    delays.insert(peer_key.clone(), next);
+                                                    drop(delays);
+                                                    retry_after.lock().unwrap().insert(peer_key, Instant::now() + current);
                                                 }
                                             }
                                         });
                                     }
                                     Err(e) => {
                                         eprintln!("[dialer] failed to connect to {}: {}", addr, e);
+                                        let mut delays = retry_delay.lock().unwrap();
+                                        let current = delays.get(peer_addr_str).copied().unwrap_or(MIN_BACKOFF);
+                                        let next = (current * 2).min(MAX_BACKOFF);
+                                        delays.insert(peer_addr_str.clone(), next);
+                                        drop(delays);
+                                        retry_after
+                                            .lock()
+                                            .unwrap()
+                                            .insert(peer_addr_str.clone(), Instant::now() + current);
                                     }
                                 }
                             }
@@ -286,7 +361,7 @@ fn start_network_runtime(
     });
 
     let peer_manager = handle_rx.recv().expect("peer manager handle");
-    let bridge = Arc::new(NetworkBridge::new(peer_manager, connected_addrs, peer_count));
+    let bridge = Arc::new(NetworkBridge::new(peer_manager, peer_addrs, addr_validators));
 
     (bridge, event_rx)
 }
@@ -414,14 +489,14 @@ fn main() {
         std::thread::spawn(move || {
             while let Ok(event) = network_events.recv() {
                 match event {
-                    NetworkEvent::PeerConnected { addr, .. } => {
+                    NetworkEvent::PeerConnected { validator_id, addr } => {
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
-                        announce_status_and_recovery(&driver, &gossip, &height_tx, addr);
+                        announce_status_and_recovery(&driver, &gossip, &height_tx, validator_id);
                     }
                     NetworkEvent::PeerDisconnected { addr, .. } => {
                         eprintln!("[p2p] peer disconnected: {}", addr);
                     }
-                    NetworkEvent::Message { from: addr, msg, .. } => {
+                    NetworkEvent::Message { from: addr, validator_id, msg } => {
                         match &msg {
                             Message::RequestBlocks { from_height, to_height } => {
                                 let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
@@ -436,7 +511,7 @@ fn main() {
                                     }
                                     blocks
                                 };
-                                gossip.send_to(&addr, &Message::BlockResponse { blocks: blocks_to_send });
+                                gossip.send_to_validator(validator_id, &Message::BlockResponse { blocks: blocks_to_send });
                                 continue;
                             }
                             Message::RequestProposal { height, round, hash } => {
@@ -452,7 +527,7 @@ fn main() {
                                         })
                                 };
                                 if let Some(block) = proposal {
-                                    gossip.send_to(&addr, &Message::Block(block));
+                                    gossip.send_to_validator(validator_id, &Message::Block(block));
                                 }
                                 continue;
                             }
@@ -507,7 +582,9 @@ fn main() {
 
                                 if let Some((peer, from_height, to_height)) = request_more {
                                     let req = Message::RequestBlocks { from_height, to_height };
-                                    gossip.send_to(&peer, &req);
+                                    if let Some(peer_validator_id) = gossip.validator_for_addr(&peer) {
+                                        gossip.send_to_validator(peer_validator_id, &req);
+                                    }
                                 }
                                 if imported_any {
                                     let _ = height_tx.send(());
@@ -523,7 +600,7 @@ fn main() {
                                     let d = driver.lock().unwrap();
                                     (d.height(), d.engine.state.tip_hash)
                                 };
-                                gossip.send_to(&addr, &Message::Status { height, tip_hash });
+                                gossip.send_to_validator(validator_id, &Message::Status { height, tip_hash });
                                 continue;
                             }
                             _ => {}
@@ -921,7 +998,9 @@ fn process_driver_actions(
             );
             let msg = Message::RequestQC { height: *height };
             for peer in &peers {
-                gossip.send_to(peer, &msg);
+                if let Some(peer_validator_id) = gossip.validator_for_addr(peer) {
+                    gossip.send_to_validator(peer_validator_id, &msg);
+                }
             }
             continue;
         }
@@ -943,7 +1022,9 @@ fn process_driver_actions(
                 from_height: *from_height,
                 to_height: *to_height,
             };
-            gossip.send_to(from, &req);
+            if let Some(peer_validator_id) = gossip.validator_for_addr(from) {
+                gossip.send_to_validator(peer_validator_id, &req);
+            }
         }
 
         if let DriverAction::RequestProposal { from, height, round, hash } = &action {
@@ -952,7 +1033,9 @@ fn process_driver_actions(
                 round: *round,
                 hash: *hash,
             };
-            gossip.send_to(from, &req);
+            if let Some(peer_validator_id) = gossip.validator_for_addr(from) {
+                gossip.send_to_validator(peer_validator_id, &req);
+            }
         }
 
         if let DriverAction::SendQCResponse { to, height, qc_bytes } = &action {
@@ -960,7 +1043,9 @@ fn process_driver_actions(
                 height: *height,
                 qc_bytes: qc_bytes.clone(),
             };
-            gossip.send_to(to, &msg);
+            if let Some(peer_validator_id) = gossip.validator_for_addr(to) {
+                gossip.send_to_validator(peer_validator_id, &msg);
+            }
         }
     }
 }
@@ -969,15 +1054,15 @@ fn announce_status_and_recovery(
     driver: &Arc<Mutex<ConsensusDriver>>,
     gossip: &Arc<NetworkBridge>,
     height_tx: &std::sync::mpsc::Sender<()>,
-    addr: SocketAddr,
+    validator_id: indra_core::Bytes32,
 ) {
     let (height, tip_hash) = {
         let d = driver.lock().unwrap();
         (d.height(), d.engine.state.tip_hash)
     };
     let [status, ping] = startup_peer_messages(height, tip_hash);
-    gossip.send_to(&addr, &status);
-    gossip.send_to(&addr, &ping);
+    gossip.send_to_validator(validator_id, &status);
+    gossip.send_to_validator(validator_id, &ping);
     broadcast_status(driver, gossip);
 
     let actions = driver.lock().unwrap().request_qc_if_needed();
@@ -1491,5 +1576,17 @@ mod tests {
         );
 
         assert_eq!(mode, ProposalMode::Reproposal);
+    }
+
+    #[tokio::test]
+    async fn handshake_semaphore_limits_concurrency() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(50));
+        let mut permits = Vec::new();
+        for _ in 0..50 {
+            permits.push(sem.clone().try_acquire_owned().expect("permit"));
+        }
+        assert!(sem.clone().try_acquire_owned().is_err());
+        drop(permits);
+        assert!(sem.clone().try_acquire_owned().is_ok());
     }
 }
