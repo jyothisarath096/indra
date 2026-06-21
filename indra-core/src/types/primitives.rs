@@ -368,11 +368,26 @@ pub const GOVERNANCE_DELAY_EPOCHS: u64 = 100;
 /// Minimum outbound peer connections.
 pub const MIN_OUTBOUND_PEERS: usize = 8;
 
+/// Default DNS seed hostname for peer discovery.
+pub const DNS_SEED_HOST: &str = "seeds.indraprotocol.com";
+
+/// Maximum peers to share in a single PeerList message.
+pub const MAX_PEER_LIST_SIZE: usize = 20;
+
+/// Interval between peer list announcements to the same peer (seconds).
+pub const PEER_LIST_INTERVAL_SECS: u64 = 60;
+
+/// Target number of outbound connections to maintain.
+pub const TARGET_OUTBOUND_PEERS: usize = 8;
+
 /// Maximum outbound peer connections.
 pub const MAX_OUTBOUND_PEERS: usize = 16;
 
 /// Maximum inbound peer connections.
 pub const MAX_INBOUND_PEERS: usize = 64;
+
+/// Peer table persistence interval (seconds).
+pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
 
 /// Maximum messages per second from one peer before rate limiting.
 pub const MAX_MSG_PER_SEC: u32 = 100;

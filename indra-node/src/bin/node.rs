@@ -3,8 +3,8 @@
 //! Networking runs on a Tokio runtime with authenticated encrypted transport.
 //! Consensus and state transition logic remain synchronous on dedicated threads.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use fs2::available_space;
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
-    MIN_PRUNE_KEEP_BLOCKS,
+    DNS_SEED_HOST, MAX_PEER_LIST_SIZE, MIN_PRUNE_KEEP_BLOCKS, PEER_LIST_INTERVAL_SECS,
+    PEER_TABLE_SAVE_INTERVAL_SECS, TARGET_OUTBOUND_PEERS,
 };
 use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_network::{
@@ -20,7 +21,9 @@ use indra_network::{
     HandshakeConfig, NetworkCommand, NetworkEvent, PeerManagerConfig, PeerManagerHandle,
 };
 use indra_node::{
+    discovery::{load_peers, peer_list_payload, resolve_dns_seeds, resolve_peer_addr, save_peers},
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
+    genesis::load_genesis_seed_peers,
     net_driver::{action_to_message, message_to_event},
     sync::SYNC_BATCH_SIZE,
     NodeConfig, NodeEngine,
@@ -34,7 +37,6 @@ const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
-const DEFAULT_BOOTSTRAP_PEER: &str = "bootstrap.indraprotocol.com:30303";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
@@ -96,6 +98,12 @@ fn has_connected_ip(
     connected_addrs.lock().unwrap().contains_key(&addr.ip())
 }
 
+fn has_connected_ip_from_socket_addrs(connected_addrs: &[SocketAddr], addr: &SocketAddr) -> bool {
+    connected_addrs
+        .iter()
+        .any(|connected| connected.ip() == addr.ip())
+}
+
 fn choose_proposal_mode(
     should_propose: bool,
     valid_reproposal_available: bool,
@@ -153,11 +161,19 @@ fn refresh_handshake_config(engine: &NodeEngine, config: &Arc<RwLock<HandshakeCo
 fn start_network_runtime(
     p2p_addr: String,
     bootstrap_peers: Vec<String>,
+    initial_discovered_peers: Vec<String>,
+    peers_file_path: String,
+    dns_seed_host: String,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
-) -> (Arc<NetworkBridge>, std::sync::mpsc::Receiver<NetworkEvent>) {
+) -> (
+    Arc<NetworkBridge>,
+    Arc<Mutex<HashSet<String>>>,
+    std::sync::mpsc::Receiver<NetworkEvent>,
+) {
     let connected_addrs = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
     let peer_addrs = Arc::new(Mutex::new(HashMap::new()));
     let addr_validators = Arc::new(Mutex::new(HashMap::new()));
+    let discovered_peers = Arc::new(Mutex::new(HashSet::<String>::new()));
     let (event_tx, event_rx) = std::sync::mpsc::channel::<NetworkEvent>();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<PeerManagerHandle>();
     let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
@@ -171,6 +187,7 @@ fn start_network_runtime(
         let retry_after = Arc::clone(&retry_after);
         let retry_delay = Arc::clone(&retry_delay);
         let handshake_sem = Arc::clone(&handshake_sem);
+        let discovered_peers = Arc::clone(&discovered_peers);
         move || {
             let runtime = TokioRuntimeBuilder::new_multi_thread()
                 .enable_all()
@@ -194,6 +211,7 @@ fn start_network_runtime(
                     let addr_validators = Arc::clone(&addr_validators);
                     let retry_after = Arc::clone(&retry_after);
                     let retry_delay = Arc::clone(&retry_delay);
+                    let discovered_peers = Arc::clone(&discovered_peers);
                     async move {
                         while let Some(event) = async_event_rx.recv().await {
                             match &event {
@@ -201,8 +219,11 @@ fn start_network_runtime(
                                     *connected_addrs.lock().unwrap().entry(addr.ip()).or_insert(0) += 1;
                                     peer_addrs.lock().unwrap().insert(*validator_id, *addr);
                                     addr_validators.lock().unwrap().insert(*addr, *validator_id);
+                                    discovered_peers.lock().unwrap().insert(addr.to_string());
                                     retry_after.lock().unwrap().remove(&addr.ip().to_string());
+                                    retry_after.lock().unwrap().remove(&addr.to_string());
                                     retry_delay.lock().unwrap().remove(&addr.ip().to_string());
+                                    retry_delay.lock().unwrap().remove(&addr.to_string());
                                 }
                                 NetworkEvent::PeerDisconnected { validator_id, addr } => {
                                     {
@@ -230,15 +251,16 @@ fn start_network_runtime(
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
                     let handshake_sem = Arc::clone(&handshake_sem);
+                    let listener_addr = p2p_addr.clone();
                     async move {
-                        let listener = match tokio::net::TcpListener::bind(&p2p_addr).await {
+                        let listener = match tokio::net::TcpListener::bind(&listener_addr).await {
                             Ok(listener) => listener,
                             Err(e) => {
                                 eprintln!("[listener] bind failed: {}", e);
                                 return;
                             }
                         };
-                        eprintln!("[p2p] listening on {}", p2p_addr);
+                        eprintln!("[p2p] listening on {}", listener_addr);
 
                         loop {
                             let Ok((stream, addr)) = listener.accept().await else {
@@ -277,12 +299,56 @@ fn start_network_runtime(
                     let retry_after = Arc::clone(&retry_after);
                     let retry_delay = Arc::clone(&retry_delay);
                     let handshake_sem = Arc::clone(&handshake_sem);
+                    let discovered_peers = Arc::clone(&discovered_peers);
+                    let peer_addrs = Arc::clone(&peer_addrs);
+                    let peers_file_path = peers_file_path.clone();
+                    let dns_seed_host = dns_seed_host.clone();
+                    let p2p_addr_for_port = p2p_addr.clone();
                     async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
+                        let persisted = load_peers(&peers_file_path);
+                        {
+                            let mut dp = discovered_peers.lock().unwrap();
+                            for addr in &persisted {
+                                dp.insert(addr.to_string());
+                            }
+                            for addr in &initial_discovered_peers {
+                                dp.insert(addr.clone());
+                            }
+                        }
+                        eprintln!("[discovery] loaded {} persisted peers", persisted.len());
+                        let p2p_port = p2p_addr_for_port
+                            .rsplit(':')
+                            .next()
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .unwrap_or(30303);
+                        let dns_peers = resolve_dns_seeds(&dns_seed_host, p2p_port);
+                        {
+                            let mut dp = discovered_peers.lock().unwrap();
+                            for addr in &dns_peers {
+                                dp.insert(addr.to_string());
+                            }
+                        }
+                        eprintln!("[discovery] {} DNS seed peers discovered", dns_peers.len());
+
                         const MIN_BACKOFF: Duration = Duration::from_secs(2);
                         const MAX_BACKOFF: Duration = Duration::from_secs(60);
+                        let mut last_peer_save = Instant::now();
                         loop {
-                            for peer_addr_str in &bootstrap_peers {
+                            let mut all_peers = bootstrap_peers.clone();
+                            {
+                                let dp = discovered_peers.lock().unwrap();
+                                for peer in dp.iter() {
+                                    if !all_peers.contains(peer) {
+                                        all_peers.push(peer.clone());
+                                    }
+                                }
+                            }
+
+                            for peer_addr_str in &all_peers {
+                                if connected_addrs.lock().unwrap().len() >= TARGET_OUTBOUND_PEERS {
+                                    break;
+                                }
                                 let Some(addr) = resolve_peer_addr(peer_addr_str) else {
                                     eprintln!("[dialer] invalid addr: {}", peer_addr_str);
                                     continue;
@@ -347,7 +413,41 @@ fn start_network_runtime(
                                     }
                                 }
                             }
+                            if last_peer_save.elapsed().as_secs() >= PEER_TABLE_SAVE_INTERVAL_SECS {
+                                let mut peers_to_save: Vec<SocketAddr> = {
+                                    let dp = discovered_peers.lock().unwrap();
+                                    dp.iter().filter_map(|peer| resolve_peer_addr(peer)).collect()
+                                };
+                                peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
+                                peers_to_save.sort();
+                                peers_to_save.dedup();
+                                save_peers(&peers_file_path, &peers_to_save);
+                                last_peer_save = Instant::now();
+                            }
                             tokio::time::sleep(DIAL_RETRY).await;
+                        }
+                    }
+                });
+
+                tokio::spawn({
+                    let discovered_peers = Arc::clone(&discovered_peers);
+                    let peer_addrs = Arc::clone(&peer_addrs);
+                    let peers_file_path = peers_file_path.clone();
+                    async move {
+                        if tokio::signal::ctrl_c().await.is_ok() {
+                            let mut peers_to_save: Vec<SocketAddr> = {
+                                let dp = discovered_peers.lock().unwrap();
+                                dp.iter().filter_map(|peer| resolve_peer_addr(peer)).collect()
+                            };
+                            peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
+                            peers_to_save.sort();
+                            peers_to_save.dedup();
+                            save_peers(&peers_file_path, &peers_to_save);
+                            eprintln!(
+                                "[discovery] saved {} peers before shutdown",
+                                peers_to_save.len()
+                            );
+                            std::process::exit(0);
                         }
                     }
                 });
@@ -364,7 +464,7 @@ fn start_network_runtime(
         addr_validators,
     ));
 
-    (bridge, event_rx)
+    (bridge, discovered_peers, event_rx)
 }
 
 fn main() {
@@ -375,6 +475,8 @@ fn main() {
         println!("  --data-dir <path>");
         println!("  --p2p-addr <host:port>");
         println!("  --bootstrap-peers <addr,addr,...>");
+        println!("  --seeds <hostname>   DNS seed hostname (default: seeds.indraprotocol.com)");
+        println!("  --peers-file <path>");
         println!("  --genesis <path>");
         println!("  --archive");
         println!(
@@ -394,6 +496,7 @@ fn main() {
     let data_dir = get_arg("--data-dir").unwrap_or_else(|| "./indra-data".to_string());
     let p2p_addr = get_arg("--p2p-addr").unwrap_or_else(|| "0.0.0.0:30303".to_string());
     let bootstrap = get_arg("--bootstrap-peers");
+    let dns_seed_host = get_arg("--seeds").unwrap_or_else(|| DNS_SEED_HOST.to_string());
     let archive = args.iter().any(|arg| arg == "--archive");
     let prune_keep = get_arg("--prune-keep")
         .and_then(|value| value.parse::<u64>().ok())
@@ -425,13 +528,8 @@ fn main() {
     let bootstrap_peers: Vec<String> = match bootstrap.as_deref() {
         Some(value) => value.split(',').map(|s| s.trim().to_string()).collect(),
         None => {
-            if should_skip_default_bootstrap(&p2p_addr, DEFAULT_BOOTSTRAP_PEER) {
-                eprintln!("Bootstrap: (bootstrap node)");
-                vec![]
-            } else {
-                eprintln!("Bootstrap: {}", DEFAULT_BOOTSTRAP_PEER);
-                vec![DEFAULT_BOOTSTRAP_PEER.to_string()]
-            }
+            eprintln!("Bootstrap: (none; DNS/persisted/genesis discovery enabled)");
+            vec![]
         }
     };
     if bootstrap_peers.is_empty() && bootstrap.is_some() {
@@ -440,6 +538,19 @@ fn main() {
         eprintln!("Bootstrap: {}", raw_bootstrap);
     }
     let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
+    let peers_file = get_arg("--peers-file").unwrap_or_else(|| {
+        Path::new(&data_dir)
+            .join("peers.json")
+            .to_string_lossy()
+            .to_string()
+    });
+    let genesis_seed_peers = load_genesis_seed_peers(&genesis_path);
+    if !genesis_seed_peers.is_empty() {
+        eprintln!(
+            "[discovery] loaded {} peer hints from genesis",
+            genesis_seed_peers.len()
+        );
+    }
 
     let config = NodeConfig {
         data_dir: std::path::PathBuf::from(&data_dir),
@@ -451,6 +562,8 @@ fn main() {
         pq_pk: if pq_pk.is_empty() { None } else { Some(pq_pk) },
         p2p_addr: p2p_addr.clone(),
         bootstrap_peers: bootstrap_peers.clone(),
+        dns_seed_host: dns_seed_host.clone(),
+        peers_file: peers_file.clone(),
         snapshot_interval: 300,
         mempool_capacity: 5_000,
         prune_keep_blocks: if archive { None } else { Some(prune_keep) },
@@ -485,9 +598,12 @@ fn main() {
     // Shared state between threads
     let driver = Arc::new(Mutex::new(driver));
     let (height_tx, height_rx) = std::sync::mpsc::channel::<()>();
-    let (gossip, network_events) = start_network_runtime(
+    let (gossip, discovered_peers, network_events) = start_network_runtime(
         p2p_addr.clone(),
         bootstrap_peers.clone(),
+        genesis_seed_peers,
+        peers_file.clone(),
+        dns_seed_host.clone(),
         Arc::clone(&handshake_config),
     );
 
@@ -497,12 +613,22 @@ fn main() {
         let driver = Arc::clone(&driver);
         let height_tx = height_tx.clone();
         let handshake_config = Arc::clone(&handshake_config);
+        let discovered_peers = Arc::clone(&discovered_peers);
+        let local_p2p_addr = p2p_addr.clone();
 
         std::thread::spawn(move || {
             while let Ok(event) = network_events.recv() {
                 match event {
                     NetworkEvent::PeerConnected { validator_id, addr } => {
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
+                        let known_addrs = peer_list_payload(
+                            gossip.connected_addrs(),
+                            Some(addr),
+                            &HashSet::new(),
+                        );
+                        if !known_addrs.is_empty() {
+                            gossip.send_to_validator(validator_id, &Message::PeerList(known_addrs));
+                        }
                         announce_status_and_recovery(
                             &driver,
                             &gossip,
@@ -524,6 +650,31 @@ fn main() {
                         msg,
                     } => {
                         match &msg {
+                            Message::PeerList(addrs) => {
+                                let mut new_peers = discovered_peers.lock().unwrap();
+                                let mut accepted = 0usize;
+                                for addr_str in addrs.iter().take(MAX_PEER_LIST_SIZE) {
+                                    let Some(addr) = resolve_peer_addr(addr_str) else {
+                                        continue;
+                                    };
+                                    if addr.to_string() != local_p2p_addr
+                                        && !has_connected_ip_from_socket_addrs(
+                                            &gossip.connected_addrs(),
+                                            &addr,
+                                        )
+                                    {
+                                        new_peers.insert(addr.to_string());
+                                        accepted = accepted.saturating_add(1);
+                                    }
+                                }
+                                eprintln!(
+                                    "[discovery] received {} peer addresses from {} (accepted {})",
+                                    addrs.len(),
+                                    addr,
+                                    accepted
+                                );
+                                continue;
+                            }
                             Message::RequestBlocks {
                                 from_height,
                                 to_height,
@@ -1033,6 +1184,7 @@ fn main() {
     {
         let driver_rpc = Arc::clone(&driver);
         let gossip_rpc = Arc::clone(&gossip);
+        let discovered_peers_rpc = Arc::clone(&discovered_peers);
         let rpc_addr = get_arg("--rpc-addr").unwrap_or_else(|| "127.0.0.1:8545".to_string());
         eprintln!("[rpc] listening on {}", rpc_addr);
 
@@ -1049,8 +1201,9 @@ fn main() {
                     Ok(stream) => {
                         let driver_rpc = Arc::clone(&driver_rpc);
                         let gossip_rpc = Arc::clone(&gossip_rpc);
+                        let discovered_peers_rpc = Arc::clone(&discovered_peers_rpc);
                         std::thread::spawn(move || {
-                            handle_rpc(stream, &driver_rpc, &gossip_rpc);
+                            handle_rpc(stream, &driver_rpc, &gossip_rpc, &discovered_peers_rpc);
                         });
                     }
                     Err(e) => eprintln!("[rpc] accept error: {}", e),
@@ -1091,6 +1244,14 @@ fn main() {
 
         if tick.is_multiple_of(10) {
             check_disk_space(Path::new(&data_dir));
+        }
+
+        let peer_list_ticks = (PEER_LIST_INTERVAL_SECS / STATUS_INTERVAL.as_secs()).max(1);
+        if tick.is_multiple_of(peer_list_ticks) {
+            let known_addrs = peer_list_payload(gossip.connected_addrs(), None, &HashSet::new());
+            if !known_addrs.is_empty() {
+                gossip.broadcast(&Message::PeerList(known_addrs));
+            }
         }
 
         last_height = height;
@@ -1287,56 +1448,6 @@ fn check_disk_space(data_dir: &Path) -> u64 {
     available
 }
 
-fn should_skip_default_bootstrap(local_p2p_addr: &str, default_peer: &str) -> bool {
-    if local_p2p_addr == default_peer {
-        return true;
-    }
-
-    let Some(default_socket) = resolve_first_socket_addr(default_peer) else {
-        return false;
-    };
-
-    if let Ok(local_addrs) = local_p2p_addr.to_socket_addrs() {
-        for addr in local_addrs {
-            if addr == default_socket {
-                return true;
-            }
-        }
-    }
-
-    if let Some(local_port) = local_p2p_addr
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-    {
-        if local_port == default_socket.port() {
-            if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-                if sock.connect(default_socket).is_ok() {
-                    if let Ok(local_outbound) = sock.local_addr() {
-                        if local_outbound.ip() == default_socket.ip() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn resolve_first_socket_addr(addr: &str) -> Option<SocketAddr> {
-    addr.to_socket_addrs().ok()?.next()
-}
-
-fn resolve_peer_addr(addr: &str) -> Option<SocketAddr> {
-    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-        return Some(socket_addr);
-    }
-
-    resolve_first_socket_addr(addr)
-}
-
 fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
     let key = format!("\"{}\":", field);
     let pos = match json.find(&key) {
@@ -1374,6 +1485,7 @@ fn handle_rpc(
     stream: std::net::TcpStream,
     driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
     gossip: &Arc<NetworkBridge>,
+    discovered_peers: &Arc<Mutex<HashSet<String>>>,
 ) {
     use std::io::{BufRead, BufReader, Read, Write};
 
@@ -1512,6 +1624,20 @@ fn handle_rpc(
             }
             "indra_getMempoolSize" => {
                 format!(r#"{{"size":{}}}"#, mempool_size)
+            }
+            "indra_getPeers" => {
+                let connected: Vec<String> = gossip
+                    .connected_addrs()
+                    .iter()
+                    .map(|addr| addr.to_string())
+                    .collect();
+                let discovered_count = discovered_peers.lock().unwrap().len();
+                format!(
+                    r#"{{"connected":{},"connected_count":{},"discovered_count":{}}}"#,
+                    serde_json::to_string(&connected).unwrap_or_default(),
+                    connected.len(),
+                    discovered_count,
+                )
             }
             "indra_submitStakingOp" => {
                 let op_hex = first_param.clone().unwrap_or_default();

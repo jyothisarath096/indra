@@ -241,6 +241,45 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
     // Liquid allocations are handled separately from validator bonding state.
 }
 
+/// Load optional P2P seed peer hints from a genesis.toml file.
+pub fn load_genesis_seed_peers(genesis_path: &str) -> Vec<String> {
+    let content = match std::fs::read_to_string(genesis_path) {
+        Ok(content) => content,
+        Err(_) => return vec![],
+    };
+
+    let mut in_seed = false;
+    let mut peers = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "[[seeds]]" {
+            in_seed = true;
+            continue;
+        }
+        if line.starts_with('[') && line != "[[seeds]]" {
+            in_seed = false;
+            continue;
+        }
+        if in_seed {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "addr" {
+                let addr = value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_end_matches(',')
+                    .trim_matches('"')
+                    .to_string();
+                if !addr.is_empty() {
+                    peers.push(addr);
+                }
+            }
+        }
+    }
+    peers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,6 +29,7 @@
 #![deny(clippy::panic)]
 
 pub mod config;
+pub mod discovery;
 pub mod driver;
 pub mod engine;
 pub mod error;

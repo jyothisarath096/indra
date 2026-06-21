@@ -46,6 +46,12 @@ pub struct NodeConfig {
     /// Bootstrap peer addresses (Phase 6).
     pub bootstrap_peers: Vec<String>,
 
+    /// DNS seed hostname for peer discovery.
+    pub dns_seed_host: String,
+
+    /// Path to peer table persistence file.
+    pub peers_file: String,
+
     /// How many blocks between state snapshots.
     pub snapshot_interval: u64,
 
@@ -61,6 +67,7 @@ pub struct NodeConfig {
 impl NodeConfig {
     /// Create a default configuration for local testing.
     pub fn local_test(data_dir: PathBuf) -> Self {
+        let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
         Self {
             data_dir,
             genesis_path: None,
@@ -71,6 +78,8 @@ impl NodeConfig {
             pq_pk: None,
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
+            dns_seed_host: indra_core::types::primitives::DNS_SEED_HOST.to_string(),
+            peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
             prune_keep_blocks: None,
@@ -79,6 +88,7 @@ impl NodeConfig {
 
     /// Create a validator-less full node config for testing.
     pub fn full_node(data_dir: PathBuf) -> Self {
+        let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
         Self {
             data_dir,
             genesis_path: None,
@@ -89,6 +99,8 @@ impl NodeConfig {
             pq_pk: None,
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
+            dns_seed_host: indra_core::types::primitives::DNS_SEED_HOST.to_string(),
+            peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
             prune_keep_blocks: None,
