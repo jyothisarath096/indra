@@ -4,25 +4,11 @@
 //! This is the core cryptographic invariant of the INDRA protocol:
 //! security requires an attacker to break BOTH schemes simultaneously.
 
-use ed25519_dalek::{
-    Signature as Ed25519Sig,
-    SigningKey,
-    Signer,
-    Verifier,
-    VerifyingKey,
-};
+use ed25519_dalek::{Signature as Ed25519Sig, Signer, SigningKey, Verifier, VerifyingKey};
 use ml_dsa::{
-    EncodedVerifyingKey,
-    Generate,
-    Keypair,
-    KeyExport,
-    MlDsa87,
-    Signature as MlDsaSignature,
-    SignatureEncoding,
-    SigningKey as MlDsaSigningKey,
-    Signer as MlDsaSigner,
-    Verifier as MlDsaVerifier,
-    VerifyingKey as MlDsaVerifyingKey,
+    EncodedVerifyingKey, Generate, KeyExport, Keypair, MlDsa87, Signature as MlDsaSignature,
+    SignatureEncoding, Signer as MlDsaSigner, SigningKey as MlDsaSigningKey,
+    Verifier as MlDsaVerifier, VerifyingKey as MlDsaVerifyingKey,
 };
 
 use crate::{
@@ -91,6 +77,7 @@ pub struct PqPublicKey(pub [u8; PQ_PK_BYTES]);
 pub struct PqSignature(pub [u8; PQ_SIG_BYTES]);
 
 /// An ML-DSA-87 signing keypair represented canonically by its 32-byte seed.
+#[derive(Clone)]
 pub struct PqKeypair {
     seed: [u8; PQ_SK_BYTES],
 }
@@ -162,11 +149,7 @@ impl PqKeypair {
 }
 
 /// Verify an ML-DSA-87 signature.
-pub fn verify_pq(
-    message: &[u8],
-    sig: &PqSignature,
-    pk: &PqPublicKey,
-) -> CryptoResult<()> {
+pub fn verify_pq(message: &[u8], sig: &PqSignature, pk: &PqPublicKey) -> CryptoResult<()> {
     let enc_vk = EncodedVerifyingKey::<MlDsa87>::try_from(pk.0.as_slice()).map_err(|_| {
         CryptoError::MalformedPublicKey {
             scheme: "ML-DSA-87",

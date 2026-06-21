@@ -11,7 +11,7 @@
 
 use indra_core::{
     codec::Encode,
-    types::primitives::{Bytes32, MAX_CHAIN_ID_BYTES, VariableBytes},
+    types::primitives::{Bytes32, VariableBytes, MAX_CHAIN_ID_BYTES},
 };
 use indra_crypto::sha256;
 
@@ -65,7 +65,9 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
             match validator.status {
                 crate::validator::ValidatorStatus::Registered => value.push(0),
                 crate::validator::ValidatorStatus::Active => value.push(1),
-                crate::validator::ValidatorStatus::Unbonding { unbonding_end_epoch } => {
+                crate::validator::ValidatorStatus::Unbonding {
+                    unbonding_end_epoch,
+                } => {
                     value.push(2);
                     value.extend_from_slice(&unbonding_end_epoch.to_le_bytes());
                 }
@@ -101,6 +103,17 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
             value.push(u8::from(delegator.unbonding_end_epoch.is_some()));
             leaves.push((key, sha256(&value)));
         }
+    }
+
+    for (signer_id, nonce) in &state.staking_nonces {
+        let mut key = Vec::with_capacity(33);
+        key.push(0x03);
+        key.extend_from_slice(&signer_id.0);
+
+        let mut value = Vec::with_capacity(40);
+        value.extend_from_slice(&signer_id.0);
+        value.extend_from_slice(&nonce.to_le_bytes());
+        leaves.push((key, sha256(&value)));
     }
 
     if leaves.is_empty() {
@@ -145,8 +158,7 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use indra_core::{
-        Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
-        types::transaction::OutputV1,
+        types::transaction::OutputV1, Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
 
     use super::*;

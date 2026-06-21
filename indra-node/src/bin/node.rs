@@ -6,33 +6,24 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use fs2::available_space;
 use indra_core::types::primitives::{
-    DEFAULT_PRUNE_KEEP_BLOCKS,
-    DISK_CRITICAL_THRESHOLD_BYTES,
-    DISK_WARN_THRESHOLD_BYTES,
+    DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
     MIN_PRUNE_KEEP_BLOCKS,
 };
-use indra_network::{
-    HandshakeConfig,
-    NetworkCommand,
-    NetworkEvent,
-    PeerManagerConfig,
-    PeerManagerHandle,
-    message::Message,
-    perform_handshake_initiator,
-    perform_handshake_responder,
-    spawn_peer_manager,
-};
 use indra_crypto::{PqKeypair, PqPublicKey};
+use indra_network::{
+    message::Message, perform_handshake_initiator, perform_handshake_responder, spawn_peer_manager,
+    HandshakeConfig, NetworkCommand, NetworkEvent, PeerManagerConfig, PeerManagerHandle,
+};
 use indra_node::{
-    NodeConfig, NodeEngine,
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
-    net_driver::{message_to_event, action_to_message},
+    net_driver::{action_to_message, message_to_event},
     sync::SYNC_BATCH_SIZE,
+    NodeConfig, NodeEngine,
 };
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -73,7 +64,9 @@ impl NetworkBridge {
     }
 
     fn broadcast(&self, msg: &Message) {
-        let _ = self.handle.send_blocking(NetworkCommand::Broadcast(msg.clone()));
+        let _ = self
+            .handle
+            .send_blocking(NetworkCommand::Broadcast(msg.clone()));
     }
 
     fn send_to_validator(&self, validator_id: indra_core::Bytes32, msg: &Message) {
@@ -88,12 +81,7 @@ impl NetworkBridge {
     }
 
     fn connected_addrs(&self) -> Vec<SocketAddr> {
-        self.peer_addrs
-            .lock()
-            .unwrap()
-            .values()
-            .copied()
-            .collect()
+        self.peer_addrs.lock().unwrap().values().copied().collect()
     }
 
     fn validator_for_addr(&self, addr: &SocketAddr) -> Option<indra_core::Bytes32> {
@@ -101,7 +89,10 @@ impl NetworkBridge {
     }
 }
 
-fn has_connected_ip(connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>, addr: &SocketAddr) -> bool {
+fn has_connected_ip(
+    connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    addr: &SocketAddr,
+) -> bool {
     connected_addrs.lock().unwrap().contains_key(&addr.ip())
 }
 
@@ -153,10 +144,16 @@ fn build_handshake_config(engine: &NodeEngine) -> Option<HandshakeConfig> {
     })
 }
 
+fn refresh_handshake_config(engine: &NodeEngine, config: &Arc<RwLock<HandshakeConfig>>) {
+    if let Some(new_config) = build_handshake_config(engine) {
+        *config.write().unwrap() = new_config;
+    }
+}
+
 fn start_network_runtime(
     p2p_addr: String,
     bootstrap_peers: Vec<String>,
-    handshake_config: HandshakeConfig,
+    handshake_config: Arc<RwLock<HandshakeConfig>>,
 ) -> (Arc<NetworkBridge>, std::sync::mpsc::Receiver<NetworkEvent>) {
     let connected_addrs = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
     let peer_addrs = Arc::new(Mutex::new(HashMap::new()));
@@ -183,14 +180,13 @@ fn start_network_runtime(
             runtime.block_on(async move {
                 let (async_event_tx, mut async_event_rx) = tokio_mpsc::channel::<NetworkEvent>(1024);
                 let peer_manager = spawn_peer_manager(PeerManagerConfig {
-                    local_validator_id: handshake_config.my_validator_id,
+                    local_validator_id: handshake_config.read().unwrap().my_validator_id,
                     event_tx: async_event_tx,
                     command_buffer: 1024,
                 });
                 let _ = handle_tx.send(peer_manager.clone());
 
                 let network_bridge = PeerManagerHandle::clone(&peer_manager);
-                let handshake_config = Arc::new(handshake_config);
 
                 tokio::spawn({
                     let connected_addrs = Arc::clone(&connected_addrs);
@@ -260,7 +256,8 @@ fn start_network_runtime(
                             let handshake_config = Arc::clone(&handshake_config);
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                match perform_handshake_responder(stream, handshake_config.as_ref()).await {
+                                let config = handshake_config.read().unwrap().clone();
+                                match perform_handshake_responder(stream, &config).await {
                                     Ok(handshake) => {
                                         let _ = peer_manager.register_peer(addr, handshake).await;
                                     }
@@ -319,7 +316,8 @@ fn start_network_runtime(
                                         let peer_key = peer_addr_str.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit;
-                                            match perform_handshake_initiator(stream, handshake_config.as_ref()).await {
+                                            let config = handshake_config.read().unwrap().clone();
+                                            match perform_handshake_initiator(stream, &config).await {
                                                 Ok(handshake) => {
                                                     let _ = peer_manager.register_peer(addr, handshake).await;
                                                 }
@@ -360,7 +358,11 @@ fn start_network_runtime(
     });
 
     let peer_manager = handle_rx.recv().expect("peer manager handle");
-    let bridge = Arc::new(NetworkBridge::new(peer_manager, peer_addrs, addr_validators));
+    let bridge = Arc::new(NetworkBridge::new(
+        peer_manager,
+        peer_addrs,
+        addr_validators,
+    ));
 
     (bridge, event_rx)
 }
@@ -375,18 +377,24 @@ fn main() {
         println!("  --bootstrap-peers <addr,addr,...>");
         println!("  --genesis <path>");
         println!("  --archive");
-        println!("  --prune-keep <blocks>  (minimum {})", MIN_PRUNE_KEEP_BLOCKS);
+        println!(
+            "  --prune-keep <blocks>  (minimum {})",
+            MIN_PRUNE_KEEP_BLOCKS
+        );
         return;
     }
     let get_arg = |flag: &str| -> Option<String> {
-        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
 
-    let keys_path  = get_arg("--keys").unwrap_or_else(|| "keys.json".to_string());
-    let data_dir   = get_arg("--data-dir").unwrap_or_else(|| "./indra-data".to_string());
-    let p2p_addr   = get_arg("--p2p-addr").unwrap_or_else(|| "0.0.0.0:30303".to_string());
-    let bootstrap  = get_arg("--bootstrap-peers");
-    let archive    = args.iter().any(|arg| arg == "--archive");
+    let keys_path = get_arg("--keys").unwrap_or_else(|| "keys.json".to_string());
+    let data_dir = get_arg("--data-dir").unwrap_or_else(|| "./indra-data".to_string());
+    let p2p_addr = get_arg("--p2p-addr").unwrap_or_else(|| "0.0.0.0:30303".to_string());
+    let bootstrap = get_arg("--bootstrap-peers");
+    let archive = args.iter().any(|arg| arg == "--archive");
     let prune_keep = get_arg("--prune-keep")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS)
@@ -409,10 +417,10 @@ fn main() {
     let keys_str = std::fs::read_to_string(&keys_path)
         .unwrap_or_else(|e| panic!("Cannot read {}: {}", keys_path, e));
     let hybrid_seed = extract_hex32(&keys_str, "hybrid_seed");
-    let bls_seed    = extract_hex32(&keys_str, "bls_seed");
-    let vrf_seed    = extract_hex32(&keys_str, "vrf_seed");
-    let pq_sk       = extract_hex_field(&keys_str, "pq_sk");
-    let pq_pk       = extract_hex_field(&keys_str, "hybrid_pq_pk");
+    let bls_seed = extract_hex32(&keys_str, "bls_seed");
+    let vrf_seed = extract_hex32(&keys_str, "vrf_seed");
+    let pq_sk = extract_hex_field(&keys_str, "pq_sk");
+    let pq_pk = extract_hex_field(&keys_str, "hybrid_pq_pk");
 
     let bootstrap_peers: Vec<String> = match bootstrap.as_deref() {
         Some(value) => value.split(',').map(|s| s.trim().to_string()).collect(),
@@ -434,28 +442,30 @@ fn main() {
     let genesis_path = get_arg("--genesis").unwrap_or_else(|| "genesis.toml".to_string());
 
     let config = NodeConfig {
-        data_dir:          std::path::PathBuf::from(&data_dir),
-        genesis_path:      Some(genesis_path),
-        validator_seed:    Some(hybrid_seed),
-        bls_seed:          Some(bls_seed),
-        vrf_seed:          Some(vrf_seed),
-        pq_sk:             if pq_sk.is_empty() { None } else { Some(pq_sk) },
-        pq_pk:             if pq_pk.is_empty() { None } else { Some(pq_pk) },
-        p2p_addr:          p2p_addr.clone(),
-        bootstrap_peers:   bootstrap_peers.clone(),
+        data_dir: std::path::PathBuf::from(&data_dir),
+        genesis_path: Some(genesis_path),
+        validator_seed: Some(hybrid_seed),
+        bls_seed: Some(bls_seed),
+        vrf_seed: Some(vrf_seed),
+        pq_sk: if pq_sk.is_empty() { None } else { Some(pq_sk) },
+        pq_pk: if pq_pk.is_empty() { None } else { Some(pq_pk) },
+        p2p_addr: p2p_addr.clone(),
+        bootstrap_peers: bootstrap_peers.clone(),
         snapshot_interval: 300,
-        mempool_capacity:  5_000,
+        mempool_capacity: 5_000,
         prune_keep_blocks: if archive { None } else { Some(prune_keep) },
     };
 
     // Init node engine + consensus driver
-    let engine = NodeEngine::init(config)
-        .unwrap_or_else(|e| panic!("Node init failed: {}", e));
+    let engine = NodeEngine::init(config).unwrap_or_else(|e| panic!("Node init failed: {}", e));
 
-    eprintln!("Validator set: {} active validators",
-        engine.state.validators.active_count());
+    eprintln!(
+        "Validator set: {} active validators",
+        engine.state.validators.active_count()
+    );
 
-    let validator_id = engine.validator_id()
+    let validator_id = engine
+        .validator_id()
         .map(|id| hex::encode(id.0))
         .unwrap_or_else(|| "full-node".to_string());
 
@@ -467,38 +477,55 @@ fn main() {
     let mut driver_state = ConsensusDriver::new(engine);
     driver_state.refresh_registered_voters();
     let startup_qc_request = driver_state.request_qc_if_needed();
-    let handshake_config = build_handshake_config(&driver_state.engine);
+    let handshake_config = build_handshake_config(&driver_state.engine)
+        .map(|config| Arc::new(RwLock::new(config)))
+        .unwrap_or_else(|| panic!("authenticated transport requires validator networking keys"));
     let driver = driver_state;
 
     // Shared state between threads
-    let driver    = Arc::new(Mutex::new(driver));
+    let driver = Arc::new(Mutex::new(driver));
     let (height_tx, height_rx) = std::sync::mpsc::channel::<()>();
-    let (gossip, network_events) = if let Some(handshake_config) = handshake_config {
-        start_network_runtime(p2p_addr.clone(), bootstrap_peers.clone(), handshake_config)
-    } else {
-        panic!("authenticated transport requires validator networking keys");
-    };
+    let (gossip, network_events) = start_network_runtime(
+        p2p_addr.clone(),
+        bootstrap_peers.clone(),
+        Arc::clone(&handshake_config),
+    );
 
     // ── Thread 3: Authenticated network event loop ──────────────────────────
     {
         let gossip = Arc::clone(&gossip);
         let driver = Arc::clone(&driver);
         let height_tx = height_tx.clone();
+        let handshake_config = Arc::clone(&handshake_config);
 
         std::thread::spawn(move || {
             while let Ok(event) = network_events.recv() {
                 match event {
                     NetworkEvent::PeerConnected { validator_id, addr } => {
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
-                        announce_status_and_recovery(&driver, &gossip, &height_tx, validator_id);
+                        announce_status_and_recovery(
+                            &driver,
+                            &gossip,
+                            &height_tx,
+                            &handshake_config,
+                            validator_id,
+                        );
                     }
                     NetworkEvent::PeerDisconnected { addr, .. } => {
                         eprintln!("[p2p] peer disconnected: {}", addr);
                     }
-                    NetworkEvent::Message { from: addr, validator_id, msg } => {
+                    NetworkEvent::Message {
+                        from: addr,
+                        validator_id,
+                        msg,
+                    } => {
                         match &msg {
-                            Message::RequestBlocks { from_height, to_height } => {
-                                let upper = (*to_height).min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
+                            Message::RequestBlocks {
+                                from_height,
+                                to_height,
+                            } => {
+                                let upper = (*to_height)
+                                    .min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
                                 let blocks_to_send = {
                                     let mut d = driver.lock().unwrap();
                                     let mut blocks = Vec::new();
@@ -510,10 +537,19 @@ fn main() {
                                     }
                                     blocks
                                 };
-                                gossip.send_to_validator(validator_id, &Message::BlockResponse { blocks: blocks_to_send });
+                                gossip.send_to_validator(
+                                    validator_id,
+                                    &Message::BlockResponse {
+                                        blocks: blocks_to_send,
+                                    },
+                                );
                                 continue;
                             }
-                            Message::RequestProposal { height, round, hash } => {
+                            Message::RequestProposal {
+                                height,
+                                round,
+                                hash,
+                            } => {
                                 let proposal = {
                                     let mut d = driver.lock().unwrap();
                                     d.pending_block(hash)
@@ -545,6 +581,10 @@ fn main() {
                                         match d.engine.commit_block(&block) {
                                             Ok(()) => {
                                                 imported_any = true;
+                                                refresh_handshake_config(
+                                                    &d.engine,
+                                                    &handshake_config,
+                                                );
                                                 d.refresh_registered_voters();
                                                 d.sync_mut().on_block_imported(block.header.height);
                                                 d.reset_round();
@@ -559,9 +599,7 @@ fn main() {
                                             Err(e) => {
                                                 eprintln!(
                                                     "[sync] failed to import block {} from {}: {}",
-                                                    block.header.height,
-                                                    addr,
-                                                    e
+                                                    block.header.height, addr, e
                                                 );
                                                 break;
                                             }
@@ -572,7 +610,8 @@ fn main() {
                                         d.sync_mut().on_empty_response(current_height);
                                     }
                                     let new_height = d.height();
-                                    request_more = d.sync_mut().next_request_after_response(new_height);
+                                    request_more =
+                                        d.sync_mut().next_request_after_response(new_height);
                                     if d.sync().is_caught_up() {
                                         d.on_sync_caught_up();
                                         caught_up_height = Some(new_height);
@@ -580,8 +619,13 @@ fn main() {
                                 }
 
                                 if let Some((peer, from_height, to_height)) = request_more {
-                                    let req = Message::RequestBlocks { from_height, to_height };
-                                    if let Some(peer_validator_id) = gossip.validator_for_addr(&peer) {
+                                    let req = Message::RequestBlocks {
+                                        from_height,
+                                        to_height,
+                                    };
+                                    if let Some(peer_validator_id) =
+                                        gossip.validator_for_addr(&peer)
+                                    {
                                         gossip.send_to_validator(peer_validator_id, &req);
                                     }
                                 }
@@ -590,7 +634,10 @@ fn main() {
                                     broadcast_status(&driver, &gossip);
                                 }
                                 if let Some(height) = caught_up_height {
-                                    eprintln!("[sync] caught up to height={}, joining consensus", height);
+                                    eprintln!(
+                                        "[sync] caught up to height={}, joining consensus",
+                                        height
+                                    );
                                 }
                                 continue;
                             }
@@ -599,7 +646,10 @@ fn main() {
                                     let d = driver.lock().unwrap();
                                     (d.height(), d.engine.state.tip_hash)
                                 };
-                                gossip.send_to_validator(validator_id, &Message::Status { height, tip_hash });
+                                gossip.send_to_validator(
+                                    validator_id,
+                                    &Message::Status { height, tip_hash },
+                                );
                                 continue;
                             }
                             _ => {}
@@ -608,9 +658,20 @@ fn main() {
                         if let Some(event) = message_to_event(msg, addr) {
                             let previous_height = driver.lock().unwrap().height();
                             let actions = driver.lock().unwrap().process(event);
-                            process_driver_actions(&driver, &gossip, &height_tx, previous_height, actions);
+                            process_driver_actions(
+                                &driver,
+                                &gossip,
+                                &height_tx,
+                                &handshake_config,
+                                previous_height,
+                                actions,
+                            );
                             let new_height = driver.lock().unwrap().height();
                             if new_height > previous_height {
+                                refresh_handshake_config(
+                                    &driver.lock().unwrap().engine,
+                                    &handshake_config,
+                                );
                                 let _ = height_tx.send(());
                                 broadcast_status(&driver, &gossip);
                             }
@@ -623,9 +684,10 @@ fn main() {
 
     // ── Thread 4: Consensus loop ────────────────────────────────────────────
     {
-        let driver  = Arc::clone(&driver);
-        let gossip  = Arc::clone(&gossip);
+        let driver = Arc::clone(&driver);
+        let gossip = Arc::clone(&gossip);
         let height_tx = height_tx.clone();
+        let handshake_config = Arc::clone(&handshake_config);
         let height_rx = height_rx;
 
         std::thread::spawn(move || {
@@ -662,7 +724,14 @@ fn main() {
                 if last_qc_bytes_empty && round % 10 == 0 {
                     let actions = driver.lock().unwrap().request_qc_if_needed();
                     if !actions.is_empty() {
-                        process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                        process_driver_actions(
+                            &driver,
+                            &gossip,
+                            &height_tx,
+                            &handshake_config,
+                            height,
+                            actions,
+                        );
                     }
                 }
 
@@ -709,22 +778,30 @@ fn main() {
                             let (should_propose, next_height) = {
                                 let d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
-                                    indra_crypto::sha256(&d.engine.state.tip_hash.0)
+                                    indra_crypto::sha256(&d.engine.state.tip_hash.0),
                                 );
                                 let height = d.engine.state.height + 1;
                                 let round = d.current_round();
                                 let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
-                                    d.engine.state.validators.active_validators()
-                                        .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
-                                            validator_id: v.validator_id,
-                                            vrf_pubkey: vrf_pk,
-                                            stake: v.stake_spark,
-                                        }))
+                                    d.engine
+                                        .state
+                                        .validators
+                                        .active_validators()
+                                        .filter_map(|v| {
+                                            v.vrf_pk.map(|vrf_pk| {
+                                                indra_consensus::proposer::ProposerCandidate {
+                                                    validator_id: v.validator_id,
+                                                    vrf_pubkey: vrf_pk,
+                                                    stake: v.stake_spark,
+                                                }
+                                            })
+                                        })
                                         .collect();
 
                                 if candidates.is_empty() {
                                     (
-                                        d.can_propose() && d.engine.config.bootstrap_peers.is_empty(),
+                                        d.can_propose()
+                                            && d.engine.config.bootstrap_peers.is_empty(),
                                         height,
                                     )
                                 } else {
@@ -734,14 +811,12 @@ fn main() {
                                         round,
                                         candidates,
                                     };
-                                    (
-                                        d.can_propose() && d.engine.is_proposer(&election),
-                                        height,
-                                    )
+                                    (d.can_propose() && d.engine.is_proposer(&election), height)
                                 }
                             };
 
-                            let already_have_proposal = proposed_at_slot == Some((next_height, round))
+                            let already_have_proposal = proposed_at_slot
+                                == Some((next_height, round))
                                 || driver
                                     .lock()
                                     .unwrap()
@@ -760,12 +835,16 @@ fn main() {
                                 already_have_proposal,
                             );
 
-                            if matches!(proposal_mode, ProposalMode::Fresh | ProposalMode::Reproposal) {
+                            if matches!(
+                                proposal_mode,
+                                ProposalMode::Fresh | ProposalMode::Reproposal
+                            ) {
                                 let time_since_last_commit = last_commit_time
                                     .and_then(|t| t.elapsed().ok())
                                     .unwrap_or(Duration::from_secs(MIN_BLOCK_INTERVAL_SECS));
 
-                                if time_since_last_commit < Duration::from_secs(MIN_BLOCK_INTERVAL_SECS)
+                                if time_since_last_commit
+                                    < Duration::from_secs(MIN_BLOCK_INTERVAL_SECS)
                                     && time_since_last_commit
                                         < Duration::from_secs(MIN_BLOCK_INTERVAL_SECS * 2)
                                 {
@@ -782,18 +861,27 @@ fn main() {
                                 let proposal = {
                                     let mut d = driver.lock().unwrap();
                                     let epoch_seed = indra_core::types::primitives::Bytes32::from(
-                                        indra_crypto::sha256(&d.engine.state.tip_hash.0)
+                                        indra_crypto::sha256(&d.engine.state.tip_hash.0),
                                     );
                                     let height = d.engine.state.height + 1;
                                     let round = d.current_round();
-                                    let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
-                                        d.engine.state.validators.active_validators()
-                                            .filter_map(|v| v.vrf_pk.map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
-                                                validator_id: v.validator_id,
-                                                vrf_pubkey: vrf_pk,
-                                                stake: v.stake_spark,
-                                            }))
-                                            .collect();
+                                    let candidates: Vec<
+                                        indra_consensus::proposer::ProposerCandidate,
+                                    > = d
+                                        .engine
+                                        .state
+                                        .validators
+                                        .active_validators()
+                                        .filter_map(|v| {
+                                            v.vrf_pk.map(|vrf_pk| {
+                                                indra_consensus::proposer::ProposerCandidate {
+                                                    validator_id: v.validator_id,
+                                                    vrf_pubkey: vrf_pk,
+                                                    stake: v.stake_spark,
+                                                }
+                                            })
+                                        })
+                                        .collect();
                                     let election = indra_consensus::proposer::ProposerElection {
                                         epoch_seed,
                                         height,
@@ -805,20 +893,26 @@ fn main() {
                                         .unwrap_or_default()
                                         .as_secs();
                                     let polc_round = d.proposal_polc_round(height);
-                                    let proposal_result = if matches!(proposal_mode, ProposalMode::Reproposal) {
-                                        let (valid_block, valid_round) = valid_reproposal
-                                            .expect("reproposal mode requires a valid block");
-                                        d.engine.repropose(
-                                            &valid_block,
-                                            round,
-                                            Some(valid_round),
-                                            &election,
-                                            valid_block.header.timestamp,
-                                            d.last_qc_bytes(),
-                                        )
-                                    } else {
-                                        d.engine.propose(&election, timestamp, d.last_qc_bytes(), polc_round)
-                                    };
+                                    let proposal_result =
+                                        if matches!(proposal_mode, ProposalMode::Reproposal) {
+                                            let (valid_block, valid_round) = valid_reproposal
+                                                .expect("reproposal mode requires a valid block");
+                                            d.engine.repropose(
+                                                &valid_block,
+                                                round,
+                                                Some(valid_round),
+                                                &election,
+                                                valid_block.header.timestamp,
+                                                d.last_qc_bytes(),
+                                            )
+                                        } else {
+                                            d.engine.propose(
+                                                &election,
+                                                timestamp,
+                                                d.last_qc_bytes(),
+                                                polc_round,
+                                            )
+                                        };
                                     match proposal_result {
                                         Ok(block) => {
                                             let actions = d.process(DriverEvent::InboundBlock {
@@ -842,21 +936,43 @@ fn main() {
                                 };
 
                                 if let Some((block, actions)) = proposal {
-                                    proposed_at_slot = Some((block.header.height, block.header.proposer_round));
-                                    process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                                    proposed_at_slot =
+                                        Some((block.header.height, block.header.proposer_round));
+                                    process_driver_actions(
+                                        &driver,
+                                        &gossip,
+                                        &height_tx,
+                                        &handshake_config,
+                                        height,
+                                        actions,
+                                    );
                                 }
                             }
 
                             if phase_started_at.elapsed() >= PROPOSE_TIMEOUT {
                                 let actions = driver.lock().unwrap().on_propose_timeout();
-                                process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                                process_driver_actions(
+                                    &driver,
+                                    &gossip,
+                                    &height_tx,
+                                    &handshake_config,
+                                    height,
+                                    actions,
+                                );
                                 phase_started_at = Instant::now();
                             }
                         }
                         RoundPhase::Prevote => {
                             if phase_started_at.elapsed() >= PREVOTE_TIMEOUT {
                                 let actions = driver.lock().unwrap().on_prevote_timeout();
-                                process_driver_actions(&driver, &gossip, &height_tx, height, actions);
+                                process_driver_actions(
+                                    &driver,
+                                    &gossip,
+                                    &height_tx,
+                                    &handshake_config,
+                                    height,
+                                    actions,
+                                );
                                 phase_started_at = Instant::now();
                             }
                         }
@@ -897,7 +1013,14 @@ fn main() {
 
     if !startup_qc_request.is_empty() {
         let current_height = driver.lock().unwrap().height();
-        process_driver_actions(&driver, &gossip, &height_tx, current_height, startup_qc_request);
+        process_driver_actions(
+            &driver,
+            &gossip,
+            &height_tx,
+            &handshake_config,
+            current_height,
+            startup_qc_request,
+        );
     }
 
     // ── Thread 5: RPC server ────────────────────────────────────────────────
@@ -912,7 +1035,10 @@ fn main() {
         std::thread::spawn(move || {
             let listener = match std::net::TcpListener::bind(&rpc_addr) {
                 Ok(l) => l,
-                Err(e) => { eprintln!("[rpc] bind failed: {}", e); return; }
+                Err(e) => {
+                    eprintln!("[rpc] bind failed: {}", e);
+                    return;
+                }
             };
             for stream in listener.incoming() {
                 match stream {
@@ -939,7 +1065,12 @@ fn main() {
 
         let (height, base_fee, mempool, peers) = {
             let d = driver.lock().unwrap();
-            (d.height(), d.engine.state.base_fee, d.engine.mempool.len(), gossip.connection_count())
+            (
+                d.height(),
+                d.engine.state.base_fee,
+                d.engine.mempool.len(),
+                gossip.connection_count(),
+            )
         };
 
         let new_blocks = height.saturating_sub(last_height);
@@ -970,18 +1101,27 @@ fn process_driver_actions(
     driver: &Arc<Mutex<ConsensusDriver>>,
     gossip: &Arc<NetworkBridge>,
     height_tx: &std::sync::mpsc::Sender<()>,
+    handshake_config: &Arc<RwLock<HandshakeConfig>>,
     previous_height: u64,
     actions: Vec<DriverAction>,
 ) {
     for action in actions {
         if let DriverAction::ActivateBufferedProposal(block) = action {
-            let actions2 = driver.lock().unwrap().process(DriverEvent::InboundBlock {
-                from: None,
-                block,
-            });
-            process_driver_actions(driver, gossip, height_tx, previous_height, actions2);
+            let actions2 = driver
+                .lock()
+                .unwrap()
+                .process(DriverEvent::InboundBlock { from: None, block });
+            process_driver_actions(
+                driver,
+                gossip,
+                height_tx,
+                handshake_config,
+                previous_height,
+                actions2,
+            );
             let new_height = driver.lock().unwrap().height();
             if new_height > previous_height {
+                refresh_handshake_config(&driver.lock().unwrap().engine, handshake_config);
                 let _ = height_tx.send(());
                 broadcast_status(driver, gossip);
             }
@@ -1008,13 +1148,18 @@ fn process_driver_actions(
             broadcast_driver_message(gossip, &action, &out_msg);
         }
 
-        if let DriverAction::RequestBlocks { from, from_height, to_height } = &action {
-            if should_log_sync_height(*from_height) || to_height.saturating_sub(*from_height) < SYNC_BATCH_SIZE {
+        if let DriverAction::RequestBlocks {
+            from,
+            from_height,
+            to_height,
+        } = &action
+        {
+            if should_log_sync_height(*from_height)
+                || to_height.saturating_sub(*from_height) < SYNC_BATCH_SIZE
+            {
                 eprintln!(
                     "[sync] requesting blocks {}..{} from {}",
-                    from_height,
-                    to_height,
-                    from
+                    from_height, to_height, from
                 );
             }
             let req = Message::RequestBlocks {
@@ -1026,7 +1171,13 @@ fn process_driver_actions(
             }
         }
 
-        if let DriverAction::RequestProposal { from, height, round, hash } = &action {
+        if let DriverAction::RequestProposal {
+            from,
+            height,
+            round,
+            hash,
+        } = &action
+        {
             let req = Message::RequestProposal {
                 height: *height,
                 round: *round,
@@ -1037,7 +1188,12 @@ fn process_driver_actions(
             }
         }
 
-        if let DriverAction::SendQCResponse { to, height, qc_bytes } = &action {
+        if let DriverAction::SendQCResponse {
+            to,
+            height,
+            qc_bytes,
+        } = &action
+        {
             let msg = Message::QCResponse {
                 height: *height,
                 qc_bytes: qc_bytes.clone(),
@@ -1053,6 +1209,7 @@ fn announce_status_and_recovery(
     driver: &Arc<Mutex<ConsensusDriver>>,
     gossip: &Arc<NetworkBridge>,
     height_tx: &std::sync::mpsc::Sender<()>,
+    handshake_config: &Arc<RwLock<HandshakeConfig>>,
     validator_id: indra_core::Bytes32,
 ) {
     let (height, tip_hash) = {
@@ -1065,7 +1222,7 @@ fn announce_status_and_recovery(
     broadcast_status(driver, gossip);
 
     let actions = driver.lock().unwrap().request_qc_if_needed();
-    process_driver_actions(driver, gossip, height_tx, height, actions);
+    process_driver_actions(driver, gossip, height_tx, handshake_config, height, actions);
 }
 
 fn startup_peer_messages(height: u64, tip_hash: indra_core::Bytes32) -> [Message; 2] {
@@ -1128,7 +1285,11 @@ fn should_skip_default_bootstrap(local_p2p_addr: &str, default_peer: &str) -> bo
         }
     }
 
-    if let Some(local_port) = local_p2p_addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+    if let Some(local_port) = local_p2p_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+    {
         if local_port == default_socket.port() {
             if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
                 if sock.connect(default_socket).is_ok() {
@@ -1165,20 +1326,21 @@ fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
     };
     let after = &json[pos + key.len()..];
     let start = after.find('"').unwrap_or(0) + 1;
-    let end   = after[start..].find('"').unwrap_or(0) + start;
+    let end = after[start..].find('"').unwrap_or(0) + start;
     hex::decode(&after[start..end]).unwrap_or_default()
 }
 
 fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
     let key = format!("\"{}\":", field);
-    let pos = json.find(&key)
+    let pos = json
+        .find(&key)
         .unwrap_or_else(|| panic!("Field '{}' not found in keys.json", field));
     let after = &json[pos + key.len()..];
     let start = after.find('"').unwrap() + 1;
-    let end   = after[start..].find('"').unwrap() + start;
+    let end = after[start..].find('"').unwrap() + start;
     let hex_str = &after[start..end];
-    let bytes = hex::decode(hex_str)
-        .unwrap_or_else(|_| panic!("Invalid hex for field '{}'", field));
+    let bytes =
+        hex::decode(hex_str).unwrap_or_else(|_| panic!("Invalid hex for field '{}'", field));
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes[..32]);
     arr
@@ -1189,8 +1351,12 @@ fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
 /// Reads one HTTP request, dispatches to the appropriate chain query,
 /// and writes the JSON response. Locks the driver only for the duration
 /// of the state read — not while writing the HTTP response.
-fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>, gossip: &Arc<NetworkBridge>) {
-    use std::io::{BufRead, BufReader, Write, Read};
+fn handle_rpc(
+    stream: std::net::TcpStream,
+    driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    gossip: &Arc<NetworkBridge>,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
 
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
 
@@ -1207,22 +1373,34 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
 
     loop {
         line.clear();
-        if reader.read_line(&mut line).is_err() { return; }
+        if reader.read_line(&mut line).is_err() {
+            return;
+        }
         let trimmed = line.trim();
         if first_line {
-            if trimmed.starts_with("OPTIONS") { is_options = true; }
+            if trimmed.starts_with("OPTIONS") {
+                is_options = true;
+            }
             first_line = false;
         }
-        if trimmed.is_empty() { break; }
+        if trimmed.is_empty() {
+            break;
+        }
         if trimmed.to_lowercase().starts_with("content-length:") {
-            content_length = trimmed["content-length:".len()..].trim().parse().unwrap_or(0);
+            content_length = trimmed["content-length:".len()..]
+                .trim()
+                .parse()
+                .unwrap_or(0);
         }
     }
 
     let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
 
     if is_options {
-        let resp = format!("HTTP/1.1 204 No Content\r\n{}Connection: close\r\n\r\n", cors);
+        let resp = format!(
+            "HTTP/1.1 204 No Content\r\n{}Connection: close\r\n\r\n",
+            cors
+        );
         let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
         return;
     }
@@ -1235,7 +1413,9 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
     }
 
     let mut body_bytes = vec![0u8; content_length.min(1_048_576)];
-    if reader.read_exact(&mut body_bytes).is_err() { return; }
+    if reader.read_exact(&mut body_bytes).is_err() {
+        return;
+    }
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     // ── Parse JSON-RPC method ─────────────────────────────────────────────
@@ -1254,8 +1434,11 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                 format!(r#"{{"height":{}}}"#, s.height)
             }
             "indra_getTip" => {
-                format!(r#"{{"height":{},"tip_hash":"{}"}}"#,
-                    s.height, hex::encode(s.tip_hash.0))
+                format!(
+                    r#"{{"height":{},"tip_hash":"{}"}}"#,
+                    s.height,
+                    hex::encode(s.tip_hash.0)
+                )
             }
             "indra_getChainInfo" => {
                 let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
@@ -1265,8 +1448,10 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     .saturating_add(s.delegations.total_staked());
                 let max_active_validators =
                     indra_core::types::primitives::max_active_validators(total_staked_spark);
-                let effective_min_stake_spark =
-                    s.validators.effective_min_active_stake(&s.delegations).unwrap_or(0);
+                let effective_min_stake_spark = s
+                    .validators
+                    .effective_min_active_stake(&s.delegations)
+                    .unwrap_or(0);
                 let validator_set_phase =
                     indra_core::types::primitives::validator_set_phase(total_staked_spark);
                 let era = if s.height < indra_core::types::primitives::ERA_1_2_DURATION_BLOCKS {
@@ -1293,7 +1478,11 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                     validator_set_phase,
                     mempool_size,
                     s.current_epoch(),
-                    if guard.engine.block_store.is_archive() { "false" } else { "true" },
+                    if guard.engine.block_store.is_archive() {
+                        "false"
+                    } else {
+                        "true"
+                    },
                     guard.engine.block_store.lowest_height(),
                     guard.engine.block_store.len(),
                     block_reward_spark,
@@ -1304,6 +1493,85 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
             }
             "indra_getMempoolSize" => {
                 format!(r#"{{"size":{}}}"#, mempool_size)
+            }
+            "indra_submitStakingOp" => {
+                let op_hex = first_param.clone().unwrap_or_default();
+                if op_hex.is_empty() {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"missing staking op hex param"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let op_bytes = match hex::decode(&op_hex) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        let err = format!(
+                            r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid hex encoding"}},"id":{}}}"#,
+                            id_raw
+                        );
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                        let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                        return;
+                    }
+                };
+                use indra_core::codec::Decode;
+                use indra_core::types::staking::StakingOp;
+                match StakingOp::decode_exact(&op_bytes) {
+                    Ok(op) => match guard.engine.add_staking_op(op) {
+                        Ok(()) => format!(r#"{{"status":"accepted"}}"#),
+                        Err(e) => {
+                            let err = format!(
+                                r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"rejected: {}"}},"id":{}}}"#,
+                                e, id_raw
+                            );
+                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                            let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let err = format!(
+                            r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"staking op decode failed: {}"}},"id":{}}}"#,
+                            e, id_raw
+                        );
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                        let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                        return;
+                    }
+                }
+            }
+            "indra_getStakingNonce" => {
+                let signer_id_hex = first_param.clone().unwrap_or_default();
+                if signer_id_hex.len() != 64 {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid signer_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let mut raw = [0u8; 32];
+                if hex::decode_to_slice(&signer_id_hex, &mut raw).is_err() {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid signer_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let signer_id = indra_core::Bytes32::from(raw);
+                let nonce = s.staking_nonces.get(&signer_id).copied().unwrap_or(0);
+                format!(
+                    r#"{{"signer_id":"{}","current_nonce":{},"next_nonce":{}}}"#,
+                    signer_id_hex,
+                    nonce,
+                    nonce.saturating_add(1),
+                )
             }
             "indra_getValidator" => {
                 let validator_hex = first_param.clone().unwrap_or_default();
@@ -1349,35 +1617,160 @@ fn handle_rpc(stream: std::net::TcpStream, driver: &Arc<Mutex<indra_node::driver
                 }).collect();
                 format!(r#"{{"validators":[{}]}}"#, entries.join(","))
             }
+            "indra_getDelegations" => {
+                let validator_hex = first_param.clone().unwrap_or_default();
+                if validator_hex.len() != 64 {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid validator_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let mut raw = [0u8; 32];
+                if hex::decode_to_slice(&validator_hex, &mut raw).is_err() {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid validator_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let validator_id = indra_core::Bytes32::from(raw);
+                let entries: Vec<String> = s.delegations.get_delegators(&validator_id).iter().map(|de| {
+                    format!(
+                        r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{}}}"#,
+                        hex::encode(de.delegator_id.0),
+                        de.staked_spark,
+                        de.pending_rewards,
+                        if de.unbonding_end_epoch.is_some() { "true" } else { "false" },
+                        de.unbonding_end_epoch.unwrap_or(0),
+                    )
+                }).collect();
+                format!(
+                    r#"{{"validator_id":"{}","delegations":[{}]}}"#,
+                    validator_hex,
+                    entries.join(",")
+                )
+            }
+            "indra_getEpochInfo" => {
+                let height = s.height;
+                let current_epoch = indra_state::epoch::epoch_for_height(height);
+                let epoch_duration = indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+                let next_epoch_height = current_epoch
+                    .saturating_add(1)
+                    .saturating_mul(epoch_duration);
+                let blocks_until_next = next_epoch_height.saturating_sub(height);
+                let total_staked = s
+                    .validators
+                    .total_selectable_self_stake()
+                    .saturating_add(s.delegations.total_staked());
+                let phase = indra_core::types::primitives::validator_set_phase(total_staked);
+                let max_validators =
+                    indra_core::types::primitives::max_active_validators(total_staked);
+                format!(
+                    r#"{{"current_epoch":{},"next_epoch_height":{},"blocks_until_next_epoch":{},"epoch_duration_blocks":{},"validator_set_phase":{},"max_active_validators":{}}}"#,
+                    current_epoch,
+                    next_epoch_height,
+                    blocks_until_next,
+                    epoch_duration,
+                    phase,
+                    max_validators,
+                )
+            }
+            "indra_getValidatorRewards" => {
+                let validator_hex = first_param.clone().unwrap_or_default();
+                if validator_hex.len() != 64 {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid validator_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let mut raw = [0u8; 32];
+                if hex::decode_to_slice(&validator_hex, &mut raw).is_err() {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid validator_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let validator_id = indra_core::Bytes32::from(raw);
+                let validator_rewards = s
+                    .validators
+                    .get(&validator_id)
+                    .map(|v| v.pending_rewards)
+                    .unwrap_or(0);
+                let delegator_rewards: Vec<String> = s
+                    .delegations
+                    .get_delegators(&validator_id)
+                    .iter()
+                    .map(|de| {
+                        format!(
+                            r#"{{"delegator_id":"{}","pending_rewards":{}}}"#,
+                            hex::encode(de.delegator_id.0),
+                            de.pending_rewards,
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"{{"validator_id":"{}","validator_pending_rewards":{},"delegator_rewards":[{}]}}"#,
+                    validator_hex,
+                    validator_rewards,
+                    delegator_rewards.join(","),
+                )
+            }
             "indra_sendTransaction" => {
                 // Params: ["<tx_hex>"]
                 let tx_hex = first_param.clone().unwrap_or_default();
                 if tx_hex.is_empty() {
-                    let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"missing tx_hex param"}},"id":{}}}"#, id_raw);
-                    let resp = format!("HTTP/1.1 200 OK
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"missing tx_hex param"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK
 Content-Type: application/json
 {}Content-Length: {}
 Connection: close
 
-{}", cors, err.len(), err);
+{}",
+                        cors,
+                        err.len(),
+                        err
+                    );
                     let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
                     return;
                 }
                 let tx_bytes = match hex::decode(&tx_hex) {
                     Ok(b) => b,
                     Err(_) => {
-                        let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid hex encoding"}},"id":{}}}"#, id_raw);
-                        let resp = format!("HTTP/1.1 200 OK
+                        let err = format!(
+                            r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid hex encoding"}},"id":{}}}"#,
+                            id_raw
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK
 Content-Type: application/json
 {}Content-Length: {}
 Connection: close
 
-{}", cors, err.len(), err);
+{}",
+                            cors,
+                            err.len(),
+                            err
+                        );
                         let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
                         return;
                     }
                 };
-                use indra_core::codec::{Decode, ByteReader};
+                use indra_core::codec::{ByteReader, Decode};
                 use indra_core::types::transaction::TransactionV1;
                 let mut reader = ByteReader::new(&tx_bytes);
                 match TransactionV1::decode(&mut reader) {
@@ -1387,30 +1780,49 @@ Connection: close
                         match guard.engine.mempool.submit(tx.clone(), base_fee, height) {
                             Ok(tx_id) => {
                                 gossip.broadcast(&Message::Tx(tx));
-                                format!(r#"{{"tx_id":"{}","status":"accepted"}}"#,
-                                    hex::encode(tx_id.0))
+                                format!(
+                                    r#"{{"tx_id":"{}","status":"accepted"}}"#,
+                                    hex::encode(tx_id.0)
+                                )
                             }
                             Err(e) => {
-                                let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"mempool rejected: {}"}},"id":{}}}"#, e, id_raw);
-                                let resp = format!("HTTP/1.1 200 OK
+                                let err = format!(
+                                    r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"mempool rejected: {}"}},"id":{}}}"#,
+                                    e, id_raw
+                                );
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK
 Content-Type: application/json
 {}Content-Length: {}
 Connection: close
 
-{}", cors, err.len(), err);
-                                let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+{}",
+                                    cors,
+                                    err.len(),
+                                    err
+                                );
+                                let _ =
+                                    stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
                                 return;
                             }
                         }
                     }
                     Err(e) => {
-                        let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"tx decode failed: {}"}},"id":{}}}"#, e, id_raw);
-                        let resp = format!("HTTP/1.1 200 OK
+                        let err = format!(
+                            r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"tx decode failed: {}"}},"id":{}}}"#,
+                            e, id_raw
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK
 Content-Type: application/json
 {}Content-Length: {}
 Connection: close
 
-{}", cors, err.len(), err);
+{}",
+                            cors,
+                            err.len(),
+                            err
+                        );
                         let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
                         return;
                     }
@@ -1422,7 +1834,8 @@ Connection: close
                 let mut balance: u64 = 0;
                 if address_hex.len() == 64 {
                     for entry in s.utxos.all_entries() {
-                        let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
+                        let owner_address =
+                            indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
                         if hex::encode(owner_address) == address_hex {
                             balance = balance.saturating_add(entry.output.value_spark);
                         }
@@ -1448,9 +1861,14 @@ Connection: close
                             )
                         })
                         .collect()
-                } else { vec![] };
-                format!(r#"{{"address":"{}","utxos":[{}]}}"#,
-                    address_hex, entries.join(","))
+                } else {
+                    vec![]
+                };
+                format!(
+                    r#"{{"address":"{}","utxos":[{}]}}"#,
+                    address_hex,
+                    entries.join(",")
+                )
             }
             "indra_getUtxoProof" => {
                 // Params: ["<utxo_id_hex>"]
@@ -1465,7 +1883,8 @@ Connection: close
                         raw.copy_from_slice(&decoded);
                         let utxo_id = indra_core::Bytes32::from(raw);
                         let proof = s.utxos.prove(&utxo_id);
-                        let siblings = proof.siblings
+                        let siblings = proof
+                            .siblings
                             .iter()
                             .map(|sibling| format!(r#""{}""#, hex::encode(sibling)))
                             .collect::<Vec<_>>()
@@ -1475,7 +1894,11 @@ Connection: close
                         format!(
                             r#"{{"utxo_id":"{}","present":{},"value_hash":"{}","siblings":[{}],"state_root":"{}"}}"#,
                             hex::encode(utxo_id.0),
-                            if proof.value.is_some() { "true" } else { "false" },
+                            if proof.value.is_some() {
+                                "true"
+                            } else {
+                                "false"
+                            },
                             value_hash,
                             siblings,
                             hex::encode(state_root.0),
@@ -1486,7 +1909,10 @@ Connection: close
                 }
             }
             _ => {
-                let err = format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found: {}"}},"id":{}}}"#, method, id_raw);
+                let err = format!(
+                    r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found: {}"}},"id":{}}}"#,
+                    method, id_raw
+                );
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
                 let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
                 return;
@@ -1499,7 +1925,9 @@ Connection: close
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         cors, json_resp.len(), json_resp
     );
-    let _ = stream.try_clone().map(|mut w| w.write_all(http_resp.as_bytes()));
+    let _ = stream
+        .try_clone()
+        .map(|mut w| w.write_all(http_resp.as_bytes()));
 }
 
 /// Extract the first element from the JSON-RPC params array.
@@ -1565,14 +1993,7 @@ mod tests {
 
     #[test]
     fn stale_staged_proposal_does_not_block_valid_reproposal() {
-        let mode = choose_proposal_mode(
-            true,
-            true,
-            None,
-            10,
-            3,
-            true,
-        );
+        let mode = choose_proposal_mode(true, true, None, 10, 3, true);
 
         assert_eq!(mode, ProposalMode::Reproposal);
     }

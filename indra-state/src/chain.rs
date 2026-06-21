@@ -6,19 +6,17 @@
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::IndraResult;
 
+use std::collections::HashMap;
+
 use indra_core::types::primitives::{
-    Bytes32,
-    DEFAULT_CHAIN_ID,
-    GENESIS_SUPPLY_SPARK,
-    INITIAL_BASE_FEE_SPARK_PER_KB,
+    Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
     MAX_CHAIN_ID_BYTES,
-    VariableBytes,
 };
 
 use crate::{
     nullifier::NullifierSet,
     utxo::UtxoSet,
-    validator::{ValidatorSet, DelegationMap},
+    validator::{DelegationMap, ValidatorSet},
 };
 
 /// The complete chain state at a given block height.
@@ -65,6 +63,9 @@ pub struct ChainState {
 
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
+
+    /// Monotonic nonces for staking op replay protection.
+    pub staking_nonces: HashMap<Bytes32, u64>,
 }
 
 impl Encode for ChainState {
@@ -95,6 +96,7 @@ impl Encode for ChainState {
         self.validators.encode(buf);
         // Included: delegations affect validator power and epoch transitions.
         self.delegations.encode(buf);
+        encode_nonce_map(&self.staking_nonces, buf);
         // Omitted: no extra cached fields live on ChainState itself; nested SMT caches are
         // intentionally reconstructed by the set decoders from the serialized canonical entries.
     }
@@ -114,6 +116,7 @@ impl Encode for ChainState {
             + self.nullifiers.encoded_len()
             + self.validators.encoded_len()
             + self.delegations.encoded_len()
+            + nonce_map_encoded_len(&self.staking_nonces)
     }
 }
 
@@ -134,6 +137,7 @@ impl Decode for ChainState {
             nullifiers: NullifierSet::decode(r)?,
             validators: ValidatorSet::decode(r)?,
             delegations: DelegationMap::decode(r)?,
+            staking_nonces: decode_nonce_map(r)?,
         })
     }
 }
@@ -144,18 +148,19 @@ impl ChainState {
     /// This is the canonical starting point for every INDRA node.
     pub fn new_genesis() -> Self {
         Self {
-            chain_id:         DEFAULT_CHAIN_ID.to_string(),
-            height:           0,
-            tip_hash:         Bytes32::ZERO,
-            base_fee:         INITIAL_BASE_FEE_SPARK_PER_KB,
-            total_supply:     GENESIS_SUPPLY_SPARK,
+            chain_id: DEFAULT_CHAIN_ID.to_string(),
+            height: 0,
+            tip_hash: Bytes32::ZERO,
+            base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
+            total_supply: GENESIS_SUPPLY_SPARK,
             treasury_balance: 0,
-            burn_buffer:      0,
-            fee_reward_pool:  0,
-            utxos:            UtxoSet::new(),
-            nullifiers:       NullifierSet::new(),
-            validators:       ValidatorSet::new(),
-            delegations:      DelegationMap::new(),
+            burn_buffer: 0,
+            fee_reward_pool: 0,
+            utxos: UtxoSet::new(),
+            nullifiers: NullifierSet::new(),
+            validators: ValidatorSet::new(),
+            delegations: DelegationMap::new(),
+            staking_nonces: HashMap::new(),
         }
     }
 
@@ -170,12 +175,50 @@ impl ChainState {
     }
 }
 
+fn encode_nonce_map(nonces: &HashMap<Bytes32, u64>, buf: &mut Vec<u8>) {
+    let mut entries: Vec<_> = nonces.iter().collect();
+    entries.sort_by_key(|(signer_id, _)| signer_id.0);
+    (entries.len() as u32).encode(buf);
+    for (signer_id, nonce) in entries {
+        signer_id.encode(buf);
+        nonce.encode(buf);
+    }
+}
+
+fn nonce_map_encoded_len(nonces: &HashMap<Bytes32, u64>) -> usize {
+    4 + nonces.len() * (32 + 8)
+}
+
+fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, u64>> {
+    use indra_core::error::IndraError;
+    use indra_core::types::primitives::MAX_VALIDATORS;
+
+    let count = u32::decode(r)? as usize;
+    let max = MAX_VALIDATORS.saturating_mul(100);
+    if count > max {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.staking_nonces",
+            max,
+            actual: count,
+        });
+    }
+    let mut nonces = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let signer_id = Bytes32::decode(r)?;
+        let nonce = u64::decode(r)?;
+        if nonces.insert(signer_id, nonce).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.staking_nonces",
+            });
+        }
+    }
+    Ok(nonces)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::{
-        GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
-    };
+    use indra_core::types::primitives::{GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB};
 
     #[test]
     fn genesis_state_is_correct() {

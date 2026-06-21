@@ -80,28 +80,28 @@ impl StateStore {
                 let mut header = [0u8; 12];
                 f.read_exact(&mut header)?;
 
-                let height_bytes: [u8; 8] = header[..8]
-                    .try_into()
-                    .map_err(|_| StorageError::Corruption {
-                        height: 0,
-                        detail: "snapshot header truncated while reading height".to_string(),
-                    })?;
+                let height_bytes: [u8; 8] =
+                    header[..8]
+                        .try_into()
+                        .map_err(|_| StorageError::Corruption {
+                            height: 0,
+                            detail: "snapshot header truncated while reading height".to_string(),
+                        })?;
                 let height = u64::from_le_bytes(height_bytes);
-                let length_bytes: [u8; 4] = header[8..12]
-                    .try_into()
-                    .map_err(|_| StorageError::Corruption {
-                        height,
-                        detail: "snapshot header truncated while reading length".to_string(),
-                    })?;
+                let length_bytes: [u8; 4] =
+                    header[8..12]
+                        .try_into()
+                        .map_err(|_| StorageError::Corruption {
+                            height,
+                            detail: "snapshot header truncated while reading length".to_string(),
+                        })?;
                 let length = u32::from_le_bytes(length_bytes) as usize;
 
                 let mut state_bytes = vec![0u8; length];
                 f.read_exact(&mut state_bytes)?;
 
-                deserialise_chain_state(&state_bytes, height).map_err(|e| StorageError::Corruption {
-                    height,
-                    detail: e,
-                })
+                deserialise_chain_state(&state_bytes, height)
+                    .map_err(|e| StorageError::Corruption { height, detail: e })
             }
         }
     }
@@ -220,15 +220,19 @@ fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<Chai
 mod tests {
     use super::*;
     use indra_core::{
-        Bytes32, ProtocolVersion, VariableBytes,
         types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         types::primitives::MAX_VRF_PROOF_BYTES,
+        Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_state_test_{}_{}", suffix, std::process::id()));
+        p.push(format!(
+            "indra_state_test_{}_{}",
+            suffix,
+            std::process::id()
+        ));
         p
     }
 
@@ -263,8 +267,10 @@ mod tests {
         let dir = temp_dir("c");
         let store = StateStore::open(&dir).unwrap();
 
-        let mut s1 = ChainState::new_genesis(); s1.height = 10;
-        let mut s2 = ChainState::new_genesis(); s2.height = 20;
+        let mut s1 = ChainState::new_genesis();
+        s1.height = 10;
+        let mut s2 = ChainState::new_genesis();
+        s2.height = 20;
 
         store.save(&s1).unwrap();
         store.save(&s2).unwrap();
@@ -375,6 +381,7 @@ mod tests {
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
+            staking_ops: vec![],
         };
 
         let mut projected = state.clone();
@@ -439,7 +446,8 @@ mod tests {
 
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(&300u64.to_le_bytes()).unwrap();
-        file.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
         file.write_all(&payload).unwrap();
         file.flush().unwrap();
         drop(file);

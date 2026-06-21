@@ -4,7 +4,7 @@
 //! else. No magic numbers appear elsewhere in the codebase.
 
 use crate::{
-    codec::{Encode, Decode, ByteReader},
+    codec::{ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
 };
 
@@ -98,6 +98,12 @@ pub const MAX_SLASHES_PER_BLOCK: usize = 10;
 
 /// Maximum governance operations per block.
 pub const MAX_GOV_OPS_PER_BLOCK: usize = 5;
+
+/// Maximum staking operations per block.
+pub const MAX_STAKING_OPS_PER_BLOCK: usize = 10;
+
+/// Domain separation tag for staking operation signing bytes.
+pub const STAKING_OP_DOMAIN: &str = "indra-stake-v1";
 
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 
@@ -367,7 +373,6 @@ pub const PRUNE_WINDOW_EPOCHS: u64 = 500;
 /// The only protocol version this implementation supports.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-
 // =============================================================================
 // PRIMITIVE TYPES
 // =============================================================================
@@ -380,18 +385,28 @@ impl Bytes32 {
     pub const ZERO: Self = Self([0u8; 32]);
 
     /// Create from a byte array.
-    pub fn from_bytes(b: [u8; 32]) -> Self { Self(b) }
+    pub fn from_bytes(b: [u8; 32]) -> Self {
+        Self(b)
+    }
 
     /// View as a fixed-size array.
-    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 
     /// View as a slice.
-    pub fn as_slice(&self) -> &[u8] { &self.0 }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl Encode for Bytes32 {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.extend_from_slice(&self.0); }
-    fn encoded_len(&self) -> usize { 32 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.0);
+    }
+    fn encoded_len(&self) -> usize {
+        32
+    }
 }
 
 impl Decode for Bytes32 {
@@ -401,21 +416,26 @@ impl Decode for Bytes32 {
 }
 
 impl AsRef<[u8]> for Bytes32 {
-    fn as_ref(&self) -> &[u8] { &self.0 }
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl From<[u8; 32]> for Bytes32 {
-    fn from(b: [u8; 32]) -> Self { Self(b) }
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
 }
 
 impl core::fmt::Display for Bytes32 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "0x")?;
-        for b in &self.0 { write!(f, "{b:02x}")?; }
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
         Ok(())
     }
 }
-
 
 /// A variable-length byte sequence with a protocol-enforced maximum size.
 ///
@@ -445,16 +465,24 @@ impl<const MAX: usize> VariableBytes<MAX> {
     }
 
     /// Byte length.
-    pub fn len(&self) -> usize { self.0.len() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 
     /// True if empty.
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     /// View as a slice.
-    pub fn as_slice(&self) -> &[u8] { &self.0 }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
 
     /// Consume and return the inner Vec.
-    pub fn into_vec(self) -> Vec<u8> { self.0 }
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 impl<const MAX: usize> Encode for VariableBytes<MAX> {
@@ -462,7 +490,9 @@ impl<const MAX: usize> Encode for VariableBytes<MAX> {
         buf.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.0);
     }
-    fn encoded_len(&self) -> usize { 4 + self.0.len() }
+    fn encoded_len(&self) -> usize {
+        4 + self.0.len()
+    }
 }
 
 impl<const MAX: usize> Decode for VariableBytes<MAX> {
@@ -480,7 +510,6 @@ impl<const MAX: usize> Decode for VariableBytes<MAX> {
     }
 }
 
-
 /// Protocol version wrapper with validation on decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolVersion(pub u16);
@@ -490,12 +519,18 @@ impl ProtocolVersion {
     pub const CURRENT: Self = Self(PROTOCOL_VERSION);
 
     /// True if this version is supported.
-    pub fn is_supported(&self) -> bool { self.0 == PROTOCOL_VERSION }
+    pub fn is_supported(&self) -> bool {
+        self.0 == PROTOCOL_VERSION
+    }
 }
 
 impl Encode for ProtocolVersion {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.extend_from_slice(&self.0.to_le_bytes()); }
-    fn encoded_len(&self) -> usize { 2 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.0.to_le_bytes());
+    }
+    fn encoded_len(&self) -> usize {
+        2
+    }
 }
 
 impl Decode for ProtocolVersion {
@@ -556,8 +591,7 @@ mod tests {
     #[test]
     fn economics_constants_consistent() {
         assert_eq!(
-            VALIDATOR_REWARDS_POOL_SPARK,
-            GENESIS_SUPPLY_SPARK,
+            VALIDATOR_REWARDS_POOL_SPARK, GENESIS_SUPPLY_SPARK,
             "All INDRA must be in the validator rewards pool — no pre-mine"
         );
         assert_eq!(HARD_CAP_SPARK, GENESIS_SUPPLY_SPARK);

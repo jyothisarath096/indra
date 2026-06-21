@@ -8,19 +8,17 @@
 //!
 //! The genesis state is produced by `ChainState::new_genesis()`.
 
-use indra_core::{
-    types::{
-        block::{BlockHeaderV1, BlockV1},
-        crypto::{CommitmentV1, HybridPubKey},
-        primitives::{
-            Bytes32, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK, ProtocolVersion, VariableBytes,
-            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
-        },
-        transaction::OutputV1,
+use indra_core::types::{
+    block::{BlockHeaderV1, BlockV1},
+    crypto::{CommitmentV1, HybridPubKey},
+    primitives::{
+        Bytes32, ProtocolVersion, VariableBytes, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
+        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
     },
+    transaction::OutputV1,
 };
-use indra_state::ChainState;
 use indra_crypto::{commit, prove_range, sha256};
+use indra_state::ChainState;
 use rand::{rngs::StdRng, SeedableRng};
 
 const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
@@ -31,24 +29,25 @@ const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
 pub fn build_genesis_block() -> BlockV1 {
     BlockV1 {
         header: BlockHeaderV1 {
-            protocol_version:    ProtocolVersion::CURRENT,
-            height:              0,
-            prev_hash:           Bytes32::ZERO,
-            timestamp:           1_700_000_000, // 2023-11-14 — fixed genesis timestamp
-            state_root:          Bytes32::ZERO,
-            validator_set_root:  Bytes32::ZERO,
-            mempool_set_root:    Bytes32::ZERO,
-            value_hash:          Bytes32::ZERO,
-            base_fee:            INITIAL_BASE_FEE_SPARK_PER_KB,
-            proposer_round:      0,
-            polc_round:          indra_core::types::block::NO_POLC_ROUND,
+            protocol_version: ProtocolVersion::CURRENT,
+            height: 0,
+            prev_hash: Bytes32::ZERO,
+            timestamp: 1_700_000_000, // 2023-11-14 — fixed genesis timestamp
+            state_root: Bytes32::ZERO,
+            validator_set_root: Bytes32::ZERO,
+            mempool_set_root: Bytes32::ZERO,
+            value_hash: Bytes32::ZERO,
+            base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
+            proposer_round: 0,
+            polc_round: indra_core::types::block::NO_POLC_ROUND,
             proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::default(),
-            quorum_certificate:  VariableBytes::<MAX_QC_SIZE_BYTES>::default(),
+            proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::default(),
+            quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::default(),
         },
-        transactions:      vec![],
+        transactions: vec![],
         slashing_evidence: vec![],
-        governance_ops:    vec![],
+        governance_ops: vec![],
+        staking_ops: vec![],
     }
 }
 
@@ -67,7 +66,6 @@ pub fn build_genesis_state() -> ChainState {
     assert_eq!(state.fee_reward_pool, 0);
     state
 }
-
 
 /// Load validator entries from a genesis.toml file.
 ///
@@ -138,7 +136,8 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         if in_validator {
             if let Some(eq) = line.find('=') {
                 let key = line[..eq].trim().to_string();
-                let val = line[eq+1..].trim()
+                let val = line[eq + 1..]
+                    .trim()
                     .trim_matches('"')
                     .trim_end_matches(',')
                     .trim_matches('"')
@@ -152,7 +151,11 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
     }
 
     // NOTE: startup logging for node bootstrap; replace with structured tracing later.
-    println!("[genesis] Loading {} validators from {}", validators.len(), genesis_path);
+    println!(
+        "[genesis] Loading {} validators from {}",
+        validators.len(),
+        genesis_path
+    );
 
     for v in &validators {
         let id_hex = match v.get("validator_id") {
@@ -192,13 +195,17 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         };
 
         let _ = state.validators.upsert(entry);
-        if let (Some(classical_pk), Some(hybrid_pq_pk)) =
-            (parse_fixed_hex::<32>(v.get("hybrid_classical_pk")), parse_vec_hex(v.get("hybrid_pq_pk")))
-        {
-            let blinding = sha256(&[
-                b"genesis-utxo-blinding".as_slice(),
-                validator_id.0.as_slice(),
-            ].concat());
+        if let (Some(classical_pk), Some(hybrid_pq_pk)) = (
+            parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
+            parse_vec_hex(v.get("hybrid_pq_pk")),
+        ) {
+            let blinding = sha256(
+                &[
+                    b"genesis-utxo-blinding".as_slice(),
+                    validator_id.0.as_slice(),
+                ]
+                .concat(),
+            );
             let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
             let mut rng = StdRng::from_seed(validator_id.0);
             if let Ok(proof) = prove_range(GENESIS_VALIDATOR_UTXO_SPARK, &blinding, &mut rng) {
@@ -217,13 +224,17 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
                 let _ = state.utxos.insert(output, 0, 0, state.utxos.len() as u32);
                 eprintln!(
                     "[genesis] created UTXO {} Spark for {}",
-                    GENESIS_VALIDATOR_UTXO_SPARK,
-                    name
+                    GENESIS_VALIDATOR_UTXO_SPARK, name
                 );
             }
         }
         // NOTE: startup logging for node bootstrap; replace with structured tracing later.
-        println!("[genesis]   + {} ({}...) stake={} Spark", name, &id_hex[..8], stake);
+        println!(
+            "[genesis]   + {} ({}...) stake={} Spark",
+            name,
+            &id_hex[..8],
+            stake
+        );
     }
     // NOTE: validator stake is bonded in ValidatorEntry only.
     // Liquid allocations are handled separately from validator bonding state.

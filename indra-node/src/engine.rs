@@ -14,9 +14,19 @@
 //!   6. Import the committed block via sync::import_block
 //!   7. Advance to next height
 
+use indra_consensus::{
+    mempool::Mempool,
+    producer::{produce_block, BlockTemplate},
+    proposer::{compute_proposer_vrf, elect_proposer, ProposerElection},
+    qc::QcValidator,
+    vote::{produce_vote, RegisteredVoter},
+};
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-    primitives::{Bytes32, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES, VariableBytes},
+    primitives::{
+        Bytes32, VariableBytes, MAX_QC_SIZE_BYTES, MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+    },
+    staking::StakingOp,
     vote::VoteStep,
 };
 use indra_crypto::{
@@ -24,13 +34,6 @@ use indra_crypto::{
     VrfKeypair,
 };
 use indra_state::ChainState;
-use indra_consensus::{
-    mempool::Mempool,
-    proposer::{ProposerElection, compute_proposer_vrf, elect_proposer},
-    producer::{BlockTemplate, produce_block},
-    qc::QcValidator,
-    vote::{RegisteredVoter, produce_vote},
-};
 use indra_storage::{BlockStore, StateStore};
 
 use crate::{
@@ -48,6 +51,8 @@ pub struct NodeEngine {
     pub state: ChainState,
     /// Pending transaction pool.
     pub mempool: Mempool,
+    /// Pending staking operations waiting to be included in a block.
+    pub staking_mempool: Vec<StakingOp>,
     /// Persistent block log.
     pub block_store: BlockStore,
     /// State snapshot store.
@@ -64,8 +69,7 @@ pub struct NodeEngine {
 impl NodeEngine {
     /// Initialise a node from its configuration.
     pub fn init(config: NodeConfig) -> NodeResult<Self> {
-        std::fs::create_dir_all(&config.data_dir)
-            .map_err(indra_storage::StorageError::Io)?;
+        std::fs::create_dir_all(&config.data_dir).map_err(indra_storage::StorageError::Io)?;
 
         if let Some(keep) = config.prune_keep_blocks {
             assert!(
@@ -93,7 +97,11 @@ impl NodeEngine {
                 });
             }
 
-            startup_log = startup_mode_message(Some(snapshot.height), replay_start, block_store.next_height());
+            startup_log = startup_mode_message(
+                Some(snapshot.height),
+                replay_start,
+                block_store.next_height(),
+            );
             let mut state = snapshot;
             rebuild_state_from_height(&mut state, &mut block_store, replay_start)?;
             state
@@ -119,21 +127,19 @@ impl NodeEngine {
         let (hybrid_keypair, vrf_keypair, validator_id) =
             match (config.validator_seed, config.vrf_seed) {
                 (Some(vs), Some(vrfs)) => {
-                let classical = ClassicalKeypair::from_seed(&vs);
-                let pq = if let (Some(pk), Some(sk)) = (
-                    config.pq_pk.as_deref(),
-                    config.pq_sk.as_deref(),
-                ) {
-                    PqKeypair::from_bytes(pk, sk)
-                        .unwrap_or_else(|_| PqKeypair::generate())
-                } else {
-                    PqKeypair::generate()
-                };
-                let hybrid = HybridKeypair::new(classical, pq);
-                let vrf = VrfKeypair::from_seed(&vrfs);
-                let pk = hybrid.public_key();
-                let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
-                (Some(hybrid), Some(vrf), Some(id))
+                    let classical = ClassicalKeypair::from_seed(&vs);
+                    let pq = if let (Some(pk), Some(sk)) =
+                        (config.pq_pk.as_deref(), config.pq_sk.as_deref())
+                    {
+                        PqKeypair::from_bytes(pk, sk).unwrap_or_else(|_| PqKeypair::generate())
+                    } else {
+                        PqKeypair::generate()
+                    };
+                    let hybrid = HybridKeypair::new(classical, pq);
+                    let vrf = VrfKeypair::from_seed(&vrfs);
+                    let pk = hybrid.public_key();
+                    let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
+                    (Some(hybrid), Some(vrf), Some(id))
                 }
                 (Some(_), None) => {
                     return Err(NodeError::ValidatorConfigIncomplete {
@@ -152,6 +158,7 @@ impl NodeEngine {
             config,
             state,
             mempool,
+            staking_mempool: Vec::new(),
             block_store,
             state_store,
             hybrid_keypair,
@@ -192,15 +199,60 @@ impl NodeEngine {
         Ok(())
     }
 
+    /// Add a staking operation to the pending pool.
+    pub fn add_staking_op(&mut self, op: StakingOp) -> NodeResult<()> {
+        op.validate_structure()
+            .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
+        let signer_id = op.signer_id();
+        let nonce = op.nonce;
+        if self
+            .staking_mempool
+            .iter()
+            .any(|existing| existing.signer_id() == signer_id && existing.nonce == nonce)
+        {
+            return Err(NodeError::InvalidStakingOp(
+                "duplicate staking op nonce".into(),
+            ));
+        }
+        self.staking_mempool.push(op);
+        Ok(())
+    }
+
+    /// Select staking operations for block inclusion.
+    pub fn select_staking_ops(&self) -> Vec<StakingOp> {
+        self.staking_mempool
+            .iter()
+            .take(MAX_STAKING_OPS_PER_BLOCK)
+            .cloned()
+            .collect()
+    }
+
+    /// Remove staking operations included in a committed block.
+    pub fn evict_committed_staking_ops(&mut self, committed_ops: &[StakingOp]) {
+        for op in committed_ops {
+            let signer_id = op.signer_id();
+            let nonce = op.nonce;
+            self.staking_mempool
+                .retain(|existing| !(existing.signer_id() == signer_id && existing.nonce == nonce));
+        }
+    }
+
     /// Check if this node is the elected proposer for the next height.
     pub fn is_proposer(&self, election: &ProposerElection) -> bool {
-        let my_id = self.validator_id
+        let my_id = self
+            .validator_id
             .map(|id| hex::encode(&id.0[..4]))
             .unwrap_or_else(|| "none".to_string());
         let has_vrf = self.vrf_keypair.is_some();
         let cand_count = election.candidates.len();
-        let in_candidates = self.validator_id
-            .map(|validator_id| election.candidates.iter().any(|candidate| candidate.validator_id == validator_id))
+        let in_candidates = self
+            .validator_id
+            .map(|validator_id| {
+                election
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.validator_id == validator_id)
+            })
             .unwrap_or(false);
 
         let Some(vrf_kp) = &self.vrf_keypair else {
@@ -248,21 +300,28 @@ impl NodeEngine {
             });
         }
 
-        let _vrf_kp = self.vrf_keypair.as_ref()
-            .ok_or(NodeError::NotProposer { height: proposal_height })?;
+        let _vrf_kp = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
+            height: proposal_height,
+        })?;
 
         let template = BlockTemplate {
-            proposer_vrf_keypair: VrfKeypair::from_seed(&self.config.vrf_seed
-                .ok_or(NodeError::NotProposer { height: proposal_height })?),
+            proposer_vrf_keypair: VrfKeypair::from_seed(&self.config.vrf_seed.ok_or(
+                NodeError::NotProposer {
+                    height: proposal_height,
+                },
+            )?),
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp,
             polc_round,
+            staking_ops: self.select_staking_ops(),
         };
 
-        eprintln!("[proposer] producing block at height={} round={}", proposal_height, election.round);
-        produce_block(&template, &self.state, &self.mempool, election)
-            .map_err(NodeError::Consensus)
+        eprintln!(
+            "[proposer] producing block at height={} round={}",
+            proposal_height, election.round
+        );
+        produce_block(&template, &self.state, &self.mempool, election).map_err(NodeError::Consensus)
     }
 
     /// Re-propose an already validated value in a later round while keeping
@@ -308,9 +367,11 @@ impl NodeEngine {
         }
 
         let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
-            .map_err(|_| NodeError::Consensus(indra_consensus::error::ConsensusError::CryptoError {
+            .map_err(|_| {
+            NodeError::Consensus(indra_consensus::error::ConsensusError::CryptoError {
                 detail: "VRF proof too large".to_string(),
-            }))?;
+            })
+        })?;
         let qc_bytes = VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&last_qc).map_err(|_| {
             NodeError::Consensus(indra_consensus::error::ConsensusError::CryptoError {
                 detail: "QC bytes too large".to_string(),
@@ -337,6 +398,7 @@ impl NodeEngine {
             transactions: original_block.transactions.clone(),
             slashing_evidence: original_block.slashing_evidence.clone(),
             governance_ops: original_block.governance_ops.clone(),
+            staking_ops: original_block.staking_ops.clone(),
         };
 
         let mut projected = self.state.clone();
@@ -356,13 +418,16 @@ impl NodeEngine {
     pub fn registered_voters(&self) -> Vec<RegisteredVoter> {
         let mut active: Vec<_> = self.state.validators.active_validators().collect();
         active.sort_by_key(|validator| validator.validator_id.0);
-        active.into_iter()
-            .filter_map(|validator| Some(RegisteredVoter {
-                validator_id: validator.validator_id,
-                classical_pk: validator.hybrid_classical_pk?,
-                pq_pk: validator.hybrid_pq_pk.clone()?,
-                stake: validator.stake_spark,
-            }))
+        active
+            .into_iter()
+            .filter_map(|validator| {
+                Some(RegisteredVoter {
+                    validator_id: validator.validator_id,
+                    classical_pk: validator.hybrid_classical_pk?,
+                    pq_pk: validator.hybrid_pq_pk.clone()?,
+                    stake: validator.stake_spark,
+                })
+            })
             .collect()
     }
 
@@ -370,14 +435,17 @@ impl NodeEngine {
     pub fn qc_validators(&self) -> Vec<QcValidator> {
         let mut active: Vec<_> = self.state.validators.active_validators().collect();
         active.sort_by_key(|validator| validator.validator_id.0);
-        active.into_iter()
+        active
+            .into_iter()
             .enumerate()
-            .filter_map(|(position, validator)| Some(QcValidator {
-                validator_id: validator.validator_id,
-                position,
-                pq_pk: validator.hybrid_pq_pk.clone()?,
-                stake: validator.stake_spark,
-            }))
+            .filter_map(|(position, validator)| {
+                Some(QcValidator {
+                    validator_id: validator.validator_id,
+                    position,
+                    pq_pk: validator.hybrid_pq_pk.clone()?,
+                    stake: validator.stake_spark,
+                })
+            })
             .collect()
     }
 
@@ -390,27 +458,40 @@ impl NodeEngine {
         block_hash: Bytes32,
     ) -> NodeResult<indra_core::types::vote::VoteV1> {
         let validator_id = self.validator_id.ok_or(NodeError::NotValidator)?;
-        let hybrid_keypair = self.hybrid_keypair.as_ref().ok_or(NodeError::NotValidator)?;
-        produce_vote(height, round, step, block_hash, validator_id, hybrid_keypair)
-            .map_err(NodeError::Consensus)
+        let hybrid_keypair = self
+            .hybrid_keypair
+            .as_ref()
+            .ok_or(NodeError::NotValidator)?;
+        produce_vote(
+            height,
+            round,
+            step,
+            block_hash,
+            validator_id,
+            hybrid_keypair,
+        )
+        .map_err(NodeError::Consensus)
     }
 
     /// Import a block that has been committed (QC formed).
-    pub fn commit_block(
-        &mut self,
-        block: &indra_core::types::block::BlockV1,
-    ) -> NodeResult<()> {
+    pub fn commit_block(&mut self, block: &indra_core::types::block::BlockV1) -> NodeResult<()> {
         import_block(
             block,
             &mut self.state,
             &mut self.mempool,
             &mut self.block_store,
             &self.state_store,
-        )
+        )?;
+        self.evict_committed_staking_ops(&block.staking_ops);
+        Ok(())
     }
 }
 
-fn startup_mode_message(snapshot_height: Option<u64>, replay_start: u64, next_height: u64) -> String {
+fn startup_mode_message(
+    snapshot_height: Option<u64>,
+    replay_start: u64,
+    next_height: u64,
+) -> String {
     match snapshot_height {
         Some(snapshot_height) => {
             let replay_blocks = next_height.saturating_sub(replay_start);
@@ -469,7 +550,6 @@ fn rebuild_state_from_height(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::codec::Encode;
     use indra_consensus::{
         build_qc,
         producer::{produce_block, BlockTemplate},
@@ -477,17 +557,29 @@ mod tests {
         qc::QcValidator,
         vote::produce_vote,
     };
-    use indra_core::types::vote::VoteStep;
-    use indra_state::{ValidatorEntry, ValidatorStatus};
+    use indra_core::codec::Encode;
+    use indra_core::types::crypto::{HybridPubKey, HybridSignature};
     use indra_core::types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK};
+    use indra_core::types::staking::StakingOpBody;
+    use indra_core::types::vote::VoteStep;
+    use indra_core::VariableBytes;
+    use indra_state::{ValidatorEntry, ValidatorStatus};
 
     fn temp_dir(suffix: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_engine_test_{}_{}", suffix, std::process::id()));
+        p.push(format!(
+            "indra_engine_test_{}_{}",
+            suffix,
+            std::process::id()
+        ));
         p
     }
 
-    fn install_active_validator(engine: &mut NodeEngine, seed: [u8; 32], name: &str) -> HybridKeypair {
+    fn install_active_validator(
+        engine: &mut NodeEngine,
+        seed: [u8; 32],
+        name: &str,
+    ) -> HybridKeypair {
         let classical = ClassicalKeypair::from_seed(&seed);
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let hybrid = HybridKeypair::new(classical, pq);
@@ -515,6 +607,28 @@ mod tests {
             })
             .unwrap();
         hybrid
+    }
+
+    fn dummy_signature() -> HybridSignature {
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        }
+    }
+
+    fn dummy_staking_op(seed: u8, nonce: u64) -> StakingOp {
+        StakingOp {
+            body: StakingOpBody::Delegate {
+                validator_id: Bytes32::from([0xAA; 32]),
+                amount_spark: 1_000_000,
+                delegator_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from([seed; 32]),
+                    pq_pk: VariableBytes::from_slice(&[seed; 2592]).unwrap(),
+                },
+            },
+            nonce,
+            signature: dummy_signature(),
+        }
     }
 
     fn make_strict_block(
@@ -547,9 +661,15 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
+            staking_ops: vec![],
         };
-        produce_block(&template, state, &indra_consensus::mempool::Mempool::default_config(), &election)
-            .unwrap()
+        produce_block(
+            &template,
+            state,
+            &indra_consensus::mempool::Mempool::default_config(),
+            &election,
+        )
+        .unwrap()
     }
 
     fn build_single_validator_qc_bytes(
@@ -563,7 +683,15 @@ mod tests {
         let hybrid = HybridKeypair::new(classical, pq);
         let public = hybrid.public_key();
         let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
-        let vote = produce_vote(height, round, VoteStep::Precommit, value_hash, validator_id, &hybrid).unwrap();
+        let vote = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            value_hash,
+            validator_id,
+            &hybrid,
+        )
+        .unwrap();
         let qc = build_qc(
             height,
             round,
@@ -635,7 +763,8 @@ mod tests {
         for height in 1..=3u64 {
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
-            last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+            last_qc =
+                build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
             assert_eq!(engine.state.height, height);
         }
 
@@ -658,7 +787,12 @@ mod tests {
             for height in 1..=1_000u64 {
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
-                last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+                last_qc = build_single_validator_qc_bytes(
+                    height,
+                    0,
+                    block.header.value_hash,
+                    [0x42u8; 32],
+                );
                 assert_eq!(engine.state.height, height);
             }
             assert!(engine.block_store.lowest_height() > 0);
@@ -685,7 +819,12 @@ mod tests {
             for height in 1..=610u64 {
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
-                last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+                last_qc = build_single_validator_qc_bytes(
+                    height,
+                    0,
+                    block.header.value_hash,
+                    [0x42u8; 32],
+                );
                 assert_eq!(engine.state.height, height);
             }
             let next_block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
@@ -749,7 +888,12 @@ mod tests {
                 let height = engine.state.height + 1;
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
-                last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+                last_qc = build_single_validator_qc_bytes(
+                    height,
+                    0,
+                    block.header.value_hash,
+                    [0x42u8; 32],
+                );
             }
         }
 
@@ -785,7 +929,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "prune_keep_blocks (100) must be greater than 2x snapshot_interval (150)")]
+    #[should_panic(
+        expected = "prune_keep_blocks (100) must be greater than 2x snapshot_interval (150)"
+    )]
     fn prune_alignment_assertion_fires() {
         let dir = temp_dir("prune_alignment");
         let mut config = NodeConfig::local_test(dir.clone());
@@ -844,12 +990,7 @@ mod tests {
         engine.state.height = 2;
         engine.state.tip_hash = Bytes32::from([0x33u8; 32]);
 
-        let candidate = engine
-            .state
-            .validators
-            .active_validators()
-            .next()
-            .unwrap();
+        let candidate = engine.state.validators.active_validators().next().unwrap();
         let election = ProposerElection {
             epoch_seed: Bytes32::from(indra_crypto::sha256(&engine.state.tip_hash.0)),
             height: 3,
@@ -865,6 +1006,40 @@ mod tests {
             .propose(&election, 1_700_000_003, Vec::new(), None)
             .unwrap_err();
         assert!(matches!(err, NodeError::MissingQc { height: 3 }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staking_mempool_deduplicates_by_nonce() {
+        let dir = temp_dir("staking_mempool_dedup");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let op = dummy_staking_op(0x11, 1);
+
+        engine.add_staking_op(op.clone()).unwrap();
+        assert!(matches!(
+            engine.add_staking_op(op),
+            Err(NodeError::InvalidStakingOp(_))
+        ));
+        assert_eq!(engine.staking_mempool.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_committed_ops_removes_correct_entries() {
+        let dir = temp_dir("staking_mempool_evict");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let committed = dummy_staking_op(0x11, 1);
+        let retained = dummy_staking_op(0x11, 2);
+
+        engine.add_staking_op(committed.clone()).unwrap();
+        engine.add_staking_op(retained.clone()).unwrap();
+        engine.evict_committed_staking_ops(&[committed]);
+
+        assert_eq!(engine.staking_mempool, vec![retained]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

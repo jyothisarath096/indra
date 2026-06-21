@@ -63,8 +63,8 @@ impl PruneConfig {
 
 /// An append-only block log with an in-memory height→offset index.
 pub struct BlockStore {
-    file:   File,
-    index:  HashMap<u64, u64>, // height → file offset of the entry header
+    file: File,
+    index: HashMap<u64, u64>, // height → file offset of the entry header
     next_height: u64,
     prune_cfg: PruneConfig,
     lowest_height: u64,
@@ -165,7 +165,9 @@ impl BlockStore {
             });
         }
 
-        let offset = self.index.get(&height)
+        let offset = self
+            .index
+            .get(&height)
             .copied()
             .ok_or(StorageError::BlockNotFound { height })?;
 
@@ -175,19 +177,21 @@ impl BlockStore {
         let mut header = [0u8; ENTRY_HEADER_BYTES];
         self.file.read_exact(&mut header)?;
 
-        let stored_height_bytes: [u8; 8] = header[..8]
-            .try_into()
-            .map_err(|_| StorageError::Corruption {
-                height,
-                detail: "entry header truncated while reading height".to_string(),
-            })?;
+        let stored_height_bytes: [u8; 8] =
+            header[..8]
+                .try_into()
+                .map_err(|_| StorageError::Corruption {
+                    height,
+                    detail: "entry header truncated while reading height".to_string(),
+                })?;
         let stored_height = u64::from_le_bytes(stored_height_bytes);
-        let length_bytes: [u8; 4] = header[8..12]
-            .try_into()
-            .map_err(|_| StorageError::Corruption {
-                height,
-                detail: "entry header truncated while reading length".to_string(),
-            })?;
+        let length_bytes: [u8; 4] =
+            header[8..12]
+                .try_into()
+                .map_err(|_| StorageError::Corruption {
+                    height,
+                    detail: "entry header truncated while reading length".to_string(),
+                })?;
         let length = u32::from_le_bytes(length_bytes) as usize;
 
         if stored_height != height {
@@ -218,7 +222,9 @@ impl BlockStore {
         let keep_offset = match self.index.get(&keep_from_height).copied() {
             Some(offset) => offset,
             None => {
-                let next_available = self.index.keys()
+                let next_available = self
+                    .index
+                    .keys()
                     .filter(|&&height| height >= keep_from_height)
                     .min()
                     .copied();
@@ -274,19 +280,21 @@ impl BlockStore {
             let mut header = [0u8; ENTRY_HEADER_BYTES];
             self.file.read_exact(&mut header)?;
 
-            let height_bytes: [u8; 8] = header[..8]
-                .try_into()
-                .map_err(|_| StorageError::Corruption {
-                    height: self.next_height,
-                    detail: "entry header truncated while rebuilding height index".to_string(),
-                })?;
+            let height_bytes: [u8; 8] =
+                header[..8]
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height: self.next_height,
+                        detail: "entry header truncated while rebuilding height index".to_string(),
+                    })?;
             let height = u64::from_le_bytes(height_bytes);
-            let length_bytes: [u8; 4] = header[8..12]
-                .try_into()
-                .map_err(|_| StorageError::Corruption {
-                    height,
-                    detail: "entry header truncated while rebuilding length index".to_string(),
-                })?;
+            let length_bytes: [u8; 4] =
+                header[8..12]
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height,
+                        detail: "entry header truncated while rebuilding length index".to_string(),
+                    })?;
             let length = u32::from_le_bytes(length_bytes) as u64;
 
             if offset + ENTRY_HEADER_BYTES as u64 + length > file_len {
@@ -314,42 +322,48 @@ impl BlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use indra_core::{
-        Bytes32, ProtocolVersion, VariableBytes,
         types::{
             block::{BlockHeaderV1, BlockV1},
             primitives::MAX_VRF_PROOF_BYTES,
         },
+        Bytes32, ProtocolVersion, VariableBytes,
     };
+    use std::path::PathBuf;
 
     fn temp_path(label: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_test_blocks_{}_{}.bin", label, std::process::id()));
+        p.push(format!(
+            "indra_test_blocks_{}_{}.bin",
+            label,
+            std::process::id()
+        ));
         p
     }
 
     fn dummy_block(height: u64, prev_hash: [u8; 32]) -> BlockV1 {
         BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version:    ProtocolVersion::CURRENT,
+                protocol_version: ProtocolVersion::CURRENT,
                 height,
-                prev_hash:           Bytes32::from(prev_hash),
-                timestamp:           1_700_000_000 + height,
-                state_root:          Bytes32::ZERO,
-                validator_set_root:  Bytes32::ZERO,
-                mempool_set_root:    Bytes32::ZERO,
-                value_hash:          Bytes32::ZERO,
-                base_fee:            100,
-                proposer_round:      0,
-                polc_round:          indra_core::types::block::NO_POLC_ROUND,
+                prev_hash: Bytes32::from(prev_hash),
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: 100,
+                proposer_round: 0,
+                polc_round: indra_core::types::block::NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0u8; 64]).unwrap(),
-                quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0u8; 64])
+                    .unwrap(),
+                quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
             },
-            transactions:      vec![],
+            transactions: vec![],
             slashing_evidence: vec![],
-            governance_ops:    vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
         }
     }
 
@@ -405,7 +419,13 @@ mod tests {
     #[test]
     fn pruning_removes_old_blocks() {
         let path = temp_path("prune");
-        let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(5) }).unwrap();
+        let mut store = BlockStore::open(
+            &path,
+            PruneConfig {
+                keep_blocks: Some(5),
+            },
+        )
+        .unwrap();
 
         for height in 0..10u64 {
             store.append(&dummy_block(height, [0u8; 32])).unwrap();
@@ -441,14 +461,26 @@ mod tests {
     fn pruned_store_survives_reopen() {
         let path = temp_path("pruned_reopen");
         {
-            let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(3) }).unwrap();
+            let mut store = BlockStore::open(
+                &path,
+                PruneConfig {
+                    keep_blocks: Some(3),
+                },
+            )
+            .unwrap();
             for height in 0..10u64 {
                 store.append(&dummy_block(height, [0u8; 32])).unwrap();
             }
             assert_eq!(store.lowest_height(), 7);
         }
 
-        let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(3) }).unwrap();
+        let mut store = BlockStore::open(
+            &path,
+            PruneConfig {
+                keep_blocks: Some(3),
+            },
+        )
+        .unwrap();
         assert!(store.get(6).is_err());
         assert!(store.get(7).is_ok());
         assert_eq!(store.len(), 3);
@@ -459,13 +491,22 @@ mod tests {
     #[test]
     fn pruned_block_error_is_informative() {
         let path = temp_path("pruned_err");
-        let mut store = BlockStore::open(&path, PruneConfig { keep_blocks: Some(5) }).unwrap();
+        let mut store = BlockStore::open(
+            &path,
+            PruneConfig {
+                keep_blocks: Some(5),
+            },
+        )
+        .unwrap();
         for height in 0..10u64 {
             store.append(&dummy_block(height, [0u8; 32])).unwrap();
         }
 
         match store.get(0) {
-            Err(StorageError::BlockPruned { height, lowest_available }) => {
+            Err(StorageError::BlockPruned {
+                height,
+                lowest_available,
+            }) => {
                 assert_eq!(height, 0);
                 assert_eq!(lowest_available, 5);
             }

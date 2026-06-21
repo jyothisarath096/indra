@@ -11,19 +11,17 @@
 
 use std::net::SocketAddr;
 
-use indra_core::types::block::BlockV1;
-use indra_core::codec::Decode;
-use indra_state::{apply_block, ChainState};
 use indra_consensus::mempool::Mempool;
-use indra_storage::{BlockStore, StateStore};
-use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_consensus::{
-    proposer::{
-        ProposerCandidate, ProposerElection, compute_vrf_input, elect_proposer,
-    },
-    qc::{QcValidator, verify_qc_strict},
+    proposer::{compute_vrf_input, elect_proposer, ProposerCandidate, ProposerElection},
+    qc::{verify_qc_strict, QcValidator},
 };
-use indra_crypto::{VrfOutput, VrfProof, vrf_verify};
+use indra_core::codec::Decode;
+use indra_core::types::block::BlockV1;
+use indra_crypto::{vrf_verify, VrfOutput, VrfProof};
+use indra_state::{apply_block, ChainState};
+use indra_storage::state_store::SNAPSHOT_INTERVAL;
+use indra_storage::{BlockStore, StateStore};
 
 use crate::{
     error::{NodeError, NodeResult},
@@ -140,10 +138,7 @@ impl SyncState {
     }
 
     /// Record one imported block while downloading.
-    pub fn on_block_imported(
-        &mut self,
-        imported_height: u64,
-    ) {
+    pub fn on_block_imported(&mut self, imported_height: u64) {
         if let SyncPhase::Downloading {
             target_height,
             next_expected,
@@ -255,10 +250,7 @@ pub fn import_block(
     Ok(())
 }
 
-pub(crate) fn verify_proposer_vrf(
-    block: &BlockV1,
-    state: &ChainState,
-) -> NodeResult<()> {
+pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     let proof_bytes = block.header.proposer_vrf_proof.as_slice();
     let output = block.header.proposer_vrf_output;
 
@@ -267,18 +259,21 @@ pub(crate) fn verify_proposer_vrf(
             height: block.header.height,
             reason: format!(
                 "missing proposer VRF proof/output at height {} round {}",
-                block.header.height,
-                block.header.proposer_round,
+                block.header.height, block.header.proposer_round,
             ),
         });
     }
 
-    let candidates: Vec<ProposerCandidate> = state.validators.active_validators()
-        .filter_map(|validator| validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
-            validator_id: validator.validator_id,
-            vrf_pubkey: vrf_pk,
-            stake: validator.stake_spark,
-        }))
+    let candidates: Vec<ProposerCandidate> = state
+        .validators
+        .active_validators()
+        .filter_map(|validator| {
+            validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                validator_id: validator.validator_id,
+                vrf_pubkey: vrf_pk,
+                stake: validator.stake_spark,
+            })
+        })
         .collect();
 
     if candidates.len() != state.validators.active_count() {
@@ -297,14 +292,19 @@ pub(crate) fn verify_proposer_vrf(
     // Bind VRF verification to the block's declared parent hash so the
     // verifier uses the same epoch seed the proposer saw when building
     // this header, even if the local node's mutable state has moved.
-    let epoch_seed = indra_core::types::primitives::Bytes32::from(
-        indra_crypto::sha256(&block.header.prev_hash.0)
+    let epoch_seed = indra_core::types::primitives::Bytes32::from(indra_crypto::sha256(
+        &block.header.prev_hash.0,
+    ));
+    let vrf_input = compute_vrf_input(
+        &epoch_seed.0,
+        block.header.height,
+        block.header.proposer_round,
     );
-    let vrf_input = compute_vrf_input(&epoch_seed.0, block.header.height, block.header.proposer_round);
     let proof = VrfProof(proof_bytes.to_vec());
     let output = VrfOutput(block.header.proposer_vrf_output.0);
 
-    let matching_candidates: Vec<_> = candidates.iter()
+    let matching_candidates: Vec<_> = candidates
+        .iter()
         .filter(|candidate| vrf_verify(&candidate.vrf_pubkey, &vrf_input, &output, &proof).is_ok())
         .collect();
 
@@ -344,10 +344,7 @@ pub(crate) fn verify_proposer_vrf(
     Ok(())
 }
 
-fn verify_block_qc(
-    block: &BlockV1,
-    state: &ChainState,
-) -> NodeResult<()> {
+fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     let qc_bytes = block.header.quorum_certificate.as_slice();
     if qc_bytes.is_empty() {
         if block.header.height == 1 {
@@ -373,14 +370,17 @@ fn verify_block_qc(
     let mut active_validators: Vec<_> = state.validators.active_validators().collect();
     active_validators.sort_by_key(|validator| validator.validator_id.0);
 
-    let validators: Vec<QcValidator> = active_validators.into_iter()
+    let validators: Vec<QcValidator> = active_validators
+        .into_iter()
         .enumerate()
-        .filter_map(|(position, validator)| Some(QcValidator {
-            validator_id: validator.validator_id,
-            position,
-            pq_pk: validator.hybrid_pq_pk.clone()?,
-            stake: validator.stake_spark,
-        }))
+        .filter_map(|(position, validator)| {
+            Some(QcValidator {
+                validator_id: validator.validator_id,
+                position,
+                pq_pk: validator.hybrid_pq_pk.clone()?,
+                stake: validator.stake_spark,
+            })
+        })
         .collect();
 
     if validators.len() != state.validators.active_count() {
@@ -399,10 +399,7 @@ fn verify_block_qc(
     verify_qc_strict(&qc, &validators, total_stake).map_err(NodeError::Consensus)
 }
 
-fn verify_block_state_root(
-    block: &BlockV1,
-    state: &ChainState,
-) -> NodeResult<()> {
+fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
 
@@ -461,28 +458,28 @@ fn verify_block_state_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_consensus::{
+        producer::{produce_block, BlockTemplate},
+        proposer::{compute_proposer_vrf, elect_proposer, ProposerCandidate, ProposerElection},
+        qc::build_qc,
+        vote::produce_vote,
+    };
     use indra_core::{
-        QuorumCertificateV1,
-        Bytes32, ProtocolVersion, VariableBytes,
         codec::Encode,
         types::{
             block::{BlockHeaderV1, BlockV1},
             primitives::MAX_VRF_PROOF_BYTES,
             vote::VoteStep,
         },
-    };
-    use indra_consensus::{
-        proposer::{ProposerCandidate, ProposerElection, compute_proposer_vrf, elect_proposer},
-        producer::{BlockTemplate, produce_block},
-        qc::build_qc,
-        vote::produce_vote,
+        Bytes32, ProtocolVersion, QuorumCertificateV1, VariableBytes,
     };
     use indra_crypto::{
-        VrfKeypair,
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+        VrfKeypair,
     };
     use indra_state::{
-        ValidatorEntry, ValidatorStatus, apply_block, compute_state_root, compute_validator_set_root,
+        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
+        ValidatorStatus,
     };
     use indra_storage::StateStore;
     use std::path::PathBuf;
@@ -507,33 +504,40 @@ mod tests {
         let vrf = VrfKeypair::from_seed(&[seed; 32]);
         let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
 
-        state.validators.upsert(ValidatorEntry {
-            validator_id,
-            name: format!("validator-{seed}"),
-            hybrid_classical_pk: Some(public.classical.0),
-            hybrid_pq_pk: with_pq_key.then(|| public.pq.0.to_vec()),
-            vrf_pk: with_vrf_key.then(|| vrf.public_key()),
-            stake_spark: stake,
-            status: ValidatorStatus::Active,
-            registered_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
-            self_report_count: 0,
-            commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
-            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
-        }).unwrap();
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: format!("validator-{seed}"),
+                hybrid_classical_pk: Some(public.classical.0),
+                hybrid_pq_pk: with_pq_key.then(|| public.pq.0.to_vec()),
+                vrf_pk: with_vrf_key.then(|| vrf.public_key()),
+                stake_spark: stake,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+                min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            })
+            .unwrap();
 
         (validator_id, hybrid)
     }
 
     fn build_election(state: &ChainState, height: u64, round: u32) -> ProposerElection {
         let epoch_seed = Bytes32::from(indra_crypto::sha256(&state.tip_hash.0));
-        let mut candidates: Vec<_> = state.validators.active_validators()
-            .filter_map(|validator| validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
-                validator_id: validator.validator_id,
-                vrf_pubkey: vrf_pk,
-                stake: validator.stake_spark,
-            }))
+        let mut candidates: Vec<_> = state
+            .validators
+            .active_validators()
+            .filter_map(|validator| {
+                validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                    validator_id: validator.validator_id,
+                    vrf_pubkey: vrf_pk,
+                    stake: validator.stake_spark,
+                })
+            })
             .collect();
         candidates.sort_by_key(|candidate| candidate.validator_id.0);
         ProposerElection {
@@ -557,6 +561,7 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
+            staking_ops: vec![],
         };
         produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
     }
@@ -570,7 +575,15 @@ mod tests {
         pq_pk: Vec<u8>,
         stake: u64,
     ) -> Vec<u8> {
-        let vote = produce_vote(height, round, VoteStep::Precommit, value_hash, validator_id, hybrid).unwrap();
+        let vote = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            value_hash,
+            validator_id,
+            hybrid,
+        )
+        .unwrap();
         let qc = build_qc(
             height,
             round,
@@ -582,31 +595,33 @@ mod tests {
                 stake,
             }],
             vec![&vote],
-        ).unwrap();
+        )
+        .unwrap();
         qc.encode_to_vec()
     }
 
     fn make_block(state: &ChainState) -> BlockV1 {
         let mut block = BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version:    ProtocolVersion::CURRENT,
-                height:              state.height + 1,
-                prev_hash:           state.tip_hash,
-                timestamp:           1_700_000_000 + state.height + 1,
-                state_root:          Bytes32::ZERO,
-                validator_set_root:  Bytes32::ZERO,
-                mempool_set_root:    Bytes32::ZERO,
-                value_hash:          Bytes32::ZERO,
-                base_fee:            state.base_fee,
-                proposer_round:      0,
-                polc_round:          indra_core::types::block::NO_POLC_ROUND,
+                protocol_version: ProtocolVersion::CURRENT,
+                height: state.height + 1,
+                prev_hash: state.tip_hash,
+                timestamp: 1_700_000_000 + state.height + 1,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: state.base_fee,
+                proposer_round: 0,
+                polc_round: indra_core::types::block::NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof:  VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-                quorum_certificate:  indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+                quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
             },
-            transactions:      vec![],
+            transactions: vec![],
             slashing_evidence: vec![],
-            governance_ops:    vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
         };
 
         let mut projected = state.clone();
@@ -627,11 +642,19 @@ mod tests {
         let mut block_store = BlockStore::open(
             dir.join("blocks.log"),
             indra_storage::PruneConfig::archive(),
-        ).unwrap();
+        )
+        .unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         let block = make_block(&state);
-        import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+        import_block(
+            &block,
+            &mut state,
+            &mut mempool,
+            &mut block_store,
+            &state_store,
+        )
+        .unwrap();
 
         assert_eq!(state.height, 1);
         assert_eq!(block_store.len(), 2); // genesis (0) + block 1
@@ -650,7 +673,8 @@ mod tests {
         let mut block_store = BlockStore::open(
             dir.join("blocks.log"),
             indra_storage::PruneConfig::archive(),
-        ).unwrap();
+        )
+        .unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[0x41; 32]);
@@ -661,7 +685,14 @@ mod tests {
         let mut prev_qc = Vec::new();
         for i in 1..=10u64 {
             let block = make_strict_block(&state, 0x41, 0, prev_qc.clone());
-            import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            import_block(
+                &block,
+                &mut state,
+                &mut mempool,
+                &mut block_store,
+                &state_store,
+            )
+            .unwrap();
             prev_qc = build_qc_bytes(
                 block.header.height,
                 block.header.proposer_round,
@@ -690,13 +721,21 @@ mod tests {
         let mut block_store = BlockStore::open(
             dir.join("blocks.log"),
             indra_storage::PruneConfig::archive(),
-        ).unwrap();
+        )
+        .unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         // Try to import height 5 when we're at genesis (height 0)
         let mut block = make_block(&state);
         block.header.height = 5;
-        assert!(import_block(&block, &mut state, &mut mempool, &mut block_store, &state_store).is_err());
+        assert!(import_block(
+            &block,
+            &mut state,
+            &mut mempool,
+            &mut block_store,
+            &state_store
+        )
+        .is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -770,7 +809,8 @@ mod tests {
     #[test]
     fn strict_block_one_accepts_empty_qc() {
         let mut state = ChainState::new_genesis();
-        let (_validator_id, _hybrid) = install_active_validator(&mut state, 0x11, 10_000, true, true);
+        let (_validator_id, _hybrid) =
+            install_active_validator(&mut state, 0x11, 10_000, true, true);
         let block = make_strict_block(&state, 0x11, 0, vec![]);
 
         assert!(verify_proposer_vrf(&block, &state).is_ok());
@@ -781,7 +821,8 @@ mod tests {
     #[test]
     fn strict_block_two_rejects_empty_qc() {
         let mut state = ChainState::new_genesis();
-        let (_validator_id, _hybrid) = install_active_validator(&mut state, 0x12, 10_000, true, true);
+        let (_validator_id, _hybrid) =
+            install_active_validator(&mut state, 0x12, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x12, 0, vec![]);
         apply_block(&mut state, &block1).unwrap();
 
@@ -798,7 +839,8 @@ mod tests {
     #[test]
     fn strict_qc_rejects_incomplete_validator_keys() {
         let mut state = ChainState::new_genesis();
-        let (validator_id, hybrid) = install_active_validator(&mut state, 0x13, 10_000, true, false);
+        let (validator_id, hybrid) =
+            install_active_validator(&mut state, 0x13, 10_000, true, false);
         let block1 = make_strict_block(&state, 0x13, 0, vec![]);
 
         let dummy_qc = QuorumCertificateV1 {
@@ -813,11 +855,18 @@ mod tests {
             pq_signatures: vec![indra_core::types::crypto::PQVoteSig {
                 validator_id,
                 pq_sig: VariableBytes::from_slice(
-                    produce_vote(1, 0, VoteStep::Precommit, block1.header.value_hash, validator_id, &hybrid)
-                        .unwrap()
-                        .signature
-                        .pq_sig
-                        .as_slice(),
+                    produce_vote(
+                        1,
+                        0,
+                        VoteStep::Precommit,
+                        block1.header.value_hash,
+                        validator_id,
+                        &hybrid,
+                    )
+                    .unwrap()
+                    .signature
+                    .pq_sig
+                    .as_slice(),
                 )
                 .unwrap(),
             }],
@@ -839,11 +888,15 @@ mod tests {
     #[test]
     fn strict_vrf_mismatch_is_rejected() {
         let mut state = ChainState::new_genesis();
-        let (validator_a, _hybrid_a) = install_active_validator(&mut state, 0x21, 10_000, true, true);
-        let (_validator_b, _hybrid_b) = install_active_validator(&mut state, 0x22, 10_000, true, true);
+        let (validator_a, _hybrid_a) =
+            install_active_validator(&mut state, 0x21, 10_000, true, true);
+        let (_validator_b, _hybrid_b) =
+            install_active_validator(&mut state, 0x22, 10_000, true, true);
 
         let mismatch_round = (0..32u32)
-            .find(|round| elect_proposer(&build_election(&state, 1, *round)).unwrap() != validator_a)
+            .find(|round| {
+                elect_proposer(&build_election(&state, 1, *round)).unwrap() != validator_a
+            })
             .expect("expected at least one round not won by validator A");
 
         let mut tampered = make_strict_block(&state, 0x22, mismatch_round, vec![]);
@@ -874,7 +927,11 @@ mod tests {
         let block1 = make_strict_block(&state, 0x31, 0, vec![]);
         let dir = temp_dir("strict_ok");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut block_store = BlockStore::open(dir.join("blocks.log"), indra_storage::PruneConfig::archive()).unwrap();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        )
+        .unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
         let mut mempool = Mempool::default_config();
         import_block(
@@ -883,7 +940,8 @@ mod tests {
             &mut mempool,
             &mut block_store,
             &state_store,
-        ).unwrap();
+        )
+        .unwrap();
 
         let pq_pk = hybrid.public_key().pq.0.to_vec();
         let qc_bytes = build_qc_bytes(

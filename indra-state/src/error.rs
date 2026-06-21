@@ -6,7 +6,6 @@ use thiserror::Error;
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StateError {
     // ── Block-level errors ─────────────────────────────────────────────────
-
     /// Block height is not exactly prev_height + 1.
     #[error("invalid block height: expected {expected}, got {actual}")]
     InvalidHeight {
@@ -62,7 +61,6 @@ pub enum StateError {
     },
 
     // ── Transaction-level errors ───────────────────────────────────────────
-
     /// A transaction references a UTXO that does not exist.
     #[error("transaction references unknown UTXO")]
     UnknownUtxo,
@@ -157,10 +155,38 @@ pub enum StateError {
     CommitmentBalanceInvalid,
 
     // ── State integrity errors ─────────────────────────────────────────────
-
     /// A staking operation was invalid.
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
+
+    /// Validator is already registered.
+    #[error("validator already registered")]
+    ValidatorAlreadyRegistered,
+
+    /// Staking op signature verification failed.
+    #[error("staking op signature invalid: {reason}")]
+    StakingOpSignatureInvalid {
+        /// Specific reason the signature could not be verified.
+        reason: String,
+    },
+
+    /// Staking op nonce is invalid.
+    #[error("staking op nonce invalid: expected {expected}, got {got}")]
+    StakingNonceInvalid {
+        /// Expected next nonce.
+        expected: u64,
+        /// Nonce carried by the operation.
+        got: u64,
+    },
+
+    /// A block contains more staking operations than allowed.
+    #[error("block contains {actual} staking ops, maximum is {max}")]
+    TooManyStakingOps {
+        /// Actual count.
+        actual: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
 
     /// Validator not found in the validator set.
     #[error("validator not found")]

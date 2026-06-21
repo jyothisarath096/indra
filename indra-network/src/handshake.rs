@@ -10,21 +10,8 @@ use tokio::{
 
 use blake3::Hash as Blake3Hash;
 use indra_core::types::primitives::Bytes32;
-use indra_crypto::{
-    PqKeypair,
-    PqPublicKey,
-    PqSignature,
-    PQ_SIG_BYTES,
-    verify_pq,
-};
-use ml_kem::{
-    Decapsulate,
-    Encapsulate,
-    EncapsulationKey1024,
-    KeyExport,
-    Kem,
-    MlKem1024,
-};
+use indra_crypto::{verify_pq, PqKeypair, PqPublicKey, PqSignature, PQ_SIG_BYTES};
+use ml_kem::{Decapsulate, Encapsulate, EncapsulationKey1024, Kem, KeyExport, MlKem1024};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
@@ -44,6 +31,7 @@ const AUTH_CONTEXT: &[u8] = b"INDRA-auth-v1";
 const AUTH_AAD: &[u8] = b"auth";
 
 /// Static configuration shared by inbound and outbound handshakes.
+#[derive(Clone)]
 pub struct HandshakeConfig {
     /// Local validator identity announced on the wire.
     pub my_validator_id: Bytes32,
@@ -69,7 +57,10 @@ pub struct HandshakeResult {
     pub is_initiator: bool,
 }
 
-fn lookup_validator_pk(config: &HandshakeConfig, validator_id: Bytes32) -> NetworkResult<PqPublicKey> {
+fn lookup_validator_pk(
+    config: &HandshakeConfig,
+    validator_id: Bytes32,
+) -> NetworkResult<PqPublicKey> {
     config
         .known_validators
         .iter()
@@ -121,13 +112,14 @@ fn parse_common_prefix(buf: &[u8]) -> NetworkResult<()> {
     if &buf[..4] != MAGIC {
         return Err(NetworkError::InvalidMagic);
     }
-    let version = u16::from_le_bytes(
-        buf[4..6]
-            .try_into()
-            .map_err(|_| NetworkError::DecodeFailed {
-                reason: "invalid handshake version bytes".to_string(),
-            })?,
-    );
+    let version =
+        u16::from_le_bytes(
+            buf[4..6]
+                .try_into()
+                .map_err(|_| NetworkError::DecodeFailed {
+                    reason: "invalid handshake version bytes".to_string(),
+                })?,
+        );
     if version != VERSION {
         return Err(NetworkError::UnsupportedVersion { got: version });
     }
@@ -200,7 +192,11 @@ fn auth_plaintext(transcript: &Blake3Hash, validator_id: Bytes32) -> Vec<u8> {
     plaintext
 }
 
-async fn write_auth_frame(stream: &mut TcpStream, key: &[u8; 32], signature: &PqSignature) -> NetworkResult<()> {
+async fn write_auth_frame(
+    stream: &mut TcpStream,
+    key: &[u8; 32],
+    signature: &PqSignature,
+) -> NetworkResult<()> {
     let nonce = [0u8; 12];
     let ciphertext = encrypt_with_aad(key, &nonce, &signature.0, AUTH_AAD)?;
     let len_bytes = (signature.0.len() as u32).to_le_bytes();
@@ -226,13 +222,11 @@ async fn read_auth_frame(stream: &mut TcpStream, key: &[u8; 32]) -> NetworkResul
     if nonce != [0u8; 12] {
         return Err(NetworkError::UnexpectedNonce {
             expected: 0,
-            got: u64::from_le_bytes(
-                nonce[4..]
-                    .try_into()
-                    .map_err(|_| NetworkError::InvalidFrame {
-                        reason: "invalid auth nonce bytes".to_string(),
-                    })?,
-            ),
+            got: u64::from_le_bytes(nonce[4..].try_into().map_err(|_| {
+                NetworkError::InvalidFrame {
+                    reason: "invalid auth nonce bytes".to_string(),
+                }
+            })?),
         });
     }
 
@@ -354,9 +348,12 @@ pub async fn perform_handshake_initiator(
     stream: TcpStream,
     config: &HandshakeConfig,
 ) -> NetworkResult<HandshakeResult> {
-    timeout(config.timeout, perform_handshake_inner(stream, config, true))
-        .await
-        .map_err(|_| NetworkError::HandshakeTimeout)?
+    timeout(
+        config.timeout,
+        perform_handshake_inner(stream, config, true),
+    )
+    .await
+    .map_err(|_| NetworkError::HandshakeTimeout)?
 }
 
 /// Run the responder side of the INDRA authenticated transport handshake.
@@ -364,9 +361,12 @@ pub async fn perform_handshake_responder(
     stream: TcpStream,
     config: &HandshakeConfig,
 ) -> NetworkResult<HandshakeResult> {
-    timeout(config.timeout, perform_handshake_inner(stream, config, false))
-        .await
-        .map_err(|_| NetworkError::HandshakeTimeout)?
+    timeout(
+        config.timeout,
+        perform_handshake_inner(stream, config, false),
+    )
+    .await
+    .map_err(|_| NetworkError::HandshakeTimeout)?
 }
 
 #[cfg(test)]
@@ -400,7 +400,10 @@ mod tests {
         let initiator_cfg = make_config(
             initiator_id,
             initiator_sk,
-            vec![(initiator_id, initiator_pk.clone()), (responder_id, responder_pk.clone())],
+            vec![
+                (initiator_id, initiator_pk.clone()),
+                (responder_id, responder_pk.clone()),
+            ],
             Duration::from_secs(2),
         );
         let responder_cfg = make_config(
@@ -410,7 +413,9 @@ mod tests {
             Duration::from_secs(2),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let responder = tokio::spawn(async move {
@@ -439,7 +444,10 @@ mod tests {
         let initiator_cfg = make_config(
             initiator_id,
             initiator_sk,
-            vec![(initiator_id, initiator_pk.clone()), (responder_id, responder_pk.clone())],
+            vec![
+                (initiator_id, initiator_pk.clone()),
+                (responder_id, responder_pk.clone()),
+            ],
             Duration::from_secs(2),
         );
         let responder_cfg = make_config(
@@ -449,7 +457,9 @@ mod tests {
             Duration::from_secs(2),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let responder = tokio::spawn(async move {
@@ -480,7 +490,9 @@ mod tests {
             Duration::from_secs(2),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let responder = tokio::spawn(async move {
@@ -507,7 +519,9 @@ mod tests {
             Duration::from_millis(100),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let responder = tokio::spawn(async move {
@@ -529,23 +543,30 @@ mod tests {
         let initiator_cfg = make_config(
             initiator_id,
             initiator_sk,
-            vec![(initiator_id, initiator_pk.clone()), (responder_id, responder_pk.clone())],
+            vec![
+                (initiator_id, initiator_pk.clone()),
+                (responder_id, responder_pk.clone()),
+            ],
             Duration::from_secs(2),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let responder = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut step1 = vec![0u8; STEP1_LEN];
             stream.read_exact(&mut step1).await.expect("read step1");
-            let (peer_x_pk_bytes, peer_kem_ek_bytes, peer_validator_id) = parse_step1(&step1).expect("parse step1");
+            let (peer_x_pk_bytes, peer_kem_ek_bytes, peer_validator_id) =
+                parse_step1(&step1).expect("parse step1");
             assert_eq!(peer_validator_id, initiator_id);
 
             let x_secret = EphemeralSecret::random();
             let x_public = PublicKey::from(&x_secret).to_bytes();
-            let peer_kem_ek = EncapsulationKey1024::new((&peer_kem_ek_bytes).into()).expect("kem ek");
+            let peer_kem_ek =
+                EncapsulationKey1024::new((&peer_kem_ek_bytes).into()).expect("kem ek");
             let (kem_ct, kem_secret) = peer_kem_ek.encapsulate();
             let step2 = build_step2(x_public, kem_ct.as_ref(), responder_id).expect("build step2");
             stream.write_all(&step2).await.expect("write step2");

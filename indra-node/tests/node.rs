@@ -1,25 +1,6 @@
 //! Integration tests for the full node pipeline.
 
-use std::path::PathBuf;
-use indra_core::{
-    Bytes32,
-    codec::{Decode, Encode},
-    types::{
-        block::BlockV1,
-        vote::VoteStep,
-    },
-};
-use indra_state::ChainState;
 use indra_consensus::mempool::Mempool;
-use indra_crypto::{hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair}, VrfKeypair};
-use indra_storage::{BlockStore, PruneConfig, StateStore};
-use indra_node::{
-    NodeConfig, NodeEngine,
-    driver::{ConsensusDriver, DriverAction, DriverEvent},
-    genesis::{build_genesis_state, genesis_block_hash},
-    state_root::compute_state_root,
-    sync::{import_block, SyncState},
-};
 use indra_consensus::{
     build_qc,
     producer::{produce_block, BlockTemplate},
@@ -27,6 +8,25 @@ use indra_consensus::{
     qc::QcValidator,
     vote::produce_vote,
 };
+use indra_core::{
+    codec::{Decode, Encode},
+    types::{block::BlockV1, vote::VoteStep},
+    Bytes32,
+};
+use indra_crypto::{
+    hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+    VrfKeypair,
+};
+use indra_node::{
+    driver::{ConsensusDriver, DriverAction, DriverEvent},
+    genesis::{build_genesis_state, genesis_block_hash},
+    state_root::compute_state_root,
+    sync::{import_block, SyncState},
+    NodeConfig, NodeEngine,
+};
+use indra_state::ChainState;
+use indra_storage::{BlockStore, PruneConfig, StateStore};
+use std::path::PathBuf;
 
 fn temp_dir(suffix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -70,6 +70,7 @@ fn make_strict_block(
         prev_qc_bytes,
         timestamp: 1_700_000_000 + state.height + 1,
         polc_round: None,
+        staking_ops: vec![],
     };
     produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
 }
@@ -149,7 +150,15 @@ fn build_single_validator_qc_bytes(
     let hybrid = HybridKeypair::new(classical, pq);
     let public = hybrid.public_key();
     let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
-    let vote = produce_vote(height, round, VoteStep::Precommit, value_hash, validator_id, &hybrid).unwrap();
+    let vote = produce_vote(
+        height,
+        round,
+        VoteStep::Precommit,
+        value_hash,
+        validator_id,
+        &hybrid,
+    )
+    .unwrap();
     let qc = build_qc(
         height,
         round,
@@ -245,12 +254,26 @@ fn state_root_changes_after_each_block() {
     let root0 = compute_state_root(&state);
 
     let b1 = make_strict_block(&state, [0x11u8; 32], vec![]);
-    import_block(&b1, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+    import_block(
+        &b1,
+        &mut state,
+        &mut mempool,
+        &mut block_store,
+        &state_store,
+    )
+    .unwrap();
     let root1 = compute_state_root(&state);
 
     let qc1 = build_single_validator_qc_bytes(1, 0, b1.header.value_hash, [0x11u8; 32]);
     let b2 = make_strict_block(&state, [0x11u8; 32], qc1);
-    import_block(&b2, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+    import_block(
+        &b2,
+        &mut state,
+        &mut mempool,
+        &mut block_store,
+        &state_store,
+    )
+    .unwrap();
     let root2 = compute_state_root(&state);
 
     assert_ne!(root0, root1);
@@ -302,7 +325,8 @@ fn restarted_block_store_preserves_hash_chain() {
             let height = engine.state.height + 1;
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
-            last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+            last_qc =
+                build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
         }
     }
 
@@ -342,7 +366,8 @@ fn sync_state_downloads_full_chain_from_genesis() {
             &source_state_store,
         )
         .unwrap();
-        source_last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x13u8; 32]);
+        source_last_qc =
+            build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x13u8; 32]);
     }
 
     let peer: std::net::SocketAddr = "127.0.0.1:30303".parse().unwrap();
@@ -369,7 +394,9 @@ fn sync_state_downloads_full_chain_from_genesis() {
         sync.on_block_imported(height);
     }
 
-    assert!(sync.next_request_after_response(follower_state.height).is_none());
+    assert!(sync
+        .next_request_after_response(follower_state.height)
+        .is_none());
     assert!(sync.is_caught_up());
     assert_eq!(follower_state.height, source_state.height);
     assert_block_log_roundtrip_and_links(&follower_log);
@@ -391,7 +418,8 @@ fn current_binary_hashes_workspace_block_log_consistently() {
             let height = engine.state.height + 1;
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
-            last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+            last_qc =
+                build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
         }
     }
 
@@ -450,13 +478,15 @@ fn full_node_pipeline() {
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
     let mut last_qc = Vec::new();
-    let roots: Vec<Bytes32> = (1..=10u64).map(|i| {
-        let b = make_strict_block(&state, [0x14u8; 32], last_qc.clone());
-        import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
-        last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x14u8; 32]);
-        assert_eq!(state.height, i);
-        compute_state_root(&state)
-    }).collect();
+    let roots: Vec<Bytes32> = (1..=10u64)
+        .map(|i| {
+            let b = make_strict_block(&state, [0x14u8; 32], last_qc.clone());
+            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x14u8; 32]);
+            assert_eq!(state.height, i);
+            compute_state_root(&state)
+        })
+        .collect();
 
     // All roots are distinct
     for i in 0..roots.len() - 1 {
@@ -493,7 +523,9 @@ fn node_syncs_before_joining_consensus() {
 
     let actions = driver.process(DriverEvent::InboundVote { from: peer, vote });
     assert!(
-        !actions.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+        !actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
         "node must not vote before catching up"
     );
 
@@ -530,7 +562,8 @@ fn full_restart_recovery_end_to_end() {
             &source_state_store,
         )
         .unwrap();
-        source_last_qc = build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x15u8; 32]);
+        source_last_qc =
+            build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x15u8; 32]);
     }
 
     for (follower_log, follower_state_dir) in [
@@ -555,7 +588,10 @@ fn full_restart_recovery_end_to_end() {
 
         let peer: std::net::SocketAddr = "127.0.0.1:30304".parse().unwrap();
         let mut sync = SyncState::follower(follower_state.height);
-        assert_eq!(sync.observe_status(peer, source_state.height, follower_state.height), Some((peer, 2, 2)));
+        assert_eq!(
+            sync.observe_status(peer, source_state.height, follower_state.height),
+            Some((peer, 2, 2))
+        );
 
         let block2 = source_store.get(2).unwrap();
         import_block(

@@ -34,25 +34,26 @@
 
 use std::collections::HashSet;
 
-use indra_crypto::{
-    PedersenCommitment, PedersenOpening, verify_balance, verify_hybrid,
-    verify_opening, verify_range,
-};
 use indra_core::{
     codec::Encode,
     types::{
-        primitives::{
-            Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_TX_PER_BLOCK,
-            PROTOCOL_VERSION, ProtocolVersion,
-        },
         block::BlockV1,
+        primitives::{
+            Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+        },
         transaction::TransactionV1,
     },
+};
+use indra_crypto::{
+    verify_balance, verify_hybrid, verify_opening, verify_range, PedersenCommitment,
+    PedersenOpening,
 };
 
 use crate::{
     chain::ChainState,
-    epoch::{apply_epoch_transition, is_epoch_boundary, epoch_for_height},
+    delegation::apply_staking_op,
+    epoch::{apply_epoch_transition, epoch_for_height, is_epoch_boundary},
     error::{StateError, StateResult},
     fee::compute_next_base_fee,
 };
@@ -84,9 +85,7 @@ fn apply_slash(state: &mut ChainState, evidence: &indra_core::types::slashing::S
     };
 
     if let Some(validator) = state.validators.get_mut(&validator_id) {
-        let slash_amount = validator.stake_spark
-            .saturating_mul(slash_bps as u64)
-            / 10_000;
+        let slash_amount = validator.stake_spark.saturating_mul(slash_bps as u64) / 10_000;
         validator.stake_spark = validator.stake_spark.saturating_sub(slash_amount);
         validator.status = crate::ValidatorStatus::Slashed;
     }
@@ -97,6 +96,13 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
     validate_block_header(state, block)?;
+
+    if block.staking_ops.len() > MAX_STAKING_OPS_PER_BLOCK {
+        return Err(StateError::TooManyStakingOps {
+            actual: block.staking_ops.len(),
+            max: MAX_STAKING_OPS_PER_BLOCK,
+        });
+    }
 
     // ── Phase 2: Transaction validation (read-only) ───────────────────────
 
@@ -124,11 +130,28 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         )?;
     }
 
+    {
+        let mut shadow = state.clone();
+        let chain_id = state.chain_id.clone();
+        for op in &block.staking_ops {
+            op.validate_structure()
+                .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
+            apply_staking_op(&mut shadow, op, &chain_id)?;
+        }
+    }
+
     // ── Phase 3: State mutation (all validation passed) ───────────────────
 
     // Apply each transaction
     for (tx_idx, tx) in block.transactions.iter().enumerate() {
         apply_transaction(state, tx, block.header.height, tx_idx as u32)?;
+    }
+
+    let chain_id = state.chain_id.clone();
+    for op in &block.staking_ops {
+        apply_staking_op(state, op, &chain_id).map_err(|_| StateError::InvariantViolation {
+            message: "staking op failed on real state after shadow validation",
+        })?;
     }
 
     // Update base fee for next block
@@ -221,8 +244,12 @@ pub fn validate_transaction(
     block_nullifiers: &mut HashSet<Bytes32>,
     current_height: u64,
 ) -> StateResult<()> {
-    if tx.inputs.is_empty()  { return Err(StateError::ZeroInputs);  }
-    if tx.outputs.is_empty() { return Err(StateError::ZeroOutputs); }
+    if tx.inputs.is_empty() {
+        return Err(StateError::ZeroInputs);
+    }
+    if tx.outputs.is_empty() {
+        return Err(StateError::ZeroOutputs);
+    }
     if tx.version != ProtocolVersion::CURRENT {
         return Err(StateError::UnsupportedTxVersion {
             version: tx.version.0,
@@ -250,9 +277,13 @@ pub fn validate_transaction(
         }
 
         // Referenced UTXO must exist
-        let entry = state.utxos.get(&input.utxo_id)
+        let entry = state
+            .utxos
+            .get(&input.utxo_id)
             .ok_or(StateError::UnknownUtxo)?;
-        input_commitments.push(PedersenCommitment(entry.output.commitment.compressed_point.0));
+        input_commitments.push(PedersenCommitment(
+            entry.output.commitment.compressed_point.0,
+        ));
 
         total_input_value = total_input_value.saturating_add(entry.output.value_spark);
         match &owner_pubkey {
@@ -268,7 +299,7 @@ pub fn validate_transaction(
         // UTXO must be past its lock height
         if entry.output.lock_height > current_height {
             return Err(StateError::OutputLocked {
-                lock_height:    entry.output.lock_height,
+                lock_height: entry.output.lock_height,
                 current_height,
             });
         }
@@ -280,14 +311,16 @@ pub fn validate_transaction(
     let crypto_pk = owner_pubkey
         .to_crypto_pubkey()
         .map_err(|reason| StateError::SignatureInvalid { reason })?;
-    let crypto_sig = tx.signature
+    let crypto_sig = tx
+        .signature
         .to_crypto_sig()
         .map_err(|reason| StateError::SignatureInvalid { reason })?;
     let signing_bytes = tx.signing_bytes(chain_id);
-    verify_hybrid(&signing_bytes, &crypto_sig, &crypto_pk)
-        .map_err(|e| StateError::SignatureInvalid {
+    verify_hybrid(&signing_bytes, &crypto_sig, &crypto_pk).map_err(|e| {
+        StateError::SignatureInvalid {
             reason: e.to_string(),
-        })?;
+        }
+    })?;
 
     verify_opening(
         &PedersenCommitment(tx.fee_commitment.compressed_point.0),
@@ -306,14 +339,15 @@ pub fn validate_transaction(
     let required_fee = state.base_fee.saturating_mul(weight_kb);
     if tx.fee_amount < required_fee {
         return Err(StateError::FeeTooLow {
-            actual:   tx.fee_amount,
+            actual: tx.fee_amount,
             required: required_fee,
         });
     }
 
-    let total_output_value = tx.outputs.iter().fold(0u64, |acc, output| {
-        acc.saturating_add(output.value_spark)
-    });
+    let total_output_value = tx
+        .outputs
+        .iter()
+        .fold(0u64, |acc, output| acc.saturating_add(output.value_spark));
     let required_total = total_output_value.saturating_add(tx.fee_amount);
     if total_input_value != required_total {
         return Err(StateError::InvariantViolation {
@@ -361,12 +395,9 @@ fn apply_transaction(
 
     // Create outputs: insert new UTXOs
     for (out_idx, output) in tx.outputs.iter().enumerate() {
-        state.utxos.insert(
-            output.clone(),
-            height,
-            tx_index,
-            out_idx as u32,
-        )?;
+        state
+            .utxos
+            .insert(output.clone(), height, tx_index, out_idx as u32)?;
     }
 
     let burn_amount = tx.fee_amount / 2;
@@ -380,23 +411,19 @@ fn apply_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519_dalek::scalar::Scalar;
-    use indra_crypto::{
-        ClassicalKeypair, HybridKeypair, PqKeypair, commit, prove_range,
-    };
-    use indra_core::{
-        Bytes32, CommitmentV1, HybridPubKey, HybridSignature, VariableBytes,
-        ProtocolVersion,
-        types::{
-            transaction::{InputV1, OutputV1, TransactionV1},
-            block::{BlockV1, BlockHeaderV1},
-            primitives::{
-                INITIAL_BASE_FEE_SPARK_PER_KB,
-            },
-        },
-    };
-    use rand::{SeedableRng, rngs::StdRng};
     use crate::chain::ChainState;
+    use curve25519_dalek::scalar::Scalar;
+    use indra_core::{
+        types::{
+            block::{BlockHeaderV1, BlockV1},
+            primitives::INITIAL_BASE_FEE_SPARK_PER_KB,
+            staking::{StakingOp, StakingOpBody},
+            transaction::{InputV1, OutputV1, TransactionV1},
+        },
+        Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
+    };
+    use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+    use rand::{rngs::StdRng, SeedableRng};
 
     const TEST_INPUT_VALUE: u64 = 1_000_000;
 
@@ -433,7 +460,43 @@ mod tests {
         }
     }
 
-    fn derive_fee_blinding(input_blindings: &[[u8; 32]], output_blindings: &[[u8; 32]]) -> [u8; 32] {
+    fn pubkey_to_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
+        use indra_core::codec::Encode;
+        Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+    }
+
+    fn sign_staking_op(keypair: &HybridKeypair, chain_id: &str, op: &mut StakingOp) {
+        let sig = keypair.sign(&op.signing_bytes(chain_id)).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
+    fn signed_register_validator_op(
+        state: &ChainState,
+        seed: [u8; 32],
+        nonce: u64,
+    ) -> (StakingOp, Bytes32) {
+        let (validator_pubkey, keypair) = make_test_keypair(seed);
+        let validator_id = pubkey_to_id_for_test(&validator_pubkey);
+        let mut op = StakingOp {
+            body: StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                validator_pubkey,
+                vrf_pk: seed,
+            },
+            nonce,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(&keypair, &state.chain_id, &mut op);
+        (op, validator_id)
+    }
+
+    fn derive_fee_blinding(
+        input_blindings: &[[u8; 32]],
+        output_blindings: &[[u8; 32]],
+    ) -> [u8; 32] {
         let input_sum = input_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
             acc + Scalar::from_bytes_mod_order(*blinding)
         });
@@ -452,10 +515,12 @@ mod tests {
 
         OutputV1 {
             value_spark: value,
-            commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commitment.0),
+            },
             owner_pubkey,
-            range_proof:  VariableBytes::from_slice(&proof).unwrap(),
-            lock_height:  0,
+            range_proof: VariableBytes::from_slice(&proof).unwrap(),
+            lock_height: 0,
         }
     }
 
@@ -486,20 +551,24 @@ mod tests {
         let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
         let (owner_pubkey, _) = make_test_keypair([0x11; 32]);
         let mut tx = TransactionV1 {
-            version:             ProtocolVersion::CURRENT,
+            version: ProtocolVersion::CURRENT,
             signature_module_id: 1,
-            inputs:  vec![InputV1 { utxo_id, nullifier }],
+            inputs: vec![InputV1 { utxo_id, nullifier }],
             outputs: vec![OutputV1 {
                 value_spark: output_value,
-                commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::from(commitment.0),
+                },
                 owner_pubkey,
                 range_proof: VariableBytes::from_slice(&proof).unwrap(),
                 lock_height: 0,
             }],
-            fee_amount:     fee,
-            fee_blinding:   Bytes32::from(fee_blinding),
-            fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
-            signature:      dummy_sig(),
+            fee_amount: fee,
+            fee_blinding: Bytes32::from(fee_blinding),
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(fee_commitment.0),
+            },
+            signature: dummy_sig(),
         };
         tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
         tx
@@ -509,28 +578,75 @@ mod tests {
         let height = state.height + 1;
         BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version:    ProtocolVersion::CURRENT,
+                protocol_version: ProtocolVersion::CURRENT,
                 height,
-                prev_hash:           state.tip_hash,
-                timestamp:           1_700_000_000 + height,
-                state_root:          Bytes32::ZERO,
-                validator_set_root:  Bytes32::ZERO,
-                mempool_set_root:    Bytes32::ZERO,
-                value_hash:          Bytes32::ZERO,
-                base_fee:            state.base_fee,
-                proposer_round:      0,
-                polc_round:          indra_core::types::block::NO_POLC_ROUND,
+                prev_hash: state.tip_hash,
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: state.base_fee,
+                proposer_round: 0,
+                polc_round: indra_core::types::block::NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                quorum_certificate:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
-            transactions:      txs,
+            transactions: txs,
             slashing_evidence: vec![],
-            governance_ops:    vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
         }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_block_rejects_too_many_staking_ops() {
+        let state = ChainState::new_genesis();
+        let (op, _) = signed_register_validator_op(&state, [0x41; 32], 1);
+        let mut block = make_block(&state, vec![]);
+        block.staking_ops = vec![op; MAX_STAKING_OPS_PER_BLOCK + 1];
+        let mut check_state = state.clone();
+
+        assert_eq!(
+            apply_block(&mut check_state, &block),
+            Err(StateError::TooManyStakingOps {
+                actual: MAX_STAKING_OPS_PER_BLOCK + 1,
+                max: MAX_STAKING_OPS_PER_BLOCK,
+            })
+        );
+    }
+
+    #[test]
+    fn apply_block_with_staking_ops_atomicity() {
+        let mut state = ChainState::new_genesis();
+        let original = state.clone();
+        let (op, validator_id) = signed_register_validator_op(&state, [0x42; 32], 1);
+        let mut block = make_block(&state, vec![]);
+        block.staking_ops = vec![op.clone(), op];
+
+        assert!(matches!(
+            apply_block(&mut state, &block),
+            Err(StateError::StakingNonceInvalid { .. })
+        ));
+        assert_eq!(state, original);
+        assert!(state.validators.get(&validator_id).is_none());
+    }
+
+    #[test]
+    fn staking_nonces_committed_to_state_root() {
+        let mut a = ChainState::new_genesis();
+        let mut b = ChainState::new_genesis();
+        a.staking_nonces.insert(Bytes32::from([0xAA; 32]), 1);
+        b.staking_nonces.insert(Bytes32::from([0xAA; 32]), 2);
+
+        assert_ne!(
+            crate::state_root::compute_state_root(&a),
+            crate::state_root::compute_state_root(&b)
+        );
+    }
 
     #[test]
     fn apply_empty_block_advances_height() {
@@ -553,7 +669,14 @@ mod tests {
     fn apply_block_with_tx_spends_utxo() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let nullifier = Bytes32::from([0x99u8; 32]);
-        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier);
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            nullifier,
+        );
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block).unwrap();
 
@@ -569,7 +692,14 @@ mod tests {
     fn double_spend_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let nullifier = Bytes32::from([0xAAu8; 32]);
-        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier);
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            nullifier,
+        );
         let block1 = make_block(&state, vec![tx.clone()]);
         apply_block(&mut state, &block1).unwrap();
 
@@ -580,9 +710,19 @@ mod tests {
 
         let block2 = make_block(
             &state,
-            vec![make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier)],
+            vec![make_tx(
+                &state,
+                &keypair,
+                utxo_id,
+                input_value,
+                input_blinding,
+                nullifier,
+            )],
         );
-        assert_eq!(apply_block(&mut state, &block2), Err(StateError::DoubleSpend));
+        assert_eq!(
+            apply_block(&mut state, &block2),
+            Err(StateError::DoubleSpend)
+        );
     }
 
     #[test]
@@ -592,7 +732,10 @@ mod tests {
         block.header.height = 99; // wrong
         assert!(matches!(
             apply_block(&mut state, &block),
-            Err(StateError::InvalidHeight { expected: 1, actual: 99 })
+            Err(StateError::InvalidHeight {
+                expected: 1,
+                actual: 99
+            })
         ));
     }
 
@@ -626,11 +769,21 @@ mod tests {
     fn unknown_utxo_rejected() {
         let mut state = ChainState::new_genesis();
         let fake_utxo = Bytes32::from([0xDEu8; 32]);
-        let nullifier  = Bytes32::from([0xADu8; 32]);
+        let nullifier = Bytes32::from([0xADu8; 32]);
         let (_, keypair) = make_test_keypair([0x22; 32]);
-        let tx = make_tx(&state, &keypair, fake_utxo, TEST_INPUT_VALUE + 1, [0x01; 32], nullifier);
+        let tx = make_tx(
+            &state,
+            &keypair,
+            fake_utxo,
+            TEST_INPUT_VALUE + 1,
+            [0x01; 32],
+            nullifier,
+        );
         let block = make_block(&state, vec![tx]);
-        assert_eq!(apply_block(&mut state, &block), Err(StateError::UnknownUtxo));
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::UnknownUtxo)
+        );
     }
 
     #[test]
@@ -679,9 +832,9 @@ mod tests {
     #[test]
     fn state_unchanged_on_error() {
         let mut state = ChainState::new_genesis();
-        let height_before  = state.height;
-        let supply_before  = state.total_supply;
-        let utxos_before   = state.utxos.len();
+        let height_before = state.height;
+        let supply_before = state.total_supply;
+        let utxos_before = state.utxos.len();
 
         // Block with wrong height — will fail
         let mut block = make_block(&state, vec![]);
@@ -699,7 +852,14 @@ mod tests {
 
         // Block 1: spend the UTXO
         let nullifier = Bytes32::from([0x55u8; 32]);
-        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding, nullifier);
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            nullifier,
+        );
         let block1 = make_block(&state, vec![tx]);
         apply_block(&mut state, &block1).unwrap();
         assert_eq!(state.height, 1);

@@ -13,6 +13,10 @@ pub enum NodeError {
     #[error("state error: {0}")]
     State(#[from] indra_state::StateError),
 
+    /// A staking operation was rejected before entering the local mempool.
+    #[error("invalid staking op: {0}")]
+    InvalidStakingOp(String),
+
     /// A consensus error.
     #[error("consensus error: {0}")]
     Consensus(#[from] indra_consensus::ConsensusError),
@@ -61,7 +65,9 @@ pub enum NodeError {
     GenesisMismatch,
 
     /// Restarting from a pruned block log requires full state snapshots.
-    #[error("pruned block replay requires full state snapshots; lowest stored block is {lowest_height}")]
+    #[error(
+        "pruned block replay requires full state snapshots; lowest stored block is {lowest_height}"
+    )]
     PrunedReplayUnsupported {
         /// Lowest block height still present in the local block store.
         lowest_height: u64,

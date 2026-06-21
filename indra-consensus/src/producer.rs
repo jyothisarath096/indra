@@ -15,23 +15,22 @@
 //! - Broadcast the block (Phase 5 networking)
 //! - Sign the block header (proposers don't sign headers — the QC does)
 
-use indra_core::{
-    types::{
-        primitives::{
-            Bytes32, ProtocolVersion, VariableBytes,
-            MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES, MAX_QC_SIZE_BYTES,
-        },
-        block::{BlockV1, BlockHeaderV1, NO_POLC_ROUND},
-        transaction::TransactionV1,
+use indra_core::types::{
+    block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    primitives::{
+        Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK,
+        MAX_VRF_PROOF_BYTES,
     },
+    staking::StakingOp,
+    transaction::TransactionV1,
 };
 use indra_crypto::VrfKeypair;
-use indra_state::{ChainState, apply_block, compute_state_root, compute_validator_set_root};
+use indra_state::{apply_block, compute_state_root, compute_validator_set_root, ChainState};
 
 use crate::{
     error::{ConsensusError, ConsensusResult},
     mempool::Mempool,
-    proposer::{compute_proposer_vrf, ProposerElection, elect_proposer},
+    proposer::{compute_proposer_vrf, elect_proposer, ProposerElection},
 };
 
 /// A block template — the inputs needed to produce a block.
@@ -47,6 +46,8 @@ pub struct BlockTemplate {
     pub timestamp: u64,
     /// Round whose prevote quorum justified re-proposal of this value.
     pub polc_round: Option<u32>,
+    /// Staking operations selected for inclusion.
+    pub staking_ops: Vec<StakingOp>,
 }
 
 /// Produce a block from the current state and mempool.
@@ -66,7 +67,9 @@ pub fn produce_block(
 ) -> ConsensusResult<BlockV1> {
     // Verify this keypair is the elected proposer
     let slot = compute_proposer_vrf(
-        election.candidates.iter()
+        election
+            .candidates
+            .iter()
             .find(|candidate| candidate.vrf_pubkey == template.proposer_vrf_keypair.public_key())
             .map(|candidate| candidate.validator_id)
             .ok_or(ConsensusError::WrongProposer)?,
@@ -105,27 +108,28 @@ pub fn produce_block(
     let height = state.height + 1;
 
     let header = BlockHeaderV1 {
-        protocol_version:    ProtocolVersion::CURRENT,
+        protocol_version: ProtocolVersion::CURRENT,
         height,
-        prev_hash:           state.tip_hash,
-        timestamp:           template.timestamp,
-        state_root:          Bytes32::ZERO,
-        validator_set_root:  Bytes32::ZERO,
-        mempool_set_root:    compute_selected_tx_root(&selected),
-        value_hash:          Bytes32::ZERO,
-        base_fee:            state.base_fee,
-        proposer_round:      election.round,
-        polc_round:          template.polc_round.unwrap_or(NO_POLC_ROUND),
+        prev_hash: state.tip_hash,
+        timestamp: template.timestamp,
+        state_root: Bytes32::ZERO,
+        validator_set_root: Bytes32::ZERO,
+        mempool_set_root: compute_selected_tx_root(&selected),
+        value_hash: Bytes32::ZERO,
+        base_fee: state.base_fee,
+        proposer_round: election.round,
+        polc_round: template.polc_round.unwrap_or(NO_POLC_ROUND),
         proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
-        proposer_vrf_proof:  vrf_proof_bytes,
-        quorum_certificate:  qc_bytes,
+        proposer_vrf_proof: vrf_proof_bytes,
+        quorum_certificate: qc_bytes,
     };
 
     let mut block = BlockV1 {
         header,
-        transactions:      selected,
+        transactions: selected,
         slashing_evidence: vec![],
-        governance_ops:    vec![],
+        governance_ops: vec![],
+        staking_ops: template.staking_ops.clone(),
     };
 
     let mut projected = state.clone();
@@ -144,10 +148,7 @@ pub fn produce_block(
 /// This binds the header hash to the exact transaction set included in the block.
 fn compute_selected_tx_root(transactions: &[TransactionV1]) -> Bytes32 {
     use indra_crypto::sha256;
-    let mut tx_ids: Vec<[u8; 32]> = transactions
-        .iter()
-        .map(|tx| tx.tx_hash().0)
-        .collect();
+    let mut tx_ids: Vec<[u8; 32]> = transactions.iter().map(|tx| tx.tx_hash().0).collect();
     tx_ids.sort();
 
     let mut data = Vec::new();
@@ -160,26 +161,28 @@ fn compute_selected_tx_root(transactions: &[TransactionV1]) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_state::ChainState;
+    use crate::mempool::Mempool;
     use indra_crypto::VrfKeypair;
-    use crate::{
-        mempool::Mempool,
-    };
+    use indra_state::ChainState;
 
-    fn make_election(seed: &[u8; 32], height: u64, round: u32, vrf_seed: [u8; 32], stake: u64) -> ProposerElection {
+    fn make_election(
+        seed: &[u8; 32],
+        height: u64,
+        round: u32,
+        vrf_seed: [u8; 32],
+        stake: u64,
+    ) -> ProposerElection {
         let vrf_pubkey = VrfKeypair::from_seed(&vrf_seed).public_key();
         let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
         ProposerElection {
             epoch_seed: Bytes32::from(*seed),
             height,
             round,
-            candidates: vec![
-                crate::proposer::ProposerCandidate {
-                    validator_id,
-                    vrf_pubkey:   vrf_pubkey,
-                    stake,
-                }
-            ],
+            candidates: vec![crate::proposer::ProposerCandidate {
+                validator_id,
+                vrf_pubkey: vrf_pubkey,
+                stake,
+            }],
         }
     }
 
@@ -196,6 +199,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            staking_ops: vec![],
         };
 
         let block = produce_block(&template, &state, &mempool, &election).unwrap();
@@ -219,6 +223,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            staking_ops: vec![],
         };
 
         assert_eq!(
@@ -239,6 +244,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            staking_ops: vec![],
         };
         let block = produce_block(&template, &state, &mempool, &election).unwrap();
         assert_eq!(block.header.height, state.height + 1);

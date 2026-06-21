@@ -3,25 +3,18 @@
 //! These tests verify multi-block scenarios, epoch transitions,
 //! and fee evolution over sequences of blocks.
 
-use indra_core::{
-    Bytes32, CommitmentV1, HybridPubKey, HybridSignature, VariableBytes,
-    ProtocolVersion,
-    types::{
-        block::{BlockV1, BlockHeaderV1},
-        transaction::{InputV1, OutputV1, TransactionV1},
-        primitives::{
-            EPOCH_DURATION_BLOCKS, INITIAL_BASE_FEE_SPARK_PER_KB,
-            GENESIS_SUPPLY_SPARK,
-        },
-    },
-};
 use curve25519_dalek::scalar::Scalar;
-use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, commit, prove_range};
-use indra_state::{
-    apply_block, ChainState,
-    utxo::UtxoSet,
+use indra_core::{
+    types::{
+        block::{BlockHeaderV1, BlockV1},
+        primitives::{EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB},
+        transaction::{InputV1, OutputV1, TransactionV1},
+    },
+    Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
-use rand::{SeedableRng, rngs::StdRng};
+use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_state::{apply_block, utxo::UtxoSet, ChainState};
+use rand::{rngs::StdRng, SeedableRng};
 
 const TEST_INPUT_VALUE: u64 = 1_000_000;
 
@@ -48,7 +41,11 @@ fn dummy_sig() -> HybridSignature {
     }
 }
 
-fn sign_transaction(keypair: &HybridKeypair, chain_id: &str, tx: &TransactionV1) -> HybridSignature {
+fn sign_transaction(
+    keypair: &HybridKeypair,
+    chain_id: &str,
+    tx: &TransactionV1,
+) -> HybridSignature {
     let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
@@ -75,10 +72,12 @@ fn make_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
 
     OutputV1 {
         value_spark: value,
-        commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(commitment.0),
+        },
         owner_pubkey,
-        range_proof:  VariableBytes::from_slice(&proof).unwrap(),
-        lock_height:  0,
+        range_proof: VariableBytes::from_slice(&proof).unwrap(),
+        lock_height: 0,
     }
 }
 
@@ -101,23 +100,27 @@ fn make_tx(
     let mut rng = StdRng::from_seed([out_byte; 32]);
     let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
     let mut tx = TransactionV1 {
-        version:             ProtocolVersion::CURRENT,
+        version: ProtocolVersion::CURRENT,
         signature_module_id: 1,
-        inputs:  vec![InputV1 {
+        inputs: vec![InputV1 {
             utxo_id,
             nullifier: Bytes32::from([nullifier_byte; 32]),
         }],
         outputs: vec![OutputV1 {
             value_spark: output_value,
-            commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commitment.0),
+            },
             owner_pubkey,
             range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }],
-        fee_amount:     fee,
-        fee_blinding:   Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
-        signature:      dummy_sig(),
+        fee_amount: fee,
+        fee_blinding: Bytes32::from(fee_blinding),
+        fee_commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(fee_commitment.0),
+        },
+        signature: dummy_sig(),
     };
     tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
     tx
@@ -127,24 +130,25 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
     let height = state.height + 1;
     BlockV1 {
         header: BlockHeaderV1 {
-            protocol_version:    ProtocolVersion::CURRENT,
+            protocol_version: ProtocolVersion::CURRENT,
             height,
-            prev_hash:           state.tip_hash,
-            timestamp:           1_700_000_000 + height,
-            state_root:          Bytes32::ZERO,
-            validator_set_root:  Bytes32::ZERO,
-            mempool_set_root:    Bytes32::ZERO,
-            value_hash:          Bytes32::ZERO,
-            base_fee:            state.base_fee,
-            proposer_round:      0,
-            polc_round:          indra_core::types::block::NO_POLC_ROUND,
+            prev_hash: state.tip_hash,
+            timestamp: 1_700_000_000 + height,
+            state_root: Bytes32::ZERO,
+            validator_set_root: Bytes32::ZERO,
+            mempool_set_root: Bytes32::ZERO,
+            value_hash: Bytes32::ZERO,
+            base_fee: state.base_fee,
+            proposer_round: 0,
+            polc_round: indra_core::types::block::NO_POLC_ROUND,
             proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-            quorum_certificate:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
         },
-        transactions:      txs,
+        transactions: txs,
         slashing_evidence: vec![],
-        governance_ops:    vec![],
+        governance_ops: vec![],
+        staking_ops: vec![],
     }
 }
 
@@ -202,13 +206,20 @@ fn utxo_lifecycle_across_blocks() {
     let commitment = commit(block1_output_value, &blinding);
     let mut rng = StdRng::from_seed([0x02u8; 32]);
     let proof = prove_range(block1_output_value, &blinding, &mut rng).unwrap();
-    let new_utxo_id = UtxoSet::compute_utxo_id(&OutputV1 {
-        value_spark: block1_output_value,
-        commitment: CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
-        owner_pubkey: owner_pubkey.clone(),
-        range_proof: VariableBytes::from_slice(&proof).unwrap(),
-        lock_height: 0,
-    }, 1, 0, 0);
+    let new_utxo_id = UtxoSet::compute_utxo_id(
+        &OutputV1 {
+            value_spark: block1_output_value,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commitment.0),
+            },
+            owner_pubkey: owner_pubkey.clone(),
+            range_proof: VariableBytes::from_slice(&proof).unwrap(),
+            lock_height: 0,
+        },
+        1,
+        0,
+        0,
+    );
     let tx2 = make_tx(
         &state,
         &keypair,

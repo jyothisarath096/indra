@@ -2,28 +2,25 @@
 //!
 //! Tests the complete path: mempool → block production → voting → QC.
 
+use curve25519_dalek::scalar::Scalar;
+use indra_consensus::{
+    mempool::Mempool,
+    producer::{produce_block, BlockTemplate},
+    proposer::{ProposerCandidate, ProposerElection},
+    qc::{verify_qc, verify_qc_strict, QcBuilder, QcValidator},
+    vote::{produce_vote, RegisteredVoter, VoteCollector, VoteDecision},
+};
 use indra_core::{
-    Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
     types::{
         crypto::HybridSignature,
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
     },
+    Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
 };
-use curve25519_dalek::scalar::Scalar;
-use indra_crypto::{
-    ClassicalKeypair, HybridKeypair, PqKeypair, commit, prove_range,
-    VrfKeypair,
-};
-use rand::{SeedableRng, rngs::StdRng};
+use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::ChainState;
-use indra_consensus::{
-    mempool::Mempool,
-    proposer::{ProposerCandidate, ProposerElection},
-    producer::{BlockTemplate, produce_block},
-    vote::{RegisteredVoter, VoteCollector, VoteDecision, produce_vote},
-    qc::{QcBuilder, QcValidator, verify_qc, verify_qc_strict},
-};
+use rand::{rngs::StdRng, SeedableRng};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,11 +40,8 @@ fn make_user_keypair(seed: u8) -> (HybridPubKey, HybridKeypair) {
 }
 
 fn derive_fee_blinding(input_blinding: [u8; 32], output_blinding: [u8; 32]) -> [u8; 32] {
-    (
-        Scalar::from_bytes_mod_order(input_blinding)
-            - Scalar::from_bytes_mod_order(output_blinding)
-    )
-    .to_bytes()
+    (Scalar::from_bytes_mod_order(input_blinding) - Scalar::from_bytes_mod_order(output_blinding))
+        .to_bytes()
 }
 
 fn dummy_output(nonce: u8, value_spark: u64, owner_pubkey: HybridPubKey) -> OutputV1 {
@@ -57,10 +51,12 @@ fn dummy_output(nonce: u8, value_spark: u64, owner_pubkey: HybridPubKey) -> Outp
     let proof = prove_range(value_spark, &blinding, &mut rng).unwrap();
     OutputV1 {
         value_spark,
-        commitment:   CommitmentV1 { compressed_point: Bytes32::from(commitment.0) },
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(commitment.0),
+        },
         owner_pubkey,
-        range_proof:  VariableBytes::from_slice(&proof).unwrap(),
-        lock_height:  0,
+        range_proof: VariableBytes::from_slice(&proof).unwrap(),
+        lock_height: 0,
     }
 }
 
@@ -84,12 +80,14 @@ fn dummy_tx(
             nullifier: Bytes32::from([nonce; 32]),
         }],
         outputs: vec![dummy_output(nonce, output_value, owner_pubkey)],
-        fee_amount:     fee,
-        fee_blinding:   Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 { compressed_point: Bytes32::from(fee_commitment.0) },
+        fee_amount: fee,
+        fee_blinding: Bytes32::from(fee_blinding),
+        fee_commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(fee_commitment.0),
+        },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         },
     };
     let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
@@ -102,8 +100,8 @@ fn dummy_tx(
 
 struct TestValidator {
     hybrid_kp: HybridKeypair,
-    id:        Bytes32,
-    stake:     u64,
+    id: Bytes32,
+    stake: u64,
 }
 
 impl TestValidator {
@@ -113,7 +111,11 @@ impl TestValidator {
         let hybrid_kp = HybridKeypair::new(classical, pq);
         let pk = hybrid_kp.public_key();
         let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
-        Self { hybrid_kp, id, stake }
+        Self {
+            hybrid_kp,
+            id,
+            stake,
+        }
     }
 
     fn as_registered_voter(&self) -> RegisteredVoter {
@@ -121,8 +123,8 @@ impl TestValidator {
         RegisteredVoter {
             validator_id: self.id,
             classical_pk: pk.classical.0,
-            pq_pk:        pk.pq.0.to_vec(),
-            stake:        self.stake,
+            pq_pk: pk.pq.0.to_vec(),
+            stake: self.stake,
         }
     }
 
@@ -131,8 +133,8 @@ impl TestValidator {
         QcValidator {
             validator_id: self.id,
             position,
-            pq_pk:        pk.pq.0.to_vec(),
-            stake:        self.stake,
+            pq_pk: pk.pq.0.to_vec(),
+            stake: self.stake,
         }
     }
 }
@@ -147,12 +149,29 @@ fn mempool_to_block_pipeline() {
 
     // Seed spendable UTXOs, then submit some transactions that consume them.
     for i in 1..=5u8 {
-        let utxo_id = state.utxos.insert(dummy_output(i, 1_100_000, owner_pubkey.clone()), 0, 0, i as u32).unwrap();
-        mempool.submit(
-            dummy_tx(&state.chain_id, &owner_keypair, owner_pubkey.clone(), utxo_id, 10_000 * i as u64, i),
-            state.base_fee,
-            state.height,
-        ).unwrap();
+        let utxo_id = state
+            .utxos
+            .insert(
+                dummy_output(i, 1_100_000, owner_pubkey.clone()),
+                0,
+                0,
+                i as u32,
+            )
+            .unwrap();
+        mempool
+            .submit(
+                dummy_tx(
+                    &state.chain_id,
+                    &owner_keypair,
+                    owner_pubkey.clone(),
+                    utxo_id,
+                    10_000 * i as u64,
+                    i,
+                ),
+                state.base_fee,
+                state.height,
+            )
+            .unwrap();
     }
     assert_eq!(mempool.len(), 5);
 
@@ -166,16 +185,17 @@ fn mempool_to_block_pipeline() {
         candidates: vec![ProposerCandidate {
             validator_id: Bytes32::from(indra_crypto::sha256(&vrf_pubkey)),
             vrf_pubkey,
-            stake:        1_000_000,
+            stake: 1_000_000,
         }],
     };
 
     let template = BlockTemplate {
         proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
-        epoch_seed:           Bytes32::from(seed),
-        prev_qc_bytes:        vec![],
-        timestamp:            1_700_000_001,
-        polc_round:           None,
+        epoch_seed: Bytes32::from(seed),
+        prev_qc_bytes: vec![],
+        timestamp: 1_700_000_001,
+        polc_round: None,
+        staking_ops: vec![],
     };
 
     let block = produce_block(&template, &state, &mempool, &election).unwrap();
@@ -194,17 +214,23 @@ fn full_consensus_round() {
     let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
     let block_hash = Bytes32::from([0xAAu8; 32]);
     let height = 1u64;
-    let round  = 0u32;
+    let round = 0u32;
 
     // All 3 validators cast precommit votes
-    let voters: Vec<RegisteredVoter> = validators.iter()
-        .map(|v| v.as_registered_voter())
-        .collect();
+    let voters: Vec<RegisteredVoter> = validators.iter().map(|v| v.as_registered_voter()).collect();
 
     let mut collector = VoteCollector::new(height, round, VoteStep::Precommit, voters);
 
     for v in &validators {
-        let vote = produce_vote(height, round, VoteStep::Precommit, block_hash, v.id, &v.hybrid_kp).unwrap();
+        let vote = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            block_hash,
+            v.id,
+            &v.hybrid_kp,
+        )
+        .unwrap();
         collector.add_vote(vote).unwrap();
     }
 
@@ -214,7 +240,9 @@ fn full_consensus_round() {
     ));
 
     // Build QC
-    let qc_validators: Vec<QcValidator> = validators.iter().enumerate()
+    let qc_validators: Vec<QcValidator> = validators
+        .iter()
+        .enumerate()
         .map(|(i, v)| v.as_qc_validator(i))
         .collect();
 
@@ -237,23 +265,38 @@ fn age_eligible_txs_included_first() {
     let (owner_pubkey, owner_keypair) = make_user_keypair(0x66);
 
     // Old tx (age-eligible) with low fee
-    mempool.submit(
-        dummy_tx(&state.chain_id, &owner_keypair, owner_pubkey.clone(), Bytes32::from([0x01; 32]), 1_000, 0x01),
-        state.base_fee,
-        1,
-    ).unwrap();
+    mempool
+        .submit(
+            dummy_tx(
+                &state.chain_id,
+                &owner_keypair,
+                owner_pubkey.clone(),
+                Bytes32::from([0x01; 32]),
+                1_000,
+                0x01,
+            ),
+            state.base_fee,
+            1,
+        )
+        .unwrap();
     // New tx with high fee
-    mempool.submit(
-        dummy_tx(&state.chain_id, &owner_keypair, owner_pubkey, Bytes32::from([0x02; 32]), 999_000, 0x02),
-        state.base_fee,
-        100,
-    ).unwrap();
+    mempool
+        .submit(
+            dummy_tx(
+                &state.chain_id,
+                &owner_keypair,
+                owner_pubkey,
+                Bytes32::from([0x02; 32]),
+                999_000,
+                0x02,
+            ),
+            state.base_fee,
+            100,
+        )
+        .unwrap();
 
     // At height 51+ the first tx is age-eligible
-    let selected = mempool.select_for_block(
-        10,
-        1 + indra_consensus::mempool::AGE_INCLUSION_BLOCKS,
-    );
+    let selected = mempool.select_for_block(10, 1 + indra_consensus::mempool::AGE_INCLUSION_BLOCKS);
 
     // Age-eligible tx (fee=1_000) must come first
     assert_eq!(selected.first().map(|e| e.tx.fee_amount), Some(1_000));
@@ -265,10 +308,7 @@ fn qc_builder_quorum_detection() {
     let v2 = TestValidator::new(0x20, 3_000);
     let block_hash = Bytes32::from([0x55u8; 32]);
 
-    let qc_validators = vec![
-        v1.as_qc_validator(0),
-        v2.as_qc_validator(1),
-    ];
+    let qc_validators = vec![v1.as_qc_validator(0), v2.as_qc_validator(1)];
 
     let mut builder = QcBuilder::new(1, 0, block_hash, qc_validators.clone());
 
@@ -285,7 +325,7 @@ fn qc_builder_quorum_detection() {
 #[test]
 fn strict_qc_verification_accepts_dilithium_only_qc() {
     use indra_core::types::crypto::PQVoteSig;
-    use indra_core::types::primitives::{MAX_PQ_SIG_BYTES, VariableBytes};
+    use indra_core::types::primitives::{VariableBytes, MAX_PQ_SIG_BYTES};
     use indra_core::types::qc::{QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
 
     let validators = vec![
@@ -293,7 +333,9 @@ fn strict_qc_verification_accepts_dilithium_only_qc() {
         TestValidator::new(0x22, 3_300),
         TestValidator::new(0x23, 3_300),
     ];
-    let qc_validators: Vec<QcValidator> = validators.iter().enumerate()
+    let qc_validators: Vec<QcValidator> = validators
+        .iter()
+        .enumerate()
         .map(|(i, v)| v.as_qc_validator(i))
         .collect();
     let block_hash = Bytes32::from([0xEFu8; 32]);
@@ -302,14 +344,28 @@ fn strict_qc_verification_accepts_dilithium_only_qc() {
 
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_signatures = Vec::new();
-    validators.iter().enumerate().for_each(|(position, validator)| {
-        signer_bitfield[position / 8] |= 1 << (position % 8);
-        let vote = produce_vote(height, round, VoteStep::Precommit, block_hash, validator.id, &validator.hybrid_kp).unwrap();
-        pq_signatures.push(PQVoteSig {
-            validator_id: validator.id,
-            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(vote.signature.pq_sig.as_slice()).unwrap(),
+    validators
+        .iter()
+        .enumerate()
+        .for_each(|(position, validator)| {
+            signer_bitfield[position / 8] |= 1 << (position % 8);
+            let vote = produce_vote(
+                height,
+                round,
+                VoteStep::Precommit,
+                block_hash,
+                validator.id,
+                &validator.hybrid_kp,
+            )
+            .unwrap();
+            pq_signatures.push(PQVoteSig {
+                validator_id: validator.id,
+                pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(
+                    vote.signature.pq_sig.as_slice(),
+                )
+                .unwrap(),
+            });
         });
-    });
     let qc = QuorumCertificateV1 {
         height,
         round,
