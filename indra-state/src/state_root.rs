@@ -126,6 +126,13 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
         leaves.push((key, sha256(&value)));
     }
 
+    for hash in &state.applied_slash_hashes {
+        let mut key = Vec::with_capacity(33);
+        key.push(0x05);
+        key.extend_from_slice(&hash.0);
+        leaves.push((key, sha256(&hash.0)));
+    }
+
     if leaves.is_empty() {
         return Bytes32::ZERO;
     }

@@ -6,14 +6,15 @@ use std::time::Duration;
 use indra_core::Bytes32;
 use indra_storage::{BlockStore, PruneConfig};
 
-use crate::{
-    fixtures::dummy_block,
-    timer::bench,
-};
+use crate::{fixtures::dummy_block, timer::bench};
 
 fn temp_path(suffix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("indra_bench_storage_{}_{}.bin", suffix, std::process::id()));
+    p.push(format!(
+        "indra_bench_storage_{}_{}.bin",
+        suffix,
+        std::process::id()
+    ));
     p
 }
 

@@ -151,12 +151,12 @@ impl ScoreEvent {
     /// The score delta for this event.
     pub fn delta(self) -> i32 {
         match self {
-            Self::ValidBlock       =>   5,
-            Self::ValidVote        =>   1,
-            Self::ValidTx          =>   1,
-            Self::InvalidMessage   => -10,
-            Self::Timeout          =>  -5,
-            Self::DuplicateVote    => -20,
+            Self::ValidBlock => 5,
+            Self::ValidVote => 1,
+            Self::ValidTx => 1,
+            Self::InvalidMessage => -10,
+            Self::Timeout => -5,
+            Self::DuplicateVote => -20,
             Self::EquivocatingBlock => -50,
         }
     }
@@ -170,15 +170,21 @@ pub struct PeerTable {
 impl PeerTable {
     /// Create an empty peer table.
     pub fn new() -> Self {
-        Self { peers: HashMap::new() }
+        Self {
+            peers: HashMap::new(),
+        }
     }
 
     /// Add a peer address. Returns the peer info (or existing entry).
     pub fn add(&mut self, addr: SocketAddr) -> NetworkResult<()> {
         if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&addr) {
-            return Err(NetworkError::PeerTableFull { capacity: MAX_PEERS });
+            return Err(NetworkError::PeerTableFull {
+                capacity: MAX_PEERS,
+            });
         }
-        self.peers.entry(addr).or_insert_with(|| PeerInfo::new(addr));
+        self.peers
+            .entry(addr)
+            .or_insert_with(|| PeerInfo::new(addr));
         Ok(())
     }
 
@@ -244,14 +250,16 @@ impl PeerTable {
 
     /// Return all connected peers.
     pub fn connected(&self) -> Vec<&PeerInfo> {
-        self.peers.values()
+        self.peers
+            .values()
             .filter(|p| p.status == PeerStatus::Connected)
             .collect()
     }
 
     /// Return all known (not banned) peer addresses for dialing.
     pub fn dialable(&self) -> Vec<SocketAddr> {
-        self.peers.values()
+        self.peers
+            .values()
             .filter(|p| !p.is_banned() && p.status != PeerStatus::Connected)
             .map(|p| p.addr)
             .collect()
@@ -259,7 +267,8 @@ impl PeerTable {
 
     /// Return the peer with the highest reported height.
     pub fn best_peer(&self) -> Option<&PeerInfo> {
-        self.peers.values()
+        self.peers
+            .values()
             .filter(|p| p.status == PeerStatus::Connected)
             .max_by_key(|p| p.reported_height)
     }

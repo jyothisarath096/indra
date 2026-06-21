@@ -4,11 +4,11 @@
 //! per signer plus a signer bitfield, and no BLS aggregate signature.
 
 use crate::{
-    codec::{Encode, Decode, ByteReader, encode_list, decode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::IndraResult,
     types::{
-        primitives::{Bytes32, MAX_QC_SIGNERS, MAX_VALIDATORS},
         crypto::PQVoteSig,
+        primitives::{Bytes32, MAX_QC_SIGNERS, MAX_VALIDATORS},
     },
 };
 
@@ -36,12 +36,17 @@ pub struct QuorumCertificateV1 {
 impl QuorumCertificateV1 {
     /// Count the number of signers indicated by the bitfield.
     pub fn signer_count(&self) -> usize {
-        self.signer_bitfield.iter().map(|b| b.count_ones() as usize).sum()
+        self.signer_bitfield
+            .iter()
+            .map(|b| b.count_ones() as usize)
+            .sum()
     }
 
     /// Return true if the validator at `slot` is marked as a signer.
     pub fn is_signer(&self, slot: usize) -> bool {
-        if slot >= MAX_VALIDATORS { return false; }
+        if slot >= MAX_VALIDATORS {
+            return false;
+        }
         self.signer_bitfield
             .get(slot / 8)
             .map(|byte| (byte >> (slot % 8)) & 1 == 1)
@@ -58,22 +63,26 @@ impl Encode for QuorumCertificateV1 {
         encode_list(&self.pq_signatures, buf);
     }
     fn encoded_len(&self) -> usize {
-        8 + 4 + 32
-            + SIGNER_BITFIELD_BYTES
-            + list_encoded_len(&self.pq_signatures)
+        8 + 4 + 32 + SIGNER_BITFIELD_BYTES + list_encoded_len(&self.pq_signatures)
     }
 }
 
 impl Decode for QuorumCertificateV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let height      = u64::decode(r)?;
-        let round       = u32::decode(r)?;
-        let block_hash  = Bytes32::decode(r)?;
-        let bf_bytes    = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
+        let height = u64::decode(r)?;
+        let round = u32::decode(r)?;
+        let block_hash = Bytes32::decode(r)?;
+        let bf_bytes = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield.copy_from_slice(bf_bytes);
         let pq_signatures = decode_list(r, MAX_QC_SIGNERS, "pq_signatures")?;
-        Ok(Self { height, round, block_hash, signer_bitfield, pq_signatures })
+        Ok(Self {
+            height,
+            round,
+            block_hash,
+            signer_bitfield,
+            pq_signatures,
+        })
     }
 }
 
@@ -84,18 +93,21 @@ mod tests {
 
     fn dummy_qc() -> QuorumCertificateV1 {
         QuorumCertificateV1 {
-            height:          1_000,
-            round:           0,
-            block_hash:      Bytes32::from([0x77u8; 32]),
+            height: 1_000,
+            round: 0,
+            block_hash: Bytes32::from([0x77u8; 32]),
             signer_bitfield: [0b11111111u8; SIGNER_BITFIELD_BYTES],
-            pq_signatures:   vec![],
+            pq_signatures: vec![],
         }
     }
 
     #[test]
     fn qc_round_trip() {
         let qc = dummy_qc();
-        assert_eq!(qc, QuorumCertificateV1::decode_exact(&qc.encode_to_vec()).unwrap());
+        assert_eq!(
+            qc,
+            QuorumCertificateV1::decode_exact(&qc.encode_to_vec()).unwrap()
+        );
     }
 
     #[test]

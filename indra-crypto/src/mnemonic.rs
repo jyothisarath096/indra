@@ -7,7 +7,7 @@ use alloc::{
     vec::Vec,
 };
 
-use bip39::{Language, Mnemonic, rand::RngCore};
+use bip39::{rand::RngCore, Language, Mnemonic};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{error::CryptoError, sha256};

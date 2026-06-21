@@ -305,7 +305,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        generators::{generator_g_vec, generator_h_vec, generator_h},
+        generators::{generator_g_vec, generator_h, generator_h_vec},
         transcript::Transcript,
     };
 

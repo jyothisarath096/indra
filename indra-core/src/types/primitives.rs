@@ -62,18 +62,30 @@ pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
-/// Slash fraction for double precommit (alias for SLASH_DOUBLE_SIGN_BPS).
-/// Both are equivocation offences — same penalty: 10% of stake.
-pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 1_000;
+/// Double precommit slash: 5% of stake.
+/// Covers both accidental (bug) and intentional equivocation.
+/// 5% hurts but doesn't destroy honest validators with software bugs.
+pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 500;
 
-/// Slash fraction for surround vote: same as double-sign (10%).
-/// Surround voting is a form of equivocation — intentional malicious act.
-/// Note: 100% slash (10_000 bps) was removed as disproportionate.
-/// A validator who double-signs loses 10% stake and is ejected from
-/// the active set — sufficient deterrence without total destruction.
+/// Surround vote slash: 10% of stake.
+/// Surround voting is a deliberate protocol attack — higher penalty.
 pub const SLASH_SURROUND_VOTE_BPS: u32 = 1_000;
 
-/// Grace period (epochs) for a self-reported software-bug slash.
+/// Self-report slash: 1% of stake.
+/// Validator reports own equivocation within SLASH_GRACE_PERIOD_EPOCHS.
+pub const SLASH_SELF_REPORT_BPS: u32 = 100;
+
+/// Reporter reward: 5% of slashed amount to treasury.
+/// Incentivizes evidence submission.
+pub const SLASH_REPORTER_REWARD_BPS: u32 = 500;
+
+/// Liveness slash: 0.1% per missed epoch after threshold.
+pub const SLASH_LIVENESS_BPS: u32 = 10;
+
+/// Consecutive missed epochs before liveness slash begins.
+pub const SLASH_LIVENESS_THRESHOLD_EPOCHS: u64 = 3;
+
+/// Grace period epochs for self-reported bug slash.
 pub const SLASH_GRACE_PERIOD_EPOCHS: u64 = 5;
 
 // ── Block and Transaction Limits ──────────────────────────────────────────────
@@ -93,8 +105,8 @@ pub const MAX_OUTPUTS: usize = 16;
 /// Maximum quorum certificate size in bytes.
 pub const MAX_QC_SIZE_BYTES: usize = 10_485_760; // 10 MB
 
-/// Maximum slash evidence entries per block.
-pub const MAX_SLASHES_PER_BLOCK: usize = 10;
+/// Maximum slash evidence per block (reduced — each requires 2 signature verifications).
+pub const MAX_SLASHES_PER_BLOCK: usize = 3;
 
 /// Maximum governance operations per block.
 pub const MAX_GOV_OPS_PER_BLOCK: usize = 5;

@@ -2,13 +2,10 @@
 
 use std::time::Duration;
 
-use indra_state::{apply_block, ChainState};
 use indra_node::state_root::compute_state_root;
+use indra_state::{apply_block, ChainState};
 
-use crate::{
-    fixtures::dummy_block,
-    timer::bench,
-};
+use crate::{fixtures::dummy_block, timer::bench};
 
 /// Benchmark applying an empty block.
 pub fn bench_block_apply_empty(iterations: u64) {

@@ -44,7 +44,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The JSON-RPC HTTP server.
 pub struct RpcServer {
-    addr:   String,
+    addr: String,
     engine: Arc<Mutex<NodeEngine>>,
 }
 
@@ -52,7 +52,7 @@ impl RpcServer {
     /// Create a new server bound to the given address.
     pub fn new(addr: &str, engine: Arc<Mutex<NodeEngine>>) -> Self {
         Self {
-            addr:   addr.to_string(),
+            addr: addr.to_string(),
             engine,
         }
     }
@@ -76,11 +76,7 @@ impl RpcServer {
         let response = match Self::read_and_process(&stream, &engine) {
             Ok(resp) => resp,
             Err(e) => {
-                let resp = RpcResponse::err(
-                    JsonId::Null,
-                    ERR_INTERNAL_ERROR,
-                    e.to_string(),
-                );
+                let resp = RpcResponse::err(JsonId::Null, ERR_INTERNAL_ERROR, e.to_string());
                 resp.to_json()
             }
         };
@@ -118,10 +114,14 @@ impl RpcServer {
             reader.read_line(&mut line)?;
             let trimmed = line.trim();
             if first_line {
-                if trimmed.starts_with("OPTIONS") { is_options = true; }
+                if trimmed.starts_with("OPTIONS") {
+                    is_options = true;
+                }
                 first_line = false;
             }
-            if trimmed.is_empty() { break; }
+            if trimmed.is_empty() {
+                break;
+            }
             if trimmed.to_lowercase().starts_with("content-length:") {
                 let val = trimmed["content-length:".len()..].trim();
                 content_length = val.parse().unwrap_or(0);
@@ -138,7 +138,8 @@ impl RpcServer {
                 JsonId::Null,
                 ERR_PARSE_ERROR,
                 "empty request body".to_string(),
-            ).to_json());
+            )
+            .to_json());
         }
 
         // Read body
@@ -151,11 +152,7 @@ impl RpcServer {
         let req = match parse_request(&body_str) {
             Ok(r) => r,
             Err(e) => {
-                return Ok(RpcResponse::err(
-                    JsonId::Null,
-                    ERR_PARSE_ERROR,
-                    e,
-                ).to_json());
+                return Ok(RpcResponse::err(JsonId::Null, ERR_PARSE_ERROR, e).to_json());
             }
         };
 
@@ -168,8 +165,8 @@ impl RpcServer {
         drop(guard);
 
         let resp = match result {
-            Ok(json)  => RpcResponse::ok(id, json),
-            Err(e)    => RpcResponse::err(id, e.code(), e.to_string()),
+            Ok(json) => RpcResponse::ok(id, json),
+            Err(e) => RpcResponse::err(id, e.code(), e.to_string()),
         };
 
         Ok(resp.to_json())
@@ -185,11 +182,7 @@ pub fn handle_with_engine(stream: TcpStream, engine: &NodeEngine) {
     let response = match read_and_process_ref(&stream, engine) {
         Ok(resp) => resp,
         Err(e) => {
-            let resp = RpcResponse::err(
-                JsonId::Null,
-                ERR_INTERNAL_ERROR,
-                e.to_string(),
-            );
+            let resp = RpcResponse::err(JsonId::Null, ERR_INTERNAL_ERROR, e.to_string());
             resp.to_json()
         }
     };
@@ -225,10 +218,14 @@ fn read_and_process_ref(
         reader.read_line(&mut line)?;
         let trimmed = line.trim();
         if first_line {
-            if trimmed.starts_with("OPTIONS") { is_options = true; }
+            if trimmed.starts_with("OPTIONS") {
+                is_options = true;
+            }
             first_line = false;
         }
-        if trimmed.is_empty() { break; }
+        if trimmed.is_empty() {
+            break;
+        }
         if trimmed.to_lowercase().starts_with("content-length:") {
             let val = trimmed["content-length:".len()..].trim();
             content_length = val.parse().unwrap_or(0);
@@ -244,7 +241,8 @@ fn read_and_process_ref(
             JsonId::Null,
             ERR_PARSE_ERROR,
             "empty request body".to_string(),
-        ).to_json());
+        )
+        .to_json());
     }
 
     let mut body = vec![0u8; content_length.min(1_048_576)];
@@ -265,22 +263,18 @@ fn read_and_process_ref(
 
     let resp = match result {
         Ok(json) => RpcResponse::ok(id, json),
-        Err(e)   => RpcResponse::err(id, e.code(), e.to_string()),
+        Err(e) => RpcResponse::err(id, e.code(), e.to_string()),
     };
 
     Ok(resp.to_json())
 }
 
 /// Make a direct in-process RPC call (for testing without HTTP).
-pub fn call_rpc(
-    method: &str,
-    params: &[String],
-    engine: &NodeEngine,
-) -> String {
+pub fn call_rpc(method: &str, params: &[String], engine: &NodeEngine) -> String {
     let state = NodeState { engine };
     match dispatch(method, params, &state) {
         Ok(result) => RpcResponse::ok(JsonId::Number(1), result).to_json(),
-        Err(e)     => RpcResponse::err(JsonId::Number(1), e.code(), e.to_string()).to_json(),
+        Err(e) => RpcResponse::err(JsonId::Number(1), e.code(), e.to_string()).to_json(),
     }
 }
 
@@ -292,7 +286,11 @@ mod tests {
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_rpc_server_test_{}_{}", suffix, std::process::id()));
+        p.push(format!(
+            "indra_rpc_server_test_{}_{}",
+            suffix,
+            std::process::id()
+        ));
         p
     }
 

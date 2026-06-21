@@ -38,13 +38,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_qc_store_test_{}_{}", label, std::process::id()));
+        p.push(format!(
+            "indra_qc_store_test_{}_{}",
+            label,
+            std::process::id()
+        ));
         p
     }
 

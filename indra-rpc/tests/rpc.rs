@@ -38,7 +38,14 @@ fn rpc_get_tip() {
 fn rpc_get_chain_info_fields() {
     let (e, dir) = engine("rpc_ci");
     let resp = call_rpc("indra_getChainInfo", &[], &e);
-    for field in &["height", "base_fee", "total_supply", "epoch", "active_validators", "mempool_size"] {
+    for field in &[
+        "height",
+        "base_fee",
+        "total_supply",
+        "epoch",
+        "active_validators",
+        "mempool_size",
+    ] {
         assert!(resp.contains(field), "missing field: {field}");
     }
     let _ = std::fs::remove_dir_all(&dir);

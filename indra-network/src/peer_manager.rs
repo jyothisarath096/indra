@@ -4,24 +4,26 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 
-use indra_core::types::primitives::Bytes32;
+use indra_core::types::{
+    primitives::Bytes32, slash_detector::SlashDetector, slashing::SlashEvidenceV1,
+};
 
 use crate::{
     frame::{FrameReader, FrameWriter},
     handshake::HandshakeResult,
     message::Message,
     net_types::{NetworkCommand, NetworkEvent},
-    peer::{BAN_DURATION_RATE_LIMIT, PeerTable, ScoreEvent},
+    peer::{PeerTable, ScoreEvent, BAN_DURATION_RATE_LIMIT},
     rate_limit::{GlobalRateLimiter, MessageClass, PeerRateLimiter},
 };
 
@@ -75,6 +77,7 @@ struct PeerManagerActor {
     validator_by_addr: HashMap<SocketAddr, Bytes32>,
     connected_peers: Arc<AtomicUsize>,
     global_limiter: GlobalRateLimiter,
+    transport_slash_detector: Arc<Mutex<SlashDetector>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,9 +178,17 @@ impl PeerManagerActor {
                 addr,
                 penalty,
             } => {
-                self.peer_table
-                    .adjust_score_with_duration(&addr, -penalty, BAN_DURATION_RATE_LIMIT);
-                if self.peer_table.get(&addr).map(|peer| peer.is_banned()).unwrap_or(false) {
+                self.peer_table.adjust_score_with_duration(
+                    &addr,
+                    -penalty,
+                    BAN_DURATION_RATE_LIMIT,
+                );
+                if self
+                    .peer_table
+                    .get(&addr)
+                    .map(|peer| peer.is_banned())
+                    .unwrap_or(false)
+                {
                     eprintln!(
                         "[p2p] peer {} ({}) banned 10min for sustained rate limit violations",
                         short_validator_id(&validator_id),
@@ -202,7 +213,10 @@ impl PeerManagerActor {
                 if MessageClass::needs_global_byte_limit(&msg)
                     && !self.global_limiter.check_large_payload(msg_size)
                 {
-                    eprintln!("[p2p] global rate limit: dropped large payload from {}", addr);
+                    eprintln!(
+                        "[p2p] global rate limit: dropped large payload from {}",
+                        addr
+                    );
                     self.peer_table
                         .adjust_score_with_duration(&addr, -1, BAN_DURATION_RATE_LIMIT);
                     return;
@@ -256,6 +270,8 @@ impl PeerManagerActor {
         let (small_tx, small_rx) = mpsc::channel(SMALL_QUEUE_CAPACITY);
         let (large_tx, large_rx) = mpsc::channel(LARGE_QUEUE_CAPACITY);
         let control_tx = self.control_tx.clone();
+        let event_tx = self.event_tx.clone();
+        let transport_slash_detector = Arc::clone(&self.transport_slash_detector);
 
         let read_task = tokio::spawn(async move {
             let mut reader = FrameReader::new(reader_half, recv_key);
@@ -275,6 +291,22 @@ impl PeerManagerActor {
                     Ok(msg) => msg,
                     Err(_) => break,
                 };
+                if let Message::Vote(vote) = &msg {
+                    if let Some(evidence) = transport_slash_detector
+                        .lock()
+                        .await
+                        .observe_vote(vote.clone())
+                    {
+                        let wire_evidence = SlashEvidenceV1 {
+                            validator_id: evidence.validator_id,
+                            vote_1: evidence.vote_a,
+                            vote_2: evidence.vote_b,
+                        };
+                        let _ = event_tx
+                            .send(NetworkEvent::SlashDetected(wire_evidence))
+                            .await;
+                    }
+                }
                 if let Some(penalty) = rate_limiter.check(&msg, msg_size) {
                     let _ = control_tx
                         .send(PeerManagerMessage::RateLimitViolation {
@@ -308,8 +340,16 @@ impl PeerManagerActor {
 
         let control_tx = self.control_tx.clone();
         let write_task = tokio::spawn(async move {
-            run_write_loop(writer_half, send_key, small_rx, large_rx, control_tx, peer_validator_id, addr)
-                .await;
+            run_write_loop(
+                writer_half,
+                send_key,
+                small_rx,
+                large_rx,
+                control_tx,
+                peer_validator_id,
+                addr,
+            )
+            .await;
         });
 
         let _ = self.peer_table.add(addr);
@@ -497,6 +537,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         validator_by_addr: HashMap::new(),
         connected_peers: Arc::clone(&connected_peers),
         global_limiter: GlobalRateLimiter::new(),
+        transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
     };
     tokio::spawn(actor.run());
     PeerManagerHandle {
@@ -536,6 +577,7 @@ mod tests {
             validator_by_addr: HashMap::new(),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             global_limiter: GlobalRateLimiter::new(),
+            transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
         }
     }
 
@@ -583,7 +625,7 @@ mod tests {
             match event {
                 NetworkEvent::PeerConnected { .. } => connected += 1,
                 NetworkEvent::PeerDisconnected { .. } => disconnected += 1,
-                NetworkEvent::Message { .. } => {}
+                NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
             }
         }
         assert_eq!(connected, 2);

@@ -1,7 +1,7 @@
 //! Slash evidence types.
 
 use crate::{
-    codec::{Encode, Decode, ByteReader},
+    codec::{ByteReader, Decode, Encode},
     error::IndraResult,
     types::{primitives::Bytes32, vote::VoteV1},
 };
@@ -32,8 +32,8 @@ impl Decode for SlashEvidenceV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
             validator_id: Bytes32::decode(r)?,
-            vote_1:       VoteV1::decode(r)?,
-            vote_2:       VoteV1::decode(r)?,
+            vote_1: VoteV1::decode(r)?,
+            vote_2: VoteV1::decode(r)?,
         })
     }
 }

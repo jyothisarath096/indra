@@ -9,13 +9,8 @@
 //! Maximum message size: MAX_MSG_BYTES.
 
 use indra_core::{
-    codec::{Decode, Encode, ByteReader},
-    types::{
-        block::BlockV1,
-        primitives::Bytes32,
-        transaction::TransactionV1,
-        vote::VoteV1,
-    },
+    codec::{ByteReader, Decode, Encode},
+    types::{block::BlockV1, primitives::Bytes32, transaction::TransactionV1, vote::VoteV1},
 };
 
 use crate::error::{NetworkError, NetworkResult};
@@ -31,23 +26,23 @@ pub const MAX_MSG_BYTES: usize = 14_680_064;
 #[repr(u8)]
 pub enum MessageType {
     /// A complete block.
-    Block     = 0x01,
+    Block = 0x01,
     /// A prevote or precommit.
-    Vote      = 0x02,
+    Vote = 0x02,
     /// A pending transaction.
-    Tx        = 0x03,
+    Tx = 0x03,
     /// A list of known peer addresses.
-    PeerList  = 0x04,
+    PeerList = 0x04,
     /// Liveness ping.
-    Ping      = 0x05,
+    Ping = 0x05,
     /// Liveness pong.
-    Pong      = 0x06,
+    Pong = 0x06,
     /// Request blocks by height range.
     RequestBlocks = 0x07,
     /// Respond with a batch of blocks.
     BlockResponse = 0x08,
     /// Announce current chain tip.
-    Status        = 0x09,
+    Status = 0x09,
     /// Request a specific proposal block by slot and hash.
     RequestProposal = 0x0A,
     /// Request the QC for a committed height.
@@ -138,15 +133,15 @@ impl Message {
     /// The message type discriminant.
     pub fn message_type(&self) -> MessageType {
         match self {
-            Self::Block(_)     => MessageType::Block,
-            Self::Vote(_)      => MessageType::Vote,
-            Self::Tx(_)        => MessageType::Tx,
-            Self::PeerList(_)  => MessageType::PeerList,
-            Self::Ping(_)      => MessageType::Ping,
-            Self::Pong(_)      => MessageType::Pong,
+            Self::Block(_) => MessageType::Block,
+            Self::Vote(_) => MessageType::Vote,
+            Self::Tx(_) => MessageType::Tx,
+            Self::PeerList(_) => MessageType::PeerList,
+            Self::Ping(_) => MessageType::Ping,
+            Self::Pong(_) => MessageType::Pong,
             Self::RequestBlocks { .. } => MessageType::RequestBlocks,
             Self::BlockResponse { .. } => MessageType::BlockResponse,
-            Self::Status { .. }        => MessageType::Status,
+            Self::Status { .. } => MessageType::Status,
             Self::RequestProposal { .. } => MessageType::RequestProposal,
             Self::RequestQC { .. } => MessageType::RequestQC,
             Self::QCResponse { .. } => MessageType::QCResponse,
@@ -191,8 +186,8 @@ impl Message {
     fn encode_payload(&self) -> Vec<u8> {
         match self {
             Self::Block(b) => b.encode_to_vec(),
-            Self::Vote(v)  => v.encode_to_vec(),
-            Self::Tx(tx)   => tx.encode_to_vec(),
+            Self::Vote(v) => v.encode_to_vec(),
+            Self::Tx(tx) => tx.encode_to_vec(),
             Self::PeerList(peers) => {
                 let mut buf = Vec::new();
                 (peers.len() as u32).encode(&mut buf);
@@ -205,7 +200,10 @@ impl Message {
             }
             Self::Ping(nonce) => nonce.to_le_bytes().to_vec(),
             Self::Pong(nonce) => nonce.to_le_bytes().to_vec(),
-            Self::RequestBlocks { from_height, to_height } => {
+            Self::RequestBlocks {
+                from_height,
+                to_height,
+            } => {
                 let mut buf = Vec::with_capacity(16);
                 buf.extend_from_slice(&from_height.to_le_bytes());
                 buf.extend_from_slice(&to_height.to_le_bytes());
@@ -227,7 +225,11 @@ impl Message {
                 buf.extend_from_slice(&tip_hash.0);
                 buf
             }
-            Self::RequestProposal { height, round, hash } => {
+            Self::RequestProposal {
+                height,
+                round,
+                hash,
+            } => {
                 let mut buf = Vec::with_capacity(44);
                 buf.extend_from_slice(&height.to_le_bytes());
                 buf.extend_from_slice(&round.to_le_bytes());
@@ -288,11 +290,11 @@ impl Message {
                             reason: "peer list entry length truncated".to_string(),
                         });
                     };
-                    let len = u16::from_le_bytes(
-                        len_bytes.try_into().map_err(|_| NetworkError::DecodeFailed {
+                    let len = u16::from_le_bytes(len_bytes.try_into().map_err(|_| {
+                        NetworkError::DecodeFailed {
                             reason: "invalid peer list entry length".to_string(),
-                        })?
-                    ) as usize;
+                        }
+                    })?) as usize;
                     offset += 2;
                     let Some(peer_bytes) = payload.get(offset..offset + len) else {
                         return Err(NetworkError::DecodeFailed {
@@ -352,7 +354,10 @@ impl Message {
                     })?;
                 let from_height = u64::from_le_bytes(from_height_bytes);
                 let to_height = u64::from_le_bytes(to_height_bytes);
-                Ok(Self::RequestBlocks { from_height, to_height })
+                Ok(Self::RequestBlocks {
+                    from_height,
+                    to_height,
+                })
             }
             MessageType::BlockResponse => {
                 let mut reader = ByteReader::new(payload);
@@ -364,9 +369,11 @@ impl Message {
                     let len = u32::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
                         reason: e.to_string(),
                     })? as usize;
-                    let bytes = reader.read_bytes(len).map_err(|e| NetworkError::DecodeFailed {
-                        reason: e.to_string(),
-                    })?;
+                    let bytes = reader
+                        .read_bytes(len)
+                        .map_err(|e| NetworkError::DecodeFailed {
+                            reason: e.to_string(),
+                        })?;
                     let mut block_reader = ByteReader::new(bytes);
                     let block = BlockV1::decode(&mut block_reader).map_err(|e| {
                         NetworkError::DecodeFailed {
@@ -397,7 +404,10 @@ impl Message {
                         reason: "invalid status tip hash".to_string(),
                     })?;
                 let height = u64::from_le_bytes(height_bytes);
-                Ok(Self::Status { height, tip_hash: Bytes32::from(tip) })
+                Ok(Self::Status {
+                    height,
+                    tip_hash: Bytes32::from(tip),
+                })
             }
             MessageType::RequestProposal => {
                 let height_bytes: [u8; 8] = payload
@@ -505,16 +515,29 @@ mod tests {
 
     #[test]
     fn request_blocks_round_trip() {
-        let msg = Message::RequestBlocks { from_height: 100, to_height: 200 };
+        let msg = Message::RequestBlocks {
+            from_height: 100,
+            to_height: 200,
+        };
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
-        assert!(matches!(decoded, Message::RequestBlocks { from_height: 100, to_height: 200 }));
+        assert!(matches!(
+            decoded,
+            Message::RequestBlocks {
+                from_height: 100,
+                to_height: 200
+            }
+        ));
     }
 
     #[test]
     fn request_proposal_round_trip() {
         let hash = Bytes32::from([0x55u8; 32]);
-        let msg = Message::RequestProposal { height: 7, round: 3, hash };
+        let msg = Message::RequestProposal {
+            height: 7,
+            round: 3,
+            hash,
+        };
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         assert!(matches!(
@@ -545,7 +568,10 @@ mod tests {
     #[test]
     fn status_round_trip() {
         let tip = Bytes32::from([0xABu8; 32]);
-        let msg = Message::Status { height: 999, tip_hash: tip };
+        let msg = Message::Status {
+            height: 999,
+            tip_hash: tip,
+        };
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         match decoded {

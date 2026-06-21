@@ -47,14 +47,14 @@
 
 pub mod error;
 pub mod mempool;
-pub mod proposer;
 pub mod producer;
-pub mod vote;
+pub mod proposer;
 pub mod qc;
+pub mod vote;
 
 pub use error::{ConsensusError, ConsensusResult};
-pub use mempool::{Mempool, MempoolEntry, MempoolConfig};
-pub use proposer::{elect_proposer, ProposerElection, SlotResult};
+pub use mempool::{Mempool, MempoolConfig, MempoolEntry};
 pub use producer::{produce_block, BlockTemplate};
-pub use vote::{VoteCollector, VoteDecision, produce_vote};
+pub use proposer::{elect_proposer, ProposerElection, SlotResult};
 pub use qc::{build_qc, qc_signing_bytes, verify_qc, verify_qc_strict, QcBuilder};
+pub use vote::{produce_vote, VoteCollector, VoteDecision};

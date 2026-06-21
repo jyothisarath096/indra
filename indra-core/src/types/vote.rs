@@ -1,9 +1,9 @@
 //! Vote type — the fundamental consensus message.
 
 use crate::{
-    codec::{Encode, Decode, ByteReader},
+    codec::{ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    types::{primitives::Bytes32, crypto::HybridSignature},
+    types::{crypto::HybridSignature, primitives::Bytes32},
 };
 
 /// Which consensus phase this vote belongs to.
@@ -11,14 +11,18 @@ use crate::{
 #[repr(u8)]
 pub enum VoteStep {
     /// Prevote phase.
-    Prevote   = 0,
+    Prevote = 0,
     /// Precommit phase.
     Precommit = 1,
 }
 
 impl Encode for VoteStep {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.push(*self as u8); }
-    fn encoded_len(&self) -> usize { 1 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(*self as u8);
+    }
+    fn encoded_len(&self) -> usize {
+        1
+    }
 }
 
 impl Decode for VoteStep {
@@ -38,21 +42,21 @@ impl Decode for VoteStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteV1 {
     /// Chain height this vote applies to.
-    pub height:       u64,
+    pub height: u64,
     /// Round within the height.
-    pub round:        u32,
+    pub round: u32,
     /// Prevote or Precommit.
-    pub step:         VoteStep,
+    pub step: VoteStep,
     /// Stable value hash being voted for.
     ///
     /// The field name remains `block_hash` for wire compatibility, but the
     /// payload now carries `BlockHeaderV1::value_hash` rather than the full
     /// per-round proposal hash.
-    pub block_hash:   Bytes32,
+    pub block_hash: Bytes32,
     /// Validator's identity.
     pub validator_id: Bytes32,
     /// Hybrid signature over (height || round || step || value_hash || validator_id).
-    pub signature:    HybridSignature,
+    pub signature: HybridSignature,
 }
 
 impl Encode for VoteV1 {
@@ -72,12 +76,12 @@ impl Encode for VoteV1 {
 impl Decode for VoteV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
-            height:       u64::decode(r)?,
-            round:        u32::decode(r)?,
-            step:         VoteStep::decode(r)?,
-            block_hash:   Bytes32::decode(r)?,
+            height: u64::decode(r)?,
+            round: u32::decode(r)?,
+            step: VoteStep::decode(r)?,
+            block_hash: Bytes32::decode(r)?,
             validator_id: Bytes32::decode(r)?,
-            signature:    HybridSignature::decode(r)?,
+            signature: HybridSignature::decode(r)?,
         })
     }
 }
@@ -97,14 +101,14 @@ mod tests {
 
     fn dummy_vote() -> VoteV1 {
         VoteV1 {
-            height:       42_000,
-            round:        1,
-            step:         VoteStep::Precommit,
-            block_hash:   Bytes32::from([0xAAu8; 32]),
+            height: 42_000,
+            round: 1,
+            step: VoteStep::Precommit,
+            block_hash: Bytes32::from([0xAAu8; 32]),
             validator_id: Bytes32::from([0xBBu8; 32]),
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-                pq_sig:        VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
             },
         }
     }

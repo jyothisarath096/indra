@@ -19,7 +19,7 @@ pub mod transcript;
 
 pub use errors::{BulletproofError, BulletproofResult};
 pub use range_proof::{
-    RANGE_PROOF_BYTES, RangeProof, prove as prove_range_full, verify as verify_range,
+    prove as prove_range_full, verify as verify_range, RangeProof, RANGE_PROOF_BYTES,
 };
 
 /// Prove that `value` is in `[0, 2^64)` and return serialized proof bytes.

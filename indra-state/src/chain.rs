@@ -6,7 +6,7 @@
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::IndraResult;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indra_core::types::primitives::{
     Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -69,6 +69,10 @@ pub struct ChainState {
 
     /// Monotonic nonces for staking op replay protection.
     pub staking_nonces: HashMap<Bytes32, u64>,
+
+    /// Hashes of applied slash evidence — prevents double-slash.
+    /// Key: SHA-256(encode(SlashEvidenceV1))
+    pub applied_slash_hashes: HashSet<Bytes32>,
 }
 
 impl Encode for ChainState {
@@ -102,6 +106,7 @@ impl Encode for ChainState {
         // Included: stake bonds lock UTXOs and drive delegation/unbonding state.
         encode_bond_map(&self.staked_bonds, buf);
         encode_nonce_map(&self.staking_nonces, buf);
+        encode_hash_set(&self.applied_slash_hashes, buf);
         // Omitted: no extra cached fields live on ChainState itself; nested SMT caches are
         // intentionally reconstructed by the set decoders from the serialized canonical entries.
     }
@@ -123,6 +128,7 @@ impl Encode for ChainState {
             + self.delegations.encoded_len()
             + bond_map_encoded_len(&self.staked_bonds)
             + nonce_map_encoded_len(&self.staking_nonces)
+            + hash_set_encoded_len(&self.applied_slash_hashes)
     }
 }
 
@@ -145,6 +151,7 @@ impl Decode for ChainState {
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
+            applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
         })
     }
 }
@@ -169,6 +176,7 @@ impl ChainState {
             delegations: DelegationMap::new(),
             staked_bonds: HashMap::new(),
             staking_nonces: HashMap::new(),
+            applied_slash_hashes: HashSet::new(),
         }
     }
 
@@ -181,6 +189,42 @@ impl ChainState {
     pub fn has_blocks(&self) -> bool {
         self.height > 0
     }
+}
+
+fn encode_hash_set(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
+    let mut entries: Vec<_> = hashes.iter().copied().collect();
+    entries.sort_by_key(|hash| hash.0);
+    (entries.len() as u32).encode(buf);
+    for hash in entries {
+        hash.encode(buf);
+    }
+}
+
+fn hash_set_encoded_len(hashes: &HashSet<Bytes32>) -> usize {
+    4 + hashes.len() * 32
+}
+
+fn decode_hash_set(r: &mut ByteReader<'_>, field: &'static str) -> IndraResult<HashSet<Bytes32>> {
+    use indra_core::error::IndraError;
+    use indra_core::types::primitives::MAX_SLASHES_PER_BLOCK;
+
+    let count = u32::decode(r)? as usize;
+    let max = MAX_SLASHES_PER_BLOCK.saturating_mul(10_000);
+    if count > max {
+        return Err(IndraError::LengthExceeded {
+            field,
+            max,
+            actual: count,
+        });
+    }
+    let mut hashes = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let hash = Bytes32::decode(r)?;
+        if !hashes.insert(hash) {
+            return Err(IndraError::DuplicateEntries { field });
+        }
+    }
+    Ok(hashes)
 }
 
 fn encode_bond_map(bonds: &HashMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {

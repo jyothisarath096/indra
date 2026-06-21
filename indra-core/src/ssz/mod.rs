@@ -5,7 +5,7 @@
 
 pub mod merkle;
 
-pub use merkle::{merkleise, hash_tree_root_chunks};
+pub use merkle::{hash_tree_root_chunks, merkleise};
 
 use sha2::{Digest, Sha256};
 
@@ -34,26 +34,36 @@ pub trait Ssz {
 
 impl Ssz for u8 {
     fn hash_tree_root(&self) -> [u8; 32] {
-        let mut c = [0u8; 32]; c[0] = *self; c
+        let mut c = [0u8; 32];
+        c[0] = *self;
+        c
     }
 }
 impl Ssz for u16 {
     fn hash_tree_root(&self) -> [u8; 32] {
-        let mut c = [0u8; 32]; c[..2].copy_from_slice(&self.to_le_bytes()); c
+        let mut c = [0u8; 32];
+        c[..2].copy_from_slice(&self.to_le_bytes());
+        c
     }
 }
 impl Ssz for u32 {
     fn hash_tree_root(&self) -> [u8; 32] {
-        let mut c = [0u8; 32]; c[..4].copy_from_slice(&self.to_le_bytes()); c
+        let mut c = [0u8; 32];
+        c[..4].copy_from_slice(&self.to_le_bytes());
+        c
     }
 }
 impl Ssz for u64 {
     fn hash_tree_root(&self) -> [u8; 32] {
-        let mut c = [0u8; 32]; c[..8].copy_from_slice(&self.to_le_bytes()); c
+        let mut c = [0u8; 32];
+        c[..8].copy_from_slice(&self.to_le_bytes());
+        c
     }
 }
 impl Ssz for bool {
     fn hash_tree_root(&self) -> [u8; 32] {
-        let mut c = [0u8; 32]; c[0] = *self as u8; c
+        let mut c = [0u8; 32];
+        c[0] = *self as u8;
+        c
     }
 }

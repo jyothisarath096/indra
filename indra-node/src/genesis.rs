@@ -187,6 +187,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
+            last_active_epoch: 0,
             pending_rewards: 0,
             rewards_last_epoch: 0,
             self_report_count: 0,

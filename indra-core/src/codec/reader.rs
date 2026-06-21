@@ -7,7 +7,7 @@ use crate::error::{IndraError, IndraResult};
 /// All reads are bounds-checked. No panics. No unsafe.
 pub struct ByteReader<'a> {
     data: &'a [u8],
-    pos:  usize,
+    pos: usize,
 }
 
 impl<'a> ByteReader<'a> {
@@ -29,11 +29,13 @@ impl<'a> ByteReader<'a> {
     /// Read exactly `n` bytes, advancing the cursor.
     pub fn read_bytes(&mut self, n: usize) -> IndraResult<&'a [u8]> {
         let end = self.pos.checked_add(n).ok_or(IndraError::UnexpectedEof {
-            needed: n, available: self.remaining(),
+            needed: n,
+            available: self.remaining(),
         })?;
         let Some(slice) = self.data.get(self.pos..end) else {
             return Err(IndraError::UnexpectedEof {
-                needed: n, available: self.remaining(),
+                needed: n,
+                available: self.remaining(),
             });
         };
         self.pos = end;

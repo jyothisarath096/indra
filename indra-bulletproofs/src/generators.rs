@@ -2,10 +2,7 @@
 
 use alloc::vec::Vec;
 
-use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::RistrettoPoint,
-};
+use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint};
 use sha2::Sha512;
 
 /// Bit length for range proofs. 64 = prove values in [0, 2^64).

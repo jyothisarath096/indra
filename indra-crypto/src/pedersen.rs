@@ -3,9 +3,9 @@
 //! C = value * G + blinding * H
 
 use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT,
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
-    constants::RISTRETTO_BASEPOINT_POINT,
 };
 use sha2::Sha512;
 
@@ -17,9 +17,7 @@ pub static GENERATOR_G: std::sync::LazyLock<RistrettoPoint> =
 
 /// The second independent generator H (blinding generator).
 pub static GENERATOR_H: std::sync::LazyLock<RistrettoPoint> =
-    std::sync::LazyLock::new(|| {
-        RistrettoPoint::hash_from_bytes::<Sha512>(b"INDRA-PEDERSEN-H-v1")
-    });
+    std::sync::LazyLock::new(|| RistrettoPoint::hash_from_bytes::<Sha512>(b"INDRA-PEDERSEN-H-v1"));
 
 /// A Pedersen commitment: a compressed Ristretto255 point (32 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +36,16 @@ impl PedersenCommitment {
 
     /// Add two commitments homomorphically.
     pub fn add(&self, other: &Self) -> CryptoResult<Self> {
-        Ok(Self::from_point(&(self.decompress()? + other.decompress()?)))
+        Ok(Self::from_point(
+            &(self.decompress()? + other.decompress()?),
+        ))
     }
 
     /// Subtract two commitments homomorphically.
     pub fn sub(&self, other: &Self) -> CryptoResult<Self> {
-        Ok(Self::from_point(&(self.decompress()? - other.decompress()?)))
+        Ok(Self::from_point(
+            &(self.decompress()? - other.decompress()?),
+        ))
     }
 
     /// Compress a RistrettoPoint to a PedersenCommitment.
@@ -69,7 +71,10 @@ pub fn commit(value: u64, blinding: &[u8; 32]) -> PedersenCommitment {
 }
 
 /// Verify that a commitment opens correctly.
-pub fn verify_opening(commitment: &PedersenCommitment, opening: &PedersenOpening) -> CryptoResult<()> {
+pub fn verify_opening(
+    commitment: &PedersenCommitment,
+    opening: &PedersenOpening,
+) -> CryptoResult<()> {
     if commit(opening.value, &opening.blinding) == *commitment {
         Ok(())
     } else {
@@ -80,18 +85,34 @@ pub fn verify_opening(commitment: &PedersenCommitment, opening: &PedersenOpening
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn b(byte: u8) -> [u8; 32] { [byte; 32] }
+    fn b(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
 
     #[test]
     fn commit_and_verify() {
         let c = commit(1000, &b(0x01));
-        assert!(verify_opening(&c, &PedersenOpening { value: 1000, blinding: b(0x01) }).is_ok());
+        assert!(verify_opening(
+            &c,
+            &PedersenOpening {
+                value: 1000,
+                blinding: b(0x01)
+            }
+        )
+        .is_ok());
     }
 
     #[test]
     fn wrong_value_fails() {
         let c = commit(1000, &b(0x01));
-        assert!(verify_opening(&c, &PedersenOpening { value: 999, blinding: b(0x01) }).is_err());
+        assert!(verify_opening(
+            &c,
+            &PedersenOpening {
+                value: 999,
+                blinding: b(0x01)
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -103,7 +124,9 @@ mod tests {
     fn homomorphic_addition() {
         let r1 = Scalar::from_bytes_mod_order(b(0x01));
         let r2 = Scalar::from_bytes_mod_order(b(0x02));
-        let c_sum = commit(100, &r1.to_bytes()).add(&commit(200, &r2.to_bytes())).unwrap();
+        let c_sum = commit(100, &r1.to_bytes())
+            .add(&commit(200, &r2.to_bytes()))
+            .unwrap();
         assert_eq!(c_sum, commit(300, &(r1 + r2).to_bytes()));
     }
 }

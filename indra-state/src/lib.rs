@@ -35,27 +35,27 @@
 #![deny(clippy::panic)]
 #![deny(clippy::indexing_slicing)]
 
-pub mod error;
-pub mod smt;
-pub mod utxo;
-pub mod nullifier;
-pub mod validator;
-pub mod chain;
 pub mod apply;
-pub mod fee;
+pub mod chain;
 pub mod delegation;
 pub mod epoch;
+pub mod error;
+pub mod fee;
+pub mod nullifier;
+pub mod smt;
 pub mod state_root;
+pub mod utxo;
+pub mod validator;
 
-pub use error::{StateError, StateResult};
-pub use smt::{MerkleProof, SparseMerkleTree, SMT_DEPTH};
-pub use utxo::{UtxoSet, UtxoEntry};
-pub use nullifier::NullifierSet;
-pub use validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};
-pub use chain::ChainState;
 pub use apply::apply_block;
-pub use fee::compute_next_base_fee;
+pub use chain::ChainState;
 pub use delegation::apply_staking_op;
 pub use epoch::apply_epoch_transition;
-pub use validator::DelegatorEntry;
+pub use error::{StateError, StateResult};
+pub use fee::compute_next_base_fee;
+pub use nullifier::NullifierSet;
+pub use smt::{MerkleProof, SparseMerkleTree, SMT_DEPTH};
 pub use state_root::{compute_state_root, compute_validator_set_root};
+pub use utxo::{UtxoEntry, UtxoSet};
+pub use validator::DelegatorEntry;
+pub use validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};

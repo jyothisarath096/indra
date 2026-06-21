@@ -15,7 +15,10 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-use std::{ffi::{CStr, c_char}, panic::catch_unwind};
+use std::{
+    ffi::{c_char, CStr},
+    panic::catch_unwind,
+};
 
 use indra_bulletproofs::RANGE_PROOF_BYTES;
 use indra_crypto::sha256;
@@ -148,10 +151,7 @@ pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -
 ///
 /// `out_phrase` must point to a writable buffer of length `out_len`.
 #[no_mangle]
-pub unsafe extern "C" fn indra_generate_mnemonic(
-    out_phrase: *mut c_char,
-    out_len: usize,
-) -> i32 {
+pub unsafe extern "C" fn indra_generate_mnemonic(out_phrase: *mut c_char, out_len: usize) -> i32 {
     if out_phrase.is_null() {
         return IndraError::NullPointer.code();
     }
@@ -262,7 +262,10 @@ pub unsafe extern "C" fn indra_validator_id(classical_pk: *const u8, out_id: *mu
 /// `params` must reference readable memory for the documented lengths, and
 /// `out` must point to writable storage for `IndraTxResult`.
 #[no_mangle]
-pub unsafe extern "C" fn indra_build_tx(params: *const IndraTxParams, out: *mut IndraTxResult) -> i32 {
+pub unsafe extern "C" fn indra_build_tx(
+    params: *const IndraTxParams,
+    out: *mut IndraTxResult,
+) -> i32 {
     if params.is_null() || out.is_null() {
         return IndraError::NullPointer.code();
     }
@@ -281,14 +284,16 @@ pub unsafe extern "C" fn indra_build_tx(params: *const IndraTxParams, out: *mut 
         }
 
         let mut recipient_classical_pk = [0u8; CLASSICAL_PK_BYTES];
-        recipient_classical_pk.copy_from_slice(
-            std::slice::from_raw_parts(params_ref.recipient_classical_pk, CLASSICAL_PK_BYTES),
-        );
+        recipient_classical_pk.copy_from_slice(std::slice::from_raw_parts(
+            params_ref.recipient_classical_pk,
+            CLASSICAL_PK_BYTES,
+        ));
 
         let mut sender_classical_seed = [0u8; CLASSICAL_SK_BYTES];
-        sender_classical_seed.copy_from_slice(
-            std::slice::from_raw_parts(params_ref.sender_classical_seed, CLASSICAL_SK_BYTES),
-        );
+        sender_classical_seed.copy_from_slice(std::slice::from_raw_parts(
+            params_ref.sender_classical_seed,
+            CLASSICAL_SK_BYTES,
+        ));
 
         let sender_pq_sk = std::slice::from_raw_parts(params_ref.sender_pq_sk, PQ_SK_BYTES);
         let sender_pq_pk = std::slice::from_raw_parts(params_ref.sender_pq_pk, PQ_PK_BYTES);
@@ -298,7 +303,8 @@ pub unsafe extern "C" fn indra_build_tx(params: *const IndraTxParams, out: *mut 
             std::slice::from_raw_parts(params_ref.utxos, params_ref.utxo_count)
         };
 
-        let wallet_context = wallet::build_wallet_context(sender_classical_seed, sender_pq_pk, utxos)?;
+        let wallet_context =
+            wallet::build_wallet_context(sender_classical_seed, sender_pq_pk, utxos)?;
         let built = tx::build(
             recipient_classical_pk,
             params_ref.amount_spark,
@@ -515,9 +521,8 @@ mod tests {
     #[test]
     fn generate_mnemonic_produces_phrase() {
         let mut phrase = [0u8; MNEMONIC_MAX_BYTES];
-        let code = unsafe {
-            indra_generate_mnemonic(phrase.as_mut_ptr().cast::<c_char>(), phrase.len())
-        };
+        let code =
+            unsafe { indra_generate_mnemonic(phrase.as_mut_ptr().cast::<c_char>(), phrase.len()) };
         assert_eq!(code, INDRA_OK);
         let nul = phrase.iter().position(|b| *b == 0).unwrap();
         let rendered = std::str::from_utf8(&phrase[..nul]).unwrap();
@@ -532,8 +537,14 @@ mod tests {
         let mut out1 = IndraKeyPair::zeroed();
         let mut out2 = IndraKeyPair::zeroed();
         unsafe {
-            assert_eq!(indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out1), INDRA_OK);
-            assert_eq!(indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out2), INDRA_OK);
+            assert_eq!(
+                indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out1),
+                INDRA_OK
+            );
+            assert_eq!(
+                indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out2),
+                INDRA_OK
+            );
         }
         assert_eq!(out1.validator_id, out2.validator_id);
         assert_eq!(out1.classical_pk, out2.classical_pk);
@@ -547,7 +558,7 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon \
              abandon abandon abandon abandon abandon abandon \
              abandon abandon abandon abandon abandon abandon \
-             abandon abandon abandon abandon abandon art"
+             abandon abandon abandon abandon abandon art",
         )
         .unwrap();
         let mut out = IndraKeyPair::zeroed();
@@ -573,7 +584,10 @@ mod tests {
 
         let mut out2 = IndraKeyPair::zeroed();
         unsafe {
-            assert_eq!(indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out2), INDRA_OK);
+            assert_eq!(
+                indra_keygen_from_mnemonic(phrase.as_ptr(), &mut out2),
+                INDRA_OK
+            );
         }
         assert_eq!(out.bls_seed, out2.bls_seed);
         assert_eq!(out.vrf_seed, out2.vrf_seed);

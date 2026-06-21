@@ -330,6 +330,7 @@ mod tests {
                 stake_spark: 1_000_000,
                 status: ValidatorStatus::Active,
                 registered_epoch: 7,
+                last_active_epoch: 7,
                 pending_rewards: 12,
                 rewards_last_epoch: 6,
                 self_report_count: 1,

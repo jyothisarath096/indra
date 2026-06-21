@@ -20,20 +20,13 @@ use indra_core::types::primitives::{
     ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, STAKING_TX_IDX,
 };
 
-use crate::{
-    chain::ChainState,
-    error::StateResult,
-    validator::ValidatorStatus,
-};
+use crate::{chain::ChainState, error::StateResult, validator::ValidatorStatus};
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
 pub const EPOCHS_PER_YEAR: u64 = BLOCKS_PER_YEAR / EPOCH_DURATION_BLOCKS;
 
 /// Apply the epoch transition to the chain state.
-pub fn apply_epoch_transition(
-    state: &mut ChainState,
-    current_epoch: u64,
-) -> StateResult<()> {
+pub fn apply_epoch_transition(state: &mut ChainState, current_epoch: u64) -> StateResult<()> {
     eprintln!(
         "[epoch] transition at height={} epoch={} validators={} total_stake={} fee_pool={}",
         state.height,
@@ -56,8 +49,7 @@ pub fn apply_epoch_transition(
         HARD_CAP_SPARK
     );
     debug_assert_eq!(
-        state.total_supply,
-        supply_before,
+        state.total_supply, supply_before,
         "supply changed during epoch transition"
     );
 
@@ -65,17 +57,18 @@ pub fn apply_epoch_transition(
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds(state, current_epoch)?;
+    apply_liveness_penalties(state, current_epoch);
     let total_staked = state
         .validators
         .total_selectable_self_stake()
         .saturating_add(state.delegations.total_staked());
-    state.validators.select_active_set(&state.delegations, total_staked);
+    state
+        .validators
+        .select_active_set(&state.delegations, total_staked);
 
     eprintln!(
         "[epoch] complete epoch={} total_supply={} treasury={}",
-        current_epoch,
-        state.total_supply,
-        state.treasury_balance,
+        current_epoch, state.total_supply, state.treasury_balance,
     );
     Ok(())
 }
@@ -113,16 +106,10 @@ fn saturation_adjusted_reward(
         return raw_reward;
     }
 
-    raw_reward
-        .saturating_mul(saturation_point)
-        / validator_stake
+    raw_reward.saturating_mul(saturation_point) / validator_stake
 }
 
-fn distribute_block_rewards(
-    state: &mut ChainState,
-    epoch_block_reward: u64,
-    current_epoch: u64,
-) {
+fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, current_epoch: u64) {
     let total_stake = state.validators.total_active_stake();
     if total_stake == 0 || epoch_block_reward == 0 {
         return;
@@ -138,12 +125,8 @@ fn distribute_block_rewards(
 
     for (id, stake) in &active {
         let raw_reward = epoch_block_reward.saturating_mul(*stake) / total_stake;
-        let adjusted_reward = saturation_adjusted_reward(
-            raw_reward,
-            *stake,
-            total_stake,
-            active_validator_count,
-        );
+        let adjusted_reward =
+            saturation_adjusted_reward(raw_reward, *stake, total_stake, active_validator_count);
 
         let commission_bps = state
             .validators
@@ -176,10 +159,7 @@ fn distribute_block_rewards(
     }
 }
 
-fn distribute_fee_rewards(
-    state: &mut ChainState,
-    current_epoch: u64,
-) {
+fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64) {
     let fee_pool = state.fee_reward_pool;
     if fee_pool == 0 {
         return;
@@ -226,8 +206,7 @@ fn distribute_fee_rewards(
         let remainder = state
             .delegations
             .distribute_rewards(id, delegator_pool, current_epoch);
-        distributed = distributed
-            .saturating_add(delegator_pool.saturating_sub(remainder));
+        distributed = distributed.saturating_add(delegator_pool.saturating_sub(remainder));
     }
 
     let remainder = fee_pool.saturating_sub(distributed);
@@ -238,11 +217,13 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
     let mut ids: Vec<indra_core::types::primitives::Bytes32> = state
         .validators
         .all_validators()
-        .filter(|v| matches!(
-            v.status,
-            ValidatorStatus::Unbonding { unbonding_end_epoch }
-            if unbonding_end_epoch <= current_epoch
-        ))
+        .filter(|v| {
+            matches!(
+                v.status,
+                ValidatorStatus::Unbonding { unbonding_end_epoch }
+                if unbonding_end_epoch <= current_epoch
+            )
+        })
         .map(|v| v.validator_id)
         .collect();
     ids.sort_by_key(|id| id.0);
@@ -271,9 +252,7 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
     let release_height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
     for (idx, utxo_id) in to_release.into_iter().enumerate() {
         if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
-            let output_index = u32::try_from(idx)
-                .unwrap_or(u32::MAX - 1)
-                .saturating_add(1);
+            let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
             state
                 .utxos
                 .insert(
@@ -290,6 +269,43 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
     Ok(())
 }
 
+fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) {
+    use indra_core::types::primitives::{SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS};
+
+    let validator_ids: Vec<Bytes32> = state
+        .validators
+        .active_validators()
+        .map(|v| v.validator_id)
+        .collect();
+
+    for validator_id in validator_ids {
+        let (missed, stake) = {
+            let v = match state.validators.get(&validator_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            let missed = current_epoch.saturating_sub(v.last_active_epoch);
+            (missed, v.stake_spark)
+        };
+
+        if missed >= SLASH_LIVENESS_THRESHOLD_EPOCHS && stake > 0 {
+            let penalty = stake
+                .saturating_mul(SLASH_LIVENESS_BPS as u64)
+                .saturating_div(10_000);
+            if let Some(v) = state.validators.get_mut(&validator_id) {
+                v.stake_spark = v.stake_spark.saturating_sub(penalty);
+            }
+            state.total_supply = state.total_supply.saturating_sub(penalty);
+            eprintln!(
+                "[liveness] validator {} missed {} epochs, penalty={} Spark burned",
+                hex::encode(&validator_id.0[..4]),
+                missed,
+                penalty,
+            );
+        }
+    }
+}
+
 /// True if the given height is the last block of an epoch.
 pub fn is_epoch_boundary(height: u64) -> bool {
     height > 0 && height.is_multiple_of(EPOCH_DURATION_BLOCKS)
@@ -303,21 +319,21 @@ pub fn epoch_for_height(height: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        compute_state_root,
+        validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
+    };
     use indra_core::{
         types::{
             crypto::HybridPubKey,
             primitives::{
-                Bytes32, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS,
-                ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
-                ERA_3_PLUS_DURATION_BLOCKS, VariableBytes,
+                Bytes32, VariableBytes, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+                ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
+                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
             },
             transaction::OutputV1,
         },
         CommitmentV1,
-    };
-    use crate::{
-        compute_state_root,
-        validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
     };
 
     fn make_validator(id_byte: u8, stake: u64) -> ValidatorEntry {
@@ -330,6 +346,7 @@ mod tests {
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
+            last_active_epoch: 0,
             pending_rewards: 0,
             rewards_last_epoch: 0,
             self_report_count: 0,
@@ -393,7 +410,10 @@ mod tests {
     #[test]
     fn block_reward_era_3() {
         let era_3_start = ERA_1_2_DURATION_BLOCKS * 2;
-        assert_eq!(block_reward_at_height(era_3_start), ERA_3_BLOCK_REWARD_SPARK);
+        assert_eq!(
+            block_reward_at_height(era_3_start),
+            ERA_3_BLOCK_REWARD_SPARK
+        );
         assert_eq!(ERA_3_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK / 2);
     }
 
@@ -447,6 +467,44 @@ mod tests {
         let treasury_before = state.treasury_balance;
         apply_epoch_transition(&mut state, 1).unwrap();
         assert_eq!(state.treasury_balance, treasury_before);
+    }
+
+    #[test]
+    fn liveness_penalty_applied_after_threshold() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let validator = make_validator(0x91, 1_000_000);
+        let validator_id = validator.validator_id;
+        state.validators.upsert(validator).unwrap();
+        apply_epoch_transition(&mut state, 3).unwrap();
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            999_000
+        );
+    }
+
+    #[test]
+    fn liveness_no_penalty_within_threshold() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let validator = make_validator(0x92, 1_000_000);
+        let validator_id = validator.validator_id;
+        state.validators.upsert(validator).unwrap();
+        apply_epoch_transition(&mut state, 2).unwrap();
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn liveness_penalty_burns_supply() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        state
+            .validators
+            .upsert(make_validator(0x93, 1_000_000))
+            .unwrap();
+        let supply_before = state.total_supply;
+        apply_epoch_transition(&mut state, 3).unwrap();
+        assert_eq!(state.total_supply, supply_before - 1_000);
     }
 
     #[test]

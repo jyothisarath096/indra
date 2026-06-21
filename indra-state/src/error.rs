@@ -188,6 +188,21 @@ pub enum StateError {
         max: usize,
     },
 
+    /// Slash evidence already applied — duplicate submission.
+    #[error("slash evidence already applied")]
+    SlashAlreadyApplied,
+
+    /// Slash evidence is cryptographically invalid or logically inconsistent.
+    #[error("invalid slash evidence: {reason}")]
+    InvalidSlashEvidence {
+        /// Specific reason the evidence is invalid.
+        reason: String,
+    },
+
+    /// Block contains duplicate slash evidence entries.
+    #[error("block contains duplicate slash evidence")]
+    DuplicateSlashEvidence,
+
     /// Validator not found in the validator set.
     #[error("validator not found")]
     ValidatorNotFound,

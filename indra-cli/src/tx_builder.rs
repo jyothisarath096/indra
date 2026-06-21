@@ -9,18 +9,15 @@
 //! 5. Signs the transaction with the hybrid keypair
 //! 6. Returns serialised hex ready for indra_sendTransaction RPC
 
+use curve25519_dalek::scalar::Scalar;
 use indra_core::{
     codec::Encode,
     types::{
-        primitives::{
-            Bytes32, MAX_RANGE_PROOF_BYTES, ProtocolVersion,
-            VariableBytes,
-        },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
+        primitives::{Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
-use curve25519_dalek::scalar::Scalar;
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     pedersen::commit,
@@ -82,35 +79,45 @@ pub struct BuiltTransaction {
 pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     // 1. Validate amount and fee
     if params.amount_spark < DUST_LIMIT_SPARK {
-        return Err(CliError::Transaction(
-            format!("amount {} Spark is below dust limit {}", params.amount_spark, DUST_LIMIT_SPARK)
-        ));
+        return Err(CliError::Transaction(format!(
+            "amount {} Spark is below dust limit {}",
+            params.amount_spark, DUST_LIMIT_SPARK
+        )));
     }
     if params.fee_spark < MIN_FEE_SPARK {
-        return Err(CliError::Transaction(
-            format!("fee {} Spark is below minimum {}", params.fee_spark, MIN_FEE_SPARK)
-        ));
+        return Err(CliError::Transaction(format!(
+            "fee {} Spark is below minimum {}",
+            params.fee_spark, MIN_FEE_SPARK
+        )));
     }
 
     // 2. Parse recipient pubkey
     let recipient_pubkey = parse_pubkey_hex(params.recipient_pubkey_hex)?;
 
     // 3. Coin selection
-    let selected = params.wallet.select_utxos(params.amount_spark, params.fee_spark)?;
+    let selected = params
+        .wallet
+        .select_utxos(params.amount_spark, params.fee_spark)?;
     let total_in: u64 = selected.iter().map(|e| e.value_spark).sum();
     let change_spark = total_in
         .saturating_sub(params.amount_spark)
         .saturating_sub(params.fee_spark);
 
     // 4. Build inputs
-    let inputs: Vec<InputV1> = selected.iter().map(|e| {
-        // nullifier = SHA-256(hybrid_seed || utxo_id)
-        let mut data = Vec::with_capacity(64);
-        data.extend_from_slice(&params.hybrid_seed);
-        data.extend_from_slice(&e.utxo_id.0);
-        let nullifier = Bytes32::from(sha256(&data));
-        InputV1 { utxo_id: e.utxo_id, nullifier }
-    }).collect();
+    let inputs: Vec<InputV1> = selected
+        .iter()
+        .map(|e| {
+            // nullifier = SHA-256(hybrid_seed || utxo_id)
+            let mut data = Vec::with_capacity(64);
+            data.extend_from_slice(&params.hybrid_seed);
+            data.extend_from_slice(&e.utxo_id.0);
+            let nullifier = Bytes32::from(sha256(&data));
+            InputV1 {
+                utxo_id: e.utxo_id,
+                nullifier,
+            }
+        })
+        .collect();
 
     let mut rng = rand::rngs::OsRng;
     // 5. Generate random blinding factors using OsRng.
@@ -136,20 +143,17 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     let change_blinding_scalar = change_blinding
         .map(Scalar::from_bytes_mod_order)
         .unwrap_or(Scalar::ZERO);
-    let fee_blinding = (
-        input_blinding_sum - recipient_blinding_scalar - change_blinding_scalar
-    ).to_bytes();
+    let fee_blinding =
+        (input_blinding_sum - recipient_blinding_scalar - change_blinding_scalar).to_bytes();
 
     // 6. Build outputs with Pedersen commitments + range proofs
     let mut outputs = Vec::new();
 
     // Recipient output
     let recipient_commitment = commit(params.amount_spark, &recipient_blinding);
-    let recipient_proof = indra_crypto::prove_range(
-        params.amount_spark,
-        &recipient_blinding,
-        &mut rng,
-    ).map_err(|e| CliError::Transaction(format!("range proof failed: {e}")))?;
+    let recipient_proof =
+        indra_crypto::prove_range(params.amount_spark, &recipient_blinding, &mut rng)
+            .map_err(|e| CliError::Transaction(format!("range proof failed: {e}")))?;
 
     outputs.push(OutputV1 {
         value_spark: params.amount_spark,
@@ -211,9 +215,11 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         // pq_pk is embedded in sender_pubkey
         params.sender_pubkey.pq_pk.as_slice(),
         &params.pq_sk_bytes,
-    ).map_err(|e| CliError::Crypto(e.to_string()))?;
+    )
+    .map_err(|e| CliError::Crypto(e.to_string()))?;
     let keypair = HybridKeypair::new(classical, pq);
-    let sig = keypair.sign(&tx_bytes_unsigned)
+    let sig = keypair
+        .sign(&tx_bytes_unsigned)
         .map_err(|e| CliError::Crypto(e.to_string()))?;
 
     let classical_sig_bytes = sig.classical.0.to_vec();
@@ -253,17 +259,17 @@ fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
         .map_err(|_| CliError::InvalidHex("bad classical pubkey hex".into()))?;
 
     if classical_bytes.len() != 32 {
-        return Err(CliError::Transaction(
-            format!("classical pubkey must be 32 bytes, got {}", classical_bytes.len())
-        ));
+        return Err(CliError::Transaction(format!(
+            "classical pubkey must be 32 bytes, got {}",
+            classical_bytes.len()
+        )));
     }
 
     let mut classical_arr = [0u8; 32];
     classical_arr.copy_from_slice(&classical_bytes);
 
     let pq_bytes = if parts.len() == 2 {
-        hex::decode(parts[1])
-            .map_err(|_| CliError::InvalidHex("bad pq pubkey hex".into()))?
+        hex::decode(parts[1]).map_err(|_| CliError::InvalidHex("bad pq pubkey hex".into()))?
     } else {
         vec![0u8; 2592] // zeroed pq key — not recommended for mainnet
     };
@@ -278,13 +284,13 @@ fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
 /// Build a dummy signature (all zeros) for pre-signing placeholder.
 fn dummy_signature() -> CliResult<HybridSignature> {
     Ok(HybridSignature {
-        classical_sig: VariableBytes::from_slice(&[0u8; 64])
-            .map_err(|_| CliError::Transaction("dummy classical signature exceeded max length".into()))?,
+        classical_sig: VariableBytes::from_slice(&[0u8; 64]).map_err(|_| {
+            CliError::Transaction("dummy classical signature exceeded max length".into())
+        })?,
         pq_sig: VariableBytes::from_slice(&[0u8; 4627])
             .map_err(|_| CliError::Transaction("dummy PQ signature exceeded max length".into()))?,
     })
 }
-
 
 #[cfg(test)]
 mod tests {

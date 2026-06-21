@@ -515,6 +515,7 @@ mod tests {
                 stake_spark: stake,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
+                last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
                 self_report_count: 0,
@@ -561,6 +562,7 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
+            slash_evidence: vec![],
             staking_ops: vec![],
         };
         produce_block(&template, state, &Mempool::default_config(), &election).unwrap()

@@ -21,6 +21,7 @@ use indra_core::types::{
         Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK,
         MAX_VRF_PROOF_BYTES,
     },
+    slashing::SlashEvidenceV1,
     staking::StakingOp,
     transaction::TransactionV1,
 };
@@ -48,6 +49,8 @@ pub struct BlockTemplate {
     pub polc_round: Option<u32>,
     /// Staking operations selected for inclusion.
     pub staking_ops: Vec<StakingOp>,
+    /// Slash evidence selected for inclusion.
+    pub slash_evidence: Vec<SlashEvidenceV1>,
 }
 
 /// Produce a block from the current state and mempool.
@@ -127,7 +130,7 @@ pub fn produce_block(
     let mut block = BlockV1 {
         header,
         transactions: selected,
-        slashing_evidence: vec![],
+        slashing_evidence: template.slash_evidence.clone(),
         governance_ops: vec![],
         staking_ops: template.staking_ops.clone(),
     };
@@ -199,6 +202,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            slash_evidence: vec![],
             staking_ops: vec![],
         };
 
@@ -223,6 +227,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            slash_evidence: vec![],
             staking_ops: vec![],
         };
 
@@ -244,6 +249,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            slash_evidence: vec![],
             staking_ops: vec![],
         };
         let block = produce_block(&template, &state, &mempool, &election).unwrap();

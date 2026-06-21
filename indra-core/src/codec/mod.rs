@@ -55,42 +55,68 @@ pub trait Decode: Sized {
 // ── Primitive encode/decode ───────────────────────────────────────────────────
 
 impl Encode for u8 {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.push(*self); }
-    fn encoded_len(&self) -> usize { 1 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(*self);
+    }
+    fn encoded_len(&self) -> usize {
+        1
+    }
 }
 impl Decode for u8 {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> { r.read_u8() }
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        r.read_u8()
+    }
 }
 
 impl Encode for u16 {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.extend_from_slice(&self.to_le_bytes()); }
-    fn encoded_len(&self) -> usize { 2 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+    fn encoded_len(&self) -> usize {
+        2
+    }
 }
 impl Decode for u16 {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> { r.read_u16_le() }
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        r.read_u16_le()
+    }
 }
 
 impl Encode for u32 {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.extend_from_slice(&self.to_le_bytes()); }
-    fn encoded_len(&self) -> usize { 4 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+    fn encoded_len(&self) -> usize {
+        4
+    }
 }
 impl Decode for u32 {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> { r.read_u32_le() }
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        r.read_u32_le()
+    }
 }
 
 impl Encode for u64 {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.extend_from_slice(&self.to_le_bytes()); }
-    fn encoded_len(&self) -> usize { 8 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+    fn encoded_len(&self) -> usize {
+        8
+    }
 }
 impl Decode for u64 {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> { r.read_u64_le() }
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        r.read_u64_le()
+    }
 }
 
 impl Encode for bool {
     fn encode(&self, buf: &mut Vec<u8>) {
         buf.push(if *self { 0x01 } else { 0x00 });
     }
-    fn encoded_len(&self) -> usize { 1 }
+    fn encoded_len(&self) -> usize {
+        1
+    }
 }
 impl Decode for bool {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
@@ -107,7 +133,9 @@ impl Decode for bool {
 /// Encode a list: u32_le(count) || item_0 || item_1 || ...
 pub fn encode_list<T: Encode>(items: &[T], buf: &mut Vec<u8>) {
     buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
-    for item in items { item.encode(buf); }
+    for item in items {
+        item.encode(buf);
+    }
 }
 
 /// Decode a bounded list. Returns error if count exceeds `max`.
@@ -118,10 +146,16 @@ pub fn decode_list<T: Decode>(
 ) -> IndraResult<Vec<T>> {
     let count = r.read_u32_le()? as usize;
     if count > max {
-        return Err(IndraError::LengthExceeded { field, max, actual: count });
+        return Err(IndraError::LengthExceeded {
+            field,
+            max,
+            actual: count,
+        });
     }
     let mut items = Vec::with_capacity(count);
-    for _ in 0..count { items.push(T::decode(r)?); }
+    for _ in 0..count {
+        items.push(T::decode(r)?);
+    }
     Ok(items)
 }
 

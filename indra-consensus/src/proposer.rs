@@ -83,12 +83,9 @@ pub fn election_score(vrf_output: &VrfOutput, validator_stake: u64, total_stake:
     if validator_stake == 0 || total_stake == 0 {
         return u64::MAX;
     }
-    let output_val = u64::from_le_bytes(
-        vrf_output.0[..8].try_into().unwrap_or([0xFF; 8])
-    );
-    let score = (output_val as u128)
-        .saturating_mul(total_stake as u128)
-        / (validator_stake as u128);
+    let output_val = u64::from_le_bytes(vrf_output.0[..8].try_into().unwrap_or([0xFF; 8]));
+    let score =
+        (output_val as u128).saturating_mul(total_stake as u128) / (validator_stake as u128);
     score.min(u64::MAX as u128) as u64
 }
 
@@ -109,22 +106,28 @@ pub fn elect_proposer(election: &ProposerElection) -> ConsensusResult<Bytes32> {
         return Err(ConsensusError::EmptyValidatorSet);
     }
     let vrf_input = election.vrf_input();
-    let total_stake: u64 = election.candidates.iter()
+    let total_stake: u64 = election
+        .candidates
+        .iter()
         .map(|c| c.stake)
         .fold(0u64, |a, b| a.saturating_add(b));
 
-    let winner = election.candidates.iter()
+    let winner = election
+        .candidates
+        .iter()
         .map(|candidate| {
             let output = candidate_output(&candidate.vrf_pubkey, &vrf_input);
             let score = election_score(&output, candidate.stake, total_stake);
             (candidate, score, output)
         })
-        .min_by(|(candidate_a, score_a, output_a), (candidate_b, score_b, output_b)| {
-            score_a
-                .cmp(score_b)
-                .then_with(|| output_a.0.cmp(&output_b.0))
-                .then_with(|| candidate_a.validator_id.0.cmp(&candidate_b.validator_id.0))
-        })
+        .min_by(
+            |(candidate_a, score_a, output_a), (candidate_b, score_b, output_b)| {
+                score_a
+                    .cmp(score_b)
+                    .then_with(|| output_a.0.cmp(&output_b.0))
+                    .then_with(|| candidate_a.validator_id.0.cmp(&candidate_b.validator_id.0))
+            },
+        )
         .map(|(candidate, _, _)| candidate.validator_id);
 
     winner.ok_or(ConsensusError::EmptyValidatorSet)
@@ -155,7 +158,7 @@ mod tests {
     fn candidate(id_byte: u8, stake: u64) -> ProposerCandidate {
         ProposerCandidate {
             validator_id: Bytes32::from([id_byte; 32]),
-            vrf_pubkey:   VrfKeypair::from_seed(&[id_byte; 32]).public_key(),
+            vrf_pubkey: VrfKeypair::from_seed(&[id_byte; 32]).public_key(),
             stake,
         }
     }
@@ -190,7 +193,10 @@ mod tests {
 
     #[test]
     fn empty_validator_set_errors() {
-        assert_eq!(elect_proposer(&election(vec![])), Err(ConsensusError::EmptyValidatorSet));
+        assert_eq!(
+            elect_proposer(&election(vec![])),
+            Err(ConsensusError::EmptyValidatorSet)
+        );
     }
 
     #[test]
@@ -203,10 +209,7 @@ mod tests {
 
     #[test]
     fn election_winner_varies_across_rounds() {
-        let candidates = vec![
-            candidate(0x01, 1_000_000),
-            candidate(0x02, 1_000_000),
-        ];
+        let candidates = vec![candidate(0x01, 1_000_000), candidate(0x02, 1_000_000)];
         let mut winners = std::collections::BTreeSet::new();
         for round in 0..10u32 {
             let election = ProposerElection {
@@ -222,10 +225,7 @@ mod tests {
 
     #[test]
     fn same_height_round_gives_same_winner() {
-        let candidates = vec![
-            candidate(0x01, 1_000_000),
-            candidate(0x02, 1_000_000),
-        ];
+        let candidates = vec![candidate(0x01, 1_000_000), candidate(0x02, 1_000_000)];
         let election_a = ProposerElection {
             epoch_seed: Bytes32::from([0x42u8; 32]),
             height: 5,
@@ -238,7 +238,10 @@ mod tests {
             round: 2,
             candidates,
         };
-        assert_eq!(elect_proposer(&election_a).unwrap(), elect_proposer(&election_b).unwrap());
+        assert_eq!(
+            elect_proposer(&election_a).unwrap(),
+            elect_proposer(&election_b).unwrap()
+        );
     }
 
     #[test]
@@ -261,11 +264,12 @@ mod tests {
     fn high_stake_gets_lower_score() {
         // output_val = 1000 (from first 8 bytes as u64 little-endian)
         let mut bytes = [0u8; 32];
-        bytes[0] = 0xe8; bytes[1] = 0x03; // 1000 in little-endian
+        bytes[0] = 0xe8;
+        bytes[1] = 0x03; // 1000 in little-endian
         let output = VrfOutput(bytes);
         // low_stake: score = 1000 * 10000 / 100   = 100000
         // high_stake: score = 1000 * 10000 / 5000 = 2
-        let low  = election_score(&output, 100,   10_000);
+        let low = election_score(&output, 100, 10_000);
         let high = election_score(&output, 5_000, 10_000);
         assert!(high < low);
     }

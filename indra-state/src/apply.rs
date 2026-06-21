@@ -42,7 +42,9 @@ use indra_core::{
             Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
         },
+        slashing::SlashEvidenceV1,
         transaction::TransactionV1,
+        vote::VoteV1,
     },
 };
 use indra_crypto::{
@@ -58,37 +60,201 @@ use crate::{
     fee::compute_next_base_fee,
 };
 
-/// Apply a block to the chain state, producing a new state.
+/// Apply slash evidence to chain state.
 ///
-/// This function is the single entry point for all state transitions.
-/// It is deterministic: same (state, block) → same result, always.
-///
-/// On success: returns the updated state.
-/// On failure: returns an error and the original state is unchanged.
-/// Apply slash evidence — reduce offending validator stake.
-///
-/// Double-precommit: 5% of stake (SLASH_DOUBLE_PRECOMMIT_BPS = 500)
-/// Surround vote:   100% of stake (SLASH_SURROUND_VOTE_BPS = 10_000)
-#[allow(dead_code)]
-fn apply_slash(state: &mut ChainState, evidence: &indra_core::types::slashing::SlashEvidenceV1) {
-    use indra_core::types::primitives::{SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_SURROUND_VOTE_BPS};
-
-    let validator_id = evidence.validator_id;
-    // Determine offence type from the two conflicting votes
-    let is_double_precommit = evidence.vote_1.height == evidence.vote_2.height
-        && evidence.vote_1.round == evidence.vote_2.round
-        && evidence.vote_1.block_hash != evidence.vote_2.block_hash;
-    let slash_bps = if is_double_precommit {
-        SLASH_DOUBLE_PRECOMMIT_BPS
-    } else {
-        SLASH_SURROUND_VOTE_BPS
+/// Verification is fail-fast and performs no state mutation until all checks pass.
+pub fn apply_slash(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV1,
+    chain_id: &str,
+) -> StateResult<()> {
+    use crate::ValidatorStatus;
+    use indra_core::types::{
+        primitives::{
+            SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_REPORTER_REWARD_BPS, SLASH_SURROUND_VOTE_BPS,
+        },
+        vote::VoteStep,
     };
 
-    if let Some(validator) = state.validators.get_mut(&validator_id) {
-        let slash_amount = validator.stake_spark.saturating_mul(slash_bps as u64) / 10_000;
-        validator.stake_spark = validator.stake_spark.saturating_sub(slash_amount);
-        validator.status = crate::ValidatorStatus::Slashed;
+    let evidence_hash = compute_slash_evidence_hash(evidence);
+    if state.applied_slash_hashes.contains(&evidence_hash) {
+        return Err(StateError::SlashAlreadyApplied);
     }
+
+    let validator_id = evidence.validator_id;
+
+    let (classical_pk, pq_pk_bytes) = {
+        let v = state
+            .validators
+            .get(&validator_id)
+            .ok_or(StateError::ValidatorNotFound)?;
+        let cpk = v
+            .hybrid_classical_pk
+            .ok_or_else(|| StateError::InvalidSlashEvidence {
+                reason: "validator has no classical public key".into(),
+            })?;
+        let ppk = v
+            .hybrid_pq_pk
+            .clone()
+            .ok_or_else(|| StateError::InvalidSlashEvidence {
+                reason: "validator has no PQ public key".into(),
+            })?;
+        (cpk, ppk)
+    };
+
+    {
+        let v = state.validators.get(&validator_id).unwrap();
+        if matches!(v.status, ValidatorStatus::Slashed | ValidatorStatus::Exited) {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "validator already slashed or exited".into(),
+            });
+        }
+    }
+
+    verify_vote_sig_with_keys(&evidence.vote_1, &classical_pk, &pq_pk_bytes, chain_id).map_err(
+        |e| StateError::InvalidSlashEvidence {
+            reason: format!("vote_1 signature invalid: {e}"),
+        },
+    )?;
+    verify_vote_sig_with_keys(&evidence.vote_2, &classical_pk, &pq_pk_bytes, chain_id).map_err(
+        |e| StateError::InvalidSlashEvidence {
+            reason: format!("vote_2 signature invalid: {e}"),
+        },
+    )?;
+
+    if evidence.vote_1.validator_id != validator_id || evidence.vote_2.validator_id != validator_id
+    {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes not from claimed validator".into(),
+        });
+    }
+
+    if evidence.vote_1.height != evidence.vote_2.height
+        || evidence.vote_1.round != evidence.vote_2.round
+    {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes not at same height and round".into(),
+        });
+    }
+
+    if evidence.vote_1.block_hash == evidence.vote_2.block_hash {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes have same block hash — not equivocation".into(),
+        });
+    }
+    if evidence.vote_1.block_hash == Bytes32::ZERO || evidence.vote_2.block_hash == Bytes32::ZERO {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "nil vote is not slashable equivocation".into(),
+        });
+    }
+
+    if evidence.vote_1.step != evidence.vote_2.step {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes must both be precommits or both be prevotes".into(),
+        });
+    }
+
+    let slash_bps = match evidence.vote_1.step {
+        VoteStep::Precommit => SLASH_DOUBLE_PRECOMMIT_BPS,
+        VoteStep::Prevote => SLASH_SURROUND_VOTE_BPS,
+    };
+
+    let current_stake = state
+        .validators
+        .get(&validator_id)
+        .map(|v| v.stake_spark)
+        .unwrap_or(0);
+    let slash_amount = current_stake
+        .saturating_mul(slash_bps as u64)
+        .saturating_div(10_000);
+    let reporter_reward = slash_amount
+        .saturating_mul(SLASH_REPORTER_REWARD_BPS as u64)
+        .saturating_div(10_000);
+    let burned = slash_amount.saturating_sub(reporter_reward);
+
+    if let Some(v) = state.validators.get_mut(&validator_id) {
+        v.stake_spark = v.stake_spark.saturating_sub(slash_amount);
+        v.status = ValidatorStatus::Slashed;
+    }
+
+    let bond_ids: Vec<Bytes32> = state
+        .staked_bonds
+        .values()
+        .filter(|bond| bond.validator_id == validator_id)
+        .map(|bond| bond.utxo_id)
+        .collect();
+
+    let mut total_bond_burned: u64 = 0;
+    for bond_id in &bond_ids {
+        if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
+            let bond_slash = bond
+                .amount_spark
+                .saturating_mul(slash_bps as u64)
+                .saturating_div(10_000);
+            bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
+            total_bond_burned = total_bond_burned.saturating_add(bond_slash);
+            let delegator_id = bond.delegator_id;
+            if let Some(entry) = state
+                .delegations
+                .get_delegator_mut(&validator_id, &delegator_id)
+            {
+                entry.staked_spark = entry.staked_spark.saturating_sub(bond_slash);
+            }
+        }
+    }
+
+    let total_burned = burned.saturating_add(total_bond_burned);
+    state.total_supply = state.total_supply.saturating_sub(total_burned);
+    state.treasury_balance = state.treasury_balance.saturating_add(reporter_reward);
+    state.applied_slash_hashes.insert(evidence_hash);
+
+    eprintln!(
+        "[slash] validator {} slashed {}bps — stake_burned={} bond_burned={} treasury_reward={}",
+        hex::encode(&validator_id.0[..4]),
+        slash_bps,
+        burned,
+        total_bond_burned,
+        reporter_reward,
+    );
+
+    Ok(())
+}
+
+/// Compute the canonical slash-evidence hash used for deduplication.
+pub fn compute_slash_evidence_hash(evidence: &SlashEvidenceV1) -> Bytes32 {
+    Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
+}
+
+fn verify_vote_sig_with_keys(
+    vote: &VoteV1,
+    classical_pk: &[u8; 32],
+    pq_pk_bytes: &[u8],
+    _chain_id: &str,
+) -> Result<(), String> {
+    use indra_crypto::{
+        verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
+    };
+
+    let pq_pk: [u8; PQ_PK_BYTES] = pq_pk_bytes.try_into().map_err(|_| {
+        format!(
+            "pq public key must be {} bytes, got {}",
+            PQ_PK_BYTES,
+            pq_pk_bytes.len()
+        )
+    })?;
+    let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
+        vote.height,
+        vote.round,
+        vote.step,
+        &vote.block_hash,
+        &vote.validator_id,
+    );
+    let pk = HybridPublicKey {
+        classical: ClassicalPublicKey(*classical_pk),
+        pq: PqPublicKey(pq_pk),
+    };
+    let sig = vote.signature.to_crypto_sig().map_err(|e| e.to_string())?;
+    verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| e.to_string())
 }
 
 /// Apply a block to the chain state, updating UTXOs, nullifiers, fees and validators.
@@ -102,6 +268,13 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
             actual: block.staking_ops.len(),
             max: MAX_STAKING_OPS_PER_BLOCK,
         });
+    }
+
+    let mut seen_slash_hashes: HashSet<Bytes32> = HashSet::new();
+    for evidence in &block.slashing_evidence {
+        if !seen_slash_hashes.insert(compute_slash_evidence_hash(evidence)) {
+            return Err(StateError::DuplicateSlashEvidence);
+        }
     }
 
     // ── Phase 2: Transaction validation (read-only) ───────────────────────
@@ -140,6 +313,14 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         }
     }
 
+    if !block.slashing_evidence.is_empty() {
+        let mut shadow = state.clone();
+        let chain_id_clone = state.chain_id.clone();
+        for evidence in &block.slashing_evidence {
+            apply_slash(&mut shadow, evidence, &chain_id_clone)?;
+        }
+    }
+
     // ── Phase 3: State mutation (all validation passed) ───────────────────
 
     // Apply each transaction
@@ -154,6 +335,12 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
                 message: "staking op failed on real state after shadow validation",
             }
         })?;
+    }
+
+    let chain_id_for_slash = state.chain_id.clone();
+    for evidence in &block.slashing_evidence {
+        apply_slash(state, evidence, &chain_id_for_slash)
+            .expect("slash failed on real state after shadow validation — invariant violation");
     }
 
     // Update base fee for next block
@@ -420,8 +607,10 @@ mod tests {
         types::{
             block::{BlockHeaderV1, BlockV1},
             primitives::INITIAL_BASE_FEE_SPARK_PER_KB,
+            slashing::SlashEvidenceV1,
             staking::{StakingOp, StakingOpBody},
             transaction::{InputV1, OutputV1, TransactionV1},
+            vote::{VoteStep, VoteV1},
         },
         Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
@@ -527,11 +716,82 @@ mod tests {
             stake_spark: 1_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
+            last_active_epoch: 0,
             pending_rewards: 0,
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: 1_000,
             min_delegation_spark: 1,
+        }
+    }
+
+    fn slash_validator_state(seed: [u8; 32], stake: u64) -> (ChainState, Bytes32, HybridKeypair) {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let keypair = HybridKeypair::new(classical, pq);
+        let public = keypair.public_key();
+        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: "slash-validator".into(),
+                hybrid_classical_pk: Some(public.classical.0),
+                hybrid_pq_pk: Some(public.pq.0.to_vec()),
+                vrf_pk: Some(seed),
+                stake_spark: stake,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: 1_000,
+                min_delegation_spark: 1,
+            })
+            .unwrap();
+        (state, validator_id, keypair)
+    }
+
+    fn signed_vote(
+        keypair: &HybridKeypair,
+        validator_id: Bytes32,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) -> VoteV1 {
+        let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
+            height,
+            round,
+            step,
+            &block_hash,
+            &validator_id,
+        );
+        let sig = keypair.sign(&signing_bytes).unwrap();
+        VoteV1 {
+            height,
+            round,
+            step,
+            block_hash,
+            validator_id,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+                pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+            },
+        }
+    }
+
+    fn slash_evidence(
+        keypair: &HybridKeypair,
+        validator_id: Bytes32,
+        step: VoteStep,
+    ) -> SlashEvidenceV1 {
+        SlashEvidenceV1 {
+            validator_id,
+            vote_1: signed_vote(keypair, validator_id, 7, 0, step, Bytes32::from([0xAA; 32])),
+            vote_2: signed_vote(keypair, validator_id, 7, 0, step, Bytes32::from([0xBB; 32])),
         }
     }
 
@@ -1160,5 +1420,229 @@ mod tests {
             apply_block(&mut state, &block),
             Err(StateError::CommitmentBalanceInvalid)
         );
+    }
+
+    #[test]
+    fn apply_slash_double_precommit_reduces_stake_5pct() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x81; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            950_000
+        );
+    }
+
+    #[test]
+    fn apply_slash_surround_vote_reduces_stake_10pct() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x82; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Prevote);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            900_000
+        );
+    }
+
+    #[test]
+    fn apply_slash_rejects_duplicate_evidence() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x83; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(
+            apply_slash(&mut state, &evidence, &chain_id),
+            Err(StateError::SlashAlreadyApplied)
+        );
+    }
+
+    #[test]
+    fn apply_slash_rejects_invalid_vote_signature() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x84; 32], 1_000_000);
+        let mut evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        evidence.vote_2.signature.classical_sig = VariableBytes::from_slice(&[0x42; 64]).unwrap();
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_slash(&mut state, &evidence, &chain_id),
+            Err(StateError::InvalidSlashEvidence { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_slash_rejects_nil_votes() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x85; 32], 1_000_000);
+        let evidence = SlashEvidenceV1 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                7,
+                0,
+                VoteStep::Precommit,
+                Bytes32::ZERO,
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                7,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xBB; 32]),
+            ),
+        };
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_slash(&mut state, &evidence, &chain_id),
+            Err(StateError::InvalidSlashEvidence { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_slash_rejects_same_block_hash() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x86; 32], 1_000_000);
+        let hash = Bytes32::from([0xAA; 32]);
+        let evidence = SlashEvidenceV1 {
+            validator_id,
+            vote_1: signed_vote(&keypair, validator_id, 7, 0, VoteStep::Precommit, hash),
+            vote_2: signed_vote(&keypair, validator_id, 7, 0, VoteStep::Precommit, hash),
+        };
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_slash(&mut state, &evidence, &chain_id),
+            Err(StateError::InvalidSlashEvidence { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_slash_rejects_already_slashed_validator() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x87; 32], 1_000_000);
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Slashed;
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_slash(&mut state, &evidence, &chain_id),
+            Err(StateError::InvalidSlashEvidence { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_slash_burns_stake_reduces_total_supply() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x88; 32], 1_000_000);
+        let before = state.total_supply;
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(state.total_supply, before - 47_500);
+    }
+
+    #[test]
+    fn apply_slash_rewards_treasury_5pct_of_slash() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x89; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(state.treasury_balance, 2_500);
+    }
+
+    #[test]
+    fn apply_slash_reduces_staked_bonds_proportionally() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x8A; 32], 1_000_000);
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        let bond_id = Bytes32::from([0xB1; 32]);
+        let (owner, _) = make_test_keypair([0x91; 32]);
+        state.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry {
+                utxo_id: bond_id,
+                validator_id,
+                delegator_id,
+                amount_spark: 200_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: dummy_output(0x20, owner),
+            },
+        );
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(
+            state.staked_bonds.get(&bond_id).unwrap().amount_spark,
+            190_000
+        );
+    }
+
+    #[test]
+    fn apply_slash_updates_delegation_accounting() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x8B; 32], 1_000_000);
+        let delegator_id = Bytes32::from([0xD2; 32]);
+        let bond_id = Bytes32::from([0xB2; 32]);
+        let (owner, _) = make_test_keypair([0x92; 32]);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 200_000, 0);
+        state.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry {
+                utxo_id: bond_id,
+                validator_id,
+                delegator_id,
+                amount_spark: 200_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: dummy_output(0x21, owner),
+            },
+        );
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_mut(&validator_id, &delegator_id)
+                .unwrap()
+                .staked_spark,
+            190_000
+        );
+    }
+
+    #[test]
+    fn apply_block_with_slash_evidence_full_flow() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x8C; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let mut block = make_block(&state, vec![]);
+        block.slashing_evidence = vec![evidence.clone()];
+        apply_block(&mut state, &block).unwrap();
+        assert!(state
+            .applied_slash_hashes
+            .contains(&compute_slash_evidence_hash(&evidence)));
+        assert!(matches!(
+            state.validators.get(&validator_id).unwrap().status,
+            ValidatorStatus::Slashed
+        ));
+    }
+
+    #[test]
+    fn apply_block_rejects_duplicate_slash_in_same_block() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x8D; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let mut block = make_block(&state, vec![]);
+        block.slashing_evidence = vec![evidence.clone(), evidence];
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(StateError::DuplicateSlashEvidence)
+        );
+    }
+
+    #[test]
+    fn applied_slash_hashes_change_state_root() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x8E; 32], 1_000_000);
+        let before = crate::state_root::compute_state_root(&state);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        state
+            .applied_slash_hashes
+            .insert(compute_slash_evidence_hash(&evidence));
+        assert_ne!(before, crate::state_root::compute_state_root(&state));
     }
 }

@@ -6,7 +6,6 @@ use thiserror::Error;
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum ConsensusError {
     // ── Mempool errors ────────────────────────────────────────────────────
-
     /// Transaction is already in the mempool.
     #[error("transaction already in mempool")]
     DuplicateTransaction,
@@ -30,7 +29,6 @@ pub enum ConsensusError {
     FeeTooLow,
 
     // ── Proposer election errors ──────────────────────────────────────────
-
     /// The validator set is empty — cannot elect a proposer.
     #[error("cannot elect proposer: validator set is empty")]
     EmptyValidatorSet,
@@ -40,7 +38,6 @@ pub enum ConsensusError {
     ValidatorNotFound,
 
     // ── Block production errors ───────────────────────────────────────────
-
     /// The proposer keypair does not match the elected proposer.
     #[error("proposer identity mismatch")]
     WrongProposer,
@@ -50,7 +47,6 @@ pub enum ConsensusError {
     EmptyMempool,
 
     // ── Vote / QC errors ──────────────────────────────────────────────────
-
     /// A vote was received for the wrong height or round.
     #[error("vote height/round mismatch: expected {expected_height}/{expected_round}")]
     VoteHeightMismatch {
@@ -130,6 +126,8 @@ pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
 impl From<indra_crypto::CryptoError> for ConsensusError {
     fn from(e: indra_crypto::CryptoError) -> Self {
-        Self::CryptoError { detail: e.to_string() }
+        Self::CryptoError {
+            detail: e.to_string(),
+        }
     }
 }

@@ -183,7 +183,10 @@ impl Transport {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
-        Ok(Self { listener, local_addr })
+        Ok(Self {
+            listener,
+            local_addr,
+        })
     }
 
     /// Accept one inbound connection (non-blocking).
@@ -198,11 +201,12 @@ impl Transport {
 
     /// Dial an outbound connection to a peer.
     pub fn dial(&self, addr: SocketAddr) -> NetworkResult<Connection> {
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-            .map_err(|e| NetworkError::ConnectionFailed {
+        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| {
+            NetworkError::ConnectionFailed {
                 addr: addr.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
         Connection::from_stream(stream)
     }
 }

@@ -38,7 +38,9 @@ fn main() {
     let mut previous: Option<BlockV1> = None;
 
     for height in 0..block_count {
-        let block = store.get(height).unwrap_or_else(|e| panic!("failed to read block {height}: {e}"));
+        let block = store
+            .get(height)
+            .unwrap_or_else(|e| panic!("failed to read block {height}: {e}"));
         let encoded = block.encode_to_vec();
         let mut reader = ByteReader::new(&encoded);
         let decoded = BlockV1::decode(&mut reader)

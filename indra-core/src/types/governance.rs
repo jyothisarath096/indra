@@ -1,7 +1,7 @@
 //! Governance operation types.
 
 use crate::{
-    codec::{Encode, Decode, ByteReader},
+    codec::{ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::primitives::{Bytes32, VariableBytes, MAX_GOV_PAYLOAD_BYTES},
 };
@@ -11,16 +11,20 @@ use crate::{
 #[repr(u8)]
 pub enum GovernanceActionType {
     /// Submit a new proposal.
-    ProposeChange   = 0,
+    ProposeChange = 0,
     /// Vote on an existing proposal.
-    CastVote        = 1,
+    CastVote = 1,
     /// Execute an approved proposal after the delay period.
     ExecuteProposal = 2,
 }
 
 impl Encode for GovernanceActionType {
-    fn encode(&self, buf: &mut Vec<u8>) { buf.push(*self as u8); }
-    fn encoded_len(&self) -> usize { 1 }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(*self as u8);
+    }
+    fn encoded_len(&self) -> usize {
+        1
+    }
 }
 
 impl Decode for GovernanceActionType {
@@ -42,7 +46,7 @@ pub struct GovernanceOpV1 {
     /// Type of action.
     pub action_type: GovernanceActionType,
     /// Action-specific payload (max 4 KB).
-    pub payload:     VariableBytes<MAX_GOV_PAYLOAD_BYTES>,
+    pub payload: VariableBytes<MAX_GOV_PAYLOAD_BYTES>,
 }
 
 impl Encode for GovernanceOpV1 {
@@ -51,7 +55,9 @@ impl Encode for GovernanceOpV1 {
         self.action_type.encode(buf);
         self.payload.encode(buf);
     }
-    fn encoded_len(&self) -> usize { 32 + 1 + self.payload.encoded_len() }
+    fn encoded_len(&self) -> usize {
+        32 + 1 + self.payload.encoded_len()
+    }
 }
 
 impl Decode for GovernanceOpV1 {
@@ -59,7 +65,7 @@ impl Decode for GovernanceOpV1 {
         Ok(Self {
             proposal_id: Bytes32::decode(r)?,
             action_type: GovernanceActionType::decode(r)?,
-            payload:     VariableBytes::decode(r)?,
+            payload: VariableBytes::decode(r)?,
         })
     }
 }
@@ -74,8 +80,11 @@ mod tests {
         let op = GovernanceOpV1 {
             proposal_id: Bytes32::from([0xDEu8; 32]),
             action_type: GovernanceActionType::CastVote,
-            payload:     VariableBytes::from_slice(b"YES").unwrap(),
+            payload: VariableBytes::from_slice(b"YES").unwrap(),
         };
-        assert_eq!(op, GovernanceOpV1::decode_exact(&op.encode_to_vec()).unwrap());
+        assert_eq!(
+            op,
+            GovernanceOpV1::decode_exact(&op.encode_to_vec()).unwrap()
+        );
     }
 }

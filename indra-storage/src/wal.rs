@@ -28,7 +28,7 @@ use indra_core::{
 use crate::error::StorageResult;
 
 const TAG_SUBMIT: u8 = 0x01;
-const TAG_EVICT:  u8 = 0x02;
+const TAG_EVICT: u8 = 0x02;
 const ENTRY_OVERHEAD: usize = 9; // 1 tag + 4 length + 4 crc
 
 /// A WAL entry recovered on startup.
@@ -182,16 +182,20 @@ fn simple_crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use indra_core::{
-        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
         types::{
             crypto::HybridSignature,
             transaction::{InputV1, OutputV1, TransactionV1},
         },
+        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
     };
 
     fn temp_path(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_wal_test_{}_{}.wal", suffix, std::process::id()));
+        p.push(format!(
+            "indra_wal_test_{}_{}.wal",
+            suffix,
+            std::process::id()
+        ));
         p
     }
 
@@ -200,25 +204,29 @@ mod tests {
             version: ProtocolVersion::CURRENT,
             signature_module_id: 1,
             inputs: vec![InputV1 {
-                utxo_id:   Bytes32::from([nonce; 32]),
+                utxo_id: Bytes32::from([nonce; 32]),
                 nullifier: Bytes32::from([nonce; 32]),
             }],
             outputs: vec![OutputV1 {
                 value_spark: 1_000,
-                commitment:   CommitmentV1 { compressed_point: Bytes32::ZERO },
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::ZERO,
+                },
                 owner_pubkey: HybridPubKey {
                     classical_pk: Bytes32::ZERO,
                     pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 },
-                range_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                lock_height:  0,
+                range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                lock_height: 0,
             }],
-            fee_amount:     10_000,
-            fee_blinding:   Bytes32::ZERO,
-            fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
+            fee_amount: 10_000,
+            fee_blinding: Bytes32::ZERO,
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::ZERO,
+            },
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-                pq_sig:        VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
         }
     }

@@ -79,11 +79,12 @@ impl SparseMerkleTree {
                 depth,
                 prefix: sibling_prefix,
             };
-            let sibling_hash = self
-                .nodes
-                .get(&sibling_loc)
-                .copied()
-                .unwrap_or_else(|| empty_hashes.get(bit_index + 1).copied().unwrap_or([0u8; 32]));
+            let sibling_hash = self.nodes.get(&sibling_loc).copied().unwrap_or_else(|| {
+                empty_hashes
+                    .get(bit_index + 1)
+                    .copied()
+                    .unwrap_or([0u8; 32])
+            });
             siblings.push(sibling_hash);
         }
 
@@ -140,7 +141,8 @@ impl SparseMerkleTree {
             let Some(child_level) = levels.get(child_depth).cloned() else {
                 continue;
             };
-            let mut grouped: HashMap<NodeLoc, (Option<[u8; 32]>, Option<[u8; 32]>)> = HashMap::new();
+            let mut grouped: HashMap<NodeLoc, (Option<[u8; 32]>, Option<[u8; 32]>)> =
+                HashMap::new();
             for (loc, hash) in child_level {
                 let parent = NodeLoc {
                     depth: depth_from_bit(bit_index),

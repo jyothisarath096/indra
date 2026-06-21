@@ -48,10 +48,10 @@
 #![deny(clippy::panic)]
 
 pub mod error;
-pub mod types;
 pub mod handlers;
 pub mod server;
+pub mod types;
 
 pub use error::{RpcError, RpcResult};
 pub use server::RpcServer;
-pub use types::{RpcRequest, RpcResponse, RpcErrorBody};
+pub use types::{RpcErrorBody, RpcRequest, RpcResponse};

@@ -18,17 +18,14 @@
 
 use std::collections::HashMap;
 
-use indra_core::{
-    codec::Encode,
-    types::{
-        primitives::Bytes32,
-        vote::{VoteStep, VoteV1},
-        crypto::HybridSignature as CoreHybridSignature,
-    },
+use indra_core::types::{
+    crypto::HybridSignature as CoreHybridSignature,
+    primitives::Bytes32,
+    vote::{VoteStep, VoteV1},
 };
-use indra_crypto::{
-    hash::domains::VOTE_SIGN,
-    hybrid::{HybridKeypair, verify_hybrid, HybridPublicKey, ClassicalPublicKey, PqPublicKey, HybridSignature, ClassicalSignature, PqSignature},
+use indra_crypto::hybrid::{
+    verify_hybrid, ClassicalPublicKey, ClassicalSignature, HybridKeypair, HybridPublicKey,
+    HybridSignature, PqPublicKey, PqSignature,
 };
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -62,24 +59,20 @@ pub enum VoteDecision {
 
 /// Collects votes for a single height/round/step.
 pub struct VoteCollector {
-    height:       u64,
-    round:        u32,
-    step:         VoteStep,
-    voters:       Vec<RegisteredVoter>,
-    total_stake:  u64,
+    height: u64,
+    round: u32,
+    step: VoteStep,
+    voters: Vec<RegisteredVoter>,
+    total_stake: u64,
     // validator_id → (vote, stake)
-    received:     HashMap<Bytes32, (VoteV1, u64)>,
+    received: HashMap<Bytes32, (VoteV1, u64)>,
 }
 
 impl VoteCollector {
     /// Create a new collector for a specific height/round/step.
-    pub fn new(
-        height: u64,
-        round: u32,
-        step: VoteStep,
-        voters: Vec<RegisteredVoter>,
-    ) -> Self {
-        let total_stake = voters.iter()
+    pub fn new(height: u64, round: u32, step: VoteStep, voters: Vec<RegisteredVoter>) -> Self {
+        let total_stake = voters
+            .iter()
             .map(|v| v.stake)
             .fold(0u64, |a, b| a.saturating_add(b));
         Self {
@@ -106,7 +99,7 @@ impl VoteCollector {
         if vote.height != self.height || vote.round != self.round {
             return Err(ConsensusError::VoteHeightMismatch {
                 expected_height: self.height,
-                expected_round:  self.round,
+                expected_round: self.round,
             });
         }
         if vote.step != self.step {
@@ -116,7 +109,9 @@ impl VoteCollector {
         }
 
         // Find the voter
-        let voter = self.voters.iter()
+        let voter = self
+            .voters
+            .iter()
             .find(|v| v.validator_id == vote.validator_id)
             .ok_or(ConsensusError::UnknownVoter)?
             .clone();
@@ -135,22 +130,29 @@ impl VoteCollector {
             &vote.validator_id,
         );
 
-        let sig_classical: [u8; 64] = vote.signature.classical_sig.as_slice()
-            .try_into()
-            .map_err(|_| ConsensusError::CryptoError {
-                detail: "malformed classical sig".to_string(),
-            })?;
+        let sig_classical: [u8; 64] =
+            vote.signature
+                .classical_sig
+                .as_slice()
+                .try_into()
+                .map_err(|_| ConsensusError::CryptoError {
+                    detail: "malformed classical sig".to_string(),
+                })?;
 
-        let sig_pq: [u8; indra_crypto::PQ_SIG_BYTES] = vote.signature.pq_sig.as_slice()
-            .try_into()
-            .map_err(|_| ConsensusError::CryptoError {
-                detail: "malformed pq sig".to_string(),
+        let sig_pq: [u8; indra_crypto::PQ_SIG_BYTES] =
+            vote.signature.pq_sig.as_slice().try_into().map_err(|_| {
+                ConsensusError::CryptoError {
+                    detail: "malformed pq sig".to_string(),
+                }
             })?;
-        let pk_pq: [u8; indra_crypto::PQ_PK_BYTES] = voter.pq_pk.as_slice()
-            .try_into()
-            .map_err(|_| ConsensusError::CryptoError {
-                detail: "malformed pq pk".to_string(),
-            })?;
+        let pk_pq: [u8; indra_crypto::PQ_PK_BYTES] =
+            voter
+                .pq_pk
+                .as_slice()
+                .try_into()
+                .map_err(|_| ConsensusError::CryptoError {
+                    detail: "malformed pq pk".to_string(),
+                })?;
 
         let sig = HybridSignature {
             classical: ClassicalSignature(sig_classical),
@@ -162,8 +164,9 @@ impl VoteCollector {
             pq: PqPublicKey(pk_pq),
         };
 
-        verify_hybrid(&signing_bytes, &sig, &pk)
-            .map_err(|e| ConsensusError::CryptoError { detail: e.to_string() })?;
+        verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| ConsensusError::CryptoError {
+            detail: e.to_string(),
+        })?;
 
         let stake = voter.stake;
         self.received.insert(vote.validator_id, (vote, stake));
@@ -233,10 +236,11 @@ pub fn produce_vote(
         .map_err(|_| ConsensusError::CryptoError {
             detail: "classical sig too large".to_string(),
         })?;
-    let pq_sig = VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&sig.pq.0)
-        .map_err(|_| ConsensusError::CryptoError {
+    let pq_sig = VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&sig.pq.0).map_err(|_| {
+        ConsensusError::CryptoError {
             detail: "PQ sig too large".to_string(),
-        })?;
+        }
+    })?;
 
     Ok(VoteV1 {
         height,
@@ -244,7 +248,10 @@ pub fn produce_vote(
         step,
         block_hash,
         validator_id,
-        signature: CoreHybridSignature { classical_sig, pq_sig },
+        signature: CoreHybridSignature {
+            classical_sig,
+            pq_sig,
+        },
     })
 }
 
@@ -256,13 +263,13 @@ pub fn vote_signing_bytes(
     block_hash: &Bytes32,
     validator_id: &Bytes32,
 ) -> Vec<u8> {
-    let mut buf = VOTE_SIGN.to_vec();
-    height.encode(&mut buf);
-    round.encode(&mut buf);
-    step.encode(&mut buf);
-    block_hash.encode(&mut buf);
-    validator_id.encode(&mut buf);
-    buf
+    indra_core::types::vote_signing::vote_signing_bytes(
+        height,
+        round,
+        step,
+        block_hash,
+        validator_id,
+    )
 }
 
 #[cfg(test)]
@@ -280,7 +287,7 @@ mod tests {
         let voter = RegisteredVoter {
             validator_id: id,
             classical_pk: pk.classical.0,
-            pq_pk:        pk.pq.0.to_vec(),
+            pq_pk: pk.pq.0.to_vec(),
             stake,
         };
         (voter, kp)
@@ -292,7 +299,8 @@ mod tests {
         let block_hash = Bytes32::from([0xBBu8; 32]);
         let mut collector = VoteCollector::new(1, 0, VoteStep::Precommit, vec![v.clone()]);
 
-        let vote = produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
         let decision = collector.add_vote(vote).unwrap();
 
         assert!(matches!(decision, VoteDecision::QuorumReached { .. }));
@@ -331,7 +339,15 @@ mod tests {
         // Register only v, not stranger
         let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, vec![v]);
 
-        let vote = produce_vote(1, 0, VoteStep::Prevote, block_hash, stranger.validator_id, &stranger_kp).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            block_hash,
+            stranger.validator_id,
+            &stranger_kp,
+        )
+        .unwrap();
         assert_eq!(collector.add_vote(vote), Err(ConsensusError::UnknownVoter));
     }
 
@@ -341,7 +357,8 @@ mod tests {
         let block_hash = Bytes32::from([0xBBu8; 32]);
         let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, vec![v.clone()]);
 
-        let mut vote = produce_vote(1, 0, VoteStep::Prevote, block_hash, v.validator_id, &kp).unwrap();
+        let mut vote =
+            produce_vote(1, 0, VoteStep::Prevote, block_hash, v.validator_id, &kp).unwrap();
         // Tamper with the block hash after signing
         vote.block_hash = Bytes32::from([0xFFu8; 32]);
         assert!(matches!(
@@ -359,13 +376,17 @@ mod tests {
         let block_hash = Bytes32::from([0xCCu8; 32]);
 
         let mut collector = VoteCollector::new(
-            1, 0, VoteStep::Precommit,
+            1,
+            0,
+            VoteStep::Precommit,
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
         // First two votes total 66%, which is below the strict > 2/3 threshold.
-        let vote1 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
-        let vote2 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
+        let vote1 =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
+        let vote2 =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
 
         let d1 = collector.add_vote(vote1).unwrap();
         let d2 = collector.add_vote(vote2).unwrap();
@@ -382,16 +403,28 @@ mod tests {
         let block_hash = Bytes32::from([0xDDu8; 32]);
 
         let mut collector = VoteCollector::new(
-            1, 0, VoteStep::Precommit,
+            1,
+            0,
+            VoteStep::Precommit,
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
-        let vote1 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
-        let vote2 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
-        let vote3 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v3.validator_id, &kp3).unwrap();
+        let vote1 =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
+        let vote2 =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
+        let vote3 =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v3.validator_id, &kp3).unwrap();
 
-        assert!(matches!(collector.add_vote(vote1).unwrap(), VoteDecision::Waiting));
-        assert!(matches!(collector.add_vote(vote2).unwrap(), VoteDecision::QuorumReached { stake_bps, .. } if stake_bps == 6_700));
-        assert!(matches!(collector.add_vote(vote3).unwrap(), VoteDecision::QuorumReached { stake_bps, .. } if stake_bps == 10_000));
+        assert!(matches!(
+            collector.add_vote(vote1).unwrap(),
+            VoteDecision::Waiting
+        ));
+        assert!(
+            matches!(collector.add_vote(vote2).unwrap(), VoteDecision::QuorumReached { stake_bps, .. } if stake_bps == 6_700)
+        );
+        assert!(
+            matches!(collector.add_vote(vote3).unwrap(), VoteDecision::QuorumReached { stake_bps, .. } if stake_bps == 10_000)
+        );
     }
 }

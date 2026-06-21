@@ -1,7 +1,7 @@
 //! Integration tests for the CLI tools.
 
 use indra_cli::{
-    generate_keypairs, generate_from_passphrase,
+    generate_from_passphrase, generate_keypairs,
     genesis_cmd::{build_genesis_config, entry_from_keys},
     query::rpc_call,
 };
@@ -81,7 +81,15 @@ fn keys_json_is_valid_structure() {
     .unwrap();
     let json = keys.to_json();
     // All required fields present
-    for field in &["name", "validator_id", "hybrid_classical_pk", "bls_pk", "vrf_pk", "hybrid_seed", "WARNING"] {
+    for field in &[
+        "name",
+        "validator_id",
+        "hybrid_classical_pk",
+        "bls_pk",
+        "vrf_pk",
+        "hybrid_seed",
+        "WARNING",
+    ] {
         assert!(json.contains(field), "missing: {field}");
     }
 }
@@ -90,19 +98,22 @@ fn keys_json_is_valid_structure() {
 
 #[test]
 fn genesis_with_4_validators() {
-        let stake = DUST_LIMIT_SPARK * 100;
-        let validators: Vec<_> = (0..4u8).map(|i| {
+    let stake = DUST_LIMIT_SPARK * 100;
+    let validators: Vec<_> = (0..4u8)
+        .map(|i| {
             let seed = [i + 1; 32];
             let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
             entry_from_keys(&format!("v{i}"), &keys, stake)
-        }).collect();
+        })
+        .collect();
 
     let config = build_genesis_config(
         "indra-testnet-1",
         1_700_000_000,
         1_000_000_000_000_000,
         validators,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(config.validators.len(), 4);
     let toml = config.to_toml();
@@ -113,11 +124,13 @@ fn genesis_with_4_validators() {
 #[test]
 fn genesis_rejects_3_validators() {
     let stake = DUST_LIMIT_SPARK * 100;
-    let validators: Vec<_> = (0..3u8).map(|i| {
-        let seed = [i + 1; 32];
-        let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
-        entry_from_keys(&format!("v{i}"), &keys, stake)
-    }).collect();
+    let validators: Vec<_> = (0..3u8)
+        .map(|i| {
+            let seed = [i + 1; 32];
+            let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
+            entry_from_keys(&format!("v{i}"), &keys, stake)
+        })
+        .collect();
 
     assert!(build_genesis_config("test", 0, 0, validators).is_err());
 }
@@ -146,17 +159,17 @@ fn query_pipeline() {
 fn full_testnet_setup_pipeline() {
     // Step 1: Each participant generates their keys
     let alice = generate_from_passphrase("alice-testnet-seed-v1", "alice".to_string()).unwrap();
-    let bob   = generate_from_passphrase("bob-testnet-seed-v1", "bob".to_string()).unwrap();
+    let bob = generate_from_passphrase("bob-testnet-seed-v1", "bob".to_string()).unwrap();
     let carol = generate_from_passphrase("carol-testnet-seed-v1", "carol".to_string()).unwrap();
-    let dave  = generate_from_passphrase("dave-testnet-seed-v1", "dave".to_string()).unwrap();
+    let dave = generate_from_passphrase("dave-testnet-seed-v1", "dave".to_string()).unwrap();
 
     // Step 2: Coordinator builds genesis
     let stake = DUST_LIMIT_SPARK * 100;
     let validators = vec![
         entry_from_keys("alice", &alice, stake),
-        entry_from_keys("bob",   &bob,   stake),
+        entry_from_keys("bob", &bob, stake),
         entry_from_keys("carol", &carol, stake),
-        entry_from_keys("dave",  &dave,  stake),
+        entry_from_keys("dave", &dave, stake),
     ];
 
     let config = build_genesis_config(
@@ -164,7 +177,8 @@ fn full_testnet_setup_pipeline() {
         1_700_000_000,
         1_000_000_000_000_000,
         validators,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(config.validators.len(), 4);
 

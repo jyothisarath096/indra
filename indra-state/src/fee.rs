@@ -21,12 +21,8 @@
 //! The fee is clamped to [MIN_BASE_FEE, u64::MAX] after each update.
 
 use indra_core::types::primitives::{
-    MAX_TX_PER_BLOCK,
-    MIN_BASE_FEE_SPARK_PER_KB,
-    FEE_ADJUST_NUMERATOR,
-    FEE_ADJUST_DENOMINATOR,
-    TARGET_UTILISATION_NUMERATOR,
-    TARGET_UTILISATION_DENOMINATOR,
+    FEE_ADJUST_DENOMINATOR, FEE_ADJUST_NUMERATOR, MAX_TX_PER_BLOCK, MIN_BASE_FEE_SPARK_PER_KB,
+    TARGET_UTILISATION_DENOMINATOR, TARGET_UTILISATION_NUMERATOR,
 };
 
 /// Compute the base fee for the next block given the current block's state.
@@ -41,13 +37,12 @@ use indra_core::types::primitives::{
 /// It never fails — the result is always clamped to a valid range.
 pub fn compute_next_base_fee(current_base_fee: u64, tx_count: usize) -> u64 {
     let max_txs = MAX_TX_PER_BLOCK as u64;
-    let count   = tx_count as u64;
+    let count = tx_count as u64;
 
     // target_count = MAX_TX_PER_BLOCK × TARGET_NUMERATOR / TARGET_DENOMINATOR
     // = 200 × 50 / 100 = 100 transactions
-    let target_count = max_txs
-        .saturating_mul(TARGET_UTILISATION_NUMERATOR)
-        / TARGET_UTILISATION_DENOMINATOR;
+    let target_count =
+        max_txs.saturating_mul(TARGET_UTILISATION_NUMERATOR) / TARGET_UTILISATION_DENOMINATOR;
 
     let new_fee = if count > target_count {
         // Above target: increase fee
@@ -79,7 +74,7 @@ pub fn compute_next_base_fee(current_base_fee: u64, tx_count: usize) -> u64 {
 mod tests {
     use super::*;
     use indra_core::types::primitives::{
-        INITIAL_BASE_FEE_SPARK_PER_KB, MIN_BASE_FEE_SPARK_PER_KB, MAX_TX_PER_BLOCK,
+        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_TX_PER_BLOCK, MIN_BASE_FEE_SPARK_PER_KB,
     };
 
     #[test]
@@ -119,8 +114,8 @@ mod tests {
 
     #[test]
     fn fee_increases_monotonically_with_load() {
-        let low  = compute_next_base_fee(100, 110);
-        let mid  = compute_next_base_fee(100, 150);
+        let low = compute_next_base_fee(100, 110);
+        let mid = compute_next_base_fee(100, 150);
         let high = compute_next_base_fee(100, 200);
         assert!(low < mid);
         assert!(mid < high);

@@ -195,6 +195,7 @@ fn mempool_to_block_pipeline() {
         prev_qc_bytes: vec![],
         timestamp: 1_700_000_001,
         polc_round: None,
+        slash_evidence: vec![],
         staking_ops: vec![],
     };
 

@@ -3,13 +3,11 @@
 use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
 use std::collections::{HashMap, HashSet};
 
-use indra_core::{
-    types::{
-        crypto::PQVoteSig,
-        primitives::{Bytes32, CONSENSUS_QUORUM_BPS, MAX_PQ_SIG_BYTES, MAX_VALIDATORS, VariableBytes},
-        qc::QuorumCertificateV1,
-        vote::{VoteStep, VoteV1},
-    },
+use indra_core::types::{
+    crypto::PQVoteSig,
+    primitives::{Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_PQ_SIG_BYTES, MAX_VALIDATORS},
+    qc::QuorumCertificateV1,
+    vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{verify_pq, PqPublicKey, PqSignature};
 
@@ -36,12 +34,14 @@ pub struct QcValidator {
 /// Kept for compatibility with existing tests and callers. Individual PQ vote
 /// signatures still verify against `vote_signing_bytes`, which binds the
 /// validator identity.
-pub fn qc_signing_bytes(
-    height: u64,
-    round: u32,
-    block_hash: &Bytes32,
-) -> Vec<u8> {
-    vote_signing_bytes(height, round, VoteStep::Precommit, block_hash, &Bytes32::ZERO)
+pub fn qc_signing_bytes(height: u64, round: u32, block_hash: &Bytes32) -> Vec<u8> {
+    vote_signing_bytes(
+        height,
+        round,
+        VoteStep::Precommit,
+        block_hash,
+        &Bytes32::ZERO,
+    )
 }
 
 /// A QC builder — accumulates votes and builds the QC when quorum is reached.
@@ -56,17 +56,19 @@ pub struct QcBuilder {
 
 impl QcBuilder {
     /// Create a new QC builder.
-    pub fn new(
-        height: u64,
-        round: u32,
-        block_hash: Bytes32,
-        validators: Vec<QcValidator>,
-    ) -> Self {
+    pub fn new(height: u64, round: u32, block_hash: Bytes32, validators: Vec<QcValidator>) -> Self {
         let total_stake = validators
             .iter()
             .map(|v| v.stake)
             .fold(0u64, |a, b| a.saturating_add(b));
-        Self { height, round, block_hash, validators, total_stake, votes: HashMap::new() }
+        Self {
+            height,
+            round,
+            block_hash,
+            validators,
+            total_stake,
+            votes: HashMap::new(),
+        }
     }
 
     /// Add a precommit vote to the builder.
@@ -130,10 +132,8 @@ fn build_qc_from_votes(
     validators: &[QcValidator],
     votes: Vec<&VoteV1>,
 ) -> ConsensusResult<QuorumCertificateV1> {
-    let by_id: HashMap<Bytes32, &QcValidator> = validators
-        .iter()
-        .map(|v| (v.validator_id, v))
-        .collect();
+    let by_id: HashMap<Bytes32, &QcValidator> =
+        validators.iter().map(|v| (v.validator_id, v)).collect();
 
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_sigs = Vec::new();
@@ -254,15 +254,17 @@ pub fn verify_qc(
             &qc.block_hash,
             &validator.validator_id,
         );
-        let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] = pq_sig.pq_sig.as_slice()
-            .try_into()
-            .map_err(|_| ConsensusError::InvalidPQSignature {
-                validator_id: validator.validator_id,
+        let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
+            pq_sig.pq_sig.as_slice().try_into().map_err(|_| {
+                ConsensusError::InvalidPQSignature {
+                    validator_id: validator.validator_id,
+                }
             })?;
-        let pq_pk_bytes: [u8; indra_crypto::PQ_PK_BYTES] = validator.pq_pk.as_slice()
-            .try_into()
-            .map_err(|_| ConsensusError::InvalidPQSignature {
-                validator_id: validator.validator_id,
+        let pq_pk_bytes: [u8; indra_crypto::PQ_PK_BYTES] =
+            validator.pq_pk.as_slice().try_into().map_err(|_| {
+                ConsensusError::InvalidPQSignature {
+                    validator_id: validator.validator_id,
+                }
             })?;
         verify_pq(
             &signing_bytes,
@@ -289,9 +291,9 @@ pub fn verify_qc_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vote::produce_vote;
     use indra_core::types::primitives::CONSENSUS_QUORUM_BPS;
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
-    use crate::vote::produce_vote;
 
     fn make_validator(seed: u8, position: usize, stake: u64) -> (QcValidator, HybridKeypair) {
         let classical = ClassicalKeypair::from_seed(&[seed; 32]);
@@ -312,7 +314,8 @@ mod tests {
     fn build_qc_single_validator() {
         let (v, kp) = make_validator(0x01, 0, 10_000);
         let block_hash = Bytes32::from([0xAAu8; 32]);
-        let vote = produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
         let qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
         assert_eq!(qc.height, 1);
         assert_eq!(qc.block_hash, block_hash);
@@ -323,7 +326,8 @@ mod tests {
     fn qc_bitfield_set_correctly() {
         let (v, kp) = make_validator(0x02, 5, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let vote = produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
         let qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
         assert!(qc.is_signer(5));
         assert!(!qc.is_signer(0));
@@ -333,7 +337,8 @@ mod tests {
     fn verify_qc_passes_with_quorum() {
         let (v, kp) = make_validator(0x03, 0, 10_000);
         let block_hash = Bytes32::from([0xCCu8; 32]);
-        let vote = produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield[0] = 0b0000_0001;
         let qc = QuorumCertificateV1 {
@@ -355,7 +360,8 @@ mod tests {
         let (v1, kp1) = make_validator(0x01, 0, 3_000);
         let (v2, _) = make_validator(0x02, 1, 7_000);
         let block_hash = Bytes32::from([0xDDu8; 32]);
-        let vote = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
         let qc = build_qc(1, 0, block_hash, &[v1.clone(), v2.clone()], vec![&vote]).unwrap();
         assert!(matches!(
             verify_qc(&qc, &[v1, v2], 10_000),
@@ -399,7 +405,10 @@ mod tests {
         };
         assert_eq!(
             verify_qc(&qc, &[v], 10_000),
-            Err(ConsensusError::SignatureCountMismatch { expected: 1, got: 0 })
+            Err(ConsensusError::SignatureCountMismatch {
+                expected: 1,
+                got: 0
+            })
         );
     }
 
@@ -407,7 +416,8 @@ mod tests {
     fn verify_qc_rejects_duplicate_pq_signatures() {
         let (v, kp) = make_validator(0x0C, 0, 10_000);
         let block_hash = Bytes32::from([0x12u8; 32]);
-        let vote = produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield[0] = 0b0000_0001;
         let sig = VariableBytes::from_slice(vote.signature.pq_sig.as_slice()).unwrap();

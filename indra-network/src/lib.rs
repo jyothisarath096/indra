@@ -50,22 +50,26 @@
 
 pub mod error;
 pub mod frame;
+pub mod gossip;
 pub mod handshake;
 pub mod message;
 pub mod net_types;
 pub mod peer;
 pub mod peer_manager;
 pub mod rate_limit;
-pub mod gossip;
 pub mod transport;
 
 pub use error::{NetworkError, NetworkResult};
 pub use frame::{FrameReader, FrameWriter};
-pub use handshake::{HandshakeConfig, HandshakeResult, perform_handshake_initiator, perform_handshake_responder};
+pub use gossip::{GossipEngine, GossipEvent};
+pub use handshake::{
+    perform_handshake_initiator, perform_handshake_responder, HandshakeConfig, HandshakeResult,
+};
 pub use message::{Message, MessageType};
 pub use net_types::{NetworkCommand, NetworkEvent};
-pub use peer::{PeerInfo, PeerTable, PeerStatus};
-pub use peer_manager::{PeerManagerConfig, PeerManagerHandle, spawn_peer_manager};
-pub use rate_limit::{GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket};
-pub use gossip::{GossipEngine, GossipEvent};
-pub use transport::{Transport, Connection};
+pub use peer::{PeerInfo, PeerStatus, PeerTable};
+pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
+pub use rate_limit::{
+    GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket,
+};
+pub use transport::{Connection, Transport};

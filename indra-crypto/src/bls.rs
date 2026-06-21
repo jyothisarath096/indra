@@ -6,11 +6,11 @@
 //! Only used for the classical component of QCs. The PQ (ML-DSA-87)
 //! component uses individual sigs because Dilithium is not aggregatable.
 
-use blst::min_pk::{PublicKey, SecretKey, Signature, AggregateSignature};
+use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
 use blst::BLST_ERROR;
 
 use crate::{
-    constants::{BLS_PK_BYTES},
+    constants::BLS_PK_BYTES,
     error::{CryptoError, CryptoResult},
 };
 
@@ -38,8 +38,9 @@ pub struct BlsKeypair {
 impl BlsKeypair {
     /// Create from a 32-byte IKM seed (must be cryptographically random).
     pub fn from_seed(seed: &[u8; 32]) -> CryptoResult<Self> {
-        let sk = SecretKey::key_gen(seed, &[])
-            .map_err(|_| CryptoError::BlsFailed { detail: "key_gen failed" })?;
+        let sk = SecretKey::key_gen(seed, &[]).map_err(|_| CryptoError::BlsFailed {
+            detail: "key_gen failed",
+        })?;
         let pk = sk.sk_to_pk();
         Ok(Self { sk, pk })
     }
@@ -64,19 +65,24 @@ pub fn aggregate_signatures(sigs: &[BlsSignature]) -> CryptoResult<BlsAggregateS
     if sigs.is_empty() {
         return Err(CryptoError::EmptySignerSet);
     }
-    let parsed: Vec<Signature> = sigs.iter()
-        .map(|s| Signature::from_bytes(&s.0)
-            .map_err(|_| CryptoError::MalformedSignature {
+    let parsed: Vec<Signature> = sigs
+        .iter()
+        .map(|s| {
+            Signature::from_bytes(&s.0).map_err(|_| CryptoError::MalformedSignature {
                 scheme: "BLS12-381",
                 actual: s.0.len(),
-            }))
+            })
+        })
         .collect::<CryptoResult<_>>()?;
 
     let refs: Vec<&Signature> = parsed.iter().collect();
-    let agg = AggregateSignature::aggregate(&refs, true)
-        .map_err(|_| CryptoError::BlsFailed { detail: "aggregation failed" })?;
+    let agg = AggregateSignature::aggregate(&refs, true).map_err(|_| CryptoError::BlsFailed {
+        detail: "aggregation failed",
+    })?;
 
-    Ok(BlsAggregateSignature(agg.to_signature().to_bytes().to_vec()))
+    Ok(BlsAggregateSignature(
+        agg.to_signature().to_bytes().to_vec(),
+    ))
 }
 
 /// Verify an aggregated BLS signature against multiple public keys on the same message.
@@ -88,18 +94,19 @@ pub fn verify_aggregate(
     if public_keys.is_empty() {
         return Err(CryptoError::EmptySignerSet);
     }
-    let sig = Signature::from_bytes(&agg_sig.0)
-        .map_err(|_| CryptoError::MalformedSignature {
-            scheme: "BLS12-381 aggregate",
-            actual: agg_sig.0.len(),
-        })?;
+    let sig = Signature::from_bytes(&agg_sig.0).map_err(|_| CryptoError::MalformedSignature {
+        scheme: "BLS12-381 aggregate",
+        actual: agg_sig.0.len(),
+    })?;
 
-    let parsed_pks: Vec<PublicKey> = public_keys.iter()
-        .map(|pk| PublicKey::from_bytes(&pk.0)
-            .map_err(|_| CryptoError::MalformedPublicKey {
+    let parsed_pks: Vec<PublicKey> = public_keys
+        .iter()
+        .map(|pk| {
+            PublicKey::from_bytes(&pk.0).map_err(|_| CryptoError::MalformedPublicKey {
                 scheme: "BLS12-381",
                 actual: pk.0.len(),
-            }))
+            })
+        })
         .collect::<CryptoResult<_>>()?;
 
     let pk_refs: Vec<&PublicKey> = parsed_pks.iter().collect();
@@ -107,7 +114,9 @@ pub fn verify_aggregate(
 
     match sig.aggregate_verify(true, &msgs, DST, &pk_refs, true) {
         BLST_ERROR::BLST_SUCCESS => Ok(()),
-        _ => Err(CryptoError::BlsFailed { detail: "aggregate_verify failed" }),
+        _ => Err(CryptoError::BlsFailed {
+            detail: "aggregate_verify failed",
+        }),
     }
 }
 

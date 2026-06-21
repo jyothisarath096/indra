@@ -24,11 +24,11 @@
 //! pseudorandom and unpredictable without the secret key.
 
 use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT,
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
-    constants::RISTRETTO_BASEPOINT_POINT,
 };
-use sha2::{Sha512, Digest};
+use sha2::{Digest, Sha512};
 
 use crate::error::{CryptoError, CryptoResult};
 
@@ -59,7 +59,10 @@ impl VrfKeypair {
     /// a valid Ristretto scalar.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let public_key = derive_public_key(seed);
-        Self { secret_key: *seed, public_key }
+        Self {
+            secret_key: *seed,
+            public_key,
+        }
     }
 
     /// Return the public key (compressed Ristretto point).
@@ -82,7 +85,7 @@ fn derive_scalar(seed: &[u8; 32]) -> Scalar {
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes.copy_from_slice(&hash[..32]);
     // Clamp for Ristretto
-    scalar_bytes[0]  &= 248;
+    scalar_bytes[0] &= 248;
     scalar_bytes[31] &= 127;
     scalar_bytes[31] |= 64;
     Scalar::from_bytes_mod_order(scalar_bytes)

@@ -31,10 +31,15 @@ fn bench_qc_verification_timing() {
     let elapsed_150 = start.elapsed();
     println!("\n  Block time:              6000ms");
     println!("  QC overhead (150 vals):  {}ms", elapsed_150.as_millis());
-    println!("  QC as % of block time:   {:.3}%",
-        elapsed_150.as_millis() as f64 / 6000.0 * 100.0);
+    println!(
+        "  QC as % of block time:   {:.3}%",
+        elapsed_150.as_millis() as f64 / 6000.0 * 100.0
+    );
     println!("===================================================");
 
-    assert!(elapsed_150.as_millis() < 2000,
-        "150 ML-DSA-87 verifications took {}ms", elapsed_150.as_millis());
+    assert!(
+        elapsed_150.as_millis() < 2000,
+        "150 ML-DSA-87 verifications took {}ms",
+        elapsed_150.as_millis()
+    );
 }

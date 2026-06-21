@@ -2,11 +2,7 @@
 //!   cargo test -p indra-bench --test full_bench -- --nocapture
 
 use indra_bench::{
-    crypto_bench::*,
-    codec_bench::*,
-    state_bench::*,
-    mempool_bench::*,
-    storage_bench::*,
+    codec_bench::*, crypto_bench::*, mempool_bench::*, state_bench::*, storage_bench::*,
 };
 
 #[test]
@@ -21,7 +17,7 @@ fn full_benchmark_suite() {
     bench_dilithium2(100);
     bench_hybrid(100);
     bench_bls_sign(500);
-    bench_bls_aggregate(10,  100);
+    bench_bls_aggregate(10, 100);
     bench_bls_aggregate(100, 20);
     bench_vrf(200);
 
@@ -44,7 +40,7 @@ fn full_benchmark_suite() {
     bench_mempool_age_eligible(500);
 
     println!("\n── Storage ──────────────────────────────────────────────");
-    bench_block_store_append(5,  10);
+    bench_block_store_append(5, 10);
     bench_block_store_read(50);
 
     println!("\n╔══════════════════════════════════════════════════════╗");

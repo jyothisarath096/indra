@@ -1,16 +1,20 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let output = args.iter()
+    let output = args
+        .iter()
         .position(|a| a == "--output")
         .and_then(|i| args.get(i + 1))
         .map_or("keys.json", String::as_str);
-    let recover_phrase = args.iter()
+    let recover_phrase = args
+        .iter()
         .position(|a| a == "--recover")
         .and_then(|i| args.get(i + 1));
-    let passphrase = args.iter()
+    let passphrase = args
+        .iter()
         .position(|a| a == "--passphrase")
         .and_then(|i| args.get(i + 1));
-    let name_arg = args.iter()
+    let name_arg = args
+        .iter()
         .position(|a| a == "--name")
         .and_then(|i| args.get(i + 1))
         .cloned();
@@ -80,7 +84,13 @@ fn main() {
     }
 
     println!("  Validator Name:   {}", keys.name);
-    println!("  Validator ID:     {}", hex::encode(keys.public.validator_id));
-    println!("  Classical PK:     {}", hex::encode(keys.public.hybrid_classical_pk));
+    println!(
+        "  Validator ID:     {}",
+        hex::encode(keys.public.validator_id)
+    );
+    println!(
+        "  Classical PK:     {}",
+        hex::encode(keys.public.hybrid_classical_pk)
+    );
     println!("  Keys written to:  {}", output);
 }

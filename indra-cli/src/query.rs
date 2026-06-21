@@ -3,8 +3,8 @@
 //! All queries go through the JSON-RPC API.
 //! For testing, `call_local` bypasses the HTTP layer.
 
-use indra_rpc::server::call_rpc;
 use indra_node::NodeEngine;
+use indra_rpc::server::call_rpc;
 
 use crate::error::{CliError, CliResult};
 
@@ -18,11 +18,7 @@ pub struct QueryResult {
 }
 
 /// Make a direct in-process RPC call (for CLI testing without a running server).
-pub fn rpc_call(
-    method: &str,
-    params: &[String],
-    engine: &NodeEngine,
-) -> CliResult<QueryResult> {
+pub fn rpc_call(method: &str, params: &[String], engine: &NodeEngine) -> CliResult<QueryResult> {
     let raw = call_rpc(method, params, engine);
 
     // Check for error
@@ -32,7 +28,10 @@ pub fn rpc_call(
     }
 
     let summary = format_result(method, &raw);
-    Ok(QueryResult { raw_json: raw, summary })
+    Ok(QueryResult {
+        raw_json: raw,
+        summary,
+    })
 }
 
 /// Format a JSON-RPC result into a human-readable summary.
@@ -78,9 +77,7 @@ fn extract_number(json: &str, field: &str) -> Option<u64> {
     let key = format!("\"{field}\":");
     let pos = json.find(&key)?;
     let after = json[pos + key.len()..].trim_start();
-    let num_str: String = after.chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     num_str.parse().ok()
 }
 
@@ -112,7 +109,11 @@ mod tests {
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_cli_query_test_{}_{}", suffix, std::process::id()));
+        p.push(format!(
+            "indra_cli_query_test_{}_{}",
+            suffix,
+            std::process::id()
+        ));
         p
     }
 

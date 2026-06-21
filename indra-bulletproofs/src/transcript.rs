@@ -2,10 +2,7 @@
 
 use alloc::vec::Vec;
 
-use curve25519_dalek::{
-    ristretto::CompressedRistretto,
-    scalar::Scalar,
-};
+use curve25519_dalek::{ristretto::CompressedRistretto, scalar::Scalar};
 use sha2::{Digest, Sha512};
 
 /// A Fiat-Shamir transcript using SHA-512.

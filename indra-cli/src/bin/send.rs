@@ -15,18 +15,26 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let get = |flag: &str| -> Option<String> {
-        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
 
-    let keys_path   = get("--keys").unwrap_or_else(|| "keys.json".to_string());
+    let keys_path = get("--keys").unwrap_or_else(|| "keys.json".to_string());
     let wallet_path = get("--wallet").unwrap_or_else(|| "wallet.json".to_string());
-    let to          = get("--to").unwrap_or_else(|| { eprintln!("Error: --to required"); std::process::exit(1); });
-    let amount_str  = get("--amount").unwrap_or_else(|| { eprintln!("Error: --amount required"); std::process::exit(1); });
-    let fee_str     = get("--fee").unwrap_or_else(|| "0.0001".to_string());
-    let node_url    = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let chain_id    = get("--chain-id").unwrap_or_else(|| {
-        indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string()
+    let to = get("--to").unwrap_or_else(|| {
+        eprintln!("Error: --to required");
+        std::process::exit(1);
     });
+    let amount_str = get("--amount").unwrap_or_else(|| {
+        eprintln!("Error: --amount required");
+        std::process::exit(1);
+    });
+    let fee_str = get("--fee").unwrap_or_else(|| "0.0001".to_string());
+    let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let chain_id = get("--chain-id")
+        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
 
     // Parse amounts (accept INDRA as decimal, convert to Spark)
     let amount_indra: f64 = amount_str.parse().unwrap_or_else(|_| {
@@ -39,8 +47,8 @@ fn main() {
     });
 
     let amount_spark = (amount_indra * SPARK_PER_INDRA_F64) as u64;
-    let fee_spark    = (fee_indra   * SPARK_PER_INDRA_F64) as u64;
-    let fee_spark    = fee_spark.max(indra_cli::tx_builder::MIN_FEE_SPARK);
+    let fee_spark = (fee_indra * SPARK_PER_INDRA_F64) as u64;
+    let fee_spark = fee_spark.max(indra_cli::tx_builder::MIN_FEE_SPARK);
 
     println!("INDRA Send");
     println!("──────────────────────────────────────");
@@ -62,14 +70,16 @@ fn main() {
     let pq_pk_bytes = extract_hex_field(&keys_str, "hybrid_pq_pk");
 
     // Derive sender pubkey from seed
-    use indra_core::types::{primitives::{Bytes32, VariableBytes}, crypto::HybridPubKey};
+    use indra_core::types::{
+        crypto::HybridPubKey,
+        primitives::{Bytes32, VariableBytes},
+    };
     use indra_crypto::hybrid::ClassicalKeypair;
     let classical = ClassicalKeypair::from_seed(&hybrid_seed);
     let sender_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(classical.public_key().0),
-        pq_pk: VariableBytes::from_slice(&pq_pk_bytes).unwrap_or_else(|_| {
-            VariableBytes::from_slice(&[0u8; 2592]).unwrap()
-        }),
+        pq_pk: VariableBytes::from_slice(&pq_pk_bytes)
+            .unwrap_or_else(|_| VariableBytes::from_slice(&[0u8; 2592]).unwrap()),
     };
 
     // Load wallet
@@ -212,19 +222,21 @@ fn submit_raw_rpc(node_url: &str, body: &str) -> Result<String, String> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    let mut stream = TcpStream::connect(host)
-        .map_err(|e| format!("cannot connect to {}: {}", host, e))?;
+    let mut stream =
+        TcpStream::connect(host).map_err(|e| format!("cannot connect to {}: {}", host, e))?;
 
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path, host, body.len(), body
     );
 
-    stream.write_all(request.as_bytes())
+    stream
+        .write_all(request.as_bytes())
         .map_err(|e| format!("write error: {}", e))?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)
+    stream
+        .read_to_string(&mut response)
         .map_err(|e| format!("read error: {}", e))?;
 
     // Extract body (after \r\n\r\n)
@@ -251,20 +263,24 @@ fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
     };
     let after = &json[pos + key.len()..];
     let start = after.find('"').unwrap_or(0) + 1;
-    let end   = after[start..].find('"').unwrap_or(0) + start;
+    let end = after[start..].find('"').unwrap_or(0) + start;
     hex::decode(&after[start..end]).unwrap_or_else(|_| vec![0u8; 2592])
 }
 
 fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
     let key = format!("\"{}\":", field);
-    let pos = json.find(&key)
-        .unwrap_or_else(|| { eprintln!("Field '{}' not found in keys.json", field); std::process::exit(1); });
+    let pos = json.find(&key).unwrap_or_else(|| {
+        eprintln!("Field '{}' not found in keys.json", field);
+        std::process::exit(1);
+    });
     let after = &json[pos + key.len()..];
     let start = after.find('"').unwrap() + 1;
-    let end   = after[start..].find('"').unwrap() + start;
+    let end = after[start..].find('"').unwrap() + start;
     let hex_str = &after[start..end];
-    let bytes = hex::decode(hex_str)
-        .unwrap_or_else(|_| { eprintln!("Invalid hex for '{}'", field); std::process::exit(1); });
+    let bytes = hex::decode(hex_str).unwrap_or_else(|_| {
+        eprintln!("Invalid hex for '{}'", field);
+        std::process::exit(1);
+    });
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes[..32]);
     arr

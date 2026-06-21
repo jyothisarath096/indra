@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use indra_core::{
-    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::primitives::Bytes32,
 };
@@ -201,10 +201,18 @@ mod tests {
 
         let included = set.prove(&present);
         assert_eq!(included.value, Some(sha256(&present.0)));
-        assert!(SparseMerkleTree::verify_proof(set.root(), present.0, &included));
+        assert!(SparseMerkleTree::verify_proof(
+            set.root(),
+            present.0,
+            &included
+        ));
 
         let excluded = set.prove(&missing);
         assert_eq!(excluded.value, None);
-        assert!(SparseMerkleTree::verify_proof(set.root(), missing.0, &excluded));
+        assert!(SparseMerkleTree::verify_proof(
+            set.root(),
+            missing.0,
+            &excluded
+        ));
     }
 }

@@ -1,10 +1,7 @@
 use indra_cli::{build_transaction, TxParams};
 use indra_core::{codec::Decode, types::transaction::TransactionV1};
 
-use crate::{
-    errors::IndraError,
-    wallet::WalletContext,
-};
+use crate::{errors::IndraError, wallet::WalletContext};
 
 /// Owned transaction result before transferring heap ownership over FFI.
 pub struct BuiltTxOwned {

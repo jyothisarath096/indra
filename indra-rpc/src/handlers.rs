@@ -17,21 +17,17 @@ pub struct NodeState<'a> {
 }
 
 /// Dispatch a method call to the appropriate handler.
-pub fn dispatch(
-    method: &str,
-    params: &[String],
-    state: &NodeState<'_>,
-) -> RpcResult<String> {
+pub fn dispatch(method: &str, params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     match method {
-        "indra_getHeight"       => get_height(state),
-        "indra_getTip"          => get_tip(state),
-        "indra_getChainInfo"    => get_chain_info(state),
-        "indra_getMempoolSize"  => get_mempool_size(state),
-        "indra_getBlock"        => get_block(params, state),
-        "indra_getValidator"    => get_validator(params, state),
+        "indra_getHeight" => get_height(state),
+        "indra_getTip" => get_tip(state),
+        "indra_getChainInfo" => get_chain_info(state),
+        "indra_getMempoolSize" => get_mempool_size(state),
+        "indra_getBlock" => get_block(params, state),
+        "indra_getValidator" => get_validator(params, state),
         "indra_getValidatorSet" => get_validator_set(state),
         "indra_sendTransaction" => send_transaction(params, state),
-        _                       => Err(RpcError::MethodNotFound(method.to_string())),
+        _ => Err(RpcError::MethodNotFound(method.to_string())),
     }
 }
 
@@ -49,8 +45,7 @@ fn get_tip(state: &NodeState<'_>) -> RpcResult<String> {
     let tip = hex::encode(state.engine.state.tip_hash.0);
     Ok(format!(
         r#"{{"height":{},"tip_hash":"{}"}}"#,
-        state.engine.state.height,
-        tip
+        state.engine.state.height, tip
     ))
 }
 
@@ -87,25 +82,25 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
 
     Ok(format!(
         r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"max_active_validators":{max_active_validators},"total_staked_spark":{total_staked_spark},"effective_min_stake_spark":{effective_min_stake_spark},"validator_set_phase":{validator_set_phase},"mempool_size":{mempool},"epoch":{epoch},"pruned_mode":{pruned_mode},"lowest_block":{lowest_block},"blocks_retained":{blocks_retained},"block_reward_spark":{block_reward_spark},"era":{era}}}"#,
-        height        = s.height,
-        tip           = tip,
-        base_fee      = s.base_fee,
-        total_supply  = s.total_supply,
-        treasury      = s.treasury_balance,
-        burn          = s.burn_buffer,
+        height = s.height,
+        tip = tip,
+        base_fee = s.base_fee,
+        total_supply = s.total_supply,
+        treasury = s.treasury_balance,
+        burn = s.burn_buffer,
         fee_reward_pool = s.fee_reward_pool,
-        validators    = active_validators,
+        validators = active_validators,
         max_active_validators = max_active_validators,
         total_staked_spark = total_staked_spark,
         effective_min_stake_spark = effective_min_stake_spark,
         validator_set_phase = validator_set_phase,
-        mempool       = mempool_size,
-        epoch         = epoch,
-        pruned_mode   = if pruned_mode { "true" } else { "false" },
-        lowest_block  = lowest_block,
+        mempool = mempool_size,
+        epoch = epoch,
+        pruned_mode = if pruned_mode { "true" } else { "false" },
+        lowest_block = lowest_block,
         blocks_retained = blocks_retained,
         block_reward_spark = block_reward_spark,
-        era           = era,
+        era = era,
     ))
 }
 
@@ -134,7 +129,8 @@ fn get_mempool_size(state: &NodeState<'_>) -> RpcResult<String> {
 /// Result: `{"height", "prev_hash", "state_root", "base_fee",
 ///           "tx_count", "timestamp"}`
 fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let height_str = params.first()
+    let height_str = params
+        .first()
         .ok_or_else(|| RpcError::InvalidParams("missing height parameter".to_string()))?;
 
     let height: u64 = unquote(height_str)
@@ -152,15 +148,17 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     }
 
     if height > s.height {
-        return Err(RpcError::NotFound(format!("block {height} not yet produced")));
+        return Err(RpcError::NotFound(format!(
+            "block {height} not yet produced"
+        )));
     }
 
     // Return summary info available from chain state
     let tip = hex::encode(s.tip_hash.0);
     Ok(format!(
         r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"note":"full block retrieval added in Phase 8"}}"#,
-        height   = height,
-        tip      = tip,
+        height = height,
+        tip = tip,
         base_fee = s.base_fee,
     ))
 }
@@ -170,7 +168,8 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 /// Params: `["<validator_id_hex>"]`
 /// Result: `{"validator_id", "stake", "status", "epoch_joined"}`
 fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let id_str = params.first()
+    let id_str = params
+        .first()
         .ok_or_else(|| RpcError::InvalidParams("missing validator_id parameter".to_string()))?;
 
     let id_hex = unquote(id_str);
@@ -178,14 +177,19 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
         .map_err(|_| RpcError::InvalidParams(format!("invalid hex: {id_hex}")))?;
 
     if id_bytes.len() != 32 {
-        return Err(RpcError::InvalidParams("validator_id must be 32 bytes (64 hex chars)".to_string()));
+        return Err(RpcError::InvalidParams(
+            "validator_id must be 32 bytes (64 hex chars)".to_string(),
+        ));
     }
 
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&id_bytes);
     let id = indra_core::types::primitives::Bytes32::from(arr);
 
-    let validator = state.engine.state.validators
+    let validator = state
+        .engine
+        .state
+        .validators
         .get(&id)
         .ok_or_else(|| RpcError::NotFound(format!("validator {id_hex} not found")))?;
 
@@ -199,11 +203,11 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
 
     Ok(format!(
         r#"{{"validator_id":"{id}","name":"{name}","stake":{stake},"status":"{status}","epoch_joined":{epoch}}}"#,
-        id     = id_hex,
-        name   = validator.name,
-        stake  = validator.stake_spark,
+        id = id_hex,
+        name = validator.name,
+        stake = validator.stake_spark,
         status = status,
-        epoch  = validator.registered_epoch,
+        epoch = validator.registered_epoch,
     ))
 }
 
@@ -228,13 +232,14 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
 /// Params: `["<tx_hex>"]`
 /// Result: `{"tx_id": "<hex>", "status": "accepted"}`
 fn send_transaction(params: &[String], _state: &NodeState<'_>) -> RpcResult<String> {
-    let tx_hex = params.first()
+    let tx_hex = params
+        .first()
         .ok_or_else(|| RpcError::InvalidParams("missing transaction parameter".to_string()))?;
 
     let tx_bytes = hex::decode(unquote(tx_hex))
         .map_err(|_| RpcError::InvalidParams("invalid hex encoding".to_string()))?;
 
-    use indra_core::codec::{Decode, ByteReader};
+    use indra_core::codec::{ByteReader, Decode};
     use indra_core::types::transaction::TransactionV1;
 
     let mut reader = ByteReader::new(&tx_bytes);
@@ -264,7 +269,11 @@ mod tests {
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("indra_rpc_handler_test_{}_{}", suffix, std::process::id()));
+        p.push(format!(
+            "indra_rpc_handler_test_{}_{}",
+            suffix,
+            std::process::id()
+        ));
         p
     }
 

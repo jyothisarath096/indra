@@ -7,8 +7,8 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, DUST_LIMIT_SPARK, MAX_COMMISSION_BPS, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS, VariableBytes,
+        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_COMMISSION_BPS, MIN_COMMISSION_BPS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -190,6 +190,7 @@ fn apply_register_validator(
         stake_spark: 0,
         status: ValidatorStatus::Registered,
         registered_epoch: current_epoch,
+        last_active_epoch: current_epoch,
         pending_rewards: 0,
         rewards_last_epoch: current_epoch,
         self_report_count: 0,
@@ -348,9 +349,7 @@ fn apply_claim_rewards(
     }
     entry.pending_rewards = 0;
 
-    let mut blinding_input = Vec::with_capacity(
-        STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8,
-    );
+    let mut blinding_input = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
     blinding_input.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
     blinding_input.extend_from_slice(&validator_id.0);
     blinding_input.extend_from_slice(&delegator_id.0);
@@ -438,7 +437,11 @@ mod tests {
         primitives::VariableBytes,
         transaction::OutputV1,
     };
-    use indra_crypto::{commit, hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair}, prove_range};
+    use indra_crypto::{
+        commit,
+        hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+        prove_range,
+    };
     use rand::{rngs::StdRng, SeedableRng};
 
     fn keypair(seed: u8) -> HybridKeypair {
@@ -480,7 +483,12 @@ mod tests {
     ) -> Bytes32 {
         state
             .utxos
-            .insert(test_output(value_spark, delegator_pubkey, seed), 1, 0, seed as u32)
+            .insert(
+                test_output(value_spark, delegator_pubkey, seed),
+                1,
+                0,
+                seed as u32,
+            )
             .unwrap()
     }
 
@@ -523,6 +531,7 @@ mod tests {
             stake_spark: 10_000_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
+            last_active_epoch: 0,
             pending_rewards: 0,
             rewards_last_epoch: 0,
             self_report_count: 0,
@@ -913,7 +922,10 @@ mod tests {
         );
         let chain_id = state.chain_id.clone();
         apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-        assert_eq!(state.validators.get(&validator_id).unwrap().vrf_pk, Some(vrf_pk));
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().vrf_pk,
+            Some(vrf_pk)
+        );
     }
 
     #[test]

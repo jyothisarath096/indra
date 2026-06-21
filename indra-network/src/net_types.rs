@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use indra_core::types::primitives::Bytes32;
+use indra_core::types::{primitives::Bytes32, slashing::SlashEvidenceV1};
 
 use crate::message::Message;
 
@@ -32,6 +32,8 @@ pub enum NetworkEvent {
         /// Last known remote socket address.
         addr: SocketAddr,
     },
+    /// Slash evidence detected by the transport before rate limiting.
+    SlashDetected(SlashEvidenceV1),
 }
 
 /// Commands sent from the node to the async network layer.

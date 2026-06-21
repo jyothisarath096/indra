@@ -58,14 +58,15 @@ fn cmd_balance(args: &[String]) {
 fn cmd_send(args: &[String]) {
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
     let recipient_address = required_arg(args, "--to");
-    let amount_spark = required_arg(args, "--amount").parse::<u64>().unwrap_or_else(|_| {
-        eprintln!("Error: invalid --amount");
-        std::process::exit(1);
-    });
+    let amount_spark = required_arg(args, "--amount")
+        .parse::<u64>()
+        .unwrap_or_else(|_| {
+            eprintln!("Error: invalid --amount");
+            std::process::exit(1);
+        });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let chain_id = get_arg(args, "--chain-id").unwrap_or_else(|| {
-        indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string()
-    });
+    let chain_id = get_arg(args, "--chain-id")
+        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
 
     let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
@@ -104,7 +105,8 @@ fn cmd_send(args: &[String]) {
         hybrid_seed,
         pq_sk_bytes,
         sender_pubkey,
-    }).unwrap_or_else(|e| {
+    })
+    .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
     });
@@ -120,7 +122,10 @@ fn cmd_send(args: &[String]) {
 fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
     let raw = rpc_call(rpc, "indra_getValidator", &[address_hex.to_string()]);
     let classical = extract_hex_string(&raw, "hybrid_classical_pk").unwrap_or_else(|| {
-        eprintln!("Error: recipient {} not found in validator set", address_hex);
+        eprintln!(
+            "Error: recipient {} not found in validator set",
+            address_hex
+        );
         std::process::exit(1);
     });
     let pq = extract_hex_string(&raw, "hybrid_pq_pk").unwrap_or_else(|| {
@@ -252,7 +257,10 @@ fn rpc_call(url: &str, method: &str, params: &[String]) -> String {
 }
 
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 fn required_arg(args: &[String], flag: &str) -> String {

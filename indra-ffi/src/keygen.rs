@@ -26,8 +26,8 @@ pub fn new_mnemonic() -> String {
 
 /// Generate an INDRA keypair bundle from a BIP-39 mnemonic phrase.
 pub fn generate_from_mnemonic(phrase: &str) -> Result<IndraKeyPair, IndraError> {
-    let keys = recover_from_mnemonic(phrase, String::new())
-        .map_err(|_| IndraError::InvalidParam)?;
+    let keys =
+        recover_from_mnemonic(phrase, String::new()).map_err(|_| IndraError::InvalidParam)?;
     keys_to_ffi(&keys)
 }
 
@@ -43,7 +43,8 @@ fn keys_to_ffi(keys: &indra_cli::KeysFile) -> Result<IndraKeyPair, IndraError> {
 
     let mut out = IndraKeyPair::zeroed();
     out.validator_id.copy_from_slice(&keys.public.validator_id);
-    out.classical_pk.copy_from_slice(&keys.public.hybrid_classical_pk);
+    out.classical_pk
+        .copy_from_slice(&keys.public.hybrid_classical_pk);
     out.pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
     out.classical_seed.copy_from_slice(&keys.hybrid_seed);
     out.pq_sk.copy_from_slice(&keys.pq_sk);

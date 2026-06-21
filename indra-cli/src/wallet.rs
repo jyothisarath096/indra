@@ -88,15 +88,18 @@ impl Wallet {
         tx_index: u32,
         out_index: u32,
     ) {
-        self.entries.insert(utxo_id, WalletEntry {
+        self.entries.insert(
             utxo_id,
-            value_spark,
-            blinding,
-            created_height,
-            tx_index,
-            out_index,
-            spent: false,
-        });
+            WalletEntry {
+                utxo_id,
+                value_spark,
+                blinding,
+                created_height,
+                tx_index,
+                out_index,
+                spent: false,
+            },
+        );
     }
 
     /// Mark a UTXO as spent.
@@ -113,7 +116,8 @@ impl Wallet {
 
     /// Record a change output until it is mined and can be assigned a real UTXO ID.
     pub fn add_pending_change(&mut self, output: OutputV1, blinding: [u8; 32]) {
-        self.pending_changes.push(PendingChange { output, blinding });
+        self.pending_changes
+            .push(PendingChange { output, blinding });
     }
 
     /// Number of pending change outputs awaiting confirmation.
@@ -130,7 +134,8 @@ impl Wallet {
         out_index: u32,
     ) -> bool {
         let Some(index) = self.pending_changes.iter().position(|pending| {
-            UtxoSet::compute_utxo_id(&pending.output, created_height, tx_index, out_index) == utxo_id
+            UtxoSet::compute_utxo_id(&pending.output, created_height, tx_index, out_index)
+                == utxo_id
         }) else {
             return false;
         };
@@ -149,7 +154,8 @@ impl Wallet {
 
     /// Total spendable balance in Spark.
     pub fn balance(&self) -> u64 {
-        self.entries.values()
+        self.entries
+            .values()
             .filter(|e| !e.spent)
             .fold(0u64, |acc, e| acc.saturating_add(e.value_spark))
     }
@@ -160,15 +166,9 @@ impl Wallet {
     /// pick until we have enough.
     ///
     /// Returns selected entries or an error if balance is insufficient.
-    pub fn select_utxos(
-        &self,
-        target_spark: u64,
-        fee_spark: u64,
-    ) -> CliResult<Vec<&WalletEntry>> {
+    pub fn select_utxos(&self, target_spark: u64, fee_spark: u64) -> CliResult<Vec<&WalletEntry>> {
         let needed = target_spark.saturating_add(fee_spark);
-        let mut available: Vec<&WalletEntry> = self.entries.values()
-            .filter(|e| !e.spent)
-            .collect();
+        let mut available: Vec<&WalletEntry> = self.entries.values().filter(|e| !e.spent).collect();
 
         // Sort by value descending (largest first — minimise inputs)
         available.sort_by(|a, b| b.value_spark.cmp(&a.value_spark));
@@ -204,13 +204,17 @@ impl Wallet {
                 e.spent,
             )
         }).collect();
-        let pending: Vec<String> = self.pending_changes.iter().map(|pending| {
-            format!(
-                r#"  {{"output_hex":"{}","blinding":"{}"}}"#,
-                hex::encode(pending.output.encode_to_vec()),
-                hex::encode(pending.blinding),
-            )
-        }).collect();
+        let pending: Vec<String> = self
+            .pending_changes
+            .iter()
+            .map(|pending| {
+                format!(
+                    r#"  {{"output_hex":"{}","blinding":"{}"}}"#,
+                    hex::encode(pending.output.encode_to_vec()),
+                    hex::encode(pending.blinding),
+                )
+            })
+            .collect();
 
         format!(
             "{{\n  \"entries\": [\n{}\n  ],\n  \"pending_changes\": [\n{}\n  ]\n}}",
@@ -244,15 +248,15 @@ impl Wallet {
             }
 
             let utxo_id = parse_str_field(obj, "utxo_id")?;
-            let value   = parse_u64_field(obj, "value_spark")?;
+            let value = parse_u64_field(obj, "value_spark")?;
             let blinding_hex = parse_str_field(obj, "blinding")?;
-            let height  = parse_u64_field(obj, "created_height")?;
-            let tx_idx  = parse_u64_field(obj, "tx_index")? as u32;
+            let height = parse_u64_field(obj, "created_height")?;
+            let tx_idx = parse_u64_field(obj, "tx_index")? as u32;
             let out_idx = parse_u64_field(obj, "out_index")? as u32;
-            let spent   = obj.contains("\"spent\":true");
+            let spent = obj.contains("\"spent\":true");
 
-            let id_bytes = hex::decode(&utxo_id)
-                .map_err(|_| CliError::Parse("bad utxo_id hex".into()))?;
+            let id_bytes =
+                hex::decode(&utxo_id).map_err(|_| CliError::Parse("bad utxo_id hex".into()))?;
             let blinding_bytes = hex::decode(&blinding_hex)
                 .map_err(|_| CliError::Parse("bad blinding hex".into()))?;
 
@@ -266,15 +270,18 @@ impl Wallet {
             bl_arr.copy_from_slice(&blinding_bytes);
 
             let utxo = Bytes32::from(id_arr);
-            wallet.entries.insert(utxo, WalletEntry {
-                utxo_id: utxo,
-                value_spark: value,
-                blinding: bl_arr,
-                created_height: height,
-                tx_index: tx_idx,
-                out_index: out_idx,
-                spent,
-            });
+            wallet.entries.insert(
+                utxo,
+                WalletEntry {
+                    utxo_id: utxo,
+                    value_spark: value,
+                    blinding: bl_arr,
+                    created_height: height,
+                    tx_index: tx_idx,
+                    out_index: out_idx,
+                    spent,
+                },
+            );
         }
 
         if let Some(pending_json) = extract_array(json, "pending_changes") {
@@ -304,7 +311,9 @@ impl Wallet {
                     .map_err(|_| CliError::Parse("bad pending output encoding".into()))?;
                 let mut blinding = [0u8; 32];
                 blinding.copy_from_slice(&blinding_bytes);
-                wallet.pending_changes.push(PendingChange { output, blinding });
+                wallet
+                    .pending_changes
+                    .push(PendingChange { output, blinding });
             }
         }
 
@@ -313,8 +322,7 @@ impl Wallet {
 
     /// Save wallet to a file.
     pub fn save(&self, path: &str) -> CliResult<()> {
-        std::fs::write(path, self.to_json())
-            .map_err(|e| CliError::Io(e.to_string()))
+        std::fs::write(path, self.to_json()).map_err(|e| CliError::Io(e.to_string()))
     }
 
     /// Load wallet from a file, or return empty wallet if file doesn't exist.
@@ -350,28 +358,34 @@ fn extract_array<'a>(json: &'a str, field: &str) -> Option<&'a str> {
 
 fn parse_str_field(json: &str, field: &str) -> CliResult<String> {
     let key = format!("\"{field}\":\"");
-    let pos = json.find(&key)
+    let pos = json
+        .find(&key)
         .ok_or_else(|| CliError::Parse(format!("missing field: {field}")))?;
     let after = &json[pos + key.len()..];
-    let end = after.find('\"')
+    let end = after
+        .find('\"')
         .ok_or_else(|| CliError::Parse(format!("unterminated field: {field}")))?;
     Ok(after[..end].to_string())
 }
 
 fn parse_u64_field(json: &str, field: &str) -> CliResult<u64> {
     let key = format!("\"{field}\":");
-    let pos = json.find(&key)
+    let pos = json
+        .find(&key)
         .ok_or_else(|| CliError::Parse(format!("missing field: {field}")))?;
     let after = json[pos + key.len()..].trim_start();
     let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse::<u64>().map_err(|_| CliError::Parse(format!("bad number: {field}")))
+    num.parse::<u64>()
+        .map_err(|_| CliError::Parse(format!("bad number: {field}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_id(b: u8) -> Bytes32 { Bytes32::from([b; 32]) }
+    fn make_id(b: u8) -> Bytes32 {
+        Bytes32::from([b; 32])
+    }
 
     #[test]
     fn empty_wallet_has_zero_balance() {
@@ -381,8 +395,8 @@ mod tests {
     #[test]
     fn add_and_balance() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 1_000_000, [0u8;32], 1, 0, 0);
-        w.add_utxo(make_id(2), 2_000_000, [0u8;32], 1, 0, 1);
+        w.add_utxo(make_id(1), 1_000_000, [0u8; 32], 1, 0, 0);
+        w.add_utxo(make_id(2), 2_000_000, [0u8; 32], 1, 0, 1);
         assert_eq!(w.balance(), 3_000_000);
     }
 
@@ -390,7 +404,7 @@ mod tests {
     fn mark_spent_reduces_balance() {
         let mut w = Wallet::new();
         let id = make_id(1);
-        w.add_utxo(id, 1_000_000, [0u8;32], 1, 0, 0);
+        w.add_utxo(id, 1_000_000, [0u8; 32], 1, 0, 0);
         w.mark_spent(&id);
         assert_eq!(w.balance(), 0);
     }
@@ -398,8 +412,8 @@ mod tests {
     #[test]
     fn coin_selection_sufficient() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 5_000_000, [0u8;32], 1, 0, 0);
-        w.add_utxo(make_id(2), 3_000_000, [0u8;32], 1, 0, 1);
+        w.add_utxo(make_id(1), 5_000_000, [0u8; 32], 1, 0, 0);
+        w.add_utxo(make_id(2), 3_000_000, [0u8; 32], 1, 0, 1);
         let selected = w.select_utxos(4_000_000, 100_000).unwrap();
         let total: u64 = selected.iter().map(|e| e.value_spark).sum();
         assert!(total >= 4_100_000);
@@ -408,14 +422,14 @@ mod tests {
     #[test]
     fn coin_selection_insufficient_errors() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 100, [0u8;32], 1, 0, 0);
+        w.add_utxo(make_id(1), 100, [0u8; 32], 1, 0, 0);
         assert!(w.select_utxos(1_000_000, 0).is_err());
     }
 
     #[test]
     fn wallet_json_round_trip() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(0xAB), 999_000, [0x42u8;32], 5, 1, 2);
+        w.add_utxo(make_id(0xAB), 999_000, [0x42u8; 32], 5, 1, 2);
         let json = w.to_json();
         let w2 = Wallet::from_json(&json).unwrap();
         assert_eq!(w2.balance(), 999_000);
@@ -431,9 +445,11 @@ mod tests {
             },
             owner_pubkey: indra_core::types::crypto::HybridPubKey {
                 classical_pk: Bytes32::from([0x22; 32]),
-                pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0x33; 32]).unwrap(),
+                pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0x33; 32])
+                    .unwrap(),
             },
-            range_proof: indra_core::types::primitives::VariableBytes::from_slice(&[0x44; 32]).unwrap(),
+            range_proof: indra_core::types::primitives::VariableBytes::from_slice(&[0x44; 32])
+                .unwrap(),
             lock_height: 0,
         };
         wallet.add_pending_change(output.clone(), [0x55; 32]);

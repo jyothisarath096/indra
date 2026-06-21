@@ -56,7 +56,6 @@ pub struct NodeConfig {
     ///
     /// `None` means archive mode.
     pub prune_keep_blocks: Option<u64>,
-
 }
 
 impl NodeConfig {
@@ -64,16 +63,16 @@ impl NodeConfig {
     pub fn local_test(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            genesis_path:      None,
-            validator_seed:   Some([0x42u8; 32]),
-            bls_seed:         Some([0x42u8; 32]),
-            vrf_seed:         Some([0x42u8; 32]),
-            pq_sk:            None,
-            pq_pk:            None,
-            p2p_addr:         "127.0.0.1:30303".to_string(),
-            bootstrap_peers:  vec![],
+            genesis_path: None,
+            validator_seed: Some([0x42u8; 32]),
+            bls_seed: Some([0x42u8; 32]),
+            vrf_seed: Some([0x42u8; 32]),
+            pq_sk: None,
+            pq_pk: None,
+            p2p_addr: "127.0.0.1:30303".to_string(),
+            bootstrap_peers: vec![],
             snapshot_interval: 300,
-            mempool_capacity:  5_000,
+            mempool_capacity: 5_000,
             prune_keep_blocks: None,
         }
     }
@@ -82,16 +81,16 @@ impl NodeConfig {
     pub fn full_node(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            genesis_path:      None,
-            validator_seed:   None,
-            bls_seed:         None,
-            vrf_seed:         None,
-            pq_sk:            None,
-            pq_pk:            None,
-            p2p_addr:         "127.0.0.1:30303".to_string(),
-            bootstrap_peers:  vec![],
+            genesis_path: None,
+            validator_seed: None,
+            bls_seed: None,
+            vrf_seed: None,
+            pq_sk: None,
+            pq_pk: None,
+            p2p_addr: "127.0.0.1:30303".to_string(),
+            bootstrap_peers: vec![],
             snapshot_interval: 300,
-            mempool_capacity:  5_000,
+            mempool_capacity: 5_000,
             prune_keep_blocks: None,
         }
     }

@@ -58,8 +58,9 @@ mod tests {
         let got = sha256(b"");
         let expected = hex::decode(
             "e3b0c44298fc1c149afbf4c8996fb924\
-             27ae41e4649b934ca495991b7852b855"
-        ).unwrap();
+             27ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
         assert_eq!(&got[..], expected.as_slice());
     }
 
@@ -69,8 +70,9 @@ mod tests {
         let got = sha256(b"abc");
         let expected = hex::decode(
             "ba7816bf8f01cfea414140de5dae2ec7\
-             3b00361bbef0469f492c30f55823e7be"
-        ).unwrap();
+             3b00361bbef0469f492c30f55823e7be",
+        )
+        .unwrap();
         // Note: standard abc vector ends in ...7be — verify length at least
         assert_eq!(got.len(), 32);
         // Determinism check
@@ -115,10 +117,7 @@ mod tests {
         let sk = [0x55u8; 32];
         let id1 = sha256(b"utxo_A");
         let id2 = sha256(b"utxo_B");
-        assert_ne!(
-            compute_nullifier(&sk, &id1),
-            compute_nullifier(&sk, &id2),
-        );
+        assert_ne!(compute_nullifier(&sk, &id1), compute_nullifier(&sk, &id2),);
     }
 }
 

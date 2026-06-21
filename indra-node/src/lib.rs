@@ -29,20 +29,20 @@
 #![deny(clippy::panic)]
 
 pub mod config;
+pub mod driver;
+pub mod engine;
 pub mod error;
 pub mod genesis;
-pub mod engine;
+pub mod net_driver;
+pub mod slash;
 pub mod state_root;
 pub mod sync;
-pub mod slash;
-pub mod driver;
-pub mod net_driver;
 
 pub use config::NodeConfig;
-pub use error::{NodeError, NodeResult};
+pub use driver::{ConsensusDriver, DriverAction, DriverEvent};
 pub use engine::NodeEngine;
+pub use error::{NodeError, NodeResult};
 pub use genesis::{build_genesis_block, build_genesis_state, load_genesis_validators};
-pub use sync::import_block;
+pub use net_driver::{action_to_message, message_to_event};
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};
-pub use driver::{ConsensusDriver, DriverEvent, DriverAction};
-pub use net_driver::{message_to_event, action_to_message};
+pub use sync::import_block;

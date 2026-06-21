@@ -33,12 +33,9 @@
 
 use indra_crypto::{
     bls::BlsKeypair,
-    derive_all_seeds,
-    generate_mnemonic,
+    derive_all_seeds, generate_mnemonic,
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
-    mnemonic_to_seed,
-    sha256,
-    VrfKeypair,
+    mnemonic_to_seed, sha256, VrfKeypair,
 };
 
 use crate::error::{CliError, CliResult};
@@ -98,16 +95,16 @@ impl KeysFile {
     "WARNING": "Keep private seeds secret. Never share this section."
   }}
 }}"#,
-            name         = self.name,
+            name = self.name,
             validator_id = hex::encode(v.validator_id),
-            classical    = hex::encode(v.hybrid_classical_pk),
-            pq           = hex::encode(&v.hybrid_pq_pk),
-            bls          = hex::encode(v.bls_pk),
-            vrf          = hex::encode(v.vrf_pk),
-            h_seed       = hex::encode(self.hybrid_seed),
-            b_seed       = hex::encode(self.bls_seed),
-            v_seed       = hex::encode(self.vrf_seed),
-            pq_sk        = hex::encode(&self.pq_sk),
+            classical = hex::encode(v.hybrid_classical_pk),
+            pq = hex::encode(&v.hybrid_pq_pk),
+            bls = hex::encode(v.bls_pk),
+            vrf = hex::encode(v.vrf_pk),
+            h_seed = hex::encode(self.hybrid_seed),
+            b_seed = hex::encode(self.bls_seed),
+            v_seed = hex::encode(self.vrf_seed),
+            pq_sk = hex::encode(&self.pq_sk),
         )
     }
 
@@ -145,19 +142,23 @@ impl KeysFile {
 
     /// Load and parse a `keys.json` file from disk.
     pub fn load(path: &str) -> CliResult<Self> {
-        let json = std::fs::read_to_string(path)
-            .map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
+        let json =
+            std::fs::read_to_string(path).map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
         Self::from_json(&json)
     }
 }
 
 fn extract_object<'a>(json: &'a str, field: &str) -> CliResult<&'a str> {
     let key = format!("\"{}\":", field);
-    let pos = json.find(&key)
+    let pos = json
+        .find(&key)
         .ok_or_else(|| CliError::Parse(format!("missing object '{}'", field)))?;
     let after = json[pos + key.len()..].trim_start();
     if !after.starts_with('{') {
-        return Err(CliError::Parse(format!("field '{}' is not an object", field)));
+        return Err(CliError::Parse(format!(
+            "field '{}' is not an object",
+            field
+        )));
     }
 
     let mut depth = 0usize;
@@ -189,8 +190,7 @@ fn extract_string(json: &str, field: &str) -> Option<String> {
 fn extract_hex(json: &str, field: &str) -> CliResult<Vec<u8>> {
     let value = extract_string(json, field)
         .ok_or_else(|| CliError::Parse(format!("missing field '{}'", field)))?;
-    hex::decode(&value)
-        .map_err(|e| CliError::InvalidHex(format!("{}: {}", field, e)))
+    hex::decode(&value).map_err(|e| CliError::InvalidHex(format!("{}: {}", field, e)))
 }
 
 fn extract_hex32(json: &str, field: &str) -> CliResult<[u8; 32]> {
@@ -220,14 +220,12 @@ pub fn generate_keypairs(
     vrf_seed: [u8; 32],
 ) -> CliResult<KeysFile> {
     let classical = ClassicalKeypair::from_seed(&hybrid_seed);
-    let pq = PqKeypair::from_seed(&hybrid_seed)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let pq = PqKeypair::from_seed(&hybrid_seed).map_err(|e| CliError::Crypto(e.to_string()))?;
     let pq_sk_bytes = pq.secret_key_bytes();
     let hybrid = HybridKeypair::new(classical, pq);
     let pk = hybrid.public_key();
 
-    let bls = BlsKeypair::from_seed(&bls_seed)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let bls = BlsKeypair::from_seed(&bls_seed).map_err(|e| CliError::Crypto(e.to_string()))?;
 
     let vrf = VrfKeypair::from_seed(&vrf_seed);
 
@@ -242,9 +240,9 @@ pub fn generate_keypairs(
         public: ValidatorKeys {
             validator_id,
             hybrid_classical_pk: pk.classical.0,
-            hybrid_pq_pk:        pk.pq.0.to_vec(),
-            bls_pk:              bls_pk_bytes,
-            vrf_pk:              vrf_pk_bytes,
+            hybrid_pq_pk: pk.pq.0.to_vec(),
+            bls_pk: bls_pk_bytes,
+            vrf_pk: vrf_pk_bytes,
         },
         hybrid_seed,
         bls_seed,
@@ -260,27 +258,35 @@ pub fn generate_keypairs(
 pub fn generate_from_passphrase(passphrase: &str, name: String) -> CliResult<KeysFile> {
     use indra_crypto::hash::domain_hash;
     let hybrid_seed = domain_hash(b"INDRA-KEYGEN-HYBRID-v1", passphrase.as_bytes());
-    let bls_seed    = domain_hash(b"INDRA-KEYGEN-BLS-v1",    passphrase.as_bytes());
-    let vrf_seed    = domain_hash(b"INDRA-KEYGEN-VRF-v1",    passphrase.as_bytes());
+    let bls_seed = domain_hash(b"INDRA-KEYGEN-BLS-v1", passphrase.as_bytes());
+    let vrf_seed = domain_hash(b"INDRA-KEYGEN-VRF-v1", passphrase.as_bytes());
     generate_keypairs(name, hybrid_seed, bls_seed, vrf_seed)
 }
 
 /// Generate a complete validator keypair set from a new mnemonic.
 pub fn generate_from_new_mnemonic(name: String) -> CliResult<(String, KeysFile)> {
     let phrase = generate_mnemonic();
-    let master_seed = mnemonic_to_seed(&phrase)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let master_seed = mnemonic_to_seed(&phrase).map_err(|e| CliError::Crypto(e.to_string()))?;
     let derived = derive_all_seeds(&master_seed);
-    let keys = generate_keypairs(name, derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)?;
+    let keys = generate_keypairs(
+        name,
+        derived.hybrid_seed,
+        derived.bls_seed,
+        derived.vrf_seed,
+    )?;
     Ok((phrase, keys))
 }
 
 /// Recover a validator keypair set from an existing mnemonic.
 pub fn recover_from_mnemonic(phrase: &str, name: String) -> CliResult<KeysFile> {
-    let master_seed = mnemonic_to_seed(phrase)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let master_seed = mnemonic_to_seed(phrase).map_err(|e| CliError::Crypto(e.to_string()))?;
     let derived = derive_all_seeds(&master_seed);
-    generate_keypairs(name, derived.hybrid_seed, derived.bls_seed, derived.vrf_seed)
+    generate_keypairs(
+        name,
+        derived.hybrid_seed,
+        derived.bls_seed,
+        derived.vrf_seed,
+    )
 }
 
 #[cfg(test)]
@@ -337,13 +343,8 @@ mod tests {
             [0x03u8; 32],
         )
         .unwrap();
-        let k2 = generate_keypairs(
-            "bob".to_string(),
-            [0xFFu8; 32],
-            [0xFEu8; 32],
-            [0xFDu8; 32],
-        )
-        .unwrap();
+        let k2 =
+            generate_keypairs("bob".to_string(), [0xFFu8; 32], [0xFEu8; 32], [0xFDu8; 32]).unwrap();
         assert_ne!(k1.public.validator_id, k2.public.validator_id);
     }
 
@@ -394,7 +395,10 @@ mod tests {
         let parsed = KeysFile::from_json(&json).unwrap();
         assert_eq!(parsed.name, keys.name);
         assert_eq!(parsed.public.validator_id, keys.public.validator_id);
-        assert_eq!(parsed.public.hybrid_classical_pk, keys.public.hybrid_classical_pk);
+        assert_eq!(
+            parsed.public.hybrid_classical_pk,
+            keys.public.hybrid_classical_pk
+        );
         assert_eq!(parsed.public.hybrid_pq_pk, keys.public.hybrid_pq_pk);
         assert_eq!(parsed.hybrid_seed, keys.hybrid_seed);
         assert_eq!(parsed.bls_seed, keys.bls_seed);
@@ -421,7 +425,10 @@ mod tests {
         let keys2 = recover_from_mnemonic(&phrase, "validator".to_string()).unwrap();
         assert_eq!(keys1.name, keys2.name);
         assert_eq!(keys1.public.validator_id, keys2.public.validator_id);
-        assert_eq!(keys1.public.hybrid_classical_pk, keys2.public.hybrid_classical_pk);
+        assert_eq!(
+            keys1.public.hybrid_classical_pk,
+            keys2.public.hybrid_classical_pk
+        );
         assert_eq!(keys1.public.hybrid_pq_pk, keys2.public.hybrid_pq_pk);
         assert_eq!(keys1.pq_sk, keys2.pq_sk);
     }

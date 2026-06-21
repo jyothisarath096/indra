@@ -22,12 +22,9 @@
 use std::collections::HashMap;
 
 use indra_core::{
-    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    types::{
-        primitives::Bytes32,
-        transaction::OutputV1,
-    },
+    types::{primitives::Bytes32, transaction::OutputV1},
 };
 use indra_crypto::sha256;
 
@@ -185,13 +182,16 @@ impl UtxoSet {
                 message: "UTXO ID collision — SHA-256 collision or duplicate block application",
             });
         }
-        self.entries.insert(id, UtxoEntry {
-            utxo_id: id,
-            output,
-            created_height: height,
-            tx_index,
-            output_index,
-        });
+        self.entries.insert(
+            id,
+            UtxoEntry {
+                utxo_id: id,
+                output,
+                created_height: height,
+                tx_index,
+                output_index,
+            },
+        );
         let smt_value = self
             .entries
             .get(&id)
@@ -256,8 +256,7 @@ impl UtxoSet {
 mod tests {
     use super::*;
     use indra_core::{
-        Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
-        types::transaction::OutputV1,
+        types::transaction::OutputV1, Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
 
     fn dummy_output(byte: u8) -> OutputV1 {

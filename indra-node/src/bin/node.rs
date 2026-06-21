@@ -219,7 +219,7 @@ fn start_network_runtime(
                                     peer_addrs.lock().unwrap().remove(validator_id);
                                     addr_validators.lock().unwrap().remove(addr);
                                 }
-                                NetworkEvent::Message { .. } => {}
+                                NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
                             }
                             let _ = event_tx.send(event);
                         }
@@ -513,6 +513,10 @@ fn main() {
                     }
                     NetworkEvent::PeerDisconnected { addr, .. } => {
                         eprintln!("[p2p] peer disconnected: {}", addr);
+                    }
+                    NetworkEvent::SlashDetected(evidence) => {
+                        let mut d = driver.lock().unwrap();
+                        d.engine.add_slash_evidence(evidence);
                     }
                     NetworkEvent::Message {
                         from: addr,
@@ -1141,6 +1145,21 @@ fn process_driver_actions(
                     gossip.send_to_validator(peer_validator_id, &msg);
                 }
             }
+            continue;
+        }
+
+        if let DriverAction::SlashDetected(slash_evidence) = &action {
+            let wire_evidence = indra_core::types::slashing::SlashEvidenceV1 {
+                validator_id: slash_evidence.validator_id,
+                vote_1: slash_evidence.vote_a.clone(),
+                vote_2: slash_evidence.vote_b.clone(),
+            };
+            let mut d = driver.lock().unwrap();
+            d.engine.add_slash_evidence(wire_evidence);
+            eprintln!(
+                "[slash] equivocation detected from validator {} — evidence queued",
+                hex::encode(&slash_evidence.validator_id.0[..4])
+            );
             continue;
         }
 

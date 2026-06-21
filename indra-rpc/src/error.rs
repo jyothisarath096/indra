@@ -4,21 +4,21 @@ use thiserror::Error;
 
 /// JSON-RPC 2.0 standard error codes.
 /// JSON-RPC parse error code.
-pub const ERR_PARSE_ERROR:      i32 = -32700;
+pub const ERR_PARSE_ERROR: i32 = -32700;
 /// JSON-RPC invalid request code.
-pub const ERR_INVALID_REQUEST:  i32 = -32600;
+pub const ERR_INVALID_REQUEST: i32 = -32600;
 /// JSON-RPC method not found code.
 pub const ERR_METHOD_NOT_FOUND: i32 = -32601;
 /// JSON-RPC invalid params code.
-pub const ERR_INVALID_PARAMS:   i32 = -32602;
+pub const ERR_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC internal error code.
-pub const ERR_INTERNAL_ERROR:   i32 = -32603;
+pub const ERR_INTERNAL_ERROR: i32 = -32603;
 /// Application-specific error range starts at -32000.
-pub const ERR_NOT_FOUND:        i32 = -32000;
+pub const ERR_NOT_FOUND: i32 = -32000;
 /// Transaction rejected.
-pub const ERR_TX_REJECTED:      i32 = -32001;
+pub const ERR_TX_REJECTED: i32 = -32001;
 /// Node is not synced.
-pub const ERR_NOT_SYNCED:       i32 = -32002;
+pub const ERR_NOT_SYNCED: i32 = -32002;
 
 /// An RPC-level error.
 #[derive(Debug, Error, Clone)]
@@ -52,12 +52,12 @@ impl RpcError {
     /// The JSON-RPC error code for this error.
     pub fn code(&self) -> i32 {
         match self {
-            Self::ParseError(_)    => ERR_PARSE_ERROR,
+            Self::ParseError(_) => ERR_PARSE_ERROR,
             Self::MethodNotFound(_) => ERR_METHOD_NOT_FOUND,
             Self::InvalidParams(_) => ERR_INVALID_PARAMS,
-            Self::Internal(_)      => ERR_INTERNAL_ERROR,
-            Self::NotFound(_)      => ERR_NOT_FOUND,
-            Self::TxRejected(_)    => ERR_TX_REJECTED,
+            Self::Internal(_) => ERR_INTERNAL_ERROR,
+            Self::NotFound(_) => ERR_NOT_FOUND,
+            Self::TxRejected(_) => ERR_TX_REJECTED,
         }
     }
 }

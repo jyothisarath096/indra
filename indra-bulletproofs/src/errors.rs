@@ -33,7 +33,10 @@ impl fmt::Display for BulletproofError {
             Self::VerificationFailed => write!(f, "range proof verification failed"),
             Self::InvalidEncoding(message) => write!(f, "invalid proof encoding: {message}"),
             Self::InvalidLength { actual, expected } => {
-                write!(f, "proof length {actual} does not match expected {expected}")
+                write!(
+                    f,
+                    "proof length {actual} does not match expected {expected}"
+                )
             }
             Self::ValueOutOfRange(value) => write!(f, "value {value} is out of range [0, 2^64)"),
             Self::InnerProductFailed => write!(f, "inner product argument verification failed"),

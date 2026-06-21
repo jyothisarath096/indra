@@ -36,14 +36,14 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-pub mod error;
 pub mod block_store;
+pub mod error;
 pub mod qc_store;
 pub mod state_store;
 pub mod wal;
 
-pub use error::{StorageError, StorageResult};
 pub use block_store::{BlockStore, PruneConfig};
+pub use error::{StorageError, StorageResult};
 pub use qc_store::{load_last_qc, save_last_qc};
 pub use state_store::StateStore;
 pub use wal::MempoolWal;

@@ -76,7 +76,10 @@ impl GenesisConfig {
             out.push_str("[[validators]]\n");
             out.push_str(&format!("name                = \"{}\"\n", v.name));
             out.push_str(&format!("validator_id        = \"{}\"\n", v.validator_id));
-            out.push_str(&format!("hybrid_classical_pk = \"{}\"\n", v.hybrid_classical_pk));
+            out.push_str(&format!(
+                "hybrid_classical_pk = \"{}\"\n",
+                v.hybrid_classical_pk
+            ));
             out.push_str(&format!("hybrid_pq_pk        = \"{}\"\n", v.hybrid_pq_pk));
             out.push_str(&format!("bls_pk              = \"{}\"\n", v.bls_pk));
             out.push_str(&format!("vrf_pk              = \"{}\"\n", v.vrf_pk));
@@ -98,7 +101,7 @@ impl GenesisConfig {
 
         if self.validators.len() < 4 {
             return Err(CliError::Genesis(
-                "need at least 4 validators for BFT safety (3f+1, f=1)".to_string()
+                "need at least 4 validators for BFT safety (3f+1, f=1)".to_string(),
             ));
         }
 
@@ -106,19 +109,16 @@ impl GenesisConfig {
         let mut seen_ids = std::collections::HashSet::new();
         for v in &self.validators {
             if !seen_ids.insert(v.validator_id.clone()) {
-                return Err(CliError::Genesis(
-                    format!("duplicate validator_id: {}", v.validator_id)
-                ));
+                return Err(CliError::Genesis(format!(
+                    "duplicate validator_id: {}",
+                    v.validator_id
+                )));
             }
             if v.stake < DUST_LIMIT_SPARK {
-                return Err(CliError::Genesis(
-                    format!(
-                        "validator {} stake {} is below dust limit {}",
-                        v.name,
-                        v.stake,
-                        DUST_LIMIT_SPARK
-                    )
-                ));
+                return Err(CliError::Genesis(format!(
+                    "validator {} stake {} is below dust limit {}",
+                    v.name, v.stake, DUST_LIMIT_SPARK
+                )));
             }
         }
 
@@ -144,23 +144,19 @@ pub fn build_genesis_config(
 }
 
 /// Build a genesis entry from a KeysFile and stake amount.
-pub fn entry_from_keys(
-    name: &str,
-    keys: &crate::keygen::KeysFile,
-    stake: u64,
-) -> GenesisEntry {
+pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -> GenesisEntry {
     let entry_name = if keys.name.is_empty() {
         name.to_string()
     } else {
         keys.name.clone()
     };
     GenesisEntry {
-        name:                entry_name,
-        validator_id:        hex::encode(keys.public.validator_id),
+        name: entry_name,
+        validator_id: hex::encode(keys.public.validator_id),
         hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
-        hybrid_pq_pk:        hex::encode(&keys.public.hybrid_pq_pk),
-        bls_pk:              hex::encode(keys.public.bls_pk),
-        vrf_pk:              hex::encode(keys.public.vrf_pk),
+        hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
+        bls_pk: hex::encode(keys.public.bls_pk),
+        vrf_pk: hex::encode(keys.public.vrf_pk),
         stake,
     }
 }
@@ -172,11 +168,13 @@ mod tests {
     use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
     fn test_validators(count: usize) -> Vec<GenesisEntry> {
-        (0..count).map(|i| {
-            let seed = [i as u8 + 1; 32];
-            let keys = generate_keypairs(format!("validator-{i}"), seed, seed, seed).unwrap();
-            entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10)
-        }).collect()
+        (0..count)
+            .map(|i| {
+                let seed = [i as u8 + 1; 32];
+                let keys = generate_keypairs(format!("validator-{i}"), seed, seed, seed).unwrap();
+                entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10)
+            })
+            .collect()
     }
 
     #[test]
@@ -187,16 +185,15 @@ mod tests {
             1_700_000_000,
             1_000_000_000_000_000,
             validators,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(config.validators.len(), 4);
     }
 
     #[test]
     fn too_few_validators_rejected() {
         let validators = test_validators(3);
-        let result = build_genesis_config(
-            "test", 0, 1_000_000_000_000_000, validators,
-        );
+        let result = build_genesis_config("test", 0, 1_000_000_000_000_000, validators);
         assert!(result.is_err());
     }
 
@@ -204,9 +201,7 @@ mod tests {
     fn below_dust_stake_rejected() {
         let mut validators = test_validators(4);
         validators[0].stake = 1; // below DUST_LIMIT_SPARK
-        let result = build_genesis_config(
-            "test", 0, 1_000_000_000_000_000, validators,
-        );
+        let result = build_genesis_config("test", 0, 1_000_000_000_000_000, validators);
         assert!(result.is_err());
     }
 
@@ -214,9 +209,7 @@ mod tests {
     fn duplicate_validator_id_rejected() {
         let mut validators = test_validators(4);
         validators[1].validator_id = validators[0].validator_id.clone();
-        let result = build_genesis_config(
-            "test", 0, 1_000_000_000_000_000, validators,
-        );
+        let result = build_genesis_config("test", 0, 1_000_000_000_000_000, validators);
         assert!(result.is_err());
     }
 
@@ -224,8 +217,12 @@ mod tests {
     fn toml_output_has_all_fields() {
         let validators = test_validators(4);
         let config = build_genesis_config(
-            "indra-testnet-1", 1_700_000_000, 1_000_000_000_000_000, validators,
-        ).unwrap();
+            "indra-testnet-1",
+            1_700_000_000,
+            1_000_000_000_000_000,
+            validators,
+        )
+        .unwrap();
         let toml = config.to_toml();
         assert!(toml.contains("[genesis]"));
         assert!(toml.contains("[[validators]]"));

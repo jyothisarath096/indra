@@ -19,13 +19,16 @@ const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let get = |flag: &str| -> Option<String> {
-        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
 
-    let keys_path   = get("--keys").unwrap_or_else(|| "keys.json".to_string());
+    let keys_path = get("--keys").unwrap_or_else(|| "keys.json".to_string());
     let wallet_path = get("--wallet").unwrap_or_else(|| "wallet.json".to_string());
-    let node_url    = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let add_utxo    = get("--add-utxo"); // manual: --add-utxo <utxo_id>:<value>:<blinding>
+    let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let add_utxo = get("--add-utxo"); // manual: --add-utxo <utxo_id>:<value>:<blinding>
 
     println!("INDRA Wallet Scanner");
     println!("─────────────────────────────────────────");
@@ -85,12 +88,12 @@ fn main() {
             std::process::exit(1);
         }
 
-        let height: u64  = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let tx_idx: u32  = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let height: u64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let tx_idx: u32 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         let out_idx: u32 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        let mut id_arr  = [0u8; 32];
-        let mut bl_arr  = [0u8; 32];
+        let mut id_arr = [0u8; 32];
+        let mut bl_arr = [0u8; 32];
         id_arr.copy_from_slice(&utxo_id_bytes);
         bl_arr.copy_from_slice(&blinding_bytes);
 
@@ -199,19 +202,21 @@ fn http_post(url: &str, body: &str) -> Result<String, String> {
         (url, "/")
     };
 
-    let mut stream = TcpStream::connect(host)
-        .map_err(|e| format!("cannot connect to {}: {}", host, e))?;
+    let mut stream =
+        TcpStream::connect(host).map_err(|e| format!("cannot connect to {}: {}", host, e))?;
 
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path, host, body.len(), body
     );
 
-    stream.write_all(request.as_bytes())
+    stream
+        .write_all(request.as_bytes())
         .map_err(|e| format!("write error: {}", e))?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)
+    stream
+        .read_to_string(&mut response)
         .map_err(|e| format!("read error: {}", e))?;
 
     if let Some(pos) = response.find("\r\n\r\n") {
@@ -303,11 +308,14 @@ fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
     let key = format!("\"{}\":", field);
     let pos = match json.find(&key) {
         Some(p) => p,
-        None => { eprintln!("Field '{}' not found in keys.json", field); std::process::exit(1); }
+        None => {
+            eprintln!("Field '{}' not found in keys.json", field);
+            std::process::exit(1);
+        }
     };
     let after = &json[pos + key.len()..];
     let start = after.find('"').unwrap_or(0) + 1;
-    let end   = after[start..].find('"').unwrap_or(0) + start;
+    let end = after[start..].find('"').unwrap_or(0) + start;
     let bytes = hex::decode(&after[start..end]).unwrap_or_else(|_| {
         eprintln!("Invalid hex for '{}'", field);
         std::process::exit(1);

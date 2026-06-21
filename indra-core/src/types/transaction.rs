@@ -9,15 +9,14 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    codec::{Encode, Decode, ByteReader, encode_list, decode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        primitives::{
-            Bytes32, ProtocolVersion, VariableBytes,
-            DUST_LIMIT_SPARK, MAX_CHAIN_ID_BYTES, MAX_INPUTS, MAX_OUTPUTS,
-            MAX_RANGE_PROOF_BYTES,
-        },
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
+        primitives::{
+            Bytes32, ProtocolVersion, VariableBytes, DUST_LIMIT_SPARK, MAX_CHAIN_ID_BYTES,
+            MAX_INPUTS, MAX_OUTPUTS, MAX_RANGE_PROOF_BYTES,
+        },
     },
 };
 use indra_crypto::sha256;
@@ -39,12 +38,17 @@ impl Encode for InputV1 {
         self.utxo_id.encode(buf);
         self.nullifier.encode(buf);
     }
-    fn encoded_len(&self) -> usize { 64 }
+    fn encoded_len(&self) -> usize {
+        64
+    }
 }
 
 impl Decode for InputV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        Ok(Self { utxo_id: Bytes32::decode(r)?, nullifier: Bytes32::decode(r)? })
+        Ok(Self {
+            utxo_id: Bytes32::decode(r)?,
+            nullifier: Bytes32::decode(r)?,
+        })
     }
 }
 
@@ -57,7 +61,7 @@ pub struct OutputV1 {
     /// implementation while commitments/range proofs still bind the value.
     pub value_spark: u64,
     /// Pedersen commitment to the output value.
-    pub commitment:  CommitmentV1,
+    pub commitment: CommitmentV1,
     /// Owner's hybrid public key (required to spend this output).
     pub owner_pubkey: HybridPubKey,
     /// Bulletproof range proof: value ∈ [DUST_LIMIT, 2^64).
@@ -75,8 +79,7 @@ impl Encode for OutputV1 {
         self.lock_height.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        8
-            + self.commitment.encoded_len()
+        8 + self.commitment.encoded_len()
             + self.owner_pubkey.encoded_len()
             + self.range_proof.encoded_len()
             + 8
@@ -87,7 +90,7 @@ impl Decode for OutputV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
             value_spark: u64::decode(r)?,
-            commitment:  CommitmentV1::decode(r)?,
+            commitment: CommitmentV1::decode(r)?,
             owner_pubkey: HybridPubKey::decode(r)?,
             range_proof: VariableBytes::decode(r)?,
             lock_height: u64::decode(r)?,
@@ -125,16 +128,24 @@ pub struct TransactionV1 {
 impl TransactionV1 {
     /// Validate structural rules (does NOT verify crypto).
     pub fn validate_structure(&self) -> IndraResult<()> {
-        if self.inputs.is_empty()  { return Err(IndraError::ZeroInputs);  }
-        if self.outputs.is_empty() { return Err(IndraError::ZeroOutputs); }
+        if self.inputs.is_empty() {
+            return Err(IndraError::ZeroInputs);
+        }
+        if self.outputs.is_empty() {
+            return Err(IndraError::ZeroOutputs);
+        }
         if self.inputs.len() > MAX_INPUTS {
             return Err(IndraError::LengthExceeded {
-                field: "inputs", max: MAX_INPUTS, actual: self.inputs.len(),
+                field: "inputs",
+                max: MAX_INPUTS,
+                actual: self.inputs.len(),
             });
         }
         if self.outputs.len() > MAX_OUTPUTS {
             return Err(IndraError::LengthExceeded {
-                field: "outputs", max: MAX_OUTPUTS, actual: self.outputs.len(),
+                field: "outputs",
+                max: MAX_OUTPUTS,
+                actual: self.outputs.len(),
             });
         }
         for output in &self.outputs {
@@ -166,7 +177,8 @@ impl TransactionV1 {
         let required = base_fee_spark_per_kb.saturating_mul(self.weight_kb());
         if self.fee_amount < required {
             return Err(IndraError::FeeTooLow {
-                actual: self.fee_amount, minimum: required,
+                actual: self.fee_amount,
+                minimum: required,
             });
         }
         Ok(())
@@ -209,7 +221,8 @@ impl Encode for TransactionV1 {
         2 + 2
             + list_encoded_len(&self.inputs)
             + list_encoded_len(&self.outputs)
-            + 8 + 32
+            + 8
+            + 32
             + self.fee_commitment.encoded_len()
             + self.signature.encoded_len()
     }
@@ -218,14 +231,14 @@ impl Encode for TransactionV1 {
 impl Decode for TransactionV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
-            version:              ProtocolVersion::decode(r)?,
-            signature_module_id:  u16::decode(r)?,
-            inputs:               decode_list(r, MAX_INPUTS, "inputs")?,
-            outputs:              decode_list(r, MAX_OUTPUTS, "outputs")?,
-            fee_amount:           u64::decode(r)?,
-            fee_blinding:         Bytes32::decode(r)?,
-            fee_commitment:       CommitmentV1::decode(r)?,
-            signature:            HybridSignature::decode(r)?,
+            version: ProtocolVersion::decode(r)?,
+            signature_module_id: u16::decode(r)?,
+            inputs: decode_list(r, MAX_INPUTS, "inputs")?,
+            outputs: decode_list(r, MAX_OUTPUTS, "outputs")?,
+            fee_amount: u64::decode(r)?,
+            fee_blinding: Bytes32::decode(r)?,
+            fee_commitment: CommitmentV1::decode(r)?,
+            signature: HybridSignature::decode(r)?,
         })
     }
 }
@@ -245,36 +258,43 @@ mod tests {
     fn dummy_sig() -> HybridSignature {
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-            pq_sig:        VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         }
     }
 
     fn minimal_tx() -> TransactionV1 {
         TransactionV1 {
-            version:             ProtocolVersion::CURRENT,
+            version: ProtocolVersion::CURRENT,
             signature_module_id: 1,
-            inputs:  vec![InputV1 {
-                utxo_id:   Bytes32::from([0x01u8; 32]),
+            inputs: vec![InputV1 {
+                utxo_id: Bytes32::from([0x01u8; 32]),
                 nullifier: Bytes32::from([0x02u8; 32]),
             }],
             outputs: vec![OutputV1 {
                 value_spark: 100_000,
-                commitment:   CommitmentV1 { compressed_point: Bytes32::from([0x03u8; 32]) },
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::from([0x03u8; 32]),
+                },
                 owner_pubkey: dummy_pubkey(),
-                range_proof:  VariableBytes::from_slice(&[0u8; 674]).unwrap(),
-                lock_height:  0,
+                range_proof: VariableBytes::from_slice(&[0u8; 674]).unwrap(),
+                lock_height: 0,
             }],
-            fee_amount:     500,
-            fee_blinding:   Bytes32::ZERO,
-            fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
-            signature:      dummy_sig(),
+            fee_amount: 500,
+            fee_blinding: Bytes32::ZERO,
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::ZERO,
+            },
+            signature: dummy_sig(),
         }
     }
 
     #[test]
     fn tx_round_trip() {
         let tx = minimal_tx();
-        assert_eq!(tx, TransactionV1::decode_exact(&tx.encode_to_vec()).unwrap());
+        assert_eq!(
+            tx,
+            TransactionV1::decode_exact(&tx.encode_to_vec()).unwrap()
+        );
     }
 
     #[test]

@@ -5,10 +5,7 @@ use std::time::Duration;
 use indra_consensus::mempool::{Mempool, MempoolConfig};
 use indra_core::types::primitives::INITIAL_BASE_FEE_SPARK_PER_KB;
 
-use crate::{
-    fixtures::dummy_tx,
-    timer::bench,
-};
+use crate::{fixtures::dummy_tx, timer::bench};
 
 /// Benchmark submitting a single transaction to the mempool.
 pub fn bench_mempool_submit(iterations: u64) {

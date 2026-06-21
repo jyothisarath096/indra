@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use indra_core::types::primitives::Bytes32;
 use indra_network::{
-    message::Message,
-    peer::{PeerTable, PeerStatus, ScoreEvent, INITIAL_SCORE},
-    transport::{RecvStatus, Transport},
     gossip::GossipEngine,
+    message::Message,
+    peer::{PeerStatus, PeerTable, ScoreEvent, INITIAL_SCORE},
+    transport::{RecvStatus, Transport},
 };
 
 #[test]
@@ -17,11 +17,20 @@ fn message_encode_decode_all_types() {
     let messages = vec![
         Message::Ping(999),
         Message::Pong(999),
-        Message::RequestBlocks { from_height: 0, to_height: 100 },
-        Message::Status { height: 42, tip_hash: Bytes32::from([0xAAu8; 32]) },
+        Message::RequestBlocks {
+            from_height: 0,
+            to_height: 100,
+        },
+        Message::Status {
+            height: 42,
+            tip_hash: Bytes32::from([0xAAu8; 32]),
+        },
         Message::PeerList(vec!["127.0.0.1:30303".to_string()]),
         Message::RequestQC { height: 42 },
-        Message::QCResponse { height: 42, qc_bytes: vec![1, 2, 3] },
+        Message::QCResponse {
+            height: 42,
+            qc_bytes: vec![1, 2, 3],
+        },
     ];
 
     for msg in messages {
@@ -124,7 +133,8 @@ fn two_nodes_exchange_status() {
     conn.send(&Message::Status {
         height: 50,
         tip_hash: Bytes32::from([0xAAu8; 32]),
-    }).unwrap();
+    })
+    .unwrap();
 
     let received_by_server = handle.join().unwrap();
     match received_by_server {

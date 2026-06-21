@@ -3,11 +3,8 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use chacha20poly1305::{
-    ChaCha20Poly1305,
-    Key,
-    KeyInit,
-    Nonce,
     aead::{Aead, Payload},
+    ChaCha20Poly1305, Key, KeyInit, Nonce,
 };
 
 use crate::{
@@ -36,7 +33,13 @@ pub(crate) fn encrypt_with_aad(
 ) -> NetworkResult<Vec<u8>> {
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher_from_key(key)
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| NetworkError::InvalidFrame {
             reason: "encryption failed".to_string(),
         })
@@ -50,7 +53,13 @@ pub(crate) fn decrypt_with_aad(
 ) -> NetworkResult<Vec<u8>> {
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher_from_key(key)
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| NetworkError::InvalidFrame {
             reason: "authentication failed".to_string(),
         })
@@ -141,13 +150,11 @@ where
 
         let mut nonce_bytes = [0u8; 12];
         self.stream.read_exact(&mut nonce_bytes).await?;
-        let got_nonce = u64::from_le_bytes(
-            nonce_bytes[4..]
-                .try_into()
-                .map_err(|_| NetworkError::InvalidFrame {
-                    reason: "invalid nonce bytes".to_string(),
-                })?,
-        );
+        let got_nonce = u64::from_le_bytes(nonce_bytes[4..].try_into().map_err(|_| {
+            NetworkError::InvalidFrame {
+                reason: "invalid nonce bytes".to_string(),
+            }
+        })?);
         if got_nonce != self.nonce_counter {
             return Err(NetworkError::UnexpectedNonce {
                 expected: self.nonce_counter,
@@ -155,12 +162,13 @@ where
             });
         }
 
-        let ciphertext_len = plaintext_len
-            .checked_add(TAG_LEN)
-            .ok_or(NetworkError::MessageTooLarge {
-                size: usize::MAX,
-                max: MAX_MSG_BYTES,
-            })?;
+        let ciphertext_len =
+            plaintext_len
+                .checked_add(TAG_LEN)
+                .ok_or(NetworkError::MessageTooLarge {
+                    size: usize::MAX,
+                    max: MAX_MSG_BYTES,
+                })?;
         let mut ciphertext = vec![0u8; ciphertext_len];
         self.stream.read_exact(&mut ciphertext).await?;
 
@@ -178,9 +186,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
-    use super::{FrameReader, FrameWriter, decrypt_with_aad, encrypt_with_aad};
+    use super::{decrypt_with_aad, encrypt_with_aad, FrameReader, FrameWriter};
     use crate::{error::NetworkError, message::MAX_MSG_BYTES};
 
     #[tokio::test]
@@ -225,8 +233,14 @@ mod tests {
         reader_stream.read_to_end(&mut raw).await.unwrap();
 
         let (mut replay_tx, replay_rx) = duplex(4096);
-        replay_tx.write_all(&raw[..(4 + 12 + 3 + 16)]).await.unwrap();
-        replay_tx.write_all(&raw[..(4 + 12 + 3 + 16)]).await.unwrap();
+        replay_tx
+            .write_all(&raw[..(4 + 12 + 3 + 16)])
+            .await
+            .unwrap();
+        replay_tx
+            .write_all(&raw[..(4 + 12 + 3 + 16)])
+            .await
+            .unwrap();
         replay_tx.shutdown().await.unwrap();
 
         let mut reader = FrameReader::new(replay_rx, key);

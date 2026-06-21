@@ -56,10 +56,10 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)] // benchmarks don't need doc comments
 
-pub mod timer;
-pub mod fixtures;
-pub mod crypto_bench;
 pub mod codec_bench;
-pub mod state_bench;
+pub mod crypto_bench;
+pub mod fixtures;
 pub mod mempool_bench;
+pub mod state_bench;
 pub mod storage_bench;
+pub mod timer;

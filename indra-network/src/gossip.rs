@@ -104,10 +104,10 @@ pub enum GossipEvent {
 
 /// The gossip engine.
 pub struct GossipEngine {
-    peers:        PeerTable,
-    connections:  HashMap<SocketAddr, PeerConnection>,
-    seen_msgs:    VecDeque<[u8; 32]>,
-    seen_set:     HashSet<[u8; 32]>,
+    peers: PeerTable,
+    connections: HashMap<SocketAddr, PeerConnection>,
+    seen_msgs: VecDeque<[u8; 32]>,
+    seen_set: HashSet<[u8; 32]>,
 }
 
 struct PeerConnection {
@@ -146,10 +146,10 @@ impl GossipEngine {
     /// Create a new gossip engine with an empty peer table.
     pub fn new() -> Self {
         Self {
-            peers:       PeerTable::new(),
+            peers: PeerTable::new(),
             connections: HashMap::new(),
-            seen_msgs:   VecDeque::with_capacity(SEEN_CACHE_SIZE),
-            seen_set:    HashSet::new(),
+            seen_msgs: VecDeque::with_capacity(SEEN_CACHE_SIZE),
+            seen_set: HashSet::new(),
         }
     }
 
@@ -194,7 +194,8 @@ impl GossipEngine {
         let targets: Vec<SocketAddr> = {
             let mut connected = self.peers.connected();
             connected.sort_by(|a, b| b.score.cmp(&a.score));
-            connected.iter()
+            connected
+                .iter()
                 .take(MAX_GOSSIP_FANOUT)
                 .map(|p| p.addr)
                 .collect()
@@ -222,8 +223,7 @@ impl GossipEngine {
     /// Send a message to one specific peer.
     pub fn send_to(&mut self, addr: &SocketAddr, msg: &Message) -> NetworkResult<()> {
         let wire = msg.encode_wire()?;
-        let conn = self.connections.get(addr)
-            .ok_or(NetworkError::NoPeers)?;
+        let conn = self.connections.get(addr).ok_or(NetworkError::NoPeers)?;
         if conn.sender.send(wire) {
             Ok(())
         } else {
@@ -393,10 +393,14 @@ mod tests {
         assert_eq!(accepted_a.remote_addr.ip(), accepted_b.remote_addr.ip());
 
         let mut engine = GossipEngine::new();
-        engine.add_connection(accepted_a.remote_addr, accepted_a).unwrap();
+        engine
+            .add_connection(accepted_a.remote_addr, accepted_a)
+            .unwrap();
         assert!(engine.is_connected_ip(&accepted_b.remote_addr));
 
-        engine.add_connection(accepted_b.remote_addr, accepted_b).unwrap();
+        engine
+            .add_connection(accepted_b.remote_addr, accepted_b)
+            .unwrap();
         assert_eq!(engine.connection_count(), 1);
 
         let _ = outbound_a.close();

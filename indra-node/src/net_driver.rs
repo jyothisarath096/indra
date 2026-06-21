@@ -25,13 +25,17 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
             };
             Some(DriverEvent::InboundTx { from, tx_bytes })
         }
-        Message::Status { height, tip_hash } => {
-            Some(DriverEvent::PeerStatus { from, height, tip_hash })
-        }
+        Message::Status { height, tip_hash } => Some(DriverEvent::PeerStatus {
+            from,
+            height,
+            tip_hash,
+        }),
         Message::RequestQC { height } => Some(DriverEvent::QcRequest { from, height }),
-        Message::QCResponse { height, qc_bytes } => {
-            Some(DriverEvent::QcResponse { from, height, qc_bytes })
-        }
+        Message::QCResponse { height, qc_bytes } => Some(DriverEvent::QcResponse {
+            from,
+            height,
+            qc_bytes,
+        }),
         _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse, RequestProposal handled elsewhere
     }
 }
@@ -40,9 +44,9 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
 pub fn action_to_message(action: &DriverAction) -> Option<Message> {
     match action {
         DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
-        DriverAction::BroadcastVote(vote)   => Some(Message::Vote(vote.clone())),
-        DriverAction::BroadcastTx(tx)       => Some(Message::Tx(tx.clone())),
-        DriverAction::RequestQC { .. }      => None,
+        DriverAction::BroadcastVote(vote) => Some(Message::Vote(vote.clone())),
+        DriverAction::BroadcastTx(tx) => Some(Message::Tx(tx.clone())),
+        DriverAction::RequestQC { .. } => None,
         _ => None,
     }
 }

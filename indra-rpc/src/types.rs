@@ -61,16 +61,13 @@ impl RpcResponse {
     pub fn to_json(&self) -> String {
         let id_str = match &self.id {
             JsonId::Number(n) => n.to_string(),
-            JsonId::Str(s)    => format!("\"{}\"", s),
-            JsonId::Null      => "null".to_string(),
+            JsonId::Str(s) => format!("\"{}\"", s),
+            JsonId::Null => "null".to_string(),
         };
 
         match &self.body {
             ResponseBody::Result(result) => {
-                format!(
-                    r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#,
-                    result, id_str
-                )
+                format!(r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#, result, id_str)
             }
             ResponseBody::Error(err) => {
                 format!(
@@ -109,12 +106,11 @@ pub fn parse_request(json: &str) -> Result<RpcRequest, String> {
     let json = json.trim();
 
     // Extract method
-    let method = extract_string_field(json, "method")
-        .ok_or_else(|| "missing 'method' field".to_string())?;
+    let method =
+        extract_string_field(json, "method").ok_or_else(|| "missing 'method' field".to_string())?;
 
     // Extract jsonrpc
-    let jsonrpc = extract_string_field(json, "jsonrpc")
-        .unwrap_or_else(|| "2.0".to_string());
+    let jsonrpc = extract_string_field(json, "jsonrpc").unwrap_or_else(|| "2.0".to_string());
 
     // Extract id
     let id = extract_id(json);
@@ -122,7 +118,12 @@ pub fn parse_request(json: &str) -> Result<RpcRequest, String> {
     // Extract params array (simplified: extract as individual string tokens)
     let params = extract_params(json);
 
-    Ok(RpcRequest { jsonrpc, method, params, id })
+    Ok(RpcRequest {
+        jsonrpc,
+        method,
+        params,
+        id,
+    })
 }
 
 /// Extract a string field value from a JSON object.
@@ -164,7 +165,8 @@ fn extract_id(json: &str) -> JsonId {
         return JsonId::Null;
     } else {
         // Try to parse as number
-        let num_str: String = after_colon.chars()
+        let num_str: String = after_colon
+            .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '-')
             .collect();
         if let Ok(n) = num_str.parse::<i64>() {
@@ -227,8 +229,14 @@ fn extract_params(json: &str) -> Vec<String> {
                 in_string = !in_string;
                 current.push(c);
             }
-            '[' | '{' if !in_string => { depth += 1; current.push(c); }
-            ']' | '}' if !in_string => { depth -= 1; current.push(c); }
+            '[' | '{' if !in_string => {
+                depth += 1;
+                current.push(c);
+            }
+            ']' | '}' if !in_string => {
+                depth -= 1;
+                current.push(c);
+            }
             ',' if !in_string && depth == 0 => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
@@ -236,7 +244,9 @@ fn extract_params(json: &str) -> Vec<String> {
                 }
                 current.clear();
             }
-            _ => { current.push(c); }
+            _ => {
+                current.push(c);
+            }
         }
         prev_char = c;
     }
@@ -252,7 +262,7 @@ fn extract_params(json: &str) -> Vec<String> {
 pub fn unquote(s: &str) -> &str {
     let s = s.trim();
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        &s[1..s.len()-1]
+        &s[1..s.len() - 1]
     } else {
         s
     }

@@ -34,22 +34,18 @@
 #![deny(clippy::panic)]
 
 pub mod error;
-pub mod keygen;
 pub mod genesis_cmd;
+pub mod keygen;
 pub mod query;
-pub mod wallet;
 pub mod tx_builder;
+pub mod wallet;
 
 pub use error::{CliError, CliResult};
+pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
 pub use keygen::{
-    KeysFile,
-    ValidatorKeys,
-    generate_from_new_mnemonic,
-    generate_from_passphrase,
-    generate_keypairs,
-    recover_from_mnemonic,
+    generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs, recover_from_mnemonic,
+    KeysFile, ValidatorKeys,
 };
-pub use genesis_cmd::{GenesisEntry, build_genesis_config, GenesisConfig};
 pub use query::{rpc_call, QueryResult};
+pub use tx_builder::{build_transaction, BuiltTransaction, TxParams};
 pub use wallet::{PendingChange, Wallet, WalletEntry};
-pub use tx_builder::{build_transaction, TxParams, BuiltTransaction};

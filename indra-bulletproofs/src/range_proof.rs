@@ -2,16 +2,16 @@
 
 use alloc::{vec, vec::Vec};
 
+use crate::{
+    errors::{BulletproofError, BulletproofResult},
+    generators::{g_vec, generator_g, generator_h, h_vec, RANGE_BITS},
+    inner_product::{self, InnerProductProof},
+    transcript::Transcript,
+};
 use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
     traits::MultiscalarMul,
-};
-use crate::{
-    errors::{BulletproofError, BulletproofResult},
-    generators::{RANGE_BITS, g_vec, generator_g, generator_h, h_vec},
-    inner_product::{self, InnerProductProof},
-    transcript::Transcript,
 };
 
 /// The serialized byte length of one range proof.
@@ -89,10 +89,15 @@ impl RangeProof {
         let tau_x = read_scalar(&mut offset)?;
         let mu = read_scalar(&mut offset)?;
         let tx = read_scalar(&mut offset)?;
-        let ipa = InnerProductProof::from_bytes(&bytes[offset..offset + InnerProductProof::serialized_len(RANGE_BITS)], RANGE_BITS)?;
+        let ipa = InnerProductProof::from_bytes(
+            &bytes[offset..offset + InnerProductProof::serialized_len(RANGE_BITS)],
+            RANGE_BITS,
+        )?;
         offset += InnerProductProof::serialized_len(RANGE_BITS);
         if bytes[offset..offset + 2] != [0u8; 2] {
-            return Err(BulletproofError::InvalidEncoding("bad proof trailer".into()));
+            return Err(BulletproofError::InvalidEncoding(
+                "bad proof trailer".into(),
+            ));
         }
 
         Ok(Self {
@@ -217,11 +222,7 @@ pub fn prove<R: rand_core::RngCore + rand_core::CryptoRng>(
             .zip(r_0.iter())
             .map(|(li, ri)| *li * *ri)
             .sum::<Scalar>();
-    let t2_val: Scalar = l_1
-        .iter()
-        .zip(r_1.iter())
-        .map(|(li, ri)| *li * *ri)
-        .sum();
+    let t2_val: Scalar = l_1.iter().zip(r_1.iter()).map(|(li, ri)| *li * *ri).sum();
 
     let tau1 = Scalar::random(rng);
     let tau2 = Scalar::random(rng);
@@ -242,11 +243,7 @@ pub fn prove<R: rand_core::RngCore + rand_core::CryptoRng>(
         .zip(r_1.iter())
         .map(|(r0, r1)| *r0 + *r1 * x)
         .collect();
-    let tx_val: Scalar = l_x
-        .iter()
-        .zip(r_x.iter())
-        .map(|(li, ri)| *li * *ri)
-        .sum();
+    let tx_val: Scalar = l_x.iter().zip(r_x.iter()).map(|(li, ri)| *li * *ri).sum();
 
     let tau_x = tau2 * x * x + tau1 * x + z_sq * gamma;
     let mu = alpha + rho * x;
@@ -358,7 +355,10 @@ pub fn verify(commitment_bytes: &[u8; 32], proof_bytes: &[u8]) -> BulletproofRes
         .ok_or_else(|| BulletproofError::InvalidEncoding("bad T2".into()))?;
 
     let lhs = RistrettoPoint::multiscalar_mul([proof.tx, proof.tau_x], [g, h]);
-    let rhs = RistrettoPoint::multiscalar_mul([z_sq, delta, x, x * x], [commitment, g, t1_point, t2_point]);
+    let rhs = RistrettoPoint::multiscalar_mul(
+        [z_sq, delta, x, x * x],
+        [commitment, g, t1_point, t2_point],
+    );
     if lhs != rhs {
         return Err(BulletproofError::VerificationFailed);
     }

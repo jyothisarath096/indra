@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use indra_core::codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len};
+use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS},
@@ -35,7 +35,9 @@ impl Encode for ValidatorStatus {
         match self {
             Self::Registered => 0u8.encode(buf),
             Self::Active => 1u8.encode(buf),
-            Self::Unbonding { unbonding_end_epoch } => {
+            Self::Unbonding {
+                unbonding_end_epoch,
+            } => {
                 2u8.encode(buf);
                 unbonding_end_epoch.encode(buf);
             }
@@ -88,6 +90,8 @@ pub struct ValidatorEntry {
     pub status: ValidatorStatus,
     /// Epoch in which this validator was registered.
     pub registered_epoch: u64,
+    /// Epoch in which this validator last cast a vote (for liveness tracking).
+    pub last_active_epoch: u64,
     /// Accumulated unclaimed rewards in Spark.
     pub pending_rewards: u64,
     /// Epoch at which pending_rewards was last updated.
@@ -123,6 +127,7 @@ impl Encode for ValidatorEntry {
         self.stake_spark.encode(buf);
         self.status.encode(buf);
         self.registered_epoch.encode(buf);
+        self.last_active_epoch.encode(buf);
         self.pending_rewards.encode(buf);
         self.rewards_last_epoch.encode(buf);
         self.self_report_count.encode(buf);
@@ -131,15 +136,27 @@ impl Encode for ValidatorEntry {
     }
 
     fn encoded_len(&self) -> usize {
-        32
-            + 4 + self.name.len()
-            + 1 + self.hybrid_classical_pk.map(|_| 32).unwrap_or(0)
+        32 + 4
+            + self.name.len()
             + 1
-            + self.hybrid_pq_pk.as_ref().map(|pk| 4 + pk.len()).unwrap_or(0)
-            + 1 + self.vrf_pk.map(|_| 32).unwrap_or(0)
+            + self.hybrid_classical_pk.map(|_| 32).unwrap_or(0)
+            + 1
+            + self
+                .hybrid_pq_pk
+                .as_ref()
+                .map(|pk| 4 + pk.len())
+                .unwrap_or(0)
+            + 1
+            + self.vrf_pk.map(|_| 32).unwrap_or(0)
             + 8
             + self.status.encoded_len()
-            + 8 + 8 + 8 + 4 + 4 + 8
+            + 8
+            + 8
+            + 8
+            + 8
+            + 4
+            + 4
+            + 8
     }
 }
 
@@ -148,14 +165,18 @@ impl Decode for ValidatorEntry {
         let validator_id = Bytes32::decode(r)?;
         let name_len = u32::decode(r)? as usize;
         let name_bytes = r.read_bytes(name_len)?;
-        let name = String::from_utf8(name_bytes.to_vec()).map_err(|_| IndraError::InvariantViolation {
-            message: "invalid UTF-8 validator name in snapshot",
-        })?;
+        let name =
+            String::from_utf8(name_bytes.to_vec()).map_err(|_| IndraError::InvariantViolation {
+                message: "invalid UTF-8 validator name in snapshot",
+            })?;
 
         let hybrid_classical_pk = if bool::decode(r)? {
-            let bytes: [u8; 32] = r.read_bytes(32)?.try_into().map_err(|_| IndraError::InvariantViolation {
-                message: "invalid classical pk length in snapshot",
-            })?;
+            let bytes: [u8; 32] =
+                r.read_bytes(32)?
+                    .try_into()
+                    .map_err(|_| IndraError::InvariantViolation {
+                        message: "invalid classical pk length in snapshot",
+                    })?;
             Some(bytes)
         } else {
             None
@@ -169,9 +190,12 @@ impl Decode for ValidatorEntry {
         };
 
         let vrf_pk = if bool::decode(r)? {
-            let bytes: [u8; 32] = r.read_bytes(32)?.try_into().map_err(|_| IndraError::InvariantViolation {
-                message: "invalid vrf pk length in snapshot",
-            })?;
+            let bytes: [u8; 32] =
+                r.read_bytes(32)?
+                    .try_into()
+                    .map_err(|_| IndraError::InvariantViolation {
+                        message: "invalid vrf pk length in snapshot",
+                    })?;
             Some(bytes)
         } else {
             None
@@ -186,6 +210,7 @@ impl Decode for ValidatorEntry {
             stake_spark: u64::decode(r)?,
             status: ValidatorStatus::decode(r)?,
             registered_epoch: u64::decode(r)?,
+            last_active_epoch: u64::decode(r)?,
             pending_rewards: u64::decode(r)?,
             rewards_last_epoch: u64::decode(r)?,
             self_report_count: u32::decode(r)?,
@@ -234,7 +259,8 @@ impl Encode for ValidatorSet {
 
 impl Decode for ValidatorSet {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let validators: Vec<ValidatorEntry> = decode_list(r, MAX_VALIDATORS, "snapshot.validators")?;
+        let validators: Vec<ValidatorEntry> =
+            decode_list(r, MAX_VALIDATORS, "snapshot.validators")?;
         let mut set = Self::new();
         for validator in validators {
             if set.validators.contains_key(&validator.validator_id) {
@@ -251,7 +277,9 @@ impl Decode for ValidatorSet {
 impl ValidatorSet {
     /// Create an empty validator set.
     pub fn new() -> Self {
-        Self { validators: HashMap::new() }
+        Self {
+            validators: HashMap::new(),
+        }
     }
 
     /// Number of registered validators (active + unbonding).
@@ -266,29 +294,37 @@ impl ValidatorSet {
 
     /// Number of currently active validators.
     pub fn active_count(&self) -> usize {
-        self.validators.values()
-            .filter(|v| v.is_active())
-            .count()
+        self.validators.values().filter(|v| v.is_active()).count()
     }
 
     /// Total stake of all active validators in Spark.
     pub fn total_active_stake(&self) -> u64 {
-        self.validators.values()
+        self.validators
+            .values()
             .filter(|v| v.is_active())
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
 
     /// Total stake of all validators eligible for active-set selection.
     pub fn total_selectable_self_stake(&self) -> u64 {
-        self.validators.values()
-            .filter(|v| matches!(v.status, ValidatorStatus::Active | ValidatorStatus::Registered))
+        self.validators
+            .values()
+            .filter(|v| {
+                matches!(
+                    v.status,
+                    ValidatorStatus::Active | ValidatorStatus::Registered
+                )
+            })
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
 
     /// Stake of the lowest-ranked active validator, if any.
     pub fn effective_min_active_stake(&self, delegations: &DelegationMap) -> Option<u64> {
         self.active_validators()
-            .map(|v| v.stake_spark.saturating_add(delegations.total_delegated(&v.validator_id)))
+            .map(|v| {
+                v.stake_spark
+                    .saturating_add(delegations.total_delegated(&v.validator_id))
+            })
             .min()
     }
 
@@ -306,14 +342,9 @@ impl ValidatorSet {
     ///
     /// Returns an error if adding this validator would exceed MAX_VALIDATORS
     /// and the validator is not already registered.
-    pub fn upsert(
-        &mut self,
-        entry: ValidatorEntry,
-    ) -> crate::error::StateResult<()> {
+    pub fn upsert(&mut self, entry: ValidatorEntry) -> crate::error::StateResult<()> {
         let id = entry.validator_id;
-        if !self.validators.contains_key(&id)
-            && self.validators.len() >= MAX_VALIDATORS
-        {
+        if !self.validators.contains_key(&id) && self.validators.len() >= MAX_VALIDATORS {
             return Err(crate::error::StateError::InvariantViolation {
                 message: "validator set at maximum capacity",
             });
@@ -350,11 +381,17 @@ impl ValidatorSet {
         let mut candidates: Vec<(Bytes32, u64)> = self
             .validators
             .values()
-            .filter(|v| matches!(v.status, ValidatorStatus::Active | ValidatorStatus::Registered))
+            .filter(|v| {
+                matches!(
+                    v.status,
+                    ValidatorStatus::Active | ValidatorStatus::Registered
+                )
+            })
             .map(|v| {
                 (
                     v.validator_id,
-                    v.stake_spark.saturating_add(delegations.total_delegated(&v.validator_id)),
+                    v.stake_spark
+                        .saturating_add(delegations.total_delegated(&v.validator_id)),
                 )
             })
             .collect();
@@ -381,18 +418,19 @@ mod tests {
 
     fn make_validator(id_byte: u8, stake: u64, epoch: u64) -> ValidatorEntry {
         ValidatorEntry {
-            validator_id:     Bytes32::from([id_byte; 32]),
-            name:             format!("validator-{id_byte}"),
+            validator_id: Bytes32::from([id_byte; 32]),
+            name: format!("validator-{id_byte}"),
             hybrid_classical_pk: None,
-            hybrid_pq_pk:    None,
-            vrf_pk:          None,
-            stake_spark:      stake,
-            status:           ValidatorStatus::Active,
+            hybrid_pq_pk: None,
+            vrf_pk: None,
+            stake_spark: stake,
+            status: ValidatorStatus::Active,
             registered_epoch: epoch,
-            pending_rewards:  0,
+            last_active_epoch: epoch,
+            pending_rewards: 0,
             rewards_last_epoch: epoch,
             self_report_count: 0,
-            commission_bps:   1_000,
+            commission_bps: 1_000,
             min_delegation_spark: DUST_LIMIT_SPARK,
         }
     }
@@ -420,7 +458,9 @@ mod tests {
     fn unbonding_validator_not_counted_as_active() {
         let mut vs = ValidatorSet::new();
         let mut v = make_validator(0x01, 5_000, 0);
-        v.status = ValidatorStatus::Unbonding { unbonding_end_epoch: 10 };
+        v.status = ValidatorStatus::Unbonding {
+            unbonding_end_epoch: 10,
+        };
         vs.upsert(v).unwrap();
         assert_eq!(vs.active_count(), 0);
         assert_eq!(vs.total_active_stake(), 0);
@@ -469,9 +509,18 @@ mod tests {
         let delegations = DelegationMap::new();
         vs.select_active_set(&delegations, 0);
 
-        assert!(matches!(vs.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Active));
-        assert!(matches!(vs.get(&Bytes32::from([0x02; 32])).unwrap().status, ValidatorStatus::Active));
-        assert!(matches!(vs.get(&Bytes32::from([0x03; 32])).unwrap().status, ValidatorStatus::Active));
+        assert!(matches!(
+            vs.get(&Bytes32::from([0x01; 32])).unwrap().status,
+            ValidatorStatus::Active
+        ));
+        assert!(matches!(
+            vs.get(&Bytes32::from([0x02; 32])).unwrap().status,
+            ValidatorStatus::Active
+        ));
+        assert!(matches!(
+            vs.get(&Bytes32::from([0x03; 32])).unwrap().status,
+            ValidatorStatus::Active
+        ));
     }
 
     #[test]
@@ -673,16 +722,20 @@ impl Decode for DelegationMap {
 impl DelegationMap {
     /// Create an empty delegation map.
     pub fn new() -> Self {
-        Self { delegators: HashMap::new() }
+        Self {
+            delegators: HashMap::new(),
+        }
     }
 
     /// Total delegated stake for a given validator in Spark.
     pub fn total_delegated(&self, validator_id: &Bytes32) -> u64 {
         self.delegators
             .get(validator_id)
-            .map(|ds| ds.iter()
-                .filter(|d| d.unbonding_end_epoch.is_none())
-                .fold(0u64, |acc, d| acc.saturating_add(d.staked_spark)))
+            .map(|ds| {
+                ds.iter()
+                    .filter(|d| d.unbonding_end_epoch.is_none())
+                    .fold(0u64, |acc, d| acc.saturating_add(d.staked_spark))
+            })
             .unwrap_or(0)
     }
 
@@ -697,7 +750,10 @@ impl DelegationMap {
 
     /// Get all delegators for a validator.
     pub fn get_delegators(&self, validator_id: &Bytes32) -> &[DelegatorEntry] {
-        self.delegators.get(validator_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.delegators
+            .get(validator_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Mutable access to delegators for a validator.
@@ -750,10 +806,12 @@ impl DelegationMap {
         amount_spark: u64,
         unbonding_end_epoch: u64,
     ) -> Result<(), &'static str> {
-        let entries = self.delegators
+        let entries = self
+            .delegators
             .get_mut(validator_id)
             .ok_or("validator has no delegators")?;
-        let entry = entries.iter_mut()
+        let entry = entries
+            .iter_mut()
             .find(|d| &d.delegator_id == delegator_id)
             .ok_or("delegator not found")?;
         if entry.is_unbonding() {
@@ -815,7 +873,8 @@ impl DelegationMap {
             None => return pool, // no delegators — return unspent pool
         };
 
-        let total: u64 = entries.iter()
+        let total: u64 = entries
+            .iter()
             .filter(|d| d.unbonding_end_epoch.is_none())
             .fold(0u64, |acc, d| acc.saturating_add(d.staked_spark));
 
@@ -824,7 +883,10 @@ impl DelegationMap {
         }
 
         let mut distributed: u64 = 0;
-        for entry in entries.iter_mut().filter(|d| d.unbonding_end_epoch.is_none()) {
+        for entry in entries
+            .iter_mut()
+            .filter(|d| d.unbonding_end_epoch.is_none())
+        {
             let reward = pool.saturating_mul(entry.staked_spark) / total;
             entry.pending_rewards = entry.pending_rewards.saturating_add(reward);
             entry.rewards_last_epoch = current_epoch;

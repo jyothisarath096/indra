@@ -24,10 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use indra_core::{
     codec::Encode,
-    types::{
-        primitives::Bytes32,
-        transaction::TransactionV1,
-    },
+    types::{primitives::Bytes32, transaction::TransactionV1},
 };
 use indra_crypto::sha256;
 
@@ -84,13 +81,16 @@ impl MempoolEntry {
 #[derive(Debug, Clone)]
 pub struct Mempool {
     entries: HashMap<Bytes32, MempoolEntry>,
-    config:  MempoolConfig,
+    config: MempoolConfig,
 }
 
 impl Mempool {
     /// Create a new empty mempool with the given configuration.
     pub fn new(config: MempoolConfig) -> Self {
-        Self { entries: HashMap::new(), config }
+        Self {
+            entries: HashMap::new(),
+            config,
+        }
     }
 
     /// Create with default configuration.
@@ -128,9 +128,10 @@ impl Mempool {
         current_base_fee: u64,
         current_height: u64,
     ) -> ConsensusResult<Bytes32> {
-        tx.validate_structure().map_err(|_| {
-            ConsensusError::InvalidTransaction { reason: "transaction structure invalid" }
-        })?;
+        tx.validate_structure()
+            .map_err(|_| ConsensusError::InvalidTransaction {
+                reason: "transaction structure invalid",
+            })?;
 
         let tx_id = Self::tx_id(&tx);
 
@@ -141,10 +142,12 @@ impl Mempool {
 
         // Fee check
         let weight_kb = (tx.encode_to_vec().len() as u64).div_ceil(1024);
-        let fee_rate  = if weight_kb > 0 { tx.fee_amount / weight_kb } else { tx.fee_amount };
-        let min_fee   = current_base_fee
-            .saturating_mul(self.config.min_fee_ratio_bps)
-            / 10_000;
+        let fee_rate = if weight_kb > 0 {
+            tx.fee_amount / weight_kb
+        } else {
+            tx.fee_amount
+        };
+        let min_fee = current_base_fee.saturating_mul(self.config.min_fee_ratio_bps) / 10_000;
         if fee_rate < min_fee {
             return Err(ConsensusError::FeeTooLow);
         }
@@ -152,16 +155,14 @@ impl Mempool {
         // Capacity check — evict lowest-fee tx if full
         if self.entries.len() >= self.config.capacity {
             // Find the tx with the lowest fee rate
-            let min_id = self.entries
+            let min_id = self
+                .entries
                 .iter()
                 .min_by_key(|(_, e)| e.fee_rate)
                 .map(|(id, _)| *id);
 
             if let Some(min_id) = min_id {
-                let min_rate = self.entries
-                    .get(&min_id)
-                    .map(|e| e.fee_rate)
-                    .unwrap_or(0);
+                let min_rate = self.entries.get(&min_id).map(|e| e.fee_rate).unwrap_or(0);
                 if fee_rate > min_rate {
                     self.entries.remove(&min_id);
                 } else {
@@ -172,12 +173,15 @@ impl Mempool {
             }
         }
 
-        self.entries.insert(tx_id, MempoolEntry {
-            tx,
+        self.entries.insert(
             tx_id,
-            arrived_height: current_height,
-            fee_rate,
-        });
+            MempoolEntry {
+                tx,
+                tx_id,
+                arrived_height: current_height,
+                fee_rate,
+            },
+        );
 
         Ok(tx_id)
     }
@@ -191,7 +195,11 @@ impl Mempool {
     /// Called after a block is applied to evict spent transactions.
     pub fn evict_spent(&mut self, nullifiers: &indra_state::NullifierSet) {
         self.entries.retain(|_, entry| {
-            !entry.tx.inputs.iter().any(|i| nullifiers.contains(&i.nullifier))
+            !entry
+                .tx
+                .inputs
+                .iter()
+                .any(|i| nullifiers.contains(&i.nullifier))
         });
     }
 
@@ -205,7 +213,8 @@ impl Mempool {
                 &state.chain_id,
                 &mut block_nullifiers,
                 state.height.saturating_add(1),
-            ).is_ok();
+            )
+            .is_ok();
             if !keep {
                 eprintln!("[mempool] evicting invalid tx {:?}", tx_id);
             }
@@ -218,18 +227,16 @@ impl Mempool {
     /// Returns up to `max_count` transactions, prioritising:
     ///   1. Age-eligible transactions (MUST be included), sorted by fee_rate desc
     ///   2. Remaining transactions sorted by fee_rate desc
-    pub fn select_for_block(
-        &self,
-        max_count: usize,
-        current_height: u64,
-    ) -> Vec<&MempoolEntry> {
-        let mut age_eligible: Vec<&MempoolEntry> = self.entries
+    pub fn select_for_block(&self, max_count: usize, current_height: u64) -> Vec<&MempoolEntry> {
+        let mut age_eligible: Vec<&MempoolEntry> = self
+            .entries
             .values()
             .filter(|e| e.is_age_eligible(current_height))
             .collect();
         age_eligible.sort_by(|a, b| b.fee_rate.cmp(&a.fee_rate));
 
-        let mut remaining: Vec<&MempoolEntry> = self.entries
+        let mut remaining: Vec<&MempoolEntry> = self
+            .entries
             .values()
             .filter(|e| !e.is_age_eligible(current_height))
             .collect();
@@ -263,12 +270,12 @@ impl Mempool {
 mod tests {
     use super::*;
     use indra_core::{
-        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
         types::{
             crypto::HybridSignature,
             primitives::DUST_LIMIT_SPARK,
             transaction::{InputV1, OutputV1, TransactionV1},
         },
+        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
     };
 
     fn dummy_tx(fee: u64, nullifier_byte: u8) -> TransactionV1 {
@@ -276,25 +283,29 @@ mod tests {
             version: ProtocolVersion::CURRENT,
             signature_module_id: 1,
             inputs: vec![InputV1 {
-                utxo_id:   Bytes32::from([nullifier_byte; 32]),
+                utxo_id: Bytes32::from([nullifier_byte; 32]),
                 nullifier: Bytes32::from([nullifier_byte; 32]),
             }],
             outputs: vec![OutputV1 {
                 value_spark: DUST_LIMIT_SPARK,
-                commitment:   CommitmentV1 { compressed_point: Bytes32::ZERO },
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::ZERO,
+                },
                 owner_pubkey: HybridPubKey {
                     classical_pk: Bytes32::ZERO,
                     pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 },
-                range_proof:  VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                lock_height:  0,
+                range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                lock_height: 0,
             }],
-            fee_amount:     fee,
-            fee_blinding:   Bytes32::ZERO,
-            fee_commitment: CommitmentV1 { compressed_point: Bytes32::ZERO },
+            fee_amount: fee,
+            fee_blinding: Bytes32::ZERO,
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::ZERO,
+            },
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-                pq_sig:        VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
         }
     }
@@ -313,7 +324,10 @@ mod tests {
         let mut mp = Mempool::default_config();
         let tx = dummy_tx(10_000, 0x01);
         mp.submit(tx.clone(), 100, 1).unwrap();
-        assert_eq!(mp.submit(tx, 100, 1), Err(ConsensusError::DuplicateTransaction));
+        assert_eq!(
+            mp.submit(tx, 100, 1),
+            Err(ConsensusError::DuplicateTransaction)
+        );
     }
 
     #[test]
@@ -359,7 +373,10 @@ mod tests {
 
     #[test]
     fn high_fee_displaces_low_fee_when_full() {
-        let config = MempoolConfig { capacity: 2, min_fee_ratio_bps: 10_000 };
+        let config = MempoolConfig {
+            capacity: 2,
+            min_fee_ratio_bps: 10_000,
+        };
         let mut mp = Mempool::new(config);
         mp.submit(dummy_tx(1_000, 0x01), 100, 1).unwrap();
         mp.submit(dummy_tx(2_000, 0x02), 100, 1).unwrap();

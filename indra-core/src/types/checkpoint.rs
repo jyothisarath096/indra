@@ -4,11 +4,11 @@
 //! Must carry hybrid signatures representing ≥ 2/3 stake.
 
 use crate::{
-    codec::{Encode, Decode, ByteReader, encode_list, decode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::IndraResult,
     types::{
-        primitives::{Bytes32, MAX_VALIDATORS},
         crypto::HybridSignature,
+        primitives::{Bytes32, MAX_VALIDATORS},
     },
 };
 
@@ -18,7 +18,7 @@ pub struct CheckpointSig {
     /// Validator ID.
     pub validator_id: Bytes32,
     /// Hybrid signature over the checkpoint content hash.
-    pub signature:    HybridSignature,
+    pub signature: HybridSignature,
 }
 
 impl Encode for CheckpointSig {
@@ -26,12 +26,17 @@ impl Encode for CheckpointSig {
         self.validator_id.encode(buf);
         self.signature.encode(buf);
     }
-    fn encoded_len(&self) -> usize { 32 + self.signature.encoded_len() }
+    fn encoded_len(&self) -> usize {
+        32 + self.signature.encoded_len()
+    }
 }
 
 impl Decode for CheckpointSig {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        Ok(Self { validator_id: Bytes32::decode(r)?, signature: HybridSignature::decode(r)? })
+        Ok(Self {
+            validator_id: Bytes32::decode(r)?,
+            signature: HybridSignature::decode(r)?,
+        })
     }
 }
 
@@ -39,15 +44,15 @@ impl Decode for CheckpointSig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointV1 {
     /// Height at which this checkpoint was taken.
-    pub height:             u64,
+    pub height: u64,
     /// Finalised block hash at this height.
-    pub block_hash:         Bytes32,
+    pub block_hash: Bytes32,
     /// State trie root at this height.
-    pub state_root:         Bytes32,
+    pub state_root: Bytes32,
     /// Validator set root at this height.
     pub validator_set_root: Bytes32,
     /// Hybrid signatures from validators representing ≥ 2/3 stake.
-    pub signatures:         Vec<CheckpointSig>,
+    pub signatures: Vec<CheckpointSig>,
 }
 
 impl Encode for CheckpointV1 {
@@ -66,11 +71,11 @@ impl Encode for CheckpointV1 {
 impl Decode for CheckpointV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
-            height:             u64::decode(r)?,
-            block_hash:         Bytes32::decode(r)?,
-            state_root:         Bytes32::decode(r)?,
+            height: u64::decode(r)?,
+            block_hash: Bytes32::decode(r)?,
+            state_root: Bytes32::decode(r)?,
             validator_set_root: Bytes32::decode(r)?,
-            signatures:         decode_list(r, MAX_VALIDATORS, "checkpoint_sigs")?,
+            signatures: decode_list(r, MAX_VALIDATORS, "checkpoint_sigs")?,
         })
     }
 }
@@ -83,11 +88,11 @@ mod tests {
     #[test]
     fn empty_checkpoint_round_trip() {
         let cp = CheckpointV1 {
-            height:             100_000,
-            block_hash:         Bytes32::from([0xFFu8; 32]),
-            state_root:         Bytes32::from([0xEEu8; 32]),
+            height: 100_000,
+            block_hash: Bytes32::from([0xFFu8; 32]),
+            state_root: Bytes32::from([0xEEu8; 32]),
             validator_set_root: Bytes32::from([0xDDu8; 32]),
-            signatures:         vec![],
+            signatures: vec![],
         };
         assert_eq!(cp, CheckpointV1::decode_exact(&cp.encode_to_vec()).unwrap());
     }

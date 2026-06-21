@@ -2,12 +2,9 @@
 
 use std::time::Duration;
 
-use indra_core::codec::{Decode, Encode, ByteReader};
+use indra_core::codec::{ByteReader, Decode, Encode};
 
-use crate::{
-    fixtures::dummy_tx,
-    timer::bench,
-};
+use crate::{fixtures::dummy_tx, timer::bench};
 
 /// Benchmark transaction encode.
 pub fn bench_tx_encode(iterations: u64) {

@@ -21,11 +21,14 @@ use indra_consensus::{
     qc::QcValidator,
     vote::{produce_vote, RegisteredVoter},
 };
+use indra_core::codec::Decode;
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     primitives::{
-        Bytes32, VariableBytes, MAX_QC_SIZE_BYTES, MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+        Bytes32, VariableBytes, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+        MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
+    slashing::SlashEvidenceV1,
     staking::StakingOp,
     vote::VoteStep,
 };
@@ -33,7 +36,7 @@ use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
 };
-use indra_state::ChainState;
+use indra_state::{apply::compute_slash_evidence_hash, ChainState};
 use indra_storage::{BlockStore, StateStore};
 
 use crate::{
@@ -53,6 +56,8 @@ pub struct NodeEngine {
     pub mempool: Mempool,
     /// Pending staking operations waiting to be included in a block.
     pub staking_mempool: Vec<StakingOp>,
+    /// Pending slash evidence waiting to be included in a block.
+    pub pending_slashes: Vec<SlashEvidenceV1>,
     /// Persistent block log.
     pub block_store: BlockStore,
     /// State snapshot store.
@@ -159,6 +164,7 @@ impl NodeEngine {
             state,
             mempool,
             staking_mempool: Vec::new(),
+            pending_slashes: Vec::new(),
             block_store,
             state_store,
             hybrid_keypair,
@@ -216,6 +222,36 @@ impl NodeEngine {
         }
         self.staking_mempool.push(op);
         Ok(())
+    }
+
+    /// Add slash evidence to the pending pool if it has not already been seen.
+    pub fn add_slash_evidence(&mut self, evidence: SlashEvidenceV1) {
+        let hash = compute_slash_evidence_hash(&evidence);
+        let already_pending = self
+            .pending_slashes
+            .iter()
+            .any(|existing| compute_slash_evidence_hash(existing) == hash);
+        if !already_pending && !self.state.applied_slash_hashes.contains(&hash) {
+            self.pending_slashes.push(evidence);
+        }
+    }
+
+    /// Select slash evidence for the next proposed block.
+    pub fn select_slash_evidence(&self) -> Vec<SlashEvidenceV1> {
+        self.pending_slashes
+            .iter()
+            .take(MAX_SLASHES_PER_BLOCK)
+            .cloned()
+            .collect()
+    }
+
+    /// Remove slash evidence that has already been committed.
+    pub fn evict_committed_slashes(&mut self, committed: &[SlashEvidenceV1]) {
+        for evidence in committed {
+            let hash = compute_slash_evidence_hash(evidence);
+            self.pending_slashes
+                .retain(|pending| compute_slash_evidence_hash(pending) != hash);
+        }
     }
 
     /// Select staking operations for block inclusion.
@@ -314,6 +350,7 @@ impl NodeEngine {
             prev_qc_bytes,
             timestamp,
             polc_round,
+            slash_evidence: self.select_slash_evidence(),
             staking_ops: self.select_staking_ops(),
         };
 
@@ -482,8 +519,38 @@ impl NodeEngine {
             &mut self.block_store,
             &self.state_store,
         )?;
+        self.update_last_active_epoch_from_block_qc(block);
+        if self.state.height > 0
+            && self
+                .state
+                .height
+                .is_multiple_of(indra_storage::state_store::SNAPSHOT_INTERVAL)
+        {
+            self.state_store.save(&self.state)?;
+        }
         self.evict_committed_staking_ops(&block.staking_ops);
+        self.evict_committed_slashes(&block.slashing_evidence);
         Ok(())
+    }
+
+    fn update_last_active_epoch_from_block_qc(
+        &mut self,
+        block: &indra_core::types::block::BlockV1,
+    ) {
+        if block.header.quorum_certificate.as_slice().is_empty() {
+            return;
+        }
+        let mut reader =
+            indra_core::codec::ByteReader::new(block.header.quorum_certificate.as_slice());
+        let Ok(qc) = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader) else {
+            return;
+        };
+        let current_epoch = indra_state::epoch::epoch_for_height(self.state.height);
+        for signature in qc.pq_signatures {
+            if let Some(v) = self.state.validators.get_mut(&signature.validator_id) {
+                v.last_active_epoch = current_epoch;
+            }
+        }
     }
 }
 
@@ -560,8 +627,9 @@ mod tests {
     use indra_core::codec::Encode;
     use indra_core::types::crypto::{HybridPubKey, HybridSignature};
     use indra_core::types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK};
+    use indra_core::types::slashing::SlashEvidenceV1;
     use indra_core::types::staking::StakingOpBody;
-    use indra_core::types::vote::VoteStep;
+    use indra_core::types::vote::{VoteStep, VoteV1};
     use indra_core::VariableBytes;
     use indra_state::{ValidatorEntry, ValidatorStatus};
 
@@ -599,6 +667,7 @@ mod tests {
                 stake_spark: 1_000_000,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
+                last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
                 self_report_count: 0,
@@ -628,6 +697,23 @@ mod tests {
             },
             nonce,
             signature: dummy_signature(),
+        }
+    }
+
+    fn dummy_slash_evidence(seed: u8) -> SlashEvidenceV1 {
+        let validator_id = Bytes32::from([seed; 32]);
+        let vote = |block_byte| VoteV1 {
+            height: 7,
+            round: 0,
+            step: VoteStep::Precommit,
+            block_hash: Bytes32::from([block_byte; 32]),
+            validator_id,
+            signature: dummy_signature(),
+        };
+        SlashEvidenceV1 {
+            validator_id,
+            vote_1: vote(0xAA),
+            vote_2: vote(0xBB),
         }
     }
 
@@ -661,6 +747,7 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
+            slash_evidence: vec![],
             staking_ops: vec![],
         };
         produce_block(
@@ -715,6 +802,47 @@ mod tests {
         let engine = NodeEngine::init(config).unwrap();
         assert_eq!(engine.height(), 0);
         assert!(engine.validator_id().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_slash_deduplicates_by_hash() {
+        let dir = temp_dir("slash_dedupe");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let evidence = dummy_slash_evidence(0xA1);
+        engine.add_slash_evidence(evidence.clone());
+        engine.add_slash_evidence(evidence);
+        assert_eq!(engine.pending_slashes.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_committed_slashes_removes_correct() {
+        let dir = temp_dir("slash_evict");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let first = dummy_slash_evidence(0xA2);
+        let second = dummy_slash_evidence(0xA3);
+        engine.add_slash_evidence(first.clone());
+        engine.add_slash_evidence(second.clone());
+        engine.evict_committed_slashes(&[first]);
+        assert_eq!(engine.pending_slashes, vec![second]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_slash_already_applied_ignored() {
+        let dir = temp_dir("slash_applied");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let evidence = dummy_slash_evidence(0xA4);
+        engine
+            .state
+            .applied_slash_hashes
+            .insert(compute_slash_evidence_hash(&evidence));
+        engine.add_slash_evidence(evidence);
+        assert!(engine.pending_slashes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
