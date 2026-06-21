@@ -116,6 +116,16 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
         leaves.push((key, sha256(&value)));
     }
 
+    for (utxo_id, bond) in &state.staked_bonds {
+        let mut key = Vec::with_capacity(33);
+        key.push(0x04);
+        key.extend_from_slice(&utxo_id.0);
+
+        let mut value = Vec::new();
+        bond.encode(&mut value);
+        leaves.push((key, sha256(&value)));
+    }
+
     if leaves.is_empty() {
         return Bytes32::ZERO;
     }

@@ -7,7 +7,10 @@ use std::collections::HashMap;
 
 use indra_core::codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len};
 use indra_core::error::{IndraError, IndraResult};
-use indra_core::types::primitives::{max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS};
+use indra_core::types::{
+    primitives::{max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS},
+    transaction::OutputV1,
+};
 
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +483,74 @@ mod tests {
 
         let delegations = DelegationMap::new();
         assert_eq!(vs.effective_min_active_stake(&delegations), Some(2_000));
+    }
+}
+
+/// A UTXO that has been bonded as delegation stake.
+///
+/// Active bonds earn rewards and count toward delegation totals. Unbonding
+/// bonds are retained until their release epoch, then restored as spendable
+/// UTXOs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StakeBondEntry {
+    /// The UTXO ID that was bonded.
+    pub utxo_id: Bytes32,
+    /// Validator this bond is staked with.
+    pub validator_id: Bytes32,
+    /// Delegator identity.
+    pub delegator_id: Bytes32,
+    /// Amount staked in Spark.
+    pub amount_spark: u64,
+    /// Epoch when this bond was created.
+    pub bonded_epoch: u64,
+    /// None while active; Some(epoch) while unbonding.
+    pub unbonding_end_epoch: Option<u64>,
+    /// Original UTXO output, needed to reinsert when unbonding completes.
+    pub original_output: OutputV1,
+}
+
+impl Encode for StakeBondEntry {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.utxo_id.encode(buf);
+        self.validator_id.encode(buf);
+        self.delegator_id.encode(buf);
+        self.amount_spark.encode(buf);
+        self.bonded_epoch.encode(buf);
+        self.unbonding_end_epoch.is_some().encode(buf);
+        if let Some(epoch) = self.unbonding_end_epoch {
+            epoch.encode(buf);
+        }
+        self.original_output.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.utxo_id.encoded_len()
+            + self.validator_id.encoded_len()
+            + self.delegator_id.encoded_len()
+            + self.amount_spark.encoded_len()
+            + self.bonded_epoch.encoded_len()
+            + 1
+            + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
+            + self.original_output.encoded_len()
+    }
+}
+
+impl Decode for StakeBondEntry {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let utxo_id = Bytes32::decode(r)?;
+        Ok(Self {
+            utxo_id,
+            validator_id: Bytes32::decode(r)?,
+            delegator_id: Bytes32::decode(r)?,
+            amount_spark: u64::decode(r)?,
+            bonded_epoch: u64::decode(r)?,
+            unbonding_end_epoch: if bool::decode(r)? {
+                Some(u64::decode(r)?)
+            } else {
+                None
+            },
+            original_output: OutputV1::decode(r)?,
+        })
     }
 }
 

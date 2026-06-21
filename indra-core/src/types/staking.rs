@@ -37,24 +37,22 @@ pub struct StakingOp {
 /// The operation payload: what the operation actually does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StakingOpBody {
-    /// Delegate Spark to a validator.
-    /// Delegator earns rewards proportional to their share of the validator's total delegation.
+    /// Delegate a specific UTXO as stake to a validator.
     Delegate {
         /// Target validator.
         validator_id: Bytes32,
-        /// Amount to delegate in Spark.
-        amount_spark: u64,
-        /// Delegator's public key — used to identify and pay out rewards.
+        /// The UTXO being bonded as stake.
+        bond_utxo_id: Bytes32,
+        /// Delegator's public key.
         delegator_pubkey: HybridPubKey,
     },
 
-    /// Begin undelegating from a validator.
-    /// Stake is locked for UNBONDING_PERIOD_EPOCHS before it can be withdrawn.
+    /// Begin undelegating a specific stake bond.
     Undelegate {
         /// Target validator.
         validator_id: Bytes32,
-        /// Amount to undelegate in Spark.
-        amount_spark: u64,
+        /// The UTXO ID originally used in the Delegate operation.
+        bond_utxo_id: Bytes32,
         /// Delegator's public key.
         delegator_pubkey: HybridPubKey,
     },
@@ -127,20 +125,8 @@ impl StakingOp {
     pub fn validate_structure(&self) -> IndraResult<()> {
         use crate::error::IndraError;
         match &self.body {
-            StakingOpBody::Delegate { amount_spark, .. } => {
-                if *amount_spark == 0 {
-                    return Err(IndraError::InvalidStakingOp(
-                        "delegate amount must be > 0".into(),
-                    ));
-                }
-            }
-            StakingOpBody::Undelegate { amount_spark, .. } => {
-                if *amount_spark == 0 {
-                    return Err(IndraError::InvalidStakingOp(
-                        "undelegate amount must be > 0".into(),
-                    ));
-                }
-            }
+            StakingOpBody::Delegate { .. } => {}
+            StakingOpBody::Undelegate { .. } => {}
             StakingOpBody::RegisterValidator { commission_bps, .. } => {
                 if *commission_bps < MIN_COMMISSION_BPS || *commission_bps > MAX_COMMISSION_BPS {
                     return Err(IndraError::CommissionOutOfRange {
@@ -174,22 +160,22 @@ impl Encode for StakingOpBody {
         match self {
             StakingOpBody::Delegate {
                 validator_id,
-                amount_spark,
+                bond_utxo_id,
                 delegator_pubkey,
             } => {
                 buf.push(TAG_DELEGATE);
                 validator_id.encode(buf);
-                amount_spark.encode(buf);
+                bond_utxo_id.encode(buf);
                 delegator_pubkey.encode(buf);
             }
             StakingOpBody::Undelegate {
                 validator_id,
-                amount_spark,
+                bond_utxo_id,
                 delegator_pubkey,
             } => {
                 buf.push(TAG_UNDELEGATE);
                 validator_id.encode(buf);
-                amount_spark.encode(buf);
+                bond_utxo_id.encode(buf);
                 delegator_pubkey.encode(buf);
             }
             StakingOpBody::ClaimRewards {
@@ -225,10 +211,10 @@ impl Encode for StakingOpBody {
         1 + match self {
             StakingOpBody::Delegate {
                 delegator_pubkey, ..
-            } => 32 + 8 + delegator_pubkey.encoded_len(),
+            } => 32 + 32 + delegator_pubkey.encoded_len(),
             StakingOpBody::Undelegate {
                 delegator_pubkey, ..
-            } => 32 + 8 + delegator_pubkey.encoded_len(),
+            } => 32 + 32 + delegator_pubkey.encoded_len(),
             StakingOpBody::ClaimRewards {
                 delegator_pubkey, ..
             } => 32 + delegator_pubkey.encoded_len(),
@@ -247,12 +233,12 @@ impl Decode for StakingOpBody {
         match tag {
             TAG_DELEGATE => Ok(StakingOpBody::Delegate {
                 validator_id: Bytes32::decode(r)?,
-                amount_spark: u64::decode(r)?,
+                bond_utxo_id: Bytes32::decode(r)?,
                 delegator_pubkey: HybridPubKey::decode(r)?,
             }),
             TAG_UNDELEGATE => Ok(StakingOpBody::Undelegate {
                 validator_id: Bytes32::decode(r)?,
-                amount_spark: u64::decode(r)?,
+                bond_utxo_id: Bytes32::decode(r)?,
                 delegator_pubkey: HybridPubKey::decode(r)?,
             }),
             TAG_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
@@ -334,12 +320,12 @@ mod tests {
         let cases = vec![
             op(StakingOpBody::Delegate {
                 validator_id: Bytes32::from([1u8; 32]),
-                amount_spark: 1_000_000,
+                bond_utxo_id: Bytes32::from([0x11u8; 32]),
                 delegator_pubkey: dummy_pubkey(),
             }),
             op(StakingOpBody::Undelegate {
                 validator_id: Bytes32::from([2u8; 32]),
-                amount_spark: 500_000,
+                bond_utxo_id: Bytes32::from([0x22u8; 32]),
                 delegator_pubkey: dummy_pubkey(),
             }),
             op(StakingOpBody::ClaimRewards {
@@ -367,7 +353,7 @@ mod tests {
     fn staking_op_signing_bytes_domain_separation() {
         let delegate = op(StakingOpBody::Delegate {
             validator_id: Bytes32::from([1u8; 32]),
-            amount_spark: 1_000_000,
+            bond_utxo_id: Bytes32::from([0x11u8; 32]),
             delegator_pubkey: dummy_pubkey(),
         });
         let register = op(StakingOpBody::RegisterValidator {
@@ -382,13 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn staking_op_validate_structure_rejects_zero_amount() {
+    fn staking_op_validate_structure_accepts_bond_id_delegate() {
         let op = op(StakingOpBody::Delegate {
             validator_id: Bytes32::ZERO,
-            amount_spark: 0,
+            bond_utxo_id: Bytes32::ZERO,
             delegator_pubkey: dummy_pubkey(),
         });
-        assert!(op.validate_structure().is_err());
+        assert!(op.validate_structure().is_ok());
     }
 
     #[test]
@@ -422,7 +408,7 @@ mod tests {
         let pubkey = dummy_pubkey();
         let a = op(StakingOpBody::Delegate {
             validator_id: Bytes32::from([1u8; 32]),
-            amount_spark: 1,
+            bond_utxo_id: Bytes32::from([0x11u8; 32]),
             delegator_pubkey: pubkey.clone(),
         });
         let b = op(StakingOpBody::ClaimRewards {

@@ -1649,10 +1649,71 @@ fn handle_rpc(
                         de.unbonding_end_epoch.unwrap_or(0),
                     )
                 }).collect();
+                let bonds: Vec<String> = s
+                    .staked_bonds
+                    .values()
+                    .filter(|bond| {
+                        bond.validator_id == validator_id && bond.unbonding_end_epoch.is_none()
+                    })
+                    .map(|bond| {
+                        format!(
+                            r#"{{"bond_utxo_id":"{}","delegator_id":"{}","amount_spark":{},"bonded_epoch":{}}}"#,
+                            hex::encode(bond.utxo_id.0),
+                            hex::encode(bond.delegator_id.0),
+                            bond.amount_spark,
+                            bond.bonded_epoch,
+                        )
+                    })
+                    .collect();
                 format!(
-                    r#"{{"validator_id":"{}","delegations":[{}]}}"#,
+                    r#"{{"validator_id":"{}","delegations":[{}],"bonds":[{}]}}"#,
                     validator_hex,
-                    entries.join(",")
+                    entries.join(","),
+                    bonds.join(",")
+                )
+            }
+            "indra_getStakeBonds" => {
+                let delegator_hex = first_param.clone().unwrap_or_default();
+                if delegator_hex.len() != 64 {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid delegator_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let mut raw = [0u8; 32];
+                if hex::decode_to_slice(&delegator_hex, &mut raw).is_err() {
+                    let err = format!(
+                        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"invalid delegator_id hex"}},"id":{}}}"#,
+                        id_raw
+                    );
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", cors, err.len(), err);
+                    let _ = stream.try_clone().map(|mut w| w.write_all(resp.as_bytes()));
+                    return;
+                }
+                let delegator_id = indra_core::Bytes32::from(raw);
+                let bonds: Vec<String> = s
+                    .staked_bonds
+                    .values()
+                    .filter(|bond| {
+                        bond.delegator_id == delegator_id && bond.unbonding_end_epoch.is_none()
+                    })
+                    .map(|bond| {
+                        format!(
+                            r#"{{"bond_utxo_id":"{}","validator_id":"{}","amount_spark":{},"bonded_epoch":{},"unbonding":false}}"#,
+                            hex::encode(bond.utxo_id.0),
+                            hex::encode(bond.validator_id.0),
+                            bond.amount_spark,
+                            bond.bonded_epoch,
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"{{"delegator_id":"{}","bonds":[{}]}}"#,
+                    delegator_hex,
+                    bonds.join(",")
                 )
             }
             "indra_getEpochInfo" => {

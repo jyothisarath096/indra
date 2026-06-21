@@ -136,7 +136,7 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         for op in &block.staking_ops {
             op.validate_structure()
                 .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
-            apply_staking_op(&mut shadow, op, &chain_id)?;
+            apply_staking_op(&mut shadow, op, &chain_id, block.header.height)?;
         }
     }
 
@@ -149,8 +149,10 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
 
     let chain_id = state.chain_id.clone();
     for op in &block.staking_ops {
-        apply_staking_op(state, op, &chain_id).map_err(|_| StateError::InvariantViolation {
-            message: "staking op failed on real state after shadow validation",
+        apply_staking_op(state, op, &chain_id, block.header.height).map_err(|_| {
+            StateError::InvariantViolation {
+                message: "staking op failed on real state after shadow validation",
+            }
         })?;
     }
 
@@ -412,6 +414,7 @@ fn apply_transaction(
 mod tests {
     use super::*;
     use crate::chain::ChainState;
+    use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         types::{
@@ -491,6 +494,45 @@ mod tests {
         };
         sign_staking_op(&keypair, &state.chain_id, &mut op);
         (op, validator_id)
+    }
+
+    fn signed_delegate_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        bond_utxo_id: Bytes32,
+        delegator_pubkey: HybridPubKey,
+        keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        let mut op = StakingOp {
+            body: StakingOpBody::Delegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey,
+            },
+            nonce,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(keypair, &state.chain_id, &mut op);
+        op
+    }
+
+    fn active_validator(validator_id: Bytes32) -> ValidatorEntry {
+        ValidatorEntry {
+            validator_id,
+            name: "test-validator".into(),
+            hybrid_classical_pk: None,
+            hybrid_pq_pk: None,
+            vrf_pk: None,
+            stake_spark: 1_000_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: 1_000,
+            min_delegation_spark: 1,
+        }
     }
 
     fn derive_fee_blinding(
@@ -649,6 +691,46 @@ mod tests {
     }
 
     #[test]
+    fn staked_bonds_in_state_root() {
+        let mut a = ChainState::new_genesis();
+        let mut b = ChainState::new_genesis();
+        let (delegator_pubkey, _) = make_test_keypair([0x77; 32]);
+        let delegator_id = pubkey_to_id_for_test(&delegator_pubkey);
+        let validator_id = Bytes32::from([0x66; 32]);
+        let output = dummy_output(0x07, delegator_pubkey);
+
+        a.staked_bonds.insert(
+            Bytes32::from([0xA1; 32]),
+            StakeBondEntry {
+                utxo_id: Bytes32::from([0xA1; 32]),
+                validator_id,
+                delegator_id,
+                amount_spark: 1_000_000,
+                bonded_epoch: 1,
+                unbonding_end_epoch: None,
+                original_output: output.clone(),
+            },
+        );
+        b.staked_bonds.insert(
+            Bytes32::from([0xB2; 32]),
+            StakeBondEntry {
+                utxo_id: Bytes32::from([0xB2; 32]),
+                validator_id,
+                delegator_id,
+                amount_spark: 1_000_000,
+                bonded_epoch: 1,
+                unbonding_end_epoch: None,
+                original_output: output,
+            },
+        );
+
+        assert_ne!(
+            crate::state_root::compute_state_root(&a),
+            crate::state_root::compute_state_root(&b)
+        );
+    }
+
+    #[test]
     fn apply_empty_block_advances_height() {
         let mut state = ChainState::new_genesis();
         let block = make_block(&state, vec![]);
@@ -686,6 +768,35 @@ mod tests {
         assert_eq!(state.utxos.len(), 1);
         // Nullifier must be recorded
         assert!(state.nullifiers.contains(&nullifier));
+    }
+
+    #[test]
+    fn apply_block_with_delegate_removes_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (delegator_pubkey, keypair) = make_test_keypair([0x71; 32]);
+        let output = dummy_output(0x08, delegator_pubkey.clone());
+        let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
+        let validator_id = Bytes32::from([0x72; 32]);
+        state
+            .validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+
+        let op = signed_delegate_op(
+            &state,
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey,
+            &keypair,
+            1,
+        );
+        let mut block = make_block(&state, vec![]);
+        block.staking_ops = vec![op];
+
+        apply_block(&mut state, &block).unwrap();
+
+        assert!(!state.utxos.contains(&bond_utxo_id));
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
     }
 
     #[test]

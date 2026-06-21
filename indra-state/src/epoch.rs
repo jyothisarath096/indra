@@ -15,15 +15,9 @@
 //! Supply only decreases via the fee burn path in `apply.rs`.
 
 use indra_core::types::primitives::{
-    BLOCKS_PER_YEAR,
-    EPOCH_DURATION_BLOCKS,
-    ERA_1_2_DURATION_BLOCKS,
-    ERA_3_BLOCK_REWARD_SPARK,
-    ERA_3_PLUS_DURATION_BLOCKS,
-    ERA_1_BLOCK_REWARD_SPARK,
-    ERA_2_BLOCK_REWARD_SPARK,
-    HARD_CAP_SPARK,
-    SATURATION_MIN_VALIDATORS,
+    Bytes32, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
+    ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
+    ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, STAKING_TX_IDX,
 };
 
 use crate::{
@@ -70,6 +64,7 @@ pub fn apply_epoch_transition(
     distribute_fee_rewards(state, current_epoch);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
+    release_unbonded_bonds(state, current_epoch)?;
     let total_staked = state
         .validators
         .total_selectable_self_stake()
@@ -260,6 +255,41 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
     }
 }
 
+fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateResult<()> {
+    let mut to_release: Vec<Bytes32> = state
+        .staked_bonds
+        .values()
+        .filter(|bond| {
+            bond.unbonding_end_epoch
+                .map(|end| end <= current_epoch)
+                .unwrap_or(false)
+        })
+        .map(|bond| bond.utxo_id)
+        .collect();
+    to_release.sort_by_key(|id| id.0);
+
+    let release_height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+    for (idx, utxo_id) in to_release.into_iter().enumerate() {
+        if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
+            let output_index = u32::try_from(idx)
+                .unwrap_or(u32::MAX - 1)
+                .saturating_add(1);
+            state
+                .utxos
+                .insert(
+                    bond.original_output,
+                    release_height,
+                    STAKING_TX_IDX,
+                    output_index,
+                )
+                .map_err(|_| crate::error::StateError::InvariantViolation {
+                    message: "UTXO ID collision in staking bond release",
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// True if the given height is the last block of an epoch.
 pub fn is_epoch_boundary(height: u64) -> bool {
     height > 0 && height.is_multiple_of(EPOCH_DURATION_BLOCKS)
@@ -273,15 +303,22 @@ pub fn epoch_for_height(height: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::{
-        Bytes32, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
-        ERA_1_2_DURATION_BLOCKS,
-        ERA_1_BLOCK_REWARD_SPARK,
-        ERA_2_BLOCK_REWARD_SPARK,
-        ERA_3_BLOCK_REWARD_SPARK,
-        ERA_3_PLUS_DURATION_BLOCKS,
+    use indra_core::{
+        types::{
+            crypto::HybridPubKey,
+            primitives::{
+                Bytes32, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS,
+                ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
+                ERA_3_PLUS_DURATION_BLOCKS, VariableBytes,
+            },
+            transaction::OutputV1,
+        },
+        CommitmentV1,
     };
-    use crate::{compute_state_root, validator::{ValidatorEntry, ValidatorStatus}};
+    use crate::{
+        compute_state_root,
+        validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
+    };
 
     fn make_validator(id_byte: u8, stake: u64) -> ValidatorEntry {
         ValidatorEntry {
@@ -298,6 +335,21 @@ mod tests {
             self_report_count: 0,
             commission_bps: DEFAULT_COMMISSION_BPS,
             min_delegation_spark: DUST_LIMIT_SPARK,
+        }
+    }
+
+    fn dummy_output(byte: u8) -> OutputV1 {
+        OutputV1 {
+            value_spark: 1_000_000,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from([byte; 32]),
+            },
+            owner_pubkey: HybridPubKey {
+                classical_pk: Bytes32::from([byte; 32]),
+                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            },
+            range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            lock_height: 0,
         }
     }
 
@@ -444,5 +496,51 @@ mod tests {
         }
 
         assert_eq!(compute_state_root(&s1), compute_state_root(&s2));
+    }
+
+    #[test]
+    fn unbonded_bonds_released_to_utxo_set() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let utxo_id = Bytes32::from([0xAB; 32]);
+        state.staked_bonds.insert(
+            utxo_id,
+            StakeBondEntry {
+                utxo_id,
+                validator_id: Bytes32::from([0x01; 32]),
+                delegator_id: Bytes32::from([0x02; 32]),
+                amount_spark: 1_000_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: Some(1),
+                original_output: dummy_output(0x44),
+            },
+        );
+
+        apply_epoch_transition(&mut state, 1).unwrap();
+
+        assert!(state.staked_bonds.is_empty());
+        assert_eq!(state.utxos.len(), 1);
+    }
+
+    #[test]
+    fn active_bonds_not_released_early() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let utxo_id = Bytes32::from([0xAC; 32]);
+        state.staked_bonds.insert(
+            utxo_id,
+            StakeBondEntry {
+                utxo_id,
+                validator_id: Bytes32::from([0x01; 32]),
+                delegator_id: Bytes32::from([0x02; 32]),
+                amount_spark: 1_000_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: dummy_output(0x45),
+            },
+        );
+
+        apply_epoch_transition(&mut state, 1).unwrap();
+
+        assert!(state.staked_bonds.contains_key(&utxo_id));
+        assert!(state.utxos.is_empty());
     }
 }

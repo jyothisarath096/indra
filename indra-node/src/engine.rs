@@ -620,7 +620,7 @@ mod tests {
         StakingOp {
             body: StakingOpBody::Delegate {
                 validator_id: Bytes32::from([0xAA; 32]),
-                amount_spark: 1_000_000,
+                bond_utxo_id: Bytes32::from([0xBB; 32]),
                 delegator_pubkey: HybridPubKey {
                     classical_pk: Bytes32::from([seed; 32]),
                     pq_pk: VariableBytes::from_slice(&[seed; 2592]).unwrap(),

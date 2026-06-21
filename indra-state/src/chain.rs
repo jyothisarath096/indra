@@ -16,7 +16,7 @@ use indra_core::types::primitives::{
 use crate::{
     nullifier::NullifierSet,
     utxo::UtxoSet,
-    validator::{DelegationMap, ValidatorSet},
+    validator::{DelegationMap, StakeBondEntry, ValidatorSet},
 };
 
 /// The complete chain state at a given block height.
@@ -64,6 +64,9 @@ pub struct ChainState {
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
 
+    /// Stake bonds: UTXOs locked as delegation stake.
+    pub staked_bonds: HashMap<Bytes32, StakeBondEntry>,
+
     /// Monotonic nonces for staking op replay protection.
     pub staking_nonces: HashMap<Bytes32, u64>,
 }
@@ -96,6 +99,8 @@ impl Encode for ChainState {
         self.validators.encode(buf);
         // Included: delegations affect validator power and epoch transitions.
         self.delegations.encode(buf);
+        // Included: stake bonds lock UTXOs and drive delegation/unbonding state.
+        encode_bond_map(&self.staked_bonds, buf);
         encode_nonce_map(&self.staking_nonces, buf);
         // Omitted: no extra cached fields live on ChainState itself; nested SMT caches are
         // intentionally reconstructed by the set decoders from the serialized canonical entries.
@@ -116,6 +121,7 @@ impl Encode for ChainState {
             + self.nullifiers.encoded_len()
             + self.validators.encoded_len()
             + self.delegations.encoded_len()
+            + bond_map_encoded_len(&self.staked_bonds)
             + nonce_map_encoded_len(&self.staking_nonces)
     }
 }
@@ -137,6 +143,7 @@ impl Decode for ChainState {
             nullifiers: NullifierSet::decode(r)?,
             validators: ValidatorSet::decode(r)?,
             delegations: DelegationMap::decode(r)?,
+            staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
         })
     }
@@ -160,6 +167,7 @@ impl ChainState {
             nullifiers: NullifierSet::new(),
             validators: ValidatorSet::new(),
             delegations: DelegationMap::new(),
+            staked_bonds: HashMap::new(),
             staking_nonces: HashMap::new(),
         }
     }
@@ -173,6 +181,54 @@ impl ChainState {
     pub fn has_blocks(&self) -> bool {
         self.height > 0
     }
+}
+
+fn encode_bond_map(bonds: &HashMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
+    let mut entries: Vec<_> = bonds.iter().collect();
+    entries.sort_by_key(|(utxo_id, _)| utxo_id.0);
+    (entries.len() as u32).encode(buf);
+    for (utxo_id, bond) in entries {
+        utxo_id.encode(buf);
+        bond.encode(buf);
+    }
+}
+
+fn bond_map_encoded_len(bonds: &HashMap<Bytes32, StakeBondEntry>) -> usize {
+    4 + bonds
+        .iter()
+        .map(|(utxo_id, bond)| utxo_id.encoded_len() + bond.encoded_len())
+        .sum::<usize>()
+}
+
+fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, StakeBondEntry>> {
+    use indra_core::error::IndraError;
+    use indra_core::types::primitives::MAX_VALIDATORS;
+
+    let count = u32::decode(r)? as usize;
+    let max = MAX_VALIDATORS.saturating_mul(1_000);
+    if count > max {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.staked_bonds",
+            max,
+            actual: count,
+        });
+    }
+    let mut bonds = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let key = Bytes32::decode(r)?;
+        let bond = StakeBondEntry::decode(r)?;
+        if key != bond.utxo_id {
+            return Err(IndraError::InvariantViolation {
+                message: "stake bond map key must match bond utxo_id",
+            });
+        }
+        if bonds.insert(key, bond).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.staked_bonds",
+            });
+        }
+    }
+    Ok(bonds)
 }
 
 fn encode_nonce_map(nonces: &HashMap<Bytes32, u64>, buf: &mut Vec<u8>) {

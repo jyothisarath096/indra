@@ -105,6 +105,12 @@ pub const MAX_STAKING_OPS_PER_BLOCK: usize = 10;
 /// Domain separation tag for staking operation signing bytes.
 pub const STAKING_OP_DOMAIN: &str = "indra-stake-v1";
 
+/// Special transaction index reserved for staking-created UTXOs.
+pub const STAKING_TX_IDX: u32 = u32::MAX;
+
+/// Domain for deterministic staking reward blinding factor derivation.
+pub const STAKING_REWARD_BLINDING_DOMAIN: &[u8] = b"indra-staking-reward-v1";
+
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 
 /// Maximum Ed25519 signature size (bytes).

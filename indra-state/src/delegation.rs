@@ -5,25 +5,33 @@
 //! contains StakingOp entries.
 
 use indra_core::types::{
-    crypto::{HybridPubKey, HybridSignature},
+    crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, DUST_LIMIT_SPARK, MAX_COMMISSION_BPS, MIN_COMMISSION_BPS, UNBONDING_PERIOD_EPOCHS,
+        Bytes32, DUST_LIMIT_SPARK, MAX_COMMISSION_BPS, MIN_COMMISSION_BPS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS, VariableBytes,
     },
     staking::{StakingOp, StakingOpBody},
+    transaction::OutputV1,
 };
+use rand::SeedableRng;
 
 use crate::{
     chain::ChainState,
     epoch::epoch_for_height,
     error::{StateError, StateResult},
-    validator::{ValidatorEntry, ValidatorStatus},
+    validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
 };
 
 /// Apply a single staking operation to chain state.
 ///
 /// Called after all transaction validation has passed.
 /// Staking ops are applied in block order after UTXO transactions.
-pub fn apply_staking_op(state: &mut ChainState, op: &StakingOp, chain_id: &str) -> StateResult<()> {
+pub fn apply_staking_op(
+    state: &mut ChainState,
+    op: &StakingOp,
+    chain_id: &str,
+    current_height: u64,
+) -> StateResult<()> {
     let signer_id = op.signer_id();
     let expected_nonce = state.staking_nonces.get(&signer_id).copied().unwrap_or(0) + 1;
     if op.nonce != expected_nonce {
@@ -85,18 +93,30 @@ pub fn apply_staking_op(state: &mut ChainState, op: &StakingOp, chain_id: &str) 
     match &op.body {
         StakingOpBody::Delegate {
             validator_id,
-            amount_spark,
+            bond_utxo_id,
             delegator_pubkey,
-        } => apply_delegate(state, validator_id, *amount_spark, delegator_pubkey),
+        } => apply_delegate(
+            state,
+            validator_id,
+            *bond_utxo_id,
+            delegator_pubkey,
+            current_height,
+        ),
         StakingOpBody::Undelegate {
             validator_id,
-            amount_spark,
+            bond_utxo_id,
             delegator_pubkey,
-        } => apply_undelegate(state, validator_id, *amount_spark, delegator_pubkey),
+        } => apply_undelegate(
+            state,
+            validator_id,
+            *bond_utxo_id,
+            delegator_pubkey,
+            current_height,
+        ),
         StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey,
-        } => apply_claim_rewards(state, validator_id, delegator_pubkey),
+        } => apply_claim_rewards(state, validator_id, delegator_pubkey, current_height),
         StakingOpBody::RegisterValidator {
             commission_bps,
             validator_pubkey,
@@ -186,10 +206,10 @@ fn apply_register_validator(
 fn apply_delegate(
     state: &mut ChainState,
     validator_id: &Bytes32,
-    amount_spark: u64,
-    delegator_pubkey: &indra_core::types::crypto::HybridPubKey,
+    bond_utxo_id: Bytes32,
+    delegator_pubkey: &HybridPubKey,
+    current_height: u64,
 ) -> StateResult<()> {
-    // Validator must exist and be active
     let validator = state
         .validators
         .get(validator_id)
@@ -200,16 +220,52 @@ fn apply_delegate(
     ) {
         return Err(StateError::ValidatorNotActive);
     }
+    let min_delegation = validator.min_delegation_spark;
+
+    if state.staked_bonds.contains_key(&bond_utxo_id) {
+        return Err(StateError::InvalidStakingOp(
+            "UTXO is already bonded as stake".into(),
+        ));
+    }
+
+    let utxo_entry = state
+        .utxos
+        .get(&bond_utxo_id)
+        .ok_or(StateError::UnknownUtxo)?
+        .clone();
+
+    let delegator_id = pubkey_to_id(delegator_pubkey);
+    let utxo_owner_id = pubkey_to_id(&utxo_entry.output.owner_pubkey);
+    if utxo_owner_id != delegator_id {
+        return Err(StateError::InvalidStakingOp(
+            "UTXO does not belong to the delegator".into(),
+        ));
+    }
+
+    let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < validator.min_delegation_spark {
         return Err(StateError::InvalidStakingOp(format!(
-            "delegation below validator minimum: have {} Spark, need {} Spark",
-            amount_spark, validator.min_delegation_spark,
+            "delegation {} Spark below minimum {} Spark",
+            amount_spark, min_delegation,
         )));
     }
 
-    // Derive delegator_id from pubkey bytes
-    let delegator_id = pubkey_to_id(delegator_pubkey);
-    let current_epoch = epoch_for_height(state.height);
+    let current_epoch = epoch_for_height(current_height);
+    let original_output = utxo_entry.output;
+    let _ = state.utxos.spend(&bond_utxo_id);
+
+    state.staked_bonds.insert(
+        bond_utxo_id,
+        StakeBondEntry {
+            utxo_id: bond_utxo_id,
+            validator_id: *validator_id,
+            delegator_id,
+            amount_spark,
+            bonded_epoch: current_epoch,
+            unbonding_end_epoch: None,
+            original_output,
+        },
+    );
 
     state
         .delegations
@@ -225,12 +281,36 @@ fn apply_delegate(
 fn apply_undelegate(
     state: &mut ChainState,
     validator_id: &Bytes32,
-    amount_spark: u64,
-    delegator_pubkey: &indra_core::types::crypto::HybridPubKey,
+    bond_utxo_id: Bytes32,
+    delegator_pubkey: &HybridPubKey,
+    current_height: u64,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
-    let current_epoch = epoch_for_height(state.height);
+
+    let bond = state
+        .staked_bonds
+        .get_mut(&bond_utxo_id)
+        .ok_or_else(|| StateError::InvalidStakingOp("stake bond not found".into()))?;
+    if bond.delegator_id != delegator_id {
+        return Err(StateError::InvalidStakingOp(
+            "bond does not belong to delegator".into(),
+        ));
+    }
+    if bond.validator_id != *validator_id {
+        return Err(StateError::InvalidStakingOp(
+            "bond not staked with this validator".into(),
+        ));
+    }
+    if bond.unbonding_end_epoch.is_some() {
+        return Err(StateError::InvalidStakingOp(
+            "bond is already unbonding".into(),
+        ));
+    }
+
+    let current_epoch = epoch_for_height(current_height);
     let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
+    bond.unbonding_end_epoch = Some(unbonding_end);
+    let amount_spark = bond.amount_spark;
 
     state
         .delegations
@@ -246,7 +326,8 @@ fn apply_undelegate(
 fn apply_claim_rewards(
     state: &mut ChainState,
     validator_id: &Bytes32,
-    delegator_pubkey: &indra_core::types::crypto::HybridPubKey,
+    delegator_pubkey: &HybridPubKey,
+    current_height: u64,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
 
@@ -255,9 +336,49 @@ fn apply_claim_rewards(
         .get_delegator_mut(validator_id, &delegator_id)
         .ok_or(StateError::DelegatorNotFound)?;
 
-    // Zero out pending rewards — in Phase 3 this creates a UTXO
-    let _claimed = entry.pending_rewards;
+    let claimed = entry.pending_rewards;
+    if claimed == 0 {
+        return Ok(());
+    }
+    if claimed < DUST_LIMIT_SPARK {
+        return Err(StateError::InvalidStakingOp(format!(
+            "rewards {} Spark below dust limit {} Spark",
+            claimed, DUST_LIMIT_SPARK
+        )));
+    }
     entry.pending_rewards = 0;
+
+    let mut blinding_input = Vec::with_capacity(
+        STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8,
+    );
+    blinding_input.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
+    blinding_input.extend_from_slice(&validator_id.0);
+    blinding_input.extend_from_slice(&delegator_id.0);
+    blinding_input.extend_from_slice(&current_height.to_le_bytes());
+    let blinding = indra_crypto::sha256(&blinding_input);
+    let commitment = indra_crypto::commit(claimed, &blinding);
+    let mut rng = rand::rngs::StdRng::from_seed(blinding);
+    let proof = indra_crypto::prove_range(claimed, &blinding, &mut rng).map_err(|_| {
+        StateError::InvalidStakingOp("failed to generate range proof for reward UTXO".into())
+    })?;
+
+    let output = OutputV1 {
+        value_spark: claimed,
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(commitment.0),
+        },
+        owner_pubkey: delegator_pubkey.clone(),
+        range_proof: VariableBytes::from_slice(&proof)
+            .map_err(|_| StateError::InvalidStakingOp("range proof too large".into()))?,
+        lock_height: 0,
+    };
+
+    state
+        .utxos
+        .insert(output, current_height, STAKING_TX_IDX, 0)
+        .map_err(|_| StateError::InvariantViolation {
+            message: "UTXO ID collision in staking reward output",
+        })?;
 
     Ok(())
 }
@@ -313,10 +434,12 @@ mod tests {
         validator::{ValidatorEntry, ValidatorStatus},
     };
     use indra_core::types::{
-        crypto::{HybridPubKey, HybridSignature},
+        crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         primitives::VariableBytes,
+        transaction::OutputV1,
     };
-    use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::{commit, hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair}, prove_range};
+    use rand::{rngs::StdRng, SeedableRng};
 
     fn keypair(seed: u8) -> HybridKeypair {
         HybridKeypair::new(
@@ -331,6 +454,34 @@ mod tests {
             classical_pk: Bytes32::from(public.classical.0),
             pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
         }
+    }
+
+    fn test_output(value_spark: u64, owner_pubkey: HybridPubKey, seed: u8) -> OutputV1 {
+        let blinding = [seed; 32];
+        let commitment = commit(value_spark, &blinding);
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let proof = prove_range(value_spark, &blinding, &mut rng).unwrap();
+        OutputV1 {
+            value_spark,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commitment.0),
+            },
+            owner_pubkey,
+            range_proof: VariableBytes::from_slice(&proof).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn insert_delegator_utxo(
+        state: &mut ChainState,
+        delegator_pubkey: HybridPubKey,
+        value_spark: u64,
+        seed: u8,
+    ) -> Bytes32 {
+        state
+            .utxos
+            .insert(test_output(value_spark, delegator_pubkey, seed), 1, 0, seed as u32)
+            .unwrap()
     }
 
     fn dummy_signature() -> HybridSignature {
@@ -382,50 +533,117 @@ mod tests {
         (validator_id, keypair)
     }
 
+    fn delegate_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        bond_utxo_id: Bytes32,
+        delegator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::Delegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(delegator_keypair),
+            },
+            nonce,
+            delegator_keypair,
+            &state.chain_id,
+        )
+    }
+
+    fn undelegate_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        bond_utxo_id: Bytes32,
+        delegator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::Undelegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(delegator_keypair),
+            },
+            nonce,
+            delegator_keypair,
+            &state.chain_id,
+        )
+    }
+
     #[test]
-    fn delegate_to_active_validator_succeeds() {
+    fn delegate_bonds_utxo_and_removes_from_spendable() {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
         let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x10);
 
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
         let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &op, &chain_id).is_ok());
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert!(!state.utxos.contains(&bond_utxo_id));
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
         assert_eq!(state.delegations.total_delegated(&validator_id), 1_000_000);
     }
 
     #[test]
-    fn delegate_to_unknown_validator_fails() {
+    fn delegate_rejects_unknown_utxo() {
         let mut state = ChainState::new_genesis();
-        let delegator_keypair = keypair(0x01);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
 
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id: Bytes32::from([0xFFu8; 32]),
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey,
-            },
-            1,
+        let op = delegate_op(
+            &state,
+            validator_id,
+            Bytes32::from([0xFF; 32]),
             &delegator_keypair,
-            &state.chain_id,
+            1,
         );
         let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &op, &chain_id).is_err());
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::UnknownUtxo)
+        );
     }
 
     #[test]
-    fn delegate_below_validator_minimum_fails() {
+    fn delegate_rejects_wrong_owner() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let wrong_owner = pubkey_from_keypair(&keypair(0x03));
+        let bond_utxo_id = insert_delegator_utxo(&mut state, wrong_owner, 1_000_000, 0x11);
+
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn delegate_rejects_already_bonded_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x12);
+
+        let first = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        let second = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn delegate_rejects_below_minimum() {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         state
@@ -435,120 +653,80 @@ mod tests {
             .min_delegation_spark = 2_000_000;
         let delegator_keypair = keypair(0x02);
         let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x13);
 
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
         let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &op, &chain_id).is_err());
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
     }
 
     #[test]
-    fn delegate_to_registered_validator_succeeds() {
+    fn undelegate_sets_unbonding_epoch() {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
         let delegator_keypair = keypair(0x02);
         let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x14);
 
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
         let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &op, &chain_id).is_ok());
-        assert_eq!(state.delegations.total_delegated(&validator_id), 1_000_000);
-    }
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
+        apply_staking_op(&mut state, &undelegate, &chain_id, 1).unwrap();
 
-    #[test]
-    fn set_commission_valid_range_succeeds() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
-
-        let op = signed_op(
-            StakingOpBody::SetCommission {
-                validator_id,
-                new_commission_bps: 1_500,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &op, &chain_id).is_ok());
         assert_eq!(
-            state.validators.get(&validator_id).unwrap().commission_bps,
-            1_500
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .unwrap()
+                .unbonding_end_epoch,
+            Some(UNBONDING_PERIOD_EPOCHS)
         );
+        assert_eq!(state.delegations.total_delegated(&validator_id), 0);
     }
 
     #[test]
-    fn set_commission_out_of_range_fails() {
+    fn undelegate_rejects_wrong_delegator() {
         let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let wrong_keypair = keypair(0x03);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x15);
 
-        let op = signed_op(
-            StakingOpBody::SetCommission {
-                validator_id,
-                new_commission_bps: 9_999,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
         let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &op, &chain_id).is_err());
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &wrong_keypair, 1);
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &undelegate, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
     }
 
     #[test]
-    fn undelegate_then_no_active_stake() {
+    fn undelegate_rejects_already_unbonding() {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
         let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x16);
 
-        // First delegate
-        let delegate_op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey.clone(),
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &delegate_op, &chain_id).unwrap();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
+        let first = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
+        let second = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 3);
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
 
-        // Then undelegate
-        let undelegate_op = signed_op(
-            StakingOpBody::Undelegate {
-                validator_id,
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey,
-            },
-            2,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert!(apply_staking_op(&mut state, &undelegate_op, &chain_id).is_ok());
-        // Active delegation should now be 0
-        assert_eq!(state.delegations.total_delegated(&validator_id), 0);
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
     }
 
     #[test]
@@ -559,7 +737,7 @@ mod tests {
         let op = signed_op(
             StakingOpBody::Delegate {
                 validator_id,
-                amount_spark: 1_000_000,
+                bond_utxo_id: Bytes32::from([0x31; 32]),
                 delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
             },
             5,
@@ -568,7 +746,7 @@ mod tests {
         );
         let chain_id = state.chain_id.clone();
         assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id),
+            apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::StakingNonceInvalid {
                 expected: 1,
                 got: 5,
@@ -581,20 +759,13 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                amount_spark: 1_000_000,
-                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id).unwrap();
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x17);
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
         assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id),
+            apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::StakingNonceInvalid {
                 expected: 2,
                 got: 1,
@@ -611,7 +782,7 @@ mod tests {
         let op = signed_op(
             StakingOpBody::Delegate {
                 validator_id,
-                amount_spark: 1_000_000,
+                bond_utxo_id: Bytes32::from([0x32; 32]),
                 delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
             },
             1,
@@ -620,8 +791,106 @@ mod tests {
         );
         let chain_id = state.chain_id.clone();
         assert!(matches!(
-            apply_staking_op(&mut state, &op, &chain_id),
+            apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::StakingOpSignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn claim_rewards_creates_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0);
+        state
+            .delegations
+            .get_delegator_mut(&validator_id, &delegator_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK;
+
+        let op = signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey,
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        let before = state.utxos.len();
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 42).unwrap();
+        assert_eq!(state.utxos.len(), before + 1);
+    }
+
+    #[test]
+    fn claim_rewards_zeroes_pending_rewards() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0);
+        state
+            .delegations
+            .get_delegator_mut(&validator_id, &delegator_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK;
+        let op = signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey,
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 42).unwrap();
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_mut(&validator_id, &delegator_id)
+                .unwrap()
+                .pending_rewards,
+            0
+        );
+    }
+
+    #[test]
+    fn claim_rewards_below_dust_rejected() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0);
+        state
+            .delegations
+            .get_delegator_mut(&validator_id, &delegator_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK - 1;
+        let op = signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey,
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 42),
+            Err(StateError::InvalidStakingOp(_))
         ));
     }
 
@@ -643,7 +912,7 @@ mod tests {
             &state.chain_id,
         );
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id).unwrap();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
         assert_eq!(state.validators.get(&validator_id).unwrap().vrf_pk, Some(vrf_pk));
     }
 
@@ -673,9 +942,9 @@ mod tests {
             &state.chain_id,
         );
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id).unwrap();
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
         assert_eq!(
-            apply_staking_op(&mut state, &second, &chain_id),
+            apply_staking_op(&mut state, &second, &chain_id, 1),
             Err(StateError::ValidatorAlreadyRegistered)
         );
     }
