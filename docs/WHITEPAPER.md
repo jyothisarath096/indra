@@ -1,8 +1,7 @@
 # INDRA Protocol
-## A Post-Quantum Monetary Settlement Network
+## A Post-Quantum Blockchain for Monetary Settlement
 
-**Version 1.8 — Pre-release draft**
-**Bonkai and team**
+**Version 2.0 — Pre-mainnet technical specification**
 
 ---
 
@@ -15,33 +14,35 @@ in all major blockchain systems currently in production: the eventual
 susceptibility of elliptic-curve digital signatures to Shor's algorithm
 running on a cryptographically relevant quantum computer.
 
-INDRA implements NIST FIPS 204 (ML-DSA, parameter set Dilithium2)
-alongside classical Ed25519 in a hybrid signature scheme for all
-transactions, ensuring security under both classical and quantum threat
-models simultaneously. Consensus finality uses Dilithium2-only Quorum
-Certificates — fully post-quantum. Transaction amounts are confidential,
-secured by Pedersen commitments and Bulletproof range proofs.
+INDRA implements NIST FIPS 204 (ML-DSA-87, the highest security parameter
+set of CRYSTALS-Dilithium) alongside classical Ed25519 in a hybrid
+signature scheme for all transactions, ensuring security under both
+classical and quantum threat models simultaneously. Consensus finality
+uses ML-DSA-87-only Quorum Certificates — fully post-quantum. Validator
+transport is encrypted with hybrid X25519 + ML-KEM-1024 (NIST FIPS 203)
+key encapsulation. Transaction amounts are confidential, secured by
+Pedersen commitments and Bulletproof range proofs.
 
-**Important scope note:** INDRA transaction *ownership* and consensus
-*finality* are post-quantum secure. Transaction *amount confidentiality*
+**Important scope note:** INDRA transaction ownership and consensus
+finality are post-quantum secure. Transaction amount confidentiality
 uses classical Ristretto255 elliptic-curve cryptography — a known and
 acknowledged limitation documented in Section 7.3. A quantum adversary
 cannot steal funds or forge consensus, but could potentially determine
 hidden transaction amounts from historical data. This distinction is
 stated clearly here and not buried.
 
-The monetary policy is simple and immutable: one billion INDRA,
-all pre-minted at genesis and locked in a protocol reward reserve,
-released deterministically to validators through block rewards over
-approximately one hundred years. No new supply is ever created after
-genesis. No coins were pre-allocated to any person or entity. Every
-INDRA is earned by securing the network.
+The monetary policy is simple and immutable: one billion INDRA, all
+pre-minted at genesis and locked in a protocol reward reserve, released
+deterministically to validators through block rewards over approximately
+one hundred years. No new supply is ever created after genesis. No coins
+were pre-allocated to any person or entity. Every INDRA is earned by
+securing the network.
 
 INDRA is written entirely in Rust. All code is open source. The
 implementation has undergone preliminary internal review. A professional
-third-party security audit is required and planned before mainnet launch.
-This document is a pre-release technical specification, not a production
-deployment announcement.
+third-party security audit is required and planned before mainnet
+launch. This document is a pre-release technical specification, not
+a production deployment announcement.
 
 ---
 
@@ -59,9 +60,9 @@ verifiable for thirty to fifty years.
 
 All major blockchains in production use elliptic-curve cryptographic
 signatures. Bitcoin uses ECDSA on secp256k1. Ethereum uses the same.
-Most proof-of-stake networks use Ed25519 or BLS12-381. The security of
-these schemes depends on the computational hardness of the elliptic-curve
-discrete logarithm problem.
+Most proof-of-stake networks use Ed25519 or BLS12-381. The security
+of these schemes depends on the computational hardness of the
+elliptic-curve discrete logarithm problem.
 
 In 1994, Peter Shor published an algorithm demonstrating that a
 sufficiently capable quantum computer can solve the discrete logarithm
@@ -73,109 +74,104 @@ could be spent by an adversary without knowledge of the private key.
 ### 1.2 Uncertain but material timeline
 
 The timing of cryptographically relevant quantum computers remains
-genuinely uncertain. Current systems operate at 1,000 to 2,000 physical
-qubits with high error rates. Breaking ECDSA-256 is estimated to require
-thousands of stable logical qubits, accounting for error correction
-overhead — a threshold meaningfully beyond current hardware.
-
-IBM's published roadmap describes a path toward fault-tolerant quantum
-computing with progress expected through the 2030s, but exact capability
-timelines involve substantial technical uncertainty. Independent academic
-estimates vary considerably.
+genuinely uncertain. Current systems operate with high error rates and
+limited logical qubits. Breaking ECDSA-256 is estimated to require
+thousands of stable logical qubits with error correction — a threshold
+meaningfully beyond current hardware.
 
 What matters for infrastructure design is not predicting the exact date
 of the threat but recognising that monetary infrastructure has long
 migration timelines. A blockchain launched today will have users,
-institutional holders, and on-chain records in 2040. The prudent
-engineering response is to design for post-quantum security now, not to
-schedule a migration for when the threat becomes acute. Migrations of
-core cryptographic assumptions in widely deployed systems are slow,
+institutional holders, and on-chain records in 2040 and beyond. The
+prudent engineering response is to design for post-quantum security now,
+not to schedule a migration for when the threat becomes acute. Migrations
+of core cryptographic assumptions in widely deployed systems are slow,
 contentious, and frequently incomplete.
 
 ### 1.3 The NIST response
 
 The United States National Institute of Standards and Technology
 concluded its post-quantum cryptography standardisation process in
-August 2024 with the publication of three final standards: FIPS 203
-(ML-KEM), FIPS 204 (ML-DSA), and FIPS 205 (SLH-DSA). These are the
-first government-standardised post-quantum algorithms intended for
-general deployment.
+August 2024 with the publication of three final standards:
+
+- **FIPS 203** (ML-KEM) — key encapsulation
+- **FIPS 204** (ML-DSA) — digital signatures
+- **FIPS 205** (SLH-DSA) — hash-based signatures
 
 FIPS 204 (ML-DSA, based on CRYSTALS-Dilithium) specifies a digital
-signature algorithm whose security rests on the hardness of the
-Module Learning With Errors problem. This problem is believed to resist
-attack by both classical and quantum computers. The Dilithium2 parameter
-set provides 128-bit post-quantum security.
+signature algorithm whose security rests on the hardness of the Module
+Learning With Errors problem. This problem is believed to resist attack
+by both classical and quantum computers. INDRA implements ML-DSA at the
+highest security parameter set, ML-DSA-87, providing NIST security level
+5 — equivalent to 256-bit post-quantum security.
 
-INDRA implements FIPS 204 at the Dilithium2 parameter set for all
-transaction signatures. This is not a custom or experimental
-cryptographic construction — it is an implementation of a published
-government standard.
+FIPS 203 (ML-KEM) specifies a key encapsulation mechanism for hybrid
+encryption. INDRA uses ML-KEM-1024 for validator-to-validator transport
+encryption, combined with classical X25519.
+
+INDRA's cryptographic choices are implementations of published government
+standards, not custom or experimental constructions.
 
 ### 1.4 Why existing blockchains face migration difficulty
 
 Upgrading an existing blockchain's signature scheme requires changing
-the core cryptographic assumptions that every participant, smart
-contract, exchange integration, and institutional custody system was
-built around. For Bitcoin specifically, this would require a hard fork —
-a protocol change requiring genuine adoption by miners, node operators,
-economic participants, and the broader ecosystem. Bitcoin's history
-with hard forks (Bitcoin Cash, Bitcoin SV) illustrates the political
+the core cryptographic assumptions that every participant, exchange
+integration, and institutional custody system was built around. For
+Bitcoin, this would require a hard fork requiring genuine adoption by
+all economic participants. Bitcoin's history illustrates the political
 and technical difficulty of such changes.
 
-Additionally, Bitcoin has a specific structural vulnerability: coins
-held at pay-to-public-key (P2PK) addresses, including a substantial
-portion of early mining rewards, have their public keys directly exposed
-on-chain. These are vulnerable to quantum key derivation without any
-further transaction occurring.
-
 INDRA does not face a migration problem. Post-quantum signatures are
-the only signature scheme for transactions. The protocol was designed
-with this assumption from the beginning.
+the only signature scheme from genesis. The protocol was designed with
+this assumption from the beginning.
 
 ### 1.5 Design goals
-
-INDRA was designed to satisfy the following properties:
 
 1. **Post-quantum security for transaction ownership.** All transaction
    signatures must remain secure against quantum adversaries.
 
-2. **Amount confidentiality.** Transaction amounts must not be visible
-   to observers of the public blockchain under classical adversaries.
-   Post-quantum amount confidentiality is a known limitation and
-   future goal — see Section 7.3.
+2. **Post-quantum consensus finality.** All consensus signatures use
+   ML-DSA-87. Quorum certificates are fully post-quantum.
 
-3. **Monetary simplicity.** The supply schedule must be simple,
+3. **Post-quantum transport.** Validator-to-validator communication
+   uses ML-KEM-1024 for key encapsulation.
+
+4. **Amount confidentiality.** Transaction amounts must not be visible
+   to classical observers. Post-quantum amount confidentiality is a
+   known future goal — see Section 7.3.
+
+5. **Monetary simplicity.** The supply schedule must be simple,
    deterministic, and immutable — not subject to governance votes.
 
-4. **Absolute finality.** Transactions must reach irreversible
+6. **Absolute finality.** Transactions must reach irreversible
    settlement without probabilistic confirmation delays.
 
-5. **Open validator participation.** Anyone meeting the stake
-   requirement can secure the network, without permission or
-   identity verification.
+7. **Open validator participation.** Anyone meeting the stake
+   requirement can secure the network.
 
-6. **Mobile accessibility.** Delegation of stake must be possible
-   from low-cost smartphone hardware.
+8. **On-chain governance.** Protocol parameters adjustable by
+   validator supermajority through a cryptographically sound
+   commit-reveal mechanism.
 
 ---
 
 ## 2. Technical Architecture
 
-### 2.1 Overview
+### 2.1 Codebase overview
 
-INDRA is implemented in Rust. The workspace consists of:
+INDRA is implemented in Rust. The workspace:
 
 ```
 indra-crypto        Post-quantum and classical cryptography
 indra-bulletproofs  Zero-knowledge range proof implementation
 indra-core          Protocol types, serialisation, primitives
-indra-state         State machine, UTXO set, epoch logic
+indra-state         State machine, UTXO set, epoch logic, governance
 indra-consensus     BFT consensus, mempool, proposer election
-indra-network       P2P networking and gossip protocol
-indra-storage       Persistent block store and state snapshots
+indra-network       P2P networking and authenticated gossip
+indra-storage       Block store, state snapshots, epoch history
 indra-node          Node binary and JSON-RPC server
-indra-cli           Command-line wallet and validator tools
+indra-rpc           RPC handler and dispatch
+indra-cli           CLI wallet, stake manager, governance CLI
 indra-ffi           C-compatible FFI bridge for mobile wallets
 ```
 
@@ -186,100 +182,81 @@ Every INDRA transaction carries two signatures:
 **Ed25519 (classical):** 32-byte public key, 64-byte signature,
 128-bit classical security. Implemented via ed25519-dalek 2.x.
 
-**Dilithium2 / ML-DSA (post-quantum):** 1,312-byte public key,
-approximately 2,420-byte signature, 128-bit post-quantum security,
-NIST FIPS 204. Implemented via pqcrypto-dilithium 0.5.
+**ML-DSA-87 (post-quantum):** NIST FIPS 204, security level 5,
+approximately 256-bit post-quantum security. Public key: 2,592 bytes.
+Signature: approximately 4,627 bytes.
 
-Both signatures must verify for a transaction to be accepted. Under
-a classical adversary, Ed25519 provides the primary security guarantee.
-Under a quantum adversary capable of breaking Ed25519, Dilithium2
+Both signatures must verify for a transaction to be accepted. Under a
+classical adversary, Ed25519 provides the primary security guarantee.
+Under a quantum adversary capable of breaking Ed25519, ML-DSA-87
 provides the security guarantee. An adversary must break both
 simultaneously to forge a transaction.
 
-**Transaction size:** A typical INDRA confidential transaction carries
-approximately 5-6 KB of data, including both signatures (~3.8 KB),
-Bulletproof range proof (~674 bytes), UTXO commitments, and nullifiers.
-INDRA is a settlement network, not a high-frequency payment processor.
-Transaction sizes are acceptable for this use case. Mobile wallets do
-not sync full block history — they query their own UTXOs via RPC, so
-the signature size does not affect mobile user experience.
+The upgrade from the earlier Dilithium2 parameter set to ML-DSA-87
+(security level 5) was made during development to align with NIST's
+final FIPS 204 specification and achieve maximum post-quantum security.
 
-### 2.3 Consensus signatures — Dilithium2-only QCs
+### 2.3 Consensus signatures — ML-DSA-87 Quorum Certificates
 
-INDRA's consensus layer uses Dilithium2 (NIST FIPS 204) exclusively
-for Quorum Certificate verification. A QC is the cryptographic
-evidence that a supermajority of validators agreed on a block.
+INDRA's consensus layer uses ML-DSA-87 exclusively for Quorum
+Certificate verification. A QC is the cryptographic evidence that a
+supermajority of validators agreed on a block.
 
-Each QC contains one Dilithium2 signature per signing validator.
-Verification is O(n) in validator count. Benchmarked on Apple
-M-series hardware (single-threaded, release build):
+Each QC contains one ML-DSA-87 signature per signing validator.
+Verification is O(n) in validator count. BLS12-381 aggregate signatures
+were considered for their O(1) verification efficiency. They were
+deliberately removed because BLS12-381 is an elliptic-curve pairing,
+broken by Shor's algorithm. ML-DSA-87-only QCs make consensus finality
+fully post-quantum at the cost of linear verification time — the
+correct tradeoff for a conservative settlement network.
+
+### 2.4 Transport layer cryptography
+
+Validator-to-validator P2P connections use a hybrid key encapsulation:
 
 ```
-Validators   QC verify time   Per signature
-10           ~1ms             ~89µs
-50           ~4ms             ~98µs
-100          ~9ms             ~94µs
-150          ~13ms            ~88µs
-200          ~12ms            ~63µs
-
-Block time:             6,000ms
-QC overhead (150v):     ~13ms
-QC as % of block time:  0.13%
+Session key = X25519(ephemeral) + ML-KEM-1024(ephemeral)
+Encryption  = ChaCha20-Poly1305(session_key)
+Auth        = ML-DSA-87(validator_identity_key)
 ```
 
-QC verification consumes less than 0.15% of block time at the
-target validator set size. It is not a performance bottleneck.
-Production nodes may parallelise verification across cores for
-further reduction.
+Unknown peers are rejected at handshake. The transport provides
+forward secrecy under both classical and quantum adversaries.
 
-BLS12-381 aggregate signatures were considered during development
-for their O(1) verification efficiency. They were deliberately
-removed because BLS12-381 is an elliptic-curve pairing, broken by
-Shor's algorithm. Dilithium2-only QCs make consensus finality fully
-post-quantum at the cost of linear verification time — the correct
-tradeoff for a conservative settlement network.
-
-**Quantum security properties:**
+### 2.5 Quantum security summary
 
 | Component | Scheme | Quantum-safe |
 |-----------|--------|-------------|
-| Transaction signatures | Ed25519 + Dilithium2 | Yes (hybrid) |
-| QC finality proofs | Dilithium2 only | Yes |
+| Transaction signatures | Ed25519 + ML-DSA-87 | Yes (hybrid) |
+| QC finality proofs | ML-DSA-87 only | Yes |
+| Validator transport | X25519 + ML-KEM-1024 | Yes (hybrid) |
 | Block hashing | SHA-256 | Partial (Grover, 2x) |
-| Pedersen commitments | Ristretto255 | No (classical EC) |
+| Pedersen commitments | Ristretto255 | No (acknowledged) |
+| Bulletproof range proofs | Ristretto255 | No (acknowledged) |
 
-Transaction ownership and consensus finality are fully post-quantum.
-Amount confidentiality uses classical cryptography — this is an
-acknowledged limitation described in Section 7.3.
+Transaction ownership, consensus finality, and validator transport are
+fully post-quantum secure. Amount confidentiality uses classical
+cryptography — an acknowledged limitation described in Section 7.3.
 
-### 2.4 Confidential transactions
+### 2.6 Confidential transactions
 
-INDRA transaction amounts are hidden using Pedersen commitments on
-the Ristretto255 group:
+INDRA transaction amounts are hidden using Pedersen commitments on the
+Ristretto255 group:
 
 ```
 C = v·G + r·H
 ```
 
-where G and H are independent generators, v is the amount, and r
-is a randomly chosen blinding factor known only to the sender and
-receiver. The commitment perfectly hides v and is computationally
-binding against classical adversaries.
+where G and H are independent generators, v is the amount, and r is a
+randomly chosen blinding factor known only to the sender and receiver.
+The commitment perfectly hides v and is computationally binding against
+classical adversaries.
 
-Bulletproof range proofs alongside each output prove that the
-committed value lies in [0, 2^64) without revealing the value.
-Proof size is approximately 674 bytes. Proof generation on server
-hardware takes approximately 300-500ms.
+Bulletproof range proofs prove that each committed value lies in
+[0, 2^64) without revealing the value. Proof size is approximately
+674 bytes.
 
-**Mobile performance note:** Bulletproof generation on mobile
-devices has not yet been systematically benchmarked across
-representative hardware. For use cases where proof generation
-time is unacceptable, INDRA supports public (non-confidential)
-transactions that omit the Bulletproof entirely. Benchmarks
-across representative Android and iOS hardware will be published
-before mainnet.
-
-### 2.5 UTXO model
+### 2.7 UTXO model
 
 INDRA uses an Unspent Transaction Output model. Each UTXO represents
 a unit of value owned by a specific public key. Spending a UTXO
@@ -287,29 +264,66 @@ produces a nullifier recorded permanently on-chain. Double-spending
 is cryptographically impossible: once a nullifier exists, any
 transaction attempting to spend the same UTXO is rejected.
 
-### 2.6 BFT consensus
+UTXO entries use versioned encoding with schema migration support,
+ensuring compatibility across protocol upgrades without requiring
+chain state wipes.
 
-INDRA uses Tendermint-style Byzantine Fault Tolerant consensus.
+### 2.8 BFT consensus
+
+INDRA uses Tendermint-style Byzantine Fault Tolerant consensus with
+several enhancements:
 
 **Absolute finality:** Once a block is committed, it is final. No
 forks, no reorganisations.
 
-**Safety threshold:** The network tolerates up to one-third of
-total validator stake being Byzantine. Consensus requires 66.67%
-of total stake to agree on a block.
+**Safety threshold:** The network tolerates up to one-third of total
+validator stake being Byzantine. Consensus requires 66.67% of total
+stake to agree on a block.
 
-**Block time:** 6 seconds. Transactions reach irreversible
-settlement within one block period.
+**Block time:** 6 seconds. Transactions reach irreversible settlement
+within one block period.
 
 **VRF proposer election:** Block proposers are selected via a
-Verifiable Random Function keyed on the previous block hash,
-providing unpredictable but publicly verifiable leader election.
+Verifiable Random Function keyed on the previous block hash, providing
+unpredictable but publicly verifiable leader election.
 
-**Block pruning:** Validators run in pruned mode by default,
-retaining the last 50,000 blocks (~300 MB). The full state
-database (UTXO set, validator set) is always retained. Archive
-nodes (block explorers) retain all blocks. Validator history
-is recorded on all nodes, not only on the validator's own device.
+**Consensus stability fixes:** Three specific stability improvements
+were implemented during testnet operation:
+
+1. *Round synchronisation* — validators broadcast their current
+   consensus round in Status messages; validators that fall behind
+   due to restart or network disruption advance to match peers.
+
+2. *Vote safety persistence* — the highest round and step voted is
+   persisted to disk (`vote_safety.dat`) before each vote. On restart,
+   the validator skips past rounds it already voted in, preventing
+   equivocating votes that would cause peers to reject its participation.
+
+3. *Proposal-driven round advancement* — when a validator receives a
+   valid VRF-verified proposal for a higher round than its current
+   round, it advances immediately to process the proposal, preventing
+   round divergence from compounding over multiple restarts.
+
+These fixes were identified and resolved during testnet operation.
+
+**Block pruning:** Validators run in pruned mode by default, retaining
+the last 50,000 blocks. The full state database (UTXO set, validator
+set, governance state) is always retained via periodic snapshots.
+Archive nodes retain all blocks.
+
+### 2.9 State migration framework
+
+INDRA uses a versioned state encoding framework (`SCHEMA_VERSION`)
+that allows protocol upgrades without chain state wipes:
+
+- Every persisted struct carries a version byte
+- Decoders handle both old and new encodings
+- Migration functions transform existing state to new schema on startup
+- A `migration.log` records all migrations for operator audit
+- `indra_getSchemaInfo` RPC exposes current schema version and migration history
+
+The current schema version is 3. This framework is essential for
+mainnet deployments where state wipes are not acceptable.
 
 ---
 
@@ -317,163 +331,102 @@ is recorded on all nodes, not only on the validator's own device.
 
 ### 3.1 Supply model
 
-All one billion INDRA are created at the genesis block. No new
-supply is ever created after this point. The total supply can only
-decrease over time through transaction fee burn.
+All one billion INDRA are created at the genesis block. No new supply
+is ever created after this point. The total supply can only decrease
+over time through transaction fee burn.
 
 ```
 Hard cap:            1,000,000,000 INDRA
 Decimals:            8 (1 INDRA = 100,000,000 Spark)
 Post-genesis supply: Zero new INDRA ever created
-Supply direction:    Decreasing (fee burn)
+Supply direction:    Decreasing (fee burn only)
 ```
 
-The hard cap is enforced as a constitutional invariant in the
-protocol. Every block application asserts that total supply does
-not exceed one billion INDRA. This cannot be disabled by governance.
+The hard cap is enforced as a constitutional invariant in the protocol.
+Every block application asserts that total supply does not exceed one
+billion INDRA. This cannot be overridden by governance.
 
-### 3.2 Genesis allocation and the locked reserve mechanism
+### 3.2 Genesis allocation
 
 ```
 Validator Rewards Pool   1,000,000,000 INDRA   100%
-  All INDRA pre-minted at genesis, locked in protocol.
-  Released deterministically via block rewards over ~100 years.
-  Earned by whoever secures the network.
-  No pre-allocation to any person or entity.
 ```
 
-**How the locked reserve works:** The validator rewards pool is
-not held by any private key or multisig. All 1,000,000,000 INDRA
-exist in the protocol state from the genesis block. Block rewards
-are distributed automatically by the protocol code according to
-the immutable schedule: `block_reward_at_height(h)` returns the
-exact reward for each block, credited to the block proposer by the
-state machine. No human intervention is required or possible.
+All 1,000,000,000 INDRA exist in protocol state from the genesis block,
+locked in a reward reserve not controlled by any private key. Block
+rewards are distributed automatically by the state machine according
+to the immutable schedule. No human intervention is required or possible.
 
-This is identical in principle to Bitcoin's block subsidy, with
-the distinction that INDRA pre-mints all coins at genesis rather
-than creating new coins at each block. The economic effect is
-identical. No entity holds the private key to this reserve — it
-is distributed by code, not by custodians.
-
-Every INDRA must be earned by running infrastructure that secures
-the network. There is no foundation pre-mine, no team allocation,
-no investor reserve, and no operational bootstrap. The founders
-hold no pre-mined INDRA. Like all participants, they earn block
-rewards by running validator nodes.
-
-**Ecosystem sustainability:** The absence of a foundation pre-mine
-raises a legitimate question: how are audits, legal costs, and
-infrastructure funded? Honestly, these are funded by the founders
-from personal resources during the bootstrap phase, supplemented
-by voluntary ecosystem contributions and grants as the network
-matures. This is the same model Bitcoin followed. It is a real
-constraint and not a solved problem. The founding team's incentive
-alignment is direct: INDRA succeeds or they earn nothing. This
-is intentional.
+Every INDRA must be earned by running infrastructure that secures the
+network. There is no foundation pre-mine, no team allocation, no investor
+reserve. The founders hold no pre-mined INDRA. Like all participants,
+they earn block rewards by running validator nodes.
 
 ### 3.3 Block reward schedule
 
-Rewards are distributed from the locked reserve — not newly
-created supply. The reward per block follows a schedule of flat
-periods and halvings:
+Rewards are distributed from the locked reserve — not newly created
+supply. The reward per block follows a flat-then-halving schedule:
 
 ```
-Era 1  Year 1-4    ~11.89 INDRA/block    250,000,000 INDRA
-Era 2  Year 4-8    ~5.94 INDRA/block     125,000,000 INDRA
-Era 3  Year 8-16   ~2.97 INDRA/block     125,000,000 INDRA
-Era 4  Year 16-24  ~1.49 INDRA/block      62,500,000 INDRA
-Era 5+ Halves every 8 years thereafter
+Era    Period          Reward / block         Total released
+─────────────────────────────────────────────────────────────
+1      Year 1–4        11.892 INDRA           ~250,000,000 INDRA
+2      Year 4–8         5.946 INDRA           ~125,000,000 INDRA
+3      Year 8–16        2.973 INDRA           ~125,000,000 INDRA
+4      Year 16–24       1.486 INDRA            ~62,500,000 INDRA
+5+     Halves every 8 years thereafter
 ```
 
-Era 1 releases approximately 25% of the validator rewards pool
-over four years. This front-loading is deliberate: high early
-rewards attract validators during the critical bootstrap period.
+Era 1 releases approximately 25% of the total supply over four years.
+High early rewards attract validators during the bootstrap period.
+The reward schedule is immutable and cannot be changed by governance.
 
-**Early validator concentration:** With a small initial validator
-set, Era 1 rewards accrue to a small number of operators. This
-mirrors Bitcoin's early mining concentration — Satoshi mined a
-substantial fraction of early blocks before others joined. The
-design is intentional: early participants take the highest risk
-(unaudited software, no price, no liquidity) and earn the highest
-rewards. The schedule is fully public from genesis. Anyone can
-join from block 0 on equal terms.
-
-Early-stage block rewards are intentionally high to incentivise
-bootstrap participation. As the validator set grows, per-validator
-rewards normalise. Specific yield projections are not published
-as they depend on adoption variables outside the protocol's control.
+**Epoch rewards:** 300 blocks × 11.892 INDRA/block = 3,567.6 INDRA
+distributed per epoch (~30 minutes) during Era 1.
 
 ### 3.4 Fee model
 
 All transaction fees are split at the protocol level:
 
 ```
-50% burned permanently
-50% distributed to validators proportional to stake
+50%  burned permanently (reduces total supply)
+50%  distributed to active validators proportional to stake
 ```
 
-No treasury share. No governance share. As transaction volume
-grows, fee revenue supplements block rewards and net supply
-decreases.
+No treasury share. No governance allocation. As transaction volume
+grows, fee revenue supplements block rewards and net supply decreases.
 
-**Monetary dynamics:** In the early phase, circulating supply
-grows as the locked reserve releases block rewards. Total supply
-is hard-capped and can only decrease via fee burn. In a mature
-high-transaction phase, fee burn may exceed new circulation,
-making circulating supply net-deflationary. INDRA is positioned
-as a store of value, not a medium of exchange — deflationary
-pressure is an intentional design choice consistent with this
-positioning, not a flaw. Validators earn from both block rewards
-(fixed in INDRA terms) and fee revenue (grows with adoption).
-This two-component reward structure reduces reliance on either
-component alone.
+### 3.5 Validator set expansion
 
-### 3.5 Anti-concentration
-
-**Saturation is disabled below 20 active validators.**
-During the bootstrap phase, all validators receive full
-proportional rewards. This ensures the network can start
-correctly before saturation mechanics become meaningful.
-
-Above 20 validators, the saturation point is:
+The maximum active validator count grows automatically with total
+staked supply — not through governance votes:
 
 ```
-saturation_point = total_active_stake / active_validator_count
+Total staked          Max active validators
+< 1,000,000 INDRA     20 validators
+< 10,000,000 INDRA    50 validators
+< 50,000,000 INDRA    100 validators
+≥ 50,000,000 INDRA    200 validators
 ```
 
-Validators above the saturation point receive diminishing
-marginal rewards. This makes visible concentration economically
-inefficient.
-
-This mechanism does not prevent hidden coordination among
-operators who split stake across multiple validators. No protocol
-mechanism can fully prevent this without becoming identity-governed.
-The saturation curve reduces visible concentration and is
-complemented by transparency tooling in the wallet.
-
-### 3.6 No monetary governance
-
-INDRA has no on-chain governance for monetary parameters.
-Protocol changes occur through INDRA Improvement Proposals —
-public proposals, open debate, validator signalling, and genuine
-ecosystem consensus via software upgrade adoption. No single
-group can impose monetary changes.
+This ties decentralisation directly to economic security: more stake
+means more security, which safely supports more validators. The maximum
+is 200 validators, constrained by QC size requirements.
 
 ---
 
-## 4. Privacy Model and Compliance
+## 4. Privacy Model
 
 ### 4.1 Amount confidentiality
 
-INDRA hides transaction amounts. The sender, recipient, and
-transaction graph are visible on-chain (public keys are public).
-What is hidden is the specific amount transferred.
+INDRA hides transaction amounts. The sender, recipient public keys,
+and transaction graph are visible on-chain. What is hidden is the
+specific amount transferred.
 
-This provides meaningful privacy for legitimate financial
-activity under a classical adversary. It does not provide full
-anonymity — transaction graph analysis can still reveal
-relationships between addresses.
+This provides meaningful privacy for legitimate financial activity
+under a classical adversary. It does not provide full anonymity —
+transaction graph analysis can still reveal relationships between
+addresses.
 
 ### 4.2 What confidential transactions do not hide
 
@@ -482,15 +435,11 @@ relationships between addresses.
 - Transaction timing is public
 - The fact that a specific UTXO was spent is public
 
-### 4.3 Compliance and disclosure
+### 4.3 Compliance support
 
-INDRA supports optional view keys for selective disclosure to
-auditors, regulators, or exchanges. A public (non-confidential)
-transaction mode omits Bulletproof range proofs and reveals
-amounts in plaintext — for use with regulated intermediaries.
-
-Sanctions screening and anti-money-laundering obligations are
-handled at the application layer, as with Bitcoin and Ethereum.
+INDRA supports optional view keys for selective disclosure to auditors,
+regulators, or exchanges. Public (non-confidential) transactions omit
+Bulletproof range proofs and reveal amounts in plaintext.
 
 ---
 
@@ -498,274 +447,245 @@ handled at the application layer, as with Bitcoin and Ethereum.
 
 ### 5.1 Open participation
 
-Any entity can register as a validator. There is no permission
-process, no identity verification, no KYC, and no hard minimum
-stake requirement. Admission to the active consensus set is
-determined purely by stake ranking — the top N validators by
-total backing (own stake plus delegations) are active at any
-given epoch.
+Any entity can register as a validator. There is no permission process,
+no identity verification, and no hard minimum stake requirement.
+Admission to the active consensus set is determined purely by stake
+ranking — the top N validators by total backing (own stake plus
+delegations) are active at each epoch boundary.
 
-**No hard minimum stake.** The only floor is the dust limit
-(0.001 INDRA) to prevent spam registrations. The effective
-minimum to enter the active set is the stake of the lowest
-currently active validator — a market-determined number that
-adjusts automatically as the network grows.
-
-**Active set size grows with the network.** As more INDRA is
-staked, more validator slots open. This ties decentralisation
-directly to economic security: more stake = more security =
-safely support more validators.
-
-```
-Total staked    Max active validators
-< 1M INDRA      20 validators
-< 10M INDRA     50 validators
-< 50M INDRA     100 validators
-< 200M INDRA    200 validators
-< 500M INDRA    350 validators
-≥ 500M INDRA    500 validators
-```
-
-**How to join as a validator:**
-1. Register by staking any amount above the dust limit
+**Active set admission:**
+1. Register by self-staking any amount above the dust limit
 2. Attract delegation from INDRA holders to boost total backing
-3. At the next epoch boundary (~30 minutes): if your total
-   backing ranks in the top N, you enter the active set
-4. No application, no approval, no waiting list beyond stake ranking
+3. At the next epoch boundary (~30 minutes): if total backing ranks
+   in the top N, the validator enters the active set
 
-**Displacement:** If another validator accumulates more total
-backing than you, they may displace you from the active set at
-the next epoch reselection. You remain registered (waiting) —
-your stake is not returned or slashed. You can re-enter by
-gaining more delegation. This is stake competition, not
-punishment.
-
-**Genesis validators** are pre-registered in the genesis block
-and form the initial active set regardless of stake amount.
-They are the founding operators who bootstrap the chain.
+**Displacement:** If another validator accumulates more total backing,
+they may displace an incumbent at the next epoch reselection. The
+displaced validator remains registered — stake is not burned. They
+can re-enter by gaining more delegation.
 
 ### 5.2 Validator lifecycle
 
 ```
 REGISTERED → ACTIVE → UNBONDING → EXITED
-                    ↘ SLASHED (equivocation only)
+                    ↘ SLASHED
 ```
 
-**Registered:** Staked minimum, submitted registration. Enters
-active set at next epoch boundary.
+**Unbonding period:** 60 epochs (~30 hours). Stake cannot be
+redirected during unbonding.
 
-**Active:** Participates in consensus, proposes blocks when elected
-by VRF, earns block rewards and fee rewards.
+### 5.3 Auto-delegation for validators outside the active set
 
-**Unbonding:** 30-hour lock after undelegation. Cannot participate
-in consensus. Earned rewards remain claimable.
-
-**Exited:** Stake returned. May re-register anytime.
-
-**Slashed:** Double-signed (equivocation). 10% of stake burned.
-Forced exit from active set.
-
-### 5.3 Block proposer election
+Validators that run 24/7 but fall outside the active set at an epoch
+boundary earn no rewards for that epoch. To offset this, validators
+can designate a preferred `auto_delegate_to` target:
 
 ```
-proposer_seed = VRF_prove(previous_block_hash, validator_vrf_key)
-proposer       = weighted_selection(active_validators, proposer_seed)
+indra-stake auto-delegate --validator <id> --target <id>
 ```
 
-Selection weighted by stake. VRF output is publicly verifiable
-but unpredictable in advance.
+When a validator is not selected for the active set, their stake is
+soft-delegated to the target validator for that epoch's reward routing.
+The stake remains self-bonded — no UTXO movement or unbonding period is
+required. This is a pure reward routing mechanism, invisible to
+consensus, that allows 24/7 operators to earn delegator rewards even
+when outside the active set.
 
-### 5.4 Reward calculation
+### 5.4 Slashing
 
-**Block rewards** distributed at each epoch boundary (~30 min):
-
-```
-epoch_block_reward = 300 × block_reward_at_current_era
-
-validator_share = epoch_block_reward
-                × (validator_stake / total_active_stake)
-                × saturation_adjustment(...)
-```
-
-**Commission split:**
-```
-if no delegators:
-    validator_keeps = total_reward
-
-if delegators present:
-    commission    = total_reward × commission_rate
-    delegator_pool = total_reward - commission
-    each_delegator = delegator_pool × (delegator_stake / total_delegated)
-```
-
-All reward distribution is automatic. Validators cannot
-intercept, delay, or redirect delegator rewards.
-
-### 5.5 Slashing
-
-INDRA's slashing model is deliberately minimal. Only intentional
-equivocation results in stake being burned.
+INDRA's slashing model is deliberate and minimal.
 
 ```
-Offence                  Penalty           Notes
-────────────────────────────────────────────────────────────────
-Miss block as proposer   Lost reward only  Not punished.
-Offline (any duration)   No rewards        Stake never burned.
-                         while offline     Come back → earn again.
-Double-signing a block   10% of stake      Intentional malicious
-(equivocation)           burned            act. Forced exit.
+Offence                      Penalty            Notes
+──────────────────────────────────────────────────────────
+Miss block as proposer       Lost reward only   Not slashed
+Offline (any duration)       No rewards         Stake never burned
+Liveness failure (3+ epochs  0.10% per epoch    After threshold
+  without participation)
+Double-precommit             5.00% of stake     Slashed and exited
+Equivocating surround vote   10.00% of stake    Slashed and exited
+Self-reported equivocation   1.00% of stake     Grace period: 5 epochs
+Reporter reward              5.00% of slash     Paid to reporter
 ```
 
-**Philosophy:** Earn when you work, nothing when you don't.
-No stake is burned for being offline — ever. A validator who
-runs four hours per day earns proportionally to those hours.
-Infrastructure failures are not punished. Only deliberate
-betrayal of consensus is slashed.
+**Liveness:** After 3 consecutive epochs without participation, a
+validator incurs a 0.10% per-epoch penalty. This is the only ongoing
+penalty for offline behaviour — stake is never burned for downtime alone.
 
-This follows Bitcoin's model and explicitly rejects the
-centralisation pressure of punitive downtime slashing.
+**Double-signing:** Only intentional equivocation (signing two different
+blocks at the same height and round) results in meaningful stake burn.
+The 5% double-precommit slash and 10% surround-vote slash apply
+immediately upon detection. Evidence must be included in a block by
+another validator.
 
-**Validator portability:** A validator's identity is derived
-deterministically from their 24-word recovery phrase. Moving
-to new hardware requires only entering the phrase — same
-validator ID, same stake, same history. No registration process.
-No downtime penalty for hardware transitions.
+**Self-reporting:** A validator who discovers their key was compromised
+can self-report within 5 epochs, incurring only a 1% penalty rather
+than the full equivocation slash. This incentivises honest key
+management disclosure.
 
-**Key architecture (v1):** Consensus signing key and wallet key
-are derived from the same phrase using domain-separated derivation.
-Key separation (hot consensus key vs cold withdrawal key,
-following the Ethereum model) is planned for a future version
-before mainnet stake reaches significant value.
+**Philosophy:** Earn when you work, nothing when you don't. No stake
+is burned for being offline — only for deliberate betrayal of consensus.
 
-**Delegator slashing:** Delegators share in slashing proportional
-to their delegation. Choose validators with no equivocation history.
-
-### 5.6 Anti-concentration
-
-**Saturation mechanism (soft nudge, not enforcement):**
-Above 20 active validators, rewards are subject to a saturation
-curve:
+### 5.5 Delegation
 
 ```
-saturation_point = total_active_stake / active_validator_count
-Below saturation: 100% reward efficiency
-Above saturation: efficiency = saturation_point / validator_stake
+Minimum delegation:    Dust limit (0.001 INDRA protocol floor)
+                       Each validator sets their own minimum above this
+Unbonding period:      60 epochs (~30 hours)
+Commission range:      0–20% (maximum governable, can only decrease)
+Reward frequency:      Each epoch (~30 minutes)
+Key custody:           Delegator retains full custody always
 ```
 
-This makes visible stake concentration economically inefficient.
-It does not prevent Sybil splitting — a sophisticated actor can
-operate multiple validators under different identities and bypass
-the curve. This is acknowledged. No on-chain mechanism can solve
-Sybil without becoming identity-governed, which INDRA rejects.
-The saturation curve deters lazy concentration; transparency
-tooling in the wallet complements it for sophisticated actors.
+Delegation is non-custodial. The validator cannot spend, redirect,
+or access delegated funds. Commission is deducted automatically by
+the protocol. Rewards accumulate in `pending_rewards` each epoch
+and are claimable at any time.
 
-**Dynamic active set as the primary anti-concentration mechanism:**
-The more meaningful protection is the stake-ranked active set
-itself. As the network grows, more validator slots open (up to
-500 at full maturity). Delegation allows community participants
-to collectively boost smaller validators into the active set,
-providing an organic check on concentration that no fixed
-mechanism can replicate.
-
-**QC size limits:**
-Maximum QC signers: 500 validators
-Maximum QC size: ~1.2 MB (500 × ~2,420 bytes)
-Within the 2 MB protocol limit.
-Verification time at 500 validators: ~50ms (0.8% of block time).
-
-### 5.7 Delegation — earning yield from any device
-
-```
-Minimum delegation:     Dust limit (0.001 INDRA protocol floor)
-                        Each validator sets their own minimum above this
-                        Default: no minimum (accept any amount)
-Maximum delegation:     No limit
-Unbonding period:       30 hours
-Commission range:       0-20% (set by each validator)
-Reward frequency:       Each epoch (~30 minutes)
-Key custody:            Delegator retains full custody always
-```
-
-**Delegation boosts validators into the active set.**
-A small validator with many delegators can have higher total
-backing than a large self-staking operator. The community can
-collectively vote validators in and out of the active set
-simply by choosing where to delegate. This is the most
-powerful decentralisation mechanism in the protocol — no
-governance vote, no permission, just economic signal.
-
-**Delegation is non-custodial.** The validator cannot spend,
-redirect, or access delegated funds. Delegation is a cryptographic
-instruction to the protocol — not a transfer of custody.
-
-**Rewards are automatic.** Protocol distributes at each epoch.
-Validators cannot intercept or redirect delegator rewards.
-Commission is deducted by the protocol automatically.
-
-**Split delegation supported.** Delegators can split across
-multiple validators to spread risk and support decentralisation.
-
-**Commission changes prospective.** Changes apply from next
-epoch only. Current epoch uses previously advertised rate.
-
-**Undelegation:** 30-hour unbonding. No rewards during unbonding.
-Funds return automatically after unbonding completes.
-
-INDRA is designed so that, if adoption and liquidity emerge,
-delegation can be accessible from low-cost mobile devices.
-Whether this becomes practically meaningful depends on factors
-outside the protocol's control: token price, validator reliability,
-wallet availability, and local regulatory treatment of staking.
+**Delegator reward query:** The `indra_getDelegatorPositions` and
+`indra_getDelegatorRewards` RPC methods allow any delegator to query
+their positions and pending rewards across all validators in a single
+call, without knowing which validators they have delegated to in advance.
 
 ---
 
-## 6. Target Context
+## 6. On-Chain Governance
 
-### 6.1 Store of value
+### 6.1 Overview
 
-INDRA's primary purpose is a quantum-safe store of value:
-fixed supply (decreasing via fee burn), post-quantum durability,
-global portability (6-second settlement), 8 decimal places.
+INDRA implements a five-phase commit-reveal governance mechanism with
+two-snapshot vote weight accounting. Governance allows the validator
+community to adjust protocol parameters within defined bounds.
+Monetary parameters (hard cap, era reward schedule) and safety
+parameters (consensus quorum) are permanently immutable.
 
-For holders considering a long-term digital asset, the quantum
-vulnerability of classical blockchain signatures is a real,
-uncertain-timeline risk. INDRA is designed to address this risk
-for transaction ownership. Amount confidentiality under quantum
-adversaries is not yet addressed — see Section 7.3.
+### 6.2 Five-phase governance lifecycle
 
-### 6.2 Settlement and remittances
+```
+Phase 1  DELIBERATION   30 epochs  (~15 hours)
+  Proposal published on-chain. Community discusses.
+  SNAPSHOT 1 taken at end of Phase 1.
+  Captures eligible validators and their stake.
 
-6-second irreversible settlement with confidential amounts and
-low fees. India receives approximately $125 billion in remittances
-annually through services charging 2-5% with 1-3 day settlement.
-INDRA's settlement economics are more favourable on both dimensions
-if an adoption ecosystem emerges — which is not guaranteed.
+Phase 2  COMMIT         20 epochs  (~10 hours)
+  All Snapshot 1 eligible validators MUST submit:
+    hash(vote_byte || nonce_32_bytes)
+  Their vote is hidden. Missing commit = abstain.
 
-Financial privacy for remittances reflects a legitimate interest
-in personal financial privacy, not regulatory evasion.
+Phase 3  REVEAL         10 epochs  (~5 hours)
+  All who committed MUST reveal (vote_byte, nonce).
+  Votes become public. Non-reveal = deposit burned + abstain.
+  Delegators who disagree may governance-redelegate their
+  vote weight to a different validator.
+  SNAPSHOT 2 taken at end of Phase 3.
 
-### 6.3 South Asia and mobile access
+Phase 4  TALLY          1 epoch    (automatic)
+  Final count: Snapshot 1 votes × Snapshot 2 stake weights.
+  Non-committed validators count as abstain in denominator.
+  Non-revealed validators count as abstain, deposit burned.
 
-India, Pakistan, Bangladesh, and Sri Lanka together have over
-one billion smartphone users, many without access to traditional
-yield-bearing financial instruments. INDRA's delegation model
-is designed to be accessible from mobile hardware.
+Phase 5  EXEC DELAY     100 epochs (~50 hours, governable)
+  If passed: parameter change queued.
+  Executes automatically at next epoch boundary.
+```
 
-The practical realisation depends on exchange liquidity, wallet
-availability, regulatory clarity, and ecosystem maturity —
-conditions that do not currently exist and cannot be promised.
-The protocol architecture supports mobile delegation. The
-ecosystem required to make it practically useful is the work
-of the phases below.
+**Total governance cycle:** ~160 epochs (~80 hours) from proposal to
+execution under default parameters.
 
-### 6.4 Government records (future stage)
+### 6.3 Two-snapshot mechanism
 
-INDRA's UTXO model and nullifier mechanism make double-selling
-cryptographically impossible. This has application to land
-registry and procurement records. This requires substantial
-policy design work and is a future stage, not a current
-capability. The technical foundation is in place.
+**Snapshot 1** (end of Phase 1): Captures which validators are eligible
+to vote and their stake at that point. Prevents late stake manipulation
+to influence validator eligibility.
+
+**Snapshot 2** (end of Phase 3): After governance redelegation, captures
+the final stake weight applied to each validator's vote. Delegators who
+disagree with their validator's revealed vote can shift their weight to
+a different validator during Phase 3.
+
+**Vote count:** `yes_stake / snapshot1_total_stake > quorum_bps / 10000`
+
+Snapshot 1 total stake is the denominator for all quorum calculations,
+including abstains. Abstentions cannot be manufactured by non-participation.
+
+### 6.4 Governance redelegation
+
+During Phase 3, after validator votes are revealed, delegators may
+submit a `GovernanceRedelegate` operation to shift their vote weight
+to a different validator for this proposal only:
+
+- Moves vote WEIGHT only — no UTXO movement, no unbonding period
+- Only delegators (not self-staking validators) may redelegate
+- One redelegation per delegator per proposal
+- Only to a validator who has already revealed their vote
+- Weight capped by actual delegated stake
+- Evaporates after proposal resolves — real delegation unchanged
+
+This gives delegators a genuine voice in governance outcomes without
+requiring the unbonding period that would make delegation-based voting
+impractical.
+
+### 6.5 Proposal tiers
+
+**Tier 1 — Standard** (50% of Snapshot 1 stake required):
+- `slash_liveness_threshold_epochs` — consecutive epochs before liveness penalty
+- `min_delegation_spark` — global delegation dust floor
+- `proposal_deposit_spark` — governance proposal deposit amount
+
+**Tier 2 — Critical** (67% of Snapshot 1 stake required):
+- `slash_liveness_bps` — liveness penalty rate (floor: 1 BPS)
+- `slash_double_precommit_bps` — double-precommit slash rate
+- `slash_surround_vote_bps` — surround-vote slash rate
+- `max_commission_bps` — maximum validator commission (monotonic decrease only)
+- `governance_delay_epochs` — execution delay (monotonic increase only)
+- `governance_quorum_bps` — standard quorum threshold (monotonic increase only)
+- `governance_critical_quorum_bps` — critical quorum threshold (monotonic increase only)
+
+### 6.6 Permanently immutable parameters
+
+The following are enforced immutable in code and cannot be changed by
+any governance action regardless of support level:
+
+- `HARD_CAP_SPARK` — 1,000,000,000 INDRA maximum supply
+- Era block reward schedule — halving schedule
+- `CONSENSUS_QUORUM_BPS` — 66.67% BFT safety threshold
+- `max_active_validators` — automatic per stake phases
+- Cryptographic algorithms (ML-DSA-87, ML-KEM-1024)
+
+### 6.7 Monotonic constraints
+
+- `max_commission_bps` — can only **decrease** (protects existing delegators)
+- `governance_delay_epochs` — can only **increase** (protects community reaction time)
+- `governance_quorum_bps` — can only **increase** (harder to pass = safer)
+- `governance_critical_quorum_bps` — can only **increase**
+
+These constraints are enforced at proposal validation time. A proposal
+that violates a monotonic constraint is rejected at submission.
+
+### 6.8 Spam protection
+
+```
+Proposal deposit:           1,000 INDRA
+Deposit return:             If ≥10% of Snapshot 1 stake supports
+Deposit burned:             If <10% support OR non-reveal penalty
+Max active proposals:       3 globally
+Per-proposer limit:         1 active proposal at any time
+Cooldown:                   1 new proposal per proposer per 10 epochs
+```
+
+### 6.9 Default governance parameters
+
+```
+Standard quorum:            50.00% of Snapshot 1 stake
+Critical quorum:            67.00% of Snapshot 1 stake
+Execution delay:            100 epochs (~50 hours)
+Proposal deposit:           1,000 INDRA
+Max commission:             20% (may only decrease via governance)
+Liveness threshold:         3 epochs
+Liveness penalty:           0.10% per epoch
+Double-precommit slash:     5.00%
+Surround-vote slash:        10.00%
+```
 
 ---
 
@@ -773,86 +693,52 @@ capability. The technical foundation is in place.
 
 ### 7.1 Development status
 
-INDRA is a pre-mainnet protocol. Implementation is complete:
-35 test suites, zero failures, zero compiler warnings, zero
-lint errors. Running on a private four-node testnet. Not yet
-subjected to public adversarial conditions.
+INDRA is a pre-mainnet protocol. A four-validator testnet has been
+running continuously producing blocks with full consensus, epoch
+transitions, governance state, and epoch history recording. The
+protocol has not yet been subjected to public adversarial conditions.
+
+Test coverage: 662 unit and integration tests across 11 crates, zero
+failures.
 
 ### 7.2 Security review status
 
-The implementation has undergone preliminary internal review.
-An independent security review was conducted prior to this
-publication. A professional third-party audit by an independent
-security firm is required and planned before mainnet launch.
-The audit report will be published in full.
+The implementation has undergone preliminary internal review. A
+professional third-party security audit by an independent firm is
+required and planned before mainnet launch. The audit report will
+be published in full.
 
-Unit tests catch implementation bugs. They are not a substitute
-for fuzzing, adversarial testnet conditions, formal verification,
-or professional cryptographic review. None of these have yet
-occurred.
+Unit tests catch implementation bugs. They are not a substitute for
+fuzzing, adversarial testnet conditions, formal verification, or
+professional cryptographic review. None of these have yet occurred.
 
 ### 7.3 Known limitations
 
-**Amount confidentiality is not post-quantum.** This is stated
-in the Abstract and repeated here for clarity. INDRA protects
-fund *ownership* and consensus *finality* against quantum
-adversaries. It does not protect transaction *amounts* against
-a quantum adversary. Ristretto255 Pedersen commitments are
-quantum-vulnerable. A sufficiently capable quantum computer
-could determine historical transaction amounts. This does not
-enable theft of funds. Post-quantum commitment schemes exist
-but are not yet standardised for deployment. This limitation
-will be addressed in a future protocol version as the field
-matures.
+**Amount confidentiality is not post-quantum.** INDRA protects fund
+ownership and consensus finality against quantum adversaries. It does
+not protect transaction amounts against a quantum adversary. Ristretto255
+Pedersen commitments are quantum-vulnerable. A sufficiently capable
+quantum computer could determine historical transaction amounts. This
+does not enable theft of funds. Post-quantum commitment schemes exist
+but are not yet standardised for deployment. This will be addressed in
+a future protocol version.
 
-**Bulletproof generation on mobile is unbenchmarked.** Proof
-generation on server hardware takes 300-500ms. Performance on
-low-end Android devices common in target markets (Moto G,
-Redmi, etc.) has not been measured. Preliminary estimates
-suggest 2-5 seconds on mid-range hardware. For users where
-this is unacceptable, public (non-confidential) transactions
-are available. Systematic mobile benchmarks will be published
-before mainnet.
+**Bulletproof generation on mobile is unbenchmarked.** Proof generation
+on server hardware takes 300–500ms. Performance on low-end devices has
+not been systematically measured. Public (non-confidential) transactions
+are available for use cases where proof generation time is unacceptable.
+Benchmarks will be published before mainnet.
 
-**Early validator concentration.** Era 1 releases 250 million
-INDRA over four years. With a small initial validator set,
-rewards concentrate among early participants. This is
-intentional and mirrors Bitcoin's early mining concentration.
-Early validators take the highest risk and earn the highest
-rewards. The schedule is public from genesis — anyone can
-join from block 0.
+**No smart contracts.** INDRA is a settlement layer. This is a
+deliberate design choice.
 
-**Economic security model (structural):**
-An attack on INDRA requires controlling more than one-third of
-total staked supply. At any given token price P:
+**Public testnet not yet launched.** A minimum three-month public
+testnet with open validator participation is required before mainnet.
 
-```
-Attack cost = 34% × total_staked_INDRA × P
-Attacker's stake slashed: 10% of their stake if detected
-
-Example (illustrative, no price assumed):
-  10M INDRA staked → attack requires 3.4M INDRA
-  100M INDRA staked → attack requires 34M INDRA
-  500M INDRA staked → attack requires 170M INDRA
-```
-
-The cost of attack scales directly with total staked supply and
-token price. A formal economic security analysis with attack
-cost vs. maximum extractable value will be published with the
-security audit before mainnet.
-
-**No smart contracts.** INDRA is a settlement layer. This
-is a deliberate design choice, not a roadmap item.
-
-**Public testnet not yet launched.** Consensus bugs often
-emerge at scale under adversarial conditions. A four-node
-private testnet cannot surface them. A minimum three-month
-public testnet with open validator participation is required
-before mainnet.
-
-**Key separation not yet implemented.** v1 uses a unified
-key derived from the 24-word phrase. Hot/cold key separation
-is planned before mainnet stake reaches significant value.
+**Key separation not yet implemented.** The current implementation
+uses a unified key derived from a 24-word recovery phrase. Hot/cold
+key separation (hot consensus key, cold withdrawal key) is planned
+before mainnet stake reaches significant value.
 
 ---
 
@@ -862,162 +748,272 @@ is planned before mainnet stake reaches significant value.
 CPU:      2 cores (any modern processor, 2015 or newer)
 RAM:      4 GB minimum / 8 GB recommended
 Storage:  10 GB free minimum (pruned mode, default)
-          500 GB+ for archive nodes (block explorers)
+          1 TB+ for archive nodes
 Network:  10 Mbps stable upload and download
-          Port 30303 open for P2P
+          Ports 30303 (P2P) and 30304 (observer) open
           Static IP recommended but not required
 Uptime:   No minimum — validators earn proportional to uptime
-          No penalty for being offline
+          No slash penalty for offline (lost rewards only)
 OS:       macOS 12+, Ubuntu 20.04+, Windows 10+ (64-bit)
 ```
 
-Default (pruned) mode retains the last 50,000 blocks (~300 MB)
-plus the state database (~200 MB). Validator history is stored
-on all network nodes — not only on the validator's own device.
-A validator can move to new hardware, re-enter their 24-word
-phrase, resync from the network, and resume with the same
+Default (pruned) mode retains the last 50,000 blocks (~300 MB) plus
+the state database (UTXO set, validator set, governance state,
+epoch history). A validator can move to new hardware, re-enter their
+24-word phrase, resync from the network, and resume with the same
 identity and full history intact.
 
 ---
 
-## 8. Roadmap
+## 8. JSON-RPC Interface
+
+INDRA nodes expose a JSON-RPC 2.0 endpoint. Key methods:
+
+```
+Chain queries
+  indra_getChainInfo         Chain height, supply, validators, fees
+  indra_getBlock             Full block by height
+  indra_getTip               Current tip hash and height
+  indra_getMempoolSize       Pending transaction count
+
+Validator queries
+  indra_getValidatorSet      All active validators
+  indra_getValidator         Single validator by ID
+  indra_getValidatorSelfStake   Self-stake bonds
+  indra_getValidatorAutoDelegate Auto-delegation target
+  indra_getValidatorDelegators  All delegators to a validator
+
+Delegator queries
+  indra_getDelegatorPositions   All positions across all validators
+  indra_getDelegatorRewards     Pending rewards across all validators
+  indra_getDelegations          Delegations to a specific validator
+
+Epoch history
+  indra_getEpochRecord       Full record for one epoch
+  indra_getEpochHistory      Paginated epoch summaries
+  indra_getLatestEpoch       Most recently completed epoch
+
+Governance
+  indra_getGovernanceParams  Current governable parameters
+  indra_getProposals         All active and recent proposals
+  indra_getProposal          Full proposal detail
+  indra_getProposalVotes     Per-validator vote breakdown
+  indra_getGovernanceNonce   Governance replay-protection nonce
+  indra_submitGovernanceOp   Submit a governance operation
+
+Schema
+  indra_getSchemaInfo        Schema version and migration history
+
+Submission
+  indra_sendTransaction      Submit a transaction
+  indra_submitStakingOp      Submit a staking operation
+  indra_getBalance           UTXO balance for an address
+  indra_getUtxos             UTXOs for an address
+  indra_getStakingNonce      Replay-protection nonce for staking ops
+  indra_getPeers             Connected validator and observer peers
+```
+
+---
+
+## 9. Roadmap
 
 Milestones, not dates. Each milestone completes before the next.
 
-**Phase 1 — Protocol implementation (current)**
-Core protocol in Rust, post-quantum hybrid signatures,
-Dilithium2-only QC consensus, confidential transactions,
-BFT consensus, v7.1 economics, block pruning, CLI tooling,
-iOS wallet with Rust FFI bridge, 35 test suites passing.
+**Phase 1 — Protocol implementation (complete)**
+Core protocol in Rust, ML-DSA-87 hybrid signatures, ML-DSA-87-only
+QC consensus, hybrid PQ transport (X25519 + ML-KEM-1024), confidential
+transactions, BFT consensus with stability fixes, UTXO delegation,
+auto-delegation, five-phase commit-reveal governance, epoch history,
+state migration framework, CLI tooling (stake + governance), JSON-RPC,
+662 tests passing, four-validator private testnet running.
 
 **Phase 2 — Public testnet**
-Private testnet stable with four validators. Public bootstrap
-nodes in at least three geographic regions. Public testnet
-open to all validators. Testnet faucet. Public block explorer.
-Android wallet. Node setup application. Minimum three months
-sustained public testnet before proceeding.
+Public bootstrap nodes in multiple geographic regions. Public testnet
+open to all validators. Testnet faucet. Public block explorer. iOS
+TestFlight release. Android wallet. Minimum three months sustained
+public testnet before proceeding.
 
 **Phase 3 — Audit and hardening**
-Professional security audit by independent firm. All findings
-resolved and published. Fuzz testing of codec, state machine,
-and cryptographic operations. Network stress testing. Mobile
-Bulletproof benchmarks published. Economic security analysis
-published. Hot/cold key separation implemented.
+Professional security audit by independent firm. All findings resolved
+and published. Fuzz testing. Network stress testing. Mobile Bulletproof
+benchmarks published. Economic security analysis published. Hot/cold
+key separation implemented.
 
 **Phase 4 — Mainnet**
-Reproducible genesis ceremony with publicly verifiable genesis
-hash. Bootstrap nodes operational. Wallets available on App
-Store and Play Store. Block explorer live. IIP process open.
+Reproducible genesis ceremony with publicly verifiable genesis hash.
+Bootstrap nodes operational. DNS seeds live. Wallets available on
+App Store and Play Store. Block explorer live.
 
 **Phase 5 — Ecosystem**
-Exchange integrations as demand warrants. TypeScript SDK.
+Exchange integrations as demand warrants. SDK releases.
 Government record pilot design. Academic partnerships.
 
 ---
 
-## 9. Team
+## 10. Team
 
-INDRA Protocol was designed and built by Bonkai and a small
-team of engineers. The code is public and the design has been
-examined independently.
+INDRA Protocol was designed and built by Jyothi Sarath Kolaparthi
+(Buddhi) and a small team of engineers. The code is public and the
+design has been examined internally.
 
-The founders hold no pre-mined INDRA. There is no team
-allocation, no foundation reserve, and no operational bootstrap.
-The founders earn INDRA the same way as every other participant:
-by running validator nodes. This is encoded in the protocol —
-the genesis block contains no pre-mine.
+The founders hold no pre-mined INDRA. There is no team allocation,
+no foundation reserve, and no operational bootstrap. The founders
+earn INDRA the same way as every other participant: by running
+validator nodes. This is encoded in the protocol — the genesis block
+contains no pre-mine.
 
-A protocol's security derives from its mathematical properties
-and open-source implementation, not from the credentials of
-its creators.
+A protocol's security derives from its mathematical properties and
+open-source implementation, not from the credentials of its creators.
 
 Contact: indraprotocol@protonmail.com
 Repository: github.com/jyothisarath096/indra
 
 ---
 
-## 10. Technical Appendix
+## 11. Technical Appendix
 
 ### A. Cryptographic primitives
 
-| Primitive | Use | Security | Quantum-safe | Library |
+| Primitive | Use | Security | Quantum-safe | Standard |
 |-----------|-----|----------|-------------|---------|
-| Ed25519 | Tx classical sig | 128-bit | No | ed25519-dalek 2.x |
-| Dilithium2/ML-DSA | Tx PQ sig | 128-bit PQ | Yes | pqcrypto-dilithium 0.5 |
-| Dilithium2/ML-DSA | QC finality sigs | 128-bit PQ | Yes | pqcrypto-dilithium 0.5 |
-| Pedersen/Ristretto255 | Amount hiding | Classical only | No (acknowledged) | curve25519-dalek 4.x |
-| Bulletproofs | Range proofs | Classical only | No (acknowledged) | indra-bulletproofs |
-| SHA-256 | Hashing | 128-bit* | Partial | sha2 |
-| VRF/Ed25519 | Proposer election | 128-bit | No | custom |
-| BLS12-381 | (removed from consensus) | — | — | — |
+| Ed25519 | Transaction classical sig | 128-bit | No | RFC 8032 |
+| ML-DSA-87 | Transaction PQ sig | Level 5 (~256-bit PQ) | Yes | NIST FIPS 204 |
+| ML-DSA-87 | QC finality sigs | Level 5 | Yes | NIST FIPS 204 |
+| ML-DSA-87 | Staking op sigs | Level 5 | Yes | NIST FIPS 204 |
+| ML-DSA-87 | Governance op sigs | Level 5 | Yes | NIST FIPS 204 |
+| ML-KEM-1024 | Transport key encap | Level 5 | Yes | NIST FIPS 203 |
+| X25519 | Transport classical ECDH | 128-bit | No | RFC 7748 |
+| ChaCha20-Poly1305 | Transport encryption | 256-bit | Partial | RFC 8439 |
+| Ristretto255 | Amount hiding (Pedersen) | 128-bit classical | No | draft-irtf-cfrg |
+| Bulletproofs | Range proofs | 128-bit classical | No | IEEE S&P 2018 |
+| SHA-256 | Hashing | 128-bit* | Partial | FIPS 180-4 |
+| VRF/Ed25519 | Proposer election | 128-bit | No | draft-irtf-cfrg-vrf |
 
-*Grover's algorithm reduces SHA-256 effective security to ~64-bit
-under a quantum adversary. Considered acceptable at this parameter size.
+*Grover's algorithm reduces SHA-256 effective security to ~64-bit under
+a quantum adversary. Considered acceptable at current parameter sizes.
 
-### B. Protocol constants (v7.1)
-
-```
-Hard cap:                   1,000,000,000 INDRA
-Spark per INDRA:            100,000,000 (8 decimals)
-Block time:                 6 seconds
-Blocks per year:            5,256,000
-Epoch duration:             300 blocks (~30 minutes)
-Consensus quorum:           66.67% of total stake
-BFT safety threshold:       <33.33% Byzantine stake
-Min validator stake:        None (dust limit only: 0.001 INDRA)
-                            Active set admission by stake ranking
-Effective min stake:        Lowest active validator's total backing
-                            (market-determined, updates each epoch)
-Max active validators:      20 → 50 → 100 → 200 → 350 → 500
-                            (grows with total staked supply)
-Min delegation:             Dust limit (validator sets own floor)
-Unbonding period:           30 hours
-Default prune window:       50,000 blocks (~300 MB)
-Era 1 block reward:         ~11.89 INDRA/block
-Era 1 duration:             4 years (21,024,000 blocks)
-Era 2 duration:             4 years
-Era 3+ duration:            8 years per era
-Fee burn:                   50% of all fees
-Fee to validators:          50% of all fees
-Slash — double sign:        10% of stake
-Slash — offline:            No penalty (lost rewards only)
-Saturation threshold:       Active when validators > 20
-                            saturation_point = total_stake / active_count
-```
-
-### C. QC verification benchmark
-
-Measured on Apple M-series hardware, single-threaded, release build:
+### B. Protocol constants
 
 ```
-Validators   Total time   Per signature
-10           ~1ms         ~89µs
-50           ~4ms         ~98µs
-100          ~9ms         ~94µs
-150          ~13ms        ~88µs
-200          ~12ms        ~63µs
+Hard cap:                    1,000,000,000 INDRA
+Spark per INDRA:             100,000,000 (8 decimal places)
+Dust limit:                  0.001 INDRA (100,000 Spark)
+Block time:                  6 seconds
+Blocks per year:             5,256,000
+Epoch duration:              300 blocks (~30 minutes)
+Consensus quorum:            66.67% of total stake
+BFT safety threshold:        <33.33% Byzantine stake
+Unbonding period:            60 epochs (~30 hours)
+Default prune window:        50,000 blocks
+Snapshot interval:           300 blocks (each epoch)
 
-Block time: 6,000ms
-QC overhead at 150 validators: ~13ms (0.13% of block time)
+Validator set phases:
+  Phase 1 (<1M INDRA staked):   20 validators
+  Phase 2 (<10M INDRA staked):  50 validators
+  Phase 3 (<50M INDRA staked):  100 validators
+  Phase 4 (≥50M INDRA staked):  200 validators
+
+Era 1 block reward:          11.892 INDRA (1,189,200,000 Spark)
+Era 1 duration:              4 years (21,024,000 blocks)
+Era 2 duration:              4 years
+Era 3+ duration:             8 years per era
+Fee burn:                    50% of all transaction fees
+Fee to validators:           50% of all transaction fees
+
+Slashing (default, governable within bounds):
+  Liveness threshold:        3 consecutive epochs
+  Liveness penalty:          0.10% per epoch (1 BPS minimum)
+  Double-precommit:          5.00% of stake (500 BPS)
+  Surround vote:             10.00% of stake (1,000 BPS)
+  Self-report grace period:  5 epochs
+  Self-report penalty:       1.00% (100 BPS)
+  Reporter reward:           5.00% of slash amount (500 BPS)
+
+Commission:
+  Maximum:                   20% (2,000 BPS, governable)
+  Range:                     0–max_commission_bps
+
+Governance (default):
+  Standard quorum:           50% (5,000 BPS)
+  Critical quorum:           67% (6,700 BPS)
+  Execution delay:           100 epochs (~50 hours)
+  Proposal deposit:          1,000 INDRA
+  Active proposals max:      3 globally
+  Per-proposer max:          1 active at a time
+  Cooldown:                  10 epochs between proposals
+
+Schema version:              3 (as of v2.0 specification)
 ```
 
-QC verification is not a performance bottleneck.
+### C. Reward mathematics
+
+**Era 1 total:**
+```
+300 blocks/epoch × 1,189,200,000 Spark/block = 356,760,000,000 Spark/epoch
+356,760,000,000 Spark × (5,256,000/300) epochs/year = 6,258,960,000,000,000 Spark/year
+6,258,960,000,000,000 / 100,000,000 = 62,589,600 INDRA/year
+62,589,600 × 4 = 250,358,400 INDRA over Era 1 (~25% of supply)
+```
+
+**Validator epoch share (equal stake, no delegation):**
+```
+validator_share = 356,760,000,000 / active_validator_count Spark/epoch
+At 4 validators:   89,190,000,000 Spark/epoch = 891.9 INDRA/epoch
+At 20 validators:  17,838,000,000 Spark/epoch = 178.38 INDRA/epoch
+```
 
 ### D. Quantum threat model
 
 | Attack vector | Threat | INDRA response |
 |---------------|--------|----------------|
-| Break Ed25519 tx sig | Forge transactions | Dilithium2 still protects |
-| Break Dilithium2 tx sig | Forge transactions | Ed25519 still protects |
-| Quantum attack on QC | Forge consensus | Dilithium2-only QC — fully PQ |
+| Break Ed25519 tx sig | Forge transactions | ML-DSA-87 still protects |
+| Break ML-DSA-87 tx sig | Forge transactions | Ed25519 still protects |
+| Break both simultaneously | Forge transactions | Both must fail together |
+| Quantum attack on QC | Forge consensus | ML-DSA-87-only QC — fully PQ |
+| Break X25519 transport | Intercept P2P | ML-KEM-1024 still protects |
+| Break ML-KEM-1024 | Intercept P2P | X25519 still protects |
 | Break Pedersen commitment | Reveal hidden amounts | Does not enable theft |
 | Grover on SHA-256 | Weaken hashing | 2x speedup only, acceptable |
 
-### E. Security review
+The hybrid construction at every layer ensures that breaking one
+classical scheme is insufficient. An adversary must break both the
+classical and post-quantum scheme simultaneously to compromise any
+security property. This is the strongest achievable hybrid guarantee.
 
-Preliminary internal review completed. Independent review conducted
-prior to publication. Professional third-party audit required before
-mainnet. Audit report will be published in full.
+### E. Governance lifecycle example
+
+```
+Block 300 (epoch 1 boundary) — Proposal submitted:
+  Action: SetSlashLivenessBps { value: 8 }  (Tier 2: Critical)
+  Deposit: 1,000 INDRA burned from proposer UTXO
+  Phase 1 start: epoch 1
+  Phase 2 start: epoch 31 (Snapshot 1 taken)
+  Phase 3 start: epoch 61 (reveals begin)
+  Tally:         epoch 71
+  Exec after:    epoch 171
+
+Epoch 31 — Phase 2 (Commit):
+  buddhi:  submits hash(YES || nonce_A)
+  bonkai:  submits hash(NO  || nonce_B)
+  siddhi:  submits hash(YES || nonce_C)
+  kushal:  submits hash(NO  || nonce_D)
+
+Epoch 61 — Phase 3 (Reveal):
+  All four validators reveal (YES/NO, nonce)
+  Votes become public.
+  A delegator to bonkai (voted NO) sees the result and
+  governance-redelegates 50,000 INDRA weight to siddhi (YES).
+
+Epoch 71 — Tally:
+  Snapshot 2 weights: buddhi 100k + siddhi 150k (received redeleg)
+    + bonkai 50k (lost redeleg) + kushal 100k = 400k total
+  YES: buddhi 100k + siddhi 150k = 250k
+  NO:  bonkai 50k + kushal 100k = 150k
+  YES% = 250k/400k = 62.5% < 67% (critical quorum)
+  → Proposal FAILS. Deposit returned (>10% support).
+
+Alternative: if YES = 270k (>67%), proposal passes → executes at epoch 171.
+```
 
 ---
 
@@ -1025,18 +1021,17 @@ mainnet. Audit report will be published in full.
 
 1. Shor, P.W. (1994). Algorithms for quantum computation. FOCS 1994.
 2. NIST (2024). FIPS 204 — ML-DSA. https://csrc.nist.gov/pubs/fips/204/final
-3. NIST (2024). Post-Quantum Cryptography Standardization. https://csrc.nist.gov/pqcrypto
-4. Nakamoto, S. (2008). Bitcoin: A Peer-to-Peer Electronic Cash System. https://bitcoin.org/bitcoin.pdf
-5. Bunz, B. et al. (2018). Bulletproofs. IEEE S&P 2018.
-6. Buchman, E. (2016). Tendermint. University of Guelph.
-7. Government of India (2023). National Quantum Mission. https://dst.gov.in/nqm
-8. IBM (2023). IBM Quantum Roadmap. https://www.ibm.com/quantum/blog/large-scale-ftqc
-9. World Bank (2024). Migration and Development Brief: Remittances.
-10. CRYSTALS-Dilithium Team (2021). Algorithm Specifications. https://pq-crystals.org/dilithium/
+3. NIST (2024). FIPS 203 — ML-KEM. https://csrc.nist.gov/pubs/fips/203/final
+4. NIST (2024). Post-Quantum Cryptography Standardization. https://csrc.nist.gov/pqcrypto
+5. Nakamoto, S. (2008). Bitcoin: A Peer-to-Peer Electronic Cash System. https://bitcoin.org/bitcoin.pdf
+6. Bunz, B. et al. (2018). Bulletproofs: Short Proofs for Confidential Transactions. IEEE S&P 2018.
+7. Buchman, E. (2016). Tendermint: Byzantine Fault Tolerance in the Age of Blockchains. University of Guelph.
+8. CRYSTALS-Dilithium Team (2021). Algorithm Specifications and Supporting Documentation. https://pq-crystals.org/dilithium/
+9. Bernstein, D.J. & Lange, T. (2017). Post-quantum cryptography. Nature 549, 188–194.
 
 ---
 
-*INDRA Protocol — Pre-release working draft v1.8*
+*INDRA Protocol — Technical specification v2.0*
 *This is a technical specification, not a financial instrument prospectus.*
 *Protocol parameters may change before mainnet.*
 *This document does not constitute investment advice.*
