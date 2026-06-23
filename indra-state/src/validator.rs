@@ -9,7 +9,7 @@ use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, 
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
-        max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS, SCHEMA_VERSION,
+        max_active_validators, muldiv, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS, SCHEMA_VERSION,
         SCHEMA_VERSION_GENESIS,
     },
     transaction::OutputV1,
@@ -1153,7 +1153,7 @@ impl DelegationMap {
             .iter_mut()
             .filter(|d| d.unbonding_end_epoch.is_none())
         {
-            let reward = pool.saturating_mul(entry.staked_spark) / total;
+            let reward = muldiv(pool, entry.staked_spark, total);
             entry.pending_rewards = entry.pending_rewards.saturating_add(reward);
             entry.rewards_last_epoch = current_epoch;
             distributed = distributed.saturating_add(reward);

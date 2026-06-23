@@ -265,6 +265,22 @@ pub fn validator_set_phase(total_staked_spark: u64) -> u8 {
     }
 }
 
+/// Multiply two u64 values and divide by a third using a u128 intermediate.
+///
+/// Returns 0 when `c` is 0. This is the canonical helper for proportional
+/// Spark calculations such as `reward * stake / total_stake`.
+pub fn muldiv(a: u64, b: u64, c: u64) -> u64 {
+    if c == 0 {
+        return 0;
+    }
+    ((a as u128) * (b as u128) / (c as u128)) as u64
+}
+
+/// Calculate a basis-point portion using a u128 intermediate.
+pub fn bps_of(value: u64, bps: u32) -> u64 {
+    ((value as u128) * (bps as u128) / 10_000u128) as u64
+}
+
 // ── Pruning ───────────────────────────────────────────────────────────────────
 
 /// Default number of blocks to retain in pruned mode.

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::Bytes32,
+    primitives::{muldiv, Bytes32},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
@@ -190,7 +190,7 @@ impl VoteCollector {
 
         // Check if any hash crossed the quorum threshold
         for (block_hash, stake) in &stake_by_hash {
-            let bps = stake.saturating_mul(10_000) / self.total_stake;
+            let bps = muldiv(*stake, 10_000, self.total_stake);
             if bps as u32 >= CONSENSUS_QUORUM_BPS {
                 return VoteDecision::QuorumReached {
                     block_hash: *block_hash,

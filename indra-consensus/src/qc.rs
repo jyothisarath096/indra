@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 
 use indra_core::types::{
     crypto::PQVoteSig,
-    primitives::{Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_PQ_SIG_BYTES, MAX_VALIDATORS},
+    primitives::{
+        bps_of, muldiv, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_PQ_SIG_BYTES,
+        MAX_VALIDATORS,
+    },
     qc::QuorumCertificateV1,
     vote::{VoteStep, VoteV1},
 };
@@ -92,7 +95,7 @@ impl QcBuilder {
             .filter_map(|id| self.validators.iter().find(|v| v.validator_id == *id))
             .map(|v| v.stake)
             .fold(0u64, |a, b| a.saturating_add(b));
-        voted.saturating_mul(10_000) / self.total_stake
+        muldiv(voted, 10_000, self.total_stake)
     }
 
     /// Build the QC if quorum has been reached.
@@ -215,7 +218,7 @@ pub fn verify_qc(
     let signed_stake = signers
         .iter()
         .fold(0u64, |acc, validator| acc.saturating_add(validator.stake));
-    let quorum_stake = total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000;
+    let quorum_stake = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
 
     if signed_stake < quorum_stake {
         return Err(ConsensusError::InsufficientStake {

@@ -20,7 +20,7 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            Bytes32, VariableBytes, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS,
+            bps_of, muldiv, Bytes32, VariableBytes, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS,
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
             ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
             SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
@@ -485,7 +485,7 @@ fn remove_auto_delegations(
         let virtual_reward = if total_staked == 0 {
             0
         } else {
-            reward_delta.saturating_mul(snapshot.amount_spark) / total_staked
+            muldiv(reward_delta, snapshot.amount_spark, total_staked)
         };
         if virtual_reward > 0 {
             if let Some(v) = state.validators.get_mut(&snapshot.delegator_id) {
@@ -537,7 +537,7 @@ fn saturation_adjusted_reward(
         return raw_reward;
     }
 
-    raw_reward.saturating_mul(saturation_point) / validator_stake
+    muldiv(raw_reward, saturation_point, validator_stake)
 }
 
 fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, current_epoch: u64) {
@@ -555,7 +555,7 @@ fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, cur
     let active_validator_count = active.len() as u64;
 
     for (id, stake) in &active {
-        let raw_reward = epoch_block_reward.saturating_mul(*stake) / total_stake;
+        let raw_reward = muldiv(epoch_block_reward, *stake, total_stake);
         let adjusted_reward =
             saturation_adjusted_reward(raw_reward, *stake, total_stake, active_validator_count);
 
@@ -575,7 +575,7 @@ fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, cur
         let (validator_share, delegator_pool) = if delegated == 0 {
             (adjusted_reward, 0)
         } else {
-            let commission = adjusted_reward.saturating_mul(commission_bps as u64) / 10_000;
+            let commission = bps_of(adjusted_reward, commission_bps);
             (commission, adjusted_reward.saturating_sub(commission))
         };
 
@@ -613,7 +613,7 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64) {
     let mut distributed = 0u64;
 
     for (id, stake) in &active {
-        let reward = fee_pool.saturating_mul(*stake) / total_stake;
+        let reward = muldiv(fee_pool, *stake, total_stake);
         let commission_bps = state
             .validators
             .get(id)
@@ -624,7 +624,7 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64) {
         let (validator_share, delegator_pool) = if delegated == 0 {
             (reward, 0)
         } else {
-            let commission = reward.saturating_mul(commission_bps as u64) / 10_000;
+            let commission = bps_of(reward, commission_bps);
             (commission, reward.saturating_sub(commission))
         };
 
@@ -754,9 +754,7 @@ fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) -> (u64,
         };
 
         if missed >= threshold && stake > 0 {
-            let penalty = stake
-                .saturating_mul(slash_bps as u64)
-                .saturating_div(10_000);
+            let penalty = bps_of(stake, slash_bps);
             if let Some(v) = state.validators.get_mut(&validator_id) {
                 v.stake_spark = v.stake_spark.saturating_sub(penalty);
             }
@@ -797,7 +795,7 @@ mod tests {
             primitives::{
                 Bytes32, VariableBytes, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
                 ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
         },
@@ -896,6 +894,49 @@ mod tests {
         assert_eq!(r2, r1 / 2);
         assert_eq!(r3, r2 / 2);
         assert_eq!(r4, r3 / 2);
+    }
+
+    #[test]
+    fn reward_distribution_no_overflow_large_stake() {
+        let epoch_block_reward: u64 = 356_760_000_000;
+        let validator_stake: u64 = 100_000_000_000;
+        let total_stake: u64 = 400_000_000_000;
+
+        let result = muldiv(epoch_block_reward, validator_stake, total_stake);
+        assert_eq!(
+            result, 89_190_000_000,
+            "Expected 89,190,000,000 Spark per validator, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn muldiv_no_overflow() {
+        let a: u64 = u64::MAX / 2;
+        let b: u64 = 3;
+        let c: u64 = 3;
+        assert_eq!(muldiv(a, b, c), u64::MAX / 2);
+    }
+
+    #[test]
+    fn bps_of_correct() {
+        let value: u64 = 1_000_000_000 * SPARK_PER_INDRA;
+        let result = bps_of(value, 1_000);
+        assert_eq!(result, 100_000_000 * SPARK_PER_INDRA);
+    }
+
+    #[test]
+    fn epoch_reward_correct_with_real_values() {
+        let epoch_block_reward: u64 = ERA_1_BLOCK_REWARD_SPARK * EPOCH_DURATION_BLOCKS;
+        let validator_stake: u64 = 100_000_000_000;
+        let total_stake: u64 = 400_000_000_000;
+
+        let raw = muldiv(epoch_block_reward, validator_stake, total_stake);
+        assert_eq!(
+            raw, 89_190_000_000,
+            "Epoch reward wrong: got {} expected 89190000000",
+            raw
+        );
     }
 
     #[test]

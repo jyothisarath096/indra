@@ -9,7 +9,7 @@ use indra_core::{
         crypto::HybridPubKey,
         governance::{GovernableAction, ProposalTier},
         primitives::{
-            Bytes32, DUST_LIMIT_SPARK, GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS,
+            bps_of, muldiv, Bytes32, DUST_LIMIT_SPARK, GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS,
             SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS,
             SLASH_SURROUND_VOTE_BPS, SPARK_PER_INDRA,
         },
@@ -325,8 +325,8 @@ impl GovernanceSnapshot {
         if self.total_stake == 0 {
             return false;
         }
-        let required = (self.total_stake as u128).saturating_mul(quorum_bps as u128) / 10_000;
-        (yes_stake as u128) > required
+        let required = bps_of(self.total_stake, quorum_bps);
+        yes_stake > required
     }
 
     /// Return yes support in bps.
@@ -334,7 +334,7 @@ impl GovernanceSnapshot {
         if self.total_stake == 0 {
             return 0;
         }
-        ((yes_stake as u128 * 10_000) / self.total_stake as u128) as u32
+        muldiv(yes_stake, 10_000, self.total_stake) as u32
     }
 }
 

@@ -39,8 +39,8 @@ use indra_core::{
     types::{
         block::BlockV1,
         primitives::{
-            Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK,
-            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+            bps_of, Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
         },
         slashing::SlashEvidenceV1,
         transaction::TransactionV1,
@@ -161,12 +161,8 @@ pub fn apply_slash(
         .get(&validator_id)
         .map(|v| v.stake_spark)
         .unwrap_or(0);
-    let slash_amount = current_stake
-        .saturating_mul(slash_bps as u64)
-        .saturating_div(10_000);
-    let reporter_reward = slash_amount
-        .saturating_mul(SLASH_REPORTER_REWARD_BPS as u64)
-        .saturating_div(10_000);
+    let slash_amount = bps_of(current_stake, slash_bps);
+    let reporter_reward = bps_of(slash_amount, SLASH_REPORTER_REWARD_BPS);
     let burned = slash_amount.saturating_sub(reporter_reward);
 
     if let Some(v) = state.validators.get_mut(&validator_id) {
@@ -188,10 +184,7 @@ pub fn apply_slash(
     let mut total_bond_slashed: u64 = 0;
     for bond_id in &bond_ids {
         if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
-            let bond_slash = bond
-                .amount_spark
-                .saturating_mul(slash_bps as u64)
-                .saturating_div(10_000);
+            let bond_slash = bps_of(bond.amount_spark, slash_bps);
             bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
             total_bond_slashed = total_bond_slashed.saturating_add(bond_slash);
         }
