@@ -15,6 +15,7 @@ use indra_core::{
     types::{
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES},
+        staking::{StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
@@ -73,6 +74,14 @@ pub struct BuiltTransaction {
     pub spent_utxo_ids: Vec<Bytes32>,
     /// Pending change output to persist until the transaction is mined.
     pub pending_change: Option<PendingChange>,
+}
+
+/// The result of building a staking operation.
+pub struct BuiltStakingOp {
+    /// The serialised staking operation (hex-encoded).
+    pub op_hex: String,
+    /// SHA-256 of the serialised operation.
+    pub op_id: String,
 }
 
 /// Build and sign a transaction.
@@ -249,6 +258,195 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     })
 }
 
+/// Build and sign a validator self-stake operation.
+pub fn build_self_stake_op(
+    bond_utxo_id: Bytes32,
+    validator_keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::SelfStake {
+            bond_utxo_id,
+            validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
+        },
+        validator_keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign a validator registration staking operation.
+pub fn build_register_validator_op(
+    commission_bps: u32,
+    keypair: &HybridKeypair,
+    vrf_pk: [u8; 32],
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::RegisterValidator {
+            commission_bps,
+            validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
+            vrf_pk,
+        },
+        keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign a delegate staking operation.
+pub fn build_delegate_op(
+    validator_id: Bytes32,
+    bond_utxo_id: Bytes32,
+    delegator_keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::Delegate {
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
+        },
+        delegator_keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign an undelegate staking operation.
+pub fn build_undelegate_op(
+    validator_id: Bytes32,
+    bond_utxo_id: Bytes32,
+    delegator_keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::Undelegate {
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
+        },
+        delegator_keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign a claim-rewards staking operation.
+pub fn build_claim_rewards_op(
+    validator_id: Bytes32,
+    delegator_keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::ClaimRewards {
+            validator_id,
+            delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
+        },
+        delegator_keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign a set-commission staking operation.
+pub fn build_set_commission_op(
+    validator_id: Bytes32,
+    new_commission_bps: u32,
+    keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::SetCommission {
+            validator_id,
+            new_commission_bps,
+        },
+        keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign a SetAutoDelegate staking op.
+/// Pass target_validator_id = Bytes32::ZERO to clear.
+pub fn build_set_auto_delegate_op(
+    validator_id: Bytes32,
+    target_validator_id: Bytes32,
+    keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::SetAutoDelegate {
+            validator_id,
+            target_validator_id,
+        },
+        keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build and sign a validator self-unstake operation.
+pub fn build_self_unstake_op(
+    bond_utxo_id: Bytes32,
+    validator_keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::SelfUnstake {
+            bond_utxo_id,
+            validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
+        },
+        validator_keypair,
+        nonce,
+        chain_id,
+    )
+}
+
+fn build_signed_staking_op(
+    body: StakingOpBody,
+    keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    let mut op = StakingOp {
+        body,
+        nonce,
+        signature: dummy_signature()?,
+    };
+    let sig = keypair
+        .sign(&op.signing_bytes(chain_id))
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    op.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0)
+            .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
+        pq_sig: VariableBytes::from_slice(&sig.pq.0)
+            .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
+    };
+    let op_bytes = op.encode_to_vec();
+    Ok(BuiltStakingOp {
+        op_hex: hex::encode(&op_bytes),
+        op_id: hex::encode(sha256(&op_bytes)),
+    })
+}
+
+fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey> {
+    let public = keypair.public_key();
+    Ok(HybridPubKey {
+        classical_pk: Bytes32::from(public.classical.0),
+        pq_pk: VariableBytes::from_slice(&public.pq.0)
+            .map_err(|_| CliError::Transaction("pq pubkey too large".into()))?,
+    })
+}
+
 /// Parse a hex-encoded hybrid public key.
 fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
     // Format: classical_pk_hex:pq_pk_hex (split by colon)
@@ -296,6 +494,7 @@ fn dummy_signature() -> CliResult<HybridSignature> {
 mod tests {
     use super::*;
     use crate::wallet::Wallet;
+    use indra_core::codec::Decode;
     use indra_core::types::primitives::{Bytes32, DEFAULT_CHAIN_ID};
 
     fn make_wallet_with_funds() -> (Wallet, [u8; 32], Vec<u8>, HybridPubKey) {
@@ -315,6 +514,18 @@ mod tests {
             pq_pk: VariableBytes::from_slice(&pq_pk).unwrap(),
         };
         (w, seed, pq_sk, spk)
+    }
+
+    fn test_keypair(seed: u8) -> HybridKeypair {
+        HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[seed; 32]),
+            PqKeypair::from_seed(&[seed; 32]).unwrap(),
+        )
+    }
+
+    fn decode_built(built: &BuiltStakingOp) -> StakingOp {
+        let bytes = hex::decode(&built.op_hex).unwrap();
+        StakingOp::decode_exact(&bytes).unwrap()
     }
 
     #[test]
@@ -376,5 +587,236 @@ mod tests {
         };
 
         assert!(build_transaction(&params).is_err());
+    }
+
+    #[test]
+    fn build_self_stake_op_serialises_signed_operation() {
+        let (_, seed, _, spk) = make_wallet_with_funds();
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
+        let bond_utxo_id = Bytes32::from([0xA5; 32]);
+
+        let built = build_self_stake_op(bond_utxo_id, &keypair, 7, DEFAULT_CHAIN_ID).unwrap();
+        let bytes = hex::decode(&built.op_hex).unwrap();
+        let op = StakingOp::decode_exact(&bytes).unwrap();
+
+        assert_eq!(built.op_id.len(), 64);
+        assert_eq!(op.nonce, 7);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::SelfStake {
+                bond_utxo_id: id,
+                validator_pubkey
+            } if id == bond_utxo_id && validator_pubkey.classical_pk == spk.classical_pk
+        ));
+    }
+
+    #[test]
+    fn build_self_unstake_op_serialises_signed_operation() {
+        let (_, seed, _, _) = make_wallet_with_funds();
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
+        let bond_utxo_id = Bytes32::from([0xA6; 32]);
+
+        let built = build_self_unstake_op(bond_utxo_id, &keypair, 8, DEFAULT_CHAIN_ID).unwrap();
+        let bytes = hex::decode(&built.op_hex).unwrap();
+        let op = StakingOp::decode_exact(&bytes).unwrap();
+
+        assert_eq!(built.op_id.len(), 64);
+        assert_eq!(op.nonce, 8);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::SelfUnstake {
+                bond_utxo_id: id,
+                ..
+            } if id == bond_utxo_id
+        ));
+    }
+
+    #[test]
+    fn build_register_validator_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x71);
+        let built =
+            build_register_validator_op(1_000, &keypair, [0xAA; 32], 9, DEFAULT_CHAIN_ID).unwrap();
+        let op = decode_built(&built);
+        assert_eq!(op.nonce, 9);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                vrf_pk,
+                ..
+            } if vrf_pk == [0xAA; 32]
+        ));
+    }
+
+    #[test]
+    fn build_delegate_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x72);
+        let validator_id = Bytes32::from([0x01; 32]);
+        let bond_utxo_id = Bytes32::from([0x02; 32]);
+        let built =
+            build_delegate_op(validator_id, bond_utxo_id, &keypair, 10, DEFAULT_CHAIN_ID).unwrap();
+        let op = decode_built(&built);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::Delegate {
+                validator_id: v,
+                bond_utxo_id: b,
+                ..
+            } if v == validator_id && b == bond_utxo_id
+        ));
+    }
+
+    #[test]
+    fn build_undelegate_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x73);
+        let validator_id = Bytes32::from([0x03; 32]);
+        let bond_utxo_id = Bytes32::from([0x04; 32]);
+        let built = build_undelegate_op(validator_id, bond_utxo_id, &keypair, 11, DEFAULT_CHAIN_ID)
+            .unwrap();
+        let op = decode_built(&built);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::Undelegate {
+                validator_id: v,
+                bond_utxo_id: b,
+                ..
+            } if v == validator_id && b == bond_utxo_id
+        ));
+    }
+
+    #[test]
+    fn build_claim_rewards_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x74);
+        let validator_id = Bytes32::from([0x05; 32]);
+        let built = build_claim_rewards_op(validator_id, &keypair, 12, DEFAULT_CHAIN_ID).unwrap();
+        let op = decode_built(&built);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::ClaimRewards {
+                validator_id: v,
+                ..
+            } if v == validator_id
+        ));
+    }
+
+    #[test]
+    fn build_set_commission_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x75);
+        let validator_id = Bytes32::from([0x06; 32]);
+        let built =
+            build_set_commission_op(validator_id, 1_500, &keypair, 13, DEFAULT_CHAIN_ID).unwrap();
+        let op = decode_built(&built);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::SetCommission {
+                validator_id: v,
+                new_commission_bps: 1_500,
+            } if v == validator_id
+        ));
+    }
+
+    #[test]
+    fn build_set_auto_delegate_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x78);
+        let validator_id = Bytes32::from([0x16; 32]);
+        let target_validator_id = Bytes32::from([0x17; 32]);
+        let built = build_set_auto_delegate_op(
+            validator_id,
+            target_validator_id,
+            &keypair,
+            14,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        let op = decode_built(&built);
+        assert_eq!(op.nonce, 14);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::SetAutoDelegate {
+                validator_id: v,
+                target_validator_id: t,
+            } if v == validator_id && t == target_validator_id
+        ));
+    }
+
+    #[test]
+    fn build_clear_auto_delegate_op_uses_zero_target() {
+        let keypair = test_keypair(0x79);
+        let validator_id = Bytes32::from([0x18; 32]);
+        let built =
+            build_set_auto_delegate_op(validator_id, Bytes32::ZERO, &keypair, 15, DEFAULT_CHAIN_ID)
+                .unwrap();
+        let op = decode_built(&built);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::SetAutoDelegate {
+                validator_id: v,
+                target_validator_id: Bytes32::ZERO,
+            } if v == validator_id
+        ));
+    }
+
+    #[test]
+    fn all_ops_have_correct_nonce() {
+        let keypair = test_keypair(0x76);
+        let validator_id = Bytes32::from([0x07; 32]);
+        let bond_utxo_id = Bytes32::from([0x08; 32]);
+        let ops = vec![
+            build_register_validator_op(1_000, &keypair, [0x11; 32], 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_stake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_unstake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_delegate_op(validator_id, bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_undelegate_op(validator_id, bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID)
+                .unwrap(),
+            build_claim_rewards_op(validator_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_set_commission_op(validator_id, 1_100, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_set_auto_delegate_op(
+                validator_id,
+                Bytes32::from([0x19; 32]),
+                &keypair,
+                42,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
+        ];
+        for built in ops {
+            assert_eq!(decode_built(&built).nonce, 42);
+        }
+    }
+
+    #[test]
+    fn all_ops_have_non_zero_signatures() {
+        let keypair = test_keypair(0x77);
+        let validator_id = Bytes32::from([0x09; 32]);
+        let bond_utxo_id = Bytes32::from([0x0A; 32]);
+        let ops = vec![
+            build_register_validator_op(1_000, &keypair, [0x12; 32], 1, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_stake_op(bond_utxo_id, &keypair, 2, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_unstake_op(bond_utxo_id, &keypair, 3, DEFAULT_CHAIN_ID).unwrap(),
+            build_delegate_op(validator_id, bond_utxo_id, &keypair, 4, DEFAULT_CHAIN_ID).unwrap(),
+            build_undelegate_op(validator_id, bond_utxo_id, &keypair, 5, DEFAULT_CHAIN_ID).unwrap(),
+            build_claim_rewards_op(validator_id, &keypair, 6, DEFAULT_CHAIN_ID).unwrap(),
+            build_set_commission_op(validator_id, 1_200, &keypair, 7, DEFAULT_CHAIN_ID).unwrap(),
+            build_set_auto_delegate_op(
+                validator_id,
+                Bytes32::from([0x1A; 32]),
+                &keypair,
+                8,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
+        ];
+        for built in ops {
+            let op = decode_built(&built);
+            assert!(op
+                .signature
+                .classical_sig
+                .as_slice()
+                .iter()
+                .any(|b| *b != 0));
+            assert!(op.signature.pq_sig.as_slice().iter().any(|b| *b != 0));
+        }
     }
 }

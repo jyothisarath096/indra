@@ -5,7 +5,7 @@ use crate::{
     error::IndraResult,
     ssz::sha256,
     types::{
-        governance::GovernanceOpV1,
+        governance::GovernanceOpV2,
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES,
             MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
@@ -163,7 +163,7 @@ pub struct BlockV1 {
     /// Slash evidence (0–10).
     pub slashing_evidence: Vec<SlashEvidenceV1>,
     /// Governance operations (0–5).
-    pub governance_ops: Vec<GovernanceOpV1>,
+    pub governance_ops: Vec<GovernanceOpV2>,
     /// Staking operations (0–10).
     pub staking_ops: Vec<StakingOp>,
 }

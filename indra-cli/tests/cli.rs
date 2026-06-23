@@ -1,11 +1,18 @@
 //! Integration tests for the CLI tools.
 
 use indra_cli::{
-    generate_from_passphrase, generate_keypairs,
+    build_claim_rewards_op, build_delegate_op, build_register_validator_op,
+    build_set_commission_op, build_undelegate_op, generate_from_passphrase, generate_keypairs,
     genesis_cmd::{build_genesis_config, entry_from_keys},
     query::rpc_call,
+    tx_builder::{build_self_stake_op, build_self_unstake_op},
 };
-use indra_core::types::primitives::DUST_LIMIT_SPARK;
+use indra_core::{
+    codec::Decode,
+    types::{primitives::DUST_LIMIT_SPARK, staking::StakingOp},
+    Bytes32,
+};
+use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_node::{NodeConfig, NodeEngine};
 use std::path::PathBuf;
 
@@ -201,4 +208,42 @@ fn full_testnet_setup_pipeline() {
     let result = rpc_call("indra_getChainInfo", &[], &e).unwrap();
     assert!(result.summary.contains("Height:"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_build_and_decode_all_staking_ops() {
+    let keypair = HybridKeypair::new(
+        ClassicalKeypair::from_seed(&[0x90; 32]),
+        PqKeypair::from_seed(&[0x90; 32]).unwrap(),
+    );
+    let validator_id = Bytes32::from([0xA1; 32]);
+    let bond_utxo_id = Bytes32::from([0xB2; 32]);
+    let chain_id = "indra-testnet-1";
+    let built = vec![
+        build_register_validator_op(1_000, &keypair, [0xC3; 32], 1, chain_id).unwrap(),
+        build_self_stake_op(bond_utxo_id, &keypair, 2, chain_id).unwrap(),
+        build_self_unstake_op(bond_utxo_id, &keypair, 3, chain_id).unwrap(),
+        build_delegate_op(validator_id, bond_utxo_id, &keypair, 4, chain_id).unwrap(),
+        build_undelegate_op(validator_id, bond_utxo_id, &keypair, 5, chain_id).unwrap(),
+        build_claim_rewards_op(validator_id, &keypair, 6, chain_id).unwrap(),
+        build_set_commission_op(validator_id, 1_250, &keypair, 7, chain_id).unwrap(),
+    ];
+
+    for (idx, op) in built.iter().enumerate() {
+        let bytes = hex::decode(&op.op_hex).unwrap();
+        let decoded = StakingOp::decode_exact(&bytes).unwrap();
+        assert_eq!(decoded.nonce, idx as u64 + 1);
+        assert!(decoded
+            .signature
+            .classical_sig
+            .as_slice()
+            .iter()
+            .any(|byte| *byte != 0));
+        assert!(decoded
+            .signature
+            .pq_sig
+            .as_slice()
+            .iter()
+            .any(|byte| *byte != 0));
+    }
 }

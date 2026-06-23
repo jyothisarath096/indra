@@ -1,6 +1,6 @@
 //! Block application — the core state transition function.
 //!
-//! `apply_block(state, block)` is the heart of the protocol.
+//! `apply_block(state, block, timestamp_secs)` is the heart of the protocol.
 //!
 //! ## Validation order (Spec Section C)
 //!
@@ -39,13 +39,14 @@ use indra_core::{
     types::{
         block::BlockV1,
         primitives::{
-            Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK,
             MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
         },
         slashing::SlashEvidenceV1,
         transaction::TransactionV1,
         vote::VoteV1,
     },
+    EpochRecord,
 };
 use indra_crypto::{
     verify_balance, verify_hybrid, verify_opening, verify_range, PedersenCommitment,
@@ -58,6 +59,7 @@ use crate::{
     epoch::{apply_epoch_transition, epoch_for_height, is_epoch_boundary},
     error::{StateError, StateResult},
     fee::compute_next_base_fee,
+    governance_apply::apply_governance_op,
 };
 
 /// Apply slash evidence to chain state.
@@ -69,12 +71,7 @@ pub fn apply_slash(
     chain_id: &str,
 ) -> StateResult<()> {
     use crate::ValidatorStatus;
-    use indra_core::types::{
-        primitives::{
-            SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_REPORTER_REWARD_BPS, SLASH_SURROUND_VOTE_BPS,
-        },
-        vote::VoteStep,
-    };
+    use indra_core::types::{primitives::SLASH_REPORTER_REWARD_BPS, vote::VoteStep};
 
     let evidence_hash = compute_slash_evidence_hash(evidence);
     if state.applied_slash_hashes.contains(&evidence_hash) {
@@ -155,8 +152,8 @@ pub fn apply_slash(
     }
 
     let slash_bps = match evidence.vote_1.step {
-        VoteStep::Precommit => SLASH_DOUBLE_PRECOMMIT_BPS,
-        VoteStep::Prevote => SLASH_SURROUND_VOTE_BPS,
+        VoteStep::Precommit => state.governance.params.slash_double_precommit_bps,
+        VoteStep::Prevote => state.governance.params.slash_surround_vote_bps,
     };
 
     let current_stake = state
@@ -180,11 +177,15 @@ pub fn apply_slash(
     let bond_ids: Vec<Bytes32> = state
         .staked_bonds
         .values()
-        .filter(|bond| bond.validator_id == validator_id)
+        .filter(|bond| {
+            bond.validator_id == validator_id
+                && bond.delegator_id == validator_id
+                && bond.unbonding_end_epoch.is_none()
+        })
         .map(|bond| bond.utxo_id)
         .collect();
 
-    let mut total_bond_burned: u64 = 0;
+    let mut total_bond_slashed: u64 = 0;
     for bond_id in &bond_ids {
         if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
             let bond_slash = bond
@@ -192,28 +193,20 @@ pub fn apply_slash(
                 .saturating_mul(slash_bps as u64)
                 .saturating_div(10_000);
             bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
-            total_bond_burned = total_bond_burned.saturating_add(bond_slash);
-            let delegator_id = bond.delegator_id;
-            if let Some(entry) = state
-                .delegations
-                .get_delegator_mut(&validator_id, &delegator_id)
-            {
-                entry.staked_spark = entry.staked_spark.saturating_sub(bond_slash);
-            }
+            total_bond_slashed = total_bond_slashed.saturating_add(bond_slash);
         }
     }
 
-    let total_burned = burned.saturating_add(total_bond_burned);
-    state.total_supply = state.total_supply.saturating_sub(total_burned);
+    state.total_supply = state.total_supply.saturating_sub(burned);
     state.treasury_balance = state.treasury_balance.saturating_add(reporter_reward);
     state.applied_slash_hashes.insert(evidence_hash);
 
     eprintln!(
-        "[slash] validator {} slashed {}bps — stake_burned={} bond_burned={} treasury_reward={}",
+        "[slash] validator {} slashed {}bps — stake_burned={} self_bond_slashed={} treasury_reward={}",
         hex::encode(&validator_id.0[..4]),
         slash_bps,
         burned,
-        total_bond_burned,
+        total_bond_slashed,
         reporter_reward,
     );
 
@@ -258,7 +251,11 @@ fn verify_vote_sig_with_keys(
 }
 
 /// Apply a block to the chain state, updating UTXOs, nullifiers, fees and validators.
-pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
+pub fn apply_block(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<Option<EpochRecord>> {
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
     validate_block_header(state, block)?;
@@ -267,6 +264,12 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         return Err(StateError::TooManyStakingOps {
             actual: block.staking_ops.len(),
             max: MAX_STAKING_OPS_PER_BLOCK,
+        });
+    }
+    if block.governance_ops.len() > MAX_GOV_OPS_PER_BLOCK {
+        return Err(StateError::TooManyGovernanceOps {
+            actual: block.governance_ops.len(),
+            max: MAX_GOV_OPS_PER_BLOCK,
         });
     }
 
@@ -313,6 +316,15 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         }
     }
 
+    {
+        let mut shadow = state.clone();
+        let chain_id = state.chain_id.clone();
+        let current_epoch = epoch_for_height(block.header.height);
+        for op in &block.governance_ops {
+            apply_governance_op(&mut shadow, op, current_epoch, &chain_id)?;
+        }
+    }
+
     if !block.slashing_evidence.is_empty() {
         let mut shadow = state.clone();
         let chain_id_clone = state.chain_id.clone();
@@ -337,10 +349,28 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         })?;
     }
 
+    let current_epoch = epoch_for_height(block.header.height);
+    let chain_id = state.chain_id.clone();
+    for op in &block.governance_ops {
+        apply_governance_op(state, op, current_epoch, &chain_id).map_err(|_| {
+            StateError::InvariantViolation {
+                message: "governance op failed on real state after shadow validation",
+            }
+        })?;
+    }
+
     let chain_id_for_slash = state.chain_id.clone();
     for evidence in &block.slashing_evidence {
+        let supply_before = state.total_supply;
+        let treasury_before = state.treasury_balance;
         apply_slash(state, evidence, &chain_id_for_slash)
             .expect("slash failed on real state after shadow validation — invariant violation");
+        let burned = supply_before.saturating_sub(state.total_supply);
+        let treasury_reward = state.treasury_balance.saturating_sub(treasury_before);
+        state.epoch_slashed_spark = state
+            .epoch_slashed_spark
+            .saturating_add(burned.saturating_add(treasury_reward));
+        state.epoch_slash_event_count = state.epoch_slash_event_count.saturating_add(1);
     }
 
     // Update base fee for next block
@@ -352,10 +382,12 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
     state.tip_hash = block.header.block_hash();
 
     // Apply epoch transition if this is the last block of an epoch
-    if is_epoch_boundary(state.height) {
+    let epoch_record = if is_epoch_boundary(state.height) {
         let epoch = epoch_for_height(state.height);
-        apply_epoch_transition(state, epoch)?;
-    }
+        Some(apply_epoch_transition(state, epoch, timestamp_secs)?)
+    } else {
+        None
+    };
 
     if state.total_supply > HARD_CAP_SPARK {
         return Err(StateError::InvariantViolation {
@@ -363,7 +395,7 @@ pub fn apply_block(state: &mut ChainState, block: &BlockV1) -> StateResult<()> {
         });
     }
 
-    Ok(())
+    Ok(epoch_record)
 }
 
 /// Validate block-level invariants (does not touch state).
@@ -593,6 +625,7 @@ fn apply_transaction(
     let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
     state.total_supply = state.total_supply.saturating_sub(burn_amount);
     state.fee_reward_pool = state.fee_reward_pool.saturating_add(validator_amount);
+    state.epoch_fees_burned = state.epoch_fees_burned.saturating_add(burn_amount);
 
     Ok(())
 }
@@ -722,6 +755,7 @@ mod tests {
             self_report_count: 0,
             commission_bps: 1_000,
             min_delegation_spark: 1,
+            auto_delegate_to: None,
         }
     }
 
@@ -749,6 +783,7 @@ mod tests {
                 self_report_count: 0,
                 commission_bps: 1_000,
                 min_delegation_spark: 1,
+                auto_delegate_to: None,
             })
             .unwrap();
         (state, validator_id, keypair)
@@ -913,7 +948,7 @@ mod tests {
         let mut check_state = state.clone();
 
         assert_eq!(
-            apply_block(&mut check_state, &block),
+            apply_block(&mut check_state, &block, 0),
             Err(StateError::TooManyStakingOps {
                 actual: MAX_STAKING_OPS_PER_BLOCK + 1,
                 max: MAX_STAKING_OPS_PER_BLOCK,
@@ -930,7 +965,7 @@ mod tests {
         block.staking_ops = vec![op.clone(), op];
 
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::StakingNonceInvalid { .. })
         ));
         assert_eq!(state, original);
@@ -994,7 +1029,7 @@ mod tests {
     fn apply_empty_block_advances_height() {
         let mut state = ChainState::new_genesis();
         let block = make_block(&state, vec![]);
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
     }
 
@@ -1003,7 +1038,7 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let block = make_block(&state, vec![]);
         let expected_hash = block.header.block_hash();
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.tip_hash, expected_hash);
     }
 
@@ -1020,7 +1055,7 @@ mod tests {
             nullifier,
         );
         let block = make_block(&state, vec![tx]);
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
 
         // Input UTXO must be gone
         assert!(!state.utxos.contains(&utxo_id));
@@ -1053,7 +1088,7 @@ mod tests {
         let mut block = make_block(&state, vec![]);
         block.staking_ops = vec![op];
 
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
 
         assert!(!state.utxos.contains(&bond_utxo_id));
         assert!(state.staked_bonds.contains_key(&bond_utxo_id));
@@ -1072,7 +1107,7 @@ mod tests {
             nullifier,
         );
         let block1 = make_block(&state, vec![tx.clone()]);
-        apply_block(&mut state, &block1).unwrap();
+        apply_block(&mut state, &block1, 0).unwrap();
 
         // Re-insert the output so the utxo_id exists again
         // but the nullifier is already spent
@@ -1091,7 +1126,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            apply_block(&mut state, &block2),
+            apply_block(&mut state, &block2, 0),
             Err(StateError::DoubleSpend)
         );
     }
@@ -1102,7 +1137,7 @@ mod tests {
         let mut block = make_block(&state, vec![]);
         block.header.height = 99; // wrong
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::InvalidHeight {
                 expected: 1,
                 actual: 99
@@ -1116,7 +1151,7 @@ mod tests {
         let mut block = make_block(&state, vec![]);
         block.header.prev_hash = Bytes32::from([0xFFu8; 32]); // wrong
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::PrevHashMismatchDetailed {
                 height: 1,
                 expected: Bytes32::ZERO,
@@ -1131,7 +1166,7 @@ mod tests {
         let mut block = make_block(&state, vec![]);
         block.header.base_fee = 9999; // wrong
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::BaseFeeIncorrect { .. })
         ));
     }
@@ -1152,7 +1187,7 @@ mod tests {
         );
         let block = make_block(&state, vec![tx]);
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::UnknownUtxo)
         );
     }
@@ -1176,7 +1211,7 @@ mod tests {
         tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::FeeTooLow { .. })
         ));
     }
@@ -1195,7 +1230,7 @@ mod tests {
             Bytes32::from([0x11u8; 32]),
         );
         let block = make_block(&state, vec![tx]);
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.total_supply, initial_supply - (fee / 2));
         assert_eq!(state.fee_reward_pool, fee - (fee / 2));
     }
@@ -1210,7 +1245,7 @@ mod tests {
         // Block with wrong height — will fail
         let mut block = make_block(&state, vec![]);
         block.header.height = 99;
-        let _ = apply_block(&mut state, &block);
+        let _ = apply_block(&mut state, &block, 0);
 
         assert_eq!(state.height, height_before);
         assert_eq!(state.total_supply, supply_before);
@@ -1232,12 +1267,12 @@ mod tests {
             nullifier,
         );
         let block1 = make_block(&state, vec![tx]);
-        apply_block(&mut state, &block1).unwrap();
+        apply_block(&mut state, &block1, 0).unwrap();
         assert_eq!(state.height, 1);
 
         // Block 2: empty, but chains correctly off block 1
         let block2 = make_block(&state, vec![]);
-        apply_block(&mut state, &block2).unwrap();
+        apply_block(&mut state, &block2, 0).unwrap();
         assert_eq!(state.height, 2);
     }
 
@@ -1259,7 +1294,7 @@ mod tests {
         );
         let block = make_block(&state, vec![tx]); // height will be 1 < 100
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::OutputLocked { .. })
         ));
     }
@@ -1276,7 +1311,7 @@ mod tests {
             Bytes32::from([0x44; 32]),
         );
         let block = make_block(&state, vec![tx]);
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
     }
 
@@ -1295,7 +1330,7 @@ mod tests {
         tx.signature = sign_transaction(&wrong_keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::SignatureInvalid { .. })
         ));
     }
@@ -1314,7 +1349,7 @@ mod tests {
         tx.signature = dummy_sig();
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::SignatureInvalid { .. })
         ));
     }
@@ -1333,7 +1368,7 @@ mod tests {
         tx.signature = sign_transaction(&keypair, "indra-mainnet-1", &tx);
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::SignatureInvalid { .. })
         ));
     }
@@ -1352,7 +1387,7 @@ mod tests {
         tx.version = ProtocolVersion(99);
         let block = make_block(&state, vec![tx]);
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::UnsupportedTxVersion { version: 99 })
         );
     }
@@ -1371,7 +1406,7 @@ mod tests {
         tx.signature_module_id = 7;
         let block = make_block(&state, vec![tx]);
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::UnsupportedSignatureModule { module_id: 7 })
         );
     }
@@ -1393,7 +1428,7 @@ mod tests {
         tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::FeeCommitmentMismatch)
         );
     }
@@ -1417,7 +1452,7 @@ mod tests {
         tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::CommitmentBalanceInvalid)
         );
     }
@@ -1549,7 +1584,6 @@ mod tests {
     #[test]
     fn apply_slash_reduces_staked_bonds_proportionally() {
         let (mut state, validator_id, keypair) = slash_validator_state([0x8A; 32], 1_000_000);
-        let delegator_id = Bytes32::from([0xD1; 32]);
         let bond_id = Bytes32::from([0xB1; 32]);
         let (owner, _) = make_test_keypair([0x91; 32]);
         state.staked_bonds.insert(
@@ -1557,7 +1591,7 @@ mod tests {
             StakeBondEntry {
                 utxo_id: bond_id,
                 validator_id,
-                delegator_id,
+                delegator_id: validator_id,
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
@@ -1574,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_slash_updates_delegation_accounting() {
+    fn apply_slash_leaves_delegator_bond_accounting_unchanged() {
         let (mut state, validator_id, keypair) = slash_validator_state([0x8B; 32], 1_000_000);
         let delegator_id = Bytes32::from([0xD2; 32]);
         let bond_id = Bytes32::from([0xB2; 32]);
@@ -1603,7 +1637,7 @@ mod tests {
                 .get_delegator_mut(&validator_id, &delegator_id)
                 .unwrap()
                 .staked_spark,
-            190_000
+            200_000
         );
     }
 
@@ -1613,7 +1647,7 @@ mod tests {
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
         let mut block = make_block(&state, vec![]);
         block.slashing_evidence = vec![evidence.clone()];
-        apply_block(&mut state, &block).unwrap();
+        apply_block(&mut state, &block, 0).unwrap();
         assert!(state
             .applied_slash_hashes
             .contains(&compute_slash_evidence_hash(&evidence)));
@@ -1630,7 +1664,7 @@ mod tests {
         let mut block = make_block(&state, vec![]);
         block.slashing_evidence = vec![evidence.clone(), evidence];
         assert_eq!(
-            apply_block(&mut state, &block),
+            apply_block(&mut state, &block, 0),
             Err(StateError::DuplicateSlashEvidence)
         );
     }

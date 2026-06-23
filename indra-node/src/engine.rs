@@ -24,8 +24,9 @@ use indra_consensus::{
 use indra_core::codec::Decode;
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    governance::GovernanceOpV2,
     primitives::{
-        Bytes32, VariableBytes, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+        Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
         MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
     slashing::SlashEvidenceV1,
@@ -37,7 +38,7 @@ use indra_crypto::{
     VrfKeypair,
 };
 use indra_state::{apply::compute_slash_evidence_hash, ChainState};
-use indra_storage::{BlockStore, StateStore};
+use indra_storage::{migration_record, BlockStore, EpochStore, MigrationLog, StateStore};
 
 use crate::{
     config::NodeConfig,
@@ -56,12 +57,18 @@ pub struct NodeEngine {
     pub mempool: Mempool,
     /// Pending staking operations waiting to be included in a block.
     pub staking_mempool: Vec<StakingOp>,
+    /// Pending governance operations waiting to be included in a block.
+    pub governance_mempool: Vec<GovernanceOpV2>,
     /// Pending slash evidence waiting to be included in a block.
     pub pending_slashes: Vec<SlashEvidenceV1>,
     /// Persistent block log.
     pub block_store: BlockStore,
+    /// Persistent epoch history log.
+    pub epoch_store: EpochStore,
     /// State snapshot store.
     pub state_store: StateStore,
+    /// Schema migration audit log.
+    pub migration_log: MigrationLog,
     /// The validator's hybrid keypair (if this is a validator node).
     #[allow(dead_code)] // retained for future local signing flows
     hybrid_keypair: Option<HybridKeypair>,
@@ -86,13 +93,35 @@ impl NodeEngine {
         }
 
         let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
+        let epoch_store = EpochStore::open(config.epoch_log_path())?;
         let state_store = StateStore::open(config.state_dir())?;
+        let migration_log = MigrationLog::open(config.migration_log_path());
+        let stored_schema_version = state_store.schema_version()?;
+        if let Some(snapshot_version) = stored_schema_version {
+            if snapshot_version > indra_core::types::primitives::SCHEMA_VERSION {
+                return Err(NodeError::SchemaVersionTooNew {
+                    snapshot_version,
+                    node_version: indra_core::types::primitives::SCHEMA_VERSION,
+                });
+            }
+        }
         let mut genesis_base = ChainState::new_genesis();
         if let Some(ref genesis_path) = config.genesis_path {
             load_genesis_validators(genesis_path, &mut genesis_base);
         }
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
+            if let Some(from_version) = stored_schema_version {
+                if from_version < indra_core::types::primitives::SCHEMA_VERSION {
+                    let record = migration_record(
+                        &snapshot,
+                        from_version,
+                        indra_core::types::primitives::SCHEMA_VERSION,
+                    );
+                    migration_log.append(&record)?;
+                    state_store.save(&snapshot)?;
+                }
+            }
             let replay_start = snapshot.height.saturating_add(1);
             if !block_store.is_empty() && block_store.lowest_height() > replay_start {
                 return Err(NodeError::SnapshotReplayGap {
@@ -164,9 +193,12 @@ impl NodeEngine {
             state,
             mempool,
             staking_mempool: Vec::new(),
+            governance_mempool: Vec::new(),
             pending_slashes: Vec::new(),
             block_store,
+            epoch_store,
             state_store,
+            migration_log,
             hybrid_keypair,
             vrf_keypair,
             validator_id,
@@ -224,6 +256,23 @@ impl NodeEngine {
         Ok(())
     }
 
+    /// Add a governance operation to the pending pool.
+    pub fn add_governance_op(&mut self, op: GovernanceOpV2) -> NodeResult<()> {
+        let signer_id = op.signer_id;
+        let nonce = op.nonce;
+        if self
+            .governance_mempool
+            .iter()
+            .any(|existing| existing.signer_id == signer_id && existing.nonce == nonce)
+        {
+            return Err(NodeError::InvalidGovernanceOp(
+                "duplicate governance op nonce".into(),
+            ));
+        }
+        self.governance_mempool.push(op);
+        Ok(())
+    }
+
     /// Add slash evidence to the pending pool if it has not already been seen.
     pub fn add_slash_evidence(&mut self, evidence: SlashEvidenceV1) {
         let hash = compute_slash_evidence_hash(&evidence);
@@ -263,6 +312,15 @@ impl NodeEngine {
             .collect()
     }
 
+    /// Select governance operations for block inclusion.
+    pub fn select_governance_ops(&self) -> Vec<GovernanceOpV2> {
+        self.governance_mempool
+            .iter()
+            .take(MAX_GOV_OPS_PER_BLOCK)
+            .cloned()
+            .collect()
+    }
+
     /// Remove staking operations included in a committed block.
     pub fn evict_committed_staking_ops(&mut self, committed_ops: &[StakingOp]) {
         for op in committed_ops {
@@ -270,6 +328,16 @@ impl NodeEngine {
             let nonce = op.nonce;
             self.staking_mempool
                 .retain(|existing| !(existing.signer_id() == signer_id && existing.nonce == nonce));
+        }
+    }
+
+    /// Remove governance operations included in a committed block.
+    pub fn evict_committed_governance_ops(&mut self, committed_ops: &[GovernanceOpV2]) {
+        for op in committed_ops {
+            let signer_id = op.signer_id;
+            let nonce = op.nonce;
+            self.governance_mempool
+                .retain(|existing| !(existing.signer_id == signer_id && existing.nonce == nonce));
         }
     }
 
@@ -351,6 +419,7 @@ impl NodeEngine {
             timestamp,
             polc_round,
             slash_evidence: self.select_slash_evidence(),
+            governance_ops: self.select_governance_ops(),
             staking_ops: self.select_staking_ops(),
         };
 
@@ -439,7 +508,7 @@ impl NodeEngine {
         };
 
         let mut projected = self.state.clone();
-        indra_state::apply_block(&mut projected, &block)?;
+        indra_state::apply_block(&mut projected, &block, 0)?;
         let expected_value_hash = block.compute_value_hash(projected.total_supply);
         if expected_value_hash != original_block.header.value_hash {
             return Err(NodeError::BlockInvalid {
@@ -512,13 +581,17 @@ impl NodeEngine {
 
     /// Import a block that has been committed (QC formed).
     pub fn commit_block(&mut self, block: &indra_core::types::block::BlockV1) -> NodeResult<()> {
-        import_block(
+        let epoch_record = import_block(
             block,
             &mut self.state,
             &mut self.mempool,
             &mut self.block_store,
             &self.state_store,
+            current_timestamp_secs(),
         )?;
+        if let Some(record) = epoch_record {
+            self.epoch_store.append(&record)?;
+        }
         self.update_last_active_epoch_from_block_qc(block);
         if self.state.height > 0
             && self
@@ -529,6 +602,7 @@ impl NodeEngine {
             self.state_store.save(&self.state)?;
         }
         self.evict_committed_staking_ops(&block.staking_ops);
+        self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
         Ok(())
     }
@@ -552,6 +626,13 @@ impl NodeEngine {
             }
         }
     }
+}
+
+fn current_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn startup_mode_message(
@@ -608,7 +689,7 @@ fn rebuild_state_from_height(
 
     for height in start_height.max(1)..block_store.next_height() {
         let block = block_store.get(height)?;
-        indra_state::apply_block(state, &block)?;
+        indra_state::apply_block(state, &block, 0)?;
     }
 
     Ok(())
@@ -673,6 +754,7 @@ mod tests {
                 self_report_count: 0,
                 commission_bps: DEFAULT_COMMISSION_BPS,
                 min_delegation_spark: DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
             })
             .unwrap();
         hybrid
@@ -748,6 +830,7 @@ mod tests {
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
             slash_evidence: vec![],
+            governance_ops: vec![],
             staking_ops: vec![],
         };
         produce_block(
@@ -969,8 +1052,8 @@ mod tests {
 
         let mut continuous_next = continuous_state.clone();
         let mut restarted_next = restarted.state.clone();
-        indra_state::apply_block(&mut continuous_next, &next_block).unwrap();
-        indra_state::apply_block(&mut restarted_next, &next_block).unwrap();
+        indra_state::apply_block(&mut continuous_next, &next_block, 0).unwrap();
+        indra_state::apply_block(&mut restarted_next, &next_block, 0).unwrap();
 
         assert_eq!(
             indra_state::compute_state_root(&continuous_next),

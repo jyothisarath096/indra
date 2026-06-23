@@ -114,6 +114,11 @@ impl Wallet {
         self.entries.contains_key(utxo_id)
     }
 
+    /// Look up a wallet entry by UTXO ID.
+    pub fn get(&self, utxo_id: &Bytes32) -> Option<&WalletEntry> {
+        self.entries.get(utxo_id)
+    }
+
     /// Record a change output until it is mined and can be assigned a real UTXO ID.
     pub fn add_pending_change(&mut self, output: OutputV1, blinding: [u8; 32]) {
         self.pending_changes

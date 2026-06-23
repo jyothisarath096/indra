@@ -17,6 +17,10 @@ pub enum NodeError {
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
 
+    /// A governance operation was rejected before entering the local mempool.
+    #[error("invalid governance op: {0}")]
+    InvalidGovernanceOp(String),
+
     /// A consensus error.
     #[error("consensus error: {0}")]
     Consensus(#[from] indra_consensus::ConsensusError),
@@ -82,6 +86,15 @@ pub enum NodeError {
         lowest_block: u64,
         /// Number of missing blocks between the snapshot and retained block window.
         gap: u64,
+    },
+
+    /// Snapshot was created by a newer schema than this binary supports.
+    #[error("snapshot schema version {snapshot_version} is newer than node schema version {node_version}")]
+    SchemaVersionTooNew {
+        /// Schema version stored in the snapshot.
+        snapshot_version: u8,
+        /// Schema version supported by this node.
+        node_version: u8,
     },
 }
 

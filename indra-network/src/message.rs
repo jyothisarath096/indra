@@ -105,6 +105,8 @@ pub enum Message {
         height: u64,
         /// The sender's current tip hash.
         tip_hash: Bytes32,
+        /// The sender's current consensus round for the next height.
+        round: u32,
     },
     /// Request a specific proposal block by slot and hash.
     RequestProposal {
@@ -219,10 +221,15 @@ impl Message {
                 }
                 buf
             }
-            Self::Status { height, tip_hash } => {
-                let mut buf = Vec::with_capacity(40);
+            Self::Status {
+                height,
+                tip_hash,
+                round,
+            } => {
+                let mut buf = Vec::with_capacity(44);
                 buf.extend_from_slice(&height.to_le_bytes());
                 buf.extend_from_slice(&tip_hash.0);
+                buf.extend_from_slice(&round.to_le_bytes());
                 buf
             }
             Self::RequestProposal {
@@ -404,9 +411,21 @@ impl Message {
                         reason: "invalid status tip hash".to_string(),
                     })?;
                 let height = u64::from_le_bytes(height_bytes);
+                let round = if payload.len() >= 44 {
+                    let round_bytes: [u8; 4] =
+                        payload[40..44]
+                            .try_into()
+                            .map_err(|_| NetworkError::DecodeFailed {
+                                reason: "invalid status round".to_string(),
+                            })?;
+                    u32::from_le_bytes(round_bytes)
+                } else {
+                    0
+                };
                 Ok(Self::Status {
                     height,
                     tip_hash: Bytes32::from(tip),
+                    round,
                 })
             }
             MessageType::RequestProposal => {
@@ -571,13 +590,19 @@ mod tests {
         let msg = Message::Status {
             height: 999,
             tip_hash: tip,
+            round: 8,
         };
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         match decoded {
-            Message::Status { height, tip_hash } => {
+            Message::Status {
+                height,
+                tip_hash,
+                round,
+            } => {
                 assert_eq!(height, 999);
                 assert_eq!(tip_hash, tip);
+                assert_eq!(round, 8);
             }
             _ => panic!("wrong message type"),
         }

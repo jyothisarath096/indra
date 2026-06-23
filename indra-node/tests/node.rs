@@ -10,12 +10,22 @@ use indra_consensus::{
 };
 use indra_core::{
     codec::{Decode, Encode},
-    types::{block::BlockV1, vote::VoteStep},
+    types::{
+        block::BlockV1,
+        crypto::HybridSignature,
+        primitives::VariableBytes,
+        vote::{VoteStep, VoteV1},
+    },
     Bytes32,
 };
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
+};
+use indra_network::{
+    observer::{NODE_TYPE_FULL, NODE_TYPE_OBSERVER},
+    perform_observer_handshake_initiator, perform_observer_handshake_responder, read_frame_plain,
+    write_frame_plain, Message,
 };
 use indra_node::{
     driver::{ConsensusDriver, DriverAction, DriverEvent},
@@ -71,9 +81,32 @@ fn make_strict_block(
         timestamp: 1_700_000_000 + state.height + 1,
         polc_round: None,
         slash_evidence: vec![],
+        governance_ops: vec![],
         staking_ops: vec![],
     };
     produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
+}
+
+async fn write_plain_msg<W>(writer: &mut W, msg: &Message)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let wire = msg.encode_wire().unwrap();
+    write_frame_plain(writer, &wire[4..]).await.unwrap();
+}
+
+fn dummy_vote() -> VoteV1 {
+    VoteV1 {
+        height: 1,
+        round: 0,
+        step: VoteStep::Precommit,
+        block_hash: Bytes32::from([0xAB; 32]),
+        validator_id: Bytes32::from([0xCD; 32]),
+        signature: HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        },
+    }
 }
 
 fn install_active_validator(
@@ -107,6 +140,7 @@ fn install_active_validator(
             self_report_count: 0,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
         })
         .unwrap();
     hybrid
@@ -137,6 +171,7 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             self_report_count: 0,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
         })
         .unwrap();
     hybrid
@@ -187,7 +222,8 @@ fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
     config.pq_pk = Some(pq.public_key().0.to_vec());
     config.pq_sk = Some(pq.secret_key_bytes());
     let engine = NodeEngine::init(config).unwrap();
-    (ConsensusDriver::new(engine), dir)
+    let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
+    (ConsensusDriver::new(engine, vote_safety), dir)
 }
 
 fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {
@@ -263,6 +299,7 @@ fn state_root_changes_after_each_block() {
         &mut mempool,
         &mut block_store,
         &state_store,
+        0,
     )
     .unwrap();
     let root1 = compute_state_root(&state);
@@ -275,6 +312,7 @@ fn state_root_changes_after_each_block() {
         &mut mempool,
         &mut block_store,
         &state_store,
+        0,
     )
     .unwrap();
     let root2 = compute_state_root(&state);
@@ -300,7 +338,15 @@ fn block_store_survives_reopen() {
         let mut last_qc = Vec::new();
         for i in 1..=3u64 {
             let b = make_strict_block(&state, [0x12u8; 32], last_qc.clone());
-            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            import_block(
+                &b,
+                &mut state,
+                &mut mempool,
+                &mut block_store,
+                &state_store,
+                0,
+            )
+            .unwrap();
             last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x12u8; 32]);
             assert_eq!(state.height, i);
         }
@@ -367,6 +413,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
             &mut source_mempool,
             &mut source_store,
             &source_state_store,
+            0,
         )
         .unwrap();
         source_last_qc =
@@ -392,6 +439,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
             &mut follower_mempool,
             &mut follower_store,
             &follower_state_store,
+            0,
         )
         .unwrap();
         sync.on_block_imported(height);
@@ -484,7 +532,15 @@ fn full_node_pipeline() {
     let roots: Vec<Bytes32> = (1..=10u64)
         .map(|i| {
             let b = make_strict_block(&state, [0x14u8; 32], last_qc.clone());
-            import_block(&b, &mut state, &mut mempool, &mut block_store, &state_store).unwrap();
+            import_block(
+                &b,
+                &mut state,
+                &mut mempool,
+                &mut block_store,
+                &state_store,
+                0,
+            )
+            .unwrap();
             last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x14u8; 32]);
             assert_eq!(state.height, i);
             compute_state_root(&state)
@@ -499,6 +555,147 @@ fn full_node_pipeline() {
     assert_eq!(state.height, 10);
     assert_eq!(block_store.len(), 11); // genesis + 10 blocks
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn observer_connects_and_receives_status() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL)
+            .await
+            .unwrap();
+        let mut stream = result.stream;
+        write_plain_msg(
+            &mut stream,
+            &Message::Status {
+                height: 7,
+                tip_hash: Bytes32::from([0x11; 32]),
+                round: 0,
+            },
+        )
+        .await;
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let result = perform_observer_handshake_initiator(stream, NODE_TYPE_OBSERVER)
+        .await
+        .unwrap();
+    let mut stream = result.stream;
+    let frame = read_frame_plain(&mut stream).await.unwrap();
+    let msg = Message::decode_wire(&frame).unwrap();
+    assert!(matches!(msg, Message::Status { height: 7, .. }));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn observer_sync_downloads_blocks() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL)
+            .await
+            .unwrap();
+        let mut stream = result.stream;
+        write_plain_msg(
+            &mut stream,
+            &Message::Status {
+                height: 5,
+                tip_hash: Bytes32::from([0x22; 32]),
+                round: 0,
+            },
+        )
+        .await;
+        let frame = read_frame_plain(&mut stream).await.unwrap();
+        Message::decode_wire(&frame).unwrap()
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let result = perform_observer_handshake_initiator(stream, NODE_TYPE_OBSERVER)
+        .await
+        .unwrap();
+    let mut stream = result.stream;
+    let frame = read_frame_plain(&mut stream).await.unwrap();
+    let msg = Message::decode_wire(&frame).unwrap();
+    assert!(matches!(msg, Message::Status { height: 5, .. }));
+    write_plain_msg(
+        &mut stream,
+        &Message::RequestBlocks {
+            from_height: 1,
+            to_height: 5,
+        },
+    )
+    .await;
+    let req = server.await.unwrap();
+    assert!(matches!(
+        req,
+        Message::RequestBlocks {
+            from_height: 1,
+            to_height: 5
+        }
+    ));
+}
+
+#[tokio::test]
+async fn observer_consensus_message_closes_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL)
+            .await
+            .unwrap();
+        let mut stream = result.stream;
+        let frame = read_frame_plain(&mut stream).await.unwrap();
+        let msg = Message::decode_wire(&frame).unwrap();
+        assert!(matches!(msg, Message::Vote(_)));
+        drop(stream);
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let result = perform_observer_handshake_initiator(stream, NODE_TYPE_OBSERVER)
+        .await
+        .unwrap();
+    let mut stream = result.stream;
+    write_plain_msg(&mut stream, &Message::Vote(dummy_vote())).await;
+    server.await.unwrap();
+    let closed = read_frame_plain(&mut stream).await;
+    assert!(closed.is_err());
+}
+
+#[tokio::test]
+async fn observer_at_capacity_receives_status_then_closes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL)
+            .await
+            .unwrap();
+        let mut stream = result.stream;
+        write_plain_msg(
+            &mut stream,
+            &Message::Status {
+                height: 9,
+                tip_hash: Bytes32::from([0x33; 32]),
+                round: 0,
+            },
+        )
+        .await;
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let result = perform_observer_handshake_initiator(stream, NODE_TYPE_OBSERVER)
+        .await
+        .unwrap();
+    let mut stream = result.stream;
+    let frame = read_frame_plain(&mut stream).await.unwrap();
+    let msg = Message::decode_wire(&frame).unwrap();
+    assert!(matches!(msg, Message::Status { height: 9, .. }));
+    server.await.unwrap();
+    assert!(read_frame_plain(&mut stream).await.is_err());
 }
 
 #[test]
@@ -563,6 +760,7 @@ fn full_restart_recovery_end_to_end() {
             &mut source_mempool,
             &mut source_store,
             &source_state_store,
+            0,
         )
         .unwrap();
         source_last_qc =
@@ -586,6 +784,7 @@ fn full_restart_recovery_end_to_end() {
             &mut follower_mempool,
             &mut follower_store,
             &follower_state_store,
+            0,
         )
         .unwrap();
 
@@ -603,6 +802,7 @@ fn full_restart_recovery_end_to_end() {
             &mut follower_mempool,
             &mut follower_store,
             &follower_state_store,
+            0,
         )
         .unwrap();
         sync.on_block_imported(2);

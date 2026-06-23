@@ -19,6 +19,7 @@ use indra_core::types::{
     transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
 };
+use indra_storage::VoteSafetyStore;
 
 use crate::{
     engine::NodeEngine,
@@ -77,6 +78,8 @@ pub enum DriverEvent {
         height: u64,
         /// The peer's tip hash.
         tip_hash: Bytes32,
+        /// The peer's current consensus round.
+        round: u32,
     },
     /// A peer responded with raw QC bytes for the current committed tip.
     QcResponse {
@@ -183,11 +186,13 @@ pub struct ConsensusDriver {
     current_phase: RoundPhase,
     /// Synchronization phase for this node.
     sync: SyncState,
+    /// Persisted local vote safety guard.
+    pub vote_safety: VoteSafetyStore,
 }
 
 impl ConsensusDriver {
     /// Create a new driver from a node engine.
-    pub fn new(engine: NodeEngine) -> Self {
+    pub fn new(engine: NodeEngine, vote_safety: VoteSafetyStore) -> Self {
         let mut driver = Self {
             engine,
             slash_detector: SlashDetector::new(),
@@ -208,6 +213,7 @@ impl ConsensusDriver {
             current_round: 0,
             current_phase: RoundPhase::Propose,
             sync: SyncState::follower(0),
+            vote_safety,
         };
         driver.sync = if driver.engine.config.bootstrap_peers.is_empty() {
             SyncState::bootstrap(driver.engine.state.height)
@@ -314,6 +320,7 @@ impl ConsensusDriver {
         self.prune_future_proposals();
         self.valid_block = None;
         self.start_round(0);
+        self.apply_vote_safety();
     }
 
     /// Re-enter consensus cleanly after block download catchup.
@@ -333,6 +340,7 @@ impl ConsensusDriver {
         self.valid_value = None;
         self.valid_block = None;
         self.start_round(0);
+        self.apply_vote_safety();
     }
 
     /// Process one inbound event and return the resulting driver actions.
@@ -345,7 +353,8 @@ impl ConsensusDriver {
                 from,
                 height,
                 tip_hash,
-            } => self.process_status(from, height, tip_hash),
+                round,
+            } => self.process_status(from, height, tip_hash, round),
             DriverEvent::QcResponse {
                 from,
                 height,
@@ -362,6 +371,21 @@ impl ConsensusDriver {
     fn start_round(&mut self, round: u32) {
         self.current_round = round;
         self.current_phase = RoundPhase::Propose;
+    }
+
+    /// Check persisted vote safety record and advance past already-voted rounds.
+    fn apply_vote_safety(&mut self) {
+        let next_height = self.engine.state.height.saturating_add(1);
+        if let Some(record) = self.vote_safety.load() {
+            if record.height == next_height && record.round >= self.current_round {
+                let safe_round = record.round.saturating_add(1);
+                eprintln!(
+                    "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
+                    safe_round, record.height, record.round, record.step
+                );
+                self.start_round(safe_round);
+            }
+        }
     }
 
     fn next_height(&self) -> u64 {
@@ -489,6 +513,14 @@ impl ConsensusDriver {
             return vec![];
         }
 
+        let step_byte = match step {
+            VoteStep::Prevote => 0u8,
+            VoteStep::Precommit => 1u8,
+        };
+        if let Err(err) = self.vote_safety.record(height, round, step_byte) {
+            eprintln!("[vote_safety] failed to persist vote safety record: {err}");
+        }
+
         match self.engine.sign_vote(height, round, step, block_hash) {
             Ok(local_vote) => {
                 self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote)
@@ -557,7 +589,7 @@ impl ConsensusDriver {
         }
 
         let mut projected_state = self.engine.state.clone();
-        if indra_state::apply_block(&mut projected_state, &block).is_err() {
+        if indra_state::apply_block(&mut projected_state, &block, 0).is_err() {
             return vec![DriverAction::None];
         }
 
@@ -580,6 +612,20 @@ impl ConsensusDriver {
             value_hash,
         ));
         self.pending_blocks.insert(block_hash, block.clone());
+
+        let proposal_round = block.header.proposer_round;
+        let proposal_height = block.header.height;
+        if proposal_height == self.next_height()
+            && proposal_round > self.current_round
+            && self.sync.is_caught_up()
+        {
+            eprintln!(
+                "[consensus] proposal-driven round jump: {} → {} at height={}",
+                self.current_round, proposal_round, proposal_height
+            );
+            self.start_round(proposal_round);
+            self.apply_vote_safety();
+        }
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
 
@@ -977,8 +1023,19 @@ impl ConsensusDriver {
         from: SocketAddr,
         height: u64,
         _tip_hash: Bytes32,
+        peer_round: u32,
     ) -> Vec<DriverAction> {
         let our_height = self.engine.height();
+        if height == our_height.saturating_add(1)
+            && peer_round > self.current_round
+            && self.sync.is_caught_up()
+        {
+            eprintln!(
+                "[consensus] round sync: advancing from round {} to {} (peer at round {})",
+                self.current_round, peer_round, peer_round
+            );
+            self.start_round(peer_round);
+        }
         match self.sync.observe_status(from, height, our_height) {
             Some((peer, from_height, to_height)) => vec![DriverAction::RequestBlocks {
                 from: peer,
@@ -1194,7 +1251,7 @@ mod tests {
         };
 
         let mut projected = state.clone();
-        apply_block(&mut projected, &block).unwrap();
+        apply_block(&mut projected, &block, 0).unwrap();
         block.header.state_root = compute_state_root(&projected);
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
@@ -1232,6 +1289,7 @@ mod tests {
                 self_report_count: 0,
                 commission_bps: DEFAULT_COMMISSION_BPS,
                 min_delegation_spark: DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
             })
             .unwrap();
         hybrid
@@ -1246,7 +1304,8 @@ mod tests {
         config.pq_pk = Some(pq.public_key().0.to_vec());
         config.pq_sk = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
-        (ConsensusDriver::new(engine), dir)
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        (ConsensusDriver::new(engine, vote_safety), dir)
     }
 
     fn make_strict_block(
@@ -1283,6 +1342,7 @@ mod tests {
             timestamp: 1_700_000_000 + driver.engine.state.height + 1,
             polc_round: None,
             slash_evidence: vec![],
+            governance_ops: vec![],
             staking_ops: vec![],
         };
         produce_block(
@@ -1498,6 +1558,67 @@ mod tests {
     }
 
     #[test]
+    fn proposal_drives_round_advancement() {
+        let (mut driver, dir) = local_driver([0x4Fu8; 32], "proposal_round_advance");
+        let validator_seeds = [[0x4Fu8; 32], [0x52u8; 32], [0x53u8; 32], [0x54u8; 32]];
+        let mut seed_by_id = HashMap::new();
+        for seed in validator_seeds {
+            let keypair = install_active_validator(&mut driver, seed, "validator");
+            let validator_id =
+                Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+            seed_by_id.insert(validator_id, seed);
+        }
+        driver.refresh_registered_voters();
+
+        let proposer_id =
+            indra_consensus::proposer::elect_proposer(&election_for_round(&driver, 1, 5)).unwrap();
+        let proposer_seed = seed_by_id[&proposer_id];
+        let block = make_strict_block(&driver, proposer_seed, 5, vec![]);
+        let value_hash = block.header.value_hash;
+        let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
+
+        assert_eq!(driver.current_round(), 5);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote)
+                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == value_hash
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposal_does_not_retreat_round() {
+        let (mut driver, dir) = local_driver([0x50u8; 32], "proposal_round_no_retreat");
+        let _local = install_active_validator(&mut driver, [0x50u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.current_round = 10;
+
+        let block = make_strict_block(&driver, [0x50u8; 32], 3, vec![]);
+        let _actions = driver.process(DriverEvent::InboundBlock { from: None, block });
+
+        assert_eq!(driver.current_round(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposal_round_jump_skips_past_voted_rounds() {
+        let (mut driver, dir) = local_driver([0x51u8; 32], "proposal_round_vote_safety");
+        let _local = install_active_validator(&mut driver, [0x51u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.vote_safety.record(1, 5, 0).unwrap();
+
+        let block = make_strict_block(&driver, [0x51u8; 32], 5, vec![]);
+        let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
+
+        assert_eq!(driver.current_round(), 6);
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote) if vote.round == 5
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prevote_timeout_sends_nil_precommit() {
         let (mut driver, dir) = local_driver([0x46u8; 32], "prevote_timeout_nil");
         let _local = install_active_validator(&mut driver, [0x46u8; 32], "local");
@@ -1524,6 +1645,81 @@ mod tests {
         driver.on_precommit_timeout();
         assert_eq!(driver.current_round(), 4);
         assert_eq!(driver.current_phase(), RoundPhase::Propose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_status_advances_round_when_peer_is_ahead() {
+        let (mut driver, dir) = local_driver([0x4Au8; 32], "status_round_advance");
+        let peer: SocketAddr = "127.0.0.1:9301".parse().unwrap();
+
+        driver.process(DriverEvent::PeerStatus {
+            from: peer,
+            height: 1,
+            tip_hash: driver.engine.state.tip_hash,
+            round: 8,
+        });
+
+        assert_eq!(driver.current_round(), 8);
+        assert_eq!(driver.current_phase(), RoundPhase::Propose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_status_does_not_retreat_round() {
+        let (mut driver, dir) = local_driver([0x4Bu8; 32], "status_round_no_retreat");
+        driver.current_round = 10;
+        let peer: SocketAddr = "127.0.0.1:9302".parse().unwrap();
+
+        driver.process(DriverEvent::PeerStatus {
+            from: peer,
+            height: 1,
+            tip_hash: driver.engine.state.tip_hash,
+            round: 3,
+        });
+
+        assert_eq!(driver.current_round(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_status_ignores_round_if_not_caught_up() {
+        let (mut driver, dir) = local_driver([0x4Cu8; 32], "status_round_syncing");
+        driver.sync = SyncState::follower(driver.engine.height());
+        let peer: SocketAddr = "127.0.0.1:9303".parse().unwrap();
+
+        driver.process(DriverEvent::PeerStatus {
+            from: peer,
+            height: 1,
+            tip_hash: driver.engine.state.tip_hash,
+            round: 8,
+        });
+
+        assert_eq!(driver.current_round(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_vote_safety_skips_past_voted_rounds() {
+        let (mut driver, dir) = local_driver([0x4Du8; 32], "vote_safety_skip");
+        driver.engine.state.height = 4;
+        driver.vote_safety.record(5, 7, 0).unwrap();
+
+        driver.apply_vote_safety();
+
+        assert_eq!(driver.current_round(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_vote_safety_ignores_old_height() {
+        let (mut driver, dir) = local_driver([0x4Eu8; 32], "vote_safety_old_height");
+        driver.engine.state.height = 5;
+        driver.vote_safety.record(3, 10, 0).unwrap();
+
+        driver.apply_vote_safety();
+
+        assert_eq!(driver.current_round(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1611,7 +1807,8 @@ mod tests {
             config.pq_pk = Some(pq.public_key().0.to_vec());
             config.pq_sk = Some(pq.secret_key_bytes());
             let engine = NodeEngine::init(config).unwrap();
-            let mut driver = ConsensusDriver::new(engine);
+            let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+            let mut driver = ConsensusDriver::new(engine, vote_safety);
             let _local = install_active_validator(&mut driver, seed, "local");
             driver.refresh_registered_voters();
             let block = make_strict_block(&driver, seed, 0, vec![]);
@@ -1626,7 +1823,8 @@ mod tests {
         config.pq_pk = Some(pq.public_key().0.to_vec());
         config.pq_sk = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
-        let restarted = ConsensusDriver::new(engine);
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let restarted = ConsensusDriver::new(engine, vote_safety);
         assert!(
             !restarted.last_qc_bytes().is_empty(),
             "restarted driver should restore persisted QC"
@@ -1654,7 +1852,8 @@ mod tests {
         driver.engine.state.tip_hash = Bytes32::from([0x22; 32]);
         let engine = driver.engine;
 
-        let restarted = ConsensusDriver::new(engine);
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let restarted = ConsensusDriver::new(engine, vote_safety);
         assert!(restarted.last_qc_bytes().is_empty());
         assert!(restarted.can_propose());
 

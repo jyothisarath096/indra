@@ -60,6 +60,18 @@ impl RpcError {
             Self::TxRejected(_) => ERR_TX_REJECTED,
         }
     }
+
+    /// The user-facing JSON-RPC error message.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::ParseError(message)
+            | Self::MethodNotFound(message)
+            | Self::InvalidParams(message)
+            | Self::Internal(message)
+            | Self::NotFound(message)
+            | Self::TxRejected(message) => message,
+        }
+    }
 }
 
 /// Convenience alias.

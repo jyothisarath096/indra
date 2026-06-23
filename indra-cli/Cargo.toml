@@ -41,3 +41,11 @@ path = "src/bin/wallet_scan.rs"
 [[bin]]
 name = "indra-tx"
 path = "src/bin/tx.rs"
+
+[[bin]]
+name = "indra-stake"
+path = "src/bin/stake.rs"
+
+[[bin]]
+name = "indra-governance"
+path = "src/bin/governance.rs"

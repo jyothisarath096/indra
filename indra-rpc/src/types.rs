@@ -56,14 +56,21 @@ pub enum JsonId {
     Null,
 }
 
+impl JsonId {
+    /// Serialise the id as a JSON value.
+    pub fn to_json(&self) -> String {
+        match self {
+            JsonId::Number(n) => n.to_string(),
+            JsonId::Str(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+            JsonId::Null => "null".to_string(),
+        }
+    }
+}
+
 impl RpcResponse {
     /// Serialise to JSON string.
     pub fn to_json(&self) -> String {
-        let id_str = match &self.id {
-            JsonId::Number(n) => n.to_string(),
-            JsonId::Str(s) => format!("\"{}\"", s),
-            JsonId::Null => "null".to_string(),
-        };
+        let id_str = self.id.to_json();
 
         match &self.body {
             ResponseBody::Result(result) => {

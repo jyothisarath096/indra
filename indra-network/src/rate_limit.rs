@@ -346,6 +346,7 @@ mod tests {
             Message::Status {
                 height: 1,
                 tip_hash: Bytes32::ZERO,
+                round: 0,
             },
             Message::RequestQC { height: 1 },
             Message::Ping(1),

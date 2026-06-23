@@ -193,6 +193,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             self_report_count: 0,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
         };
 
         let _ = state.validators.upsert(entry);

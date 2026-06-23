@@ -17,6 +17,7 @@
 
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    governance::GovernanceOpV2,
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK,
         MAX_VRF_PROOF_BYTES,
@@ -49,6 +50,8 @@ pub struct BlockTemplate {
     pub polc_round: Option<u32>,
     /// Staking operations selected for inclusion.
     pub staking_ops: Vec<StakingOp>,
+    /// Governance operations selected for inclusion.
+    pub governance_ops: Vec<GovernanceOpV2>,
     /// Slash evidence selected for inclusion.
     pub slash_evidence: Vec<SlashEvidenceV1>,
 }
@@ -131,12 +134,12 @@ pub fn produce_block(
         header,
         transactions: selected,
         slashing_evidence: template.slash_evidence.clone(),
-        governance_ops: vec![],
+        governance_ops: template.governance_ops.clone(),
         staking_ops: template.staking_ops.clone(),
     };
 
     let mut projected = state.clone();
-    apply_block(&mut projected, &block).map_err(|err| ConsensusError::CryptoError {
+    apply_block(&mut projected, &block, 0).map_err(|err| ConsensusError::CryptoError {
         detail: format!("failed to project roots for produced block: {err}"),
     })?;
     block.header.state_root = compute_state_root(&projected);
@@ -203,6 +206,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            governance_ops: vec![],
             staking_ops: vec![],
         };
 
@@ -228,6 +232,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            governance_ops: vec![],
             staking_ops: vec![],
         };
 
@@ -250,6 +255,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            governance_ops: vec![],
             staking_ops: vec![],
         };
         let block = produce_block(&template, &state, &mempool, &election).unwrap();

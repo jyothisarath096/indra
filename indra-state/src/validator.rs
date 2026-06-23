@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
-    primitives::{max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS},
+    primitives::{
+        max_active_validators, Bytes32, DUST_LIMIT_SPARK, MAX_VALIDATORS, SCHEMA_VERSION,
+        SCHEMA_VERSION_GENESIS,
+    },
     transaction::OutputV1,
 };
 
@@ -103,10 +106,13 @@ pub struct ValidatorEntry {
     pub commission_bps: u32,
     /// Validator-specific minimum delegation amount in Spark.
     pub min_delegation_spark: u64,
+    /// Optional target validator for epoch-scoped reward auto-delegation.
+    pub auto_delegate_to: Option<Bytes32>,
 }
 
 impl Encode for ValidatorEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
+        SCHEMA_VERSION.encode(buf);
         self.validator_id.encode(buf);
         let name_bytes = self.name.as_bytes();
         (name_bytes.len() as u32).encode(buf);
@@ -133,6 +139,10 @@ impl Encode for ValidatorEntry {
         self.self_report_count.encode(buf);
         self.commission_bps.encode(buf);
         self.min_delegation_spark.encode(buf);
+        self.auto_delegate_to.is_some().encode(buf);
+        if let Some(target) = self.auto_delegate_to {
+            target.encode(buf);
+        }
     }
 
     fn encoded_len(&self) -> usize {
@@ -157,67 +167,138 @@ impl Encode for ValidatorEntry {
             + 4
             + 4
             + 8
+            + 1
+            + 1
+            + self.auto_delegate_to.map(|_| 32).unwrap_or(0)
     }
 }
 
 impl Decode for ValidatorEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let validator_id = Bytes32::decode(r)?;
-        let name_len = u32::decode(r)? as usize;
-        let name_bytes = r.read_bytes(name_len)?;
-        let name =
-            String::from_utf8(name_bytes.to_vec()).map_err(|_| IndraError::InvariantViolation {
-                message: "invalid UTF-8 validator name in snapshot",
-            })?;
-
-        let hybrid_classical_pk = if bool::decode(r)? {
-            let bytes: [u8; 32] =
-                r.read_bytes(32)?
-                    .try_into()
-                    .map_err(|_| IndraError::InvariantViolation {
-                        message: "invalid classical pk length in snapshot",
-                    })?;
-            Some(bytes)
-        } else {
-            None
-        };
-
-        let hybrid_pq_pk = if bool::decode(r)? {
-            let len = u32::decode(r)? as usize;
-            Some(r.read_bytes(len)?.to_vec())
-        } else {
-            None
-        };
-
-        let vrf_pk = if bool::decode(r)? {
-            let bytes: [u8; 32] =
-                r.read_bytes(32)?
-                    .try_into()
-                    .map_err(|_| IndraError::InvariantViolation {
-                        message: "invalid vrf pk length in snapshot",
-                    })?;
-            Some(bytes)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            validator_id,
-            name,
-            hybrid_classical_pk,
-            hybrid_pq_pk,
-            vrf_pk,
-            stake_spark: u64::decode(r)?,
-            status: ValidatorStatus::decode(r)?,
-            registered_epoch: u64::decode(r)?,
-            last_active_epoch: u64::decode(r)?,
-            pending_rewards: u64::decode(r)?,
-            rewards_last_epoch: u64::decode(r)?,
-            self_report_count: u32::decode(r)?,
-            commission_bps: u32::decode(r)?,
-            min_delegation_spark: u64::decode(r)?,
-        })
+        let marker = u8::decode(r)?;
+        match marker {
+            SCHEMA_VERSION_GENESIS => decode_validator_entry_v1(r, None),
+            SCHEMA_VERSION => decode_validator_entry_v2(r, None),
+            other if r.remaining() == 0 => Err(unsupported_schema("ValidatorEntry", other)),
+            first_byte => decode_validator_entry_v1(r, Some(first_byte)),
+        }
     }
+}
+
+fn unsupported_schema(struct_name: &'static str, version: u8) -> IndraError {
+    IndraError::UnsupportedSchemaVersion {
+        struct_name,
+        version,
+        max_supported: SCHEMA_VERSION,
+    }
+}
+
+fn decode_bytes32_with_first(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<Bytes32> {
+    match first_byte {
+        Some(first) => {
+            let mut bytes = [0u8; 32];
+            bytes[0] = first;
+            bytes[1..].copy_from_slice(r.read_bytes(31)?);
+            Ok(Bytes32::from(bytes))
+        }
+        None => Bytes32::decode(r),
+    }
+}
+
+fn decode_validator_entry_v1(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<ValidatorEntry> {
+    decode_validator_entry_fields(r, first_byte, false)
+}
+
+fn decode_validator_entry_v2(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<ValidatorEntry> {
+    decode_validator_entry_fields(r, first_byte, true)
+}
+
+impl ValidatorEntry {
+    /// Decode the legacy unversioned schema V1 layout.
+    pub fn decode_legacy_v1(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        decode_validator_entry_v1(r, None)
+    }
+
+    /// Decode the legacy unversioned schema V2 layout used before version bytes.
+    pub fn decode_legacy_v2(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        decode_validator_entry_v2(r, None)
+    }
+}
+
+fn decode_validator_entry_fields(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+    has_auto_delegate_to: bool,
+) -> IndraResult<ValidatorEntry> {
+    let validator_id = decode_bytes32_with_first(r, first_byte)?;
+    let name_len = u32::decode(r)? as usize;
+    let name_bytes = r.read_bytes(name_len)?;
+    let name =
+        String::from_utf8(name_bytes.to_vec()).map_err(|_| IndraError::InvariantViolation {
+            message: "invalid UTF-8 validator name in snapshot",
+        })?;
+
+    let hybrid_classical_pk = if bool::decode(r)? {
+        let bytes: [u8; 32] =
+            r.read_bytes(32)?
+                .try_into()
+                .map_err(|_| IndraError::InvariantViolation {
+                    message: "invalid classical pk length in snapshot",
+                })?;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    let hybrid_pq_pk = if bool::decode(r)? {
+        let len = u32::decode(r)? as usize;
+        Some(r.read_bytes(len)?.to_vec())
+    } else {
+        None
+    };
+
+    let vrf_pk = if bool::decode(r)? {
+        let bytes: [u8; 32] =
+            r.read_bytes(32)?
+                .try_into()
+                .map_err(|_| IndraError::InvariantViolation {
+                    message: "invalid vrf pk length in snapshot",
+                })?;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    Ok(ValidatorEntry {
+        validator_id,
+        name,
+        hybrid_classical_pk,
+        hybrid_pq_pk,
+        vrf_pk,
+        stake_spark: u64::decode(r)?,
+        status: ValidatorStatus::decode(r)?,
+        registered_epoch: u64::decode(r)?,
+        last_active_epoch: u64::decode(r)?,
+        pending_rewards: u64::decode(r)?,
+        rewards_last_epoch: u64::decode(r)?,
+        self_report_count: u32::decode(r)?,
+        commission_bps: u32::decode(r)?,
+        min_delegation_spark: u64::decode(r)?,
+        auto_delegate_to: if has_auto_delegate_to && bool::decode(r)? {
+            Some(Bytes32::decode(r)?)
+        } else {
+            None
+        },
+    })
 }
 
 impl ValidatorEntry {
@@ -280,6 +361,36 @@ impl ValidatorSet {
         Self {
             validators: HashMap::new(),
         }
+    }
+
+    /// Decode a legacy unversioned validator set.
+    pub fn decode_legacy(r: &mut ByteReader<'_>, schema_version: u8) -> IndraResult<Self> {
+        let count = u32::decode(r)? as usize;
+        if count > MAX_VALIDATORS {
+            return Err(IndraError::LengthExceeded {
+                field: "snapshot.validators",
+                max: MAX_VALIDATORS,
+                actual: count,
+            });
+        }
+        let mut set = Self::new();
+        for _ in 0..count {
+            let validator = if schema_version <= SCHEMA_VERSION_GENESIS {
+                ValidatorEntry::decode_legacy_v1(r)?
+            } else {
+                ValidatorEntry::decode_legacy_v2(r)?
+            };
+            if set
+                .validators
+                .insert(validator.validator_id, validator)
+                .is_some()
+            {
+                return Err(IndraError::DuplicateEntries {
+                    field: "snapshot.validators",
+                });
+            }
+        }
+        Ok(set)
     }
 
     /// Number of registered validators (active + unbonding).
@@ -432,7 +543,73 @@ mod tests {
             self_report_count: 0,
             commission_bps: 1_000,
             min_delegation_spark: DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
         }
+    }
+
+    fn encode_legacy_validator_v1(validator: &ValidatorEntry) -> Vec<u8> {
+        let mut buf = Vec::new();
+        validator.validator_id.encode(&mut buf);
+        let name_bytes = validator.name.as_bytes();
+        (name_bytes.len() as u32).encode(&mut buf);
+        buf.extend_from_slice(name_bytes);
+        validator.hybrid_classical_pk.is_some().encode(&mut buf);
+        if let Some(pk) = validator.hybrid_classical_pk {
+            buf.extend_from_slice(&pk);
+        }
+        validator.hybrid_pq_pk.is_some().encode(&mut buf);
+        if let Some(pk) = &validator.hybrid_pq_pk {
+            (pk.len() as u32).encode(&mut buf);
+            buf.extend_from_slice(pk);
+        }
+        validator.vrf_pk.is_some().encode(&mut buf);
+        if let Some(pk) = validator.vrf_pk {
+            buf.extend_from_slice(&pk);
+        }
+        validator.stake_spark.encode(&mut buf);
+        validator.status.encode(&mut buf);
+        validator.registered_epoch.encode(&mut buf);
+        validator.last_active_epoch.encode(&mut buf);
+        validator.pending_rewards.encode(&mut buf);
+        validator.rewards_last_epoch.encode(&mut buf);
+        validator.self_report_count.encode(&mut buf);
+        validator.commission_bps.encode(&mut buf);
+        validator.min_delegation_spark.encode(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn validator_entry_v1_decodes_with_auto_delegate_none() {
+        let mut validator = make_validator(0x42, 10_000, 3);
+        validator.auto_delegate_to = Some(Bytes32::from([0x99; 32]));
+        let bytes = encode_legacy_validator_v1(&validator);
+        let decoded = ValidatorEntry::decode_exact(&bytes).unwrap();
+        assert_eq!(decoded.validator_id, validator.validator_id);
+        assert_eq!(decoded.last_active_epoch, validator.last_active_epoch);
+        assert_eq!(decoded.auto_delegate_to, None);
+    }
+
+    #[test]
+    fn validator_entry_v2_round_trips_with_auto_delegate_some() {
+        let mut validator = make_validator(0x43, 10_000, 3);
+        let target = Bytes32::from([0x55; 32]);
+        validator.auto_delegate_to = Some(target);
+        let decoded = ValidatorEntry::decode_exact(&validator.encode_to_vec()).unwrap();
+        assert_eq!(decoded, validator);
+        assert_eq!(decoded.auto_delegate_to, Some(target));
+    }
+
+    #[test]
+    fn validator_entry_unsupported_version_errors_clearly() {
+        let err = ValidatorEntry::decode_exact(&[99]).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::UnsupportedSchemaVersion {
+                struct_name: "ValidatorEntry",
+                version: 99,
+                max_supported: SCHEMA_VERSION
+            }
+        ));
     }
 
     #[test]
@@ -560,6 +737,7 @@ pub struct StakeBondEntry {
 
 impl Encode for StakeBondEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
+        SCHEMA_VERSION.encode(buf);
         self.utxo_id.encode(buf);
         self.validator_id.encode(buf);
         self.delegator_id.encode(buf);
@@ -573,7 +751,7 @@ impl Encode for StakeBondEntry {
     }
 
     fn encoded_len(&self) -> usize {
-        self.utxo_id.encoded_len()
+        1 + self.utxo_id.encoded_len()
             + self.validator_id.encoded_len()
             + self.delegator_id.encoded_len()
             + self.amount_spark.encoded_len()
@@ -586,21 +764,40 @@ impl Encode for StakeBondEntry {
 
 impl Decode for StakeBondEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let utxo_id = Bytes32::decode(r)?;
-        Ok(Self {
-            utxo_id,
-            validator_id: Bytes32::decode(r)?,
-            delegator_id: Bytes32::decode(r)?,
-            amount_spark: u64::decode(r)?,
-            bonded_epoch: u64::decode(r)?,
-            unbonding_end_epoch: if bool::decode(r)? {
-                Some(u64::decode(r)?)
-            } else {
-                None
-            },
-            original_output: OutputV1::decode(r)?,
-        })
+        let marker = u8::decode(r)?;
+        match marker {
+            SCHEMA_VERSION_GENESIS | SCHEMA_VERSION => decode_stake_bond_entry_fields(r, None),
+            other if r.remaining() == 0 => Err(unsupported_schema("StakeBondEntry", other)),
+            first_byte => decode_stake_bond_entry_fields(r, Some(first_byte)),
+        }
     }
+}
+
+impl StakeBondEntry {
+    /// Decode the legacy unversioned stake bond layout.
+    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        decode_stake_bond_entry_fields(r, None)
+    }
+}
+
+fn decode_stake_bond_entry_fields(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<StakeBondEntry> {
+    let utxo_id = decode_bytes32_with_first(r, first_byte)?;
+    Ok(StakeBondEntry {
+        utxo_id,
+        validator_id: Bytes32::decode(r)?,
+        delegator_id: Bytes32::decode(r)?,
+        amount_spark: u64::decode(r)?,
+        bonded_epoch: u64::decode(r)?,
+        unbonding_end_epoch: if bool::decode(r)? {
+            Some(u64::decode(r)?)
+        } else {
+            None
+        },
+        original_output: OutputV1::decode(r)?,
+    })
 }
 
 /// A single delegator's position with a validator.
@@ -620,6 +817,7 @@ pub struct DelegatorEntry {
 
 impl Encode for DelegatorEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
+        SCHEMA_VERSION.encode(buf);
         self.delegator_id.encode(buf);
         self.staked_spark.encode(buf);
         self.pending_rewards.encode(buf);
@@ -631,29 +829,48 @@ impl Encode for DelegatorEntry {
     }
 
     fn encoded_len(&self) -> usize {
-        32 + 8 + 8 + 8 + 1 + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
+        1 + 32 + 8 + 8 + 8 + 1 + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
     }
 }
 
 impl Decode for DelegatorEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let delegator_id = Bytes32::decode(r)?;
-        let staked_spark = u64::decode(r)?;
-        let pending_rewards = u64::decode(r)?;
-        let rewards_last_epoch = u64::decode(r)?;
-        let has_unbonding = bool::decode(r)?;
-        Ok(Self {
-            delegator_id,
-            staked_spark,
-            pending_rewards,
-            rewards_last_epoch,
-            unbonding_end_epoch: if has_unbonding {
-                Some(u64::decode(r)?)
-            } else {
-                None
-            },
-        })
+        let marker = u8::decode(r)?;
+        match marker {
+            SCHEMA_VERSION_GENESIS | SCHEMA_VERSION => decode_delegator_entry_fields(r, None),
+            other if r.remaining() == 0 => Err(unsupported_schema("DelegatorEntry", other)),
+            first_byte => decode_delegator_entry_fields(r, Some(first_byte)),
+        }
     }
+}
+
+impl DelegatorEntry {
+    /// Decode the legacy unversioned delegator layout.
+    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        decode_delegator_entry_fields(r, None)
+    }
+}
+
+fn decode_delegator_entry_fields(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<DelegatorEntry> {
+    let delegator_id = decode_bytes32_with_first(r, first_byte)?;
+    let staked_spark = u64::decode(r)?;
+    let pending_rewards = u64::decode(r)?;
+    let rewards_last_epoch = u64::decode(r)?;
+    let has_unbonding = bool::decode(r)?;
+    Ok(DelegatorEntry {
+        delegator_id,
+        staked_spark,
+        pending_rewards,
+        rewards_last_epoch,
+        unbonding_end_epoch: if has_unbonding {
+            Some(u64::decode(r)?)
+        } else {
+            None
+        },
+    })
 }
 
 impl DelegatorEntry {
@@ -727,6 +944,27 @@ impl DelegationMap {
         }
     }
 
+    /// Decode a legacy unversioned delegation map.
+    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let count = u32::decode(r)? as usize;
+        let mut delegators = HashMap::with_capacity(count);
+        for _ in 0..count {
+            let validator_id = Bytes32::decode(r)?;
+            if delegators.contains_key(&validator_id) {
+                return Err(IndraError::DuplicateEntries {
+                    field: "snapshot.delegations",
+                });
+            }
+            let entry_count = u32::decode(r)? as usize;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                entries.push(DelegatorEntry::decode_legacy(r)?);
+            }
+            delegators.insert(validator_id, entries);
+        }
+        Ok(Self { delegators })
+    }
+
     /// Total delegated stake for a given validator in Spark.
     pub fn total_delegated(&self, validator_id: &Bytes32) -> u64 {
         self.delegators
@@ -756,6 +994,11 @@ impl DelegationMap {
             .unwrap_or(&[])
     }
 
+    /// Iterate all validator delegator lists.
+    pub fn all_delegators(&self) -> impl Iterator<Item = (&Bytes32, &Vec<DelegatorEntry>)> {
+        self.delegators.iter()
+    }
+
     /// Mutable access to delegators for a validator.
     pub fn get_delegators_mut(
         &mut self,
@@ -774,6 +1017,29 @@ impl DelegationMap {
             .get_mut(validator_id)?
             .iter_mut()
             .find(|d| &d.delegator_id == delegator_id)
+    }
+
+    /// Get pending rewards for a specific delegator entry.
+    pub fn get_delegator_reward(&self, validator_id: &Bytes32, delegator_id: &Bytes32) -> u64 {
+        self.delegators
+            .get(validator_id)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|d| &d.delegator_id == delegator_id)
+                    .map(|d| d.pending_rewards)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Remove a specific virtual delegation entry without unbonding.
+    pub fn remove_virtual_delegation(&mut self, validator_id: &Bytes32, delegator_id: &Bytes32) {
+        if let Some(entries) = self.delegators.get_mut(validator_id) {
+            entries.retain(|d| &d.delegator_id != delegator_id);
+            if entries.is_empty() {
+                self.delegators.remove(validator_id);
+            }
+        }
     }
 
     /// Add a new delegation or increase an existing one.
@@ -894,5 +1160,34 @@ impl DelegationMap {
         }
 
         pool.saturating_sub(distributed) // remainder back to treasury
+    }
+}
+
+#[cfg(test)]
+mod delegation_map_tests {
+    use super::*;
+
+    #[test]
+    fn test_all_delegators_iterates_all_entries() {
+        let mut map = DelegationMap::new();
+        for validator in 1..=3u8 {
+            for delegator in 1..=2u8 {
+                map.add_delegation(
+                    Bytes32::from([validator; 32]),
+                    Bytes32::from([validator * 10 + delegator; 32]),
+                    1_000,
+                    0,
+                );
+            }
+        }
+
+        let mut counts: Vec<usize> = map
+            .all_delegators()
+            .map(|(_, entries)| entries.len())
+            .collect();
+        counts.sort_unstable();
+
+        assert_eq!(counts, vec![2, 2, 2]);
+        assert_eq!(map.all_delegators().count(), 3);
     }
 }

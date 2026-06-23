@@ -54,6 +54,7 @@ pub mod gossip;
 pub mod handshake;
 pub mod message;
 pub mod net_types;
+pub mod observer;
 pub mod peer;
 pub mod peer_manager;
 pub mod rate_limit;
@@ -67,6 +68,10 @@ pub use handshake::{
 };
 pub use message::{Message, MessageType};
 pub use net_types::{NetworkCommand, NetworkEvent};
+pub use observer::{
+    perform_observer_handshake_initiator, perform_observer_handshake_responder, read_frame_plain,
+    write_frame_plain, ObserverHandshakeResult,
+};
 pub use peer::{PeerInfo, PeerStatus, PeerTable};
 pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
 pub use rate_limit::{

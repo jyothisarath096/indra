@@ -196,6 +196,7 @@ fn mempool_to_block_pipeline() {
         timestamp: 1_700_000_001,
         polc_round: None,
         slash_evidence: vec![],
+        governance_ops: vec![],
         staking_ops: vec![],
     };
 

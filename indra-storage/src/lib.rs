@@ -37,13 +37,19 @@
 #![deny(clippy::panic)]
 
 pub mod block_store;
+pub mod epoch_store;
 pub mod error;
+pub mod migration;
 pub mod qc_store;
 pub mod state_store;
+pub mod vote_safety;
 pub mod wal;
 
 pub use block_store::{BlockStore, PruneConfig};
+pub use epoch_store::EpochStore;
 pub use error::{StorageError, StorageResult};
+pub use migration::{migrate_chain_state, migration_record, MigrationLog, MigrationRecord};
 pub use qc_store::{load_last_qc, save_last_qc};
 pub use state_store::StateStore;
+pub use vote_safety::{VoteSafetyRecord, VoteSafetyStore};
 pub use wal::MempoolWal;

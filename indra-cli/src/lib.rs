@@ -20,6 +20,9 @@
 //! ### `send-tx`
 //! Build and submit a transaction to a running node via JSON-RPC.
 //!
+//! ### `stake`
+//! Build and submit validator and delegation staking operations.
+//!
 //! ### `query`
 //! Query chain state from a running node:
 //! - `query height`
@@ -37,6 +40,7 @@ pub mod error;
 pub mod genesis_cmd;
 pub mod keygen;
 pub mod query;
+pub mod staking;
 pub mod tx_builder;
 pub mod wallet;
 
@@ -47,5 +51,10 @@ pub use keygen::{
     KeysFile, ValidatorKeys,
 };
 pub use query::{rpc_call, QueryResult};
-pub use tx_builder::{build_transaction, BuiltTransaction, TxParams};
+pub use staking::{
+    build_claim_rewards_op, build_delegate_op, build_register_validator_op,
+    build_set_auto_delegate_op, build_set_commission_op, build_undelegate_op, fetch_chain_id,
+    fetch_staking_nonce, reconstruct_keypair, submit_staking_op,
+};
+pub use tx_builder::{build_transaction, BuiltStakingOp, BuiltTransaction, TxParams};
 pub use wallet::{PendingChange, Wallet, WalletEntry};

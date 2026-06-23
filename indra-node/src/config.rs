@@ -62,6 +62,16 @@ pub struct NodeConfig {
     ///
     /// `None` means archive mode.
     pub prune_keep_blocks: Option<u64>,
+
+    /// Listen address for the observer/full-node port.
+    ///
+    /// `None` disables the observer port entirely.
+    pub observer_addr: Option<String>,
+
+    /// Listen address for the Prometheus metrics endpoint.
+    ///
+    /// `None` disables metrics entirely.
+    pub metrics_addr: Option<String>,
 }
 
 impl NodeConfig {
@@ -83,6 +93,8 @@ impl NodeConfig {
             snapshot_interval: 300,
             mempool_capacity: 5_000,
             prune_keep_blocks: None,
+            observer_addr: None,
+            metrics_addr: None,
         }
     }
 
@@ -104,6 +116,37 @@ impl NodeConfig {
             snapshot_interval: 300,
             mempool_capacity: 5_000,
             prune_keep_blocks: None,
+            observer_addr: Some(format!(
+                "0.0.0.0:{}",
+                indra_core::types::primitives::OBSERVER_PORT
+            )),
+            metrics_addr: Some(crate::metrics::DEFAULT_METRICS_ADDR.to_string()),
+        }
+    }
+
+    /// Create an observer node config.
+    pub fn observer_node(data_dir: PathBuf, p2p_addr: String) -> Self {
+        let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
+        Self {
+            data_dir,
+            genesis_path: None,
+            validator_seed: None,
+            bls_seed: None,
+            vrf_seed: None,
+            pq_sk: None,
+            pq_pk: None,
+            p2p_addr,
+            bootstrap_peers: vec![],
+            dns_seed_host: indra_core::types::primitives::DNS_SEED_HOST.to_string(),
+            peers_file,
+            snapshot_interval: 300,
+            mempool_capacity: 5_000,
+            prune_keep_blocks: None,
+            observer_addr: Some(format!(
+                "0.0.0.0:{}",
+                indra_core::types::primitives::OBSERVER_PORT
+            )),
+            metrics_addr: Some(crate::metrics::DEFAULT_OBSERVER_METRICS_ADDR.to_string()),
         }
     }
 
@@ -115,6 +158,21 @@ impl NodeConfig {
     /// Path to the block log file.
     pub fn block_log_path(&self) -> PathBuf {
         self.data_dir.join("blocks.log")
+    }
+
+    /// Path to the epoch history log.
+    pub fn epoch_log_path(&self) -> PathBuf {
+        self.data_dir.join("epochs.log")
+    }
+
+    /// Path to the vote safety persistence file.
+    pub fn vote_safety_path(&self) -> PathBuf {
+        self.data_dir.join("vote_safety.dat")
+    }
+
+    /// Path to the schema migration audit log.
+    pub fn migration_log_path(&self) -> PathBuf {
+        self.data_dir.join("migration.log")
     }
 
     /// Path to the state snapshot directory.

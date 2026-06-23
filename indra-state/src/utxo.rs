@@ -24,7 +24,10 @@ use std::collections::HashMap;
 use indra_core::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    types::{primitives::Bytes32, transaction::OutputV1},
+    types::{
+        primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS},
+        transaction::OutputV1,
+    },
 };
 use indra_crypto::sha256;
 
@@ -50,6 +53,7 @@ pub struct UtxoEntry {
 
 impl Encode for UtxoEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
+        SCHEMA_VERSION.encode(buf);
         self.utxo_id.encode(buf);
         self.output.encode(buf);
         self.created_height.encode(buf);
@@ -58,7 +62,7 @@ impl Encode for UtxoEntry {
     }
 
     fn encoded_len(&self) -> usize {
-        self.utxo_id.encoded_len()
+        1 + self.utxo_id.encoded_len()
             + self.output.encoded_len()
             + self.created_height.encoded_len()
             + self.tx_index.encoded_len()
@@ -68,14 +72,46 @@ impl Encode for UtxoEntry {
 
 impl Decode for UtxoEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        Ok(Self {
-            utxo_id: Bytes32::decode(r)?,
-            output: OutputV1::decode(r)?,
-            created_height: u64::decode(r)?,
-            tx_index: u32::decode(r)?,
-            output_index: u32::decode(r)?,
-        })
+        let marker = u8::decode(r)?;
+        match marker {
+            SCHEMA_VERSION_GENESIS | SCHEMA_VERSION => decode_utxo_entry_fields(r, None),
+            other if r.remaining() == 0 => Err(IndraError::UnsupportedSchemaVersion {
+                struct_name: "UtxoEntry",
+                version: other,
+                max_supported: SCHEMA_VERSION,
+            }),
+            first_byte => decode_utxo_entry_fields(r, Some(first_byte)),
+        }
     }
+}
+
+impl UtxoEntry {
+    /// Decode the legacy unversioned UTXO layout.
+    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        decode_utxo_entry_fields(r, None)
+    }
+}
+
+fn decode_utxo_entry_fields(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<UtxoEntry> {
+    let utxo_id = match first_byte {
+        Some(first) => {
+            let mut bytes = [0u8; 32];
+            bytes[0] = first;
+            bytes[1..].copy_from_slice(r.read_bytes(31)?);
+            Bytes32::from(bytes)
+        }
+        None => Bytes32::decode(r)?,
+    };
+    Ok(UtxoEntry {
+        utxo_id,
+        output: OutputV1::decode(r)?,
+        created_height: u64::decode(r)?,
+        tx_index: u32::decode(r)?,
+        output_index: u32::decode(r)?,
+    })
 }
 
 /// The complete set of unspent transaction outputs.
@@ -135,6 +171,24 @@ impl UtxoSet {
             entries: HashMap::new(),
             smt: SparseMerkleTree::new(),
         }
+    }
+
+    /// Decode a legacy unversioned UTXO set.
+    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let count = u32::decode(r)? as usize;
+        let mut set = Self::new();
+        for _ in 0..count {
+            let entry = UtxoEntry::decode_legacy(r)?;
+            if set.entries.contains_key(&entry.utxo_id) {
+                return Err(IndraError::DuplicateEntries {
+                    field: "snapshot.utxos",
+                });
+            }
+            let leaf_value = Self::leaf_value(&entry);
+            set.smt.insert(entry.utxo_id.0, leaf_value);
+            set.entries.insert(entry.utxo_id, entry);
+        }
+        Ok(set)
     }
 
     /// Number of UTXOs currently in the set.

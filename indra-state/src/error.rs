@@ -203,6 +203,42 @@ pub enum StateError {
     #[error("block contains duplicate slash evidence")]
     DuplicateSlashEvidence,
 
+    /// A block contains more governance operations than allowed.
+    #[error("block contains {actual} governance ops, maximum is {max}")]
+    TooManyGovernanceOps {
+        /// Actual count.
+        actual: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Governance operation is invalid.
+    #[error("invalid governance op: {reason}")]
+    InvalidGovernanceOp {
+        /// Specific reason.
+        reason: String,
+    },
+
+    /// Governance operation signature is invalid.
+    #[error("governance op signature invalid: {reason}")]
+    GovernanceSignatureInvalid {
+        /// Specific reason.
+        reason: String,
+    },
+
+    /// Governance nonce is invalid.
+    #[error("governance nonce invalid: expected {expected}, got {got}")]
+    GovernanceNonceInvalid {
+        /// Expected next nonce.
+        expected: u64,
+        /// Nonce carried by operation.
+        got: u64,
+    },
+
+    /// Governance proposal was not found.
+    #[error("governance proposal not found")]
+    GovernanceProposalNotFound,
+
     /// Validator not found in the validator set.
     #[error("validator not found")]
     ValidatorNotFound,

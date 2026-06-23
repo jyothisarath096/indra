@@ -10,7 +10,7 @@ use crate::{
     error::IndraResult,
     types::{
         crypto::{HybridPubKey, HybridSignature},
-        primitives::{Bytes32, MAX_COMMISSION_BPS, MIN_COMMISSION_BPS, STAKING_OP_DOMAIN},
+        primitives::{Bytes32, STAKING_OP_DOMAIN},
     },
 };
 
@@ -20,6 +20,9 @@ const TAG_UNDELEGATE: u8 = 2;
 const TAG_CLAIM_REWARDS: u8 = 3;
 const TAG_REGISTER_VALIDATOR: u8 = 4;
 const TAG_SET_COMMISSION: u8 = 5;
+const TAG_SELF_STAKE: u8 = 6;
+const TAG_SELF_UNSTAKE: u8 = 7;
+const TAG_SET_AUTO_DELEGATE: u8 = 8;
 
 /// A public staking operation included in a block.
 /// All operations carry a hybrid signature and a replay-protection nonce.
@@ -83,6 +86,30 @@ pub enum StakingOpBody {
         /// New commission rate in basis points.
         new_commission_bps: u32,
     },
+
+    /// Bond a validator-owned UTXO as validator self-stake.
+    SelfStake {
+        /// The UTXO being bonded as validator self-stake.
+        bond_utxo_id: Bytes32,
+        /// Validator's public key.
+        validator_pubkey: HybridPubKey,
+    },
+
+    /// Begin unbonding validator self-stake.
+    SelfUnstake {
+        /// The self-stake bond UTXO ID.
+        bond_utxo_id: Bytes32,
+        /// Validator's public key.
+        validator_pubkey: HybridPubKey,
+    },
+
+    /// Set or clear the auto-delegation target for this validator.
+    SetAutoDelegate {
+        /// This validator's identity.
+        validator_id: Bytes32,
+        /// Target validator to soft-delegate to. Bytes32::ZERO clears.
+        target_validator_id: Bytes32,
+    },
 }
 
 impl StakingOp {
@@ -116,8 +143,15 @@ impl StakingOp {
             } => pubkey_to_id(delegator_pubkey),
             StakingOpBody::RegisterValidator {
                 validator_pubkey, ..
+            }
+            | StakingOpBody::SelfStake {
+                validator_pubkey, ..
+            }
+            | StakingOpBody::SelfUnstake {
+                validator_pubkey, ..
             } => pubkey_to_id(validator_pubkey),
-            StakingOpBody::SetCommission { validator_id, .. } => *validator_id,
+            StakingOpBody::SetCommission { validator_id, .. }
+            | StakingOpBody::SetAutoDelegate { validator_id, .. } => *validator_id,
         }
     }
 
@@ -127,29 +161,30 @@ impl StakingOp {
         match &self.body {
             StakingOpBody::Delegate { .. } => {}
             StakingOpBody::Undelegate { .. } => {}
+            StakingOpBody::SelfStake { .. } => {}
+            StakingOpBody::SelfUnstake { .. } => {}
             StakingOpBody::RegisterValidator { commission_bps, .. } => {
-                if *commission_bps < MIN_COMMISSION_BPS || *commission_bps > MAX_COMMISSION_BPS {
+                if *commission_bps > 10_000 {
                     return Err(IndraError::CommissionOutOfRange {
                         actual: *commission_bps,
-                        min: MIN_COMMISSION_BPS,
-                        max: MAX_COMMISSION_BPS,
+                        min: 0,
+                        max: 10_000,
                     });
                 }
             }
             StakingOpBody::SetCommission {
                 new_commission_bps, ..
             } => {
-                if *new_commission_bps < MIN_COMMISSION_BPS
-                    || *new_commission_bps > MAX_COMMISSION_BPS
-                {
+                if *new_commission_bps > 10_000 {
                     return Err(IndraError::CommissionOutOfRange {
                         actual: *new_commission_bps,
-                        min: MIN_COMMISSION_BPS,
-                        max: MAX_COMMISSION_BPS,
+                        min: 0,
+                        max: 10_000,
                     });
                 }
             }
             StakingOpBody::ClaimRewards { .. } => {}
+            StakingOpBody::SetAutoDelegate { .. } => {}
         }
         Ok(())
     }
@@ -204,6 +239,30 @@ impl Encode for StakingOpBody {
                 validator_id.encode(buf);
                 new_commission_bps.encode(buf);
             }
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey,
+            } => {
+                buf.push(TAG_SELF_STAKE);
+                bond_utxo_id.encode(buf);
+                validator_pubkey.encode(buf);
+            }
+            StakingOpBody::SelfUnstake {
+                bond_utxo_id,
+                validator_pubkey,
+            } => {
+                buf.push(TAG_SELF_UNSTAKE);
+                bond_utxo_id.encode(buf);
+                validator_pubkey.encode(buf);
+            }
+            StakingOpBody::SetAutoDelegate {
+                validator_id,
+                target_validator_id,
+            } => {
+                buf.push(TAG_SET_AUTO_DELEGATE);
+                validator_id.encode(buf);
+                target_validator_id.encode(buf);
+            }
         }
     }
 
@@ -222,6 +281,13 @@ impl Encode for StakingOpBody {
                 validator_pubkey, ..
             } => 4 + validator_pubkey.encoded_len() + 32,
             StakingOpBody::SetCommission { .. } => 32 + 4,
+            StakingOpBody::SelfStake {
+                validator_pubkey, ..
+            } => 32 + validator_pubkey.encoded_len(),
+            StakingOpBody::SelfUnstake {
+                validator_pubkey, ..
+            } => 32 + validator_pubkey.encoded_len(),
+            StakingOpBody::SetAutoDelegate { .. } => 32 + 32,
         }
     }
 }
@@ -253,6 +319,18 @@ impl Decode for StakingOpBody {
             TAG_SET_COMMISSION => Ok(StakingOpBody::SetCommission {
                 validator_id: Bytes32::decode(r)?,
                 new_commission_bps: u32::decode(r)?,
+            }),
+            TAG_SELF_STAKE => Ok(StakingOpBody::SelfStake {
+                bond_utxo_id: Bytes32::decode(r)?,
+                validator_pubkey: HybridPubKey::decode(r)?,
+            }),
+            TAG_SELF_UNSTAKE => Ok(StakingOpBody::SelfUnstake {
+                bond_utxo_id: Bytes32::decode(r)?,
+                validator_pubkey: HybridPubKey::decode(r)?,
+            }),
+            TAG_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
+                validator_id: Bytes32::decode(r)?,
+                target_validator_id: Bytes32::decode(r)?,
             }),
             _ => Err(IndraError::InvalidStakingOp(format!(
                 "unknown staking op tag: {}",
@@ -341,6 +419,18 @@ mod tests {
                 validator_id: Bytes32::from([5u8; 32]),
                 new_commission_bps: 1_500,
             }),
+            op(StakingOpBody::SelfStake {
+                bond_utxo_id: Bytes32::from([0x66u8; 32]),
+                validator_pubkey: dummy_pubkey(),
+            }),
+            op(StakingOpBody::SelfUnstake {
+                bond_utxo_id: Bytes32::from([0x77u8; 32]),
+                validator_pubkey: dummy_pubkey(),
+            }),
+            op(StakingOpBody::SetAutoDelegate {
+                validator_id: Bytes32::from([0x88u8; 32]),
+                target_validator_id: Bytes32::from([0x99u8; 32]),
+            }),
         ];
 
         for op in cases {
@@ -380,7 +470,7 @@ mod tests {
     #[test]
     fn staking_op_validate_structure_rejects_bad_commission() {
         let bad_register = op(StakingOpBody::RegisterValidator {
-            commission_bps: 50,
+            commission_bps: 10_001,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
         });
@@ -388,7 +478,7 @@ mod tests {
 
         let bad_set = op(StakingOpBody::SetCommission {
             validator_id: Bytes32::ZERO,
-            new_commission_bps: 9_999,
+            new_commission_bps: 10_001,
         });
         assert!(bad_set.validate_structure().is_err());
     }
@@ -416,5 +506,86 @@ mod tests {
             delegator_pubkey: pubkey,
         });
         assert_eq!(a.signer_id(), b.signer_id());
+    }
+
+    #[test]
+    fn staking_op_self_stake_encode_decode_round_trip() {
+        let op = op(StakingOpBody::SelfStake {
+            bond_utxo_id: Bytes32::from([0xA1; 32]),
+            validator_pubkey: dummy_pubkey(),
+        });
+        let encoded = op.encode_to_vec();
+        assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
+    }
+
+    #[test]
+    fn staking_op_self_unstake_encode_decode_round_trip() {
+        let op = op(StakingOpBody::SelfUnstake {
+            bond_utxo_id: Bytes32::from([0xA2; 32]),
+            validator_pubkey: dummy_pubkey(),
+        });
+        let encoded = op.encode_to_vec();
+        assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
+    }
+
+    #[test]
+    fn staking_op_self_stake_signer_id_is_validator_id() {
+        let pubkey = dummy_pubkey();
+        let expected = pubkey_to_id(&pubkey);
+        let op = op(StakingOpBody::SelfStake {
+            bond_utxo_id: Bytes32::from([0xA3; 32]),
+            validator_pubkey: pubkey,
+        });
+        assert_eq!(op.signer_id(), expected);
+    }
+
+    #[test]
+    fn staking_op_self_stake_signing_bytes_domain_separated_from_delegate() {
+        let pubkey = dummy_pubkey();
+        let bond_utxo_id = Bytes32::from([0xA4; 32]);
+        let self_stake = op(StakingOpBody::SelfStake {
+            bond_utxo_id,
+            validator_pubkey: pubkey.clone(),
+        });
+        let delegate = op(StakingOpBody::Delegate {
+            validator_id: pubkey_to_id(&pubkey),
+            bond_utxo_id,
+            delegator_pubkey: pubkey,
+        });
+        assert_ne!(
+            self_stake.signing_bytes("indra-testnet-1"),
+            delegate.signing_bytes("indra-testnet-1")
+        );
+    }
+
+    #[test]
+    fn staking_op_set_auto_delegate_encode_decode() {
+        let op = op(StakingOpBody::SetAutoDelegate {
+            validator_id: Bytes32::from([0x31; 32]),
+            target_validator_id: Bytes32::from([0x32; 32]),
+        });
+        let encoded = op.encode_to_vec();
+        assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
+    }
+
+    #[test]
+    fn staking_op_set_auto_delegate_signer_is_validator_id() {
+        let validator_id = Bytes32::from([0x33; 32]);
+        let op = op(StakingOpBody::SetAutoDelegate {
+            validator_id,
+            target_validator_id: Bytes32::from([0x34; 32]),
+        });
+        assert_eq!(op.signer_id(), validator_id);
+    }
+
+    #[test]
+    fn staking_op_clear_auto_delegate_zero_target() {
+        let op = op(StakingOpBody::SetAutoDelegate {
+            validator_id: Bytes32::from([0x35; 32]),
+            target_validator_id: Bytes32::ZERO,
+        });
+        assert!(op.validate_structure().is_ok());
+        let encoded = op.encode_to_vec();
+        assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
     }
 }

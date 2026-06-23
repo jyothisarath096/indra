@@ -25,10 +25,15 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
             };
             Some(DriverEvent::InboundTx { from, tx_bytes })
         }
-        Message::Status { height, tip_hash } => Some(DriverEvent::PeerStatus {
+        Message::Status {
+            height,
+            tip_hash,
+            round,
+        } => Some(DriverEvent::PeerStatus {
             from,
             height,
             tip_hash,
+            round,
         }),
         Message::RequestQC { height } => Some(DriverEvent::QcRequest { from, height }),
         Message::QCResponse { height, qc_bytes } => Some(DriverEvent::QcResponse {

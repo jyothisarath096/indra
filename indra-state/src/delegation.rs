@@ -7,7 +7,7 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_COMMISSION_BPS, MIN_COMMISSION_BPS,
+        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MIN_COMMISSION_BPS,
         STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{StakingOp, StakingOpBody},
@@ -43,7 +43,8 @@ pub fn apply_staking_op(
 
     let signing_bytes = op.signing_bytes(chain_id);
     match &op.body {
-        StakingOpBody::SetCommission { validator_id, .. } => {
+        StakingOpBody::SetCommission { validator_id, .. }
+        | StakingOpBody::SetAutoDelegate { validator_id, .. } => {
             let validator = state
                 .validators
                 .get(validator_id)
@@ -77,6 +78,12 @@ pub fn apply_staking_op(
             )?;
         }
         StakingOpBody::RegisterValidator {
+            validator_pubkey, ..
+        }
+        | StakingOpBody::SelfStake {
+            validator_pubkey, ..
+        }
+        | StakingOpBody::SelfUnstake {
             validator_pubkey, ..
         } => {
             verify_staking_sig(
@@ -126,6 +133,18 @@ pub fn apply_staking_op(
             validator_id,
             new_commission_bps,
         } => apply_set_commission(state, validator_id, *new_commission_bps),
+        StakingOpBody::SetAutoDelegate {
+            validator_id,
+            target_validator_id,
+        } => apply_set_auto_delegate(state, *validator_id, *target_validator_id),
+        StakingOpBody::SelfStake {
+            bond_utxo_id,
+            validator_pubkey,
+        } => apply_self_stake(state, *bond_utxo_id, validator_pubkey, current_height),
+        StakingOpBody::SelfUnstake {
+            bond_utxo_id,
+            validator_pubkey,
+        } => apply_self_unstake(state, *bond_utxo_id, validator_pubkey, current_height),
     }
 }
 
@@ -169,7 +188,9 @@ fn apply_register_validator(
     validator_pubkey: &HybridPubKey,
     vrf_pk: [u8; 32],
 ) -> StateResult<()> {
-    if commission_bps < MIN_COMMISSION_BPS || commission_bps > MAX_COMMISSION_BPS {
+    if commission_bps < MIN_COMMISSION_BPS
+        || commission_bps > state.governance.params.max_commission_bps
+    {
         return Err(StateError::InvalidStakingOp(
             "commission out of range".into(),
         ));
@@ -196,6 +217,7 @@ fn apply_register_validator(
         self_report_count: 0,
         commission_bps,
         min_delegation_spark: DUST_LIMIT_SPARK,
+        auto_delegate_to: None,
     };
     state.validators.upsert(entry)
 }
@@ -221,7 +243,9 @@ fn apply_delegate(
     ) {
         return Err(StateError::ValidatorNotActive);
     }
-    let min_delegation = validator.min_delegation_spark;
+    let min_delegation = validator
+        .min_delegation_spark
+        .max(state.governance.params.min_delegation_spark);
 
     if state.staked_bonds.contains_key(&bond_utxo_id) {
         return Err(StateError::InvalidStakingOp(
@@ -244,7 +268,7 @@ fn apply_delegate(
     }
 
     let amount_spark = utxo_entry.output.value_spark;
-    if amount_spark < validator.min_delegation_spark {
+    if amount_spark < min_delegation {
         return Err(StateError::InvalidStakingOp(format!(
             "delegation {} Spark below minimum {} Spark",
             amount_spark, min_delegation,
@@ -319,6 +343,115 @@ fn apply_undelegate(
         .map_err(|e| StateError::InvalidStakingOp(e.into()))
 }
 
+/// Bond a validator-owned UTXO as validator self-stake.
+fn apply_self_stake(
+    state: &mut ChainState,
+    bond_utxo_id: Bytes32,
+    validator_pubkey: &HybridPubKey,
+    current_height: u64,
+) -> StateResult<()> {
+    let validator_id = pubkey_to_id(validator_pubkey);
+    let validator = state
+        .validators
+        .get(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+    if !matches!(
+        validator.status,
+        ValidatorStatus::Active | ValidatorStatus::Registered
+    ) {
+        return Err(StateError::ValidatorNotActive);
+    }
+
+    if state.staked_bonds.contains_key(&bond_utxo_id) {
+        return Err(StateError::InvalidStakingOp(
+            "UTXO is already bonded as stake".into(),
+        ));
+    }
+
+    let utxo_entry = state
+        .utxos
+        .get(&bond_utxo_id)
+        .ok_or(StateError::UnknownUtxo)?
+        .clone();
+    let utxo_owner_id = pubkey_to_id(&utxo_entry.output.owner_pubkey);
+    if utxo_owner_id != validator_id {
+        return Err(StateError::InvalidStakingOp(
+            "UTXO does not belong to the validator".into(),
+        ));
+    }
+
+    let amount_spark = utxo_entry.output.value_spark;
+    if amount_spark < DUST_LIMIT_SPARK {
+        return Err(StateError::InvalidStakingOp(format!(
+            "self-stake {} Spark below dust limit {} Spark",
+            amount_spark, DUST_LIMIT_SPARK,
+        )));
+    }
+
+    let current_epoch = epoch_for_height(current_height);
+    let original_output = utxo_entry.output;
+    let _ = state.utxos.spend(&bond_utxo_id);
+    state.staked_bonds.insert(
+        bond_utxo_id,
+        StakeBondEntry {
+            utxo_id: bond_utxo_id,
+            validator_id,
+            delegator_id: validator_id,
+            amount_spark,
+            bonded_epoch: current_epoch,
+            unbonding_end_epoch: None,
+            original_output,
+        },
+    );
+    if let Some(v) = state.validators.get_mut(&validator_id) {
+        v.stake_spark = v.stake_spark.saturating_add(amount_spark);
+    }
+    Ok(())
+}
+
+/// Begin unbonding validator self-stake.
+fn apply_self_unstake(
+    state: &mut ChainState,
+    bond_utxo_id: Bytes32,
+    validator_pubkey: &HybridPubKey,
+    current_height: u64,
+) -> StateResult<()> {
+    let validator_id = pubkey_to_id(validator_pubkey);
+    state
+        .validators
+        .get(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+
+    let bond = state
+        .staked_bonds
+        .get_mut(&bond_utxo_id)
+        .ok_or_else(|| StateError::InvalidStakingOp("self-stake bond not found".into()))?;
+    if bond.delegator_id != validator_id {
+        return Err(StateError::InvalidStakingOp(
+            "bond is not validator self-stake".into(),
+        ));
+    }
+    if bond.validator_id != validator_id {
+        return Err(StateError::InvalidStakingOp(
+            "bond not staked with this validator".into(),
+        ));
+    }
+    if bond.unbonding_end_epoch.is_some() {
+        return Err(StateError::InvalidStakingOp(
+            "bond is already unbonding".into(),
+        ));
+    }
+
+    let current_epoch = epoch_for_height(current_height);
+    let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
+    let amount_spark = bond.amount_spark;
+    bond.unbonding_end_epoch = Some(unbonding_end);
+    if let Some(v) = state.validators.get_mut(&validator_id) {
+        v.stake_spark = v.stake_spark.saturating_sub(amount_spark);
+    }
+    Ok(())
+}
+
 /// Claim pending rewards for a delegator.
 ///
 /// Transfers pending_rewards to the delegator's UTXO set entry.
@@ -332,12 +465,22 @@ fn apply_claim_rewards(
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
 
-    let entry = state
+    let delegation_claim = state
         .delegations
-        .get_delegator_mut(validator_id, &delegator_id)
-        .ok_or(StateError::DelegatorNotFound)?;
+        .get_delegators(validator_id)
+        .iter()
+        .find(|entry| entry.delegator_id == delegator_id)
+        .map(|entry| entry.pending_rewards);
+    let validator_claim = state
+        .validators
+        .get(validator_id)
+        .filter(|validator| validator.validator_id == delegator_id)
+        .map(|validator| validator.pending_rewards);
+    let claim_from_validator = delegation_claim.is_none() && validator_claim.is_some();
 
-    let claimed = entry.pending_rewards;
+    let claimed = delegation_claim
+        .or(validator_claim)
+        .ok_or(StateError::DelegatorNotFound)?;
     if claimed == 0 {
         return Ok(());
     }
@@ -347,7 +490,16 @@ fn apply_claim_rewards(
             claimed, DUST_LIMIT_SPARK
         )));
     }
-    entry.pending_rewards = 0;
+    if claim_from_validator {
+        if let Some(validator) = state.validators.get_mut(validator_id) {
+            validator.pending_rewards = 0;
+        }
+    } else if let Some(entry) = state
+        .delegations
+        .get_delegator_mut(validator_id, &delegator_id)
+    {
+        entry.pending_rewards = 0;
+    }
 
     let mut blinding_input = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
     blinding_input.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
@@ -391,7 +543,9 @@ fn apply_set_commission(
     validator_id: &Bytes32,
     new_commission_bps: u32,
 ) -> StateResult<()> {
-    if !(MIN_COMMISSION_BPS..=MAX_COMMISSION_BPS).contains(&new_commission_bps) {
+    if new_commission_bps < MIN_COMMISSION_BPS
+        || new_commission_bps > state.governance.params.max_commission_bps
+    {
         return Err(StateError::InvalidStakingOp(
             "commission out of governance-set range".into(),
         ));
@@ -410,6 +564,46 @@ fn apply_set_commission(
     }
 
     validator.commission_bps = new_commission_bps;
+    Ok(())
+}
+
+fn apply_set_auto_delegate(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    target_validator_id: Bytes32,
+) -> StateResult<()> {
+    let validator = state
+        .validators
+        .get(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+
+    if !matches!(
+        validator.status,
+        ValidatorStatus::Active | ValidatorStatus::Registered
+    ) {
+        return Err(StateError::ValidatorNotActive);
+    }
+
+    if target_validator_id == Bytes32::ZERO {
+        if let Some(v) = state.validators.get_mut(&validator_id) {
+            v.auto_delegate_to = None;
+        }
+        return Ok(());
+    }
+
+    if target_validator_id == validator_id {
+        return Err(StateError::InvalidStakingOp(
+            "cannot auto-delegate to self".to_string(),
+        ));
+    }
+
+    if state.validators.get(&target_validator_id).is_none() {
+        return Err(StateError::ValidatorNotFound);
+    }
+
+    if let Some(v) = state.validators.get_mut(&validator_id) {
+        v.auto_delegate_to = Some(target_validator_id);
+    }
     Ok(())
 }
 
@@ -537,6 +731,7 @@ mod tests {
             self_report_count: 0,
             commission_bps: 1_000,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
         };
         state.validators.upsert(entry).unwrap();
         (validator_id, keypair)
@@ -576,6 +771,58 @@ mod tests {
             },
             nonce,
             delegator_keypair,
+            &state.chain_id,
+        )
+    }
+
+    fn self_stake_op(
+        state: &ChainState,
+        bond_utxo_id: Bytes32,
+        validator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: pubkey_from_keypair(validator_keypair),
+            },
+            nonce,
+            validator_keypair,
+            &state.chain_id,
+        )
+    }
+
+    fn self_unstake_op(
+        state: &ChainState,
+        bond_utxo_id: Bytes32,
+        validator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::SelfUnstake {
+                bond_utxo_id,
+                validator_pubkey: pubkey_from_keypair(validator_keypair),
+            },
+            nonce,
+            validator_keypair,
+            &state.chain_id,
+        )
+    }
+
+    fn set_auto_delegate_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        target_validator_id: Bytes32,
+        validator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::SetAutoDelegate {
+                validator_id,
+                target_validator_id,
+            },
+            nonce,
+            validator_keypair,
             &state.chain_id,
         )
     }
@@ -732,6 +979,206 @@ mod tests {
         let second = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 3);
         apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
 
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn self_stake_bonds_validator_utxo_and_increases_stake() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x30);
+
+        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert!(!state.utxos.contains(&bond_utxo_id));
+        let bond = state.staked_bonds.get(&bond_utxo_id).unwrap();
+        assert_eq!(bond.validator_id, validator_id);
+        assert_eq!(bond.delegator_id, validator_id);
+        assert_eq!(bond.amount_spark, 2_000_000);
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn self_stake_rejects_unknown_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let op = self_stake_op(&state, Bytes32::from([0x31; 32]), &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::UnknownUtxo)
+        );
+    }
+
+    #[test]
+    fn self_stake_rejects_wrong_utxo_owner() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let wrong_owner = pubkey_from_keypair(&keypair(0x02));
+        let bond_utxo_id = insert_delegator_utxo(&mut state, wrong_owner, 2_000_000, 0x32);
+
+        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn self_stake_rejects_unregistered_validator() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0x01);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x33);
+
+        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::ValidatorNotFound)
+        );
+    }
+
+    #[test]
+    fn self_stake_rejects_slashed_validator() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Slashed;
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x34);
+
+        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::ValidatorNotActive)
+        );
+    }
+
+    #[test]
+    fn self_stake_rejects_already_bonded_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x35);
+
+        let chain_id = state.chain_id.clone();
+        let first = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let second = self_stake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn self_stake_rejects_invalid_signature() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let wrong_keypair = keypair(0x02);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey.clone(), 2_000_000, 0x36);
+        let op = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: pubkey,
+            },
+            1,
+            &wrong_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::StakingOpSignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn self_unstake_sets_unbonding_and_reduces_stake() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x37);
+
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
+        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
+
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .unwrap()
+                .unbonding_end_epoch,
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+        assert_eq!(state.validators.get(&validator_id).unwrap().stake_spark, 0);
+    }
+
+    #[test]
+    fn self_unstake_rejects_non_self_bond() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x38);
+        let chain_id = state.chain_id.clone();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
+
+        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        assert!(matches!(
+            apply_staking_op(&mut state, &unstake, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn self_unstake_rejects_wrong_validator() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let (_, wrong_validator_keypair) = make_active_validator(&mut state, 0x02);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x39);
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
+
+        let unstake = self_unstake_op(&state, bond_utxo_id, &wrong_validator_keypair, 1);
+        assert!(matches!(
+            apply_staking_op(&mut state, &unstake, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn self_unstake_rejects_already_unbonding() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x3A);
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
+        let first = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        let second = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 3);
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
         assert!(matches!(
             apply_staking_op(&mut state, &second, &chain_id, 1),
             Err(StateError::InvalidStakingOp(_))
@@ -959,5 +1406,88 @@ mod tests {
             apply_staking_op(&mut state, &second, &chain_id, 1),
             Err(StateError::ValidatorAlreadyRegistered)
         );
+    }
+
+    #[test]
+    fn set_auto_delegate_stores_target() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB1);
+        let (target_id, _) = make_active_validator(&mut state, 0xB2);
+        let op = set_auto_delegate_op(&state, validator_id, target_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .and_then(|v| v.auto_delegate_to),
+            Some(target_id)
+        );
+    }
+
+    #[test]
+    fn set_auto_delegate_clears_with_zero() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB3);
+        let (target_id, _) = make_active_validator(&mut state, 0xB4);
+        let chain_id = state.chain_id.clone();
+        let set = set_auto_delegate_op(&state, validator_id, target_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &set, &chain_id, 1).unwrap();
+        let clear =
+            set_auto_delegate_op(&state, validator_id, Bytes32::ZERO, &validator_keypair, 2);
+        apply_staking_op(&mut state, &clear, &chain_id, 1).unwrap();
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .and_then(|v| v.auto_delegate_to),
+            None
+        );
+    }
+
+    #[test]
+    fn set_auto_delegate_rejects_self() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB5);
+        let op = set_auto_delegate_op(&state, validator_id, validator_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(msg)) if msg.contains("cannot auto-delegate to self")
+        ));
+    }
+
+    #[test]
+    fn set_auto_delegate_rejects_nonexistent_target() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB6);
+        let op = set_auto_delegate_op(
+            &state,
+            validator_id,
+            Bytes32::from([0xCC; 32]),
+            &validator_keypair,
+            1,
+        );
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::ValidatorNotFound)
+        ));
+    }
+
+    #[test]
+    fn set_auto_delegate_rejects_slashed_validator() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB7);
+        let (target_id, _) = make_active_validator(&mut state, 0xB8);
+        if let Some(v) = state.validators.get_mut(&validator_id) {
+            v.status = ValidatorStatus::Slashed;
+        }
+        let op = set_auto_delegate_op(&state, validator_id, target_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::ValidatorNotActive)
+        ));
     }
 }

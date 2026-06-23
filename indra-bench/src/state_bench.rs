@@ -12,7 +12,7 @@ pub fn bench_block_apply_empty(iterations: u64) {
     let r = bench("block_apply_empty", iterations, || {
         let mut state = ChainState::new_genesis();
         let block = dummy_block(1, state.tip_hash, 0);
-        let _ = apply_block(&mut state, &block);
+        let _ = apply_block(&mut state, &block, 0);
     });
     r.print();
     r.assert_faster_than(Duration::from_millis(5));
@@ -25,7 +25,7 @@ pub fn bench_block_apply_full(iterations: u64) {
     let r = bench("block_apply_200tx", iterations, || {
         let mut state = ChainState::new_genesis();
         let block = dummy_block(1, state.tip_hash, 200);
-        let _ = apply_block(&mut state, &block);
+        let _ = apply_block(&mut state, &block, 0);
     });
     r.print();
     r.assert_faster_than(Duration::from_millis(100));
@@ -37,7 +37,7 @@ pub fn bench_chain_of_blocks(n: u64, iterations: u64) {
         let mut state = ChainState::new_genesis();
         for i in 1..=n {
             let block = dummy_block(i, state.tip_hash, 10);
-            let _ = apply_block(&mut state, &block);
+            let _ = apply_block(&mut state, &block, 0);
         }
     });
     r.print();

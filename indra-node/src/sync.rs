@@ -18,6 +18,7 @@ use indra_consensus::{
 };
 use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
+use indra_core::EpochRecord;
 use indra_crypto::{vrf_verify, VrfOutput, VrfProof};
 use indra_state::{apply_block, ChainState};
 use indra_storage::state_store::SNAPSHOT_INTERVAL;
@@ -208,7 +209,8 @@ pub fn import_block(
     mempool: &mut Mempool,
     block_store: &mut BlockStore,
     state_store: &StateStore,
-) -> NodeResult<()> {
+    timestamp_secs: u64,
+) -> NodeResult<Option<EpochRecord>> {
     let height = block.header.height;
 
     if state.validators.active_count() > 0 {
@@ -222,10 +224,11 @@ pub fn import_block(
     verify_block_state_root(block, state)?;
 
     // 1. Apply block to state (validates everything)
-    apply_block(state, block).map_err(|e| NodeError::BlockInvalid {
-        height,
-        reason: e.to_string(),
-    })?;
+    let epoch_record =
+        apply_block(state, block, timestamp_secs).map_err(|e| NodeError::BlockInvalid {
+            height,
+            reason: e.to_string(),
+        })?;
 
     // 2. Compute state root and store it in the state
     //    (the block header's state_root is checked against this in Phase 6)
@@ -247,7 +250,7 @@ pub fn import_block(
         state_store.save(state)?;
     }
 
-    Ok(())
+    Ok(epoch_record)
 }
 
 pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
@@ -407,7 +410,7 @@ fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()
     // applies the same block a second time inside `import_block` to mutate the
     // real chain state only after all header commitments match.
     let mut projected = state.clone();
-    apply_block(&mut projected, block).map_err(|e| NodeError::BlockInvalid {
+    apply_block(&mut projected, block, 0).map_err(|e| NodeError::BlockInvalid {
         height: block.header.height,
         reason: format!("block failed during pre-apply root verification: {e}"),
     })?;
@@ -521,6 +524,7 @@ mod tests {
                 self_report_count: 0,
                 commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                 min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
             })
             .unwrap();
 
@@ -563,6 +567,7 @@ mod tests {
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
             slash_evidence: vec![],
+            governance_ops: vec![],
             staking_ops: vec![],
         };
         produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
@@ -627,7 +632,7 @@ mod tests {
         };
 
         let mut projected = state.clone();
-        apply_block(&mut projected, &block).unwrap();
+        apply_block(&mut projected, &block, 0).unwrap();
         block.header.state_root = compute_state_root(&projected);
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
@@ -655,6 +660,7 @@ mod tests {
             &mut mempool,
             &mut block_store,
             &state_store,
+            0,
         )
         .unwrap();
 
@@ -693,6 +699,7 @@ mod tests {
                 &mut mempool,
                 &mut block_store,
                 &state_store,
+                0,
             )
             .unwrap();
             prev_qc = build_qc_bytes(
@@ -735,7 +742,8 @@ mod tests {
             &mut state,
             &mut mempool,
             &mut block_store,
-            &state_store
+            &state_store,
+            0
         )
         .is_err());
 
@@ -826,7 +834,7 @@ mod tests {
         let (_validator_id, _hybrid) =
             install_active_validator(&mut state, 0x12, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x12, 0, vec![]);
-        apply_block(&mut state, &block1).unwrap();
+        apply_block(&mut state, &block1, 0).unwrap();
 
         let block2 = make_strict_block(&state, 0x12, 0, vec![]);
         let err = verify_block_qc(&block2, &state).unwrap_err();
@@ -875,7 +883,7 @@ mod tests {
         };
 
         let mut state_after = state.clone();
-        apply_block(&mut state_after, &block1).unwrap();
+        apply_block(&mut state_after, &block1, 0).unwrap();
         let block2 = make_strict_block(&state_after, 0x13, 0, dummy_qc.encode_to_vec());
 
         let err = verify_block_qc(&block2, &state_after).unwrap_err();
@@ -942,6 +950,7 @@ mod tests {
             &mut mempool,
             &mut block_store,
             &state_store,
+            0,
         )
         .unwrap();
 

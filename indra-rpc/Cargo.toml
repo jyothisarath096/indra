@@ -11,11 +11,9 @@ indra-core      = { path = "../indra-core" }
 indra-crypto    = { path = "../indra-crypto" }
 indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
-indra-node      = { path = "../indra-node" }
 thiserror.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }
 indra-state     = { path = "../indra-state" }
-indra-node      = { path = "../indra-node" }

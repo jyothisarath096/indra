@@ -54,9 +54,14 @@ echo "Downloading INDRA node binary..."
 curl -sSf "$GITHUB_RAW/$PLATFORM/indra-node" -o "$BIN_DIR/indra-node"
 chmod +x "$BIN_DIR/indra-node"
 
+curl -sSf "$GITHUB_RAW/$PLATFORM/indra-observer" -o "$BIN_DIR/indra-observer"
+chmod +x "$BIN_DIR/indra-observer"
+
 curl -sSf "$GITHUB_RAW/$PLATFORM/indra-tx" -o "$BIN_DIR/indra-tx"
 chmod +x "$BIN_DIR/indra-tx"
 
+curl -sSf "$GITHUB_RAW/$PLATFORM/indra-stake" -o "$BIN_DIR/indra-stake"
+chmod +x "$BIN_DIR/indra-stake"
 
 echo "Downloading INDRA keygen..."
 curl -sSf "$GITHUB_RAW/$PLATFORM/indra-keygen" -o "$BIN_DIR/indra-keygen"
@@ -107,31 +112,9 @@ else
 fi
 
 echo ""
-echo "══════════════════════════════════════════"
-echo "  To start your node:"
-echo ""
-echo "  indra-node \\"
-echo "    --data-dir ~/.indra/data \\"
-echo "    --genesis ~/.indra/data/genesis.toml \\"
-echo "    --keys ~/.indra/data/keys.json"
-echo ""
-echo "  Or as a background service:"
-echo "  indra-node --data-dir ~/.indra/data \\"
-echo "    --genesis ~/.indra/data/genesis.toml \\"
-echo "    --keys ~/.indra/data/keys.json &"
-echo ""
-echo "  Dashboard (once running):"
-echo "  http://localhost:8545"
-echo "══════════════════════════════════════════"
-echo ""
+echo "Generating node configuration..."
+"$BIN_DIR/indra-node" --init
 
-# Ask if they want to start now
-read -p "Start the node now? [y/N] " -n 1 -r
 echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "Starting INDRA node..."
-    exec "$BIN_DIR/indra-node" \
-        --data-dir "$DATA_DIR" \
-        --genesis "$DATA_DIR/genesis.toml" \
-        --keys "$DATA_DIR/keys.json"
-fi
+echo "To install the systemd service, run the commands shown above."
+echo "Then: systemctl start indra-node"

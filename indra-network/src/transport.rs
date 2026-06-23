@@ -300,6 +300,7 @@ mod tests {
         let wire = Message::Status {
             height: 42,
             tip_hash: Bytes32::ZERO,
+            round: 0,
         }
         .encode_wire()
         .unwrap();

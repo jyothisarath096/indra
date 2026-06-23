@@ -14,6 +14,7 @@ use indra_core::types::primitives::{
 };
 
 use crate::{
+    governance::GovernanceState,
     nullifier::NullifierSet,
     utxo::UtxoSet,
     validator::{DelegationMap, StakeBondEntry, ValidatorSet},
@@ -73,6 +74,21 @@ pub struct ChainState {
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
     pub applied_slash_hashes: HashSet<Bytes32>,
+
+    /// On-chain governance state.
+    pub governance: GovernanceState,
+
+    /// Transient fee burns accumulated for the current epoch summary.
+    /// Not encoded and not included in consensus state roots.
+    pub epoch_fees_burned: u64,
+
+    /// Transient slash total accumulated for the current epoch summary.
+    /// Not encoded and not included in consensus state roots.
+    pub epoch_slashed_spark: u64,
+
+    /// Transient slash event count accumulated for the current epoch summary.
+    /// Not encoded and not included in consensus state roots.
+    pub epoch_slash_event_count: u32,
 }
 
 impl Encode for ChainState {
@@ -107,8 +123,9 @@ impl Encode for ChainState {
         encode_bond_map(&self.staked_bonds, buf);
         encode_nonce_map(&self.staking_nonces, buf);
         encode_hash_set(&self.applied_slash_hashes, buf);
-        // Omitted: no extra cached fields live on ChainState itself; nested SMT caches are
-        // intentionally reconstructed by the set decoders from the serialized canonical entries.
+        self.governance.encode(buf);
+        // Omitted: transient epoch summary counters and nested SMT caches are intentionally
+        // reconstructed/reset by decoders from the serialized canonical entries.
     }
 
     fn encoded_len(&self) -> usize {
@@ -129,6 +146,7 @@ impl Encode for ChainState {
             + bond_map_encoded_len(&self.staked_bonds)
             + nonce_map_encoded_len(&self.staking_nonces)
             + hash_set_encoded_len(&self.applied_slash_hashes)
+            + self.governance.encoded_len()
     }
 }
 
@@ -152,6 +170,10 @@ impl Decode for ChainState {
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
+            governance: GovernanceState::decode(r)?,
+            epoch_fees_burned: 0,
+            epoch_slashed_spark: 0,
+            epoch_slash_event_count: 0,
         })
     }
 }
@@ -177,7 +199,69 @@ impl ChainState {
             staked_bonds: HashMap::new(),
             staking_nonces: HashMap::new(),
             applied_slash_hashes: HashSet::new(),
+            governance: GovernanceState::new(),
+            epoch_fees_burned: 0,
+            epoch_slashed_spark: 0,
+            epoch_slash_event_count: 0,
         }
+    }
+
+    /// Decode a legacy unversioned snapshot payload at the supplied schema version.
+    pub fn decode_legacy_snapshot(r: &mut ByteReader<'_>, schema_version: u8) -> IndraResult<Self> {
+        let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
+        Ok(Self {
+            chain_id: String::from_utf8(chain_id_bytes.as_slice().to_vec())
+                .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string()),
+            height: u64::decode(r)?,
+            tip_hash: Bytes32::decode(r)?,
+            base_fee: u64::decode(r)?,
+            total_supply: u64::decode(r)?,
+            treasury_balance: u64::decode(r)?,
+            burn_buffer: u64::decode(r)?,
+            fee_reward_pool: u64::decode(r)?,
+            utxos: UtxoSet::decode_legacy(r)?,
+            nullifiers: NullifierSet::decode(r)?,
+            validators: ValidatorSet::decode_legacy(r, schema_version)?,
+            delegations: DelegationMap::decode_legacy(r)?,
+            staked_bonds: decode_bond_map_legacy(r)?,
+            staking_nonces: decode_nonce_map(r)?,
+            applied_slash_hashes: if r.remaining() > 0 {
+                decode_hash_set(r, "snapshot.applied_slash_hashes")?
+            } else {
+                HashSet::new()
+            },
+            governance: GovernanceState::new(),
+            epoch_fees_burned: 0,
+            epoch_slashed_spark: 0,
+            epoch_slash_event_count: 0,
+        })
+    }
+
+    /// Decode a schema-v2 versioned snapshot payload that predates governance.
+    pub fn decode_schema_v2_snapshot(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
+        Ok(Self {
+            chain_id: String::from_utf8(chain_id_bytes.as_slice().to_vec())
+                .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string()),
+            height: u64::decode(r)?,
+            tip_hash: Bytes32::decode(r)?,
+            base_fee: u64::decode(r)?,
+            total_supply: u64::decode(r)?,
+            treasury_balance: u64::decode(r)?,
+            burn_buffer: u64::decode(r)?,
+            fee_reward_pool: u64::decode(r)?,
+            utxos: UtxoSet::decode(r)?,
+            nullifiers: NullifierSet::decode(r)?,
+            validators: ValidatorSet::decode(r)?,
+            delegations: DelegationMap::decode(r)?,
+            staked_bonds: decode_bond_map(r)?,
+            staking_nonces: decode_nonce_map(r)?,
+            applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
+            governance: GovernanceState::new(),
+            epoch_fees_burned: 0,
+            epoch_slashed_spark: 0,
+            epoch_slash_event_count: 0,
+        })
     }
 
     /// Current epoch number (0-indexed).
@@ -261,6 +345,37 @@ fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, Stake
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let bond = StakeBondEntry::decode(r)?;
+        if key != bond.utxo_id {
+            return Err(IndraError::InvariantViolation {
+                message: "stake bond map key must match bond utxo_id",
+            });
+        }
+        if bonds.insert(key, bond).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.staked_bonds",
+            });
+        }
+    }
+    Ok(bonds)
+}
+
+fn decode_bond_map_legacy(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, StakeBondEntry>> {
+    use indra_core::error::IndraError;
+    use indra_core::types::primitives::MAX_VALIDATORS;
+
+    let count = u32::decode(r)? as usize;
+    let max = MAX_VALIDATORS.saturating_mul(1_000);
+    if count > max {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.staked_bonds",
+            max,
+            actual: count,
+        });
+    }
+    let mut bonds = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let key = Bytes32::decode(r)?;
+        let bond = StakeBondEntry::decode_legacy(r)?;
         if key != bond.utxo_id {
             return Err(IndraError::InvariantViolation {
                 message: "stake bond map key must match bond utxo_id",

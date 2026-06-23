@@ -20,14 +20,17 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
+use indra_core::types::primitives::{SCHEMA_VERSION, SCHEMA_VERSION_GENESIS};
 use indra_state::ChainState;
 
 use crate::error::{StorageError, StorageResult};
+use crate::migration::migrate_chain_state;
 
 /// How often to take a state snapshot (in blocks).
 pub const SNAPSHOT_INTERVAL: u64 = 300;
 const SNAPSHOT_VERSION_V1_SUMMARY: u8 = 0x01;
 const SNAPSHOT_VERSION_V2_COMPLETE: u8 = 0x02;
+const SNAPSHOT_VERSION_V3_VERSIONED: u8 = 0x03;
 
 /// Manages chain state snapshots on disk.
 pub struct StateStore {
@@ -106,6 +109,42 @@ impl StateStore {
         }
     }
 
+    /// Return the schema version stored in the latest snapshot, if any.
+    pub fn schema_version(&self) -> StorageResult<Option<u8>> {
+        let Some(path) = self.find_latest_snapshot()? else {
+            return Ok(None);
+        };
+        let mut f = fs::File::open(&path)?;
+        let mut header = [0u8; 12];
+        f.read_exact(&mut header)?;
+        let height =
+            u64::from_le_bytes(
+                header[..8]
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated while reading height".to_string(),
+                    })?,
+            );
+        let length =
+            u32::from_le_bytes(
+                header[8..12]
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height,
+                        detail: "snapshot header truncated while reading length".to_string(),
+                    })?,
+            ) as usize;
+        let mut state_bytes = vec![0u8; length.min(2)];
+        f.read_exact(&mut state_bytes)?;
+        match state_bytes.as_slice() {
+            [SNAPSHOT_VERSION_V3_VERSIONED, schema_version] => Ok(Some(*schema_version)),
+            [SNAPSHOT_VERSION_V2_COMPLETE, ..] => Ok(Some(SCHEMA_VERSION_GENESIS)),
+            [SNAPSHOT_VERSION_V1_SUMMARY, ..] => Ok(Some(SCHEMA_VERSION_GENESIS)),
+            _ => Ok(None),
+        }
+    }
+
     /// Find the path of the most recent snapshot file.
     fn find_latest_snapshot(&self) -> StorageResult<Option<PathBuf>> {
         let mut snapshots: Vec<(u64, PathBuf)> = Vec::new();
@@ -154,11 +193,13 @@ impl StateStore {
 /// Serialise a complete chain state snapshot.
 ///
 /// Payload format:
-/// - `0x02` version discriminator for the complete-state format
+/// - `0x03` version discriminator for the schema-versioned complete-state format
+/// - current schema version byte
 /// - canonical `ChainState` encoding
 fn serialise_chain_state(state: &ChainState) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + state.encoded_len());
-    buf.push(SNAPSHOT_VERSION_V2_COMPLETE);
+    let mut buf = Vec::with_capacity(2 + state.encoded_len());
+    buf.push(SNAPSHOT_VERSION_V3_VERSIONED);
+    buf.push(SCHEMA_VERSION);
     state.encode(&mut buf);
     buf
 }
@@ -189,8 +230,31 @@ fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<Chai
             Ok(None)
         }
         SNAPSHOT_VERSION_V2_COMPLETE => {
+            let (state, schema_version) = decode_legacy_snapshot(payload)
+                .map_err(|e| format!("legacy snapshot decode failed: {e}"))?;
+            let state = if schema_version < SCHEMA_VERSION {
+                migrate_chain_state(state, schema_version)?
+            } else {
+                state
+            };
+            validate_snapshot_state(state, file_height)
+        }
+        SNAPSHOT_VERSION_V3_VERSIONED => {
+            let Some((&schema_version, payload)) = payload.split_first() else {
+                return Err("V3 snapshot missing schema version".to_string());
+            };
+            if schema_version > SCHEMA_VERSION {
+                return Err(format!(
+                    "snapshot schema version {} exceeds node's maximum {} — upgrade your node binary",
+                    schema_version, SCHEMA_VERSION
+                ));
+            }
             let mut reader = ByteReader::new(payload);
-            let state = ChainState::decode(&mut reader).map_err(|e| e.to_string())?;
+            let state = if schema_version == 2 {
+                ChainState::decode_schema_v2_snapshot(&mut reader).map_err(|e| e.to_string())?
+            } else {
+                ChainState::decode(&mut reader).map_err(|e| e.to_string())?
+            };
             if reader.remaining() != 0 {
                 return Err(format!(
                     "snapshot at height {} has {} trailing bytes",
@@ -198,13 +262,12 @@ fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<Chai
                     reader.remaining()
                 ));
             }
-            if state.height != file_height {
-                return Err(format!(
-                    "snapshot height mismatch: file says {}, payload says {}",
-                    file_height, state.height
-                ));
-            }
-            Ok(Some(state))
+            let state = if schema_version < SCHEMA_VERSION {
+                migrate_chain_state(state, schema_version)?
+            } else {
+                state
+            };
+            validate_snapshot_state(state, file_height)
         }
         other => {
             eprintln!(
@@ -214,6 +277,39 @@ fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<Chai
             Ok(None)
         }
     }
+}
+
+fn decode_legacy_snapshot(payload: &[u8]) -> Result<(ChainState, u8), String> {
+    let mut reader_v2 = ByteReader::new(payload);
+    if let Ok(state) = ChainState::decode_legacy_snapshot(&mut reader_v2, SCHEMA_VERSION) {
+        if reader_v2.remaining() == 0 {
+            return Ok((state, SCHEMA_VERSION));
+        }
+    }
+
+    let mut reader_v1 = ByteReader::new(payload);
+    let state = ChainState::decode_legacy_snapshot(&mut reader_v1, SCHEMA_VERSION_GENESIS)
+        .map_err(|e| e.to_string())?;
+    if reader_v1.remaining() != 0 {
+        return Err(format!(
+            "legacy snapshot has {} trailing bytes",
+            reader_v1.remaining()
+        ));
+    }
+    Ok((state, SCHEMA_VERSION_GENESIS))
+}
+
+fn validate_snapshot_state(
+    state: ChainState,
+    file_height: u64,
+) -> Result<Option<ChainState>, String> {
+    if state.height != file_height {
+        return Err(format!(
+            "snapshot height mismatch: file says {}, payload says {}",
+            file_height, state.height
+        ));
+    }
+    Ok(Some(state))
 }
 
 #[cfg(test)]
@@ -236,6 +332,17 @@ mod tests {
         p
     }
 
+    fn write_snapshot(dir: &Path, height: u64, payload: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("state_{height}.snap"));
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&height.to_le_bytes()).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(payload).unwrap();
+        file.flush().unwrap();
+    }
+
     #[test]
     fn save_and_load() {
         let dir = temp_dir("a");
@@ -251,6 +358,37 @@ mod tests {
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded, state);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_snapshot_round_trips() {
+        let dir = temp_dir("v3_round_trip");
+        let store = StateStore::open(&dir).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.height = 123;
+        state.treasury_balance = 456;
+        store.save(&state).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
+        let loaded = store.load_latest().unwrap().unwrap();
+        assert_eq!(loaded, state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_with_future_schema_version_rejected() {
+        let dir = temp_dir("future_schema");
+        let store = StateStore::open(&dir).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.height = 7;
+        let mut payload = Vec::new();
+        payload.push(SNAPSHOT_VERSION_V3_VERSIONED);
+        payload.push(255);
+        state.encode(&mut payload);
+        write_snapshot(&dir, state.height, &payload);
+
+        let err = store.load_latest().unwrap_err();
+        assert!(err.to_string().contains("upgrade your node binary"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -336,6 +474,7 @@ mod tests {
                 self_report_count: 1,
                 commission_bps: 900,
                 min_delegation_spark: DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
             })
             .unwrap();
         state.delegations.add_delegation(
@@ -386,7 +525,7 @@ mod tests {
         };
 
         let mut projected = state.clone();
-        apply_block(&mut projected, &block).unwrap();
+        apply_block(&mut projected, &block, 0).unwrap();
         block.header.state_root = compute_state_root(&projected);
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
@@ -401,7 +540,7 @@ mod tests {
         let mut original = ChainState::new_genesis();
         for _ in 1u8..=12u8 {
             let block = make_block(&original);
-            apply_block(&mut original, &block).unwrap();
+            apply_block(&mut original, &block, 0).unwrap();
         }
 
         store.save(&original).unwrap();
@@ -419,8 +558,8 @@ mod tests {
         let next_block = make_block(&original);
         let mut original_next = original.clone();
         let mut decoded_next = decoded.clone();
-        apply_block(&mut original_next, &next_block).unwrap();
-        apply_block(&mut decoded_next, &next_block).unwrap();
+        apply_block(&mut original_next, &next_block, 0).unwrap();
+        apply_block(&mut decoded_next, &next_block, 0).unwrap();
 
         assert_eq!(original_next, decoded_next);
         assert_eq!(

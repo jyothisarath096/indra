@@ -11,9 +11,6 @@
 //! indra-wallet-scan --keys keys.json --wallet wallet.json \
 //!                   --node http://127.0.0.1:8545
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-
 const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
 
 fn main() {
@@ -190,40 +187,7 @@ fn query_utxos(node_url: &str, pubkey_hex: &str) -> Result<String, String> {
         r#"{{"jsonrpc":"2.0","method":"indra_getUtxos","params":["{}"],"id":1}}"#,
         pubkey_hex
     );
-    http_post(node_url, &body)
-}
-
-/// Make a simple HTTP POST request.
-fn http_post(url: &str, body: &str) -> Result<String, String> {
-    let url = url.trim_start_matches("http://");
-    let (host, path) = if let Some(pos) = url.find('/') {
-        (&url[..pos], &url[pos..])
-    } else {
-        (url, "/")
-    };
-
-    let mut stream =
-        TcpStream::connect(host).map_err(|e| format!("cannot connect to {}: {}", host, e))?;
-
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, body.len(), body
-    );
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("write error: {}", e))?;
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("read error: {}", e))?;
-
-    if let Some(pos) = response.find("\r\n\r\n") {
-        Ok(response[pos + 4..].to_string())
-    } else {
-        Ok(response)
-    }
+    indra_cli::staking::http_post(node_url, &body).map_err(|e| e.to_string())
 }
 
 /// Derive the genesis blinding factor for this validator's initial stake UTXO.

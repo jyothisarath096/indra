@@ -14,12 +14,14 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
 indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
+indra-rpc       = { path = "../indra-rpc" }
 indra-bulletproofs = { path = "../indra-bulletproofs" }
 rand.workspace = true
 thiserror.workspace = true
 fs2 = "0.4"
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["full"] }
+toml.workspace = true
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }
@@ -28,3 +30,7 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
 indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
+
+[[bin]]
+name = "indra-observer"
+path = "src/bin/observer.rs"

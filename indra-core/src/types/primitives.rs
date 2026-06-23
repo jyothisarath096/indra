@@ -123,6 +123,9 @@ pub const STAKING_TX_IDX: u32 = u32::MAX;
 /// Domain for deterministic staking reward blinding factor derivation.
 pub const STAKING_REWARD_BLINDING_DOMAIN: &[u8] = b"indra-staking-reward-v1";
 
+/// Domain for deterministic slashed self-stake bond release blinding derivation.
+pub const SLASH_BOND_RELEASE_BLINDING_DOMAIN: &[u8] = b"INDRA-slash-bond-release-v1";
+
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 
 /// Maximum Ed25519 signature size (bytes).
@@ -142,9 +145,6 @@ pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
 
 /// Maximum Bulletproof range proof per output (bytes).
 pub const MAX_RANGE_PROOF_BYTES: usize = 674;
-
-/// Maximum governance operation payload (bytes).
-pub const MAX_GOV_PAYLOAD_BYTES: usize = 4_096;
 
 // ── Economics ─────────────────────────────────────────────────────────────────
 
@@ -386,6 +386,21 @@ pub const MAX_OUTBOUND_PEERS: usize = 16;
 /// Maximum inbound peer connections.
 pub const MAX_INBOUND_PEERS: usize = 64;
 
+/// Default observer/full-node P2P port.
+pub const OBSERVER_PORT: u16 = 30304;
+
+/// Maximum concurrent observer connections per validator.
+pub const MAX_OBSERVER_CONNECTIONS: usize = 256;
+
+/// Observer handshake timeout in seconds.
+pub const OBSERVER_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
+/// Seconds between observer liveness pings.
+pub const OBSERVER_PING_INTERVAL_SECS: u64 = 30;
+
+/// Seconds to wait for observer pong before reconnecting.
+pub const OBSERVER_PONG_TIMEOUT_SECS: u64 = 10;
+
 /// Peer table persistence interval (seconds).
 pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
 
@@ -405,6 +420,14 @@ pub const PRUNE_WINDOW_EPOCHS: u64 = 500;
 
 /// The only protocol version this implementation supports.
 pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Current schema version for all persisted structs.
+///
+/// Increment this whenever any persisted struct changes its encoding.
+pub const SCHEMA_VERSION: u8 = 3;
+
+/// The schema version when INDRA was first deployed.
+pub const SCHEMA_VERSION_GENESIS: u8 = 1;
 
 // =============================================================================
 // PRIMITIVE TYPES

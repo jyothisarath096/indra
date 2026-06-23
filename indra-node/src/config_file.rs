@@ -1,0 +1,524 @@
+//! TOML configuration file parsing for the INDRA node.
+//!
+//! Parses `config.toml` into a `NodeConfigFile` intermediate struct, then
+//! converts to `NodeConfig` for use by the node engine. Parsing is manual over
+//! `toml::Value`; no serde derives are used.
+
+use std::path::{Path, PathBuf};
+
+use toml::Value;
+
+use crate::config::NodeConfig;
+use indra_core::types::primitives::{
+    DEFAULT_PRUNE_KEEP_BLOCKS, DNS_SEED_HOST, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT,
+};
+
+/// Parsed key material loaded from `keys.json`.
+#[derive(Debug, Clone)]
+pub struct KeysData {
+    /// Ed25519 seed for the hybrid classical key.
+    pub hybrid_seed: [u8; 32],
+    /// Legacy BLS seed.
+    pub bls_seed: [u8; 32],
+    /// VRF seed.
+    pub vrf_seed: [u8; 32],
+    /// ML-DSA private key bytes.
+    pub pq_sk: Vec<u8>,
+    /// ML-DSA public key bytes.
+    pub pq_pk: Vec<u8>,
+}
+
+/// Raw parsed config file values.
+#[derive(Debug, Default, Clone)]
+pub struct NodeConfigFile {
+    /// `[node].mode`.
+    pub mode: Option<String>,
+    /// `[node].chain_id`.
+    pub chain_id: Option<String>,
+    /// `[node].data_dir`.
+    pub data_dir: Option<String>,
+    /// `[node].genesis`.
+    pub genesis: Option<String>,
+    /// `[keys].path`.
+    pub keys_path: Option<String>,
+    /// `[network].p2p_addr`.
+    pub p2p_addr: Option<String>,
+    /// `[network].observer_addr`.
+    pub observer_addr: Option<String>,
+    /// `[network].bootstrap_peers`.
+    pub bootstrap_peers: Vec<String>,
+    /// `[network].dns_seed_host`.
+    pub dns_seed_host: Option<String>,
+    /// `[network].peers_file`.
+    pub peers_file: Option<String>,
+    /// `[rpc].addr`.
+    pub rpc_addr: Option<String>,
+    /// `[rpc].enabled`.
+    pub rpc_enabled: Option<bool>,
+    /// `[metrics].addr`.
+    pub metrics_addr: Option<String>,
+    /// `[metrics].enabled`.
+    pub metrics_enabled: Option<bool>,
+    /// `[storage].prune_keep_blocks`.
+    pub prune_keep_blocks: Option<u64>,
+    /// `[storage].snapshot_interval`.
+    pub snapshot_interval: Option<u64>,
+    /// `[storage].mempool_capacity`.
+    pub mempool_capacity: Option<usize>,
+}
+
+impl NodeConfigFile {
+    /// Load a TOML config file from disk.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read config file {}: {}", path.display(), e))?;
+        let table = toml::from_str::<Value>(&content)
+            .map_err(|e| format!("config.toml parse error: {}", e))?;
+        Ok(Self {
+            mode: get_str(&table, "node", "mode"),
+            chain_id: get_str(&table, "node", "chain_id"),
+            data_dir: get_str(&table, "node", "data_dir"),
+            genesis: get_str(&table, "node", "genesis"),
+            keys_path: get_str(&table, "keys", "path"),
+            p2p_addr: get_str(&table, "network", "p2p_addr"),
+            observer_addr: get_str(&table, "network", "observer_addr"),
+            bootstrap_peers: get_str_array(&table, "network", "bootstrap_peers"),
+            dns_seed_host: get_str(&table, "network", "dns_seed_host"),
+            peers_file: get_str(&table, "network", "peers_file"),
+            rpc_addr: get_str(&table, "rpc", "addr"),
+            rpc_enabled: get_bool(&table, "rpc", "enabled"),
+            metrics_addr: get_str(&table, "metrics", "addr"),
+            metrics_enabled: get_bool(&table, "metrics", "enabled"),
+            prune_keep_blocks: get_u64(&table, "storage", "prune_keep_blocks"),
+            snapshot_interval: get_u64(&table, "storage", "snapshot_interval"),
+            mempool_capacity: get_usize(&table, "storage", "mempool_capacity"),
+        })
+    }
+
+    /// Validate parsed config and return all detected errors.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        let mode = self.mode.as_deref().unwrap_or("validator");
+        if !matches!(mode, "validator" | "observer") {
+            errors.push("node.mode must be \"validator\" or \"observer\"".to_string());
+        }
+        if is_blank(self.data_dir.as_deref()) {
+            errors.push("node.data_dir must be set and non-empty".to_string());
+        }
+        if is_blank(self.genesis.as_deref()) {
+            errors.push("node.genesis must be set and non-empty".to_string());
+        }
+        if mode != "observer" && is_blank(self.keys_path.as_deref()) {
+            errors.push("keys.path must be set and non-empty for validator mode".to_string());
+        }
+        if let Some(addr) = self.p2p_addr.as_deref() {
+            if !is_valid_addr(addr) {
+                errors
+                    .push("network.p2p_addr must be valid host:port with port 1-65535".to_string());
+            }
+        }
+        if let Some(addr) = self.observer_addr.as_deref() {
+            if !addr.is_empty() && !is_valid_addr(addr) {
+                errors.push(
+                    "network.observer_addr must be valid host:port, empty, or omitted".to_string(),
+                );
+            }
+        }
+        if let Some(addr) = self.metrics_addr.as_deref() {
+            if !addr.is_empty() && !is_valid_addr(addr) {
+                errors.push("metrics.addr must be valid host:port, empty, or omitted".to_string());
+            }
+        }
+        if let Some(addr) = self.rpc_addr.as_deref() {
+            if !addr.is_empty() && !is_valid_addr(addr) {
+                errors.push("rpc.addr must be valid host:port, empty, or omitted".to_string());
+            }
+        }
+        if let Some(keep) = self.prune_keep_blocks {
+            if keep > 0 && keep < MIN_PRUNE_KEEP_BLOCKS {
+                errors.push(format!(
+                    "storage.prune_keep_blocks must be 0 for archive or at least {}",
+                    MIN_PRUNE_KEEP_BLOCKS
+                ));
+            }
+        }
+        if self.snapshot_interval == Some(0) {
+            errors.push("storage.snapshot_interval must be greater than 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Convert parsed config into runtime node configuration.
+    pub fn to_node_config(&self, keys_data: Option<&KeysData>) -> Result<NodeConfig, String> {
+        if let Err(errors) = self.validate() {
+            return Err(errors.join("; "));
+        }
+        let mode = self.mode.as_deref().unwrap_or("validator");
+        let data_dir = self
+            .data_dir
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "node.data_dir must be set".to_string())?;
+        let genesis = self
+            .genesis
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "node.genesis must be set".to_string())?;
+        let peers_file = self.peers_file.clone().unwrap_or_else(|| {
+            Path::new(data_dir)
+                .join("peers.json")
+                .to_string_lossy()
+                .to_string()
+        });
+        let prune_keep_blocks = match self.prune_keep_blocks.unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS) {
+            0 => None,
+            keep => Some(keep),
+        };
+        let observer_addr = match self.observer_addr.as_deref() {
+            Some("") => None,
+            Some(addr) => Some(addr.to_string()),
+            None => Some(format!("0.0.0.0:{}", OBSERVER_PORT)),
+        };
+        let metrics_addr = if self.metrics_enabled == Some(false) {
+            None
+        } else {
+            match self.metrics_addr.as_deref() {
+                Some("") => None,
+                Some(addr) => Some(addr.to_string()),
+                None => Some(crate::metrics::DEFAULT_METRICS_ADDR.to_string()),
+            }
+        };
+        let (validator_seed, bls_seed, vrf_seed, pq_sk, pq_pk) = if mode == "observer" {
+            (None, None, None, None, None)
+        } else {
+            let keys =
+                keys_data.ok_or_else(|| "validator mode requires keys.json data".to_string())?;
+            (
+                Some(keys.hybrid_seed),
+                Some(keys.bls_seed),
+                Some(keys.vrf_seed),
+                if keys.pq_sk.is_empty() {
+                    None
+                } else {
+                    Some(keys.pq_sk.clone())
+                },
+                if keys.pq_pk.is_empty() {
+                    None
+                } else {
+                    Some(keys.pq_pk.clone())
+                },
+            )
+        };
+        Ok(NodeConfig {
+            data_dir: PathBuf::from(data_dir),
+            genesis_path: Some(genesis.clone()),
+            validator_seed,
+            bls_seed,
+            vrf_seed,
+            pq_sk,
+            pq_pk,
+            p2p_addr: self
+                .p2p_addr
+                .clone()
+                .unwrap_or_else(|| "0.0.0.0:30303".to_string()),
+            bootstrap_peers: self.bootstrap_peers.clone(),
+            dns_seed_host: self
+                .dns_seed_host
+                .clone()
+                .unwrap_or_else(|| DNS_SEED_HOST.to_string()),
+            peers_file,
+            snapshot_interval: self.snapshot_interval.unwrap_or(300),
+            mempool_capacity: self.mempool_capacity.unwrap_or(5_000),
+            prune_keep_blocks,
+            observer_addr,
+            metrics_addr,
+        })
+    }
+}
+
+fn get_str(table: &Value, section: &str, key: &str) -> Option<String> {
+    table
+        .get(section)?
+        .get(key)?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn get_bool(table: &Value, section: &str, key: &str) -> Option<bool> {
+    table.get(section)?.get(key)?.as_bool()
+}
+
+fn get_u64(table: &Value, section: &str, key: &str) -> Option<u64> {
+    table
+        .get(section)?
+        .get(key)?
+        .as_integer()
+        .and_then(|v| u64::try_from(v).ok())
+}
+
+fn get_usize(table: &Value, section: &str, key: &str) -> Option<usize> {
+    table
+        .get(section)?
+        .get(key)?
+        .as_integer()
+        .and_then(|v| usize::try_from(v).ok())
+}
+
+fn get_str_array(table: &Value, section: &str, key: &str) -> Vec<String> {
+    table
+        .get(section)
+        .and_then(|s| s.get(key))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_blank(value: Option<&str>) -> bool {
+    value.map(str::trim).unwrap_or("").is_empty()
+}
+
+fn is_valid_addr(s: &str) -> bool {
+    let parts: Vec<&str> = s.rsplitn(2, ':').collect();
+    if parts.len() != 2 || parts[1].is_empty() {
+        return false;
+    }
+    parts[0].parse::<u16>().map(|p| p > 0).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> KeysData {
+        KeysData {
+            hybrid_seed: [1u8; 32],
+            bls_seed: [2u8; 32],
+            vrf_seed: [3u8; 32],
+            pq_sk: vec![4, 5, 6],
+            pq_pk: vec![7, 8, 9],
+        }
+    }
+
+    fn temp_file(name: &str, content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{}-{}-{}.toml",
+            name,
+            std::process::id(),
+            crate::metrics::MetricsState::new()
+                .started_at
+                .elapsed()
+                .as_nanos()
+        ));
+        if let Err(e) = std::fs::write(&path, content) {
+            panic!("failed to write temp config {}: {}", path.display(), e);
+        }
+        path
+    }
+
+    fn minimal() -> NodeConfigFile {
+        NodeConfigFile {
+            mode: Some("validator".to_string()),
+            data_dir: Some("/tmp/indra".to_string()),
+            genesis: Some("/tmp/indra/genesis.toml".to_string()),
+            keys_path: Some("/tmp/indra/keys.json".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_parse_minimal_config() {
+        let path = temp_file(
+            "minimal-config",
+            r#"
+[node]
+mode = "validator"
+data_dir = "/tmp/indra"
+genesis = "/tmp/indra/genesis.toml"
+
+[keys]
+path = "/tmp/indra/keys.json"
+"#,
+        );
+        let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(cfg.mode.as_deref(), Some("validator"));
+        assert_eq!(cfg.data_dir.as_deref(), Some("/tmp/indra"));
+        assert_eq!(cfg.keys_path.as_deref(), Some("/tmp/indra/keys.json"));
+    }
+
+    #[test]
+    fn test_parse_full_config() {
+        let path = temp_file(
+            "full-config",
+            r#"
+[node]
+mode = "validator"
+chain_id = "indra-testnet-1"
+data_dir = "/root/.indra/data"
+genesis = "/root/.indra/data/genesis.toml"
+
+[keys]
+path = "/root/.indra/data/keys.json"
+
+[network]
+p2p_addr = "0.0.0.0:30303"
+observer_addr = "0.0.0.0:30304"
+bootstrap_peers = ["1.1.1.1:30303", "2.2.2.2:30303"]
+dns_seed_host = "seeds.indraprotocol.com"
+peers_file = "/root/.indra/data/peers.json"
+
+[rpc]
+addr = "127.0.0.1:8545"
+enabled = true
+
+[metrics]
+addr = "0.0.0.0:9615"
+enabled = true
+
+[storage]
+prune_keep_blocks = 50000
+snapshot_interval = 300
+mempool_capacity = 5000
+"#,
+        );
+        let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(cfg.p2p_addr.as_deref(), Some("0.0.0.0:30303"));
+        assert_eq!(cfg.bootstrap_peers.len(), 2);
+        assert_eq!(cfg.rpc_enabled, Some(true));
+        assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9615"));
+        assert_eq!(cfg.mempool_capacity, Some(5000));
+    }
+
+    #[test]
+    fn test_parse_bootstrap_peers_array() {
+        let path = temp_file(
+            "bootstrap-config",
+            r#"
+[network]
+bootstrap_peers = ["a.example:30303", "b.example:30303"]
+"#,
+        );
+        let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(
+            cfg.bootstrap_peers,
+            vec!["a.example:30303".to_string(), "b.example:30303".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_validate_missing_data_dir() {
+        let err = NodeConfigFile::default()
+            .validate()
+            .err()
+            .unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("data_dir")));
+    }
+
+    #[test]
+    fn test_validate_invalid_p2p_addr() {
+        let mut cfg = minimal();
+        cfg.p2p_addr = Some("bad-address".to_string());
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("p2p_addr")));
+    }
+
+    #[test]
+    fn test_validate_invalid_port_zero() {
+        let mut cfg = minimal();
+        cfg.p2p_addr = Some("127.0.0.1:0".to_string());
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("port")));
+    }
+
+    #[test]
+    fn test_validate_collects_all_errors() {
+        let cfg = NodeConfigFile {
+            p2p_addr: Some("nope".to_string()),
+            metrics_addr: Some("also-nope".to_string()),
+            ..Default::default()
+        };
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("data_dir")));
+        assert!(err.iter().any(|e| e.contains("p2p_addr")));
+    }
+
+    #[test]
+    fn test_validate_observer_mode_no_keys() {
+        let cfg = NodeConfigFile {
+            mode: Some("observer".to_string()),
+            data_dir: Some("/tmp/indra-observer".to_string()),
+            genesis: Some("/tmp/indra-observer/genesis.toml".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_prune_keep_below_minimum() {
+        let mut cfg = minimal();
+        cfg.prune_keep_blocks = Some(MIN_PRUNE_KEEP_BLOCKS.saturating_sub(1));
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("prune_keep_blocks")));
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let path = PathBuf::from("/tmp/indra-definitely-missing-config.toml");
+        let err = NodeConfigFile::load(&path).err().unwrap_or_default();
+        assert!(err.contains("cannot read config file"));
+        assert!(err.contains("/tmp/indra-definitely-missing-config.toml"));
+    }
+
+    #[test]
+    fn test_load_invalid_toml() {
+        let path = temp_file("invalid-config", "not = [valid");
+        let err = NodeConfigFile::load(&path).err().unwrap_or_default();
+        assert!(err.contains("config.toml parse error"));
+    }
+
+    #[test]
+    fn test_to_node_config_defaults() {
+        let cfg = minimal();
+        let node = cfg
+            .to_node_config(Some(&keys()))
+            .unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(node.p2p_addr, "0.0.0.0:30303");
+        assert_eq!(node.dns_seed_host, DNS_SEED_HOST);
+        assert_eq!(node.peers_file, "/tmp/indra/peers.json");
+        assert_eq!(node.prune_keep_blocks, Some(DEFAULT_PRUNE_KEEP_BLOCKS));
+        assert_eq!(
+            node.metrics_addr.as_deref(),
+            Some(crate::metrics::DEFAULT_METRICS_ADDR)
+        );
+    }
+
+    #[test]
+    fn test_cli_override_beats_config_file() {
+        let mut cfg = minimal();
+        cfg.p2p_addr = Some("0.0.0.0:30303".to_string());
+        cfg.p2p_addr = Some("0.0.0.0:30304".to_string());
+        let node = cfg
+            .to_node_config(Some(&keys()))
+            .unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(node.p2p_addr, "0.0.0.0:30304");
+    }
+
+    #[test]
+    fn test_archive_mode_when_prune_zero() {
+        let mut cfg = minimal();
+        cfg.prune_keep_blocks = Some(0);
+        let node = cfg
+            .to_node_config(Some(&keys()))
+            .unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(node.prune_keep_blocks, None);
+    }
+}

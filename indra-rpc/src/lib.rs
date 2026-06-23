@@ -53,5 +53,6 @@ pub mod server;
 pub mod types;
 
 pub use error::{RpcError, RpcResult};
+pub use handlers::{dispatch, DispatchResult, NetworkContext, NodeState};
 pub use server::RpcServer;
 pub use types::{RpcErrorBody, RpcRequest, RpcResponse};

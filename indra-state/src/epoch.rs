@@ -14,19 +14,52 @@
 //! `state.total_supply` never increases during an epoch transition.
 //! Supply only decreases via the fee burn path in `apply.rs`.
 
-use indra_core::types::primitives::{
-    Bytes32, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
-    ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
-    ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, STAKING_TX_IDX,
-};
+use std::collections::{HashMap, HashSet};
 
-use crate::{chain::ChainState, error::StateResult, validator::ValidatorStatus};
+use indra_core::{
+    types::{
+        crypto::CommitmentV1,
+        primitives::{
+            Bytes32, VariableBytes, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS,
+            ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
+            ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
+            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
+        },
+    },
+    EpochRecord,
+};
+use rand::SeedableRng;
+
+use crate::{
+    chain::ChainState,
+    error::StateResult,
+    governance::{
+        GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
+        GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS,
+    },
+    governance_apply::return_governance_deposit,
+    validator::ValidatorStatus,
+};
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
 pub const EPOCHS_PER_YEAR: u64 = BLOCKS_PER_YEAR / EPOCH_DURATION_BLOCKS;
 
+#[derive(Debug, Clone, Copy)]
+struct AutoDelegationSnapshot {
+    delegator_id: Bytes32,
+    target_id: Bytes32,
+    amount_spark: u64,
+    previous_staked_spark: u64,
+    previous_pending_rewards: u64,
+    had_existing_entry: bool,
+}
+
 /// Apply the epoch transition to the chain state.
-pub fn apply_epoch_transition(state: &mut ChainState, current_epoch: u64) -> StateResult<()> {
+pub fn apply_epoch_transition(
+    state: &mut ChainState,
+    current_epoch: u64,
+    timestamp_secs: u64,
+) -> StateResult<EpochRecord> {
     eprintln!(
         "[epoch] transition at height={} epoch={} validators={} total_stake={} fee_pool={}",
         state.height,
@@ -35,9 +68,32 @@ pub fn apply_epoch_transition(state: &mut ChainState, current_epoch: u64) -> Sta
         state.validators.total_active_stake(),
         state.fee_reward_pool,
     );
+    apply_governance_phase_transitions(state, current_epoch)?;
+    let active_before: HashSet<Bytes32> = state
+        .validators
+        .active_validators()
+        .map(|v| v.validator_id)
+        .collect();
+    let active_validators_before = active_before.len() as u32;
+    let total_staked = state
+        .validators
+        .total_selectable_self_stake()
+        .saturating_add(state.delegations.total_staked());
+    let fee_pool_before = state.fee_reward_pool;
+    let fees_burned_this_epoch = state.epoch_fees_burned;
+    let explicit_slashed_this_epoch = state.epoch_slashed_spark;
+    let explicit_slash_count_this_epoch = state.epoch_slash_event_count;
     let current_height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+    let record_epoch = current_epoch.saturating_sub(1);
+    let record_start_height = record_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
     let reward_per_block = block_reward_at_height(current_height);
     let epoch_block_reward = reward_per_block.saturating_mul(EPOCH_DURATION_BLOCKS);
+
+    state
+        .validators
+        .select_active_set(&state.delegations, total_staked);
+
+    let virtual_delegations = apply_auto_delegations(state, current_epoch);
 
     let supply_before = state.total_supply;
     distribute_block_rewards(state, epoch_block_reward, current_epoch);
@@ -54,23 +110,67 @@ pub fn apply_epoch_transition(state: &mut ChainState, current_epoch: u64) -> Sta
     );
 
     distribute_fee_rewards(state, current_epoch);
+    let fee_rewards_distributed = fee_pool_before.saturating_sub(state.fee_reward_pool);
+    remove_auto_delegations(state, &virtual_delegations, current_epoch);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds(state, current_epoch)?;
-    apply_liveness_penalties(state, current_epoch);
-    let total_staked = state
+    let (liveness_slashed, liveness_penalty_count) = apply_liveness_penalties(state, current_epoch);
+
+    let mut active_after: Vec<Bytes32> = state
         .validators
-        .total_selectable_self_stake()
-        .saturating_add(state.delegations.total_staked());
-    state
-        .validators
-        .select_active_set(&state.delegations, total_staked);
+        .active_validators()
+        .map(|v| v.validator_id)
+        .collect();
+    active_after.sort_by_key(|id| id.0);
+    let active_after_set: HashSet<Bytes32> = active_after.iter().copied().collect();
+    let mut validators_joined: Vec<Bytes32> = active_after_set
+        .difference(&active_before)
+        .copied()
+        .collect();
+    validators_joined.sort_by_key(|id| id.0);
+    let mut validators_left: Vec<Bytes32> = active_before
+        .difference(&active_after_set)
+        .copied()
+        .collect();
+    validators_left.sort_by_key(|id| id.0);
+
+    let record = EpochRecord {
+        epoch: record_epoch,
+        start_height: record_start_height,
+        end_height: record_start_height
+            .saturating_add(EPOCH_DURATION_BLOCKS)
+            .saturating_sub(1),
+        timestamp_secs,
+        active_validators: active_validators_before,
+        total_staked_spark: total_staked,
+        block_rewards_distributed: if state.validators.total_active_stake() == 0 {
+            0
+        } else {
+            epoch_block_reward
+        },
+        fee_rewards_distributed,
+        fees_burned: fees_burned_this_epoch,
+        total_slashed_spark: explicit_slashed_this_epoch.saturating_add(liveness_slashed),
+        slash_event_count: explicit_slash_count_this_epoch.saturating_add(liveness_penalty_count),
+        liveness_penalty_count,
+        avg_base_fee: state.base_fee,
+        validators_joined,
+        validators_left,
+        era: era_for_height(record_start_height),
+        block_reward_spark: reward_per_block,
+        total_supply: state.total_supply,
+        treasury_balance: state.treasury_balance,
+    };
 
     eprintln!(
         "[epoch] complete epoch={} total_supply={} treasury={}",
         current_epoch, state.total_supply, state.treasury_balance,
     );
-    Ok(())
+    state.epoch_fees_burned = 0;
+    state.epoch_slashed_spark = 0;
+    state.epoch_slash_event_count = 0;
+    Ok(record)
 }
 
 /// Compute the block reward in Spark for a given block height.
@@ -84,6 +184,337 @@ pub fn block_reward_at_height(height: u64) -> u64 {
         let blocks_since_era_3 = height.saturating_sub(era_3_start);
         let era_index = blocks_since_era_3 / ERA_3_PLUS_DURATION_BLOCKS;
         ERA_3_BLOCK_REWARD_SPARK >> era_index.min(63)
+    }
+}
+
+fn era_for_height(height: u64) -> u64 {
+    if height < ERA_1_2_DURATION_BLOCKS {
+        1
+    } else if height < ERA_1_2_DURATION_BLOCKS.saturating_mul(2) {
+        2
+    } else {
+        3 + height.saturating_sub(ERA_1_2_DURATION_BLOCKS.saturating_mul(2))
+            / ERA_3_PLUS_DURATION_BLOCKS
+    }
+}
+
+/// Apply governance phase transitions at an epoch boundary.
+pub fn apply_governance_phase_transitions(
+    state: &mut ChainState,
+    current_epoch: u64,
+) -> StateResult<()> {
+    let proposal_ids: Vec<Bytes32> = state.governance.proposals.keys().copied().collect();
+    for proposal_id in proposal_ids {
+        let phase = match state.governance.proposals.get(&proposal_id) {
+            Some(proposal) => proposal.phase,
+            None => continue,
+        };
+        match phase {
+            ProposalPhase::Deliberation => {
+                let commit_start = state.governance.proposals[&proposal_id].commit_start_epoch;
+                if current_epoch >= commit_start {
+                    let snapshot1 = take_governance_snapshot(state);
+                    if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
+                        proposal.snapshot1 = Some(snapshot1);
+                        proposal.phase = ProposalPhase::Commit;
+                    }
+                    eprintln!(
+                        "[governance] proposal {} -> Commit phase",
+                        hex::encode(&proposal_id.0[..4])
+                    );
+                }
+            }
+            ProposalPhase::Commit => {
+                let reveal_start = state.governance.proposals[&proposal_id].reveal_start_epoch;
+                if current_epoch >= reveal_start {
+                    if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
+                        proposal.phase = ProposalPhase::Reveal;
+                    }
+                    eprintln!(
+                        "[governance] proposal {} -> Reveal phase",
+                        hex::encode(&proposal_id.0[..4])
+                    );
+                }
+            }
+            ProposalPhase::Reveal => {
+                let tally_epoch = state.governance.proposals[&proposal_id].tally_epoch;
+                if current_epoch >= tally_epoch {
+                    tally_proposal(state, proposal_id)?;
+                }
+            }
+            ProposalPhase::ExecDelay => {
+                auto_execute_ready(state, proposal_id, current_epoch);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32) -> StateResult<()> {
+    let snapshot2 = {
+        let proposal = state
+            .governance
+            .proposals
+            .get(&proposal_id)
+            .ok_or(crate::error::StateError::GovernanceProposalNotFound)?;
+        compute_snapshot2(proposal)
+    };
+    let mut should_return_deposit = false;
+    let mut should_queue = None;
+    if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
+        proposal.snapshot2 = Some(snapshot2);
+        for validator_id in proposal.commits.keys() {
+            if !proposal.reveals.contains_key(validator_id) {
+                proposal.deposit_burned = true;
+            }
+        }
+        let (yes, no, abstain) = tally_votes(proposal);
+        proposal.yes_stake = yes;
+        proposal.no_stake = no;
+        proposal.abstain_stake = abstain;
+        let snap2 = proposal.snapshot2.as_ref().ok_or_else(|| {
+            crate::error::StateError::InvariantViolation {
+                message: "snapshot2 missing after tally",
+            }
+        })?;
+        let quorum_bps = match proposal.tier {
+            indra_core::types::governance::ProposalTier::Standard => {
+                state.governance.params.governance_quorum_bps
+            }
+            indra_core::types::governance::ProposalTier::Critical => {
+                state.governance.params.governance_critical_quorum_bps
+            }
+        };
+        let passed = snap2.quorum_met(yes, quorum_bps);
+        proposal.passed = Some(passed);
+        if passed {
+            proposal.phase = ProposalPhase::ExecDelay;
+            should_queue = Some(QueuedExecution {
+                proposal_id,
+                action: proposal.action.clone(),
+                executable_epoch: proposal.executable_after_epoch,
+                executed: false,
+            });
+            should_return_deposit = !proposal.deposit_burned;
+        } else {
+            let support_bps = snap2.support_bps(yes);
+            if support_bps >= GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS && !proposal.deposit_burned {
+                should_return_deposit = true;
+            } else {
+                proposal.deposit_burned = true;
+            }
+            proposal.phase = ProposalPhase::Failed;
+        }
+    }
+    if let Some(exec) = should_queue {
+        state.governance.queued_executions.push(exec);
+    }
+    if should_return_deposit {
+        return_governance_deposit(state, proposal_id)?;
+    }
+    Ok(())
+}
+
+fn auto_execute_ready(state: &mut ChainState, proposal_id: Bytes32, current_epoch: u64) {
+    for exec in state.governance.queued_executions.iter_mut() {
+        if exec.proposal_id == proposal_id
+            && !exec.executed
+            && current_epoch >= exec.executable_epoch
+        {
+            state.governance.params.apply_action(&exec.action);
+            exec.executed = true;
+            if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
+                proposal.phase = ProposalPhase::Executed;
+            }
+            eprintln!(
+                "[governance] auto-executed proposal {} at epoch {}",
+                hex::encode(&proposal_id.0[..4]),
+                current_epoch
+            );
+        }
+    }
+}
+
+/// Take a governance stake snapshot.
+pub fn take_governance_snapshot(state: &ChainState) -> GovernanceSnapshot {
+    let mut weights = HashMap::new();
+    let mut total = 0u64;
+    for validator in state.validators.all_validators() {
+        if matches!(
+            validator.status,
+            ValidatorStatus::Active | ValidatorStatus::Registered
+        ) {
+            let delegated = state.delegations.total_delegated(&validator.validator_id);
+            let weight = validator.stake_spark.saturating_add(delegated);
+            if weight > 0 {
+                weights.insert(validator.validator_id, weight);
+                total = total.saturating_add(weight);
+            }
+        }
+    }
+    GovernanceSnapshot {
+        weights,
+        total_stake: total,
+    }
+}
+
+/// Compute Snapshot 2 by applying governance redelegation overlay.
+pub fn compute_snapshot2(proposal: &ProposalRecord) -> GovernanceSnapshot {
+    let mut weights = proposal
+        .snapshot1
+        .as_ref()
+        .map(|snapshot| snapshot.weights.clone())
+        .unwrap_or_default();
+    let total = proposal
+        .snapshot1
+        .as_ref()
+        .map(|snapshot| snapshot.total_stake)
+        .unwrap_or(0);
+    for redelegation in &proposal.redelegations {
+        if !proposal.reveals.contains_key(&redelegation.from_validator) {
+            continue;
+        }
+        if !proposal.reveals.contains_key(&redelegation.to_validator) {
+            continue;
+        }
+        if let Some(from_weight) = weights.get_mut(&redelegation.from_validator) {
+            *from_weight = from_weight.saturating_sub(redelegation.amount_spark);
+        }
+        let to_weight = weights.entry(redelegation.to_validator).or_insert(0);
+        *to_weight = to_weight.saturating_add(redelegation.amount_spark);
+    }
+    GovernanceSnapshot {
+        weights,
+        total_stake: total,
+    }
+}
+
+/// Tally proposal votes.
+pub fn tally_votes(proposal: &ProposalRecord) -> (u64, u64, u64) {
+    let Some(snapshot2) = proposal.snapshot2.as_ref() else {
+        return (0, 0, 0);
+    };
+    let snapshot1_total = proposal
+        .snapshot1
+        .as_ref()
+        .map(|snapshot| snapshot.total_stake)
+        .unwrap_or(snapshot2.total_stake);
+    let mut yes = 0u64;
+    let mut no = 0u64;
+    let mut abstain = 0u64;
+    for (validator_id, weight) in &snapshot2.weights {
+        match proposal.reveals.get(validator_id) {
+            Some(reveal) if reveal.vote => yes = yes.saturating_add(*weight),
+            Some(_) => no = no.saturating_add(*weight),
+            None => abstain = abstain.saturating_add(*weight),
+        }
+    }
+    let counted = yes.saturating_add(no).saturating_add(abstain);
+    if counted < snapshot1_total {
+        abstain = abstain.saturating_add(snapshot1_total.saturating_sub(counted));
+    }
+    (yes, no, abstain)
+}
+
+fn apply_auto_delegations(
+    state: &mut ChainState,
+    current_epoch: u64,
+) -> Vec<AutoDelegationSnapshot> {
+    let mut virtual_delegations: Vec<(Bytes32, Bytes32, u64)> = state
+        .validators
+        .all_validators()
+        .filter(|v| {
+            matches!(v.status, ValidatorStatus::Registered)
+                && v.auto_delegate_to.is_some()
+                && v.stake_spark > 0
+        })
+        .filter_map(|v| {
+            let target_id = v.auto_delegate_to?;
+            let target = state.validators.get(&target_id)?;
+            if !target.is_active() {
+                return None;
+            }
+            Some((v.validator_id, target_id, v.stake_spark))
+        })
+        .collect();
+    virtual_delegations.sort_by_key(|(delegator_id, target_id, _)| (target_id.0, delegator_id.0));
+
+    let mut snapshots = Vec::with_capacity(virtual_delegations.len());
+    for (delegator_id, target_id, amount_spark) in &virtual_delegations {
+        let (previous_staked_spark, previous_pending_rewards, had_existing_entry) = state
+            .delegations
+            .get_delegator_mut(target_id, delegator_id)
+            .map(|entry| (entry.staked_spark, entry.pending_rewards, true))
+            .unwrap_or((0, 0, false));
+        state
+            .delegations
+            .add_delegation(*target_id, *delegator_id, *amount_spark, current_epoch);
+        snapshots.push(AutoDelegationSnapshot {
+            delegator_id: *delegator_id,
+            target_id: *target_id,
+            amount_spark: *amount_spark,
+            previous_staked_spark,
+            previous_pending_rewards,
+            had_existing_entry,
+        });
+        eprintln!(
+            "[epoch] auto-delegation: validator {} -> {} ({} Spark)",
+            hex::encode(&delegator_id.0[..4]),
+            hex::encode(&target_id.0[..4]),
+            amount_spark,
+        );
+    }
+
+    snapshots
+}
+
+fn remove_auto_delegations(
+    state: &mut ChainState,
+    virtual_delegations: &[AutoDelegationSnapshot],
+    current_epoch: u64,
+) {
+    for snapshot in virtual_delegations {
+        let accumulated = state
+            .delegations
+            .get_delegator_reward(&snapshot.target_id, &snapshot.delegator_id);
+        let reward_delta = accumulated.saturating_sub(snapshot.previous_pending_rewards);
+        let total_staked = snapshot
+            .previous_staked_spark
+            .saturating_add(snapshot.amount_spark);
+        let virtual_reward = if total_staked == 0 {
+            0
+        } else {
+            reward_delta.saturating_mul(snapshot.amount_spark) / total_staked
+        };
+        if virtual_reward > 0 {
+            if let Some(v) = state.validators.get_mut(&snapshot.delegator_id) {
+                v.pending_rewards = v.pending_rewards.saturating_add(virtual_reward);
+                v.rewards_last_epoch = current_epoch;
+            }
+            eprintln!(
+                "[epoch] auto-delegation reward: validator {} earned {} Spark",
+                hex::encode(&snapshot.delegator_id.0[..4]),
+                virtual_reward,
+            );
+        }
+        if snapshot.had_existing_entry {
+            if let Some(entry) = state
+                .delegations
+                .get_delegator_mut(&snapshot.target_id, &snapshot.delegator_id)
+            {
+                let real_reward = reward_delta.saturating_sub(virtual_reward);
+                entry.staked_spark = snapshot.previous_staked_spark;
+                entry.pending_rewards = snapshot
+                    .previous_pending_rewards
+                    .saturating_add(real_reward);
+                entry.rewards_last_epoch = current_epoch;
+            }
+        } else {
+            state
+                .delegations
+                .remove_virtual_delegation(&snapshot.target_id, &snapshot.delegator_id);
+        }
     }
 }
 
@@ -253,14 +684,10 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
     for (idx, utxo_id) in to_release.into_iter().enumerate() {
         if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
             let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
+            let output = released_bond_output(&bond, release_height)?;
             state
                 .utxos
-                .insert(
-                    bond.original_output,
-                    release_height,
-                    STAKING_TX_IDX,
-                    output_index,
-                )
+                .insert(output, release_height, STAKING_TX_IDX, output_index)
                 .map_err(|_| crate::error::StateError::InvariantViolation {
                     message: "UTXO ID collision in staking bond release",
                 })?;
@@ -269,9 +696,47 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
     Ok(())
 }
 
-fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) {
-    use indra_core::types::primitives::{SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS};
+fn released_bond_output(
+    bond: &crate::validator::StakeBondEntry,
+    release_height: u64,
+) -> StateResult<indra_core::types::transaction::OutputV1> {
+    if bond.delegator_id != bond.validator_id
+        || bond.amount_spark >= bond.original_output.value_spark
+    {
+        return Ok(bond.original_output.clone());
+    }
 
+    let mut blinding_input =
+        Vec::with_capacity(SLASH_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 8);
+    blinding_input.extend_from_slice(SLASH_BOND_RELEASE_BLINDING_DOMAIN);
+    blinding_input.extend_from_slice(&bond.validator_id.0);
+    blinding_input.extend_from_slice(&bond.utxo_id.0);
+    blinding_input.extend_from_slice(&release_height.to_le_bytes());
+    let blinding = indra_crypto::sha256(&blinding_input);
+    let commitment = indra_crypto::commit(bond.amount_spark, &blinding);
+    let mut rng = rand::rngs::StdRng::from_seed(blinding);
+    let proof =
+        indra_crypto::prove_range(bond.amount_spark, &blinding, &mut rng).map_err(|_| {
+            crate::error::StateError::InvalidStakingOp(
+                "failed to generate range proof for slashed self-stake release".into(),
+            )
+        })?;
+
+    let mut output = bond.original_output.clone();
+    output.value_spark = bond.amount_spark;
+    output.commitment = CommitmentV1 {
+        compressed_point: Bytes32::from(commitment.0),
+    };
+    output.range_proof = VariableBytes::from_slice(&proof)
+        .map_err(|_| crate::error::StateError::InvalidStakingOp("range proof too large".into()))?;
+    Ok(output)
+}
+
+fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) -> (u64, u32) {
+    let mut total_slashed = 0u64;
+    let mut penalty_count = 0u32;
+    let threshold = state.governance.params.slash_liveness_threshold_epochs;
+    let slash_bps = state.governance.params.slash_liveness_bps;
     let validator_ids: Vec<Bytes32> = state
         .validators
         .active_validators()
@@ -288,14 +753,16 @@ fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) {
             (missed, v.stake_spark)
         };
 
-        if missed >= SLASH_LIVENESS_THRESHOLD_EPOCHS && stake > 0 {
+        if missed >= threshold && stake > 0 {
             let penalty = stake
-                .saturating_mul(SLASH_LIVENESS_BPS as u64)
+                .saturating_mul(slash_bps as u64)
                 .saturating_div(10_000);
             if let Some(v) = state.validators.get_mut(&validator_id) {
                 v.stake_spark = v.stake_spark.saturating_sub(penalty);
             }
             state.total_supply = state.total_supply.saturating_sub(penalty);
+            total_slashed = total_slashed.saturating_add(penalty);
+            penalty_count = penalty_count.saturating_add(1);
             eprintln!(
                 "[liveness] validator {} missed {} epochs, penalty={} Spark burned",
                 hex::encode(&validator_id.0[..4]),
@@ -304,6 +771,7 @@ fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) {
             );
         }
     }
+    (total_slashed, penalty_count)
 }
 
 /// True if the given height is the last block of an epoch.
@@ -352,6 +820,7 @@ mod tests {
             self_report_count: 0,
             commission_bps: DEFAULT_COMMISSION_BPS,
             min_delegation_spark: DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
         }
     }
 
@@ -457,7 +926,7 @@ mod tests {
     fn epoch_transition_does_not_increase_supply() {
         let mut state = crate::chain::ChainState::new_genesis();
         let supply_before = state.total_supply;
-        apply_epoch_transition(&mut state, 1).unwrap();
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
         assert_eq!(state.total_supply, supply_before);
     }
 
@@ -465,7 +934,7 @@ mod tests {
     fn epoch_transition_does_not_increase_treasury() {
         let mut state = crate::chain::ChainState::new_genesis();
         let treasury_before = state.treasury_balance;
-        apply_epoch_transition(&mut state, 1).unwrap();
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
         assert_eq!(state.treasury_balance, treasury_before);
     }
 
@@ -475,7 +944,7 @@ mod tests {
         let validator = make_validator(0x91, 1_000_000);
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
-        apply_epoch_transition(&mut state, 3).unwrap();
+        apply_epoch_transition(&mut state, 3, 0).unwrap();
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
             999_000
@@ -488,7 +957,7 @@ mod tests {
         let validator = make_validator(0x92, 1_000_000);
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
-        apply_epoch_transition(&mut state, 2).unwrap();
+        apply_epoch_transition(&mut state, 2, 0).unwrap();
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
             1_000_000
@@ -503,7 +972,7 @@ mod tests {
             .upsert(make_validator(0x93, 1_000_000))
             .unwrap();
         let supply_before = state.total_supply;
-        apply_epoch_transition(&mut state, 3).unwrap();
+        apply_epoch_transition(&mut state, 3, 0).unwrap();
         assert_eq!(state.total_supply, supply_before - 1_000);
     }
 
@@ -511,8 +980,8 @@ mod tests {
     fn epoch_transition_is_deterministic() {
         let mut s1 = crate::chain::ChainState::new_genesis();
         let mut s2 = crate::chain::ChainState::new_genesis();
-        apply_epoch_transition(&mut s1, 1).unwrap();
-        apply_epoch_transition(&mut s2, 1).unwrap();
+        apply_epoch_transition(&mut s1, 1, 0).unwrap();
+        apply_epoch_transition(&mut s2, 1, 0).unwrap();
         assert_eq!(s1.total_supply, s2.total_supply);
         assert_eq!(s1.treasury_balance, s2.treasury_balance);
     }
@@ -538,8 +1007,8 @@ mod tests {
             s2.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut s1, 1).unwrap();
-        apply_epoch_transition(&mut s2, 1).unwrap();
+        apply_epoch_transition(&mut s1, 1, 0).unwrap();
+        apply_epoch_transition(&mut s2, 1, 0).unwrap();
 
         for validator in validators {
             let id = validator.validator_id;
@@ -554,6 +1023,174 @@ mod tests {
         }
 
         assert_eq!(compute_state_root(&s1), compute_state_root(&s2));
+    }
+
+    #[test]
+    fn auto_delegation_routes_rewards_when_not_in_active_set() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        for i in 1..=21u8 {
+            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
+            if i == 21 {
+                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
+            }
+            state.validators.upsert(validator).unwrap();
+        }
+
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
+
+        let inactive_id = Bytes32::from([0x15; 32]);
+        let target_id = Bytes32::from([0x01; 32]);
+        let inactive = state.validators.get(&inactive_id).unwrap();
+        let target = state.validators.get(&target_id).unwrap();
+
+        assert_eq!(inactive.status, ValidatorStatus::Registered);
+        assert!(inactive.pending_rewards > 0);
+        assert!(target.pending_rewards > 0);
+        assert!(state
+            .delegations
+            .get_delegators(&target_id)
+            .iter()
+            .all(|entry| entry.delegator_id != inactive_id));
+    }
+
+    #[test]
+    fn auto_delegation_skipped_if_target_not_active() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        for i in 1..=22u8 {
+            let mut validator = make_validator(i, (23u64 - i as u64) * 1_000_000);
+            if i == 22 {
+                validator.auto_delegate_to = Some(Bytes32::from([0x15; 32]));
+            }
+            state.validators.upsert(validator).unwrap();
+        }
+
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
+
+        let inactive_id = Bytes32::from([0x16; 32]);
+        let target_id = Bytes32::from([0x15; 32]);
+        assert_eq!(
+            state.validators.get(&target_id).unwrap().status,
+            ValidatorStatus::Registered
+        );
+        assert_eq!(
+            state.validators.get(&inactive_id).unwrap().pending_rewards,
+            0
+        );
+    }
+
+    #[test]
+    fn auto_delegation_does_not_affect_active_set_selection() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        for i in 1..=22u8 {
+            let mut validator = make_validator(i, (23u64 - i as u64) * 1_000_000);
+            if i == 22 {
+                validator.auto_delegate_to = Some(Bytes32::from([0x15; 32]));
+            }
+            state.validators.upsert(validator).unwrap();
+        }
+
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
+
+        assert_eq!(
+            state
+                .validators
+                .get(&Bytes32::from([0x15; 32]))
+                .unwrap()
+                .status,
+            ValidatorStatus::Registered
+        );
+        assert_eq!(
+            state
+                .validators
+                .get(&Bytes32::from([0x16; 32]))
+                .unwrap()
+                .status,
+            ValidatorStatus::Registered
+        );
+    }
+
+    #[test]
+    fn auto_delegation_virtual_entry_not_in_state_root_after_transition() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        for i in 1..=21u8 {
+            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
+            if i == 21 {
+                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
+            }
+            state.validators.upsert(validator).unwrap();
+        }
+
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        let root_after_first = compute_state_root(&state);
+        let target_id = Bytes32::from([0x01; 32]);
+        let inactive_id = Bytes32::from([0x15; 32]);
+
+        assert!(state
+            .delegations
+            .get_delegators(&target_id)
+            .iter()
+            .all(|entry| entry.delegator_id != inactive_id));
+        assert_eq!(root_after_first, compute_state_root(&state));
+    }
+
+    #[test]
+    fn auto_delegation_preserves_existing_real_delegation() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        for i in 1..=21u8 {
+            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
+            if i == 21 {
+                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
+            }
+            state.validators.upsert(validator).unwrap();
+        }
+        let target_id = Bytes32::from([0x01; 32]);
+        let inactive_id = Bytes32::from([0x15; 32]);
+        state
+            .delegations
+            .add_delegation(target_id, inactive_id, 123_456, 0);
+
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
+
+        let entries = state.delegations.get_delegators(&target_id);
+        let restored = entries
+            .iter()
+            .find(|entry| entry.delegator_id == inactive_id)
+            .unwrap();
+        assert_eq!(restored.staked_spark, 123_456);
+        assert!(restored.pending_rewards > 0);
+        assert!(state.validators.get(&inactive_id).unwrap().pending_rewards > 0);
+    }
+
+    #[test]
+    fn auto_delegate_to_changes_state_root() {
+        let mut with_auto = crate::chain::ChainState::new_genesis();
+        let mut without_auto = crate::chain::ChainState::new_genesis();
+        let mut validator = make_validator(0x71, 1_000_000);
+        without_auto.validators.upsert(validator.clone()).unwrap();
+        validator.auto_delegate_to = Some(Bytes32::from([0x72; 32]));
+        with_auto.validators.upsert(validator).unwrap();
+
+        assert_ne!(
+            compute_state_root(&with_auto),
+            compute_state_root(&without_auto)
+        );
+    }
+
+    #[test]
+    fn auto_delegation_does_not_violate_supply_invariant() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        for i in 1..=21u8 {
+            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
+            if i == 21 {
+                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
+            }
+            state.validators.upsert(validator).unwrap();
+        }
+        let supply_before = state.total_supply;
+
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
+
+        assert_eq!(state.total_supply, supply_before);
     }
 
     #[test]
@@ -573,7 +1210,7 @@ mod tests {
             },
         );
 
-        apply_epoch_transition(&mut state, 1).unwrap();
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
 
         assert!(state.staked_bonds.is_empty());
         assert_eq!(state.utxos.len(), 1);
@@ -596,7 +1233,7 @@ mod tests {
             },
         );
 
-        apply_epoch_transition(&mut state, 1).unwrap();
+        apply_epoch_transition(&mut state, 1, 0).unwrap();
 
         assert!(state.staked_bonds.contains_key(&utxo_id));
         assert!(state.utxos.is_empty());

@@ -32,6 +32,9 @@ use crate::error::{StorageError, StorageResult};
 
 /// The header size for each block entry: u64 height + u32 length.
 const ENTRY_HEADER_BYTES: usize = 12;
+const FILE_HEADER_BYTES: u64 = 16;
+const BLOCK_MAGIC: &[u8; 4] = b"INBK";
+const BLOCK_FILE_VERSION: u8 = 1;
 
 /// Pruning configuration for the block store.
 #[derive(Debug, Clone)]
@@ -68,6 +71,7 @@ pub struct BlockStore {
     next_height: u64,
     prune_cfg: PruneConfig,
     lowest_height: u64,
+    data_start: u64,
 }
 
 impl BlockStore {
@@ -76,12 +80,14 @@ impl BlockStore {
     /// On first open, scans the file to rebuild the index.
     /// Truncates any incomplete final entry.
     pub fn open(path: impl AsRef<Path>, prune_cfg: PruneConfig) -> StorageResult<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
+
+        let data_start = initialise_block_log_header(&mut file)?;
 
         let mut store = Self {
             file,
@@ -89,6 +95,7 @@ impl BlockStore {
             next_height: 0,
             prune_cfg,
             lowest_height: 0,
+            data_start,
         };
         store.rebuild_index()?;
         Ok(store)
@@ -235,7 +242,7 @@ impl BlockStore {
             }
         };
 
-        if keep_offset == 0 {
+        if keep_offset == self.data_start {
             return Ok(());
         }
 
@@ -245,12 +252,12 @@ impl BlockStore {
         self.file.seek(SeekFrom::Start(keep_offset))?;
         self.file.read_exact(&mut kept_data)?;
 
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(self.data_start))?;
+        self.file.set_len(self.data_start)?;
         self.file.write_all(&kept_data)?;
         self.file.flush()?;
 
-        let offset_adjustment = keep_offset;
+        let offset_adjustment = keep_offset.saturating_sub(self.data_start);
         let mut new_index = HashMap::new();
         for (&height, &old_offset) in &self.index {
             if height >= keep_from_height {
@@ -266,10 +273,10 @@ impl BlockStore {
     /// Truncates any incomplete final entry.
     fn rebuild_index(&mut self) -> StorageResult<()> {
         let file_len = self.file.seek(SeekFrom::End(0))?;
-        self.file.seek(SeekFrom::Start(0))?;
+        self.file.seek(SeekFrom::Start(self.data_start))?;
 
-        let mut offset: u64 = 0;
-        let mut last_good_offset: u64 = 0;
+        let mut offset: u64 = self.data_start;
+        let mut last_good_offset: u64 = self.data_start;
         let mut max_height: Option<u64> = None;
 
         loop {
@@ -316,6 +323,35 @@ impl BlockStore {
         self.next_height = max_height.map_or(0, |h| h + 1);
         self.lowest_height = self.index.keys().min().copied().unwrap_or(0);
         Ok(())
+    }
+}
+
+fn initialise_block_log_header(file: &mut File) -> StorageResult<u64> {
+    let file_len = file.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(BLOCK_MAGIC)?;
+        file.write_all(&[BLOCK_FILE_VERSION])?;
+        file.write_all(&[0u8; 11])?;
+        file.flush()?;
+        return Ok(FILE_HEADER_BYTES);
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic == BLOCK_MAGIC {
+        let mut rest = [0u8; 12];
+        file.read_exact(&mut rest)?;
+        if rest[0] != BLOCK_FILE_VERSION {
+            return Err(StorageError::Corruption {
+                height: 0,
+                detail: format!("unsupported block store file version {}", rest[0]),
+            });
+        }
+        Ok(FILE_HEADER_BYTES)
+    } else {
+        Ok(0)
     }
 }
 
@@ -382,6 +418,38 @@ mod tests {
         assert_eq!(got0.header.height, 0);
         assert_eq!(got1.header.height, 1);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn new_block_store_has_header() {
+        let path = temp_path("header");
+        {
+            let _store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(BLOCK_MAGIC));
+        assert_eq!(bytes.len(), FILE_HEADER_BYTES as usize);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_headerless_block_store_still_works() {
+        let path = temp_path("legacy_headerless");
+        let block = dummy_block(0, [0u8; 32]);
+        let block_bytes = block.encode_to_vec();
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&0u64.to_le_bytes()).unwrap();
+            file.write_all(&(block_bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            file.write_all(&block_bytes).unwrap();
+            file.flush().unwrap();
+        }
+
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(0).unwrap().header.height, 0);
         let _ = std::fs::remove_file(&path);
     }
 

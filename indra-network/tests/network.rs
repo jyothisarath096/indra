@@ -24,6 +24,7 @@ fn message_encode_decode_all_types() {
         Message::Status {
             height: 42,
             tip_hash: Bytes32::from([0xAAu8; 32]),
+            round: 0,
         },
         Message::PeerList(vec!["127.0.0.1:30303".to_string()]),
         Message::RequestQC { height: 42 },
@@ -111,6 +112,7 @@ fn two_nodes_exchange_status() {
                     let response = Message::Status {
                         height: 100,
                         tip_hash: Bytes32::from([0xBBu8; 32]),
+                        round: 0,
                     };
                     conn.send(&response).unwrap();
                     return msg;
@@ -133,6 +135,7 @@ fn two_nodes_exchange_status() {
     conn.send(&Message::Status {
         height: 50,
         tip_hash: Bytes32::from([0xAAu8; 32]),
+        round: 0,
     })
     .unwrap();
 

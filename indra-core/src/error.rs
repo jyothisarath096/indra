@@ -46,6 +46,28 @@ pub enum IndraError {
         version: u16,
     },
 
+    /// Unsupported persisted-struct schema version.
+    #[error(
+        "unsupported schema version {version} for {struct_name} (max supported {max_supported})"
+    )]
+    UnsupportedSchemaVersion {
+        /// Name of the persisted struct.
+        struct_name: &'static str,
+        /// The version number found.
+        version: u8,
+        /// Highest version supported by this node.
+        max_supported: u8,
+    },
+
+    /// Persisted data was written by a newer node schema.
+    #[error("schema version {version} is newer than node schema version {max_supported}")]
+    SchemaVersionTooNew {
+        /// The version number found.
+        version: u8,
+        /// Highest version supported by this node.
+        max_supported: u8,
+    },
+
     /// Unsupported signature module ID.
     #[error("unsupported signature module ID {id}")]
     UnsupportedSignatureModule {

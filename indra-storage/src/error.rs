@@ -16,6 +16,13 @@ pub enum StorageError {
         height: u64,
     },
 
+    /// An epoch record at the requested epoch does not exist.
+    #[error("epoch record not found at epoch {epoch}")]
+    EpochNotFound {
+        /// The requested epoch.
+        epoch: u64,
+    },
+
     /// Block has been pruned and is no longer available.
     #[error("block {height} has been pruned (lowest available: {lowest_available})")]
     BlockPruned {

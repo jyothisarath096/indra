@@ -33,6 +33,7 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
     metadata.extend_from_slice(&state.treasury_balance.to_le_bytes());
     metadata.extend_from_slice(&state.burn_buffer.to_le_bytes());
     metadata.extend_from_slice(&state.fee_reward_pool.to_le_bytes());
+    state.governance.encode(&mut metadata);
     let metadata_hash = sha256(&metadata);
 
     let mut combined = Vec::with_capacity(128);
@@ -58,10 +59,15 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
             value.extend_from_slice(&validator.stake_spark.to_le_bytes());
             value.extend_from_slice(&validator.pending_rewards.to_le_bytes());
             value.extend_from_slice(&validator.registered_epoch.to_le_bytes());
+            value.extend_from_slice(&validator.last_active_epoch.to_le_bytes());
             value.extend_from_slice(&validator.rewards_last_epoch.to_le_bytes());
             value.extend_from_slice(&validator.self_report_count.to_le_bytes());
             value.extend_from_slice(&validator.commission_bps.to_le_bytes());
             value.extend_from_slice(&validator.min_delegation_spark.to_le_bytes());
+            value.push(u8::from(validator.auto_delegate_to.is_some()));
+            if let Some(target_id) = validator.auto_delegate_to {
+                value.extend_from_slice(&target_id.0);
+            }
             match validator.status {
                 crate::validator::ValidatorStatus::Registered => value.push(0),
                 crate::validator::ValidatorStatus::Active => value.push(1),
