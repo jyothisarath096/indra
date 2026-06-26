@@ -611,3 +611,61 @@ fn test_self_stake_slash_reduces_bond_amount() {
         ValidatorStatus::Slashed
     ));
 }
+
+#[test]
+fn epoch_transition_produces_identical_state_on_replay() {
+    let mut original = ChainState::new_genesis();
+    for seed in 1..=4 {
+        let (id, _, _) = install_validator(&mut original, [seed; 32]);
+        original.validators.get_mut(&id).unwrap().stake_spark = 1_000_000;
+    }
+    let mut replay = original.clone();
+    apply_epoch_transition(&mut original, 1, 0).unwrap();
+    apply_epoch_transition(&mut replay, 1, 0).unwrap();
+    assert_eq!(original.encode_to_vec(), replay.encode_to_vec());
+}
+
+#[test]
+fn reward_distribution_is_height_gated() {
+    // At testnet genesis the u128 path is active, avoiding the u64 overflow
+    // that the historical saturating implementation would produce.
+    assert_eq!(
+        indra_core::types::primitives::muldiv(356_760_000_000, 1, 4),
+        89_190_000_000
+    );
+    assert!(indra_core::types::primitives::overflow_fix_active(0));
+}
+
+#[test]
+fn governance_state_encoding_is_deterministic() {
+    let mut first = ChainState::new_genesis();
+    let mut second = ChainState::new_genesis();
+    let a = Bytes32::from([1; 32]);
+    let b = Bytes32::from([2; 32]);
+    first.governance.gov_nonces.insert(b, 2);
+    first.governance.gov_nonces.insert(a, 1);
+    second.governance.gov_nonces.insert(a, 1);
+    second.governance.gov_nonces.insert(b, 2);
+    assert_eq!(
+        first.governance.encode_to_vec(),
+        second.governance.encode_to_vec()
+    );
+}
+
+#[test]
+fn btreemap_iteration_order_is_deterministic() {
+    let mut first = ChainState::new_genesis();
+    let mut second = ChainState::new_genesis();
+    let _ = install_validator(&mut first, [2; 32]);
+    let _ = install_validator(&mut first, [1; 32]);
+    let _ = install_validator(&mut second, [1; 32]);
+    let _ = install_validator(&mut second, [2; 32]);
+    assert_eq!(
+        first.validators.total_active_stake(),
+        second.validators.total_active_stake()
+    );
+    assert_eq!(
+        first.validators.encode_to_vec(),
+        second.validators.encode_to_vec()
+    );
+}

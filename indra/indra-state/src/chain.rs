@@ -6,7 +6,7 @@
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::IndraResult;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use indra_core::types::primitives::{
     Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -66,10 +66,10 @@ pub struct ChainState {
     pub delegations: DelegationMap,
 
     /// Stake bonds: UTXOs locked as delegation stake.
-    pub staked_bonds: HashMap<Bytes32, StakeBondEntry>,
+    pub staked_bonds: BTreeMap<Bytes32, StakeBondEntry>,
 
     /// Monotonic nonces for staking op replay protection.
-    pub staking_nonces: HashMap<Bytes32, u64>,
+    pub staking_nonces: BTreeMap<Bytes32, u64>,
 
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
@@ -196,8 +196,8 @@ impl ChainState {
             nullifiers: NullifierSet::new(),
             validators: ValidatorSet::new(),
             delegations: DelegationMap::new(),
-            staked_bonds: HashMap::new(),
-            staking_nonces: HashMap::new(),
+            staked_bonds: BTreeMap::new(),
+            staking_nonces: BTreeMap::new(),
             applied_slash_hashes: HashSet::new(),
             governance: GovernanceState::new(),
             epoch_fees_burned: 0,
@@ -311,24 +311,22 @@ fn decode_hash_set(r: &mut ByteReader<'_>, field: &'static str) -> IndraResult<H
     Ok(hashes)
 }
 
-fn encode_bond_map(bonds: &HashMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = bonds.iter().collect();
-    entries.sort_by_key(|(utxo_id, _)| utxo_id.0);
-    (entries.len() as u32).encode(buf);
-    for (utxo_id, bond) in entries {
+fn encode_bond_map(bonds: &BTreeMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
+    (bonds.len() as u32).encode(buf);
+    for (utxo_id, bond) in bonds {
         utxo_id.encode(buf);
         bond.encode(buf);
     }
 }
 
-fn bond_map_encoded_len(bonds: &HashMap<Bytes32, StakeBondEntry>) -> usize {
+fn bond_map_encoded_len(bonds: &BTreeMap<Bytes32, StakeBondEntry>) -> usize {
     4 + bonds
         .iter()
         .map(|(utxo_id, bond)| utxo_id.encoded_len() + bond.encoded_len())
         .sum::<usize>()
 }
 
-fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, StakeBondEntry>> {
+fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, StakeBondEntry>> {
     use indra_core::error::IndraError;
     use indra_core::types::primitives::MAX_VALIDATORS;
 
@@ -341,7 +339,7 @@ fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, Stake
             actual: count,
         });
     }
-    let mut bonds = HashMap::with_capacity(count);
+    let mut bonds = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let bond = StakeBondEntry::decode(r)?;
@@ -359,7 +357,9 @@ fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, Stake
     Ok(bonds)
 }
 
-fn decode_bond_map_legacy(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, StakeBondEntry>> {
+fn decode_bond_map_legacy(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<BTreeMap<Bytes32, StakeBondEntry>> {
     use indra_core::error::IndraError;
     use indra_core::types::primitives::MAX_VALIDATORS;
 
@@ -372,7 +372,7 @@ fn decode_bond_map_legacy(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32
             actual: count,
         });
     }
-    let mut bonds = HashMap::with_capacity(count);
+    let mut bonds = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let bond = StakeBondEntry::decode_legacy(r)?;
@@ -390,21 +390,19 @@ fn decode_bond_map_legacy(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32
     Ok(bonds)
 }
 
-fn encode_nonce_map(nonces: &HashMap<Bytes32, u64>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = nonces.iter().collect();
-    entries.sort_by_key(|(signer_id, _)| signer_id.0);
-    (entries.len() as u32).encode(buf);
-    for (signer_id, nonce) in entries {
+fn encode_nonce_map(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
+    (nonces.len() as u32).encode(buf);
+    for (signer_id, nonce) in nonces {
         signer_id.encode(buf);
         nonce.encode(buf);
     }
 }
 
-fn nonce_map_encoded_len(nonces: &HashMap<Bytes32, u64>) -> usize {
+fn nonce_map_encoded_len(nonces: &BTreeMap<Bytes32, u64>) -> usize {
     4 + nonces.len() * (32 + 8)
 }
 
-fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, u64>> {
+fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, u64>> {
     use indra_core::error::IndraError;
     use indra_core::types::primitives::MAX_VALIDATORS;
 
@@ -417,7 +415,7 @@ fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, u64>
             actual: count,
         });
     }
-    let mut nonces = HashMap::with_capacity(count);
+    let mut nonces = BTreeMap::new();
     for _ in 0..count {
         let signer_id = Bytes32::decode(r)?;
         let nonce = u64::decode(r)?;

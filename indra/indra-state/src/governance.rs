@@ -1,6 +1,6 @@
 //! On-chain governance state.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
@@ -9,9 +9,10 @@ use indra_core::{
         crypto::HybridPubKey,
         governance::{GovernableAction, ProposalTier},
         primitives::{
-            bps_of, muldiv, Bytes32, DUST_LIMIT_SPARK, GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS,
-            SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS,
-            SLASH_SURROUND_VOTE_BPS, SPARK_PER_INDRA,
+            bps_of, muldiv, overflow_fix_active, Bytes32, DUST_LIMIT_SPARK,
+            GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS, SLASH_DOUBLE_PRECOMMIT_BPS,
+            SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SLASH_SURROUND_VOTE_BPS,
+            SPARK_PER_INDRA,
         },
     },
 };
@@ -314,7 +315,7 @@ impl Decode for ProposalPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GovernanceSnapshot {
     /// Per-validator weights.
-    pub weights: HashMap<Bytes32, u64>,
+    pub weights: BTreeMap<Bytes32, u64>,
     /// Total stake denominator.
     pub total_stake: u64,
 }
@@ -322,10 +323,19 @@ pub struct GovernanceSnapshot {
 impl GovernanceSnapshot {
     /// Return whether yes stake meets quorum.
     pub fn quorum_met(&self, yes_stake: u64, quorum_bps: u32) -> bool {
+        self.quorum_met_at_height(yes_stake, quorum_bps, u64::MAX)
+    }
+
+    /// Return whether yes stake meets quorum under the arithmetic active at `height`.
+    pub fn quorum_met_at_height(&self, yes_stake: u64, quorum_bps: u32, height: u64) -> bool {
         if self.total_stake == 0 {
             return false;
         }
-        let required = bps_of(self.total_stake, quorum_bps);
+        let required = if overflow_fix_active(height) {
+            bps_of(self.total_stake, quorum_bps)
+        } else {
+            self.total_stake.saturating_mul(quorum_bps as u64) / 10_000
+        };
         yes_stake > required
     }
 
@@ -536,13 +546,13 @@ pub struct ProposalRecord {
     /// Snapshot 1.
     pub snapshot1: Option<GovernanceSnapshot>,
     /// Commits.
-    pub commits: HashMap<Bytes32, VoteCommit>,
+    pub commits: BTreeMap<Bytes32, VoteCommit>,
     /// Reveals.
-    pub reveals: HashMap<Bytes32, VoteReveal>,
+    pub reveals: BTreeMap<Bytes32, VoteReveal>,
     /// Redelegations.
     pub redelegations: Vec<GovernanceRedelegation>,
     /// Delegators already redelegated.
-    pub redelegated_delegators: HashMap<Bytes32, ()>,
+    pub redelegated_delegators: BTreeMap<Bytes32, ()>,
     /// Snapshot 2.
     pub snapshot2: Option<GovernanceSnapshot>,
     /// Yes stake.
@@ -656,13 +666,13 @@ pub struct GovernanceState {
     /// Current params.
     pub params: GovernableParams,
     /// Proposals by id.
-    pub proposals: HashMap<Bytes32, ProposalRecord>,
+    pub proposals: BTreeMap<Bytes32, ProposalRecord>,
     /// Queued executions.
     pub queued_executions: Vec<QueuedExecution>,
     /// Governance nonces.
-    pub gov_nonces: HashMap<Bytes32, u64>,
+    pub gov_nonces: BTreeMap<Bytes32, u64>,
     /// Last proposal epoch by proposer.
-    pub last_proposal_epoch: HashMap<Bytes32, u64>,
+    pub last_proposal_epoch: BTreeMap<Bytes32, u64>,
 }
 
 impl GovernanceState {
@@ -670,10 +680,10 @@ impl GovernanceState {
     pub fn new() -> Self {
         Self {
             params: GovernableParams::default_mainnet(),
-            proposals: HashMap::new(),
+            proposals: BTreeMap::new(),
             queued_executions: Vec::new(),
-            gov_nonces: HashMap::new(),
-            last_proposal_epoch: HashMap::new(),
+            gov_nonces: BTreeMap::new(),
+            last_proposal_epoch: BTreeMap::new(),
         }
     }
 
@@ -803,11 +813,9 @@ fn vec_len<T: Encode>(values: &[T]) -> usize {
     4 + values.iter().map(Encode::encoded_len).sum::<usize>()
 }
 
-fn encode_u64_map(map: &HashMap<Bytes32, u64>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(key, _)| key.0);
-    (entries.len() as u32).encode(buf);
-    for (key, value) in entries {
+fn encode_u64_map(map: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
+    (map.len() as u32).encode(buf);
+    for (key, value) in map {
         key.encode(buf);
         value.encode(buf);
     }
@@ -816,7 +824,7 @@ fn encode_u64_map(map: &HashMap<Bytes32, u64>, buf: &mut Vec<u8>) {
 fn decode_u64_map(
     r: &mut ByteReader<'_>,
     field: &'static str,
-) -> IndraResult<HashMap<Bytes32, u64>> {
+) -> IndraResult<BTreeMap<Bytes32, u64>> {
     let count = u32::decode(r)? as usize;
     if count > 10_000 {
         return Err(IndraError::LengthExceeded {
@@ -825,7 +833,7 @@ fn decode_u64_map(
             actual: count,
         });
     }
-    let mut map = HashMap::with_capacity(count);
+    let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let value = u64::decode(r)?;
@@ -836,18 +844,16 @@ fn decode_u64_map(
     Ok(map)
 }
 
-fn encode_set_map(map: &HashMap<Bytes32, ()>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = map.keys().copied().collect();
-    entries.sort_by_key(|key| key.0);
-    (entries.len() as u32).encode(buf);
-    for key in entries {
+fn encode_set_map(map: &BTreeMap<Bytes32, ()>, buf: &mut Vec<u8>) {
+    (map.len() as u32).encode(buf);
+    for key in map.keys() {
         key.encode(buf);
     }
 }
 
-fn decode_set_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, ()>> {
+fn decode_set_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, ()>> {
     let count = u32::decode(r)? as usize;
-    let mut map = HashMap::with_capacity(count);
+    let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         if map.insert(key, ()).is_some() {
@@ -859,23 +865,21 @@ fn decode_set_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, ()>> {
     Ok(map)
 }
 
-fn set_map_len(map: &HashMap<Bytes32, ()>) -> usize {
+fn set_map_len(map: &BTreeMap<Bytes32, ()>) -> usize {
     4 + map.len() * 32
 }
 
-fn encode_commit_map(map: &HashMap<Bytes32, VoteCommit>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(key, _)| key.0);
-    (entries.len() as u32).encode(buf);
-    for (key, value) in entries {
+fn encode_commit_map(map: &BTreeMap<Bytes32, VoteCommit>, buf: &mut Vec<u8>) {
+    (map.len() as u32).encode(buf);
+    for (key, value) in map {
         key.encode(buf);
         value.encode(buf);
     }
 }
 
-fn decode_commit_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, VoteCommit>> {
+fn decode_commit_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, VoteCommit>> {
     let count = u32::decode(r)? as usize;
-    let mut map = HashMap::with_capacity(count);
+    let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let value = VoteCommit::decode(r)?;
@@ -893,23 +897,21 @@ fn decode_commit_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, Vot
     Ok(map)
 }
 
-fn commit_map_len(map: &HashMap<Bytes32, VoteCommit>) -> usize {
+fn commit_map_len(map: &BTreeMap<Bytes32, VoteCommit>) -> usize {
     4 + map.len() * (32 + 72)
 }
 
-fn encode_reveal_map(map: &HashMap<Bytes32, VoteReveal>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(key, _)| key.0);
-    (entries.len() as u32).encode(buf);
-    for (key, value) in entries {
+fn encode_reveal_map(map: &BTreeMap<Bytes32, VoteReveal>, buf: &mut Vec<u8>) {
+    (map.len() as u32).encode(buf);
+    for (key, value) in map {
         key.encode(buf);
         value.encode(buf);
     }
 }
 
-fn decode_reveal_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, VoteReveal>> {
+fn decode_reveal_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, VoteReveal>> {
     let count = u32::decode(r)? as usize;
-    let mut map = HashMap::with_capacity(count);
+    let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let value = VoteReveal::decode(r)?;
@@ -927,23 +929,21 @@ fn decode_reveal_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, Vot
     Ok(map)
 }
 
-fn reveal_map_len(map: &HashMap<Bytes32, VoteReveal>) -> usize {
+fn reveal_map_len(map: &BTreeMap<Bytes32, VoteReveal>) -> usize {
     4 + map.len() * (32 + 41)
 }
 
-fn encode_proposal_map(map: &HashMap<Bytes32, ProposalRecord>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(key, _)| key.0);
-    (entries.len() as u32).encode(buf);
-    for (key, value) in entries {
+fn encode_proposal_map(map: &BTreeMap<Bytes32, ProposalRecord>, buf: &mut Vec<u8>) {
+    (map.len() as u32).encode(buf);
+    for (key, value) in map {
         key.encode(buf);
         value.encode(buf);
     }
 }
 
-fn decode_proposal_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, ProposalRecord>> {
+fn decode_proposal_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, ProposalRecord>> {
     let count = u32::decode(r)? as usize;
-    let mut map = HashMap::with_capacity(count);
+    let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let value = ProposalRecord::decode(r)?;
@@ -961,7 +961,7 @@ fn decode_proposal_map(r: &mut ByteReader<'_>) -> IndraResult<HashMap<Bytes32, P
     Ok(map)
 }
 
-fn proposal_map_len(map: &HashMap<Bytes32, ProposalRecord>) -> usize {
+fn proposal_map_len(map: &BTreeMap<Bytes32, ProposalRecord>) -> usize {
     4 + map
         .iter()
         .map(|(_, proposal)| 32 + proposal.encoded_len())
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn governance_snapshot_quorum_met() {
         let snapshot = GovernanceSnapshot {
-            weights: HashMap::new(),
+            weights: BTreeMap::new(),
             total_stake: 100,
         };
         assert!(snapshot.quorum_met(51, 5_000));
@@ -1035,10 +1035,10 @@ mod tests {
                 executable_after_epoch: 7,
                 phase: ProposalPhase::Deliberation,
                 snapshot1: None,
-                commits: HashMap::new(),
-                reveals: HashMap::new(),
+                commits: BTreeMap::new(),
+                reveals: BTreeMap::new(),
                 redelegations: Vec::new(),
-                redelegated_delegators: HashMap::new(),
+                redelegated_delegators: BTreeMap::new(),
                 snapshot2: None,
                 yes_stake: 0,
                 no_stake: 0,

@@ -16,11 +16,11 @@
 //!
 //! Both Ed25519 and ML-DSA-87 components are required.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::{muldiv, Bytes32},
+    primitives::{bps_of, muldiv, overflow_fix_active, Bytes32},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
@@ -183,15 +183,22 @@ impl VoteCollector {
         }
 
         // Count stake per vote hash (INDRA now carries stable `value_hash` here).
-        let mut stake_by_hash: HashMap<Bytes32, u64> = HashMap::new();
+        // Ordered so a malformed edge case cannot make the selected value
+        // depend on randomized HashMap iteration order.
+        let mut stake_by_hash: BTreeMap<Bytes32, u64> = BTreeMap::new();
         for (vote, stake) in self.received.values() {
             *stake_by_hash.entry(vote.block_hash).or_insert(0) += stake;
         }
 
         // Check if any hash crossed the quorum threshold
+        let threshold = if overflow_fix_active(self.height) {
+            bps_of(self.total_stake, CONSENSUS_QUORUM_BPS)
+        } else {
+            self.total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
+        };
         for (block_hash, stake) in &stake_by_hash {
             let bps = muldiv(*stake, 10_000, self.total_stake);
-            if bps as u32 >= CONSENSUS_QUORUM_BPS {
+            if *stake >= threshold {
                 return VoteDecision::QuorumReached {
                     block_hash: *block_hash,
                     stake_bps: bps,

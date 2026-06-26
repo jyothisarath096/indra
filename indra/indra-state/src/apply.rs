@@ -39,8 +39,9 @@ use indra_core::{
     types::{
         block::BlockV1,
         primitives::{
-            bps_of, Bytes32, ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
-            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+            bps_of, overflow_fix_active, Bytes32, ProtocolVersion, HARD_CAP_SPARK,
+            MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+            MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
         },
         slashing::SlashEvidenceV1,
         transaction::TransactionV1,
@@ -56,7 +57,7 @@ use indra_crypto::{
 use crate::{
     chain::ChainState,
     delegation::apply_staking_op,
-    epoch::{apply_epoch_transition, epoch_for_height, is_epoch_boundary},
+    epoch::{epoch_for_height, is_epoch_boundary},
     error::{StateError, StateResult},
     fee::compute_next_base_fee,
     governance_apply::apply_governance_op,
@@ -69,6 +70,16 @@ pub fn apply_slash(
     state: &mut ChainState,
     evidence: &SlashEvidenceV1,
     chain_id: &str,
+) -> StateResult<()> {
+    apply_slash_at_height(state, evidence, chain_id, state.height)
+}
+
+/// Apply slash evidence using the arithmetic rules active at `height`.
+pub fn apply_slash_at_height(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV1,
+    chain_id: &str,
+    height: u64,
 ) -> StateResult<()> {
     use crate::ValidatorStatus;
     use indra_core::types::{primitives::SLASH_REPORTER_REWARD_BPS, vote::VoteStep};
@@ -161,8 +172,15 @@ pub fn apply_slash(
         .get(&validator_id)
         .map(|v| v.stake_spark)
         .unwrap_or(0);
-    let slash_amount = bps_of(current_stake, slash_bps);
-    let reporter_reward = bps_of(slash_amount, SLASH_REPORTER_REWARD_BPS);
+    let bps = |amount, rate| {
+        if overflow_fix_active(height) {
+            bps_of(amount, rate)
+        } else {
+            amount.saturating_mul(rate as u64) / 10_000
+        }
+    };
+    let slash_amount = bps(current_stake, slash_bps);
+    let reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
     let burned = slash_amount.saturating_sub(reporter_reward);
 
     if let Some(v) = state.validators.get_mut(&validator_id) {
@@ -184,7 +202,7 @@ pub fn apply_slash(
     let mut total_bond_slashed: u64 = 0;
     for bond_id in &bond_ids {
         if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
-            let bond_slash = bps_of(bond.amount_spark, slash_bps);
+            let bond_slash = bps(bond.amount_spark, slash_bps);
             bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
             total_bond_slashed = total_bond_slashed.saturating_add(bond_slash);
         }
@@ -322,7 +340,7 @@ pub fn apply_block(
         let mut shadow = state.clone();
         let chain_id_clone = state.chain_id.clone();
         for evidence in &block.slashing_evidence {
-            apply_slash(&mut shadow, evidence, &chain_id_clone)?;
+            apply_slash_at_height(&mut shadow, evidence, &chain_id_clone, block.header.height)?;
         }
     }
 
@@ -356,7 +374,7 @@ pub fn apply_block(
     for evidence in &block.slashing_evidence {
         let supply_before = state.total_supply;
         let treasury_before = state.treasury_balance;
-        apply_slash(state, evidence, &chain_id_for_slash)
+        apply_slash_at_height(state, evidence, &chain_id_for_slash, block.header.height)
             .expect("slash failed on real state after shadow validation — invariant violation");
         let burned = supply_before.saturating_sub(state.total_supply);
         let treasury_reward = state.treasury_balance.saturating_sub(treasury_before);
@@ -377,7 +395,12 @@ pub fn apply_block(
     // Apply epoch transition if this is the last block of an epoch
     let epoch_record = if is_epoch_boundary(state.height) {
         let epoch = epoch_for_height(state.height);
-        Some(apply_epoch_transition(state, epoch, timestamp_secs)?)
+        Some(crate::epoch::apply_epoch_transition_at_height(
+            state,
+            epoch,
+            timestamp_secs,
+            block.header.height,
+        )?)
     } else {
         None
     };

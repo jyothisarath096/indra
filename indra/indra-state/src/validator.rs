@@ -3,7 +3,7 @@
 //! Tracks each validator's stake, status, and accumulated reward.
 //! The validator set is snapshotted at each epoch boundary.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
@@ -321,7 +321,7 @@ impl ValidatorEntry {
 /// Keyed by validator_id (Bytes32). Maximum MAX_VALIDATORS entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValidatorSet {
-    validators: HashMap<Bytes32, ValidatorEntry>,
+    validators: BTreeMap<Bytes32, ValidatorEntry>,
 }
 
 impl Encode for ValidatorSet {
@@ -359,7 +359,7 @@ impl ValidatorSet {
     /// Create an empty validator set.
     pub fn new() -> Self {
         Self {
-            validators: HashMap::new(),
+            validators: BTreeMap::new(),
         }
     }
 
@@ -892,7 +892,7 @@ impl DelegatorEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationMap {
     /// Inner map: validator_id → delegators.
-    delegators: HashMap<Bytes32, Vec<DelegatorEntry>>,
+    delegators: BTreeMap<Bytes32, Vec<DelegatorEntry>>,
 }
 
 impl Encode for DelegationMap {
@@ -921,7 +921,7 @@ impl Encode for DelegationMap {
 impl Decode for DelegationMap {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
-        let mut delegators = HashMap::with_capacity(count);
+        let mut delegators = BTreeMap::new();
         for _ in 0..count {
             let validator_id = Bytes32::decode(r)?;
             if delegators.contains_key(&validator_id) {
@@ -940,14 +940,14 @@ impl DelegationMap {
     /// Create an empty delegation map.
     pub fn new() -> Self {
         Self {
-            delegators: HashMap::new(),
+            delegators: BTreeMap::new(),
         }
     }
 
     /// Decode a legacy unversioned delegation map.
     pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
-        let mut delegators = HashMap::with_capacity(count);
+        let mut delegators = BTreeMap::new();
         for _ in 0..count {
             let validator_id = Bytes32::decode(r)?;
             if delegators.contains_key(&validator_id) {

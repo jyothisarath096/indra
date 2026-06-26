@@ -14,16 +14,17 @@
 //! `state.total_supply` never increases during an epoch transition.
 //! Supply only decreases via the fee burn path in `apply.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, muldiv, Bytes32, VariableBytes, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS,
-            ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-            ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
-            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
+            bps_of, muldiv, overflow_fix_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
+            EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+            ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+            HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN,
+            STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -60,6 +61,17 @@ pub fn apply_epoch_transition(
     current_epoch: u64,
     timestamp_secs: u64,
 ) -> StateResult<EpochRecord> {
+    let height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+    apply_epoch_transition_at_height(state, current_epoch, timestamp_secs, height)
+}
+
+/// Apply an epoch transition using the consensus block height that triggered it.
+pub fn apply_epoch_transition_at_height(
+    state: &mut ChainState,
+    current_epoch: u64,
+    timestamp_secs: u64,
+    height: u64,
+) -> StateResult<EpochRecord> {
     eprintln!(
         "[epoch] transition at height={} epoch={} validators={} total_stake={} fee_pool={}",
         state.height,
@@ -68,7 +80,7 @@ pub fn apply_epoch_transition(
         state.validators.total_active_stake(),
         state.fee_reward_pool,
     );
-    apply_governance_phase_transitions(state, current_epoch)?;
+    apply_governance_phase_transitions(state, current_epoch, height)?;
     let active_before: HashSet<Bytes32> = state
         .validators
         .active_validators()
@@ -83,7 +95,7 @@ pub fn apply_epoch_transition(
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
     let explicit_slash_count_this_epoch = state.epoch_slash_event_count;
-    let current_height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+    let current_height = height;
     let record_epoch = current_epoch.saturating_sub(1);
     let record_start_height = record_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
     let reward_per_block = block_reward_at_height(current_height);
@@ -96,7 +108,7 @@ pub fn apply_epoch_transition(
     let virtual_delegations = apply_auto_delegations(state, current_epoch);
 
     let supply_before = state.total_supply;
-    distribute_block_rewards(state, epoch_block_reward, current_epoch);
+    distribute_block_rewards(state, epoch_block_reward, current_epoch, height);
 
     assert!(
         state.total_supply <= HARD_CAP_SPARK,
@@ -109,9 +121,9 @@ pub fn apply_epoch_transition(
         "supply changed during epoch transition"
     );
 
-    distribute_fee_rewards(state, current_epoch);
+    distribute_fee_rewards(state, current_epoch, height);
     let fee_rewards_distributed = fee_pool_before.saturating_sub(state.fee_reward_pool);
-    remove_auto_delegations(state, &virtual_delegations, current_epoch);
+    remove_auto_delegations(state, &virtual_delegations, current_epoch, height);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds(state, current_epoch)?;
@@ -202,6 +214,7 @@ fn era_for_height(height: u64) -> u64 {
 pub fn apply_governance_phase_transitions(
     state: &mut ChainState,
     current_epoch: u64,
+    height: u64,
 ) -> StateResult<()> {
     let proposal_ids: Vec<Bytes32> = state.governance.proposals.keys().copied().collect();
     for proposal_id in proposal_ids {
@@ -239,7 +252,7 @@ pub fn apply_governance_phase_transitions(
             ProposalPhase::Reveal => {
                 let tally_epoch = state.governance.proposals[&proposal_id].tally_epoch;
                 if current_epoch >= tally_epoch {
-                    tally_proposal(state, proposal_id)?;
+                    tally_proposal(state, proposal_id, height)?;
                 }
             }
             ProposalPhase::ExecDelay => {
@@ -251,7 +264,7 @@ pub fn apply_governance_phase_transitions(
     Ok(())
 }
 
-fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32) -> StateResult<()> {
+fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> StateResult<()> {
     let snapshot2 = {
         let proposal = state
             .governance
@@ -286,7 +299,7 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32) -> StateResult<(
                 state.governance.params.governance_critical_quorum_bps
             }
         };
-        let passed = snap2.quorum_met(yes, quorum_bps);
+        let passed = snap2.quorum_met_at_height(yes, quorum_bps, height);
         proposal.passed = Some(passed);
         if passed {
             proposal.phase = ProposalPhase::ExecDelay;
@@ -338,7 +351,7 @@ fn auto_execute_ready(state: &mut ChainState, proposal_id: Bytes32, current_epoc
 
 /// Take a governance stake snapshot.
 pub fn take_governance_snapshot(state: &ChainState) -> GovernanceSnapshot {
-    let mut weights = HashMap::new();
+    let mut weights = std::collections::BTreeMap::new();
     let mut total = 0u64;
     for validator in state.validators.all_validators() {
         if matches!(
@@ -473,6 +486,7 @@ fn remove_auto_delegations(
     state: &mut ChainState,
     virtual_delegations: &[AutoDelegationSnapshot],
     current_epoch: u64,
+    height: u64,
 ) {
     for snapshot in virtual_delegations {
         let accumulated = state
@@ -485,7 +499,7 @@ fn remove_auto_delegations(
         let virtual_reward = if total_staked == 0 {
             0
         } else {
-            muldiv(reward_delta, snapshot.amount_spark, total_staked)
+            proportional_reward(reward_delta, snapshot.amount_spark, total_staked, height)
         };
         if virtual_reward > 0 {
             if let Some(v) = state.validators.get_mut(&snapshot.delegator_id) {
@@ -523,6 +537,7 @@ fn saturation_adjusted_reward(
     validator_stake: u64,
     total_active_stake: u64,
     active_validator_count: u64,
+    height: u64,
 ) -> u64 {
     if total_active_stake == 0 || active_validator_count == 0 {
         return raw_reward;
@@ -537,10 +552,25 @@ fn saturation_adjusted_reward(
         return raw_reward;
     }
 
-    muldiv(raw_reward, saturation_point, validator_stake)
+    proportional_reward(raw_reward, saturation_point, validator_stake, height)
 }
 
-fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, current_epoch: u64) {
+fn proportional_reward(amount: u64, numerator: u64, denominator: u64, height: u64) -> u64 {
+    if overflow_fix_active(height) {
+        muldiv(amount, numerator, denominator)
+    } else if denominator == 0 {
+        0
+    } else {
+        amount.saturating_mul(numerator) / denominator
+    }
+}
+
+fn distribute_block_rewards(
+    state: &mut ChainState,
+    epoch_block_reward: u64,
+    current_epoch: u64,
+    height: u64,
+) {
     let total_stake = state.validators.total_active_stake();
     if total_stake == 0 || epoch_block_reward == 0 {
         return;
@@ -555,9 +585,14 @@ fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, cur
     let active_validator_count = active.len() as u64;
 
     for (id, stake) in &active {
-        let raw_reward = muldiv(epoch_block_reward, *stake, total_stake);
-        let adjusted_reward =
-            saturation_adjusted_reward(raw_reward, *stake, total_stake, active_validator_count);
+        let raw_reward = proportional_reward(epoch_block_reward, *stake, total_stake, height);
+        let adjusted_reward = saturation_adjusted_reward(
+            raw_reward,
+            *stake,
+            total_stake,
+            active_validator_count,
+            height,
+        );
 
         let commission_bps = state
             .validators
@@ -590,7 +625,7 @@ fn distribute_block_rewards(state: &mut ChainState, epoch_block_reward: u64, cur
     }
 }
 
-fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64) {
+fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u64) {
     let fee_pool = state.fee_reward_pool;
     if fee_pool == 0 {
         return;
@@ -613,7 +648,7 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64) {
     let mut distributed = 0u64;
 
     for (id, stake) in &active {
-        let reward = muldiv(fee_pool, *stake, total_stake);
+        let reward = proportional_reward(fee_pool, *stake, total_stake, height);
         let commission_bps = state
             .validators
             .get(id)
@@ -941,25 +976,25 @@ mod tests {
 
     #[test]
     fn saturation_below_point_full_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 100, 200_000, 200);
+        let reward = saturation_adjusted_reward(1_000_000, 100, 200_000, 200, 0);
         assert_eq!(reward, 1_000_000);
     }
 
     #[test]
     fn saturation_above_point_reduced_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 2_000, 200_000, 200);
+        let reward = saturation_adjusted_reward(1_000_000, 2_000, 200_000, 200, 0);
         assert_eq!(reward, 500_000);
     }
 
     #[test]
     fn saturation_at_point_full_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 1_000, 200_000, 200);
+        let reward = saturation_adjusted_reward(1_000_000, 1_000, 200_000, 200, 0);
         assert_eq!(reward, 1_000_000);
     }
 
     #[test]
     fn saturation_disabled_for_small_validator_sets() {
-        let reward = saturation_adjusted_reward(1_000_000, 50_000, 200_000, 20);
+        let reward = saturation_adjusted_reward(1_000_000, 50_000, 200_000, 20, 0);
         assert_eq!(reward, 1_000_000);
     }
 

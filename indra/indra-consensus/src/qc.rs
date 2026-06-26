@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
-        bps_of, muldiv, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_PQ_SIG_BYTES,
-        MAX_VALIDATORS,
+        bps_of, muldiv, overflow_fix_active, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS,
+        MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
     qc::QuorumCertificateV1,
     vote::{VoteStep, VoteV1},
@@ -218,7 +218,11 @@ pub fn verify_qc(
     let signed_stake = signers
         .iter()
         .fold(0u64, |acc, validator| acc.saturating_add(validator.stake));
-    let quorum_stake = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
+    let quorum_stake = if overflow_fix_active(qc.height) {
+        bps_of(total_stake, CONSENSUS_QUORUM_BPS)
+    } else {
+        total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
+    };
 
     if signed_stake < quorum_stake {
         return Err(ConsensusError::InsufficientStake {

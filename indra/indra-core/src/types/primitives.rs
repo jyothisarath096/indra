@@ -281,6 +281,21 @@ pub fn bps_of(value: u64, bps: u32) -> u64 {
     ((value as u128) * (bps as u128) / 10_000u128) as u64
 }
 
+/// Consensus hard-fork activation heights.
+///
+/// Testnet activates existing arithmetic fixes from genesis. Mainnet values
+/// must be set and announced before the corresponding release is deployed.
+pub mod hard_forks {
+    /// u128 intermediate arithmetic for proportional reward and slash math.
+    pub const OVERFLOW_FIX_HEIGHT: u64 = 0;
+}
+
+/// Whether proportional arithmetic uses the overflow-safe implementation.
+#[inline]
+pub fn overflow_fix_active(height: u64) -> bool {
+    height >= hard_forks::OVERFLOW_FIX_HEIGHT
+}
+
 // ── Pruning ───────────────────────────────────────────────────────────────────
 
 /// Default number of blocks to retain in pruned mode.
@@ -716,5 +731,13 @@ mod tests {
         assert_eq!(max_active_validators(u64::MAX), VALIDATOR_SET_PHASE4_MAX);
         assert!(MAX_QC_SIGNERS >= VALIDATOR_SET_PHASE4_MAX);
         assert!(MIN_ACTIVE_VALIDATORS <= VALIDATOR_SET_PHASE1_MAX);
+    }
+
+    #[test]
+    fn overflow_fix_activates_at_correct_height() {
+        assert!(overflow_fix_active(0));
+        assert!(overflow_fix_active(1));
+        assert!(overflow_fix_active(25_932));
+        assert!(overflow_fix_active(u64::MAX));
     }
 }
