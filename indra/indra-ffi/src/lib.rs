@@ -24,17 +24,31 @@ use indra_bulletproofs::RANGE_PROOF_BYTES;
 use indra_crypto::sha256;
 
 pub mod errors;
+pub mod governance;
 pub mod keygen;
+pub mod staking;
 pub mod tx;
 pub mod wallet;
 
 use errors::{error_string, IndraError};
 
-const CLASSICAL_PK_BYTES: usize = 32;
-const CLASSICAL_SK_BYTES: usize = 32;
-const PQ_PK_BYTES: usize = 2592;
-const PQ_SK_BYTES: usize = 32;
-const BYTES32_LEN: usize = 32;
+pub const CLASSICAL_PK_BYTES: usize = 32;
+pub const CLASSICAL_SK_BYTES: usize = 32;
+pub const PQ_PK_BYTES: usize = 2592;
+pub const PQ_SK_BYTES: usize = 32;
+pub const BYTES32_LEN: usize = 32;
+
+/// Maximum byte length of a hex-encoded staking or governance operation
+/// including the null terminator. 32 KB is generous for current ops.
+pub const INDRA_OP_HEX_MAX_BYTES: usize = 32768;
+/// Length of a validator ID.
+pub const INDRA_VALIDATOR_ID_BYTES: usize = 32;
+/// Length of a UTXO ID.
+pub const INDRA_UTXO_ID_BYTES: usize = 32;
+/// Length of a VRF public key.
+pub const INDRA_VRF_PK_BYTES: usize = 32;
+/// Length of a proposal ID.
+pub const INDRA_PROPOSAL_ID_BYTES: usize = 32;
 
 /// FFI keypair bundle returned to Swift.
 #[repr(C)]

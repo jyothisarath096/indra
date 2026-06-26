@@ -22,6 +22,12 @@ pub enum IndraError {
     InsufficientBalance = -8,
     /// Invalid parameter value.
     InvalidParam = -9,
+    /// JSON parse error for governance action JSON.
+    InvalidJson = -10,
+    /// Unknown governable action type.
+    UnknownAction = -11,
+    /// Invalid governance vote value.
+    InvalidVote = -12,
     /// Internal error.
     Internal = -99,
 }
@@ -67,6 +73,9 @@ pub const fn error_string(error_code: i32) -> &'static [u8] {
         -7 => b"range proof failed\0",
         -8 => b"insufficient balance\0",
         -9 => b"invalid parameter\0",
+        -10 => b"invalid json\0",
+        -11 => b"unknown governance action\0",
+        -12 => b"invalid vote\0",
         _ => b"internal error\0",
     }
 }
