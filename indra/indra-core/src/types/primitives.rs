@@ -24,11 +24,11 @@ pub const EPOCH_DURATION_BLOCKS: u64 = 300;
 pub const MAX_VALIDATORS: usize = 1_500;
 
 /// Epochs a validator's stake is locked after initiating exit.
-pub const UNBONDING_PERIOD_EPOCHS: u64 = 60; // reduced from 200 — 30 days vs 100 days, industry standard
+pub const UNBONDING_PERIOD_EPOCHS: u64 = 1008; // 21 days at 2 epochs/hour (48 epochs/day × 21 days = 1008)
 
 /// Epochs after exit during which a validator's signatures remain valid.
 /// AUTH_WINDOW = UNBONDING_PERIOD + 100
-pub const AUTH_WINDOW_EPOCHS: u64 = 160; // reduced with unbonding — unbonding(60) + buffer(100)
+pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
 
 /// Epochs beyond which a new node must have a checkpoint to sync.
 pub const WS_WINDOW_EPOCHS: u64 = 500;
