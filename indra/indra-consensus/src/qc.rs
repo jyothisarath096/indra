@@ -1,7 +1,7 @@
 //! Quorum Certificate construction and verification.
 
 use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use indra_core::types::{
     crypto::PQVoteSig,
@@ -54,7 +54,7 @@ pub struct QcBuilder {
     block_hash: Bytes32,
     validators: Vec<QcValidator>,
     total_stake: u64,
-    votes: HashMap<Bytes32, VoteV1>,
+    votes: BTreeMap<Bytes32, VoteV1>,
 }
 
 impl QcBuilder {
@@ -70,7 +70,7 @@ impl QcBuilder {
             block_hash,
             validators,
             total_stake,
-            votes: HashMap::new(),
+            votes: BTreeMap::new(),
         }
     }
 
@@ -95,13 +95,29 @@ impl QcBuilder {
             .filter_map(|id| self.validators.iter().find(|v| v.validator_id == *id))
             .map(|v| v.stake)
             .fold(0u64, |a, b| a.saturating_add(b));
-        muldiv(voted, 10_000, self.total_stake)
+        if overflow_fix_active(self.height) {
+            muldiv(voted, 10_000, self.total_stake)
+        } else {
+            voted.saturating_mul(10_000) / self.total_stake
+        }
     }
 
     /// Build the QC if quorum has been reached.
     pub fn build(&self) -> ConsensusResult<QuorumCertificateV1> {
         let stake_bps = self.current_stake_bps();
-        if (stake_bps as u32) < CONSENSUS_QUORUM_BPS {
+        let voted_stake = self
+            .votes
+            .keys()
+            .filter_map(|id| self.validators.iter().find(|v| v.validator_id == *id))
+            .fold(0u64, |total, validator| {
+                total.saturating_add(validator.stake)
+            });
+        let quorum_stake = if overflow_fix_active(self.height) {
+            bps_of(self.total_stake, CONSENSUS_QUORUM_BPS)
+        } else {
+            self.total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
+        };
+        if voted_stake < quorum_stake {
             return Err(ConsensusError::QuorumNotReached {
                 have_bps: stake_bps,
                 need_bps: CONSENSUS_QUORUM_BPS as u64,

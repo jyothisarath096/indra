@@ -341,10 +341,19 @@ impl GovernanceSnapshot {
 
     /// Return yes support in bps.
     pub fn support_bps(&self, yes_stake: u64) -> u32 {
+        self.support_bps_at_height(yes_stake, u64::MAX)
+    }
+
+    /// Return yes support in bps under the arithmetic active at `height`.
+    pub fn support_bps_at_height(&self, yes_stake: u64, height: u64) -> u32 {
         if self.total_stake == 0 {
             return 0;
         }
-        muldiv(yes_stake, 10_000, self.total_stake) as u32
+        if overflow_fix_active(height) {
+            muldiv(yes_stake, 10_000, self.total_stake) as u32
+        } else {
+            (yes_stake.saturating_mul(10_000) / self.total_stake) as u32
+        }
     }
 }
 

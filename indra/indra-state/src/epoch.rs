@@ -127,7 +127,8 @@ pub fn apply_epoch_transition_at_height(
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds(state, current_epoch)?;
-    let (liveness_slashed, liveness_penalty_count) = apply_liveness_penalties(state, current_epoch);
+    let (liveness_slashed, liveness_penalty_count) =
+        apply_liveness_penalties(state, current_epoch, height);
 
     let mut active_after: Vec<Bytes32> = state
         .validators
@@ -311,7 +312,7 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
             });
             should_return_deposit = !proposal.deposit_burned;
         } else {
-            let support_bps = snap2.support_bps(yes);
+            let support_bps = snap2.support_bps_at_height(yes, height);
             if support_bps >= GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS && !proposal.deposit_burned {
                 should_return_deposit = true;
             } else {
@@ -610,7 +611,11 @@ fn distribute_block_rewards(
         let (validator_share, delegator_pool) = if delegated == 0 {
             (adjusted_reward, 0)
         } else {
-            let commission = bps_of(adjusted_reward, commission_bps);
+            let commission = if overflow_fix_active(height) {
+                bps_of(adjusted_reward, commission_bps)
+            } else {
+                adjusted_reward.saturating_mul(commission_bps as u64) / 10_000
+            };
             (commission, adjusted_reward.saturating_sub(commission))
         };
 
@@ -619,9 +624,10 @@ fn distribute_block_rewards(
             entry.rewards_last_epoch = current_epoch;
         }
 
-        let _remainder = state
-            .delegations
-            .distribute_rewards(id, delegator_pool, current_epoch);
+        let _remainder =
+            state
+                .delegations
+                .distribute_rewards(id, delegator_pool, current_epoch, height);
     }
 }
 
@@ -659,7 +665,11 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u6
         let (validator_share, delegator_pool) = if delegated == 0 {
             (reward, 0)
         } else {
-            let commission = bps_of(reward, commission_bps);
+            let commission = if overflow_fix_active(height) {
+                bps_of(reward, commission_bps)
+            } else {
+                reward.saturating_mul(commission_bps as u64) / 10_000
+            };
             (commission, reward.saturating_sub(commission))
         };
 
@@ -669,9 +679,10 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u6
             distributed = distributed.saturating_add(validator_share);
         }
 
-        let remainder = state
-            .delegations
-            .distribute_rewards(id, delegator_pool, current_epoch);
+        let remainder =
+            state
+                .delegations
+                .distribute_rewards(id, delegator_pool, current_epoch, height);
         distributed = distributed.saturating_add(delegator_pool.saturating_sub(remainder));
     }
 
@@ -767,7 +778,7 @@ fn released_bond_output(
     Ok(output)
 }
 
-fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) -> (u64, u32) {
+fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64, height: u64) -> (u64, u32) {
     let mut total_slashed = 0u64;
     let mut penalty_count = 0u32;
     let threshold = state.governance.params.slash_liveness_threshold_epochs;
@@ -789,7 +800,11 @@ fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64) -> (u64,
         };
 
         if missed >= threshold && stake > 0 {
-            let penalty = bps_of(stake, slash_bps);
+            let penalty = if overflow_fix_active(height) {
+                bps_of(stake, slash_bps)
+            } else {
+                stake.saturating_mul(slash_bps as u64) / 10_000
+            };
             if let Some(v) = state.validators.get_mut(&validator_id) {
                 v.stake_spark = v.stake_spark.saturating_sub(penalty);
             }

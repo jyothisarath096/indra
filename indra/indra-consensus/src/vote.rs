@@ -16,7 +16,7 @@
 //!
 //! Both Ed25519 and ML-DSA-87 components are required.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
@@ -65,7 +65,7 @@ pub struct VoteCollector {
     voters: Vec<RegisteredVoter>,
     total_stake: u64,
     // validator_id → (vote, stake)
-    received: HashMap<Bytes32, (VoteV1, u64)>,
+    received: BTreeMap<Bytes32, (VoteV1, u64)>,
 }
 
 impl VoteCollector {
@@ -81,7 +81,7 @@ impl VoteCollector {
             step,
             voters,
             total_stake,
-            received: HashMap::new(),
+            received: BTreeMap::new(),
         }
     }
 
@@ -197,7 +197,11 @@ impl VoteCollector {
             self.total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
         };
         for (block_hash, stake) in &stake_by_hash {
-            let bps = muldiv(*stake, 10_000, self.total_stake);
+            let bps = if overflow_fix_active(self.height) {
+                muldiv(*stake, 10_000, self.total_stake)
+            } else {
+                stake.saturating_mul(10_000) / self.total_stake
+            };
             if *stake >= threshold {
                 return VoteDecision::QuorumReached {
                     block_hash: *block_hash,

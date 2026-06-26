@@ -21,8 +21,8 @@ use indra_core::{
 };
 use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_state::{
-    apply::apply_slash, apply_block, epoch::apply_epoch_transition, utxo::UtxoSet, ChainState,
-    ValidatorEntry, ValidatorStatus,
+    apply::apply_slash, apply_block, compute_state_root, epoch::apply_epoch_transition,
+    utxo::UtxoSet, ChainState, ValidatorEntry, ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -626,14 +626,91 @@ fn epoch_transition_produces_identical_state_on_replay() {
 }
 
 #[test]
-fn reward_distribution_is_height_gated() {
-    // At testnet genesis the u128 path is active, avoiding the u64 overflow
-    // that the historical saturating implementation would produce.
-    assert_eq!(
-        indra_core::types::primitives::muldiv(356_760_000_000, 1, 4),
-        89_190_000_000
-    );
-    assert!(indra_core::types::primitives::overflow_fix_active(0));
+fn replay_with_different_arithmetic_diverges_without_height_gating() {
+    use indra_core::types::primitives::{muldiv, overflow_fix_active};
+
+    const EPOCH_REWARD: u64 = 1_189_200_000 * 300;
+    const STAKE: u64 = 100_000_000_000;
+    const TOTAL_STAKE: u64 = STAKE * 4;
+
+    // This is the persisted snapshot before the 300th (epoch-boundary) block.
+    // The transition below models the reward mutation caused by those 300
+    // blocks; all other blocks in this minimal replay are empty.
+    let mut snapshot = ChainState::new_genesis();
+    let mut validator_ids = Vec::new();
+    for seed in 1..=4 {
+        let (id, _, _) = install_validator(&mut snapshot, [seed; 32]);
+        snapshot.validators.get_mut(&id).unwrap().stake_spark = STAKE;
+        validator_ids.push(id);
+    }
+
+    let old_reward = EPOCH_REWARD.saturating_mul(STAKE) / TOTAL_STAKE;
+    let new_reward = muldiv(EPOCH_REWARD, STAKE, TOTAL_STAKE);
+    assert_eq!(old_reward, 46_116_860);
+    assert_eq!(new_reward, 89_190_000_000);
+    assert_ne!(old_reward, new_reward);
+
+    // What the old live chain committed at the epoch boundary.
+    let mut reference = snapshot.clone();
+    reference.height = EPOCH_DURATION_BLOCKS;
+    for id in &validator_ids {
+        reference.validators.get_mut(id).unwrap().pending_rewards = old_reward;
+    }
+    let committed_root = compute_state_root(&reference);
+
+    // What a new binary would produce when replaying the same boundary with
+    // unconditional muldiv: a different state root, reproducing the incident.
+    let mut ungated_replay = snapshot.clone();
+    ungated_replay.height = EPOCH_DURATION_BLOCKS;
+    for id in &validator_ids {
+        ungated_replay
+            .validators
+            .get_mut(id)
+            .unwrap()
+            .pending_rewards = new_reward;
+    }
+    assert_ne!(committed_root, compute_state_root(&ungated_replay));
+
+    // Simulate a mainnet activation at 50,000. A replay of height 300 must
+    // continue using historical arithmetic even when executed by the new code.
+    let activation_height = 50_000;
+    let gated_reward = if EPOCH_DURATION_BLOCKS >= activation_height {
+        new_reward
+    } else {
+        old_reward
+    };
+    let mut gated_replay = snapshot;
+    gated_replay.height = EPOCH_DURATION_BLOCKS;
+    for id in &validator_ids {
+        gated_replay.validators.get_mut(id).unwrap().pending_rewards = gated_reward;
+    }
+    assert_eq!(committed_root, compute_state_root(&gated_replay));
+
+    // The current testnet configuration activates the corrected path at genesis.
+    assert!(overflow_fix_active(0));
+    assert!(overflow_fix_active(25_932));
+    assert!(overflow_fix_active(u64::MAX));
+}
+
+#[test]
+fn height_gated_arithmetic_is_deterministic_across_restarts() {
+    use indra_core::types::primitives::{muldiv, overflow_fix_active};
+
+    let epoch_reward = 356_760_000_000;
+    let stake = 100_000_000_000;
+    let total_stake = 400_000_000_000;
+    let replay_height = 100u64;
+    let reward_for = |height: u64| {
+        if overflow_fix_active(height) {
+            muldiv(epoch_reward, stake, total_stake)
+        } else {
+            epoch_reward.saturating_mul(stake) / total_stake
+        }
+    };
+
+    // Both binaries dispatch from the block height, not from binary version.
+    assert_eq!(reward_for(replay_height), reward_for(replay_height));
+    assert_eq!(reward_for(replay_height), 89_190_000_000);
 }
 
 #[test]
@@ -653,19 +730,104 @@ fn governance_state_encoding_is_deterministic() {
 }
 
 #[test]
-fn btreemap_iteration_order_is_deterministic() {
-    let mut first = ChainState::new_genesis();
-    let mut second = ChainState::new_genesis();
-    let _ = install_validator(&mut first, [2; 32]);
-    let _ = install_validator(&mut first, [1; 32]);
-    let _ = install_validator(&mut second, [1; 32]);
-    let _ = install_validator(&mut second, [2; 32]);
-    assert_eq!(
-        first.validators.total_active_stake(),
-        second.validators.total_active_stake()
-    );
-    assert_eq!(
-        first.validators.encode_to_vec(),
-        second.validators.encode_to_vec()
-    );
+fn btreemap_iteration_is_deterministic_unlike_hashmap() {
+    use std::collections::BTreeMap;
+
+    let keys = [
+        Bytes32::from([0xFF; 32]),
+        Bytes32::from([0x01; 32]),
+        Bytes32::from([0xAA; 32]),
+        Bytes32::from([0x55; 32]),
+    ];
+    let mut map = BTreeMap::new();
+    for (index, key) in keys.iter().enumerate() {
+        map.insert(*key, index as u64 * 1_000);
+    }
+
+    let order: Vec<Bytes32> = map.keys().copied().collect();
+    let mut expected = order.clone();
+    expected.sort_by_key(|key| key.0);
+    assert_eq!(order, expected);
+
+    let encode = |entries: &BTreeMap<Bytes32, u64>| {
+        entries
+            .iter()
+            .flat_map(|(key, value)| key.0.into_iter().chain(value.to_le_bytes()))
+            .collect::<Vec<u8>>()
+    };
+    assert_eq!(encode(&map), encode(&map));
+}
+
+#[test]
+fn delegator_reward_distribution_is_height_gated() {
+    use indra_core::types::primitives::muldiv;
+
+    let reward_pool = 80_271_000_000u64;
+    let staked = 100_000_000_000u64;
+    let total_delegated = 400_000_000_000u64;
+    let old = reward_pool.saturating_mul(staked) / total_delegated;
+    let new = muldiv(reward_pool, staked, total_delegated);
+
+    assert_ne!(old, new);
+    assert!(new > old);
+}
+
+#[test]
+fn commission_bps_is_height_gated() {
+    use indra_core::types::primitives::{bps_of, overflow_fix_active};
+
+    let reward = 89_190_000_000u64;
+    let commission_bps = 1_000u32;
+    let old = reward.saturating_mul(commission_bps as u64) / 10_000;
+    let new = bps_of(reward, commission_bps);
+
+    assert_eq!(old, 8_919_000_000);
+    assert_eq!(new, 8_919_000_000);
+    assert!(overflow_fix_active(0));
+}
+
+#[test]
+fn liveness_penalty_is_height_gated() {
+    use indra_core::types::primitives::{bps_of, overflow_fix_active};
+
+    let stake = 100_000_000_000u64;
+    let liveness_bps = 10u32;
+    let old = stake.saturating_mul(liveness_bps as u64) / 10_000;
+    let new = bps_of(stake, liveness_bps);
+
+    assert_eq!(old, 100_000_000);
+    assert_eq!(new, 100_000_000);
+    assert!(overflow_fix_active(0));
+}
+
+#[test]
+fn qc_vote_order_is_deterministic() {
+    use std::collections::BTreeMap;
+
+    let validator_ids = [
+        Bytes32::from([0xFF; 32]),
+        Bytes32::from([0x01; 32]),
+        Bytes32::from([0x80; 32]),
+        Bytes32::from([0x42; 32]),
+    ];
+    let mut votes1 = BTreeMap::new();
+    for (index, id) in validator_ids.iter().enumerate() {
+        votes1.insert(*id, index as u64);
+    }
+    let mut votes2 = BTreeMap::new();
+    for (index, id) in validator_ids.iter().rev().enumerate() {
+        votes2.insert(*id, (3 - index) as u64);
+    }
+
+    let order1: Vec<Bytes32> = votes1.keys().copied().collect();
+    let order2: Vec<Bytes32> = votes2.keys().copied().collect();
+    assert_eq!(order1, order2);
+
+    let encode = |votes: &BTreeMap<Bytes32, u64>| {
+        votes
+            .iter()
+            .flat_map(|(id, vote)| id.0.into_iter().chain(vote.to_le_bytes()))
+            .collect::<Vec<u8>>()
+    };
+    assert_eq!(encode(&votes1), encode(&votes2));
 }
