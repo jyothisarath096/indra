@@ -72,6 +72,9 @@ pub fn apply_epoch_transition_at_height(
     timestamp_secs: u64,
     height: u64,
 ) -> StateResult<EpochRecord> {
+    // DETERMINISM NOTE: timestamp_secs is stored ONLY in EpochRecord
+    // and does NOT affect ChainState mutations. State root is computed
+    // from ChainState only. EpochRecord is stored separately in EpochStore.
     eprintln!(
         "[epoch] transition at height={} epoch={} validators={} total_stake={} fee_pool={}",
         state.height,

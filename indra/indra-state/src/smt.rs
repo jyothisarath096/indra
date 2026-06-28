@@ -5,6 +5,19 @@
 //! populated leaves and recomputes the affected internal nodes eagerly on
 //! every update. That keeps the external API incremental while preserving
 //! simple, auditable logic.
+//!
+//! ## Determinism guarantees
+//!
+//! The root hash is deterministic and independent of leaf insertion or
+//! deletion order. This is a consensus-critical invariant: all validators
+//! must compute identical roots from identical leaf sets.
+//!
+//! Internal `HashMap` usage is safe because nodes are keyed by
+//! deterministic `NodeLoc` values and the root is retrieved by a fixed
+//! root key, not by iteration. See `recompute()` for the safety comment.
+//!
+//! **Do not** add iteration-order-dependent logic to `recompute()` without
+//! updating the determinism tests and this documentation.
 
 use std::collections::HashMap;
 
@@ -120,6 +133,18 @@ impl SparseMerkleTree {
     }
 
     fn recompute(&mut self) {
+        // DETERMINISM SAFETY: This function uses HashMap internally for
+        // intermediate node storage. The computed root is order-insensitive
+        // because every node is keyed by its deterministic NodeLoc (depth +
+        // prefix), and parent hashes are pure functions of (left_child,
+        // right_child) selected by bit_at(), not by iteration order.
+        //
+        // MAINTENANCE WARNING: Do NOT fold HashMap entries directly into a
+        // running hash or accumulator. Always key by NodeLoc and fetch by
+        // deterministic location. Violating this breaks consensus determinism.
+        //
+        // The test `deterministic_independent_of_insertion_order` guards this
+        // invariant. Add new leaves to that test when adding new leaf types.
         let empty_hashes = empty_hashes();
         let mut levels: Vec<HashMap<NodeLoc, [u8; 32]>> =
             (0..=SMT_DEPTH).map(|_| HashMap::new()).collect();
@@ -315,11 +340,9 @@ mod tests {
 
     #[test]
     fn deterministic_independent_of_insertion_order() {
-        let pairs = vec![
-            (key(0x10), value(0x20)),
-            (key(0x11), value(0x21)),
-            (key(0x12), value(0x22)),
-        ];
+        let pairs: Vec<([u8; 32], [u8; 32])> = (0u8..16)
+            .map(|i| (key(i), value(i.wrapping_mul(3))))
+            .collect();
 
         let mut a = SparseMerkleTree::new();
         for (k, v) in &pairs {
@@ -331,6 +354,57 @@ mod tests {
             b.insert(*k, *v);
         }
 
-        assert_eq!(a.root(), b.root());
+        let mut c = SparseMerkleTree::new();
+        let mut shuffled = pairs.clone();
+        shuffled.rotate_left(7);
+        for (k, v) in &shuffled {
+            c.insert(*k, *v);
+        }
+
+        assert_eq!(
+            a.root(),
+            b.root(),
+            "SMT root must be identical regardless of insertion order (forward vs reverse)"
+        );
+        assert_eq!(
+            a.root(),
+            c.root(),
+            "SMT root must be identical regardless of insertion order (forward vs shuffled)"
+        );
+
+        let proof_a = a.prove(pairs[0].0);
+        let proof_b = b.prove(pairs[0].0);
+        assert_eq!(
+            proof_a.siblings, proof_b.siblings,
+            "SMT proof siblings must be identical regardless of insertion order"
+        );
+    }
+
+    #[test]
+    fn smt_root_is_independent_of_deletion_order() {
+        let all_pairs: Vec<([u8; 32], [u8; 32])> = (0u8..8).map(|i| (key(i), value(i))).collect();
+        let to_delete: Vec<[u8; 32]> = (0u8..4).map(key).collect();
+
+        let mut a = SparseMerkleTree::new();
+        for (k, v) in &all_pairs {
+            a.insert(*k, *v);
+        }
+        for k in &to_delete {
+            a.delete(*k);
+        }
+
+        let mut b = SparseMerkleTree::new();
+        for (k, v) in &all_pairs {
+            b.insert(*k, *v);
+        }
+        for k in to_delete.iter().rev() {
+            b.delete(*k);
+        }
+
+        assert_eq!(
+            a.root(),
+            b.root(),
+            "SMT root must be identical regardless of deletion order"
+        );
     }
 }

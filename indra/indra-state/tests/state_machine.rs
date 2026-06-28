@@ -415,6 +415,56 @@ fn apply_block_updates_last_active_epoch_for_qc_signers() {
 }
 
 #[test]
+fn timestamp_does_not_affect_state_root() {
+    let mut state_t0 = ChainState::new_genesis();
+    let mut state_t1 = ChainState::new_genesis();
+    install_test_validators_for_qc(&mut state_t0);
+    install_test_validators_for_qc(&mut state_t1);
+
+    let block = make_block(&state_t0, vec![]);
+
+    apply_block(&mut state_t0, &block, 0).unwrap();
+    apply_block(&mut state_t1, &block, 1_700_000_000).unwrap();
+
+    assert_eq!(
+        compute_state_root(&state_t0),
+        compute_state_root(&state_t1),
+        "State root must be identical regardless of timestamp_secs value. If this fails, timestamp has been accidentally used in state computation."
+    );
+}
+
+#[test]
+fn epoch_record_timestamp_differs_but_state_root_matches() {
+    let mut state_live = ChainState::new_genesis();
+    let mut state_replay = ChainState::new_genesis();
+    install_test_validators_for_qc(&mut state_live);
+    install_test_validators_for_qc(&mut state_replay);
+
+    let mut live_boundary_record = None;
+    let mut replay_boundary_record = None;
+    for height in 1u64..=EPOCH_DURATION_BLOCKS {
+        let block = make_block(&state_live, vec![]);
+        assert_eq!(block.header.height, height);
+
+        live_boundary_record =
+            apply_block(&mut state_live, &block, 1_700_000_000 + height).unwrap();
+        replay_boundary_record = apply_block(&mut state_replay, &block, 0).unwrap();
+    }
+
+    let live_record = live_boundary_record.expect("epoch boundary should emit an EpochRecord");
+    let replay_record = replay_boundary_record.expect("epoch boundary should emit an EpochRecord");
+    assert_ne!(
+        live_record.timestamp_secs, replay_record.timestamp_secs,
+        "EpochRecord timestamps should differ between live and replay"
+    );
+    assert_eq!(
+        compute_state_root(&state_live),
+        compute_state_root(&state_replay),
+        "State roots must match between live and replay despite different timestamps"
+    );
+}
+
+#[test]
 fn one_hundred_empty_blocks() {
     let mut state = ChainState::new_genesis();
     for _ in 0..100 {

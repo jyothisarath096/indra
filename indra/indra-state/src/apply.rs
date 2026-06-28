@@ -266,8 +266,17 @@ fn verify_vote_sig_with_keys(
 pub fn apply_block(
     state: &mut ChainState,
     block: &BlockV1,
-    timestamp_secs: u64,
+    timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
 ) -> StateResult<Option<EpochRecord>> {
+    // DETERMINISM NOTE: timestamp_secs is NOT written into ChainState.
+    // It is only stored in the returned EpochRecord for historical records.
+    // Replay passes 0 for this parameter — this is intentional and safe
+    // because timestamp_secs does not affect state root computation.
+    //
+    // WARNING: Do NOT use timestamp_secs in any computation that writes
+    // to ChainState fields. If epoch-based timing logic is ever needed,
+    // use block.header.timestamp (committed, deterministic) instead.
+
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
     validate_block_header(state, block)?;

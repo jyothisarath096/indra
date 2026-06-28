@@ -4,7 +4,7 @@
 Phase 2 found one CRITICAL restart/replay determinism bug and one HIGH block-production canonicalization bug; both are now **FIXED**. The height 9872 restart divergence was most likely caused by the live commit path mutating `ValidatorEntry.last_active_epoch` from the committed block QC after `apply_block`, while startup replay only called `apply_block`. That QC-derived mutation now lives inside `indra-state::apply_block`, so live commit, sync import, block-production projection, and replay all execute the same state transition. Mempool equal-fee selection and capacity eviction now use deterministic `tx_id` tiebreakers. The originally suspected equal-stake active-set tiebreaker is safe: equal stake is broken deterministically by validator ID. The SMT uses `HashMap` internally, but its current root computation is order-insensitive.
 
 ## SMT Analysis
-### Finding: SAFE
+### Finding: RESOLVED LOW
 `indra-state/src/smt.rs` stores `leaves: HashMap<[u8; 32], [u8; 32]>` at line 37 and `nodes: HashMap<NodeLoc, [u8; 32]>` at line 38. Recompute builds `levels: Vec<HashMap<NodeLoc, [u8; 32]>>` at lines 124-125 and `grouped: HashMap<NodeLoc, (Option<[u8; 32]>, Option<[u8; 32]>)>` at lines 144-145.
 
 The implementation does iterate these maps:
@@ -16,7 +16,9 @@ The implementation does iterate these maps:
 
 Despite the randomized map iteration order, the computed root is deterministic because every write is keyed by a deterministic tree location, and parent hashes are pure functions of `(left_child, right_child)` selected by `bit_at`, not by iteration position. The final root is fetched by the fixed location `NodeLoc { depth: 0, prefix: [0; 32] }` at lines 177-184. Iteration order can affect insertion order into `HashMap`, but not the key/value set or the final root. The file also has a regression test, `deterministic_independent_of_insertion_order`, at lines 317-335.
 
-Residual risk: this is safe only because recompute never folds hashes in map iteration order. Any future optimization that folds `HashMap` entries directly into a root would be dangerous.
+**Resolution status:** RESOLVED. `smt.rs` now has module-level determinism documentation and an explicit `recompute()` maintenance warning. The insertion-order test now covers 16 leaves plus forward, reverse, and rotated orders, and it verifies proof sibling determinism. A new deletion-order test verifies identical roots after deleting the same leaves in different orders.
+
+Residual risk: this remains safe only because recompute never folds hashes in map iteration order. Any future optimization that folds `HashMap` entries directly into a root would be dangerous, and should first update the determinism tests.
 
 ## State Root Computation
 ### Finding: FIXED CRITICAL
@@ -150,12 +152,14 @@ Additional snapshot notes:
 - Epoch record history is stored separately in `EpochStore`, not in `ChainState`. It is not used by the audited state-root path.
 
 ## Timestamp Non-Determinism
-### Finding: SAFE
+### Finding: RESOLVED LOW
 `apply_block(state, block, timestamp_secs)` receives a timestamp at `indra-state/src/apply.rs` lines 265-269. It passes this timestamp to `apply_epoch_transition_at_height` only when the block is an epoch boundary at lines 395-403.
 
 `apply_epoch_transition_at_height` receives `timestamp_secs` at `indra-state/src/epoch.rs` lines 69-74 and stores it only in the returned `EpochRecord` at line 157. The timestamp is not written into `ChainState`, and `EpochRecord` is not included in `compute_state_root`.
 
 Live import passes wall-clock time through `NodeEngine::commit_block` at `indra-node/src/engine.rs` lines 583-591, then appends the returned `EpochRecord` to `EpochStore` at lines 592-594. Replay passes `0` at `engine.rs` line 692. This can make epoch-history files differ between live operation and replay, but based on the audited code it does not affect `ChainState` or state root.
+
+**Resolution status:** RESOLVED. `apply_block` now documents that `timestamp_secs` must never be written into `ChainState`, and `apply_epoch_transition_at_height` documents that the timestamp is stored only in the returned `EpochRecord`. Two regression tests assert that different live/replay timestamps do not change the state root, including at an epoch boundary where `EpochRecord.timestamp_secs` intentionally differs.
 
 Operational caveat: if future consensus or state-root logic reads `EpochStore` or `EpochRecord.timestamp_secs`, this becomes dangerous immediately. Block headers also have `header.timestamp`, but `apply_block` does not currently use it for state mutation.
 
@@ -188,13 +192,13 @@ Operational caveat: if future consensus or state-root logic reads `EpochStore` o
 ## Ranked Findings (by severity)
 1. **FIXED CRITICAL — Live/replay mismatch for `last_active_epoch` from QC signatures.** The QC-derived mutation now occurs inside `apply_block`.
 2. **FIXED HIGH — Mempool equal-fee selection and eviction lacked deterministic tiebreakers.** Selection and eviction now use explicit `tx_id` tie rules.
-3. **LOW — SMT uses `HashMap` internally.** Current implementation is order-insensitive and tested, but future maintenance could accidentally introduce order-dependent folding.
-4. **LOW — `timestamp_secs` differs live vs replay but currently only affects `EpochRecord`.** Safe for state root today, dangerous if epoch records become consensus inputs.
+3. **RESOLVED LOW — SMT uses `HashMap` internally.** Current implementation is order-insensitive, documented, and guarded by expanded insertion/deletion-order tests.
+4. **RESOLVED LOW — `timestamp_secs` differs live vs replay but currently only affects `EpochRecord`.** This invariant is now documented and guarded by state-root regression tests.
 
 ## Recommended Fix Order
 1. **Completed:** QC-derived `last_active_epoch` updates were moved into canonical `apply_block`.
 2. **Completed:** Replay/snapshot regression coverage verifies identical `last_active_epoch` and full state roots.
 3. **Completed:** Mempool selection and eviction now use explicit `tx_id` tiebreakers.
 4. Keep QC construction on `BTreeMap` and retain the QC encoding-order regression test with votes inserted in different orders.
-5. Add an SMT order-independence property test with a larger randomized insertion/deletion corpus to protect against future internal refactors.
-6. Keep `timestamp_secs` out of consensus state unless block timestamp semantics are explicitly designed and replay uses committed block timestamps rather than wall-clock time.
+5. **Completed:** Added expanded SMT insertion/proof determinism and deletion-order determinism tests.
+6. **Completed:** Documented timestamp safety and added state-root tests proving live/replay timestamp differences do not affect `ChainState`.
