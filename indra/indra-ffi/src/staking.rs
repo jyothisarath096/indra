@@ -63,7 +63,10 @@ pub(crate) unsafe fn write_hex_to_buf(
     out_len: usize,
 ) -> Result<(), IndraError> {
     let needed = hex.len().saturating_add(1);
-    if out_len < needed || out_len < INDRA_OP_HEX_MAX_BYTES {
+    if out_len > INDRA_OP_HEX_MAX_BYTES {
+        return Err(IndraError::InvalidParam);
+    }
+    if out_len < needed {
         return Err(IndraError::BufferTooSmall);
     }
     let out_bytes = std::slice::from_raw_parts_mut(out.cast::<u8>(), out_len);

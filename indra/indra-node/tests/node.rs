@@ -63,6 +63,7 @@ fn make_strict_block(
             validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                 validator_id: validator.validator_id,
                 vrf_pubkey: vrf_pk,
+                verified_vrf_output: None,
                 stake: validator.stake_spark,
             })
         })
@@ -205,6 +206,7 @@ fn build_single_validator_qc_bytes(
             validator_id,
             position: 0,
             pq_pk: public.pq.0.to_vec(),
+            classical_pk: public.classical.0,
             stake: 1_000_000,
         }],
         vec![&vote],

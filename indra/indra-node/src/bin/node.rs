@@ -1311,6 +1311,7 @@ fn main() {
                                                 indra_consensus::proposer::ProposerCandidate {
                                                     validator_id: v.validator_id,
                                                     vrf_pubkey: vrf_pk,
+                                                    verified_vrf_output: None,
                                                     stake: v.stake_spark,
                                                 }
                                             })
@@ -1396,6 +1397,7 @@ fn main() {
                                                 indra_consensus::proposer::ProposerCandidate {
                                                     validator_id: v.validator_id,
                                                     vrf_pubkey: vrf_pk,
+                                                    verified_vrf_output: None,
                                                     stake: v.stake_spark,
                                                 }
                                             })

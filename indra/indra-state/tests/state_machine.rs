@@ -13,7 +13,7 @@ use indra_core::{
             DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, UNBONDING_PERIOD_EPOCHS,
         },
-        qc::{QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
+        qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         slashing::SlashEvidenceV1,
         staking::{StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
@@ -286,6 +286,14 @@ fn qc_bytes_for_signers(
             .map(|validator_id| PQVoteSig {
                 validator_id,
                 pq_sig: VariableBytes::from_slice(&[0xDD; 32]).unwrap(),
+            })
+            .collect(),
+        classical_signatures: signer_ids
+            .iter()
+            .copied()
+            .map(|validator_id| ClassicalVoteSig {
+                validator_id,
+                classical_sig: VariableBytes::from_slice(&[0xCC; 64]).unwrap(),
             })
             .collect(),
     };

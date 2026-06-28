@@ -1,6 +1,6 @@
 //! Deterministic proposer election and VRF proof generation.
 
-use indra_core::types::primitives::{Bytes32, MAX_ROUNDS_PER_HEIGHT};
+use indra_core::types::primitives::{vrf_verified_output_active, Bytes32, MAX_ROUNDS_PER_HEIGHT};
 use indra_crypto::{sha256, vrf_prove, VrfKeypair, VrfOutput, VrfProof};
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -12,6 +12,8 @@ pub struct ProposerCandidate {
     pub validator_id: Bytes32,
     /// Validator's VRF public key.
     pub vrf_pubkey: [u8; 32],
+    /// Verified VRF output for this exact election slot, when available.
+    pub verified_vrf_output: Option<VrfOutput>,
     /// Validator's stake in Spark.
     pub stake: u64,
 }
@@ -101,7 +103,7 @@ pub fn candidate_output(vrf_pubkey: &[u8; 32], vrf_input: &[u8; 32]) -> VrfOutpu
 }
 
 /// Elect the proposer for a given height.
-pub fn elect_proposer(election: &ProposerElection) -> ConsensusResult<Bytes32> {
+pub fn elect_proposer(election: &ProposerElection, height: u64) -> ConsensusResult<Bytes32> {
     if election.candidates.is_empty() {
         return Err(ConsensusError::EmptyValidatorSet);
     }
@@ -116,7 +118,14 @@ pub fn elect_proposer(election: &ProposerElection) -> ConsensusResult<Bytes32> {
         .candidates
         .iter()
         .map(|candidate| {
-            let output = candidate_output(&candidate.vrf_pubkey, &vrf_input);
+            let output = if vrf_verified_output_active(height) {
+                candidate
+                    .verified_vrf_output
+                    .clone()
+                    .unwrap_or_else(|| candidate_output(&candidate.vrf_pubkey, &vrf_input))
+            } else {
+                candidate_output(&candidate.vrf_pubkey, &vrf_input)
+            };
             let score = election_score(&output, candidate.stake, total_stake);
             (candidate, score, output)
         })
@@ -159,6 +168,7 @@ mod tests {
         ProposerCandidate {
             validator_id: Bytes32::from([id_byte; 32]),
             vrf_pubkey: VrfKeypair::from_seed(&[id_byte; 32]).public_key(),
+            verified_vrf_output: None,
             stake,
         }
     }
@@ -175,7 +185,7 @@ mod tests {
     #[test]
     fn election_with_single_validator() {
         let e = election(vec![candidate(0x01, 1_000_000)]);
-        let winner = elect_proposer(&e).unwrap();
+        let winner = elect_proposer(&e, e.height).unwrap();
         assert_eq!(winner, Bytes32::from([0x01u8; 32]));
     }
 
@@ -186,15 +196,20 @@ mod tests {
             candidate(0x02, 2_000_000),
             candidate(0x03, 500_000),
         ];
-        let w1 = elect_proposer(&election(candidates.clone())).unwrap();
-        let w2 = elect_proposer(&election(candidates)).unwrap();
+        let e1 = election(candidates.clone());
+        let e2 = election(candidates);
+        let w1 = elect_proposer(&e1, e1.height).unwrap();
+        let w2 = elect_proposer(&e2, e2.height).unwrap();
         assert_eq!(w1, w2);
     }
 
     #[test]
     fn empty_validator_set_errors() {
         assert_eq!(
-            elect_proposer(&election(vec![])),
+            {
+                let e = election(vec![]);
+                elect_proposer(&e, e.height)
+            },
             Err(ConsensusError::EmptyValidatorSet)
         );
     }
@@ -218,7 +233,7 @@ mod tests {
                 round,
                 candidates: candidates.clone(),
             };
-            winners.insert(elect_proposer(&election).unwrap());
+            winners.insert(elect_proposer(&election, election.height).unwrap());
         }
         assert!(winners.len() > 1, "winner did not vary across rounds");
     }
@@ -239,8 +254,8 @@ mod tests {
             candidates,
         };
         assert_eq!(
-            elect_proposer(&election_a).unwrap(),
-            elect_proposer(&election_b).unwrap()
+            elect_proposer(&election_a, election_a.height).unwrap(),
+            elect_proposer(&election_b, election_b.height).unwrap()
         );
     }
 
@@ -280,5 +295,27 @@ mod tests {
         let keypair = VrfKeypair::from_seed(&[0x11u8; 32]);
         let slot = compute_proposer_vrf(validator_id, &keypair, &Bytes32::from([0x22u8; 32]), 7, 0);
         assert_eq!(slot.proposer_id, validator_id);
+    }
+
+    #[test]
+    fn election_score_uses_verified_vrf_output_not_public_hash() {
+        let vrf_input = compute_vrf_input(&[0x42u8; 32], 100, 0);
+
+        let keypairs: Vec<VrfKeypair> = (0u8..100)
+            .map(|i| VrfKeypair::from_seed(&[i; 32]))
+            .collect();
+
+        let vrf_outputs: Vec<VrfOutput> = keypairs
+            .iter()
+            .map(|kp| vrf_prove(kp, &vrf_input).0)
+            .collect();
+
+        for (i, kp) in keypairs.iter().enumerate() {
+            let public_hash = candidate_output(&kp.public_key(), &vrf_input);
+            assert_ne!(
+                public_hash.0, vrf_outputs[i].0,
+                "public hash must not predict verified VRF output"
+            );
+        }
     }
 }

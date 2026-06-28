@@ -172,6 +172,7 @@ fn quorum_certificate_round_trip() {
         block_hash: Bytes32::from([0xFFu8; 32]),
         signer_bitfield: [0b10101010u8; SIGNER_BITFIELD_BYTES],
         pq_signatures: vec![],
+        classical_signatures: vec![],
     };
     assert_eq!(
         qc,

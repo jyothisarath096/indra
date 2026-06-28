@@ -49,6 +49,14 @@ pub const INDRA_UTXO_ID_BYTES: usize = 32;
 pub const INDRA_VRF_PK_BYTES: usize = 32;
 /// Length of a proposal ID.
 pub const INDRA_PROPOSAL_ID_BYTES: usize = 32;
+/// Maximum number of UTXOs allowed in a single transaction.
+pub const MAX_UTXO_COUNT: usize = 100;
+/// Maximum byte length of a serialized transaction.
+pub const MAX_TX_BYTES: usize = 1_048_576;
+/// Maximum byte length of a hex-encoded transaction including null terminator.
+pub const MAX_TX_HEX_BYTES: usize = MAX_TX_BYTES * 2 + 1;
+/// Maximum byte length for a generated mnemonic output buffer.
+pub const MAX_MNEMONIC_BYTES: usize = 512;
 
 /// FFI keypair bundle returned to Swift.
 #[repr(C)]
@@ -173,6 +181,9 @@ pub unsafe extern "C" fn indra_generate_mnemonic(out_phrase: *mut c_char, out_le
     match catch_unwind(|| {
         let phrase = keygen::new_mnemonic();
         let bytes = phrase.as_bytes();
+        if out_len > MAX_MNEMONIC_BYTES {
+            return Err(IndraError::InvalidParam);
+        }
         if bytes.len().saturating_add(1) > out_len {
             return Err(IndraError::BufferTooSmall);
         }
@@ -288,6 +299,9 @@ pub unsafe extern "C" fn indra_build_tx(
 
     match catch_unwind(|| {
         let params_ref = &*params;
+        if params_ref.utxo_count > MAX_UTXO_COUNT {
+            return Err(IndraError::InvalidParam);
+        }
         if params_ref.recipient_classical_pk.is_null()
             || params_ref.sender_classical_seed.is_null()
             || params_ref.sender_pq_sk.is_null()
@@ -373,6 +387,9 @@ pub unsafe extern "C" fn indra_tx_to_hex(
     }
 
     match catch_unwind(|| {
+        if tx_bytes_len == 0 || tx_bytes_len > MAX_TX_BYTES || out_hex_len > MAX_TX_HEX_BYTES {
+            return Err(IndraError::InvalidParam);
+        }
         let bytes = std::slice::from_raw_parts(tx_bytes, tx_bytes_len);
         let encoded = tx::tx_to_hex(bytes);
         let needed = encoded.len().saturating_add(1);
@@ -458,6 +475,9 @@ pub unsafe extern "C" fn indra_free_bytes(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
     }
+    if len > MAX_TX_BYTES {
+        return;
+    }
     let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
     drop(Box::from_raw(slice_ptr));
 }
@@ -471,6 +491,9 @@ pub unsafe extern "C" fn indra_free_bytes(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn indra_free_usize(ptr: *mut usize, len: usize) {
     if ptr.is_null() {
+        return;
+    }
+    if len > MAX_UTXO_COUNT {
         return;
     }
     let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
@@ -657,6 +680,30 @@ mod tests {
     }
 
     #[test]
+    fn indra_build_tx_rejects_excessive_utxo_count() {
+        let seed = [0x42u8; 32];
+        let mut keys = IndraKeyPair::zeroed();
+        unsafe {
+            indra_keygen(seed.as_ptr(), &mut keys);
+        }
+
+        let params = IndraTxParams {
+            recipient_classical_pk: keys.classical_pk.as_ptr(),
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: std::ptr::null(),
+            utxo_count: MAX_UTXO_COUNT + 1,
+            sender_classical_seed: keys.classical_seed.as_ptr(),
+            sender_pq_sk: keys.pq_sk.as_ptr(),
+            sender_pq_pk: keys.pq_pk.as_ptr(),
+        };
+
+        let mut result = IndraTxResult::zeroed();
+        let code = unsafe { indra_build_tx(&params, &mut result) };
+        assert_eq!(code, INDRA_ERR_INVALID_PARAM);
+    }
+
+    #[test]
     fn free_null_is_safe() {
         unsafe {
             indra_free_bytes(std::ptr::null_mut(), 0);
@@ -678,5 +725,20 @@ mod tests {
         };
         assert_eq!(result, INDRA_OK);
         assert_eq!(&hex_buf[..8], b"deadbeef");
+    }
+
+    #[test]
+    fn indra_tx_to_hex_rejects_excessive_length() {
+        let bytes = [0u8; 4];
+        let mut hex = [0i8; 16];
+        let code = unsafe {
+            indra_tx_to_hex(
+                bytes.as_ptr(),
+                MAX_TX_BYTES + 1,
+                hex.as_mut_ptr(),
+                hex.len(),
+            )
+        };
+        assert_eq!(code, INDRA_ERR_INVALID_PARAM);
     }
 }

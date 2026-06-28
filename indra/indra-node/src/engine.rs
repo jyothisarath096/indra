@@ -371,7 +371,20 @@ impl NodeEngine {
             election.height,
             election.round,
         );
-        let elected = match elect_proposer(election) {
+        let mut effective_election = ProposerElection {
+            epoch_seed: election.epoch_seed,
+            height: election.height,
+            round: election.round,
+            candidates: election.candidates.clone(),
+        };
+        if let Some(candidate) = effective_election
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.validator_id == slot.proposer_id)
+        {
+            candidate.verified_vrf_output = Some(slot.vrf_output.clone());
+        }
+        let elected = match elect_proposer(&effective_election, election.height) {
             Ok(id) => id,
             Err(_) => {
                 eprintln!(
@@ -464,7 +477,21 @@ impl NodeEngine {
             election.height,
             election.round,
         );
-        let elected = elect_proposer(election).map_err(NodeError::Consensus)?;
+        let mut effective_election = ProposerElection {
+            epoch_seed: election.epoch_seed,
+            height: election.height,
+            round: election.round,
+            candidates: election.candidates.clone(),
+        };
+        if let Some(candidate) = effective_election
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.validator_id == slot.proposer_id)
+        {
+            candidate.verified_vrf_output = Some(slot.vrf_output.clone());
+        }
+        let elected =
+            elect_proposer(&effective_election, election.height).map_err(NodeError::Consensus)?;
         if elected != slot.proposer_id {
             return Err(NodeError::NotProposer {
                 height: proposal_height,
@@ -548,6 +575,7 @@ impl NodeEngine {
                     validator_id: validator.validator_id,
                     position,
                     pq_pk: validator.hybrid_pq_pk.clone()?,
+                    classical_pk: validator.hybrid_classical_pk?,
                     stake: validator.stake_spark,
                 })
             })
@@ -793,6 +821,7 @@ mod tests {
                 validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: validator.validator_id,
                     vrf_pubkey: vrf_pk,
+                    verified_vrf_output: None,
                     stake: validator.stake_spark,
                 })
             })
@@ -851,6 +880,7 @@ mod tests {
                 validator_id,
                 position: 0,
                 pq_pk: public.pq.0.to_vec(),
+                classical_pk: public.classical.0,
                 stake: 1_000_000,
             }],
             vec![&vote],
@@ -1190,6 +1220,7 @@ mod tests {
             candidates: vec![indra_consensus::proposer::ProposerCandidate {
                 validator_id: candidate.validator_id,
                 vrf_pubkey: candidate.vrf_pk.unwrap(),
+                verified_vrf_output: None,
                 stake: candidate.stake_spark,
             }],
         };

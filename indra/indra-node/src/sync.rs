@@ -267,13 +267,14 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
         });
     }
 
-    let candidates: Vec<ProposerCandidate> = state
+    let mut candidates: Vec<ProposerCandidate> = state
         .validators
         .active_validators()
         .filter_map(|validator| {
             validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                 validator_id: validator.validator_id,
                 vrf_pubkey: vrf_pk,
+                verified_vrf_output: None,
                 stake: validator.stake_spark,
             })
         })
@@ -324,13 +325,18 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
     }
 
     let matched_validator_id = matching_candidates[0].validator_id;
+    for candidate in &mut candidates {
+        if candidate.validator_id == matched_validator_id {
+            candidate.verified_vrf_output = Some(output.clone());
+        }
+    }
     let election = ProposerElection {
         epoch_seed,
         height: block.header.height,
         round: block.header.proposer_round,
         candidates,
     };
-    let elected = elect_proposer(&election).map_err(NodeError::Consensus)?;
+    let elected = elect_proposer(&election, block.header.height).map_err(NodeError::Consensus)?;
     if matched_validator_id != elected {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
@@ -381,6 +387,7 @@ fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
                 validator_id: validator.validator_id,
                 position,
                 pq_pk: validator.hybrid_pq_pk.clone()?,
+                classical_pk: validator.hybrid_classical_pk?,
                 stake: validator.stake_spark,
             })
         })
@@ -540,6 +547,7 @@ mod tests {
                 validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: validator.validator_id,
                     vrf_pubkey: vrf_pk,
+                    verified_vrf_output: None,
                     stake: validator.stake_spark,
                 })
             })
@@ -551,6 +559,39 @@ mod tests {
             round,
             candidates,
         }
+    }
+
+    fn elect_with_verified_output_for_seed(
+        election: &ProposerElection,
+        seed: u8,
+    ) -> Option<Bytes32> {
+        let keypair = VrfKeypair::from_seed(&[seed; 32]);
+        let validator_id = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.vrf_pubkey == keypair.public_key())?
+            .validator_id;
+        let slot = compute_proposer_vrf(
+            validator_id,
+            &keypair,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let mut effective = ProposerElection {
+            epoch_seed: election.epoch_seed,
+            height: election.height,
+            round: election.round,
+            candidates: election.candidates.clone(),
+        };
+        if let Some(candidate) = effective
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.validator_id == slot.proposer_id)
+        {
+            candidate.verified_vrf_output = Some(slot.vrf_output);
+        }
+        elect_proposer(&effective, effective.height).ok()
     }
 
     fn make_strict_block(
@@ -599,6 +640,7 @@ mod tests {
                 validator_id,
                 position: 0,
                 pq_pk,
+                classical_pk: hybrid.public_key().classical.0,
                 stake,
             }],
             vec![&vote],
@@ -852,6 +894,15 @@ mod tests {
         let (validator_id, hybrid) =
             install_active_validator(&mut state, 0x13, 10_000, true, false);
         let block1 = make_strict_block(&state, 0x13, 0, vec![]);
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block1.header.value_hash,
+            validator_id,
+            &hybrid,
+        )
+        .unwrap();
 
         let dummy_qc = QuorumCertificateV1 {
             height: 1,
@@ -864,21 +915,12 @@ mod tests {
             },
             pq_signatures: vec![indra_core::types::crypto::PQVoteSig {
                 validator_id,
-                pq_sig: VariableBytes::from_slice(
-                    produce_vote(
-                        1,
-                        0,
-                        VoteStep::Precommit,
-                        block1.header.value_hash,
-                        validator_id,
-                        &hybrid,
-                    )
-                    .unwrap()
-                    .signature
-                    .pq_sig
-                    .as_slice(),
-                )
-                .unwrap(),
+                pq_sig: VariableBytes::from_slice(vote.signature.pq_sig.as_slice()).unwrap(),
+            }],
+            classical_signatures: vec![indra_core::types::qc::ClassicalVoteSig {
+                validator_id,
+                classical_sig: VariableBytes::from_slice(vote.signature.classical_sig.as_slice())
+                    .unwrap(),
             }],
         };
 
@@ -900,14 +942,16 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let (validator_a, _hybrid_a) =
             install_active_validator(&mut state, 0x21, 10_000, true, true);
-        let (_validator_b, _hybrid_b) =
+        let (validator_b, _hybrid_b) =
             install_active_validator(&mut state, 0x22, 10_000, true, true);
 
         let mismatch_round = (0..32u32)
             .find(|round| {
-                elect_proposer(&build_election(&state, 1, *round)).unwrap() != validator_a
+                let election = build_election(&state, 1, *round);
+                elect_with_verified_output_for_seed(&election, 0x22) == Some(validator_b)
+                    && elect_with_verified_output_for_seed(&election, 0x21) != Some(validator_a)
             })
-            .expect("expected at least one round not won by validator A");
+            .expect("expected a round won by B and not by tampered A");
 
         let mut tampered = make_strict_block(&state, 0x22, mismatch_round, vec![]);
         let election = build_election(&state, 1, mismatch_round);

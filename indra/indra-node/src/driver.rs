@@ -1324,6 +1324,7 @@ mod tests {
                 v.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: v.validator_id,
                     vrf_pubkey: vrf_pk,
+                    verified_vrf_output: None,
                     stake: v.stake_spark,
                 })
             })
@@ -1370,6 +1371,7 @@ mod tests {
                     .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                         validator_id: v.validator_id,
                         vrf_pubkey: vrf_pk,
+                        verified_vrf_output: None,
                         stake: v.stake_spark,
                     })
             })
@@ -1380,6 +1382,39 @@ mod tests {
             round,
             candidates,
         }
+    }
+
+    fn elect_with_verified_output_for_seed(
+        election: &indra_consensus::proposer::ProposerElection,
+        seed: [u8; 32],
+    ) -> Option<Bytes32> {
+        let keypair = VrfKeypair::from_seed(&seed);
+        let validator_id = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.vrf_pubkey == keypair.public_key())?
+            .validator_id;
+        let slot = indra_consensus::proposer::compute_proposer_vrf(
+            validator_id,
+            &keypair,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let mut effective = indra_consensus::proposer::ProposerElection {
+            epoch_seed: election.epoch_seed,
+            height: election.height,
+            round: election.round,
+            candidates: election.candidates.clone(),
+        };
+        if let Some(candidate) = effective
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.validator_id == slot.proposer_id)
+        {
+            candidate.verified_vrf_output = Some(slot.vrf_output);
+        }
+        indra_consensus::proposer::elect_proposer(&effective, effective.height).ok()
     }
 
     fn pick_tip_hash_for_round_winners(
@@ -1403,6 +1438,7 @@ mod tests {
                         .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                             validator_id: v.validator_id,
                             vrf_pubkey: vrf_pk,
+                            verified_vrf_output: None,
                             stake: v.stake_spark,
                         })
                 })
@@ -1419,9 +1455,17 @@ mod tests {
                 round: 1,
                 candidates,
             };
-            if indra_consensus::proposer::elect_proposer(&election_round_zero).ok()
+            if indra_consensus::proposer::elect_proposer(
+                &election_round_zero,
+                election_round_zero.height,
+            )
+            .ok()
                 == Some(round_zero_winner)
-                && indra_consensus::proposer::elect_proposer(&election_round_one).ok()
+                && indra_consensus::proposer::elect_proposer(
+                    &election_round_one,
+                    election_round_one.height,
+                )
+                .ok()
                     == Some(round_one_winner)
             {
                 return tip_hash;
@@ -1561,18 +1605,28 @@ mod tests {
     fn proposal_drives_round_advancement() {
         let (mut driver, dir) = local_driver([0x4Fu8; 32], "proposal_round_advance");
         let validator_seeds = [[0x4Fu8; 32], [0x52u8; 32], [0x53u8; 32], [0x54u8; 32]];
-        let mut seed_by_id = HashMap::new();
         for seed in validator_seeds {
-            let keypair = install_active_validator(&mut driver, seed, "validator");
-            let validator_id =
-                Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
-            seed_by_id.insert(validator_id, seed);
+            install_active_validator(&mut driver, seed, "validator");
         }
         driver.refresh_registered_voters();
 
-        let proposer_id =
-            indra_consensus::proposer::elect_proposer(&election_for_round(&driver, 1, 5)).unwrap();
-        let proposer_seed = seed_by_id[&proposer_id];
+        let proposer_election = election_for_round(&driver, 1, 5);
+        let proposer_seed = validator_seeds
+            .into_iter()
+            .find(|seed| {
+                let Some(elected) = elect_with_verified_output_for_seed(&proposer_election, *seed)
+                else {
+                    return false;
+                };
+                let keypair = HybridKeypair::new(
+                    ClassicalKeypair::from_seed(seed),
+                    PqKeypair::from_seed(seed).unwrap(),
+                );
+                let validator_id =
+                    Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+                elected == validator_id
+            })
+            .expect("expected one validator to win with verified VRF output");
         let block = make_strict_block(&driver, proposer_seed, 5, vec![]);
         let value_hash = block.header.value_hash;
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
@@ -2077,6 +2131,7 @@ mod tests {
                     .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                         validator_id: v.validator_id,
                         vrf_pubkey: vrf_pk,
+                        verified_vrf_output: None,
                         stake: v.stake_spark,
                     })
             })
@@ -2144,7 +2199,11 @@ mod tests {
         let local_validator_id =
             Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
         assert_eq!(
-            indra_consensus::proposer::elect_proposer(&election_round_zero).unwrap(),
+            indra_consensus::proposer::elect_proposer(
+                &election_round_zero,
+                election_round_zero.height,
+            )
+            .unwrap(),
             local_validator_id
         );
 
@@ -2197,7 +2256,11 @@ mod tests {
 
         let election_round_zero = election_for_round(&driver_a, 1, 0);
         assert_eq!(
-            indra_consensus::proposer::elect_proposer(&election_round_zero).unwrap(),
+            indra_consensus::proposer::elect_proposer(
+                &election_round_zero,
+                election_round_zero.height,
+            )
+            .unwrap(),
             a_id
         );
         let block_x = driver_a
@@ -2259,7 +2322,11 @@ mod tests {
 
         let election_round_one = election_for_round(&driver_b, 1, 1);
         assert_eq!(
-            indra_consensus::proposer::elect_proposer(&election_round_one).unwrap(),
+            indra_consensus::proposer::elect_proposer(
+                &election_round_one,
+                election_round_one.height,
+            )
+            .unwrap(),
             b_id
         );
         let (valid_block, valid_round) = driver_b

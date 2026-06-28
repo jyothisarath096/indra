@@ -134,6 +134,7 @@ impl TestValidator {
             validator_id: self.id,
             position,
             pq_pk: pk.pq.0.to_vec(),
+            classical_pk: pk.classical.0,
             stake: self.stake,
         }
     }
@@ -185,6 +186,7 @@ fn mempool_to_block_pipeline() {
         candidates: vec![ProposerCandidate {
             validator_id: Bytes32::from(indra_crypto::sha256(&vrf_pubkey)),
             vrf_pubkey,
+            verified_vrf_output: None,
             stake: 1_000_000,
         }],
     };
@@ -325,10 +327,10 @@ fn qc_builder_quorum_detection() {
 }
 
 #[test]
-fn strict_qc_verification_accepts_dilithium_only_qc() {
+fn strict_qc_verification_accepts_hybrid_qc() {
     use indra_core::types::crypto::PQVoteSig;
-    use indra_core::types::primitives::{VariableBytes, MAX_PQ_SIG_BYTES};
-    use indra_core::types::qc::{QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
+    use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
+    use indra_core::types::qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
 
     let validators = vec![
         TestValidator::new(0x21, 3_400),
@@ -346,6 +348,7 @@ fn strict_qc_verification_accepts_dilithium_only_qc() {
 
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_signatures = Vec::new();
+    let mut classical_signatures = Vec::new();
     validators
         .iter()
         .enumerate()
@@ -367,6 +370,13 @@ fn strict_qc_verification_accepts_dilithium_only_qc() {
                 )
                 .unwrap(),
             });
+            classical_signatures.push(ClassicalVoteSig {
+                validator_id: validator.id,
+                classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(
+                    vote.signature.classical_sig.as_slice(),
+                )
+                .unwrap(),
+            });
         });
     let qc = QuorumCertificateV1 {
         height,
@@ -374,6 +384,7 @@ fn strict_qc_verification_accepts_dilithium_only_qc() {
         block_hash,
         signer_bitfield,
         pq_signatures,
+        classical_signatures,
     };
 
     assert!(verify_qc_strict(&qc, &qc_validators, 10_000).is_ok());

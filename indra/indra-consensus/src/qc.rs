@@ -6,13 +6,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
-        bps_of, muldiv, overflow_fix_active, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS,
-        MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
+        bps_of, hybrid_qc_active, muldiv, overflow_fix_active, Bytes32, VariableBytes,
+        CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
-    qc::QuorumCertificateV1,
+    qc::{ClassicalVoteSig, QuorumCertificateV1},
     vote::{VoteStep, VoteV1},
 };
-use indra_crypto::hybrid::{verify_pq, PqPublicKey, PqSignature};
+use indra_crypto::hybrid::{
+    verify_classical, verify_pq, ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature,
+};
 
 use crate::{
     error::{ConsensusError, ConsensusResult},
@@ -28,6 +30,8 @@ pub struct QcValidator {
     pub position: usize,
     /// ML-DSA-87 public key bytes.
     pub pq_pk: Vec<u8>,
+    /// Ed25519 public key bytes.
+    pub classical_pk: [u8; 32],
     /// Stake in Spark.
     pub stake: u64,
 }
@@ -156,6 +160,7 @@ fn build_qc_from_votes(
 
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_sigs = Vec::new();
+    let mut classical_sigs = Vec::new();
 
     for vote in &votes {
         let Some(validator) = by_id.get(&vote.validator_id) else {
@@ -177,6 +182,15 @@ fn build_qc_from_votes(
                     detail: "PQ sig too large".to_string(),
                 })?,
         });
+        classical_sigs.push(ClassicalVoteSig {
+            validator_id: vote.validator_id,
+            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(
+                vote.signature.classical_sig.as_slice(),
+            )
+            .map_err(|_| ConsensusError::CryptoError {
+                detail: "classical sig too large".to_string(),
+            })?,
+        });
     }
 
     if pq_sigs.is_empty() {
@@ -192,6 +206,7 @@ fn build_qc_from_votes(
         block_hash,
         signer_bitfield,
         pq_signatures: pq_sigs,
+        classical_signatures: classical_sigs,
     })
 }
 
@@ -224,7 +239,7 @@ fn signer_validators<'a>(
     Ok(signers)
 }
 
-/// Verify a QC using ML-DSA-87 signatures only.
+/// Verify a QC using hybrid Ed25519 + ML-DSA-87 signatures when active.
 pub fn verify_qc(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
@@ -263,6 +278,24 @@ pub fn verify_qc(
         });
     }
 
+    let mut classical_by_validator = HashMap::new();
+    if hybrid_qc_active(qc.height) {
+        if qc.classical_signatures.len() != signers.len() {
+            return Err(ConsensusError::SignatureCountMismatch {
+                expected: signers.len(),
+                got: qc.classical_signatures.len(),
+            });
+        }
+
+        let mut seen_classical = HashSet::new();
+        for signature in &qc.classical_signatures {
+            if !seen_classical.insert(signature.validator_id) {
+                return Err(ConsensusError::DuplicateSignature);
+            }
+            classical_by_validator.insert(signature.validator_id, signature);
+        }
+    }
+
     for validator in signers {
         let pq_sig = pq_by_validator
             .get(&validator.validator_id)
@@ -297,6 +330,36 @@ pub fn verify_qc(
         .map_err(|_| ConsensusError::InvalidPQSignature {
             validator_id: validator.validator_id,
         })?;
+
+        if hybrid_qc_active(qc.height) {
+            let classical_sig = classical_by_validator
+                .get(&validator.validator_id)
+                .copied()
+                .ok_or(ConsensusError::MissingSignature {
+                    validator_id: validator.validator_id,
+                })?;
+            let classical_sig_bytes: [u8; indra_crypto::CLASSICAL_SIG_BYTES] = classical_sig
+                .classical_sig
+                .as_slice()
+                .try_into()
+                .map_err(|_| ConsensusError::CryptoError {
+                    detail: format!(
+                        "invalid QC classical signature for validator {}",
+                        validator.validator_id
+                    ),
+                })?;
+            verify_classical(
+                &signing_bytes,
+                &ClassicalSignature(classical_sig_bytes),
+                &ClassicalPublicKey(validator.classical_pk),
+            )
+            .map_err(|_| ConsensusError::CryptoError {
+                detail: format!(
+                    "invalid QC classical signature for validator {}",
+                    validator.validator_id
+                ),
+            })?;
+        }
     }
 
     Ok(())
@@ -328,6 +391,7 @@ mod tests {
             validator_id: id,
             position,
             pq_pk: pk.pq.0.to_vec(),
+            classical_pk: pk.classical.0,
             stake,
         };
         (v, hybrid_kp)
@@ -373,9 +437,59 @@ mod tests {
                 validator_id: v.validator_id,
                 pq_sig: VariableBytes::from_slice(vote.signature.pq_sig.as_slice()).unwrap(),
             }],
+            classical_signatures: vec![ClassicalVoteSig {
+                validator_id: v.validator_id,
+                classical_sig: VariableBytes::from_slice(vote.signature.classical_sig.as_slice())
+                    .unwrap(),
+            }],
         };
         assert!(verify_qc(&qc, &[v.clone()], 10_000).is_ok());
         assert!(verify_qc_strict(&qc, &[v], 10_000).is_ok());
+    }
+
+    #[test]
+    fn verify_qc_requires_both_classical_and_pq_when_hybrid_active() {
+        let (v, kp) = make_validator(0x13, 0, 10_000);
+        let block_hash = Bytes32::from([0x13u8; 32]);
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let mut qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        qc.classical_signatures.clear();
+
+        assert_eq!(
+            verify_qc(&qc, &[v], 10_000),
+            Err(ConsensusError::SignatureCountMismatch {
+                expected: 1,
+                got: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn verify_qc_accepts_valid_hybrid_qc() {
+        let (v, kp) = make_validator(0x14, 0, 10_000);
+        let block_hash = Bytes32::from([0x14u8; 32]);
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+
+        assert!(verify_qc(&qc, &[v], 10_000).is_ok());
+    }
+
+    #[test]
+    fn verify_qc_rejects_classical_forgery() {
+        let (v, kp) = make_validator(0x15, 0, 10_000);
+        let block_hash = Bytes32::from([0x15u8; 32]);
+        let vote =
+            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let mut qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        qc.classical_signatures[0].classical_sig =
+            VariableBytes::from_slice(&[0x42u8; 64]).unwrap();
+
+        assert!(matches!(
+            verify_qc(&qc, &[v], 10_000),
+            Err(ConsensusError::CryptoError { .. })
+        ));
     }
 
     #[test]
@@ -407,6 +521,10 @@ mod tests {
                 validator_id: v.validator_id,
                 pq_sig: VariableBytes::from_slice(&[0x42u8; 32]).unwrap(),
             }],
+            classical_signatures: vec![ClassicalVoteSig {
+                validator_id: v.validator_id,
+                classical_sig: VariableBytes::from_slice(&[0x42u8; 64]).unwrap(),
+            }],
         };
         assert!(matches!(
             verify_qc(&qc, &[v], 10_000),
@@ -425,6 +543,7 @@ mod tests {
             block_hash: Bytes32::from([0x11u8; 32]),
             signer_bitfield,
             pq_signatures: vec![],
+            classical_signatures: vec![],
         };
         assert_eq!(
             verify_qc(&qc, &[v], 10_000),
@@ -457,6 +576,22 @@ mod tests {
                 PQVoteSig {
                     validator_id: v.validator_id,
                     pq_sig: sig,
+                },
+            ],
+            classical_signatures: vec![
+                ClassicalVoteSig {
+                    validator_id: v.validator_id,
+                    classical_sig: VariableBytes::from_slice(
+                        vote.signature.classical_sig.as_slice(),
+                    )
+                    .unwrap(),
+                },
+                ClassicalVoteSig {
+                    validator_id: v.validator_id,
+                    classical_sig: VariableBytes::from_slice(
+                        vote.signature.classical_sig.as_slice(),
+                    )
+                    .unwrap(),
                 },
             ],
         };

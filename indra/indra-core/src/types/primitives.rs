@@ -288,12 +288,28 @@ pub fn bps_of(value: u64, bps: u32) -> u64 {
 pub mod hard_forks {
     /// u128 intermediate arithmetic for proportional reward and slash math.
     pub const OVERFLOW_FIX_HEIGHT: u64 = 0;
+    /// Proposer election uses verified VRF output instead of public key grinding hashes.
+    pub const VRF_VERIFIED_OUTPUT_HEIGHT: u64 = 0;
+    /// Quorum certificates require both Ed25519 and ML-DSA vote signatures.
+    pub const HYBRID_QC_HEIGHT: u64 = 0;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
 #[inline]
 pub fn overflow_fix_active(height: u64) -> bool {
     height >= hard_forks::OVERFLOW_FIX_HEIGHT
+}
+
+/// Whether proposer election must use verified VRF output when available.
+#[inline]
+pub fn vrf_verified_output_active(height: u64) -> bool {
+    height >= hard_forks::VRF_VERIFIED_OUTPUT_HEIGHT
+}
+
+/// Whether QCs must carry and verify both classical and PQ vote signatures.
+#[inline]
+pub fn hybrid_qc_active(height: u64) -> bool {
+    height >= hard_forks::HYBRID_QC_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
