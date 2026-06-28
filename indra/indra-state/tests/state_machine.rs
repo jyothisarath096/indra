@@ -5,13 +5,15 @@
 
 use curve25519_dalek::scalar::Scalar;
 use indra_core::{
-    codec::Encode,
+    codec::{Decode, Encode},
     types::{
         block::{BlockHeaderV1, BlockV1},
+        crypto::PQVoteSig,
         primitives::{
             DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-            INITIAL_BASE_FEE_SPARK_PER_KB, UNBONDING_PERIOD_EPOCHS,
+            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, UNBONDING_PERIOD_EPOCHS,
         },
+        qc::{QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         slashing::SlashEvidenceV1,
         staking::{StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
@@ -236,6 +238,67 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
     }
 }
 
+fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
+    (0..4u8)
+        .map(|index| {
+            let validator_id = Bytes32::from([0xA0 + index; 32]);
+            state
+                .validators
+                .upsert(ValidatorEntry {
+                    validator_id,
+                    name: format!("qc-validator-{index}"),
+                    hybrid_classical_pk: None,
+                    hybrid_pq_pk: None,
+                    vrf_pk: None,
+                    stake_spark: 100_000_000_000,
+                    status: ValidatorStatus::Active,
+                    registered_epoch: 0,
+                    last_active_epoch: 0,
+                    pending_rewards: 0,
+                    rewards_last_epoch: 0,
+                    self_report_count: 0,
+                    commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+                    min_delegation_spark: DUST_LIMIT_SPARK,
+                    auto_delegate_to: None,
+                })
+                .unwrap();
+            validator_id
+        })
+        .collect()
+}
+
+fn qc_bytes_for_signers(
+    signer_ids: &[Bytes32],
+    certified_height: u64,
+) -> VariableBytes<MAX_QC_SIZE_BYTES> {
+    let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
+    for slot in 0..signer_ids.len() {
+        signer_bitfield[slot / 8] |= 1 << (slot % 8);
+    }
+    let qc = QuorumCertificateV1 {
+        height: certified_height,
+        round: 0,
+        block_hash: Bytes32::from([0xC1; 32]),
+        signer_bitfield,
+        pq_signatures: signer_ids
+            .iter()
+            .copied()
+            .map(|validator_id| PQVoteSig {
+                validator_id,
+                pq_sig: VariableBytes::from_slice(&[0xDD; 32]).unwrap(),
+            })
+            .collect(),
+    };
+    VariableBytes::from_slice(&qc.encode_to_vec()).unwrap()
+}
+
+fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockV1 {
+    let mut block = make_block(state, vec![]);
+    block.header.quorum_certificate =
+        qc_bytes_for_signers(signer_ids, block.header.height.saturating_sub(1));
+    block
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -244,6 +307,111 @@ fn genesis_state_constants() {
     assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
     assert_eq!(state.height, 0);
     assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
+}
+
+#[test]
+fn last_active_epoch_updated_identically_live_and_replay() {
+    let mut live_state = ChainState::new_genesis();
+    let signer_ids = install_test_validators_for_qc(&mut live_state);
+    live_state.height = EPOCH_DURATION_BLOCKS;
+
+    let mut replay_state = live_state.clone();
+    for _ in 0..10 {
+        let block = make_block_with_qc(&live_state, &signer_ids);
+        apply_block(&mut live_state, &block, 0).unwrap();
+        apply_block(&mut replay_state, &block, 0).unwrap();
+    }
+
+    let live_epochs: Vec<(Bytes32, u64)> = live_state
+        .validators
+        .all_validators()
+        .map(|v| (v.validator_id, v.last_active_epoch))
+        .collect();
+    let replay_epochs: Vec<(Bytes32, u64)> = replay_state
+        .validators
+        .all_validators()
+        .map(|v| (v.validator_id, v.last_active_epoch))
+        .collect();
+    assert_eq!(
+        live_epochs, replay_epochs,
+        "live and replay apply paths must update last_active_epoch identically"
+    );
+    assert_eq!(
+        compute_state_root(&live_state),
+        compute_state_root(&replay_state)
+    );
+
+    let snapshot_bytes = live_state.encode_to_vec();
+    let restored_state = ChainState::decode_exact(&snapshot_bytes).unwrap();
+    let restored_epochs: Vec<(Bytes32, u64)> = restored_state
+        .validators
+        .all_validators()
+        .map(|v| (v.validator_id, v.last_active_epoch))
+        .collect();
+    assert_eq!(
+        live_epochs, restored_epochs,
+        "snapshot restore must preserve last_active_epoch"
+    );
+    assert_eq!(
+        compute_state_root(&live_state),
+        compute_state_root(&restored_state),
+        "state roots must match after snapshot/restore"
+    );
+}
+
+#[test]
+fn apply_block_updates_last_active_epoch_for_qc_signers() {
+    let mut state = ChainState::new_genesis();
+    let signer_ids = install_test_validators_for_qc(&mut state);
+    state.height = EPOCH_DURATION_BLOCKS;
+
+    for validator_id in &signer_ids {
+        assert_eq!(
+            state
+                .validators
+                .get(validator_id)
+                .unwrap()
+                .last_active_epoch,
+            0
+        );
+    }
+
+    let block = make_block_with_qc(&state, &signer_ids[..2]);
+    apply_block(&mut state, &block, 0).unwrap();
+
+    let expected_epoch = indra_state::epoch::epoch_for_height(block.header.height);
+    assert_eq!(
+        state
+            .validators
+            .get(&signer_ids[0])
+            .unwrap()
+            .last_active_epoch,
+        expected_epoch
+    );
+    assert_eq!(
+        state
+            .validators
+            .get(&signer_ids[1])
+            .unwrap()
+            .last_active_epoch,
+        expected_epoch
+    );
+    assert_eq!(
+        state
+            .validators
+            .get(&signer_ids[2])
+            .unwrap()
+            .last_active_epoch,
+        0
+    );
+    assert_eq!(
+        state
+            .validators
+            .get(&signer_ids[3])
+            .unwrap()
+            .last_active_epoch,
+        0
+    );
 }
 
 #[test]

@@ -154,11 +154,16 @@ impl Mempool {
 
         // Capacity check — evict lowest-fee tx if full
         if self.entries.len() >= self.config.capacity {
-            // Find the tx with the lowest fee rate
+            // Find the tx with the lowest fee rate. Break equal-fee ties by
+            // highest tx_id so every node evicts the same transaction.
             let min_id = self
                 .entries
                 .iter()
-                .min_by_key(|(_, e)| e.fee_rate)
+                .min_by(|(_, a), (_, b)| {
+                    a.fee_rate
+                        .cmp(&b.fee_rate)
+                        .then_with(|| b.tx_id.cmp(&a.tx_id))
+                })
                 .map(|(id, _)| *id);
 
             if let Some(min_id) = min_id {
@@ -225,22 +230,30 @@ impl Mempool {
     /// Return transactions for block production.
     ///
     /// Returns up to `max_count` transactions, prioritising:
-    ///   1. Age-eligible transactions (MUST be included), sorted by fee_rate desc
-    ///   2. Remaining transactions sorted by fee_rate desc
+    ///   1. Age-eligible transactions (MUST be included), sorted by fee_rate desc, tx_id asc
+    ///   2. Remaining transactions sorted by fee_rate desc, tx_id asc
     pub fn select_for_block(&self, max_count: usize, current_height: u64) -> Vec<&MempoolEntry> {
         let mut age_eligible: Vec<&MempoolEntry> = self
             .entries
             .values()
             .filter(|e| e.is_age_eligible(current_height))
             .collect();
-        age_eligible.sort_by(|a, b| b.fee_rate.cmp(&a.fee_rate));
+        age_eligible.sort_by(|a, b| {
+            b.fee_rate
+                .cmp(&a.fee_rate)
+                .then_with(|| a.tx_id.cmp(&b.tx_id))
+        });
 
         let mut remaining: Vec<&MempoolEntry> = self
             .entries
             .values()
             .filter(|e| !e.is_age_eligible(current_height))
             .collect();
-        remaining.sort_by(|a, b| b.fee_rate.cmp(&a.fee_rate));
+        remaining.sort_by(|a, b| {
+            b.fee_rate
+                .cmp(&a.fee_rate)
+                .then_with(|| a.tx_id.cmp(&b.tx_id))
+        });
 
         age_eligible.extend(remaining);
         age_eligible.truncate(max_count);
@@ -386,6 +399,76 @@ mod tests {
         // The 1_000 fee tx should have been evicted
         let fees: Vec<u64> = mp.iter().map(|e| e.tx.fee_amount).collect();
         assert!(!fees.contains(&1_000));
+    }
+
+    #[test]
+    fn mempool_select_for_block_is_deterministic_with_equal_fees() {
+        let mut mp1 = Mempool::new(MempoolConfig {
+            capacity: 100,
+            min_fee_ratio_bps: 10_000,
+        });
+        let mut mp2 = Mempool::new(MempoolConfig {
+            capacity: 100,
+            min_fee_ratio_bps: 10_000,
+        });
+        let txs: Vec<TransactionV1> = (1..=10).map(|byte| dummy_tx(10_000, byte)).collect();
+
+        for tx in &txs {
+            mp1.submit(tx.clone(), 100, 1).unwrap();
+        }
+        for tx in txs.iter().rev() {
+            mp2.submit(tx.clone(), 100, 1).unwrap();
+        }
+
+        let ids1: Vec<Bytes32> = mp1
+            .select_for_block(5, 1)
+            .iter()
+            .map(|entry| entry.tx_id)
+            .collect();
+        let ids2: Vec<Bytes32> = mp2
+            .select_for_block(5, 1)
+            .iter()
+            .map(|entry| entry.tx_id)
+            .collect();
+        let mut expected: Vec<Bytes32> = txs.iter().map(Mempool::tx_id).collect();
+        expected.sort();
+        expected.truncate(5);
+
+        assert_eq!(ids1, ids2);
+        assert_eq!(ids1, expected);
+    }
+
+    #[test]
+    fn mempool_eviction_is_deterministic_with_equal_fees() {
+        let config = MempoolConfig {
+            capacity: 3,
+            min_fee_ratio_bps: 10_000,
+        };
+        let mut mp1 = Mempool::new(config.clone());
+        let mut mp2 = Mempool::new(config);
+        let txs: Vec<TransactionV1> = (1..=3).map(|byte| dummy_tx(10_000, byte)).collect();
+        let mut equal_fee_ids: Vec<Bytes32> = txs.iter().map(Mempool::tx_id).collect();
+        equal_fee_ids.sort();
+        let evicted_id = *equal_fee_ids.last().unwrap();
+
+        for tx in &txs {
+            mp1.submit(tx.clone(), 100, 1).unwrap();
+        }
+        for tx in txs.iter().rev() {
+            mp2.submit(tx.clone(), 100, 1).unwrap();
+        }
+
+        mp1.submit(dummy_tx(20_000, 0xF0), 100, 1).unwrap();
+        mp2.submit(dummy_tx(20_000, 0xF0), 100, 1).unwrap();
+
+        assert!(!mp1.contains(&evicted_id));
+        assert!(!mp2.contains(&evicted_id));
+
+        let mut remaining1: Vec<Bytes32> = mp1.iter().map(|entry| entry.tx_id).collect();
+        let mut remaining2: Vec<Bytes32> = mp2.iter().map(|entry| entry.tx_id).collect();
+        remaining1.sort();
+        remaining2.sort();
+        assert_eq!(remaining1, remaining2);
     }
 
     #[test]

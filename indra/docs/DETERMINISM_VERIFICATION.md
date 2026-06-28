@@ -60,6 +60,37 @@ The replay path is:
 
 Therefore the full reward, fee, commission, delegation, liveness, governance, and QC replay paths have the correct block height available end-to-end.
 
+## Phase 2 Restart Determinism Fixes
+
+### Confirmed and Fixed: QC Signer Liveness Was Outside `apply_block`
+
+Phase 2 confirmed a second replay divergence mechanism: `ValidatorEntry.last_active_epoch` was updated in `NodeEngine::commit_block` after `apply_block` returned, by decoding the committed block QC and marking every QC signer active in the current epoch. Startup replay uses `rebuild_state_from_height` and only calls `apply_block`, so replay did not reproduce that mutation. Because `last_active_epoch` is encoded into the validator-set root, this was a state-root bug.
+
+Fix:
+
+- `indra-state/src/apply.rs::apply_block` now performs the QC signer `last_active_epoch` update at the end of the canonical state transition.
+- `indra-node/src/engine.rs::commit_block` no longer performs a separate live-only mutation.
+- Live commit, sync import, replay, and block-production projection now all reach the same mutation through `apply_block`.
+
+Regression tests:
+
+- `last_active_epoch_updated_identically_live_and_replay`
+- `apply_block_updates_last_active_epoch_for_qc_signers`
+
+### Confirmed and Fixed: Equal-Fee Mempool Ties Were Not Canonical
+
+Phase 2 also confirmed that `Mempool::select_for_block` sorted by fee rate only. Equal-fee transactions inherited randomized `HashMap` iteration order before truncation, allowing different proposers to choose different equal-fee subsets. Capacity eviction had the same issue when multiple lowest-fee entries existed.
+
+Fix:
+
+- Age-eligible and remaining block-selection entries now sort by `(fee_rate desc, tx_id asc)`.
+- Capacity eviction now uses a deterministic total order: lowest fee first, and for equal fees the highest `tx_id` is evicted.
+
+Regression tests:
+
+- `mempool_select_for_block_is_deterministic_with_equal_fees`
+- `mempool_eviction_is_deterministic_with_equal_fees`
+
 ## Fix Verification
 
 ### Test Results
@@ -73,6 +104,10 @@ Therefore the full reward, fee, commission, delegation, liveness, governance, an
 - `commission_bps_is_height_gated`
 - `liveness_penalty_is_height_gated`
 - `qc_vote_order_is_deterministic`
+- `last_active_epoch_updated_identically_live_and_replay`
+- `apply_block_updates_last_active_epoch_for_qc_signers`
+- `mempool_select_for_block_is_deterministic_with_equal_fees`
+- `mempool_eviction_is_deterministic_with_equal_fees`
 
 The requested `cargo test --workspace --exclude indra-ffi --exclude indra-network` was also run. All determinism tests passed, but the command cannot complete in this sandbox because the unrelated `indra-node::metrics::tests::test_metrics_server_starts_and_responds` test is denied permission to bind its random local port (`Operation not permitted`). This is an environment restriction, not a test failure introduced by the audit changes.
 

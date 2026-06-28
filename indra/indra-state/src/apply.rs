@@ -35,7 +35,7 @@
 use std::collections::HashSet;
 
 use indra_core::{
-    codec::Encode,
+    codec::{ByteReader, Decode, Encode},
     types::{
         block::BlockV1,
         primitives::{
@@ -43,6 +43,7 @@ use indra_core::{
             MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
             MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
         },
+        qc::QuorumCertificateV1,
         slashing::SlashEvidenceV1,
         transaction::TransactionV1,
         vote::VoteV1,
@@ -411,7 +412,33 @@ pub fn apply_block(
         });
     }
 
+    update_last_active_epoch_from_block_qc(state, block);
+
     Ok(epoch_record)
+}
+
+/// Update validator liveness from the QC embedded in the applied block.
+///
+/// This is consensus state because `last_active_epoch` is committed in the
+/// validator-set root. Keeping this mutation inside `apply_block` ensures live
+/// import, sync import, snapshot replay, and block-production projection all
+/// execute the same state transition.
+fn update_last_active_epoch_from_block_qc(state: &mut ChainState, block: &BlockV1) {
+    if block.header.quorum_certificate.as_slice().is_empty() {
+        return;
+    }
+
+    let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
+    let Ok(qc) = QuorumCertificateV1::decode(&mut reader) else {
+        return;
+    };
+
+    let current_epoch = epoch_for_height(block.header.height);
+    for signature in qc.pq_signatures {
+        if let Some(validator) = state.validators.get_mut(&signature.validator_id) {
+            validator.last_active_epoch = current_epoch;
+        }
+    }
 }
 
 /// Validate block-level invariants (does not touch state).

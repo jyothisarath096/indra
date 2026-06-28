@@ -21,7 +21,6 @@ use indra_consensus::{
     qc::QcValidator,
     vote::{produce_vote, RegisteredVoter},
 };
-use indra_core::codec::Decode;
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
@@ -592,7 +591,9 @@ impl NodeEngine {
         if let Some(record) = epoch_record {
             self.epoch_store.append(&record)?;
         }
-        self.update_last_active_epoch_from_block_qc(block);
+        // QC signer liveness is updated inside `apply_block` so live import,
+        // sync import, replay, and block-production projection mutate state
+        // identically.
         if self.state.height > 0
             && self
                 .state
@@ -605,26 +606,6 @@ impl NodeEngine {
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
         Ok(())
-    }
-
-    fn update_last_active_epoch_from_block_qc(
-        &mut self,
-        block: &indra_core::types::block::BlockV1,
-    ) {
-        if block.header.quorum_certificate.as_slice().is_empty() {
-            return;
-        }
-        let mut reader =
-            indra_core::codec::ByteReader::new(block.header.quorum_certificate.as_slice());
-        let Ok(qc) = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader) else {
-            return;
-        };
-        let current_epoch = indra_state::epoch::epoch_for_height(self.state.height);
-        for signature in qc.pq_signatures {
-            if let Some(v) = self.state.validators.get_mut(&signature.validator_id) {
-                v.last_active_epoch = current_epoch;
-            }
-        }
     }
 }
 
