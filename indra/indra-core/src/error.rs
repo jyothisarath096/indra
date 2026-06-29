@@ -46,6 +46,13 @@ pub enum IndraError {
         version: u16,
     },
 
+    /// Unsupported quorum certificate wire format version.
+    #[error("unsupported QC format version {format}")]
+    InvalidQcFormat {
+        /// The QC format byte found.
+        format: u8,
+    },
+
     /// Unsupported persisted-struct schema version.
     #[error(
         "unsupported schema version {version} for {struct_name} (max supported {max_supported})"

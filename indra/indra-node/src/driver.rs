@@ -223,12 +223,23 @@ impl ConsensusDriver {
         if driver.engine.state.height > 0 {
             match driver.engine.load_persisted_qc() {
                 Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
-                    eprintln!(
-                        "[driver] restored last_qc_bytes ({} bytes) for height {}",
-                        qc_bytes.len(),
-                        driver.engine.state.height,
-                    );
-                    driver.last_qc_bytes = qc_bytes;
+                    match QuorumCertificateV1::decode_exact(&qc_bytes) {
+                        Ok(_) => {
+                            eprintln!(
+                                "[driver] restored last_qc_bytes ({} bytes) for height {}",
+                                qc_bytes.len(),
+                                driver.engine.state.height,
+                            );
+                            driver.last_qc_bytes = qc_bytes;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[driver] WARNING: persisted QC at height {} is not decodable by this binary: {} — discarding and requesting from peers",
+                                driver.engine.state.height,
+                                err,
+                            );
+                        }
+                    }
                 }
                 Ok(Some(_)) | Ok(None) => {
                     eprintln!(
