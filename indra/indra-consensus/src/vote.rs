@@ -12,7 +12,7 @@
 //! ## Vote signing
 //!
 //! A vote is signed with the validator's hybrid keypair over:
-//!   SHA-256(DOMAIN_VOTE || height || round || step || value_hash || validator_id)
+//!   SHA-256(DOMAIN_VOTE || height || round || step || full_block_hash || validator_id)
 //!
 //! Both Ed25519 and ML-DSA-87 components are required.
 
@@ -182,7 +182,7 @@ impl VoteCollector {
             return VoteDecision::Waiting;
         }
 
-        // Count stake per vote hash (INDRA now carries stable `value_hash` here).
+        // Count stake per full block hash.
         // Ordered so a malformed edge case cannot make the selected value
         // depend on randomized HashMap iteration order.
         let mut stake_by_hash: BTreeMap<Bytes32, u64> = BTreeMap::new();

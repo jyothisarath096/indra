@@ -986,7 +986,7 @@ mod tests {
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
             last_qc =
-                build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+                build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x42u8; 32]);
             assert_eq!(engine.state.height, height);
         }
 
@@ -1012,7 +1012,7 @@ mod tests {
                 last_qc = build_single_validator_qc_bytes(
                     height,
                     0,
-                    block.header.value_hash,
+                    block.header.block_hash(),
                     [0x42u8; 32],
                 );
                 assert_eq!(engine.state.height, height);
@@ -1044,7 +1044,7 @@ mod tests {
                 last_qc = build_single_validator_qc_bytes(
                     height,
                     0,
-                    block.header.value_hash,
+                    block.header.block_hash(),
                     [0x42u8; 32],
                 );
                 assert_eq!(engine.state.height, height);
@@ -1113,7 +1113,7 @@ mod tests {
                 last_qc = build_single_validator_qc_bytes(
                     height,
                     0,
-                    block.header.value_hash,
+                    block.header.block_hash(),
                     [0x42u8; 32],
                 );
             }

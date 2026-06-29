@@ -171,9 +171,14 @@ pub struct ConsensusDriver {
     pending_precommit_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Tendermint lock state for the current height.
     locked_round: Option<u32>,
+    /// Full block hash this validator is locked on.
     locked_value: Option<Bytes32>,
+    /// Stable value hash corresponding to `locked_value`, used only for POLC
+    /// same-value checks across reproposals with different full hashes.
+    locked_value_hash: Option<Bytes32>,
     /// Tendermint valid value / valid round for reproposal.
     valid_round: Option<u32>,
+    /// Full block hash that reached prevote quorum.
     valid_value: Option<Bytes32>,
     valid_block: Option<BlockV1>,
     /// Serialised QC for the most recently finalised height.
@@ -205,6 +210,7 @@ impl ConsensusDriver {
             pending_precommit_quorum: HashSet::new(),
             locked_round: None,
             locked_value: None,
+            locked_value_hash: None,
             valid_round: None,
             valid_value: None,
             valid_block: None,
@@ -347,6 +353,7 @@ impl ConsensusDriver {
         self.seen_round_votes.clear();
         self.locked_round = None;
         self.locked_value = None;
+        self.locked_value_hash = None;
         self.valid_round = None;
         self.valid_value = None;
         self.valid_block = None;
@@ -419,27 +426,7 @@ impl ConsensusDriver {
 
     /// Return a locally staged proposal by hash, if present.
     pub fn pending_block(&self, hash: &Bytes32) -> Option<BlockV1> {
-        self.pending_blocks.get(hash).cloned().or_else(|| {
-            self.pending_blocks
-                .values()
-                .find(|block| block.header.value_hash == *hash)
-                .cloned()
-        })
-    }
-
-    /// Return the canonical locally staged block for a certified consensus value.
-    ///
-    /// Votes and QCs certify `value_hash`, while the chain tip is the full
-    /// `block_hash()`. Multiple proposal headers can carry the same `value_hash`
-    /// but differ in round/QC/VRF metadata. Always choose the lexicographically
-    /// lowest full block hash so finalization never depends on randomized
-    /// `HashMap` iteration order.
-    fn canonical_block_for_value_hash(&self, value_hash: Bytes32) -> Option<(Bytes32, BlockV1)> {
-        self.pending_blocks
-            .iter()
-            .filter(|(_, block)| block.header.value_hash == value_hash)
-            .min_by_key(|(_, block)| block.header.block_hash().0)
-            .map(|(key, block)| (*key, block.clone()))
+        self.pending_blocks.get(hash).cloned()
     }
 
     /// The proposer includes the latest valid-round in its header.
@@ -477,11 +464,20 @@ impl ConsensusDriver {
             .map(|collector| collector.current_decision())
     }
 
-    fn has_quorum_for_hash(&self, height: u64, round: u32, step: VoteStep, hash: Bytes32) -> bool {
-        matches!(
-            self.vote_decision(height, round, step),
-            Some(VoteDecision::QuorumReached { block_hash, .. }) if block_hash == hash
-        )
+    fn has_quorum_for_value_hash(
+        &self,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        value_hash: Bytes32,
+    ) -> bool {
+        match self.vote_decision(height, round, step) {
+            Some(VoteDecision::QuorumReached { block_hash, .. }) if block_hash != Bytes32::ZERO => {
+                self.pending_block(&block_hash)
+                    .is_some_and(|block| block.header.value_hash == value_hash)
+            }
+            _ => false,
+        }
     }
 
     /// Rules 2 and 3 — decide whether the current-round proposal should be
@@ -505,7 +501,8 @@ impl ConsensusDriver {
         let Some(block) = self.pending_block_for_slot(height, self.current_round) else {
             return vec![];
         };
-        let hash = block.header.value_hash;
+        let hash = block.header.block_hash();
+        let value_hash = block.header.value_hash;
 
         let vote_hash = if block.header.polc_round == NO_POLC_ROUND {
             // Rule 2
@@ -518,9 +515,14 @@ impl ConsensusDriver {
             // Rule 3
             let valid_round = block.header.polc_round;
             if valid_round < self.current_round
-                && self.has_quorum_for_hash(height, valid_round, VoteStep::Prevote, hash)
+                && self.has_quorum_for_value_hash(
+                    height,
+                    valid_round,
+                    VoteStep::Prevote,
+                    value_hash,
+                )
                 && (self.locked_round.is_none()
-                    || self.locked_value == Some(hash)
+                    || self.locked_value_hash == Some(value_hash)
                     || self
                         .locked_round
                         .is_some_and(|locked_round| locked_round <= valid_round))
@@ -630,7 +632,6 @@ impl ConsensusDriver {
         }
 
         let block_hash = block.header.block_hash();
-        let value_hash = block.header.value_hash;
         if let Some(existing_block) =
             self.pending_block_for_slot(block.header.height, block.header.proposer_round)
         {
@@ -645,7 +646,7 @@ impl ConsensusDriver {
         self.requested_proposals.remove(&(
             block.header.height,
             block.header.proposer_round,
-            value_hash,
+            block_hash,
         ));
         self.pending_blocks.insert(block_hash, block.clone());
 
@@ -668,7 +669,7 @@ impl ConsensusDriver {
         if let Some(buffered_votes) = self.buffered_votes.remove(&(
             block.header.height,
             block.header.proposer_round,
-            value_hash,
+            block_hash,
         )) {
             for (vote_from, vote) in buffered_votes {
                 actions.extend(self.record_vote_and_actions(vote_from, vote));
@@ -678,12 +679,12 @@ impl ConsensusDriver {
         if self.pending_precommit_quorum.remove(&(
             block.header.height,
             block.header.proposer_round,
-            value_hash,
+            block_hash,
         )) {
             actions.extend(self.finalize_block_on_quorum(
                 block.header.height,
                 block.header.proposer_round,
-                value_hash,
+                block_hash,
             ));
             return actions;
         }
@@ -844,6 +845,9 @@ impl ConsensusDriver {
                                     if block_hash != Bytes32::ZERO {
                                         self.locked_round = Some(vote.round);
                                         self.locked_value = Some(block_hash);
+                                        self.locked_value_hash = self
+                                            .pending_block(&block_hash)
+                                            .map(|block| block.header.value_hash);
                                         actions.extend(self.sign_and_record_local_vote(
                                             vote.height,
                                             vote.round,
@@ -902,7 +906,7 @@ impl ConsensusDriver {
         round: u32,
         block_hash: Bytes32,
     ) -> Vec<DriverAction> {
-        let Some((pending_key, block)) = self.canonical_block_for_value_hash(block_hash) else {
+        let Some(block) = self.pending_blocks.get(&block_hash).cloned() else {
             eprintln!(
                 "[commit] quorum reached for {} at height={} round={}, but block is not staged yet",
                 hex::encode(&block_hash.0[..4]),
@@ -913,7 +917,7 @@ impl ConsensusDriver {
                 .insert((height, round, block_hash));
             return vec![DriverAction::None];
         };
-        self.pending_blocks.remove(&pending_key);
+        self.pending_blocks.remove(&block_hash);
 
         let key = Self::collector_key(height, round, VoteStep::Precommit);
         let Some(collector) = self.vote_collectors.get(&key) else {
@@ -981,6 +985,7 @@ impl ConsensusDriver {
                 // Rule 9 / height transition cleanup.
                 self.locked_round = None;
                 self.locked_value = None;
+                self.locked_value_hash = None;
                 self.valid_round = None;
                 self.valid_value = None;
                 self.start_round(0);
@@ -1231,6 +1236,7 @@ mod tests {
     use indra_consensus::{
         producer::{produce_block, BlockTemplate},
         proposer::ProposerCandidate,
+        vote::VoteCollector,
     };
     use indra_core::{
         types::block::{BlockHeaderV1, BlockV1},
@@ -1287,62 +1293,6 @@ mod tests {
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
-    }
-
-    #[test]
-    fn finalize_on_quorum_selects_canonical_block_when_multiple_proposals_exist() {
-        let (driver_template, template_dir) = local_driver([0x90u8; 32], "canonical_template");
-        let mut block_a = make_block(&driver_template.engine.state);
-        block_a.header.proposer_round = 0;
-        block_a.header.polc_round = NO_POLC_ROUND;
-
-        let mut block_b = block_a.clone();
-        block_b.header.proposer_round = 1;
-        block_b.header.polc_round = 0;
-
-        assert_eq!(
-            block_a.header.value_hash, block_b.header.value_hash,
-            "test requires the same certified value hash"
-        );
-        assert_ne!(
-            block_a.header.block_hash(),
-            block_b.header.block_hash(),
-            "test requires distinct full block hashes"
-        );
-
-        let value_hash = block_a.header.value_hash;
-        let hash_a = block_a.header.block_hash();
-        let hash_b = block_b.header.block_hash();
-        let expected_winner = if hash_a.0 < hash_b.0 { hash_a } else { hash_b };
-
-        let (mut driver_a, dir_a) = local_driver([0x91u8; 32], "canonical_a");
-        driver_a.pending_blocks.insert(hash_a, block_a.clone());
-        driver_a.pending_blocks.insert(hash_b, block_b.clone());
-
-        let (mut driver_b, dir_b) = local_driver([0x92u8; 32], "canonical_b");
-        driver_b.pending_blocks.insert(hash_b, block_b);
-        driver_b.pending_blocks.insert(hash_a, block_a);
-
-        let selected_a = driver_a
-            .canonical_block_for_value_hash(value_hash)
-            .map(|(_, block)| block.header.block_hash());
-        let selected_b = driver_b
-            .canonical_block_for_value_hash(value_hash)
-            .map(|(_, block)| block.header.block_hash());
-
-        assert_eq!(
-            selected_a, selected_b,
-            "drivers must select the same canonical block regardless of insertion order"
-        );
-        assert_eq!(
-            selected_a,
-            Some(expected_winner),
-            "canonical block must be the lexicographically lowest full block hash"
-        );
-
-        let _ = std::fs::remove_dir_all(&template_dir);
-        let _ = std::fs::remove_dir_all(&dir_a);
-        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     fn install_active_validator(
@@ -1578,6 +1528,117 @@ mod tests {
     }
 
     #[test]
+    fn votes_are_cast_for_full_block_hash_not_value_hash() {
+        let (mut driver, dir) = local_driver([0x8Au8; 32], "vote_full_hash");
+        let _local = install_active_validator(&mut driver, [0x8Au8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let block = make_strict_block(&driver, [0x8Au8; 32], 0, vec![]);
+        let full_hash = block.header.block_hash();
+        let value_hash = block.header.value_hash;
+        assert_ne!(
+            full_hash, value_hash,
+            "test requires full block hash to differ from value hash"
+        );
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block.clone(),
+        });
+        let vote = actions
+            .iter()
+            .find_map(|action| match action {
+                DriverAction::BroadcastVote(vote) => Some(vote),
+                _ => None,
+            })
+            .expect("proposal should trigger a prevote");
+
+        assert_eq!(vote.block_hash, full_hash);
+        assert_ne!(vote.block_hash, value_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn competing_proposals_same_value_hash_cannot_both_reach_quorum() {
+        let (mut driver, dir) = local_driver([0x8Bu8; 32], "competing_full_hash");
+        let a = install_active_validator(&mut driver, [0x8Bu8; 32], "a");
+        let b = install_active_validator(&mut driver, [0x8Cu8; 32], "b");
+        let c = install_active_validator(&mut driver, [0x8Du8; 32], "c");
+        let d = install_active_validator(&mut driver, [0x8Eu8; 32], "d");
+        driver.refresh_registered_voters();
+
+        let mut block_a = make_block(&driver.engine.state);
+        block_a.header.proposer_round = 0;
+        block_a.header.polc_round = NO_POLC_ROUND;
+        let mut block_b = block_a.clone();
+        block_b.header.proposer_round = 1;
+        block_b.header.polc_round = 0;
+
+        assert_eq!(block_a.header.value_hash, block_b.header.value_hash);
+        let hash_a = block_a.header.block_hash();
+        let hash_b = block_b.header.block_hash();
+        assert_ne!(hash_a, hash_b);
+
+        let voters = driver.registered_voters.clone();
+        let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, voters);
+        let signer_ids = [
+            Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0)),
+            Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0)),
+            Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0)),
+            Bytes32::from(indra_crypto::sha256(&d.public_key().classical.0)),
+        ];
+        let signers = [&a, &b, &c, &d];
+
+        for idx in 0..2 {
+            let vote = indra_consensus::vote::produce_vote(
+                1,
+                0,
+                VoteStep::Prevote,
+                hash_a,
+                signer_ids[idx],
+                signers[idx],
+            )
+            .unwrap();
+            assert!(matches!(
+                collector.add_vote(vote).unwrap(),
+                indra_consensus::vote::VoteDecision::Waiting
+            ));
+        }
+        for idx in 2..4 {
+            let vote = indra_consensus::vote::produce_vote(
+                1,
+                0,
+                VoteStep::Prevote,
+                hash_b,
+                signer_ids[idx],
+                signers[idx],
+            )
+            .unwrap();
+            assert!(matches!(
+                collector.add_vote(vote).unwrap(),
+                indra_consensus::vote::VoteDecision::Waiting
+            ));
+        }
+
+        let equivocation = indra_consensus::vote::produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            hash_a,
+            signer_ids[2],
+            signers[2],
+        )
+        .unwrap();
+        assert!(
+            collector.add_vote(equivocation).is_err(),
+            "a validator cannot move from one full hash to another to make both quorums"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn vote_before_block_requests_proposal_then_commits() {
         let (mut driver, dir) = local_driver([0x42u8; 32], "votes_before_block");
         let _local = install_active_validator(&mut driver, [0x42u8; 32], "local");
@@ -1588,7 +1649,7 @@ mod tests {
         driver.engine.state.tip_hash =
             pick_tip_hash_for_round_winners(&driver, 1, local_id, local_id);
         let block = make_strict_block(&driver, [0x42u8; 32], 0, vec![]);
-        let value_hash = block.header.value_hash;
+        let block_hash = block.header.block_hash();
 
         let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
         let remote_b_id = Bytes32::from(indra_crypto::sha256(&remote_b.public_key().classical.0));
@@ -1597,7 +1658,7 @@ mod tests {
             1,
             0,
             VoteStep::Prevote,
-            value_hash,
+            block_hash,
             remote_a_id,
             &remote_a,
         )
@@ -1606,7 +1667,7 @@ mod tests {
             1,
             0,
             VoteStep::Prevote,
-            value_hash,
+            block_hash,
             remote_b_id,
             &remote_b,
         )
@@ -1615,7 +1676,7 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            value_hash,
+            block_hash,
             remote_a_id,
             &remote_a,
         )
@@ -1624,7 +1685,7 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            value_hash,
+            block_hash,
             remote_b_id,
             &remote_b,
         )
@@ -1662,7 +1723,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             DriverAction::BroadcastVote(vote)
-                if vote.step == VoteStep::Precommit && vote.block_hash == value_hash
+                if vote.step == VoteStep::Precommit && vote.block_hash == block_hash
         )));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1674,7 +1735,7 @@ mod tests {
         driver.refresh_registered_voters();
 
         let block = make_strict_block(&driver, [0x45u8; 32], 0, vec![]);
-        let value_hash = block.header.value_hash;
+        let block_hash = block.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9201".parse().unwrap()),
             block,
@@ -1683,7 +1744,7 @@ mod tests {
         assert!(actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote)
-                if vote.step == VoteStep::Prevote && vote.block_hash == value_hash
+                if vote.step == VoteStep::Prevote && vote.block_hash == block_hash
         )));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1715,14 +1776,14 @@ mod tests {
             })
             .expect("expected one validator to win with verified VRF output");
         let block = make_strict_block(&driver, proposer_seed, 5, vec![]);
-        let value_hash = block.header.value_hash;
+        let block_hash = block.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
 
         assert_eq!(driver.current_round(), 5);
         assert!(actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote)
-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == value_hash
+                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
         )));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2151,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn proposer_reproposes_valid_value_after_prevote_quorum() {
+    fn reproposal_is_voted_with_its_own_block_hash() {
         let (mut driver, dir) = local_driver([0x73u8; 32], "valid_reproposal");
         let _local = install_active_validator(&mut driver, [0x73u8; 32], "local");
         let remote_a = install_active_validator(&mut driver, [0x74u8; 32], "remote-a");
@@ -2161,6 +2222,7 @@ mod tests {
 
         let block = make_block(&driver.engine.state);
         let value_hash = block.header.value_hash;
+        let original_hash = block.header.block_hash();
         let height = block.header.height;
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
         assert!(actions.iter().any(
@@ -2173,7 +2235,7 @@ mod tests {
             height,
             0,
             VoteStep::Prevote,
-            value_hash,
+            original_hash,
             remote_a_id,
             &remote_a,
         )
@@ -2182,7 +2244,7 @@ mod tests {
             height,
             0,
             VoteStep::Prevote,
-            value_hash,
+            original_hash,
             remote_b_id,
             &remote_b,
         )
@@ -2198,7 +2260,7 @@ mod tests {
         });
 
         assert_eq!(driver.valid_round, Some(0));
-        assert_eq!(driver.valid_value, Some(value_hash));
+        assert_eq!(driver.valid_value, Some(original_hash));
         let (valid_block, valid_round) = driver
             .take_valid_block_for_reproposal()
             .expect("valid block should be stored for reproposal");
@@ -2253,7 +2315,7 @@ mod tests {
         assert!(reproposal_actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote)
-                if vote.step == VoteStep::Prevote && vote.block_hash == value_hash
+                if vote.step == VoteStep::Prevote && vote.block_hash == reproposed_hash
         )));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2360,6 +2422,7 @@ mod tests {
             )
             .expect("A should propose round 0");
         let value_hash = block_x.header.value_hash;
+        let block_x_hash = block_x.header.block_hash();
 
         let stage_actions = driver_b.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9801".parse().unwrap()),
@@ -2368,7 +2431,7 @@ mod tests {
         assert!(stage_actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote)
-                if vote.step == VoteStep::Prevote && vote.block_hash == value_hash
+                if vote.step == VoteStep::Prevote && vote.block_hash == block_x_hash
         )));
 
         for (peer, validator_id, signer) in [
@@ -2380,7 +2443,7 @@ mod tests {
                 1,
                 0,
                 VoteStep::Prevote,
-                value_hash,
+                block_x_hash,
                 validator_id,
                 signer,
             )
@@ -2392,7 +2455,7 @@ mod tests {
         }
 
         assert_eq!(driver_b.valid_round, Some(0));
-        assert_eq!(driver_b.valid_value, Some(value_hash));
+        assert_eq!(driver_b.valid_value, Some(block_x_hash));
         assert_eq!(
             driver_b
                 .take_valid_block_for_reproposal()
@@ -2431,7 +2494,8 @@ mod tests {
             )
             .expect("B should repropose valid value at round 1");
         assert_eq!(block_y.header.value_hash, value_hash);
-        assert_ne!(block_y.header.block_hash(), block_x.header.block_hash());
+        let block_y_hash = block_y.header.block_hash();
+        assert_ne!(block_y_hash, block_x_hash);
 
         let reproposal_actions = driver_b.process(DriverEvent::InboundBlock {
             from: None,
@@ -2440,7 +2504,7 @@ mod tests {
         assert!(reproposal_actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote)
-                if vote.step == VoteStep::Prevote && vote.block_hash == value_hash
+                if vote.step == VoteStep::Prevote && vote.block_hash == block_y_hash
         )));
 
         for (peer, validator_id, signer) in [
@@ -2452,7 +2516,7 @@ mod tests {
                 1,
                 1,
                 VoteStep::Prevote,
-                value_hash,
+                block_y_hash,
                 validator_id,
                 signer,
             )
@@ -2472,7 +2536,7 @@ mod tests {
                 1,
                 1,
                 VoteStep::Precommit,
-                value_hash,
+                block_y_hash,
                 validator_id,
                 signer,
             )

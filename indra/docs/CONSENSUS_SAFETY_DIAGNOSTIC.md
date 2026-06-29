@@ -2,9 +2,9 @@
 
 ## Executive Summary
 
-The height-4 fork is caused by a split between the identity that consensus votes certify and the identity the chain stores as its tip. Votes and QCs certify `value_hash`, but committed chain links use the full `block_hash()`, which includes round/proposer metadata, VRF proof/output, embedded QC bytes, `polc_round`, and `value_hash`. During finalization, `ConsensusDriver::finalize_block_on_quorum` receives a precommit quorum for a `value_hash`, then selects the first locally staged `BlockV1` with that `value_hash` from `pending_blocks: HashMap<Bytes32, BlockV1>`. If multiple proposal/reproposal headers carry the same `value_hash`, different validators can pick different full block headers due to different arrival sets or randomized `HashMap` iteration order. They then commit different full block hashes at the same height even though the QC signatures are valid for the same value. C-08’s verified-VRF fallback is also dangerous because it can admit multiple accepted proposals for a slot, making this split easier to trigger, but the direct safety violation is the non-canonical `value_hash` → `BlockV1` commit selection.
+The height-4 fork is caused by a split between the identity that consensus votes certify and the identity the chain stores as its tip. The original broken path had votes and QCs certify `value_hash`, while committed chain links use the full `block_hash()`, which includes round/proposer metadata, VRF proof/output, embedded QC bytes, `polc_round`, and `value_hash`. During finalization, `ConsensusDriver::finalize_block_on_quorum` received a precommit quorum for a `value_hash`, then committed a locally staged `BlockV1` with that `value_hash`. Because each validator accepts only one proposal per `(height, round)` and network ordering can differ, validators could hold different full blocks for the same certified value and commit different tips. C-08’s verified-VRF fallback is also dangerous because it can admit multiple accepted proposals for a slot, making this split easier to trigger, but the direct safety violation was that the QC did not certify the full committed block hash.
 
-Status: **FIXED** by canonical block selection in `finalize_block_on_quorum`: when multiple staged blocks carry the certified `value_hash`, the driver now selects the lexicographically lowest full `block_hash()` instead of the first `HashMap` entry. `verify_block_qc` also now rejects embedded QCs whose `qc.height` is not `block.header.height - 1`.
+Status: **FIXED in v2** by making votes and QCs certify the full `block_hash()`. `value_hash` remains only for POLC/reproposal same-value checks. `finalize_block_on_quorum` now directly looks up the certified full hash in `pending_blocks`. `verify_block_qc` also rejects embedded QCs whose `qc.height` is not `block.header.height - 1`.
 
 ## Area 1 — QC Verification Signing Bytes
 
@@ -14,7 +14,7 @@ Votes are signed over:
 vote_signing_bytes(height, round, step, block_hash, validator_id)
 ```
 
-where `VoteV1.block_hash` is documented and used as the stable `value_hash`.
+where `VoteV1.block_hash` is now the full `BlockHeaderV1::block_hash()`.
 
 Evidence:
 
@@ -23,9 +23,9 @@ Evidence:
 - `indra-consensus/src/vote.rs:124-169` verifies received votes over `vote.block_hash`.
 - `indra-consensus/src/qc.rs:306-312` verifies QC signatures over `vote_signing_bytes(qc.height, qc.round, Precommit, &qc.block_hash, &validator.validator_id)`.
 
-The signed bytes and QC verification bytes match if `qc.block_hash == vote.block_hash`. In the current design, both fields carry `value_hash`; `QuorumCertificateV1.block_hash` explicitly documents that the field name remains for compatibility but now carries the stable `value_hash` (`indra-core/src/types/qc.rs:61-65`).
+The signed bytes and QC verification bytes match if `qc.block_hash == vote.block_hash`. In the fixed design, both fields carry the full block hash.
 
-Finding: **SAFE for signature-byte consistency, but contributes to the root cause because the certified identity is not the full committed block hash.**
+Finding: **FIXED. Signature bytes now certify the full committed block hash.**
 
 ## Area 2 — Block Hash vs Value Hash
 
@@ -43,11 +43,17 @@ The full `block_hash()` includes metadata that can differ across reproposals:
 - `quorum_certificate`
 - `value_hash`
 
-Votes use `value_hash`:
+Before the v2 fix, votes used `value_hash`:
 
 - `maybe_prevote_current_round_proposal` votes for `block.header.value_hash` (`indra-node/src/driver.rs:489-520`).
-- `VoteCollector::current_decision` counts stake per `vote.block_hash`, with comments saying this carries `value_hash` (`indra-consensus/src/vote.rs:185-190`).
+- `VoteCollector::current_decision` counted stake per `vote.block_hash`, where the value stored there was a `value_hash` by convention.
 - `finalize_block_on_quorum` builds the QC for the quorum `block_hash` argument, which is actually the value hash (`indra-node/src/driver.rs:930-936`).
+
+After the v2 fix, votes and QCs use the full `block.header.block_hash()`:
+
+- `maybe_prevote_current_round_proposal` votes for `block.header.block_hash()`.
+- `VoteCollector::current_decision` counts stake per full `vote.block_hash`.
+- `finalize_block_on_quorum` directly looks up `pending_blocks[block_hash]` and builds the QC over that full hash.
 
 But the chain tip is the full header hash:
 
@@ -65,7 +71,7 @@ self.pending_blocks
 
 This turns a quorum over `value_hash` into an arbitrary locally staged full `BlockV1` (`indra-node/src/driver.rs:884-906`). Because `pending_blocks` is a `HashMap`, if more than one staged block has that `value_hash`, the selected full block is not canonical.
 
-Finding: **ROOT CAUSE — FIXED. Consensus certifies `value_hash`; finalization previously committed a non-canonical full `block_hash()`.**
+Finding: **ROOT CAUSE — FIXED in v2. Consensus now certifies the full `block_hash()`; `value_hash` is no longer the vote/QC target.**
 
 ## Area 3 — VRF Proposer Election Determinism
 
@@ -96,7 +102,7 @@ Finding: **DANGEROUS. This does not by itself explain three different committed 
 
 I found no path where `verify_qc` accepts an invalid or missing classical signature while `hybrid_qc_active(qc.height)` is true.
 
-The remaining concern is height linkage: `verify_block_qc` verifies the embedded QC cryptographically but does not check `qc.height == block.header.height - 1` or that the QC certifies the local previous tip’s `value_hash` (`indra-node/src/sync.rs:360-413`). That is a validity gap, but not the direct source of the observed three tip hashes.
+The previous remaining concern was height linkage. The fix now rejects embedded QCs whose `qc.height` is not exactly `block.header.height - 1`. A stronger parent-hash linkage check can still be added later if previous block lookup is made available in this validation path.
 
 Finding: **SAFE for hybrid signature enforcement; DANGEROUS for missing embedded-QC linkage checks.**
 
@@ -104,16 +110,16 @@ Finding: **SAFE for hybrid signature enforcement; DANGEROUS for missing embedded
 
 `pending_precommit_quorum` is only a deferred-finalization queue for quorums that arrive before the matching proposal is staged:
 
-- It inserts `(height, round, block_hash)` when precommit quorum exists but no staged block with matching `value_hash` exists (`indra-node/src/driver.rs:895-904`).
-- It removes and finalizes when a later proposal with the matching `value_hash` arrives (`indra-node/src/driver.rs:663-672`).
+- It inserts `(height, round, block_hash)` when precommit quorum exists but the exact full block hash is not staged.
+- It removes and finalizes when a later proposal with the exact full `block_hash()` arrives.
 
 It does not prevent competing finalizations:
 
 - The key includes the hash, so it distinguishes `(height, round, X)` from `(height, round, Y)`.
 - It is not a lock or safety guard.
-- It does not canonicalize which full block corresponds to a certified `value_hash`.
+- It no longer needs to canonicalize from value hash to full block hash because the quorum key is the full hash.
 
-Finding: **SAFE as a deferred queue; NOT a safety mechanism. It does not prevent this bug.**
+Finding: **SAFE as a deferred queue after v2. It is still not a consensus safety mechanism by itself, but it now defers exact full-hash finalization rather than value-hash finalization.**
 
 ## Area 6 — QC Embedding in Block Headers
 
@@ -128,17 +134,17 @@ Verification:
 
 - `verify_block_qc` decodes `block.header.quorum_certificate` and verifies the QC against the active validator set (`indra-node/src/sync.rs:360-413`).
 
-The codec version byte path is working structurally, but the embedded QC is not linked to the block’s declared parent:
+The codec version byte path is working structurally. The v2 fix also adds height linkage:
 
-- No check that `qc.height == block.header.height - 1`.
-- No check that `qc.block_hash` is the previous block’s certified `value_hash`.
-- Since the local state only stores `tip_hash` as the full block hash, there is no immediately available canonical previous `value_hash` to compare unless the previous block is loaded.
+- `verify_block_qc` rejects `qc.height != block.header.height - 1`.
+- `qc.block_hash` now certifies the previous block’s full block hash.
+- A future hardening step could compare `qc.block_hash` to a loaded previous block id, but the direct value/full-hash split is fixed.
 
-Finding: **DANGEROUS validity gap, but secondary to the root cause. The immediate fork can occur even with valid QC bytes because the QC certifies a value hash, not a canonical full header hash.**
+Finding: **FIXED for the immediate safety issue.**
 
 ## Root Cause
 
-Different validators commit different full block headers at height 4 because `finalize_block_on_quorum` turns a valid precommit quorum for a `value_hash` into whichever locally staged `BlockV1` with that `value_hash` happens to be found first in a `HashMap`, while the chain tip and next block’s `prev_hash` use the full `block_hash()`.
+Different validators committed different full block headers at height 4 because `finalize_block_on_quorum` turned a valid precommit quorum for a `value_hash` into whichever locally staged `BlockV1` with that `value_hash` happened to be found first locally, while the chain tip and next block’s `prev_hash` used the full `block_hash()`. This is **fixed in v2**: votes, QCs, pending quorums, and finalization now use the full block hash.
 
 ## Proof of Concept
 
@@ -146,15 +152,15 @@ Minimal reasoning:
 
 1. A block `X` is proposed at height `H`, round `0`, with `value_hash = V` and full hash `HX`.
 2. A later reproposal `Y` carries the same block content and same `value_hash = V`, but different round/proposer metadata, so `Y.block_hash() = HY`, and `HY != HX`. This is explicitly expected by the existing reproposal test: `assert_eq!(block_y.header.value_hash, value_hash); assert_ne!(block_y.header.block_hash(), block_x.header.block_hash())` (`indra-node/src/driver.rs:2356-2369`).
-3. Validators precommit `V`, not `HX` or `HY`.
+3. Before v2, validators precommitted `V`, not `HX` or `HY`.
 4. On quorum, each node calls `finalize_block_on_quorum(H, R, V)`.
-5. The code searches `pending_blocks: HashMap<full_hash, BlockV1>` for the first block whose `header.value_hash == V` (`indra-node/src/driver.rs:890-894`).
+5. The old code searched `pending_blocks: HashMap<full_hash, BlockV1>` for the first block whose `header.value_hash == V`.
 6. Node A may have only `X`, or may encounter `X` first; Node B may have only `Y`, or may encounter `Y` first.
 7. Both build a valid QC for `V`, then commit their chosen full block object (`indra-node/src/driver.rs:930-960`).
 8. The resulting state transition can be identical, but `state.tip_hash`/block-store tip differs because it is the full header hash. This matches the observed symptom: all validators at height 4, but with multiple tip hashes.
 
-This is enough to create a visible chain fork without requiring forged signatures, broken hybrid QC verification, or arithmetic/state-root divergence.
+This was enough to create a visible chain fork without requiring forged signatures, broken hybrid QC verification, or arithmetic/state-root divergence. The v2 regression tests cover the repaired behavior: votes target the full block hash, competing proposals cannot both reach quorum for the same voter set, and reproposals are voted on by their own new full hash.
 
 ## Fix Direction
 
-Make the identity that QCs certify identical to the identity that the chain commits and extends: either vote/QC over a canonical full block id, or make the committed tip hash derive only from the canonical `value_hash`; in either design, remove the arbitrary `HashMap` search from `value_hash` to full `BlockV1` and store one deterministic canonical block per certified value.
+Implemented: the identity that QCs certify is now identical to the identity that the chain commits and extends. Votes/QCs use the full block hash; `value_hash` remains only for POLC/reproposal same-value checks.

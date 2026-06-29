@@ -763,7 +763,7 @@ mod tests {
             prev_qc = build_qc_bytes(
                 block.header.height,
                 block.header.proposer_round,
-                block.header.value_hash,
+                block.header.block_hash(),
                 validator_id,
                 &hybrid,
                 pq_pk.clone(),
@@ -950,7 +950,7 @@ mod tests {
         let wrong_qc_bytes = build_qc_bytes(
             3,
             block1.header.proposer_round,
-            block1.header.value_hash,
+            block1.header.block_hash(),
             validator_id,
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
@@ -980,7 +980,7 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            block1.header.value_hash,
+            block1.header.block_hash(),
             validator_id,
             &hybrid,
         )
@@ -989,7 +989,7 @@ mod tests {
         let dummy_qc = QuorumCertificateV1 {
             height: 1,
             round: 0,
-            block_hash: block1.header.value_hash,
+            block_hash: block1.header.block_hash(),
             signer_bitfield: {
                 let mut bf = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                 bf[0] = 1;
@@ -1084,7 +1084,7 @@ mod tests {
         let qc_bytes = build_qc_bytes(
             block1.header.height,
             block1.header.proposer_round,
-            block1.header.value_hash,
+            block1.header.block_hash(),
             validator_id,
             &hybrid,
             pq_pk,
