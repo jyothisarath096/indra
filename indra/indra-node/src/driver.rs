@@ -472,7 +472,17 @@ impl ConsensusDriver {
     /// Rules 2 and 3 — decide whether the current-round proposal should be
     /// prevoted or nil-prevoted.
     fn maybe_prevote_current_round_proposal(&mut self) -> Vec<DriverAction> {
-        if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Propose {
+        if !self.sync.is_caught_up() {
+            if self.current_phase == RoundPhase::Propose {
+                eprintln!(
+                    "[vote] DIAG: skipping prevote at height={} round={} — awaiting peer status",
+                    self.next_height(),
+                    self.current_round,
+                );
+            }
+            return vec![];
+        }
+        if self.current_phase != RoundPhase::Propose {
             return vec![];
         }
 

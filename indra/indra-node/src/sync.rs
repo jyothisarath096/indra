@@ -196,6 +196,10 @@ impl SyncState {
     pub fn mark_caught_up(&mut self, local_height: u64) {
         self.best_peer_height = self.best_peer_height.max(local_height);
         self.phase = SyncPhase::CaughtUp;
+        // If we successfully committed/imported a block, we are caught up
+        // enough to participate without waiting for the periodic peer Status
+        // heartbeat. The block itself proves network communication happened.
+        self.received_peer_status = true;
     }
 }
 
@@ -819,6 +823,41 @@ mod tests {
 
         assert!(!sync.is_caught_up());
         assert_eq!(sync.observe_status(peer, 10, 10), None);
+        assert!(sync.is_caught_up());
+    }
+
+    #[test]
+    fn mark_caught_up_sets_received_peer_status() {
+        let mut sync = SyncState::follower(0);
+
+        assert!(
+            !sync.is_caught_up(),
+            "follower must not be caught up before receiving Status"
+        );
+
+        sync.mark_caught_up(1);
+
+        assert!(
+            sync.is_caught_up(),
+            "follower must be caught up after mark_caught_up (block committed)"
+        );
+    }
+
+    #[test]
+    fn follower_not_caught_up_before_any_communication() {
+        let sync = SyncState::follower(0);
+        assert!(!sync.is_caught_up());
+    }
+
+    #[test]
+    fn follower_caught_up_after_status_then_commit() {
+        let mut sync = SyncState::follower(0);
+        let peer: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+
+        sync.observe_status(peer, 0, 0);
+        assert!(sync.is_caught_up());
+
+        sync.mark_caught_up(1);
         assert!(sync.is_caught_up());
     }
 
