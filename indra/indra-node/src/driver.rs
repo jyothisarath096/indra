@@ -427,6 +427,21 @@ impl ConsensusDriver {
         })
     }
 
+    /// Return the canonical locally staged block for a certified consensus value.
+    ///
+    /// Votes and QCs certify `value_hash`, while the chain tip is the full
+    /// `block_hash()`. Multiple proposal headers can carry the same `value_hash`
+    /// but differ in round/QC/VRF metadata. Always choose the lexicographically
+    /// lowest full block hash so finalization never depends on randomized
+    /// `HashMap` iteration order.
+    fn canonical_block_for_value_hash(&self, value_hash: Bytes32) -> Option<(Bytes32, BlockV1)> {
+        self.pending_blocks
+            .iter()
+            .filter(|(_, block)| block.header.value_hash == value_hash)
+            .min_by_key(|(_, block)| block.header.block_hash().0)
+            .map(|(key, block)| (*key, block.clone()))
+    }
+
     /// The proposer includes the latest valid-round in its header.
     pub fn proposal_polc_round(&self, height: u64) -> Option<u32> {
         if self.next_height() != height || self.valid_value.is_none() {
@@ -887,12 +902,7 @@ impl ConsensusDriver {
         round: u32,
         block_hash: Bytes32,
     ) -> Vec<DriverAction> {
-        let Some((pending_key, block)) = self
-            .pending_blocks
-            .iter()
-            .find(|(_, block)| block.header.value_hash == block_hash)
-            .map(|(key, block)| (*key, block.clone()))
-        else {
+        let Some((pending_key, block)) = self.canonical_block_for_value_hash(block_hash) else {
             eprintln!(
                 "[commit] quorum reached for {} at height={} round={}, but block is not staged yet",
                 hex::encode(&block_hash.0[..4]),
@@ -1277,6 +1287,62 @@ mod tests {
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
+    }
+
+    #[test]
+    fn finalize_on_quorum_selects_canonical_block_when_multiple_proposals_exist() {
+        let (driver_template, template_dir) = local_driver([0x90u8; 32], "canonical_template");
+        let mut block_a = make_block(&driver_template.engine.state);
+        block_a.header.proposer_round = 0;
+        block_a.header.polc_round = NO_POLC_ROUND;
+
+        let mut block_b = block_a.clone();
+        block_b.header.proposer_round = 1;
+        block_b.header.polc_round = 0;
+
+        assert_eq!(
+            block_a.header.value_hash, block_b.header.value_hash,
+            "test requires the same certified value hash"
+        );
+        assert_ne!(
+            block_a.header.block_hash(),
+            block_b.header.block_hash(),
+            "test requires distinct full block hashes"
+        );
+
+        let value_hash = block_a.header.value_hash;
+        let hash_a = block_a.header.block_hash();
+        let hash_b = block_b.header.block_hash();
+        let expected_winner = if hash_a.0 < hash_b.0 { hash_a } else { hash_b };
+
+        let (mut driver_a, dir_a) = local_driver([0x91u8; 32], "canonical_a");
+        driver_a.pending_blocks.insert(hash_a, block_a.clone());
+        driver_a.pending_blocks.insert(hash_b, block_b.clone());
+
+        let (mut driver_b, dir_b) = local_driver([0x92u8; 32], "canonical_b");
+        driver_b.pending_blocks.insert(hash_b, block_b);
+        driver_b.pending_blocks.insert(hash_a, block_a);
+
+        let selected_a = driver_a
+            .canonical_block_for_value_hash(value_hash)
+            .map(|(_, block)| block.header.block_hash());
+        let selected_b = driver_b
+            .canonical_block_for_value_hash(value_hash)
+            .map(|(_, block)| block.header.block_hash());
+
+        assert_eq!(
+            selected_a, selected_b,
+            "drivers must select the same canonical block regardless of insertion order"
+        );
+        assert_eq!(
+            selected_a,
+            Some(expected_winner),
+            "canonical block must be the lexicographically lowest full block hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&template_dir);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     fn install_active_validator(

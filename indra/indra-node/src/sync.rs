@@ -358,11 +358,12 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
 }
 
 fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+    if block.header.height <= 1 {
+        return Ok(());
+    }
+
     let qc_bytes = block.header.quorum_certificate.as_slice();
     if qc_bytes.is_empty() {
-        if block.header.height == 1 {
-            return Ok(());
-        }
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
@@ -379,6 +380,17 @@ fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
             reason: format!("invalid QC encoding: {e}"),
         }
     })?;
+
+    let expected_qc_height = block.header.height.saturating_sub(1);
+    if qc.height != expected_qc_height {
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!(
+                "embedded QC height {} does not match expected {}",
+                qc.height, expected_qc_height,
+            ),
+        });
+    }
 
     let mut active_validators: Vec<_> = state.validators.active_validators().collect();
     active_validators.sort_by_key(|validator| validator.validator_id.0);
@@ -922,6 +934,37 @@ mod tests {
         match err {
             NodeError::BlockInvalid { reason, .. } => {
                 assert!(reason.contains("missing quorum certificate"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_block_qc_rejects_wrong_height_qc() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x14, 10_000, true, true);
+
+        let block1 = make_strict_block(&state, 0x14, 0, vec![]);
+        apply_block(&mut state, &block1, 0).unwrap();
+
+        let wrong_qc_bytes = build_qc_bytes(
+            3,
+            block1.header.proposer_round,
+            block1.header.value_hash,
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let block2 = make_strict_block(&state, 0x14, 0, wrong_qc_bytes);
+
+        let err = verify_block_qc(&block2, &state).unwrap_err();
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("embedded QC height 3 does not match expected 1"),
+                    "unexpected reason: {reason}"
+                );
             }
             other => panic!("unexpected error: {other:?}"),
         }
