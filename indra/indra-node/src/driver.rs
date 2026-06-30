@@ -802,6 +802,13 @@ impl ConsensusDriver {
 
         match self.engine.sign_vote(height, round, step, block_hash) {
             Ok(local_vote) => {
+                eprintln!(
+                    "[vote] produced {:?} for height={} round={} hash={}",
+                    step,
+                    height,
+                    round,
+                    hex::encode(&block_hash.0[..4]),
+                );
                 self.record_vote_and_actions(SocketAddr::from(([127, 0, 0, 1], 0)), local_vote)
             }
             Err(err) => {

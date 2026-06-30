@@ -144,6 +144,35 @@ fn is_configured_self_addr(addr: &SocketAddr, local_p2p_addr: &str) -> bool {
     resolve_peer_addr(local_p2p_addr).is_some_and(|local| *addr == local)
 }
 
+fn is_address_acceptable_for_discovery(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unique_local()
+        }
+    }
+}
+
+fn proposal_matches_request(
+    block: &indra_core::types::block::BlockV1,
+    height: u64,
+    round: u32,
+    hash: &indra_core::Bytes32,
+) -> bool {
+    block.header.height == height
+        && block.header.proposer_round == round
+        && block.header.block_hash() == *hash
+}
+
 fn record_peer_connected_event(
     local_validator_id: indra_core::Bytes32,
     validator_id: indra_core::Bytes32,
@@ -1088,6 +1117,7 @@ fn main() {
                                         continue;
                                     };
                                     if !is_configured_self_addr(&addr, &local_p2p_addr)
+                                        && is_address_acceptable_for_discovery(&addr)
                                         && !has_connected_ip_from_socket_addrs(
                                             &gossip.connected_addrs(),
                                             &addr,
@@ -1143,10 +1173,7 @@ fn main() {
                                     d.pending_block(hash)
                                         .or_else(|| d.engine.block_store.get(*height).ok())
                                         .filter(|block| {
-                                            block.header.height == *height
-                                                && block.header.proposer_round == *round
-                                                && (block.header.block_hash() == *hash
-                                                    || block.header.value_hash == *hash)
+                                            proposal_matches_request(block, *height, *round, hash)
                                         })
                                 };
                                 if let Some(block) = proposal {
@@ -1826,6 +1853,12 @@ fn process_driver_actions(
         }
 
         if let Some(out_msg) = action_to_message(&action) {
+            if let DriverAction::BroadcastVote(vote) = &action {
+                eprintln!(
+                    "[vote] broadcasting {:?} for height={} round={}",
+                    vote.step, vote.height, vote.round,
+                );
+            }
             broadcast_driver_message(gossip, &action, &out_msg);
         }
 
@@ -2462,6 +2495,74 @@ mod tests {
             bounded_discovered_peer_addrs(&discovered_peers).len(),
             MAX_DISCOVERED_PEERS
         );
+    }
+
+    #[test]
+    fn peerlist_rejects_loopback_addresses() {
+        let addr: SocketAddr = "127.0.0.1:30303".parse().unwrap();
+        assert!(!is_address_acceptable_for_discovery(&addr));
+
+        let addr: SocketAddr = "[::1]:30303".parse().unwrap();
+        assert!(!is_address_acceptable_for_discovery(&addr));
+    }
+
+    #[test]
+    fn peerlist_rejects_private_addresses() {
+        for raw in ["10.1.2.3:30303", "172.16.1.2:30303", "192.168.1.2:30303"] {
+            let addr: SocketAddr = raw.parse().unwrap();
+            assert!(!is_address_acceptable_for_discovery(&addr));
+        }
+    }
+
+    #[test]
+    fn peerlist_accepts_legitimate_public_addresses() {
+        let addr: SocketAddr = "93.184.216.34:30303".parse().unwrap();
+        assert!(is_address_acceptable_for_discovery(&addr));
+    }
+
+    fn request_proposal_test_block() -> indra_core::types::block::BlockV1 {
+        use indra_core::types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND};
+        use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
+
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion::CURRENT,
+                height: 7,
+                prev_hash: Bytes32::from([0x01; 32]),
+                timestamp: 1_700_000_007,
+                state_root: Bytes32::from([0x02; 32]),
+                validator_set_root: Bytes32::from([0x03; 32]),
+                mempool_set_root: Bytes32::from([0x04; 32]),
+                value_hash: Bytes32::from([0xAA; 32]),
+                base_fee: 1,
+                proposer_round: 3,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::from([0x05; 32]),
+                proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+        }
+    }
+
+    #[test]
+    fn request_proposal_serves_by_full_block_hash() {
+        let block = request_proposal_test_block();
+        let full_hash = block.header.block_hash();
+
+        assert!(proposal_matches_request(&block, 7, 3, &full_hash));
+    }
+
+    #[test]
+    fn request_proposal_does_not_serve_by_value_hash_alone() {
+        let block = request_proposal_test_block();
+        let value_hash = block.header.value_hash;
+        assert_ne!(block.header.block_hash(), value_hash);
+
+        assert!(!proposal_matches_request(&block, 7, 3, &value_hash));
     }
 
     #[tokio::test]

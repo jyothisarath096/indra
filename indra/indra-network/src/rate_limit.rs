@@ -177,7 +177,12 @@ impl PeerRateLimiter {
         count_buckets.insert(MessageClass::BlockRequest, TokenBucket::new(5, 10));
         count_buckets.insert(MessageClass::Tx, TokenBucket::new(50, 200));
         count_buckets.insert(MessageClass::PingPong, TokenBucket::new(2, 4));
-        count_buckets.insert(MessageClass::BlockResponse, TokenBucket::new(2, 4));
+        // Sync catch-up can legitimately receive several BlockResponse
+        // messages back-to-back after pipelined RequestBlocks. Keep the
+        // message-count bucket permissive enough for honest bursts and rely
+        // on the byte buckets below as the primary abuse guard for large
+        // payloads.
+        count_buckets.insert(MessageClass::BlockResponse, TokenBucket::new(20, 64));
         count_buckets.insert(MessageClass::QCResponse, TokenBucket::new(5, 10));
 
         Self {
@@ -358,5 +363,38 @@ mod tests {
         for msg in messages {
             assert_eq!(limiter.check(&msg, 256), None);
         }
+    }
+
+    #[test]
+    fn legitimate_sync_burst_does_not_trigger_rate_limit_penalty() {
+        let mut limiter = PeerRateLimiter::new();
+        let msg = Message::BlockResponse { blocks: Vec::new() };
+
+        for _ in 0..50 {
+            assert_eq!(
+                limiter.check(&msg, 1024),
+                None,
+                "honest catch-up BlockResponse bursts should not be penalized"
+            );
+        }
+    }
+
+    #[test]
+    fn unsolicited_block_response_flood_still_rate_limited() {
+        let mut limiter = PeerRateLimiter::new();
+        let msg = Message::BlockResponse { blocks: Vec::new() };
+
+        let mut limited = false;
+        for _ in 0..100 {
+            if limiter.check(&msg, 1024).is_some() {
+                limited = true;
+                break;
+            }
+        }
+
+        assert!(
+            limited,
+            "unsolicited BlockResponse floods must still exhaust the count bucket"
+        );
     }
 }
