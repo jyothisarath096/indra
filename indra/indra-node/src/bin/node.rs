@@ -44,6 +44,7 @@ const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
+const MAX_DISCOVERED_PEERS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
@@ -109,6 +110,77 @@ fn has_connected_ip_from_socket_addrs(connected_addrs: &[SocketAddr], addr: &Soc
     connected_addrs
         .iter()
         .any(|connected| connected.ip() == addr.ip())
+}
+
+fn trim_discovered_peers(discovered_peers: &mut HashSet<String>) {
+    if discovered_peers.len() <= MAX_DISCOVERED_PEERS {
+        return;
+    }
+    let mut peers: Vec<String> = discovered_peers.iter().cloned().collect();
+    peers.sort();
+    peers.truncate(MAX_DISCOVERED_PEERS);
+    discovered_peers.clear();
+    discovered_peers.extend(peers);
+}
+
+fn insert_discovered_peer_bounded(discovered_peers: &mut HashSet<String>, peer: String) -> bool {
+    let inserted = discovered_peers.insert(peer);
+    trim_discovered_peers(discovered_peers);
+    inserted
+}
+
+fn bounded_discovered_peer_addrs(discovered_peers: &HashSet<String>) -> Vec<SocketAddr> {
+    let mut peers: Vec<SocketAddr> = discovered_peers
+        .iter()
+        .filter_map(|peer| resolve_peer_addr(peer))
+        .collect();
+    peers.sort();
+    peers.dedup();
+    peers.truncate(MAX_DISCOVERED_PEERS);
+    peers
+}
+
+fn is_configured_self_addr(addr: &SocketAddr, local_p2p_addr: &str) -> bool {
+    resolve_peer_addr(local_p2p_addr).is_some_and(|local| *addr == local)
+}
+
+fn record_peer_connected_event(
+    local_validator_id: indra_core::Bytes32,
+    validator_id: indra_core::Bytes32,
+    addr: SocketAddr,
+    connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer_addrs: &Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
+    addr_validators: &Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
+    discovered_peers: &Arc<Mutex<HashSet<String>>>,
+    retry_after: &Arc<Mutex<HashMap<String, Instant>>>,
+    retry_delay: &Arc<Mutex<HashMap<String, Duration>>>,
+) -> bool {
+    if validator_id == local_validator_id {
+        eprintln!(
+            "[p2p] WARNING: rejected self-connection from {} (own validator_id), not adding to peer table",
+            addr
+        );
+        discovered_peers.lock().unwrap().remove(&addr.to_string());
+        retry_after.lock().unwrap().remove(&addr.ip().to_string());
+        retry_after.lock().unwrap().remove(&addr.to_string());
+        retry_delay.lock().unwrap().remove(&addr.ip().to_string());
+        retry_delay.lock().unwrap().remove(&addr.to_string());
+        return false;
+    }
+
+    *connected_addrs
+        .lock()
+        .unwrap()
+        .entry(addr.ip())
+        .or_insert(0) += 1;
+    peer_addrs.lock().unwrap().insert(validator_id, addr);
+    addr_validators.lock().unwrap().insert(addr, validator_id);
+    insert_discovered_peer_bounded(&mut discovered_peers.lock().unwrap(), addr.to_string());
+    retry_after.lock().unwrap().remove(&addr.ip().to_string());
+    retry_after.lock().unwrap().remove(&addr.to_string());
+    retry_delay.lock().unwrap().remove(&addr.ip().to_string());
+    retry_delay.lock().unwrap().remove(&addr.to_string());
+    true
 }
 
 fn choose_proposal_mode(
@@ -219,18 +291,26 @@ fn start_network_runtime(
                     let retry_after = Arc::clone(&retry_after);
                     let retry_delay = Arc::clone(&retry_delay);
                     let discovered_peers = Arc::clone(&discovered_peers);
+                    let handshake_config = Arc::clone(&handshake_config);
                     async move {
                         while let Some(event) = async_event_rx.recv().await {
                             match &event {
                                 NetworkEvent::PeerConnected { validator_id, addr } => {
-                                    *connected_addrs.lock().unwrap().entry(addr.ip()).or_insert(0) += 1;
-                                    peer_addrs.lock().unwrap().insert(*validator_id, *addr);
-                                    addr_validators.lock().unwrap().insert(*addr, *validator_id);
-                                    discovered_peers.lock().unwrap().insert(addr.to_string());
-                                    retry_after.lock().unwrap().remove(&addr.ip().to_string());
-                                    retry_after.lock().unwrap().remove(&addr.to_string());
-                                    retry_delay.lock().unwrap().remove(&addr.ip().to_string());
-                                    retry_delay.lock().unwrap().remove(&addr.to_string());
+                                    let local_id =
+                                        handshake_config.read().unwrap().my_validator_id;
+                                    if !record_peer_connected_event(
+                                        local_id,
+                                        *validator_id,
+                                        *addr,
+                                        &connected_addrs,
+                                        &peer_addrs,
+                                        &addr_validators,
+                                        &discovered_peers,
+                                        &retry_after,
+                                        &retry_delay,
+                                    ) {
+                                        continue;
+                                    }
                                 }
                                 NetworkEvent::PeerDisconnected { validator_id, addr } => {
                                     {
@@ -317,10 +397,10 @@ fn start_network_runtime(
                         {
                             let mut dp = discovered_peers.lock().unwrap();
                             for addr in &persisted {
-                                dp.insert(addr.to_string());
+                                insert_discovered_peer_bounded(&mut dp, addr.to_string());
                             }
                             for addr in &initial_discovered_peers {
-                                dp.insert(addr.clone());
+                                insert_discovered_peer_bounded(&mut dp, addr.clone());
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
@@ -333,7 +413,7 @@ fn start_network_runtime(
                         {
                             let mut dp = discovered_peers.lock().unwrap();
                             for addr in &dns_peers {
-                                dp.insert(addr.to_string());
+                                insert_discovered_peer_bounded(&mut dp, addr.to_string());
                             }
                         }
                         eprintln!("[discovery] {} DNS seed peers discovered", dns_peers.len());
@@ -360,6 +440,12 @@ fn start_network_runtime(
                                     eprintln!("[dialer] invalid addr: {}", peer_addr_str);
                                     continue;
                                 };
+                                if is_configured_self_addr(&addr, &p2p_addr_for_port) {
+                                    discovered_peers.lock().unwrap().remove(peer_addr_str);
+                                    retry_after.lock().unwrap().remove(peer_addr_str);
+                                    retry_delay.lock().unwrap().remove(peer_addr_str);
+                                    continue;
+                                }
                                 if has_connected_ip(&connected_addrs, &addr) {
                                     retry_after.lock().unwrap().remove(peer_addr_str);
                                     retry_delay.lock().unwrap().remove(peer_addr_str);
@@ -421,13 +507,12 @@ fn start_network_runtime(
                                 }
                             }
                             if last_peer_save.elapsed().as_secs() >= PEER_TABLE_SAVE_INTERVAL_SECS {
-                                let mut peers_to_save: Vec<SocketAddr> = {
-                                    let dp = discovered_peers.lock().unwrap();
-                                    dp.iter().filter_map(|peer| resolve_peer_addr(peer)).collect()
-                                };
+                                let mut peers_to_save: Vec<SocketAddr> =
+                                    bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap());
                                 peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
                                 peers_to_save.sort();
                                 peers_to_save.dedup();
+                                peers_to_save.truncate(MAX_DISCOVERED_PEERS);
                                 save_peers(&peers_file_path, &peers_to_save);
                                 last_peer_save = Instant::now();
                             }
@@ -442,13 +527,12 @@ fn start_network_runtime(
                     let peers_file_path = peers_file_path.clone();
                     async move {
                         if tokio::signal::ctrl_c().await.is_ok() {
-                            let mut peers_to_save: Vec<SocketAddr> = {
-                                let dp = discovered_peers.lock().unwrap();
-                                dp.iter().filter_map(|peer| resolve_peer_addr(peer)).collect()
-                            };
+                            let mut peers_to_save: Vec<SocketAddr> =
+                                bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap());
                             peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
                             peers_to_save.sort();
                             peers_to_save.dedup();
+                            peers_to_save.truncate(MAX_DISCOVERED_PEERS);
                             save_peers(&peers_file_path, &peers_to_save);
                             eprintln!(
                                 "[discovery] saved {} peers before shutdown",
@@ -1003,13 +1087,16 @@ fn main() {
                                     let Some(addr) = resolve_peer_addr(addr_str) else {
                                         continue;
                                     };
-                                    if addr.to_string() != local_p2p_addr
+                                    if !is_configured_self_addr(&addr, &local_p2p_addr)
                                         && !has_connected_ip_from_socket_addrs(
                                             &gossip.connected_addrs(),
                                             &addr,
                                         )
                                     {
-                                        new_peers.insert(addr.to_string());
+                                        insert_discovered_peer_bounded(
+                                            &mut new_peers,
+                                            addr.to_string(),
+                                        );
                                         accepted = accepted.saturating_add(1);
                                     }
                                 }
@@ -2306,6 +2393,55 @@ mod tests {
         let mode = choose_proposal_mode(true, true, None, 10, 3, true);
 
         assert_eq!(mode, ProposalMode::Reproposal);
+    }
+
+    #[test]
+    fn peer_connected_event_for_own_validator_id_is_rejected() {
+        let local = indra_core::Bytes32::from([0x42; 32]);
+        let addr: SocketAddr = "127.0.0.1:32782".parse().unwrap();
+        let connected_addrs = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+        let peer_addrs = Arc::new(Mutex::new(HashMap::<indra_core::Bytes32, SocketAddr>::new()));
+        let addr_validators =
+            Arc::new(Mutex::new(HashMap::<SocketAddr, indra_core::Bytes32>::new()));
+        let discovered_peers = Arc::new(Mutex::new(HashSet::from([addr.to_string()])));
+        let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
+        let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
+
+        let accepted = record_peer_connected_event(
+            local,
+            local,
+            addr,
+            &connected_addrs,
+            &peer_addrs,
+            &addr_validators,
+            &discovered_peers,
+            &retry_after,
+            &retry_delay,
+        );
+
+        assert!(!accepted);
+        assert!(connected_addrs.lock().unwrap().is_empty());
+        assert!(peer_addrs.lock().unwrap().is_empty());
+        assert!(addr_validators.lock().unwrap().is_empty());
+        assert!(discovered_peers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn discovered_peers_table_has_bounded_size() {
+        let mut discovered_peers = HashSet::new();
+
+        for port in 30_000..(30_000 + MAX_DISCOVERED_PEERS as u16 + 100) {
+            insert_discovered_peer_bounded(
+                &mut discovered_peers,
+                SocketAddr::from(([127, 0, 0, 1], port)).to_string(),
+            );
+        }
+
+        assert_eq!(discovered_peers.len(), MAX_DISCOVERED_PEERS);
+        assert_eq!(
+            bounded_discovered_peer_addrs(&discovered_peers).len(),
+            MAX_DISCOVERED_PEERS
+        );
     }
 
     #[tokio::test]

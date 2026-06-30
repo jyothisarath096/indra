@@ -93,6 +93,10 @@ fn short_validator_id(id: &Bytes32) -> String {
         .collect()
 }
 
+fn is_self_connection(local_validator_id: Bytes32, peer_validator_id: Bytes32) -> bool {
+    local_validator_id == peer_validator_id
+}
+
 fn message_queue(msg: &Message) -> QueueType {
     match msg {
         Message::Block(_) | Message::BlockResponse { .. } | Message::QCResponse { .. } => {
@@ -235,6 +239,15 @@ impl PeerManagerActor {
 
     async fn register_peer(&mut self, addr: SocketAddr, handshake: HandshakeResult) {
         let peer_validator_id = handshake.peer_validator_id;
+        if is_self_connection(self.local_validator_id, peer_validator_id) {
+            eprintln!(
+                "[p2p] rejected self-connection from {} (validator {})",
+                addr,
+                short_validator_id(&peer_validator_id),
+            );
+            drop(handshake.stream);
+            return;
+        }
 
         if let Some(existing) = self.peers_by_validator.get(&peer_validator_id) {
             let (initiator_id, responder_id) = if handshake.is_initiator {
@@ -630,6 +643,16 @@ mod tests {
         }
         assert_eq!(connected, 2);
         assert_eq!(disconnected, 1);
+    }
+
+    #[test]
+    fn self_connection_is_rejected_before_peer_connected_event() {
+        let local = Bytes32::from([0x01; 32]);
+        let remote_self = Bytes32::from([0x01; 32]);
+        let remote_peer = Bytes32::from([0x02; 32]);
+
+        assert!(is_self_connection(local, remote_self));
+        assert!(!is_self_connection(local, remote_peer));
     }
 
     #[tokio::test]
