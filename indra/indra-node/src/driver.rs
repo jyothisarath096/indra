@@ -35,6 +35,24 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+/// Maximum round jump accepted from a single peer Status message in one step.
+///
+/// A single faulty/runaway peer must not be able to teleport the whole
+/// network's round counter to an arbitrary value. Larger legitimate gaps can
+/// still be caught up gradually across repeated Status messages.
+///
+/// Multi-peer corroboration is intentionally deferred: on the 4-validator
+/// testnet, requiring multiple matching statuses before any jump could stall
+/// a partially connected but otherwise recoverable node.
+const MAX_ACCEPTED_ROUND_JUMP: u32 = 8;
+
+/// Maximum entries retained per stalled-height consensus collection.
+///
+/// These collections are normally pruned on height advancement. This cap keeps
+/// them bounded when the node is stuck at one height and peers send many
+/// distinct round/hash combinations.
+const MAX_STALLED_HEIGHT_ENTRIES: usize = 256;
+
 /// Current Tendermint phase of the local round state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundPhase {
@@ -410,11 +428,198 @@ impl ConsensusDriver {
         self.engine.state.height + 1
     }
 
+    fn prune_stalled_collections(&mut self) {
+        self.prune_vote_collectors();
+        self.prune_pending_blocks();
+        self.prune_future_proposals_bounded();
+        self.prune_buffered_votes();
+        self.prune_requested_proposals();
+        self.prune_seen_round_votes();
+        self.prune_pending_precommit_quorum();
+    }
+
+    fn prune_vote_collectors(&mut self) {
+        if self.vote_collectors.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut keys: Vec<_> = self.vote_collectors.keys().copied().collect();
+        keys.sort_by_key(|(height, round, step)| {
+            (
+                height.abs_diff(next_height),
+                round.abs_diff(current_round),
+                match step {
+                    VoteStep::Prevote => 0u8,
+                    VoteStep::Precommit => 1u8,
+                },
+            )
+        });
+        let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
+        self.vote_collectors.retain(|key, _| keep.contains(key));
+    }
+
+    fn prune_pending_blocks(&mut self) {
+        if self.pending_blocks.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut keys: Vec<_> = self
+            .pending_blocks
+            .iter()
+            .map(|(hash, block)| {
+                (
+                    *hash,
+                    block.header.height.abs_diff(next_height),
+                    block.header.proposer_round.abs_diff(current_round),
+                )
+            })
+            .collect();
+        keys.sort_by_key(|(hash, height_distance, round_distance)| {
+            (*height_distance, *round_distance, hash.0)
+        });
+        let keep: HashSet<_> = keys
+            .into_iter()
+            .take(MAX_STALLED_HEIGHT_ENTRIES)
+            .map(|(hash, _, _)| hash)
+            .collect();
+        self.pending_blocks.retain(|hash, _| keep.contains(hash));
+    }
+
+    fn prune_future_proposals_bounded(&mut self) {
+        for proposals in self.future_proposals.values_mut() {
+            if proposals.len() > MAX_STALLED_HEIGHT_ENTRIES {
+                let next_height = self.engine.state.height.saturating_add(1);
+                let current_round = self.current_round;
+                proposals.sort_by_key(|block| {
+                    (
+                        block.header.height.abs_diff(next_height),
+                        block.header.proposer_round.abs_diff(current_round),
+                        block.header.block_hash().0,
+                    )
+                });
+                proposals.truncate(MAX_STALLED_HEIGHT_ENTRIES);
+            }
+        }
+        self.future_proposals
+            .retain(|_, proposals| !proposals.is_empty());
+
+        let total: usize = self.future_proposals.values().map(Vec::len).sum();
+        if total <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut ranked = Vec::new();
+        for proposals in self.future_proposals.values() {
+            for block in proposals {
+                let hash = block.header.block_hash();
+                ranked.push((
+                    hash,
+                    block.header.height.abs_diff(next_height),
+                    block.header.proposer_round.abs_diff(current_round),
+                ));
+            }
+        }
+        ranked.sort_by_key(|(hash, height_distance, round_distance)| {
+            (*height_distance, *round_distance, hash.0)
+        });
+        let keep: HashSet<_> = ranked
+            .into_iter()
+            .take(MAX_STALLED_HEIGHT_ENTRIES)
+            .map(|(hash, _, _)| hash)
+            .collect();
+        self.future_proposals.retain(|_, proposals| {
+            proposals.retain(|block| keep.contains(&block.header.block_hash()));
+            !proposals.is_empty()
+        });
+    }
+
+    fn prune_buffered_votes(&mut self) {
+        if self.buffered_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut keys: Vec<_> = self.buffered_votes.keys().copied().collect();
+        keys.sort_by_key(|(height, round, hash)| {
+            (
+                height.abs_diff(next_height),
+                round.abs_diff(current_round),
+                hash.0,
+            )
+        });
+        let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
+        self.buffered_votes.retain(|key, _| keep.contains(key));
+    }
+
+    fn prune_requested_proposals(&mut self) {
+        if self.requested_proposals.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut keys: Vec<_> = self.requested_proposals.iter().copied().collect();
+        keys.sort_by_key(|(height, round, hash)| {
+            (
+                height.abs_diff(next_height),
+                round.abs_diff(current_round),
+                hash.0,
+            )
+        });
+        let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
+        self.requested_proposals.retain(|key| keep.contains(key));
+    }
+
+    fn prune_seen_round_votes(&mut self) {
+        if self.seen_round_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut keys: Vec<_> = self.seen_round_votes.keys().copied().collect();
+        keys.sort_by_key(|(validator_id, height, round, step)| {
+            (
+                height.abs_diff(next_height),
+                round.abs_diff(current_round),
+                match step {
+                    VoteStep::Prevote => 0u8,
+                    VoteStep::Precommit => 1u8,
+                },
+                validator_id.0,
+            )
+        });
+        let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
+        self.seen_round_votes.retain(|key, _| keep.contains(key));
+    }
+
+    fn prune_pending_precommit_quorum(&mut self) {
+        if self.pending_precommit_quorum.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+            return;
+        }
+        let next_height = self.next_height();
+        let current_round = self.current_round;
+        let mut keys: Vec<_> = self.pending_precommit_quorum.iter().copied().collect();
+        keys.sort_by_key(|(height, round, hash)| {
+            (
+                height.abs_diff(next_height),
+                round.abs_diff(current_round),
+                hash.0,
+            )
+        });
+        let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
+        self.pending_precommit_quorum
+            .retain(|key| keep.contains(key));
+    }
+
     fn prune_future_proposals(&mut self) {
         let next_height = self.next_height();
         self.future_proposals.retain(|(height, _), _| {
             *height >= next_height && *height <= next_height.saturating_add(2)
         });
+        self.prune_future_proposals_bounded();
     }
 
     fn pending_block_for_slot(&self, height: u64, round: u32) -> Option<BlockV1> {
@@ -649,6 +854,7 @@ impl ConsensusDriver {
             block_hash,
         ));
         self.pending_blocks.insert(block_hash, block.clone());
+        self.prune_pending_blocks();
 
         let proposal_round = block.header.proposer_round;
         let proposal_height = block.header.height;
@@ -747,6 +953,7 @@ impl ConsensusDriver {
             return actions;
         }
         self.seen_round_votes.insert(slot_key, vote.block_hash);
+        self.prune_seen_round_votes();
 
         if !self.sync.is_caught_up() {
             self.record_vote_passive(from, vote);
@@ -759,6 +966,7 @@ impl ConsensusDriver {
         {
             let request_key = (vote.height, vote.round, vote.block_hash);
             let should_request = self.requested_proposals.insert(request_key);
+            self.prune_requested_proposals();
             if should_request {
                 actions.push(DriverAction::RequestProposal {
                     from,
@@ -771,6 +979,7 @@ impl ConsensusDriver {
                 .entry((vote.height, vote.round, vote.block_hash))
                 .or_default()
                 .push((from, vote));
+            self.prune_buffered_votes();
             return actions;
         }
 
@@ -780,16 +989,20 @@ impl ConsensusDriver {
 
     fn record_vote_passive(&mut self, from: SocketAddr, vote: VoteV1) {
         let key = Self::collector_key(vote.height, vote.round, vote.step);
-        let collector = self.vote_collectors.entry(key).or_insert_with(|| {
-            VoteCollector::new(
-                vote.height,
-                vote.round,
-                vote.step,
-                self.registered_voters.clone(),
-            )
-        });
+        let decision = {
+            let collector = self.vote_collectors.entry(key).or_insert_with(|| {
+                VoteCollector::new(
+                    vote.height,
+                    vote.round,
+                    vote.step,
+                    self.registered_voters.clone(),
+                )
+            });
+            collector.add_vote(vote.clone())
+        };
+        self.prune_vote_collectors();
 
-        match collector.add_vote(vote.clone()) {
+        match decision {
             Ok(_decision) => {}
             Err(err) => {
                 eprintln!(
@@ -818,6 +1031,7 @@ impl ConsensusDriver {
             });
             collector.add_vote(vote.clone())
         };
+        self.prune_vote_collectors();
 
         match decision {
             Ok(decision) => {
@@ -915,6 +1129,7 @@ impl ConsensusDriver {
             );
             self.pending_precommit_quorum
                 .insert((height, round, block_hash));
+            self.prune_pending_precommit_quorum();
             return vec![DriverAction::None];
         };
         self.pending_blocks.remove(&block_hash);
@@ -1066,11 +1281,25 @@ impl ConsensusDriver {
             && peer_round > self.current_round
             && self.sync.is_caught_up()
         {
-            eprintln!(
-                "[consensus] round sync: advancing from round {} to {} (peer at round {})",
-                self.current_round, peer_round, peer_round
-            );
-            self.start_round(peer_round);
+            let current_round = self.current_round;
+            let capped_round = current_round
+                .saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+                .min(peer_round);
+            if capped_round > current_round {
+                if peer_round > capped_round {
+                    eprintln!(
+                        "[consensus] WARNING: peer {} claimed round {} (capping jump from {} to {})",
+                        from, peer_round, current_round, capped_round
+                    );
+                } else {
+                    eprintln!(
+                        "[consensus] round sync: advancing from round {} to {} (peer at round {})",
+                        current_round, capped_round, peer_round
+                    );
+                }
+                self.start_round(capped_round);
+                self.prune_stalled_collections();
+            }
         }
         match self.sync.observe_status(from, height, our_height) {
             Some((peer, from_height, to_height)) => vec![DriverAction::RequestBlocks {
@@ -1293,6 +1522,26 @@ mod tests {
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
+    }
+
+    fn test_hash(i: usize) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&((i as u64).saturating_add(1)).to_le_bytes());
+        Bytes32::from(bytes)
+    }
+
+    fn dummy_vote(height: u64, round: u32, step: VoteStep, block_hash: Bytes32) -> VoteV1 {
+        VoteV1 {
+            height,
+            round,
+            step,
+            block_hash,
+            validator_id: test_hash(round as usize),
+            signature: indra_core::types::crypto::HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            },
+        }
     }
 
     fn install_active_validator(
@@ -1868,6 +2117,61 @@ mod tests {
     }
 
     #[test]
+    fn peer_status_round_jump_is_capped() {
+        let (mut driver, dir) = local_driver([0x8Au8; 32], "status_round_cap");
+        driver.current_round = 5;
+        let peer: SocketAddr = "127.0.0.1:9401".parse().unwrap();
+
+        driver.process(DriverEvent::PeerStatus {
+            from: peer,
+            height: 1,
+            tip_hash: driver.engine.state.tip_hash,
+            round: 1_358,
+        });
+
+        assert_eq!(driver.current_round(), 5 + MAX_ACCEPTED_ROUND_JUMP);
+        assert_eq!(driver.current_phase(), RoundPhase::Propose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_status_normal_round_advance_still_works() {
+        let (mut driver, dir) = local_driver([0x8Bu8; 32], "status_round_normal");
+        driver.current_round = 5;
+        let peer: SocketAddr = "127.0.0.1:9402".parse().unwrap();
+
+        driver.process(DriverEvent::PeerStatus {
+            from: peer,
+            height: 1,
+            tip_hash: driver.engine.state.tip_hash,
+            round: 6,
+        });
+
+        assert_eq!(driver.current_round(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_status_repeated_messages_can_eventually_catch_up() {
+        let (mut driver, dir) = local_driver([0x8Cu8; 32], "status_round_repeated");
+        driver.current_round = 5;
+        let peer: SocketAddr = "127.0.0.1:9403".parse().unwrap();
+
+        while driver.current_round() < 29 {
+            driver.sync.mark_caught_up(driver.height());
+            driver.process(DriverEvent::PeerStatus {
+                from: peer,
+                height: 1,
+                tip_hash: driver.engine.state.tip_hash,
+                round: 29,
+            });
+        }
+
+        assert_eq!(driver.current_round(), 29);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn process_status_does_not_retreat_round() {
         let (mut driver, dir) = local_driver([0x4Bu8; 32], "status_round_no_retreat");
         driver.current_round = 10;
@@ -1898,6 +2202,171 @@ mod tests {
         });
 
         assert_eq!(driver.current_round(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffered_votes_does_not_grow_unbounded_while_stalled() {
+        let (mut driver, dir) = local_driver([0x90u8; 32], "bounded_buffered_votes");
+        driver.current_round = 128;
+        let peer: SocketAddr = "127.0.0.1:9501".parse().unwrap();
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            let hash = test_hash(i);
+            driver
+                .buffered_votes
+                .entry((1, i as u32, hash))
+                .or_default()
+                .push((peer, dummy_vote(1, i as u32, VoteStep::Prevote, hash)));
+        }
+        driver.prune_buffered_votes();
+
+        assert!(driver.buffered_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vote_collectors_evicts_oldest_when_at_capacity() {
+        let (mut driver, dir) = local_driver([0x91u8; 32], "bounded_vote_collectors");
+        driver.current_round = 128;
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            driver.vote_collectors.insert(
+                (1, i as u32, VoteStep::Prevote),
+                VoteCollector::new(
+                    1,
+                    i as u32,
+                    VoteStep::Prevote,
+                    driver.registered_voters.clone(),
+                ),
+            );
+        }
+        driver.prune_vote_collectors();
+
+        assert!(driver.vote_collectors.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requested_proposals_does_not_grow_unbounded() {
+        let (mut driver, dir) = local_driver([0x92u8; 32], "bounded_requested");
+        driver.current_round = 128;
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            driver
+                .requested_proposals
+                .insert((1, i as u32, test_hash(i)));
+        }
+        driver.prune_requested_proposals();
+
+        assert!(driver.requested_proposals.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seen_round_votes_does_not_grow_unbounded() {
+        let (mut driver, dir) = local_driver([0x93u8; 32], "bounded_seen_votes");
+        driver.current_round = 128;
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            driver.seen_round_votes.insert(
+                (test_hash(i), 1, i as u32, VoteStep::Prevote),
+                test_hash(i + 1_000),
+            );
+        }
+        driver.prune_seen_round_votes();
+
+        assert!(driver.seen_round_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_blocks_does_not_grow_unbounded() {
+        let (mut driver, dir) = local_driver([0x94u8; 32], "bounded_pending_blocks");
+        driver.current_round = 128;
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            let mut block = make_block(&driver.engine.state);
+            block.header.proposer_round = i as u32;
+            block.header.timestamp = block.header.timestamp.saturating_add(i as u64);
+            driver
+                .pending_blocks
+                .insert(block.header.block_hash(), block);
+        }
+        driver.prune_pending_blocks();
+
+        assert!(driver.pending_blocks.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn future_proposals_does_not_grow_unbounded() {
+        let (mut driver, dir) = local_driver([0x95u8; 32], "bounded_future_proposals");
+        driver.current_round = 128;
+        let key = (driver.next_height(), driver.engine.state.tip_hash);
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            let mut block = make_block(&driver.engine.state);
+            block.header.proposer_round = i as u32;
+            block.header.timestamp = block.header.timestamp.saturating_add(i as u64);
+            driver.future_proposals.entry(key).or_default().push(block);
+        }
+        driver.prune_future_proposals_bounded();
+
+        let total: usize = driver.future_proposals.values().map(Vec::len).sum();
+        assert!(total <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_precommit_quorum_does_not_grow_unbounded() {
+        let (mut driver, dir) = local_driver([0x96u8; 32], "bounded_pending_quorum");
+        driver.current_round = 128;
+
+        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+            driver
+                .pending_precommit_quorum
+                .insert((1, i as u32, test_hash(i)));
+        }
+        driver.prune_pending_precommit_quorum();
+
+        assert!(driver.pending_precommit_quorum.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_collections_do_not_break_normal_consensus_operation() {
+        let (mut driver, dir) = local_driver([0x97u8; 32], "bounded_normal_consensus");
+        let _local = install_active_validator(&mut driver, [0x97u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.engine.state.tip_hash = pick_tip_hash_for_round_winners(
+            &driver,
+            1,
+            driver.engine.validator_id().unwrap(),
+            driver.engine.validator_id().unwrap(),
+        );
+
+        let block = make_strict_block(&driver, [0x97u8; 32], 0, vec![]);
+        let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
+
+        assert_eq!(driver.height(), 1);
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
+        assert!(driver.vote_collectors.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        assert!(driver.pending_blocks.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        assert!(
+            driver
+                .future_proposals
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+                <= MAX_STALLED_HEIGHT_ENTRIES
+        );
+        assert!(driver.buffered_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        assert!(driver.requested_proposals.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        assert!(driver.seen_round_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+        assert!(driver.pending_precommit_quorum.len() <= MAX_STALLED_HEIGHT_ENTRIES);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
