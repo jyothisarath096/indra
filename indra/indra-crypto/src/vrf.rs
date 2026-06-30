@@ -6,7 +6,7 @@
 //!
 //! Given secret key `sk` (32 bytes) and input `alpha`:
 //!
-//! 1. Derive `x` = SHA-512(sk)[..32] as scalar
+//! 1. Derive `x` = SHA-512(sk) reduced as a wide Ristretto scalar
 //! 2. Compute `Y` = x * B  (public key, Ristretto point)
 //! 3. Hash `alpha` to a curve point `H` = hash_to_ristretto(alpha)
 //! 4. Compute `Gamma` = x * H
@@ -55,8 +55,8 @@ pub struct VrfKeypair {
 impl VrfKeypair {
     /// Create from a 32-byte seed.
     ///
-    /// The secret scalar is derived as SHA-512(seed)[..32] clamped to
-    /// a valid Ristretto scalar.
+    /// The secret scalar is derived as SHA-512(seed) reduced as a wide
+    /// Ristretto scalar.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let public_key = derive_public_key(seed);
         Self {
@@ -82,13 +82,9 @@ fn derive_public_key(seed: &[u8; 32]) -> [u8; 32] {
 /// Derive secret scalar from seed using SHA-512.
 fn derive_scalar(seed: &[u8; 32]) -> Scalar {
     let hash = Sha512::digest(seed);
-    let mut scalar_bytes = [0u8; 32];
-    scalar_bytes.copy_from_slice(&hash[..32]);
-    // Clamp for Ristretto
-    scalar_bytes[0] &= 248;
-    scalar_bytes[31] &= 127;
-    scalar_bytes[31] |= 64;
-    Scalar::from_bytes_mod_order(scalar_bytes)
+    let mut wide_bytes = [0u8; 64];
+    wide_bytes.copy_from_slice(&hash);
+    Scalar::from_bytes_mod_order_wide(&wide_bytes)
 }
 
 /// Hash arbitrary bytes to a Ristretto255 point.
@@ -260,6 +256,14 @@ mod tests {
         let kp = VrfKeypair::from_seed(&[0x42u8; 32]);
         let (out, proof) = vrf_prove(&kp, b"INDRA epoch seed test");
         assert!(vrf_verify(&kp.public_key(), b"INDRA epoch seed test", &out, &proof).is_ok());
+    }
+
+    #[test]
+    fn vrf_scalar_no_clamping_for_ristretto() {
+        let seed = [0x01u8; 32];
+        let kp = VrfKeypair::from_seed(&seed);
+        let (out, proof) = vrf_prove(&kp, b"test");
+        assert!(vrf_verify(&kp.public_key(), b"test", &out, &proof).is_ok());
     }
 
     #[test]

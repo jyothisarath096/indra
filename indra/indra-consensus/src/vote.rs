@@ -12,7 +12,7 @@
 //! ## Vote signing
 //!
 //! A vote is signed with the validator's hybrid keypair over:
-//!   SHA-256(DOMAIN_VOTE || height || round || step || full_block_hash || validator_id)
+//!   SHA-256(DOMAIN_VOTE || chain_id || height || round || step || full_block_hash || validator_id)
 //!
 //! Both Ed25519 and ML-DSA-87 components are required.
 
@@ -62,6 +62,7 @@ pub struct VoteCollector {
     height: u64,
     round: u32,
     step: VoteStep,
+    chain_id: String,
     voters: Vec<RegisteredVoter>,
     total_stake: u64,
     // validator_id → (vote, stake)
@@ -70,7 +71,13 @@ pub struct VoteCollector {
 
 impl VoteCollector {
     /// Create a new collector for a specific height/round/step.
-    pub fn new(height: u64, round: u32, step: VoteStep, voters: Vec<RegisteredVoter>) -> Self {
+    pub fn new(
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        chain_id: String,
+        voters: Vec<RegisteredVoter>,
+    ) -> Self {
         let total_stake = voters
             .iter()
             .map(|v| v.stake)
@@ -79,6 +86,7 @@ impl VoteCollector {
             height,
             round,
             step,
+            chain_id,
             voters,
             total_stake,
             received: BTreeMap::new(),
@@ -128,6 +136,7 @@ impl VoteCollector {
             vote.step,
             &vote.block_hash,
             &vote.validator_id,
+            &self.chain_id,
         );
 
         let sig_classical: [u8; 64] =
@@ -236,11 +245,13 @@ pub fn produce_vote(
     step: VoteStep,
     block_hash: Bytes32,
     validator_id: Bytes32,
+    chain_id: &str,
     keypair: &HybridKeypair,
 ) -> ConsensusResult<VoteV1> {
     use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
 
-    let signing_bytes = vote_signing_bytes(height, round, step, &block_hash, &validator_id);
+    let signing_bytes =
+        vote_signing_bytes(height, round, step, &block_hash, &validator_id, chain_id);
     let sig = keypair.sign(&signing_bytes)?;
 
     let classical_sig = VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&sig.classical.0)
@@ -273,6 +284,7 @@ pub fn vote_signing_bytes(
     step: VoteStep,
     block_hash: &Bytes32,
     validator_id: &Bytes32,
+    chain_id: &str,
 ) -> Vec<u8> {
     indra_core::types::vote_signing::vote_signing_bytes(
         height,
@@ -280,13 +292,14 @@ pub fn vote_signing_bytes(
         step,
         block_hash,
         validator_id,
+        chain_id,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::vote::VoteStep;
+    use indra_core::types::{primitives::DEFAULT_CHAIN_ID, vote::VoteStep};
     use indra_crypto::{hybrid::HybridKeypair, sha256};
 
     fn voter(seed: u8, stake: u64) -> (RegisteredVoter, HybridKeypair) {
@@ -308,10 +321,24 @@ mod tests {
     fn single_voter_reaches_quorum() {
         let (v, kp) = voter(0x01, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let mut collector = VoteCollector::new(1, 0, VoteStep::Precommit, vec![v.clone()]);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
+            vec![v.clone()],
+        );
 
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
         let decision = collector.add_vote(vote).unwrap();
 
         assert!(matches!(decision, VoteDecision::QuorumReached { .. }));
@@ -321,10 +348,25 @@ mod tests {
     fn wrong_height_rejected() {
         let (v, kp) = voter(0x01, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, vec![v.clone()]);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Prevote,
+            DEFAULT_CHAIN_ID.to_string(),
+            vec![v.clone()],
+        );
 
         // Vote for height 99 instead of 1
-        let vote = produce_vote(99, 0, VoteStep::Prevote, block_hash, v.validator_id, &kp).unwrap();
+        let vote = produce_vote(
+            99,
+            0,
+            VoteStep::Prevote,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
         assert!(matches!(
             collector.add_vote(vote),
             Err(ConsensusError::VoteHeightMismatch { .. })
@@ -335,9 +377,24 @@ mod tests {
     fn duplicate_vote_rejected() {
         let (v, kp) = voter(0x01, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, vec![v.clone()]);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Prevote,
+            DEFAULT_CHAIN_ID.to_string(),
+            vec![v.clone()],
+        );
 
-        let vote = produce_vote(1, 0, VoteStep::Prevote, block_hash, v.validator_id, &kp).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
         collector.add_vote(vote.clone()).unwrap();
         assert_eq!(collector.add_vote(vote), Err(ConsensusError::DuplicateVote));
     }
@@ -348,7 +405,13 @@ mod tests {
         let (stranger, stranger_kp) = voter(0x99, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
         // Register only v, not stranger
-        let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, vec![v]);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Prevote,
+            DEFAULT_CHAIN_ID.to_string(),
+            vec![v],
+        );
 
         let vote = produce_vote(
             1,
@@ -356,6 +419,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             stranger.validator_id,
+            DEFAULT_CHAIN_ID,
             &stranger_kp,
         )
         .unwrap();
@@ -366,14 +430,56 @@ mod tests {
     fn tampered_vote_rejected() {
         let (v, kp) = voter(0x01, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, vec![v.clone()]);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Prevote,
+            DEFAULT_CHAIN_ID.to_string(),
+            vec![v.clone()],
+        );
 
-        let mut vote =
-            produce_vote(1, 0, VoteStep::Prevote, block_hash, v.validator_id, &kp).unwrap();
+        let mut vote = produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
         // Tamper with the block hash after signing
         vote.block_hash = Bytes32::from([0xFFu8; 32]);
         assert!(matches!(
             collector.add_vote(vote),
+            Err(ConsensusError::CryptoError { .. })
+        ));
+    }
+
+    #[test]
+    fn vote_cross_chain_replay_fails() {
+        let (v, kp) = voter(0x42, 10_000);
+        let block_hash = Bytes32::from([0x42u8; 32]);
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            "indra-testnet-1",
+            &kp,
+        )
+        .unwrap();
+        let mut mainnet_collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Precommit,
+            "indra-mainnet-1".to_string(),
+            vec![v],
+        );
+
+        assert!(matches!(
+            mainnet_collector.add_vote(vote),
             Err(ConsensusError::CryptoError { .. })
         ));
     }
@@ -390,14 +496,31 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
         // First two votes total 66%, which is below the strict > 2/3 threshold.
-        let vote1 =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
-        let vote2 =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
+        let vote1 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v1.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp1,
+        )
+        .unwrap();
+        let vote2 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v2.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp2,
+        )
+        .unwrap();
 
         let d1 = collector.add_vote(vote1).unwrap();
         let d2 = collector.add_vote(vote2).unwrap();
@@ -417,15 +540,40 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
-        let vote1 =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
-        let vote2 =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v2.validator_id, &kp2).unwrap();
-        let vote3 =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v3.validator_id, &kp3).unwrap();
+        let vote1 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v1.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp1,
+        )
+        .unwrap();
+        let vote2 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v2.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp2,
+        )
+        .unwrap();
+        let vote3 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v3.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp3,
+        )
+        .unwrap();
 
         assert!(matches!(
             collector.add_vote(vote1).unwrap(),

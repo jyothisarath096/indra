@@ -41,13 +41,14 @@ pub struct QcValidator {
 /// Kept for compatibility with existing tests and callers. Individual PQ vote
 /// signatures still verify against `vote_signing_bytes`, which binds the
 /// validator identity.
-pub fn qc_signing_bytes(height: u64, round: u32, block_hash: &Bytes32) -> Vec<u8> {
+pub fn qc_signing_bytes(height: u64, round: u32, block_hash: &Bytes32, chain_id: &str) -> Vec<u8> {
     vote_signing_bytes(
         height,
         round,
         VoteStep::Precommit,
         block_hash,
         &Bytes32::ZERO,
+        chain_id,
     )
 }
 
@@ -56,6 +57,7 @@ pub struct QcBuilder {
     height: u64,
     round: u32,
     block_hash: Bytes32,
+    chain_id: String,
     validators: Vec<QcValidator>,
     total_stake: u64,
     votes: BTreeMap<Bytes32, VoteV1>,
@@ -63,7 +65,13 @@ pub struct QcBuilder {
 
 impl QcBuilder {
     /// Create a new QC builder.
-    pub fn new(height: u64, round: u32, block_hash: Bytes32, validators: Vec<QcValidator>) -> Self {
+    pub fn new(
+        height: u64,
+        round: u32,
+        block_hash: Bytes32,
+        chain_id: String,
+        validators: Vec<QcValidator>,
+    ) -> Self {
         let total_stake = validators
             .iter()
             .map(|v| v.stake)
@@ -72,6 +80,7 @@ impl QcBuilder {
             height,
             round,
             block_hash,
+            chain_id,
             validators,
             total_stake,
             votes: BTreeMap::new(),
@@ -131,6 +140,7 @@ impl QcBuilder {
             self.height,
             self.round,
             self.block_hash,
+            &self.chain_id,
             &self.validators,
             self.votes.values().collect(),
         )
@@ -142,16 +152,18 @@ pub fn build_qc(
     height: u64,
     round: u32,
     block_hash: Bytes32,
+    chain_id: &str,
     validators: &[QcValidator],
     votes: Vec<&VoteV1>,
 ) -> ConsensusResult<QuorumCertificateV1> {
-    build_qc_from_votes(height, round, block_hash, validators, votes)
+    build_qc_from_votes(height, round, block_hash, chain_id, validators, votes)
 }
 
 fn build_qc_from_votes(
     height: u64,
     round: u32,
     block_hash: Bytes32,
+    _chain_id: &str,
     validators: &[QcValidator],
     votes: Vec<&VoteV1>,
 ) -> ConsensusResult<QuorumCertificateV1> {
@@ -244,6 +256,7 @@ pub fn verify_qc(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
     total_stake: u64,
+    chain_id: &str,
 ) -> ConsensusResult<()> {
     let signers = signer_validators(qc, validators)?;
     let signed_stake = signers
@@ -309,6 +322,7 @@ pub fn verify_qc(
             VoteStep::Precommit,
             &qc.block_hash,
             &validator.validator_id,
+            chain_id,
         );
         let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
             pq_sig.pq_sig.as_slice().try_into().map_err(|_| {
@@ -370,15 +384,16 @@ pub fn verify_qc_strict(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
     total_stake: u64,
+    chain_id: &str,
 ) -> ConsensusResult<()> {
-    verify_qc(qc, validators, total_stake)
+    verify_qc(qc, validators, total_stake, chain_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vote::produce_vote;
-    use indra_core::types::primitives::CONSENSUS_QUORUM_BPS;
+    use indra_core::types::primitives::{CONSENSUS_QUORUM_BPS, DEFAULT_CHAIN_ID};
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
     fn make_validator(seed: u8, position: usize, stake: u64) -> (QcValidator, HybridKeypair) {
@@ -401,9 +416,25 @@ mod tests {
     fn build_qc_single_validator() {
         let (v, kp) = make_validator(0x01, 0, 10_000);
         let block_hash = Bytes32::from([0xAAu8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
-        let qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v.clone()],
+            vec![&vote],
+        )
+        .unwrap();
         assert_eq!(qc.height, 1);
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.signer_count(), 1);
@@ -413,9 +444,25 @@ mod tests {
     fn qc_bitfield_set_correctly() {
         let (v, kp) = make_validator(0x02, 5, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
-        let qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v.clone()],
+            vec![&vote],
+        )
+        .unwrap();
         assert!(qc.is_signer(5));
         assert!(!qc.is_signer(0));
     }
@@ -424,8 +471,16 @@ mod tests {
     fn verify_qc_passes_with_quorum() {
         let (v, kp) = make_validator(0x03, 0, 10_000);
         let block_hash = Bytes32::from([0xCCu8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield[0] = 0b0000_0001;
         let qc = QuorumCertificateV1 {
@@ -443,21 +498,37 @@ mod tests {
                     .unwrap(),
             }],
         };
-        assert!(verify_qc(&qc, &[v.clone()], 10_000).is_ok());
-        assert!(verify_qc_strict(&qc, &[v], 10_000).is_ok());
+        assert!(verify_qc(&qc, &[v.clone()], 10_000, DEFAULT_CHAIN_ID).is_ok());
+        assert!(verify_qc_strict(&qc, &[v], 10_000, DEFAULT_CHAIN_ID).is_ok());
     }
 
     #[test]
     fn verify_qc_requires_both_classical_and_pq_when_hybrid_active() {
         let (v, kp) = make_validator(0x13, 0, 10_000);
         let block_hash = Bytes32::from([0x13u8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
-        let mut qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
+        let mut qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v.clone()],
+            vec![&vote],
+        )
+        .unwrap();
         qc.classical_signatures.clear();
 
         assert_eq!(
-            verify_qc(&qc, &[v], 10_000),
+            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
             Err(ConsensusError::SignatureCountMismatch {
                 expected: 1,
                 got: 0,
@@ -469,25 +540,57 @@ mod tests {
     fn verify_qc_accepts_valid_hybrid_qc() {
         let (v, kp) = make_validator(0x14, 0, 10_000);
         let block_hash = Bytes32::from([0x14u8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
-        let qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v.clone()],
+            vec![&vote],
+        )
+        .unwrap();
 
-        assert!(verify_qc(&qc, &[v], 10_000).is_ok());
+        assert!(verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID).is_ok());
     }
 
     #[test]
     fn verify_qc_rejects_classical_forgery() {
         let (v, kp) = make_validator(0x15, 0, 10_000);
         let block_hash = Bytes32::from([0x15u8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
-        let mut qc = build_qc(1, 0, block_hash, &[v.clone()], vec![&vote]).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
+        let mut qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v.clone()],
+            vec![&vote],
+        )
+        .unwrap();
         qc.classical_signatures[0].classical_sig =
             VariableBytes::from_slice(&[0x42u8; 64]).unwrap();
 
         assert!(matches!(
-            verify_qc(&qc, &[v], 10_000),
+            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
             Err(ConsensusError::CryptoError { .. })
         ));
     }
@@ -497,11 +600,27 @@ mod tests {
         let (v1, kp1) = make_validator(0x01, 0, 3_000);
         let (v2, _) = make_validator(0x02, 1, 7_000);
         let block_hash = Bytes32::from([0xDDu8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.validator_id, &kp1).unwrap();
-        let qc = build_qc(1, 0, block_hash, &[v1.clone(), v2.clone()], vec![&vote]).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v1.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp1,
+        )
+        .unwrap();
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v1.clone(), v2.clone()],
+            vec![&vote],
+        )
+        .unwrap();
         assert!(matches!(
-            verify_qc(&qc, &[v1, v2], 10_000),
+            verify_qc(&qc, &[v1, v2], 10_000, DEFAULT_CHAIN_ID),
             Err(ConsensusError::InsufficientStake { .. })
         ));
     }
@@ -527,7 +646,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            verify_qc(&qc, &[v], 10_000),
+            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
             Err(ConsensusError::InvalidPQSignature { .. })
         ));
     }
@@ -546,7 +665,7 @@ mod tests {
             classical_signatures: vec![],
         };
         assert_eq!(
-            verify_qc(&qc, &[v], 10_000),
+            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
             Err(ConsensusError::SignatureCountMismatch {
                 expected: 1,
                 got: 0
@@ -558,8 +677,16 @@ mod tests {
     fn verify_qc_rejects_duplicate_pq_signatures() {
         let (v, kp) = make_validator(0x0C, 0, 10_000);
         let block_hash = Bytes32::from([0x12u8; 32]);
-        let vote =
-            produce_vote(1, 0, VoteStep::Precommit, block_hash, v.validator_id, &kp).unwrap();
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp,
+        )
+        .unwrap();
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield[0] = 0b0000_0001;
         let sig = VariableBytes::from_slice(vote.signature.pq_sig.as_slice()).unwrap();
@@ -596,7 +723,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            verify_qc(&qc, &[v], 10_000),
+            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
             Err(ConsensusError::DuplicateSignature)
         );
     }

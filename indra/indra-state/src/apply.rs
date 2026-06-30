@@ -234,7 +234,7 @@ fn verify_vote_sig_with_keys(
     vote: &VoteV1,
     classical_pk: &[u8; 32],
     pq_pk_bytes: &[u8],
-    _chain_id: &str,
+    chain_id: &str,
 ) -> Result<(), String> {
     use indra_crypto::{
         verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
@@ -253,6 +253,7 @@ fn verify_vote_sig_with_keys(
         vote.step,
         &vote.block_hash,
         &vote.validator_id,
+        chain_id,
     );
     let pk = HybridPublicKey {
         classical: ClassicalPublicKey(*classical_pk),
@@ -691,7 +692,7 @@ mod tests {
     use indra_core::{
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::INITIAL_BASE_FEE_SPARK_PER_KB,
+            primitives::{DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB},
             slashing::SlashEvidenceV1,
             staking::{StakingOp, StakingOpBody},
             transaction::{InputV1, OutputV1, TransactionV1},
@@ -855,6 +856,7 @@ mod tests {
             step,
             &block_hash,
             &validator_id,
+            DEFAULT_CHAIN_ID,
         );
         let sig = keypair.sign(&signing_bytes).unwrap();
         VoteV1 {

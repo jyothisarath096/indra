@@ -23,6 +23,7 @@ license = "MIT"
 
 [workspace.dependencies]
 sha2               = { version = "0.10", default-features = false }
+hmac               = { version = "0.12", default-features = false }
 thiserror          = { version = "1.0" }
 hex                = { version = "0.4", default-features = false, features = ["alloc"] }
 bip39              = { version = "2.0", default-features = false, features = ["rand"] }

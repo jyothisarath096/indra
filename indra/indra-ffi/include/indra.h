@@ -92,6 +92,9 @@ int32_t indra_keygen_from_mnemonic(
     IndraKeyPair* out
 );
 
+void indra_zeroize_keypair(IndraKeyPair* keypair);
+void indra_zeroize_tx_result(IndraTxResult* result);
+
 int32_t indra_validate_mnemonic(const char* phrase);
 
 int32_t indra_validator_id(

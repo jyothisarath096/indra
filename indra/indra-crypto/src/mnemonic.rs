@@ -8,9 +8,11 @@ use alloc::{
 };
 
 use bip39::{rand::RngCore, Language, Mnemonic};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{error::CryptoError, sha256};
+use crate::error::CryptoError;
 
 /// Number of words in INDRA mnemonic (256 bits of entropy = 24 words).
 pub const MNEMONIC_WORD_COUNT: usize = 24;
@@ -63,10 +65,14 @@ pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
 }
 
 fn derive_seed(master_seed: &[u8; 32], domain: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(master_seed.len() + domain.len());
-    input.extend_from_slice(master_seed);
-    input.extend_from_slice(domain);
-    sha256(&input)
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(master_seed).expect("HMAC accepts any key size");
+    mac.update(domain);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 /// Validate a mnemonic phrase without deriving keys.
@@ -157,6 +163,14 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
         let seed = mnemonic_to_seed(phrase).unwrap();
         let derived = derive_all_seeds(&seed);
-        assert_eq!(&derived.hybrid_seed[0..4], &[143u8, 153u8, 67u8, 141u8]);
+        assert_eq!(&derived.hybrid_seed[0..4], &[227u8, 28u8, 214u8, 187u8]);
+    }
+
+    #[test]
+    fn hmac_derive_seed_is_deterministic() {
+        let master = [0x42u8; 32];
+        let s1 = derive_seed(&master, b"indra-hybrid-v1");
+        let s2 = derive_seed(&master, b"indra-hybrid-v1");
+        assert_eq!(s1, s2);
     }
 }

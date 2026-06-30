@@ -123,8 +123,14 @@ fn signed_vote(
     step: VoteStep,
     block_hash: Bytes32,
 ) -> VoteV1 {
-    let signing_bytes =
-        indra_core::types::vote_signing::vote_signing_bytes(7, 0, step, &block_hash, &validator_id);
+    let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
+        7,
+        0,
+        step,
+        &block_hash,
+        &validator_id,
+        indra_core::types::primitives::DEFAULT_CHAIN_ID,
+    );
     let sig = keypair.sign(&signing_bytes).unwrap();
     VoteV1 {
         height: 7,

@@ -139,6 +139,33 @@ impl IndraTxResult {
     }
 }
 
+/// Explicitly zeroize an FFI keypair bundle in caller-owned memory.
+///
+/// # Safety
+///
+/// `keypair` must be null or point to valid writable `IndraKeyPair` storage.
+#[no_mangle]
+pub unsafe extern "C" fn indra_zeroize_keypair(keypair: *mut IndraKeyPair) {
+    if keypair.is_null() {
+        return;
+    }
+    std::ptr::write_volatile(keypair, IndraKeyPair::zeroed());
+}
+
+/// Explicitly zeroize sensitive transaction result fields in caller-owned memory.
+///
+/// # Safety
+///
+/// `result` must be null or point to valid writable `IndraTxResult` storage.
+#[no_mangle]
+pub unsafe extern "C" fn indra_zeroize_tx_result(result: *mut IndraTxResult) {
+    if result.is_null() {
+        return;
+    }
+    (*result).change_blinding = [0u8; BYTES32_LEN];
+    (*result).tx_id = [0u8; BYTES32_LEN];
+}
+
 /// Generate a new INDRA keypair from one 32-byte wallet seed.
 ///
 /// # Safety
@@ -631,6 +658,28 @@ mod tests {
     }
 
     #[test]
+    fn keypair_zeroize_clears_private_fields() {
+        let seed = [0x42u8; 32];
+        let mut keypair = IndraKeyPair::zeroed();
+
+        unsafe {
+            assert_eq!(indra_keygen(seed.as_ptr(), &mut keypair), INDRA_OK);
+        }
+        assert_ne!(keypair.classical_seed, [0u8; 32]);
+        assert_ne!(keypair.pq_sk, [0u8; 32]);
+        assert_ne!(keypair.bls_seed, [0u8; 32]);
+        assert_ne!(keypair.vrf_seed, [0u8; 32]);
+
+        unsafe {
+            indra_zeroize_keypair(&mut keypair);
+        }
+        assert_eq!(keypair.classical_seed, [0u8; 32]);
+        assert_eq!(keypair.pq_sk, [0u8; 32]);
+        assert_eq!(keypair.bls_seed, [0u8; 32]);
+        assert_eq!(keypair.vrf_seed, [0u8; 32]);
+    }
+
+    #[test]
     fn validate_mnemonic_rejects_invalid_phrase() {
         let phrase = std::ffi::CString::new("invalid phrase").unwrap();
         let code = unsafe { indra_validate_mnemonic(phrase.as_ptr()) };
@@ -677,6 +726,26 @@ mod tests {
             indra_free_bytes(result.tx_bytes, result.tx_bytes_len);
             indra_free_usize(result.spent_indices, result.spent_count);
         }
+    }
+
+    #[test]
+    fn tx_result_zeroize_clears_sensitive_fields() {
+        let mut result = IndraTxResult {
+            tx_id: [0xAAu8; 32],
+            tx_bytes: std::ptr::null_mut(),
+            tx_bytes_len: 0,
+            change_spark: 123,
+            change_blinding: [0xBBu8; 32],
+            spent_indices: std::ptr::null_mut(),
+            spent_count: 0,
+        };
+
+        unsafe {
+            indra_zeroize_tx_result(&mut result);
+        }
+        assert_eq!(result.tx_id, [0u8; 32]);
+        assert_eq!(result.change_blinding, [0u8; 32]);
+        assert_eq!(result.change_spark, 123);
     }
 
     #[test]

@@ -262,6 +262,19 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_rejects_non_canonical_signature() {
+        let kp = ClassicalKeypair::from_seed(&[0x42u8; 32]);
+        let msg = b"test message";
+        let mut sig_bytes = kp.sign(msg).0;
+        sig_bytes[63] |= 0x80;
+        let bad_sig = ClassicalSignature(sig_bytes);
+        assert!(
+            verify_classical(msg, &bad_sig, &kp.public_key()).is_err(),
+            "ed25519-dalek must reject non-canonical S values"
+        );
+    }
+
+    #[test]
     fn classical_sig_is_deterministic() {
         let kp = classical_kp();
         let msg = b"determinism";

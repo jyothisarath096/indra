@@ -601,6 +601,7 @@ impl NodeEngine {
             step,
             block_hash,
             validator_id,
+            &self.state.chain_id,
             hybrid_keypair,
         )
         .map_err(NodeError::Consensus)
@@ -716,7 +717,9 @@ mod tests {
     };
     use indra_core::codec::Encode;
     use indra_core::types::crypto::{HybridPubKey, HybridSignature};
-    use indra_core::types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK};
+    use indra_core::types::primitives::{
+        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+    };
     use indra_core::types::slashing::SlashEvidenceV1;
     use indra_core::types::staking::StakingOpBody;
     use indra_core::types::vote::{VoteStep, VoteV1};
@@ -869,6 +872,7 @@ mod tests {
             VoteStep::Precommit,
             value_hash,
             validator_id,
+            &DEFAULT_CHAIN_ID,
             &hybrid,
         )
         .unwrap();
@@ -876,6 +880,7 @@ mod tests {
             height,
             round,
             value_hash,
+            DEFAULT_CHAIN_ID,
             &[QcValidator {
                 validator_id,
                 position: 0,

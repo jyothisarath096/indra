@@ -995,6 +995,7 @@ impl ConsensusDriver {
                     vote.height,
                     vote.round,
                     vote.step,
+                    self.engine.state.chain_id.clone(),
                     self.registered_voters.clone(),
                 )
             });
@@ -1026,6 +1027,7 @@ impl ConsensusDriver {
                     vote.height,
                     vote.round,
                     vote.step,
+                    self.engine.state.chain_id.clone(),
                     self.registered_voters.clone(),
                 )
             });
@@ -1161,7 +1163,14 @@ impl ConsensusDriver {
             .into_iter()
             .filter(|vote| vote.block_hash == block_hash && vote.step == VoteStep::Precommit)
             .collect();
-        let qc = match build_qc(height, round, block_hash, &qc_validators, quorum_votes) {
+        let qc = match build_qc(
+            height,
+            round,
+            block_hash,
+            &self.engine.state.chain_id,
+            &qc_validators,
+            quorum_votes,
+        ) {
             Ok(qc) => qc,
             Err(err) => {
                 eprintln!(
@@ -1388,7 +1397,7 @@ impl ConsensusDriver {
 
         let validators = self.engine.qc_validators();
         let total_stake = self.engine.state.validators.total_active_stake();
-        if let Err(err) = verify_qc(&qc, &validators, total_stake) {
+        if let Err(err) = verify_qc(&qc, &validators, total_stake, &self.engine.state.chain_id) {
             eprintln!(
                 "[driver] WARNING: received invalid QC from {} at height {}: {}",
                 from, height, err,
@@ -1469,7 +1478,9 @@ mod tests {
     };
     use indra_core::{
         types::block::{BlockHeaderV1, BlockV1},
-        types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES},
+        types::primitives::{
+            DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES,
+        },
         Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_crypto::{
@@ -1760,6 +1771,106 @@ mod tests {
         panic!("failed to find deterministic tip hash for requested round winners");
     }
 
+    fn validator_id_for_seed(seed: [u8; 32]) -> Bytes32 {
+        let keypair = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&seed),
+            PqKeypair::from_seed(&seed).unwrap(),
+        );
+        Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0))
+    }
+
+    fn pick_tip_hash_for_verified_round_winners(
+        driver: &ConsensusDriver,
+        height: u64,
+        round_zero_seed: [u8; 32],
+        round_one_seed: [u8; 32],
+    ) -> Bytes32 {
+        let round_zero_winner = validator_id_for_seed(round_zero_seed);
+        let round_one_winner = validator_id_for_seed(round_one_seed);
+        for nonce in 0u16..=u16::MAX {
+            let mut tip = [0u8; 32];
+            tip[..2].copy_from_slice(&nonce.to_le_bytes());
+            let tip_hash = Bytes32::from(tip);
+            let epoch_seed = Bytes32::from(indra_crypto::sha256(&tip_hash.0));
+            let candidates: Vec<indra_consensus::proposer::ProposerCandidate> = driver
+                .engine
+                .state
+                .validators
+                .active_validators()
+                .filter_map(|v| {
+                    v.vrf_pk
+                        .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
+                            validator_id: v.validator_id,
+                            vrf_pubkey: vrf_pk,
+                            verified_vrf_output: None,
+                            stake: v.stake_spark,
+                        })
+                })
+                .collect();
+            let election_round_zero = indra_consensus::proposer::ProposerElection {
+                epoch_seed,
+                height,
+                round: 0,
+                candidates: candidates.clone(),
+            };
+            let election_round_one = indra_consensus::proposer::ProposerElection {
+                epoch_seed,
+                height,
+                round: 1,
+                candidates,
+            };
+
+            if elect_with_verified_output_for_seed(&election_round_zero, round_zero_seed)
+                == Some(round_zero_winner)
+                && elect_with_verified_output_for_seed(&election_round_one, round_one_seed)
+                    == Some(round_one_winner)
+            {
+                return tip_hash;
+            }
+        }
+        panic!("failed to find deterministic tip hash for requested verified round winners");
+    }
+
+    fn pick_tip_hash_for_verified_winner(
+        driver: &ConsensusDriver,
+        height: u64,
+        round: u32,
+        proposer_seed: [u8; 32],
+    ) -> Bytes32 {
+        let proposer_id = validator_id_for_seed(proposer_seed);
+        for nonce in 0u16..=u16::MAX {
+            let mut tip = [0u8; 32];
+            tip[..2].copy_from_slice(&nonce.to_le_bytes());
+            let tip_hash = Bytes32::from(tip);
+            let epoch_seed = Bytes32::from(indra_crypto::sha256(&tip_hash.0));
+            let candidates: Vec<indra_consensus::proposer::ProposerCandidate> = driver
+                .engine
+                .state
+                .validators
+                .active_validators()
+                .filter_map(|v| {
+                    v.vrf_pk
+                        .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
+                            validator_id: v.validator_id,
+                            vrf_pubkey: vrf_pk,
+                            verified_vrf_output: None,
+                            stake: v.stake_spark,
+                        })
+                })
+                .collect();
+            let election = indra_consensus::proposer::ProposerElection {
+                epoch_seed,
+                height,
+                round,
+                candidates,
+            };
+            if elect_with_verified_output_for_seed(&election, proposer_seed) == Some(proposer_id) {
+                return tip_hash;
+            }
+        }
+        panic!("failed to find deterministic tip hash for requested verified winner");
+    }
+
     #[test]
     fn single_validator_block_commits_immediately() {
         let (mut driver, dir) = local_driver([0x41u8; 32], "single_commit");
@@ -1830,7 +1941,13 @@ mod tests {
         assert_ne!(hash_a, hash_b);
 
         let voters = driver.registered_voters.clone();
-        let mut collector = VoteCollector::new(1, 0, VoteStep::Prevote, voters);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Prevote,
+            DEFAULT_CHAIN_ID.to_string(),
+            voters,
+        );
         let signer_ids = [
             Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0)),
             Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0)),
@@ -1846,6 +1963,7 @@ mod tests {
                 VoteStep::Prevote,
                 hash_a,
                 signer_ids[idx],
+                DEFAULT_CHAIN_ID,
                 signers[idx],
             )
             .unwrap();
@@ -1861,6 +1979,7 @@ mod tests {
                 VoteStep::Prevote,
                 hash_b,
                 signer_ids[idx],
+                DEFAULT_CHAIN_ID,
                 signers[idx],
             )
             .unwrap();
@@ -1876,6 +1995,7 @@ mod tests {
             VoteStep::Prevote,
             hash_a,
             signer_ids[2],
+            DEFAULT_CHAIN_ID,
             signers[2],
         )
         .unwrap();
@@ -1894,9 +2014,8 @@ mod tests {
         let remote_a = install_active_validator(&mut driver, [0x43u8; 32], "remote-a");
         let remote_b = install_active_validator(&mut driver, [0x44u8; 32], "remote-b");
         driver.refresh_registered_voters();
-        let local_id = driver.engine.validator_id().unwrap();
         driver.engine.state.tip_hash =
-            pick_tip_hash_for_round_winners(&driver, 1, local_id, local_id);
+            pick_tip_hash_for_verified_winner(&driver, 1, 0, [0x42u8; 32]);
         let block = make_strict_block(&driver, [0x42u8; 32], 0, vec![]);
         let block_hash = block.header.block_hash();
 
@@ -1909,6 +2028,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             remote_a_id,
+            DEFAULT_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
@@ -1918,6 +2038,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             remote_b_id,
+            DEFAULT_CHAIN_ID,
             &remote_b,
         )
         .unwrap();
@@ -1927,6 +2048,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             remote_a_id,
+            DEFAULT_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
@@ -1936,6 +2058,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             remote_b_id,
+            DEFAULT_CHAIN_ID,
             &remote_b,
         )
         .unwrap();
@@ -2007,21 +2130,15 @@ mod tests {
         }
         driver.refresh_registered_voters();
 
-        let proposer_election = election_for_round(&driver, 1, 5);
         let proposer_seed = validator_seeds
             .into_iter()
-            .find(|seed| {
-                let Some(elected) = elect_with_verified_output_for_seed(&proposer_election, *seed)
-                else {
-                    return false;
-                };
-                let keypair = HybridKeypair::new(
-                    ClassicalKeypair::from_seed(seed),
-                    PqKeypair::from_seed(seed).unwrap(),
-                );
-                let validator_id =
-                    Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
-                elected == validator_id
+            .find_map(|seed| {
+                driver.engine.state.tip_hash =
+                    pick_tip_hash_for_verified_winner(&driver, 1, 5, seed);
+                let proposer_election = election_for_round(&driver, 1, 5);
+                let elected = elect_with_verified_output_for_seed(&proposer_election, seed)?;
+                let validator_id = validator_id_for_seed(seed);
+                (elected == validator_id).then_some(seed)
             })
             .expect("expected one validator to win with verified VRF output");
         let block = make_strict_block(&driver, proposer_seed, 5, vec![]);
@@ -2237,6 +2354,7 @@ mod tests {
                     1,
                     i as u32,
                     VoteStep::Prevote,
+                    DEFAULT_CHAIN_ID.to_string(),
                     driver.registered_voters.clone(),
                 ),
             );
@@ -2407,6 +2525,7 @@ mod tests {
             VoteStep::Precommit,
             Bytes32::from([0xAAu8; 32]),
             remote_id,
+            DEFAULT_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -2416,6 +2535,7 @@ mod tests {
             VoteStep::Precommit,
             Bytes32::from([0xBBu8; 32]),
             remote_id,
+            DEFAULT_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -2547,11 +2667,14 @@ mod tests {
             VoteStep::Precommit,
             value_hash,
             validator_id,
+            DEFAULT_CHAIN_ID,
             &local,
         )
         .unwrap();
         let validators = driver.engine.qc_validators();
-        let qc = indra_consensus::build_qc(7, 0, value_hash, &validators, vec![&vote]).unwrap();
+        let qc =
+            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+                .unwrap();
         let qc_bytes = qc.encode_to_vec();
 
         let _ = driver.process(DriverEvent::QcResponse {
@@ -2586,11 +2709,14 @@ mod tests {
             VoteStep::Precommit,
             value_hash,
             validator_id,
+            DEFAULT_CHAIN_ID,
             &local,
         )
         .unwrap();
         let validators = driver.engine.qc_validators();
-        let qc = indra_consensus::build_qc(7, 0, value_hash, &validators, vec![&vote]).unwrap();
+        let qc =
+            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+                .unwrap();
         let mut qc_bytes = qc.encode_to_vec();
         let last = qc_bytes.len() - 1;
         qc_bytes[last] ^= 0x01;
@@ -2706,6 +2832,7 @@ mod tests {
             VoteStep::Prevote,
             original_hash,
             remote_a_id,
+            DEFAULT_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
@@ -2715,6 +2842,7 @@ mod tests {
             VoteStep::Prevote,
             original_hash,
             remote_b_id,
+            DEFAULT_CHAIN_ID,
             &remote_b,
         )
         .unwrap();
@@ -2868,18 +2996,15 @@ mod tests {
         let c_id = Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0));
         let d_id = Bytes32::from(indra_crypto::sha256(&d.public_key().classical.0));
 
-        let chosen_tip = pick_tip_hash_for_round_winners(&driver_a, 1, a_id, b_id);
+        let chosen_tip =
+            pick_tip_hash_for_verified_round_winners(&driver_a, 1, [0x81u8; 32], [0x82u8; 32]);
         driver_a.engine.state.tip_hash = chosen_tip;
         driver_b.engine.state.tip_hash = chosen_tip;
 
         let election_round_zero = election_for_round(&driver_a, 1, 0);
         assert_eq!(
-            indra_consensus::proposer::elect_proposer(
-                &election_round_zero,
-                election_round_zero.height,
-            )
-            .unwrap(),
-            a_id
+            elect_with_verified_output_for_seed(&election_round_zero, [0x81u8; 32]),
+            Some(a_id)
         );
         let block_x = driver_a
             .engine
@@ -2914,6 +3039,7 @@ mod tests {
                 VoteStep::Prevote,
                 block_x_hash,
                 validator_id,
+                DEFAULT_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -2941,12 +3067,8 @@ mod tests {
 
         let election_round_one = election_for_round(&driver_b, 1, 1);
         assert_eq!(
-            indra_consensus::proposer::elect_proposer(
-                &election_round_one,
-                election_round_one.height,
-            )
-            .unwrap(),
-            b_id
+            elect_with_verified_output_for_seed(&election_round_one, [0x82u8; 32]),
+            Some(b_id)
         );
         let (valid_block, valid_round) = driver_b
             .take_valid_block_for_reproposal()
@@ -2987,6 +3109,7 @@ mod tests {
                 VoteStep::Prevote,
                 block_y_hash,
                 validator_id,
+                DEFAULT_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -3007,6 +3130,7 @@ mod tests {
                 VoteStep::Precommit,
                 block_y_hash,
                 validator_id,
+                DEFAULT_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -3060,6 +3184,7 @@ mod tests {
             VoteStep::Prevote,
             Bytes32::from([0xABu8; 32]),
             remote_id,
+            DEFAULT_CHAIN_ID,
             &remote,
         )
         .unwrap();

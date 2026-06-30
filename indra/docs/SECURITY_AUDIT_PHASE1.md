@@ -2,29 +2,29 @@
 
 Scope: `indra-crypto/`, `indra-bulletproofs/`, `indra-ffi/src/keygen.rs`, plus the consensus/state call sites needed to determine exploitability.
 
-This is an audit and proof-of-concept report only. No production fixes were made.
+This report began as an audit and proof-of-concept report. It now also records the Phase 1 remediation status for the high, medium, and low findings that have been fixed in the Rust codebase.
 
 ## Summary Table
 
 | ID | Component | Finding | Severity | Status |
 |----|-----------|---------|----------|--------|
-| C-01 | hybrid.rs / signing domains | Transaction signing lacks an explicit literal domain; other domains are distinct | LOW | Needs hardening |
-| C-02 | vote signing | Votes omit `chain_id` | MEDIUM | Needs hardening |
+| C-01 | hybrid.rs / signing domains | Transaction signing lacked an explicit literal domain; other domains are distinct | LOW | FIXED — `TX_SIGN` is prepended to transaction signing bytes |
+| C-02 | vote signing | Votes omitted `chain_id` | MEDIUM | FIXED — vote signing bytes include length-prefixed `chain_id` |
 | C-03 | QC verification | Block QC verification was ML-DSA-only, not hybrid | HIGH | FIXED — QCs now carry and verify Ed25519 + ML-DSA signatures |
-| C-04 | Ed25519 | `ed25519-dalek` 2.2.0 is used; code calls `verify`, not explicitly `verify_strict` | LOW | Review strictness |
+| C-04 | Ed25519 | `ed25519-dalek` 2.2.0 is used; non-canonical signature acceptance is now regression-tested | LOW | FIXED — malleability regression test added |
 | C-05 | ML-DSA-87 | Signing API takes no caller RNG; no weak RNG passed | SAFE | Checked |
-| C-06 | VRF | Ed25519-style clamping is applied to a Ristretto scalar | MEDIUM | Non-standard |
+| C-06 | VRF | Ed25519-style clamping was applied to a Ristretto scalar | MEDIUM | FIXED — scalar derivation now uses 64-byte wide reduction |
 | C-07 | VRF | Implementation deviates from ECVRF-RISTRETTO255-SHA512 | MEDIUM | Non-standard |
 | C-08 | proposer election | Election used public `sha256(vrf_pubkey || input)`, enabling VRF-key grinding | HIGH | FIXED — election uses verified VRF output when active |
 | C-09 | mnemonic.rs | BIP-39 passphrase is fixed to empty string | LOW | Feature limitation |
-| C-10 | mnemonic.rs | KDF uses `SHA256(master || domain)` instead of HMAC/BIP-32 style KDF | LOW | Needs hardening |
-| C-11 | mnemonic / FFI | Rust seeds zeroize; FFI returned secret arrays do not | MEDIUM | Needs lifecycle design |
+| C-10 | mnemonic.rs | KDF used `SHA256(master || domain)` instead of HMAC/BIP-32 style KDF | LOW | FIXED — HMAC-SHA256 KDF implemented |
+| C-11 | mnemonic / FFI | Rust seeds zeroize; FFI returned secret arrays lacked explicit zeroize APIs | MEDIUM | FIXED — Rust FFI zeroize functions added; Swift lifecycle remains follow-up |
 | C-12 | bulletproof transcript | SHA-512 labelled transcript with challenge absorption | SAFE | Checked |
 | C-13 | range proof binding | Proof verifies against stored output commitment; balance equation is enforced | SAFE | Checked |
 | C-14 | blinding factors | CLI builder uses `OsRng`; FFI UTXO blindings are caller-supplied | SAFE / LOW | Operational caveat |
 | C-15 | commitment.rs / apply.rs | `verify_balance` is called during transaction validation | SAFE | Checked |
 | C-16 | indra-ffi | Raw pointer lengths/counts were not globally bounded before `from_raw_parts` | HIGH | FIXED — transaction/UTXO/buffer caps added |
-| C-17 | indra-ffi | Secret key material returned over FFI is not zeroized on free/drop | MEDIUM | Needs Swift/Rust zeroization |
+| C-17 | indra-ffi | Secret key material returned over FFI lacked explicit zeroize APIs | MEDIUM | PARTIAL FIX — Rust zeroize APIs added; Swift wrapper follow-up remains |
 | C-18 | bls.rs | Same-message aggregate BLS has no proof-of-possession guard | HIGH | Latent if BLS is used for consensus |
 | C-19 | bls.rs | `blst` parsing/verification requests subgroup/key validation | SAFE | Checked, with C-18 caveat |
 
@@ -50,6 +50,8 @@ Transactions include `chain_id`, version, module id, inputs, outputs, fee, fee b
 
 **Recommended fix:** Prepend `indra_crypto::hash::domains::TX_SIGN` to `TransactionV1::signing_bytes` under a hard-fork/protocol-version gate.
 
+**Status:** FIXED. `TransactionV1::signing_bytes` now prepends `indra_crypto::hash::domains::TX_SIGN`, and `transaction_signing_bytes_include_domain` locks the invariant.
+
 **References:** RFC 8032 domain separation guidance; general protocol transcript domain separation practice.
 
 ### C-02 — Vote signatures omit `chain_id`
@@ -63,6 +65,8 @@ Transactions include `chain_id`, version, module id, inputs, outputs, fee, fee b
 **Proof-of-concept:** Reasoning: the signed byte function has no `chain_id` parameter, so no call site can bind chain identity.
 
 **Recommended fix:** Add `chain_id` to vote signing bytes and thread it through vote production/verification under a hard-fork/protocol-version gate.
+
+**Status:** FIXED. `vote_signing_bytes` now includes a length-prefixed `chain_id` when `vote_chain_id_active(height)` is active. Vote production, vote verification, QC construction, QC verification, slash evidence verification, and tests now pass the chain id explicitly. The `block_hash` parameter remains the full `BlockHeaderV1::block_hash()` as required by the consensus safety fix, not `value_hash`.
 
 **References:** Tendermint/Cosmos signing domain practices; replay protection design.
 
@@ -101,6 +105,8 @@ This violates the “break both schemes” hybrid security goal for consensus fi
 
 **Recommended fix:** Use the strictest available dalek verification API and add malleability test vectors.
 
+**Status:** FIXED. `ed25519_rejects_non_canonical_signature` confirms the current `ed25519-dalek` verification path rejects a deliberately non-canonical signature encoding.
+
 **References:** RFC 8032; `ed25519-dalek` strict verification documentation.
 
 ### C-05 — ML-DSA-87 signing does not use caller-provided weak RNG
@@ -128,6 +134,8 @@ This violates the “break both schemes” hybrid security goal for consensus fi
 **Proof-of-concept:** Code inspection: the clamp masks low/high bits before scalar conversion.
 
 **Recommended fix:** Use a standard ECVRF-RISTRETTO255-SHA512 scalar derivation or `Scalar::from_bytes_mod_order_wide` from a 64-byte hash, gated if existing keys/state depend on current public keys.
+
+**Status:** FIXED. VRF scalar derivation now reduces the full SHA-512 output with `Scalar::from_bytes_mod_order_wide`. This is a breaking key-derivation change for existing VRF seeds and is intended for fresh-genesis deployment only.
 
 **References:** draft-irtf-cfrg-vrf-15; Ristretto255 group documentation.
 
@@ -194,6 +202,8 @@ This is strongest when `epoch_seed` or future heights are predictable before val
 
 **Recommended fix:** Use HKDF-SHA256 or HMAC-SHA512 with labelled info strings.
 
+**Status:** FIXED. `derive_seed` now uses HMAC-SHA256 keyed by the BIP-39 master seed and labelled by the INDRA domain string. This changes derived wallet seeds for the same mnemonic and must only be deployed with an explicit migration/fresh-genesis plan.
+
 **References:** RFC 5869 HKDF; BIP-32.
 
 ### C-11 — Seed zeroization is partial
@@ -207,6 +217,8 @@ This is strongest when `epoch_seed` or future heights are predictable before val
 **Proof-of-concept:** Code inspection; no zeroizing wrapper exists for `IndraKeyPair`.
 
 **Recommended fix:** Return opaque key handles or encrypted key blobs where possible. Add explicit zeroize/free APIs and Swift-side secure memory handling.
+
+**Status:** FIXED on the Rust FFI boundary. `indra_zeroize_keypair` and `indra_zeroize_tx_result` were added and exported in `indra.h`; Rust tests verify private fields are cleared. Swift wrapper lifecycle integration remains a separate application task.
 
 **References:** Rust `zeroize`; iOS Keychain/Secure Enclave key handling guidance.
 
@@ -300,6 +312,8 @@ This is partly inherent to C FFI, but unbounded `usize` lengths are avoidable.
 **Proof-of-concept:** Code inspection; no zeroizing drop/free path exists for FFI structs.
 
 **Recommended fix:** Add explicit zeroizing free functions and Swift wrappers that call them; avoid returning raw long-term secrets when a handle/keychain design is possible.
+
+**Status:** PARTIAL FIX. The Rust FFI now exports `indra_zeroize_keypair` and `indra_zeroize_tx_result`, and tests verify the exposed private fields/blindings are cleared. Swift wrappers still need to call these APIs during wallet lock/deallocation.
 
 **References:** Rust `zeroize`; mobile wallet key management practice.
 

@@ -292,6 +292,8 @@ pub mod hard_forks {
     pub const VRF_VERIFIED_OUTPUT_HEIGHT: u64 = 0;
     /// Quorum certificates require both Ed25519 and ML-DSA vote signatures.
     pub const HYBRID_QC_HEIGHT: u64 = 0;
+    /// Vote signatures include the chain ID in their signing domain.
+    pub const VOTE_CHAIN_ID_HEIGHT: u64 = 0;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -310,6 +312,12 @@ pub fn vrf_verified_output_active(height: u64) -> bool {
 #[inline]
 pub fn hybrid_qc_active(height: u64) -> bool {
     height >= hard_forks::HYBRID_QC_HEIGHT
+}
+
+/// Whether vote signatures must include the chain ID in their signing bytes.
+#[inline]
+pub fn vote_chain_id_active(height: u64) -> bool {
+    height >= hard_forks::VOTE_CHAIN_ID_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

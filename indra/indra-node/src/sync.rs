@@ -422,7 +422,7 @@ fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     }
 
     let total_stake = state.validators.total_active_stake();
-    verify_qc_strict(&qc, &validators, total_stake).map_err(NodeError::Consensus)
+    verify_qc_strict(&qc, &validators, total_stake, &state.chain_id).map_err(NodeError::Consensus)
 }
 
 fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
@@ -494,7 +494,7 @@ mod tests {
         codec::Encode,
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::MAX_VRF_PROOF_BYTES,
+            primitives::{DEFAULT_CHAIN_ID, MAX_VRF_PROOF_BYTES},
             vote::VoteStep,
         },
         Bytes32, ProtocolVersion, QuorumCertificateV1, VariableBytes,
@@ -645,6 +645,7 @@ mod tests {
             VoteStep::Precommit,
             value_hash,
             validator_id,
+            DEFAULT_CHAIN_ID,
             hybrid,
         )
         .unwrap();
@@ -652,6 +653,7 @@ mod tests {
             height,
             round,
             value_hash,
+            DEFAULT_CHAIN_ID,
             &[QcValidator {
                 validator_id,
                 position: 0,
@@ -982,6 +984,7 @@ mod tests {
             VoteStep::Precommit,
             block1.header.block_hash(),
             validator_id,
+            DEFAULT_CHAIN_ID,
             &hybrid,
         )
         .unwrap();

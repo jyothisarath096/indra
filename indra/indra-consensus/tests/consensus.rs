@@ -13,6 +13,7 @@ use indra_consensus::{
 use indra_core::{
     types::{
         crypto::HybridSignature,
+        primitives::DEFAULT_CHAIN_ID,
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
     },
@@ -223,7 +224,13 @@ fn full_consensus_round() {
     // All 3 validators cast precommit votes
     let voters: Vec<RegisteredVoter> = validators.iter().map(|v| v.as_registered_voter()).collect();
 
-    let mut collector = VoteCollector::new(height, round, VoteStep::Precommit, voters);
+    let mut collector = VoteCollector::new(
+        height,
+        round,
+        VoteStep::Precommit,
+        DEFAULT_CHAIN_ID.to_string(),
+        voters,
+    );
 
     for v in &validators {
         let vote = produce_vote(
@@ -232,6 +239,7 @@ fn full_consensus_round() {
             VoteStep::Precommit,
             block_hash,
             v.id,
+            DEFAULT_CHAIN_ID,
             &v.hybrid_kp,
         )
         .unwrap();
@@ -250,7 +258,13 @@ fn full_consensus_round() {
         .map(|(i, v)| v.as_qc_validator(i))
         .collect();
 
-    let mut builder = QcBuilder::new(height, round, block_hash, qc_validators.clone());
+    let mut builder = QcBuilder::new(
+        height,
+        round,
+        block_hash,
+        DEFAULT_CHAIN_ID.to_string(),
+        qc_validators.clone(),
+    );
     for vote in collector.accepted_votes() {
         builder.add_precommit(vote.clone());
     }
@@ -258,8 +272,8 @@ fn full_consensus_round() {
     let qc = builder.build().unwrap();
     assert_eq!(qc.signer_count(), 3);
 
-    assert!(verify_qc(&qc, &qc_validators, total_stake).is_ok());
-    assert!(verify_qc_strict(&qc, &qc_validators, total_stake).is_ok());
+    assert!(verify_qc(&qc, &qc_validators, total_stake, DEFAULT_CHAIN_ID).is_ok());
+    assert!(verify_qc_strict(&qc, &qc_validators, total_stake, DEFAULT_CHAIN_ID).is_ok());
 }
 
 #[test]
@@ -314,13 +328,28 @@ fn qc_builder_quorum_detection() {
 
     let qc_validators = vec![v1.as_qc_validator(0), v2.as_qc_validator(1)];
 
-    let mut builder = QcBuilder::new(1, 0, block_hash, qc_validators.clone());
+    let mut builder = QcBuilder::new(
+        1,
+        0,
+        block_hash,
+        DEFAULT_CHAIN_ID.to_string(),
+        qc_validators.clone(),
+    );
 
     // Before any votes
     assert_eq!(builder.current_stake_bps(), 0);
 
     // v1 votes (70%) → quorum reached (need > 2/3)
-    let vote1 = produce_vote(1, 0, VoteStep::Precommit, block_hash, v1.id, &v1.hybrid_kp).unwrap();
+    let vote1 = produce_vote(
+        1,
+        0,
+        VoteStep::Precommit,
+        block_hash,
+        v1.id,
+        DEFAULT_CHAIN_ID,
+        &v1.hybrid_kp,
+    )
+    .unwrap();
     builder.add_precommit(vote1);
     assert!(builder.current_stake_bps() >= 6_667);
     assert!(builder.build().is_ok());
@@ -360,6 +389,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
                 VoteStep::Precommit,
                 block_hash,
                 validator.id,
+                DEFAULT_CHAIN_ID,
                 &validator.hybrid_kp,
             )
             .unwrap();
@@ -387,5 +417,5 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         classical_signatures,
     };
 
-    assert!(verify_qc_strict(&qc, &qc_validators, 10_000).is_ok());
+    assert!(verify_qc_strict(&qc, &qc_validators, 10_000, DEFAULT_CHAIN_ID).is_ok());
 }

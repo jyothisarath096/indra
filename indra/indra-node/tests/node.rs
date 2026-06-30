@@ -13,7 +13,7 @@ use indra_core::{
     types::{
         block::BlockV1,
         crypto::HybridSignature,
-        primitives::VariableBytes,
+        primitives::{VariableBytes, DEFAULT_CHAIN_ID},
         vote::{VoteStep, VoteV1},
     },
     Bytes32,
@@ -195,6 +195,7 @@ fn build_single_validator_qc_bytes(
         VoteStep::Precommit,
         value_hash,
         validator_id,
+        DEFAULT_CHAIN_ID,
         &hybrid,
     )
     .unwrap();
@@ -202,6 +203,7 @@ fn build_single_validator_qc_bytes(
         height,
         round,
         value_hash,
+        DEFAULT_CHAIN_ID,
         &[QcValidator {
             validator_id,
             position: 0,
@@ -719,6 +721,7 @@ fn node_syncs_before_joining_consensus() {
         VoteStep::Prevote,
         Bytes32::from([0xCCu8; 32]),
         remote_id,
+        DEFAULT_CHAIN_ID,
         &remote,
     )
     .unwrap();

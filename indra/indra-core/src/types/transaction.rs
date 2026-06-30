@@ -186,7 +186,10 @@ impl TransactionV1 {
 
     /// Canonical bytes covered by the transaction signature.
     pub fn signing_bytes(&self, chain_id: &str) -> Vec<u8> {
+        use indra_crypto::hash::domains::TX_SIGN;
+
         let mut buf = Vec::new();
+        buf.extend_from_slice(TX_SIGN);
         VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(chain_id.as_bytes())
             .unwrap_or_default()
             .encode(&mut buf);
@@ -341,5 +344,12 @@ mod tests {
     fn tx_hash_is_deterministic() {
         let tx = minimal_tx();
         assert_eq!(tx.tx_hash(), tx.tx_hash());
+    }
+
+    #[test]
+    fn transaction_signing_bytes_include_domain() {
+        let tx = minimal_tx();
+        let signing_bytes = tx.signing_bytes("indra-testnet-1");
+        assert!(signing_bytes.starts_with(indra_crypto::hash::domains::TX_SIGN));
     }
 }
