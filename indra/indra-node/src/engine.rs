@@ -364,6 +364,20 @@ impl NodeEngine {
         let Some(validator_id) = self.validator_id else {
             return false;
         };
+        let Some(local_candidate) = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.validator_id == validator_id)
+        else {
+            return false;
+        };
+        if local_candidate.vrf_pubkey != vrf_kp.public_key() {
+            eprintln!(
+                "[proposer] local VRF key does not match registered validator VRF key for validator {} — refusing to propose",
+                hex::encode(&validator_id.0[..4])
+            );
+            return false;
+        }
         let slot = compute_proposer_vrf(
             validator_id,
             vrf_kp,
@@ -416,16 +430,12 @@ impl NodeEngine {
             });
         }
 
-        let _vrf_kp = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
+        let vrf_kp = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
             height: proposal_height,
         })?;
 
         let template = BlockTemplate {
-            proposer_vrf_keypair: VrfKeypair::from_seed(&self.config.vrf_seed.ok_or(
-                NodeError::NotProposer {
-                    height: proposal_height,
-                },
-            )?),
+            proposer_vrf_keypair: vrf_kp.clone(),
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp,
@@ -1234,6 +1244,79 @@ mod tests {
             .propose(&election, 1_700_000_003, Vec::new(), None)
             .unwrap_err();
         assert!(matches!(err, NodeError::MissingQc { height: 3 }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_genesis_height_one_block_production_succeeds() {
+        let dir = temp_dir("height1_production");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        install_active_validator(&mut engine, [0x42u8; 32], "local");
+
+        let candidate = engine.state.validators.active_validators().next().unwrap();
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from(indra_crypto::sha256(&engine.state.tip_hash.0)),
+            height: 1,
+            round: 0,
+            candidates: vec![ProposerCandidate {
+                validator_id: candidate.validator_id,
+                vrf_pubkey: candidate.vrf_pk.unwrap(),
+                verified_vrf_output: None,
+                stake: candidate.stake_spark,
+            }],
+        };
+
+        assert!(
+            engine.is_proposer(&election),
+            "single local validator should be eligible to produce height 1"
+        );
+        let block = engine
+            .propose(&election, 1_700_000_001, Vec::new(), None)
+            .unwrap();
+        assert_eq!(block.header.height, 1);
+        assert_eq!(block.header.prev_hash, engine.state.tip_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_proposer_rejects_registered_vrf_key_mismatch() {
+        let dir = temp_dir("height1_vrf_mismatch");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let local_id = {
+            install_active_validator(&mut engine, [0x42u8; 32], "local");
+            engine.validator_id().unwrap()
+        };
+        engine.state.validators.get_mut(&local_id).unwrap().vrf_pk =
+            Some(VrfKeypair::from_seed(&[0x99u8; 32]).public_key());
+
+        let candidate = engine.state.validators.active_validators().next().unwrap();
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from(indra_crypto::sha256(&engine.state.tip_hash.0)),
+            height: 1,
+            round: 0,
+            candidates: vec![ProposerCandidate {
+                validator_id: candidate.validator_id,
+                vrf_pubkey: candidate.vrf_pk.unwrap(),
+                verified_vrf_output: None,
+                stake: candidate.stake_spark,
+            }],
+        };
+
+        assert!(
+            !engine.is_proposer(&election),
+            "a node must not claim proposer eligibility when its local VRF key does not match the registered validator VRF key"
+        );
+        let err = engine
+            .propose(&election, 1_700_000_001, Vec::new(), None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer)
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -46,6 +46,7 @@ pub struct VrfOutput(pub [u8; 32]);
 pub struct VrfProof(pub Vec<u8>);
 
 /// A VRF keypair (secret scalar + public Ristretto point).
+#[derive(Clone)]
 pub struct VrfKeypair {
     secret_key: [u8; 32],
     /// The public key (compressed Ristretto point, 32 bytes).
