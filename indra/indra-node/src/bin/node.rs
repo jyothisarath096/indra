@@ -1159,6 +1159,7 @@ fn main() {
                                 let request_more;
                                 let mut caught_up_height = None;
                                 let mut imported_any = false;
+                                let mut qc_recovery_actions = Vec::new();
                                 {
                                     let mut d = driver.lock().unwrap();
                                     for block in response_blocks {
@@ -1180,6 +1181,12 @@ fn main() {
                                                 d.refresh_registered_voters();
                                                 d.sync_mut().on_block_imported(block.header.height);
                                                 d.reset_round();
+                                                if d.clear_last_qc_if_stale() {
+                                                    eprintln!(
+                                                        "[sync] imported height={} with stale last_qc_bytes — clearing and recovering QC for new tip",
+                                                        block.header.height,
+                                                    );
+                                                }
                                                 if should_log_sync_height(block.header.height) {
                                                     eprintln!(
                                                         "[sync] imported block at height={} from {}",
@@ -1206,6 +1213,7 @@ fn main() {
                                         d.sync_mut().next_request_after_response(new_height);
                                     if d.sync().is_caught_up() {
                                         d.on_sync_caught_up();
+                                        qc_recovery_actions = d.request_qc_if_needed();
                                         caught_up_height = Some(new_height);
                                     }
                                 }
@@ -1224,6 +1232,18 @@ fn main() {
                                 if imported_any {
                                     let _ = height_tx.send(());
                                     broadcast_status(&driver, &gossip);
+                                }
+                                if !qc_recovery_actions.is_empty() {
+                                    process_driver_actions(
+                                        &driver,
+                                        &gossip,
+                                        &height_tx,
+                                        &handshake_config,
+                                        caught_up_height.unwrap_or_default(),
+                                        qc_recovery_actions,
+                                        &metrics_state,
+                                        &last_block_timestamp,
+                                    );
                                 }
                                 if let Some(height) = caught_up_height {
                                     eprintln!(

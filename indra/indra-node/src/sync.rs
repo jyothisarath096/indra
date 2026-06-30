@@ -357,7 +357,7 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
     Ok(())
 }
 
-fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     if block.header.height <= 1 {
         return Ok(());
     }

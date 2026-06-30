@@ -25,7 +25,7 @@ use crate::{
     engine::NodeEngine,
     error::NodeError,
     slash::{SlashDetector, SlashEvidence},
-    sync::{verify_proposer_vrf, SyncState},
+    sync::{verify_block_qc, verify_proposer_vrf, SyncState},
 };
 
 fn now_ms() -> u128 {
@@ -248,13 +248,20 @@ impl ConsensusDriver {
             match driver.engine.load_persisted_qc() {
                 Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
                     match QuorumCertificateV1::decode_exact(&qc_bytes) {
-                        Ok(_) => {
+                        Ok(qc) if qc.height == driver.engine.state.height => {
                             eprintln!(
                                 "[driver] restored last_qc_bytes ({} bytes) for height {}",
                                 qc_bytes.len(),
-                                driver.engine.state.height,
+                                qc.height,
                             );
                             driver.last_qc_bytes = qc_bytes;
+                        }
+                        Ok(qc) => {
+                            eprintln!(
+                                "[driver] WARNING: persisted QC height {} does not match current state height {} — discarding and requesting from peers",
+                                qc.height,
+                                driver.engine.state.height,
+                            );
                         }
                         Err(err) => {
                             eprintln!(
@@ -298,6 +305,35 @@ impl ConsensusDriver {
         self.last_qc_bytes.clone()
     }
 
+    /// True when the cached QC does not certify the current committed tip.
+    pub fn last_qc_is_stale(&self) -> bool {
+        if self.engine.state.height == 0 {
+            return false;
+        }
+        if self.last_qc_bytes.is_empty() {
+            return true;
+        }
+        match QuorumCertificateV1::decode_exact(&self.last_qc_bytes) {
+            Ok(qc) => qc.height != self.engine.state.height,
+            Err(_) => true,
+        }
+    }
+
+    /// Drop the cached QC so recovery must fetch one for the current tip.
+    pub fn clear_last_qc_bytes(&mut self) {
+        self.last_qc_bytes.clear();
+    }
+
+    /// Clear cached QC bytes when they no longer certify the local tip.
+    pub fn clear_last_qc_if_stale(&mut self) -> bool {
+        if self.last_qc_is_stale() {
+            self.clear_last_qc_bytes();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Proposal eligibility is enforced inside block construction, where the
     /// node can see the exact height and QC bytes being embedded.
     pub fn can_propose(&self) -> bool {
@@ -307,7 +343,7 @@ impl ConsensusDriver {
     /// Request the QC for the currently committed tip if restart recovery left
     /// us without persisted `last_qc_bytes`.
     pub fn request_qc_if_needed(&self) -> Vec<DriverAction> {
-        if self.engine.state.height > 0 && self.last_qc_bytes.is_empty() {
+        if self.engine.state.height > 0 && self.last_qc_is_stale() {
             vec![DriverAction::RequestQC {
                 height: self.engine.state.height,
             }]
@@ -831,6 +867,16 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         }
 
+        if block.header.height > 1 {
+            if let Err(err) = verify_block_qc(&block, &self.engine.state) {
+                eprintln!(
+                    "[vote] rejecting proposal at height={} round={}: embedded QC invalid: {}",
+                    block.header.height, block.header.proposer_round, err,
+                );
+                return vec![DriverAction::None];
+            }
+        }
+
         let mut projected_state = self.engine.state.clone();
         if indra_state::apply_block(&mut projected_state, &block, 0).is_err() {
             return vec![DriverAction::None];
@@ -1324,7 +1370,7 @@ impl ConsensusDriver {
         let local_height = self.engine.state.height;
 
         if height == local_height {
-            if self.last_qc_bytes.is_empty() {
+            if self.last_qc_is_stale() {
                 return vec![];
             }
             eprintln!("[driver] serving QC for height {} to {}", height, from);
@@ -1375,7 +1421,7 @@ impl ConsensusDriver {
         height: u64,
         qc_bytes: Vec<u8>,
     ) -> Vec<DriverAction> {
-        if height != self.engine.state.height || !self.last_qc_bytes.is_empty() {
+        if height != self.engine.state.height || !self.last_qc_is_stale() {
             return vec![];
         }
 
@@ -1553,6 +1599,35 @@ mod tests {
                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
         }
+    }
+
+    fn single_validator_qc_bytes(
+        driver: &ConsensusDriver,
+        signer: &HybridKeypair,
+        height: u64,
+        block_hash: Bytes32,
+    ) -> Vec<u8> {
+        let validator_id = Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+        let vote = indra_consensus::vote::produce_vote(
+            height,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            validator_id,
+            DEFAULT_CHAIN_ID,
+            signer,
+        )
+        .unwrap();
+        build_qc(
+            height,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &driver.engine.qc_validators(),
+            vec![&vote],
+        )
+        .unwrap()
+        .encode_to_vec()
     }
 
     fn install_active_validator(
@@ -2587,6 +2662,158 @@ mod tests {
     }
 
     #[test]
+    fn last_qc_is_stale_detects_height_mismatch() {
+        let (mut driver, dir) = local_driver([0xA1u8; 32], "last_qc_stale");
+        let local = install_active_validator(&mut driver, [0xA1u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = 5;
+        driver.last_qc_bytes =
+            single_validator_qc_bytes(&driver, &local, 3, Bytes32::from([0x33u8; 32]));
+
+        assert!(driver.last_qc_is_stale());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_qc_is_stale_false_when_height_matches() {
+        let (mut driver, dir) = local_driver([0xA2u8; 32], "last_qc_fresh");
+        let local = install_active_validator(&mut driver, [0xA2u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = 5;
+        driver.last_qc_bytes =
+            single_validator_qc_bytes(&driver, &local, 5, Bytes32::from([0x55u8; 32]));
+
+        assert!(!driver.last_qc_is_stale());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_import_clears_stale_last_qc_bytes() {
+        let (mut driver, dir) = local_driver([0xA3u8; 32], "sync_import_stale_qc");
+        let local = install_active_validator(&mut driver, [0xA3u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let block1 = make_strict_block(&driver, [0xA3u8; 32], 0, vec![]);
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1,
+        });
+        let qc_for_height_1 = driver.last_qc_bytes();
+        assert!(!qc_for_height_1.is_empty());
+
+        let block2 = make_strict_block(&driver, [0xA3u8; 32], 0, qc_for_height_1.clone());
+        driver.engine.commit_block(&block2).unwrap();
+        driver.refresh_registered_voters();
+        driver.sync_mut().on_block_imported(block2.header.height);
+        driver.reset_round();
+
+        assert_eq!(driver.height(), 2);
+        assert!(driver.last_qc_is_stale());
+        assert!(driver.clear_last_qc_if_stale());
+        assert!(driver.last_qc_bytes().is_empty());
+        assert!(matches!(
+            driver.request_qc_if_needed().as_slice(),
+            [DriverAction::RequestQC { height }] if *height == 2
+        ));
+
+        drop(local);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposal_with_wrong_qc_height_rejected_at_intake_not_just_finalization() {
+        let (mut driver, dir) = local_driver([0xA4u8; 32], "proposal_wrong_qc_intake");
+        let _local = install_active_validator(&mut driver, [0xA4u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let block1 = make_strict_block(&driver, [0xA4u8; 32], 0, vec![]);
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1,
+        });
+        let qc_for_height_1 = driver.last_qc_bytes();
+
+        let block2 = make_strict_block(&driver, [0xA4u8; 32], 0, qc_for_height_1.clone());
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block2,
+        });
+        assert_eq!(driver.height(), 2);
+
+        let malformed_block3 = make_strict_block(&driver, [0xA4u8; 32], 0, qc_for_height_1);
+        let malformed_hash = malformed_block3.header.block_hash();
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: malformed_block3,
+        });
+
+        assert!(actions
+            .iter()
+            .all(|action| matches!(action, DriverAction::None)));
+        assert!(driver.pending_block(&malformed_hash).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_restart_with_stale_persisted_qc_does_not_restore_it() {
+        let dir = temp_dir("restart_stale_qc");
+        let seed = [0xA5u8; 32];
+        let stale_qc_bytes = {
+            let (mut source_driver, source_dir) = local_driver(seed, "restart_stale_qc_source");
+            let local = install_active_validator(&mut source_driver, seed, "local");
+            source_driver.refresh_registered_voters();
+            source_driver.engine.state.height = 3;
+            let bytes =
+                single_validator_qc_bytes(&source_driver, &local, 3, Bytes32::from([0xA5u8; 32]));
+            let _ = std::fs::remove_dir_all(&source_dir);
+            bytes
+        };
+
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        config.validator_seed = Some(seed);
+        config.vrf_seed = Some(seed);
+        config.pq_pk = Some(pq.public_key().0.to_vec());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        indra_storage::save_last_qc(&config.state_dir(), &stale_qc_bytes).unwrap();
+
+        let mut engine = NodeEngine::init(config).unwrap();
+        engine.state.height = 5;
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let restarted = ConsensusDriver::new(engine, vote_safety);
+
+        assert!(restarted.last_qc_bytes().is_empty());
+        assert!(restarted.last_qc_is_stale());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normal_consensus_unaffected_by_staleness_checks() {
+        let (mut driver, dir) = local_driver([0xA6u8; 32], "normal_qc_fresh");
+        let _local = install_active_validator(&mut driver, [0xA6u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let block1 = make_strict_block(&driver, [0xA6u8; 32], 0, vec![]);
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1,
+        });
+        assert_eq!(driver.height(), 1);
+        assert!(!driver.last_qc_is_stale());
+
+        let block2 = make_strict_block(&driver, [0xA6u8; 32], 0, driver.last_qc_bytes());
+        let _ = driver.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block2,
+        });
+        assert_eq!(driver.height(), 2);
+        assert!(!driver.last_qc_is_stale());
+        assert!(driver.request_qc_if_needed().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn last_qc_restored_on_restart() {
         let dir = temp_dir("restore_qc");
         let seed = [0x62u8; 32];
@@ -2748,8 +2975,11 @@ mod tests {
     #[test]
     fn qc_request_not_sent_when_qc_present() {
         let (mut driver, dir) = local_driver([0x68u8; 32], "qc_request_present");
+        let local = install_active_validator(&mut driver, [0x68u8; 32], "local");
+        driver.refresh_registered_voters();
         driver.engine.state.height = 9;
-        driver.last_qc_bytes = vec![1, 2, 3];
+        driver.last_qc_bytes =
+            single_validator_qc_bytes(&driver, &local, 9, Bytes32::from([0x68u8; 32]));
         assert!(driver.request_qc_if_needed().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2757,16 +2987,20 @@ mod tests {
     #[test]
     fn qc_request_served_when_height_matches() {
         let (mut driver, dir) = local_driver([0x69u8; 32], "qc_request_served");
+        let local = install_active_validator(&mut driver, [0x69u8; 32], "local");
+        driver.refresh_registered_voters();
         let from: SocketAddr = "127.0.0.1:9504".parse().unwrap();
         driver.engine.state.height = 12;
-        driver.last_qc_bytes = vec![7, 8, 9];
+        let expected_qc_bytes =
+            single_validator_qc_bytes(&driver, &local, 12, Bytes32::from([0x69u8; 32]));
+        driver.last_qc_bytes = expected_qc_bytes.clone();
 
         let actions = driver.process(DriverEvent::QcRequest { from, height: 12 });
 
         assert!(matches!(
             actions.as_slice(),
             [DriverAction::SendQCResponse { to, height, qc_bytes }]
-                if *to == from && *height == 12 && *qc_bytes == vec![7, 8, 9]
+                if *to == from && *height == 12 && qc_bytes == &expected_qc_bytes
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
