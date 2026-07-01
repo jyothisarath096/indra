@@ -174,6 +174,14 @@ pub const DUST_LIMIT_SPARK: u64 = 100_000;
 /// Minimum validator self-bond required for registration.
 pub const MINIMUM_VALIDATOR_BOND_SPARK: u64 = 1_000_000_000;
 
+/// Maximum governance-set global delegation floor.
+///
+/// The delegation floor may be raised for spam resistance, but it must not be
+/// raised above the minimum cost to register a validator. Otherwise governance
+/// could effectively disable ordinary delegation while validator registration
+/// remains cheaper than delegating.
+pub const MAX_DELEGATION_SPARK: u64 = MINIMUM_VALIDATOR_BOND_SPARK;
+
 /// Minimum active validator self-stake required to remain in the active set.
 ///
 /// Falling below this floor after self-unstaking demotes the validator back to
@@ -409,13 +417,21 @@ pub const TARGET_UTILISATION_DENOMINATOR: u64 = 100;
 
 // ── Governance ────────────────────────────────────────────────────────────────
 
-/// Minimum stake participation for a vote to be valid (3300 = 33.00%).
+/// Deprecated legacy governance quorum constant.
+///
+/// Current governance uses `GovernableParams::governance_quorum_bps` and
+/// `governance_critical_quorum_bps` instead.
+#[deprecated(note = "superseded by GovernableParams governance quorum fields")]
 pub const QUORUM_THRESHOLD_BPS: u32 = 3_300;
 /// Consensus quorum threshold — strictly more than 2/3 of stake must agree
 /// for a block to be finalised.
 pub const CONSENSUS_QUORUM_BPS: u32 = 6_667;
 
-/// Required YES fraction of participating stake to pass (8000 = 80.00%).
+/// Deprecated legacy governance pass threshold.
+///
+/// Current governance requires yes stake to exceed the per-proposal total-stake
+/// quorum in `GovernableParams`.
+#[deprecated(note = "superseded by GovernableParams governance quorum fields")]
 pub const PASS_THRESHOLD_BPS: u32 = 6_600; // reduced from 8000 — 80% impossible at 500+ validators
 
 /// Minimum validator commission rate in basis points (500 = 5%).

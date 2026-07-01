@@ -121,9 +121,10 @@ fn parse_action_json(action_json: *const c_char) -> Result<GovernableAction, Ind
 
 fn wire_vote(vote: u8) -> Result<u8, IndraError> {
     match vote {
-        0 => Ok(1),
-        1 => Ok(0),
-        2 => Ok(2),
+        // Governance reveal wire values are defined by the state machine:
+        // 0 = NO, 1 = YES. Abstain is represented by not revealing.
+        0 => Ok(0),
+        1 => Ok(1),
         _ => Err(IndraError::InvalidVote),
     }
 }
@@ -518,7 +519,7 @@ mod tests {
 
     #[test]
     fn governance_commit_reveal_commitment_matches() {
-        let vote = 0u8;
+        let vote = 1u8;
         let reveal_nonce = [0xABu8; 32];
         let mut out_commitment = [0u8; 32];
         let result = unsafe {
@@ -526,6 +527,18 @@ mod tests {
         };
         assert_eq!(result, OK);
         let expected = compute_vote_commit_hash(1, Bytes32::from(reveal_nonce));
+        assert_eq!(out_commitment, expected.0);
+    }
+
+    #[test]
+    fn governance_no_vote_uses_state_no_value() {
+        let reveal_nonce = [0xCDu8; 32];
+        let mut out_commitment = [0u8; 32];
+        let result = unsafe {
+            indra_compute_vote_commitment(0, reveal_nonce.as_ptr(), out_commitment.as_mut_ptr())
+        };
+        assert_eq!(result, OK);
+        let expected = compute_vote_commit_hash(0, Bytes32::from(reveal_nonce));
         assert_eq!(out_commitment, expected.0);
     }
 
@@ -591,7 +604,7 @@ mod tests {
         let reveal_nonce = [0xABu8; 32];
         let mut out_commitment = [0u8; 32];
         let result = unsafe {
-            indra_compute_vote_commitment(3, reveal_nonce.as_ptr(), out_commitment.as_mut_ptr())
+            indra_compute_vote_commitment(2, reveal_nonce.as_ptr(), out_commitment.as_mut_ptr())
         };
         assert_eq!(result, IndraError::InvalidVote.code());
     }

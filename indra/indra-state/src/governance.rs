@@ -10,9 +10,9 @@ use indra_core::{
         governance::{GovernableAction, ProposalTier},
         primitives::{
             bps_of, muldiv, overflow_fix_active, Bytes32, DUST_LIMIT_SPARK,
-            GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS, SLASH_DOUBLE_PRECOMMIT_BPS,
-            SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SLASH_SURROUND_VOTE_BPS,
-            SPARK_PER_INDRA,
+            GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS, MAX_DELEGATION_SPARK,
+            SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS,
+            SLASH_SURROUND_VOTE_BPS, SPARK_PER_INDRA,
         },
     },
 };
@@ -90,6 +90,11 @@ impl GovernableParams {
             GovernableAction::SetMinDelegationSpark { value } => {
                 if *value < DUST_LIMIT_SPARK {
                     return Err(format!("floor is {DUST_LIMIT_SPARK} Spark (DUST_LIMIT)"));
+                }
+                if *value > MAX_DELEGATION_SPARK {
+                    return Err(format!(
+                        "ceiling is {MAX_DELEGATION_SPARK} Spark (MAX_DELEGATION_SPARK)"
+                    ));
                 }
             }
             GovernableAction::SetProposalDepositSpark { value } => {
@@ -998,6 +1003,31 @@ mod tests {
         assert!(params
             .validate_action(&GovernableAction::SetSlashLivenessBps { value: 0 })
             .is_err());
+    }
+
+    #[test]
+    fn governance_cannot_set_min_delegation_above_maximum() {
+        use indra_core::types::primitives::MAX_DELEGATION_SPARK;
+
+        let params = GovernableParams::default_mainnet();
+        let err = params
+            .validate_action(&GovernableAction::SetMinDelegationSpark {
+                value: MAX_DELEGATION_SPARK + 1,
+            })
+            .unwrap_err();
+        assert!(err.contains("MAX_DELEGATION_SPARK"));
+    }
+
+    #[test]
+    fn governance_can_set_min_delegation_within_bounds() {
+        use indra_core::types::primitives::MAX_DELEGATION_SPARK;
+
+        let params = GovernableParams::default_mainnet();
+        params
+            .validate_action(&GovernableAction::SetMinDelegationSpark {
+                value: MAX_DELEGATION_SPARK,
+            })
+            .unwrap();
     }
 
     #[test]

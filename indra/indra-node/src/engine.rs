@@ -36,7 +36,12 @@ use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
 };
-use indra_state::{apply::compute_slash_evidence_hash, ChainState};
+use indra_state::{
+    apply::compute_slash_evidence_hash,
+    epoch::epoch_for_height,
+    governance_apply::{apply_governance_op, validate_governance_op},
+    ChainState,
+};
 use indra_storage::{migration_record, BlockStore, EpochStore, MigrationLog, StateStore};
 
 use crate::{
@@ -259,6 +264,9 @@ impl NodeEngine {
     pub fn add_governance_op(&mut self, op: GovernanceOpV2) -> NodeResult<()> {
         let signer_id = op.signer_id;
         let nonce = op.nonce;
+        let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
+        validate_governance_op(&self.state, &op, current_epoch, &self.state.chain_id)
+            .map_err(|error| NodeError::InvalidGovernanceOp(error.to_string()))?;
         if self
             .governance_mempool
             .iter()
@@ -270,6 +278,25 @@ impl NodeEngine {
         }
         self.governance_mempool.push(op);
         Ok(())
+    }
+
+    /// Remove governance operations that are no longer valid against the
+    /// current tip before selecting them for a new block.
+    pub fn prune_invalid_governance_ops(&mut self) {
+        let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
+        let chain_id = self.state.chain_id.clone();
+        let state = self.state.clone();
+        self.governance_mempool.retain(|op| {
+            let valid = validate_governance_op(&state, op, current_epoch, &chain_id).is_ok();
+            if !valid {
+                eprintln!(
+                    "[governance] evicting invalid pending op signer={} nonce={}",
+                    hex::encode(&op.signer_id.0[..4]),
+                    op.nonce
+                );
+            }
+            valid
+        });
     }
 
     /// Add slash evidence to the pending pool if it has not already been seen.
@@ -312,12 +339,34 @@ impl NodeEngine {
     }
 
     /// Select governance operations for block inclusion.
-    pub fn select_governance_ops(&self) -> Vec<GovernanceOpV2> {
-        self.governance_mempool
-            .iter()
-            .take(MAX_GOV_OPS_PER_BLOCK)
-            .cloned()
-            .collect()
+    pub fn select_governance_ops(&mut self) -> Vec<GovernanceOpV2> {
+        let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
+        let chain_id = self.state.chain_id.clone();
+        let mut scratch = self.state.clone();
+        let mut selected = Vec::new();
+        let mut retained = Vec::new();
+        for op in std::mem::take(&mut self.governance_mempool) {
+            if selected.len() >= MAX_GOV_OPS_PER_BLOCK {
+                retained.push(op);
+                continue;
+            }
+            match apply_governance_op(&mut scratch, &op, current_epoch, &chain_id) {
+                Ok(()) => {
+                    selected.push(op.clone());
+                    retained.push(op);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[governance] evicting invalid pending op signer={} nonce={}: {}",
+                        hex::encode(&op.signer_id.0[..4]),
+                        op.nonce,
+                        error
+                    );
+                }
+            }
+        }
+        self.governance_mempool = retained;
+        selected
     }
 
     /// Remove staking operations included in a committed block.
@@ -393,7 +442,7 @@ impl NodeEngine {
 
     /// Propose a block for the next height (only if this node is the proposer).
     pub fn propose(
-        &self,
+        &mut self,
         election: &ProposerElection,
         timestamp: u64,
         prev_qc_bytes: Vec<u8>,
@@ -410,12 +459,18 @@ impl NodeEngine {
             });
         }
 
-        let vrf_kp = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
-            height: proposal_height,
-        })?;
+        let vrf_kp = self
+            .vrf_keypair
+            .as_ref()
+            .ok_or(NodeError::NotProposer {
+                height: proposal_height,
+            })?
+            .clone();
+
+        self.prune_invalid_governance_ops();
 
         let template = BlockTemplate {
-            proposer_vrf_keypair: vrf_kp.clone(),
+            proposer_vrf_keypair: vrf_kp,
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp,
@@ -693,12 +748,18 @@ mod tests {
     };
     use indra_core::codec::Encode;
     use indra_core::types::crypto::{HybridPubKey, HybridSignature};
+    use indra_core::types::governance::{
+        governance_signing_domain, GovernableAction, GovernanceActionType, GovernanceOpV2,
+        GovernancePayload,
+    };
     use indra_core::types::primitives::{
         DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
     };
     use indra_core::types::slashing::SlashEvidenceV1;
     use indra_core::types::staking::StakingOpBody;
+    use indra_core::types::transaction::OutputV1;
     use indra_core::types::vote::{VoteStep, VoteV1};
+    use indra_core::CommitmentV1;
     use indra_core::VariableBytes;
     use indra_state::{ValidatorEntry, ValidatorStatus};
 
@@ -770,6 +831,82 @@ mod tests {
             nonce,
             signature: dummy_signature(),
         }
+    }
+
+    fn governance_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
+        let public = keypair.public_key();
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        }
+    }
+
+    fn sign_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair) {
+        let domain = governance_signing_domain(
+            op.action_type,
+            op.signer_id,
+            op.nonce,
+            &op.payload,
+            DEFAULT_CHAIN_ID,
+        );
+        let msg_hash = indra_crypto::sha256(&domain);
+        let sig = keypair.sign(&msg_hash).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
+    fn governance_deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
+        OutputV1 {
+            value_spark,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::ZERO,
+            },
+            owner_pubkey,
+            range_proof: VariableBytes::from_slice(&[]).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn valid_governance_propose_op(
+        engine: &mut NodeEngine,
+        keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let proposer_pubkey = governance_pubkey_from_keypair(keypair);
+        let signer_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let deposit_utxo_id = engine
+            .state
+            .utxos
+            .insert(
+                governance_deposit_output(
+                    proposer_pubkey.clone(),
+                    engine.state.governance.params.proposal_deposit_spark,
+                ),
+                0,
+                nonce as u32,
+                0,
+            )
+            .unwrap();
+        let payload = GovernancePayload::Propose {
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            deposit_utxo_id,
+            proposer_pubkey,
+            title: VariableBytes::from_slice(b"test").unwrap(),
+            description: VariableBytes::from_slice(b"test").unwrap(),
+        };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ProposeChange,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_signature(),
+        };
+        sign_governance_op(&mut op, keypair);
+        op
     }
 
     fn dummy_slash_evidence(seed: u8) -> SlashEvidenceV1 {
@@ -1359,6 +1496,67 @@ mod tests {
             Err(NodeError::InvalidStakingOp(_))
         ));
         assert_eq!(engine.staking_mempool.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_rejects_invalid_signature() {
+        let dir = temp_dir("governance_bad_sig");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x51; 32], "gov");
+        let mut op = valid_governance_propose_op(&mut engine, &keypair, 1);
+        op.signature = dummy_signature();
+
+        assert!(matches!(
+            engine.add_governance_op(op),
+            Err(NodeError::InvalidGovernanceOp(_))
+        ));
+        assert!(engine.governance_mempool.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_rejects_op_for_nonexistent_proposal() {
+        let dir = temp_dir("governance_missing_proposal");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x52; 32], "gov");
+        let signer_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id,
+            nonce: 1,
+            payload: GovernancePayload::Commit {
+                proposal_id: Bytes32::from([0x99; 32]),
+                commit_hash: Bytes32::from([0x44; 32]),
+            },
+            signature: dummy_signature(),
+        };
+        sign_governance_op(&mut op, &keypair);
+
+        assert!(matches!(
+            engine.add_governance_op(op),
+            Err(NodeError::InvalidGovernanceOp(_))
+        ));
+        assert!(engine.governance_mempool.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_accepts_valid_op() {
+        let dir = temp_dir("governance_valid");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x53; 32], "gov");
+        let op = valid_governance_propose_op(&mut engine, &keypair, 1);
+
+        engine.add_governance_op(op.clone()).unwrap();
+
+        assert_eq!(engine.governance_mempool, vec![op]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -215,8 +215,10 @@ fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey
 fn parse_vote(raw: &str) -> CliResult<u8> {
     match raw {
         "yes" | "YES" | "1" => Ok(1),
-        "no" | "NO" | "2" => Ok(2),
-        "abstain" | "ABSTAIN" | "0" => Ok(0),
+        "no" | "NO" | "0" => Ok(0),
+        "abstain" | "ABSTAIN" => Err(CliError::Parse(
+            "governance abstain is represented by not submitting a reveal op".into(),
+        )),
         _ => Err(CliError::Parse(format!("invalid vote '{raw}'"))),
     }
 }
@@ -312,6 +314,32 @@ Common flags:\n\
 Propose flags:\n\
   --action <name> --value <n> --deposit-utxo <hex> --title <text> --description <text>\n\n\
 Vote flags:\n\
-  --proposal-id <hex> --vote yes|no|abstain --vote-nonce <32-byte-hex>"
+  --proposal-id <hex> --vote yes|no --vote-nonce <32-byte-hex>\n\
+  Abstain by not submitting a reveal op."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_no_vote_encodes_to_state_no_value() {
+        assert_eq!(parse_vote("no").unwrap(), 0);
+        assert_eq!(parse_vote("NO").unwrap(), 0);
+        assert_eq!(parse_vote("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn cli_yes_vote_encodes_to_state_yes_value() {
+        assert_eq!(parse_vote("yes").unwrap(), 1);
+        assert_eq!(parse_vote("YES").unwrap(), 1);
+        assert_eq!(parse_vote("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn abstain_behavior_is_explicitly_documented() {
+        let err = parse_vote("abstain").unwrap_err().to_string();
+        assert!(err.contains("not submitting a reveal op"));
+    }
 }

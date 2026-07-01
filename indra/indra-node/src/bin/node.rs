@@ -1548,6 +1548,7 @@ fn main() {
                                         .unwrap_or_default()
                                         .as_secs();
                                     let polc_round = d.proposal_polc_round(height);
+                                    let last_qc_bytes = d.last_qc_bytes();
                                     let proposal_result =
                                         if matches!(proposal_mode, ProposalMode::Reproposal) {
                                             let (valid_block, valid_round) = valid_reproposal
@@ -1558,13 +1559,13 @@ fn main() {
                                                 Some(valid_round),
                                                 &election,
                                                 valid_block.header.timestamp,
-                                                d.last_qc_bytes(),
+                                                last_qc_bytes,
                                             )
                                         } else {
                                             d.engine.propose(
                                                 &election,
                                                 timestamp,
-                                                d.last_qc_bytes(),
+                                                last_qc_bytes,
                                                 polc_round,
                                             )
                                         };

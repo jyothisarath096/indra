@@ -87,6 +87,20 @@ pub fn apply_governance_op(
     }
 }
 
+/// Validate a governance op against a scratch copy of the provided state.
+///
+/// This is used by mempool/RPC admission so malformed governance operations do
+/// not sit in the pending pool and later poison honest block proposals.
+pub fn validate_governance_op(
+    state: &ChainState,
+    op: &GovernanceOpV2,
+    current_epoch: u64,
+    chain_id: &str,
+) -> StateResult<()> {
+    let mut scratch = state.clone();
+    apply_governance_op(&mut scratch, op, current_epoch, chain_id)
+}
+
 fn apply_propose(
     state: &mut ChainState,
     op: &GovernanceOpV2,
@@ -1010,5 +1024,54 @@ mod tests {
         assert!(state.utxos.all_entries().any(|entry| {
             entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
         }));
+    }
+
+    #[test]
+    fn state_rejects_invalid_reveal_value() {
+        let mut state = ChainState::new_genesis();
+        let proposal_id = Bytes32::from([0x99; 32]);
+        let validator_id = Bytes32::from([0xAA; 32]);
+        let nonce = Bytes32::from([0xBB; 32]);
+        let mut commit_bytes = Vec::new();
+        2u8.encode(&mut commit_bytes);
+        nonce.encode(&mut commit_bytes);
+        let commit_hash = Bytes32::from(sha256(&commit_bytes));
+
+        let (proposer_pubkey, _) = keypair(0x99);
+        let mut proposal = proposal_record(
+            proposal_id,
+            proposer_pubkey,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            ProposalPhase::Reveal,
+        );
+        proposal.commits.insert(
+            validator_id,
+            VoteCommit {
+                validator_id,
+                commit_hash,
+                committed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+        let op = GovernanceOpV2 {
+            action_type: GovernanceActionType::RevealVote,
+            signer_id: validator_id,
+            nonce: 1,
+            payload: GovernancePayload::Reveal {
+                proposal_id,
+                vote: 2,
+                nonce,
+            },
+            signature: dummy_sig(),
+        };
+
+        let result = apply_reveal(&mut state, &op, 0, &proposal_id, 2, &nonce);
+
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidGovernanceOp { reason }) if reason.contains("vote must be 0 or 1")
+        ));
     }
 }

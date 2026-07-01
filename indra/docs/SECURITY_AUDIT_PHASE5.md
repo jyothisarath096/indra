@@ -2,22 +2,22 @@
 
 ## Executive Summary
 
-Phase 5 found two high-priority governance vulnerabilities and three medium/low hardening gaps. GV-01 and GV-09 are now fixed. Governance proposal deposits must be owned by the proposer before the UTXO can be spent, closing the direct funds-at-risk path. Queued governance actions are now revalidated immediately before both manual and automatic execution, preserving monotonic safety rules such as "governance quorum can only increase." The core vote/QC-grade authorization model is otherwise strong: governance operations are hybrid-signed, chain-ID domain separated, nonce-protected, stake-weighted by snapshots, and thresholded by yes stake over total snapshot stake.
+Phase 5 found two high-priority governance vulnerabilities and three medium/low hardening gaps. GV-01, GV-02, GV-04, GV-08, and GV-09 are now fixed. Governance proposal deposits must be owned by the proposer before the UTXO can be spent, closing the direct funds-at-risk path. Queued governance actions are revalidated immediately before both manual and automatic execution, preserving monotonic safety rules such as "governance quorum can only increase." Client vote encoding now matches state semantics (`0 = no`, `1 = yes`, abstain by not revealing), governance mempool admission validates ops against scratch state before acceptance, and `min_delegation_spark` has a hard upper bound.
 
-Regression tests were added for the two fixed findings. Remaining follow-up items are GV-02, GV-04, and GV-08.
+Regression tests were added for all fixed Phase 5 findings. Remaining lower-priority governance cleanup is historical proposal pruning/archival.
 
 ## Summary Table
 
 | ID | Component | Finding | Severity | Status |
 |----|-----------|---------|----------|--------|
 | GV-01 | Authorization | Proposal deposit UTXO ownership is now enforced before spending | CRITICAL | FIXED |
-| GV-02 | Authorization | Vote authorization is hybrid-signed and snapshot-gated, but CLI/FFI vote encoding is inconsistent with state semantics | MEDIUM | NEEDS FIX |
+| GV-02 | Authorization | CLI/FFI vote encoding now matches state reveal semantics | MEDIUM | FIXED |
 | GV-03 | Authorization | Double voting is prevented by one commit/reveal per validator per proposal | SAFE | VERIFIED |
-| GV-04 | Lifecycle | Proposal lifecycle has caps/timelocks, but governance mempool admits invalid ops and historical proposals are unpruned | MEDIUM | NEEDS HARDENING |
+| GV-04 | Lifecycle | Governance mempool admission validates ops before acceptance; historical proposal pruning remains cleanup | MEDIUM | FIXED |
 | GV-05 | Quorum | Quorum base is snapshot total governance stake, not live mutable stake | SAFE | VERIFIED |
 | GV-06 | Quorum | Approval requires yes stake to exceed the configured total-stake threshold; minority pass not possible under defaults | SAFE | VERIFIED |
 | GV-07 | Quorum | Thresholds are stake-weighted, not validator-count-weighted | SAFE | VERIFIED |
-| GV-08 | Parameters | Governable parameters are enumerated and bounded; `min_delegation_spark` lacks an upper bound | LOW | NEEDS CLEANUP |
+| GV-08 | Parameters | `min_delegation_spark` now has a maximum and stale governance constants are deprecated | LOW | FIXED |
 | GV-09 | Parameters | Queued governance-of-governance actions are now revalidated at execution time | HIGH | FIXED |
 | GV-10 | Parameters | Phase 4 security constants are mostly hard-coded and not governable | SAFE | VERIFIED |
 | GV-11 | Execution | Timelocks exist for all passed proposals before execution | SAFE | VERIFIED |
@@ -85,7 +85,7 @@ Regression tests:
 
 Severity: MEDIUM
 
-Status: NEEDS FIX
+Status: FIXED
 
 Code evidence:
 
@@ -94,16 +94,21 @@ Code evidence:
 - Voting authorization is snapshot-gated: commits require `snapshot1` and reject signers absent from that snapshot.
 - Double commits are rejected by `proposal.commits.contains_key(&op.signer_id)`.
 - Reveal votes accept only `0` or `1`, where `1` is yes and `0` is no.
-- CLI parsing maps `"no"` to `2` and `"abstain"` to `0`: `indra-cli/src/bin/governance.rs:215`.
-- FFI maps input vote `2` to wire vote `2`: `indra-ffi/src/governance.rs:122`.
+- CLI parsing now maps `"no"`/`"0"` to `0`, `"yes"`/`"1"` to `1`, and rejects explicit `"abstain"` with guidance that abstention is represented by not submitting a reveal op.
+- FFI vote handling now accepts only the state wire values `0` and `1`; `2` is rejected as invalid.
 
 Analysis:
 
-The on-chain authorization model is strong: active/registered validator voting is hybrid-signed, nonce-protected, and tied to the chain ID. The client tooling is inconsistent with the state machine, though. A CLI "no" vote produces `2`, which the state rejects as invalid. A CLI "abstain" vote produces `0`, which the state interprets as a no vote. FFI similarly exposes a `2` vote value even though the state does not support explicit abstain reveals. This is not a signature bypass, but it can materially affect governance participation and outcomes by preventing valid NO votes and turning intended abstentions into NO votes.
+The on-chain authorization model is strong: active/registered validator voting is hybrid-signed, nonce-protected, and tied to the chain ID. The client tooling now matches the state machine. INDRA keeps the existing non-breaking reveal model: `0 = no`, `1 = yes`, and abstention means not revealing.
 
-Recommended fix:
+Regression tests:
 
-Align client and FFI vote encodings with the state machine. Either define explicit abstain support in `GovernancePayload::Reveal` and tallying, or document that abstention means no reveal and reject client-side abstain reveal construction.
+- `cli_no_vote_encodes_to_state_no_value`
+- `cli_yes_vote_encodes_to_state_yes_value`
+- `state_rejects_invalid_reveal_value`
+- `abstain_behavior_is_explicitly_documented`
+- FFI `governance_no_vote_uses_state_no_value`
+- FFI `governance_invalid_vote_rejected`
 
 ### GV-03 — Double Voting Prevention
 
@@ -125,26 +130,28 @@ A validator cannot add two different commit hashes or reveal twice for the same 
 
 Severity: MEDIUM
 
-Status: NEEDS HARDENING
+Status: FIXED
 
 Code evidence:
 
 - Active proposal caps are present: `MAX_ACTIVE_GOVERNANCE_PROPOSALS = 3` and `MAX_ACTIVE_GOVERNANCE_PROPOSALS_PER_PROPOSER = 1` at `indra-state/src/governance.rs:21`.
 - Proposal timing constants are fixed in epochs: deliberation 30, commit 20/30, reveal 10 at `indra-state/src/governance.rs:27`.
 - Epoch transitions move proposals from deliberation to commit, reveal, tally, execution delay, and auto-execution: `indra-state/src/epoch.rs:247`.
-- Governance mempool admission in `NodeEngine::add_governance_op` only deduplicates `(signer_id, nonce)` and pushes the op: `indra-node/src/engine.rs:259`.
-- RPC accepts decoded governance ops and sends them to the engine without state/signature validation at admission: `indra-rpc/src/server.rs:316`.
-- Proposers select the first `MAX_GOV_OPS_PER_BLOCK` governance ops for blocks: `indra-node/src/engine.rs:315`.
+- Governance mempool admission in `NodeEngine::add_governance_op` now validates each op against a scratch clone of current state before admission.
+- RPC still decodes governance ops and sends them to the engine, but engine admission now rejects bad signatures, invalid nonces, ineligible signers, missing proposals, and invalid proposal/deposit state.
+- Proposer selection now applies governance ops sequentially to scratch state and evicts invalid pending ops instead of blindly taking the first `MAX_GOV_OPS_PER_BLOCK`.
 
 Analysis:
 
-The on-chain lifecycle has strong active caps and long timing windows, so live proposal spam is bounded. However, invalid governance ops can enter the engine mempool and be repeatedly selected into proposed blocks until rejected during block application. That creates a liveness/DoS risk similar to the earlier transaction-mempool hardening gap: a malicious RPC/P2P source can fill governance mempool slots with invalid signatures, invalid nonces, invalid proposal IDs, or invalid payloads, causing honest proposers to waste proposal rounds.
+The on-chain lifecycle has strong active caps and long timing windows, so live proposal spam is bounded. Invalid governance ops are now rejected before entering the engine mempool. Pending ops that become stale after admission are pruned/evicted before proposal construction.
 
 There is also no apparent historical pruning of inactive proposal records. This is less urgent because active caps, deposit cost, and proposer cooldown bound near-term abuse, but historical storage growth should be bounded before mainnet.
 
-Recommended fix:
+Regression tests:
 
-Run `apply_governance_op`-equivalent validation on a scratch state before governance mempool admission, or at minimum verify hybrid signatures, nonces, signer eligibility, and payload/action consistency before accepting/gossiping. Add invalid-op eviction when block production rejects a governance op. Add archival/pruning policy for old executed/failed/cancelled proposals.
+- `governance_mempool_rejects_invalid_signature`
+- `governance_mempool_rejects_op_for_nonexistent_proposal`
+- `governance_mempool_accepts_valid_op`
 
 ### GV-05 — Quorum Calculation Base
 
@@ -197,7 +204,7 @@ Governance does not use validator count for passage. Registering many tiny valid
 
 Severity: LOW
 
-Status: NEEDS CLEANUP
+Status: FIXED
 
 Governable actions:
 
@@ -223,7 +230,7 @@ Bounds summary:
 | Parameter | Bound behavior |
 |---|---|
 | `slash_liveness_threshold_epochs` | 1 to 10 |
-| `min_delegation_spark` | floor `DUST_LIMIT_SPARK`; no ceiling |
+| `min_delegation_spark` | `DUST_LIMIT_SPARK` to `MAX_DELEGATION_SPARK` |
 | `proposal_deposit_spark` | 100 to 10,000 INDRA |
 | `slash_liveness_bps` | 1 to 1000 |
 | `slash_double_precommit_bps` | 100 to 5000 |
@@ -235,7 +242,12 @@ Bounds summary:
 
 Analysis:
 
-Most security-sensitive parameters have hard floors/ceilings and monotonic constraints. `SetMinDelegationSpark` has no upper bound, so governance can set it high enough to effectively disable new small delegations. That is not an immediate takeover vector because it still requires a standard governance majority, but it should be bounded to a protocol-acceptable ceiling. Stale constants `QUORUM_THRESHOLD_BPS` and `PASS_THRESHOLD_BPS` still exist in primitives but are not used by the current governance state machine; this is confusing and should be cleaned up.
+Most security-sensitive parameters have hard floors/ceilings and monotonic constraints. `SetMinDelegationSpark` is now bounded above by `MAX_DELEGATION_SPARK`, currently equal to `MINIMUM_VALIDATOR_BOND_SPARK`, so governance cannot set the delegation floor above the cost to register a validator. Stale constants `QUORUM_THRESHOLD_BPS` and `PASS_THRESHOLD_BPS` are now explicitly deprecated in primitives because current governance uses `GovernableParams` thresholds.
+
+Regression tests:
+
+- `governance_cannot_set_min_delegation_above_maximum`
+- `governance_can_set_min_delegation_within_bounds`
 
 ### GV-09 — Governance-of-Governance Queued Execution Is Revalidated
 
@@ -450,9 +462,8 @@ Target finding: GV-02.
 #[test]
 fn governance_cli_no_vote_encodes_to_state_no_vote() {
     // CLI "no" must produce the state wire value for no.
-    // Today CLI maps "no" to 2, but state only accepts 0/1.
     // Fixed behavior: "no" encodes to 0, "yes" to 1, and explicit abstain
-    // is either rejected client-side or supported end-to-end.
+    // is rejected client-side because abstention means not revealing.
 }
 ```
 
@@ -469,9 +480,6 @@ fn governance_cli_no_vote_encodes_to_state_no_vote() {
 - No direct treasury withdrawal action exists.
 - Block-level governance application uses scratch-state atomicity.
 
-## Recommended Fix Order
+## Remaining Cleanup
 
-1. **GV-02 — Fix CLI/FFI vote encoding and abstain semantics.** Align client builders with the state machine so NO votes and abstentions behave as intended.
-2. **GV-04 — Harden governance mempool admission.** Validate signatures, nonces, signer eligibility, payload/action consistency, and proposal/deposit state before admitting/gossiping governance ops.
-3. **GV-08 — Add an upper bound for `min_delegation_spark` and remove stale governance constants.**
-4. **GV-04 cleanup — Add historical proposal pruning/archival policy.**
+1. **GV-04 cleanup — Add historical proposal pruning/archival policy.** Active proposal spam is bounded, but inactive proposal history still needs an archival/pruning design before mainnet-scale operation.
