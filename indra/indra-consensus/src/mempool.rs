@@ -212,11 +212,13 @@ impl Mempool {
     pub fn evict_invalid(&mut self, state: &indra_state::ChainState) {
         self.entries.retain(|tx_id, entry| {
             let mut block_nullifiers = HashSet::new();
+            let mut block_input_utxos = HashSet::new();
             let keep = indra_state::apply::validate_transaction(
                 state,
                 &entry.tx,
                 &state.chain_id,
                 &mut block_nullifiers,
+                &mut block_input_utxos,
                 state.height.saturating_add(1),
             )
             .is_ok();

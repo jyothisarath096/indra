@@ -90,6 +90,13 @@ pub enum StateError {
     #[error("transaction contains duplicate nullifiers")]
     DuplicateNullifier,
 
+    /// A block or transaction attempts to spend the same UTXO more than once.
+    #[error("duplicate UTXO spend in block: {utxo_id}")]
+    DuplicateUtxoSpend {
+        /// UTXO ID that appeared more than once in transaction inputs.
+        utxo_id: indra_core::Bytes32,
+    },
+
     /// Transaction signature verification failed.
     #[error("transaction signature invalid: {reason}")]
     SignatureInvalid {

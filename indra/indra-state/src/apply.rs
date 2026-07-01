@@ -315,8 +315,10 @@ pub fn apply_block(
 
     // Validate each transaction against current state
     // We do a dry-run: check but don't mutate yet
-    // Track nullifiers seen in THIS block to catch intra-block double spends
+    // Track nullifiers and input UTXO IDs seen in THIS block to catch
+    // intra-block double spends before any mutation occurs.
     let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
+    let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
 
     for tx in &block.transactions {
         validate_transaction(
@@ -324,6 +326,7 @@ pub fn apply_block(
             tx,
             &state.chain_id,
             &mut block_nullifiers,
+            &mut block_input_utxos,
             block.header.height,
         )?;
     }
@@ -511,11 +514,15 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
 ///
 /// `block_nullifiers` accumulates nullifiers seen so far in THIS block,
 /// allowing detection of intra-block double spends.
+/// `block_input_utxos` accumulates input UTXO IDs seen so far in THIS block,
+/// preventing the same UTXO from being counted more than once with distinct
+/// nullifiers.
 pub fn validate_transaction(
     state: &ChainState,
     tx: &TransactionV1,
     chain_id: &str,
     block_nullifiers: &mut HashSet<Bytes32>,
+    block_input_utxos: &mut HashSet<Bytes32>,
     current_height: u64,
 ) -> StateResult<()> {
     if tx.inputs.is_empty() {
@@ -540,6 +547,12 @@ pub fn validate_transaction(
     let mut input_commitments = Vec::with_capacity(tx.inputs.len());
 
     for input in &tx.inputs {
+        if !block_input_utxos.insert(input.utxo_id) {
+            return Err(StateError::DuplicateUtxoSpend {
+                utxo_id: input.utxo_id,
+            });
+        }
+
         // Duplicate nullifier within this transaction
         if block_nullifiers.contains(&input.nullifier) {
             return Err(StateError::DuplicateNullifier);
@@ -663,7 +676,11 @@ fn apply_transaction(
     tx_index: u32,
 ) -> StateResult<()> {
     for input in &tx.inputs {
-        state.utxos.spend(&input.utxo_id);
+        if state.utxos.spend(&input.utxo_id).is_none() {
+            return Err(StateError::InvariantViolation {
+                message: "attempted to spend an already-spent UTXO during apply_transaction",
+            });
+        }
         state.nullifiers.insert_or_double_spend(input.nullifier)?;
     }
 
@@ -1117,6 +1134,27 @@ mod tests {
         assert_eq!(state.utxos.len(), 1);
         // Nullifier must be recorded
         assert!(state.nullifiers.contains(&nullifier));
+    }
+
+    #[test]
+    fn apply_transaction_fails_loudly_if_utxo_already_spent() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0x9A; 32]),
+        );
+        assert!(state.utxos.spend(&utxo_id).is_some());
+
+        assert_eq!(
+            apply_transaction(&mut state, &tx, 1, 0),
+            Err(StateError::InvariantViolation {
+                message: "attempted to spend an already-spent UTXO during apply_transaction",
+            })
+        );
     }
 
     #[test]
