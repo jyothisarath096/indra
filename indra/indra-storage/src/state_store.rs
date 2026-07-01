@@ -16,13 +16,14 @@
 //! The previous snapshot is kept for one additional interval, then deleted.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
-use indra_core::types::primitives::{SCHEMA_VERSION, SCHEMA_VERSION_GENESIS};
-use indra_state::ChainState;
+use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS};
+use indra_state::{compute_state_root, compute_validator_set_root, ChainState};
 
+use crate::atomic::{crc32, write_atomic_synced};
 use crate::error::{StorageError, StorageResult};
 use crate::migration::migrate_chain_state;
 
@@ -31,6 +32,25 @@ pub const SNAPSHOT_INTERVAL: u64 = 300;
 const SNAPSHOT_VERSION_V1_SUMMARY: u8 = 0x01;
 const SNAPSHOT_VERSION_V2_COMPLETE: u8 = 0x02;
 const SNAPSHOT_VERSION_V3_VERSIONED: u8 = 0x03;
+const SNAPSHOT_META_MAGIC: &[u8; 4] = b"INSM";
+const SNAPSHOT_META_VERSION: u8 = 1;
+
+/// Metadata sidecar that binds a snapshot to committed roots and tip hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    /// Snapshot height.
+    pub height: u64,
+    /// Block hash at this height (`ChainState::tip_hash`).
+    pub block_hash: Bytes32,
+    /// State root computed from the snapshot.
+    pub state_root: Bytes32,
+    /// Validator set root computed from the snapshot.
+    pub validator_set_root: Bytes32,
+    /// Chain identifier stored in the snapshot.
+    pub chain_id: String,
+    /// CRC32 of the complete `.snap` file bytes.
+    pub checksum: u32,
+}
 
 /// Manages chain state snapshots on disk.
 pub struct StateStore {
@@ -55,17 +75,24 @@ impl StateStore {
 
         let tmp_path = self.dir.join(format!("state_{height}.tmp"));
         let final_path = self.dir.join(format!("state_{height}.snap"));
+        let meta_tmp_path = self.dir.join(format!("state_{height}.snap.meta.tmp"));
+        let meta_final_path = self.dir.join(format!("state_{height}.snap.meta"));
 
-        // Write to temp file first
-        let mut f = fs::File::create(&tmp_path)?;
-        f.write_all(&height.to_le_bytes())?;
-        f.write_all(&length.to_le_bytes())?;
-        f.write_all(&state_bytes)?;
-        f.flush()?;
-        drop(f);
+        let mut snapshot_bytes = Vec::with_capacity(12 + state_bytes.len());
+        snapshot_bytes.extend_from_slice(&height.to_le_bytes());
+        snapshot_bytes.extend_from_slice(&length.to_le_bytes());
+        snapshot_bytes.extend_from_slice(&state_bytes);
+        write_atomic_synced(&tmp_path, &final_path, &snapshot_bytes)?;
 
-        // Atomic rename
-        fs::rename(&tmp_path, &final_path)?;
+        let meta = SnapshotMeta {
+            height,
+            block_hash: state.tip_hash,
+            state_root: compute_state_root(state),
+            validator_set_root: compute_validator_set_root(state),
+            chain_id: state.chain_id.clone(),
+            checksum: crc32(&snapshot_bytes),
+        };
+        write_atomic_synced(&meta_tmp_path, &meta_final_path, &meta.encode())?;
 
         // Clean up old snapshots (keep current and one previous)
         self.cleanup_old_snapshots(height)?;
@@ -79,9 +106,14 @@ impl StateStore {
         match latest {
             None => Ok(None),
             Some(path) => {
-                let mut f = fs::File::open(&path)?;
-                let mut header = [0u8; 12];
-                f.read_exact(&mut header)?;
+                let file_bytes = fs::read(&path)?;
+                if file_bytes.len() < 12 {
+                    return Err(StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated".into(),
+                    });
+                }
+                let header = &file_bytes[..12];
 
                 let height_bytes: [u8; 8] =
                     header[..8]
@@ -100,11 +132,27 @@ impl StateStore {
                         })?;
                 let length = u32::from_le_bytes(length_bytes) as usize;
 
-                let mut state_bytes = vec![0u8; length];
-                f.read_exact(&mut state_bytes)?;
+                if file_bytes.len() != 12 + length {
+                    return Err(StorageError::Corruption {
+                        height,
+                        detail: format!(
+                            "snapshot length mismatch: header says {}, file has {} payload bytes",
+                            length,
+                            file_bytes.len().saturating_sub(12)
+                        ),
+                    });
+                }
 
-                deserialise_chain_state(&state_bytes, height)
-                    .map_err(|e| StorageError::Corruption { height, detail: e })
+                let state_bytes = &file_bytes[12..];
+
+                let state = deserialise_chain_state(state_bytes, height)
+                    .map_err(|e| StorageError::Corruption { height, detail: e })?;
+                if let Some(state) = state {
+                    self.verify_snapshot_meta(&path, &state, crc32(&file_bytes))?;
+                    Ok(Some(state))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -145,6 +193,20 @@ impl StateStore {
         }
     }
 
+    /// Height of the newest snapshot, if any.
+    pub fn latest_snapshot_height(&self) -> StorageResult<Option<u64>> {
+        Ok(self.find_latest_snapshot()?.and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| {
+                    name.trim_start_matches("state_")
+                        .trim_end_matches(".snap")
+                        .parse::<u64>()
+                        .ok()
+                })
+        }))
+    }
+
     /// Find the path of the most recent snapshot file.
     fn find_latest_snapshot(&self) -> StorageResult<Option<PathBuf>> {
         let mut snapshots: Vec<(u64, PathBuf)> = Vec::new();
@@ -182,12 +244,176 @@ impl StateStore {
                 if let Ok(h) = height_str.parse::<u64>() {
                     if h < keep_from {
                         let _ = fs::remove_file(entry.path());
+                        let _ = fs::remove_file(self.dir.join(format!("state_{h}.snap.meta")));
+                        let _ = fs::remove_file(self.dir.join(format!("state_{h}.snap.meta.tmp")));
                     }
                 }
             }
         }
         Ok(())
     }
+
+    fn verify_snapshot_meta(
+        &self,
+        snapshot_path: &Path,
+        state: &ChainState,
+        checksum: u32,
+    ) -> StorageResult<()> {
+        let meta_path = snapshot_path.with_extension("snap.meta");
+        let meta_bytes = match fs::read(&meta_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "[storage] warning: snapshot {} has no sidecar metadata; accepting legacy snapshot",
+                    snapshot_path.display()
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let meta =
+            SnapshotMeta::decode(&meta_bytes).map_err(|detail| StorageError::Corruption {
+                height: state.height,
+                detail,
+            })?;
+        if meta.height != state.height {
+            return Err(StorageError::SnapshotRootMismatch {
+                height: state.height,
+                detail: format!("metadata height {} does not match snapshot", meta.height),
+            });
+        }
+        if meta.chain_id != state.chain_id {
+            return Err(StorageError::SnapshotRootMismatch {
+                height: state.height,
+                detail: "chain_id mismatch".into(),
+            });
+        }
+        if meta.checksum != checksum {
+            return Err(StorageError::SnapshotRootMismatch {
+                height: state.height,
+                detail: format!(
+                    "snapshot checksum mismatch: meta {}, actual {}",
+                    meta.checksum, checksum
+                ),
+            });
+        }
+        let state_root = compute_state_root(state);
+        if meta.state_root != state_root {
+            return Err(StorageError::SnapshotRootMismatch {
+                height: state.height,
+                detail: format!(
+                    "state root meta {} actual {}",
+                    hex_bytes(&meta.state_root.0),
+                    hex_bytes(&state_root.0)
+                ),
+            });
+        }
+        let validator_root = compute_validator_set_root(state);
+        if meta.validator_set_root != validator_root {
+            return Err(StorageError::SnapshotRootMismatch {
+                height: state.height,
+                detail: format!(
+                    "validator root meta {} actual {}",
+                    hex_bytes(&meta.validator_set_root.0),
+                    hex_bytes(&validator_root.0)
+                ),
+            });
+        }
+        if meta.block_hash != state.tip_hash {
+            return Err(StorageError::SnapshotTipMismatch {
+                height: state.height,
+                detail: format!(
+                    "tip hash meta {} actual {}",
+                    hex_bytes(&meta.block_hash.0),
+                    hex_bytes(&state.tip_hash.0)
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotMeta {
+    fn encode(&self) -> Vec<u8> {
+        let chain_bytes = self.chain_id.as_bytes();
+        let mut buf = Vec::with_capacity(4 + 1 + 8 + 32 * 3 + 2 + chain_bytes.len() + 4);
+        buf.extend_from_slice(SNAPSHOT_META_MAGIC);
+        buf.push(SNAPSHOT_META_VERSION);
+        buf.extend_from_slice(&self.height.to_le_bytes());
+        buf.extend_from_slice(&self.block_hash.0);
+        buf.extend_from_slice(&self.state_root.0);
+        buf.extend_from_slice(&self.validator_set_root.0);
+        buf.extend_from_slice(&(chain_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(chain_bytes);
+        buf.extend_from_slice(&self.checksum.to_le_bytes());
+        buf
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let min = 4 + 1 + 8 + 32 * 3 + 2 + 4;
+        if bytes.len() < min {
+            return Err("snapshot metadata truncated".into());
+        }
+        if &bytes[0..4] != SNAPSHOT_META_MAGIC {
+            return Err("snapshot metadata magic mismatch".into());
+        }
+        if bytes[4] != SNAPSHOT_META_VERSION {
+            return Err(format!(
+                "unsupported snapshot metadata version {}",
+                bytes[4]
+            ));
+        }
+        let height = u64::from_le_bytes(copy_8(&bytes[5..13])?);
+        let block_hash = Bytes32::from(copy_32(&bytes[13..45])?);
+        let state_root = Bytes32::from(copy_32(&bytes[45..77])?);
+        let validator_set_root = Bytes32::from(copy_32(&bytes[77..109])?);
+        let chain_len = u16::from_le_bytes(copy_2(&bytes[109..111])?) as usize;
+        let chain_start = 111;
+        let chain_end = chain_start + chain_len;
+        if bytes.len() != chain_end + 4 {
+            return Err("snapshot metadata length mismatch".into());
+        }
+        let chain_id = std::str::from_utf8(&bytes[chain_start..chain_end])
+            .map_err(|e| e.to_string())?
+            .to_string();
+        let checksum = u32::from_le_bytes(copy_4(&bytes[chain_end..chain_end + 4])?);
+        Ok(Self {
+            height,
+            block_hash,
+            state_root,
+            validator_set_root,
+            chain_id,
+            checksum,
+        })
+    }
+}
+
+fn copy_2(bytes: &[u8]) -> Result<[u8; 2], String> {
+    bytes.try_into().map_err(|_| "failed to copy u16".into())
+}
+
+fn copy_4(bytes: &[u8]) -> Result<[u8; 4], String> {
+    bytes.try_into().map_err(|_| "failed to copy u32".into())
+}
+
+fn copy_8(bytes: &[u8]) -> Result<[u8; 8], String> {
+    bytes.try_into().map_err(|_| "failed to copy u64".into())
+}
+
+fn copy_32(bytes: &[u8]) -> Result<[u8; 32], String> {
+    bytes
+        .try_into()
+        .map_err(|_| "failed to copy Bytes32".into())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Serialise a complete chain state snapshot.
@@ -321,6 +547,7 @@ mod tests {
         Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
+    use std::io::Write;
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -372,6 +599,47 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded, state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_with_wrong_state_root_is_rejected() {
+        let dir = temp_dir("bad_meta_state_root");
+        let store = StateStore::open(&dir).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.height = 7;
+        store.save(&state).unwrap();
+
+        let meta_path = dir.join("state_7.snap.meta");
+        let mut meta = std::fs::read(&meta_path).unwrap();
+        meta[45] ^= 0x01; // first byte of state_root in sidecar
+        std::fs::write(&meta_path, meta).unwrap();
+
+        assert!(matches!(
+            store.load_latest(),
+            Err(StorageError::SnapshotRootMismatch { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_with_wrong_tip_hash_is_rejected() {
+        let dir = temp_dir("bad_meta_tip_hash");
+        let store = StateStore::open(&dir).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.height = 8;
+        state.tip_hash = Bytes32::from([0xAB; 32]);
+        store.save(&state).unwrap();
+
+        let meta_path = dir.join("state_8.snap.meta");
+        let mut meta = std::fs::read(&meta_path).unwrap();
+        meta[13] ^= 0x01; // first byte of block_hash in sidecar
+        std::fs::write(&meta_path, meta).unwrap();
+
+        assert!(matches!(
+            store.load_latest(),
+            Err(StorageError::SnapshotTipMismatch { .. })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

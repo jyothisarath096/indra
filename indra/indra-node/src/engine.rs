@@ -21,6 +21,7 @@ use indra_consensus::{
     qc::QcValidator,
     vote::{produce_vote, RegisteredVoter},
 };
+use indra_core::codec::{ByteReader, Decode};
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
@@ -42,13 +43,16 @@ use indra_state::{
     governance_apply::{apply_governance_op, validate_governance_op},
     ChainState,
 };
-use indra_storage::{migration_record, BlockStore, EpochStore, MigrationLog, StateStore};
+use indra_storage::{
+    load_chain_manifest, load_last_qc, migration_record, save_chain_manifest, BlockStore,
+    ChainManifest, EpochStore, MigrationLog, StateStore,
+};
 
 use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
     genesis::{build_genesis_block, load_genesis_validators},
-    sync::import_block,
+    sync::{import_block, verify_block_state_root},
 };
 
 /// The node engine: owns all state and drives consensus.
@@ -115,6 +119,7 @@ impl NodeEngine {
         }
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
+            verify_snapshot_tip_against_retained_block(&snapshot, &mut block_store)?;
             if let Some(from_version) = stored_schema_version {
                 if from_version < indra_core::types::primitives::SCHEMA_VERSION {
                     let record = migration_record(
@@ -154,6 +159,7 @@ impl NodeEngine {
             rebuild_state_from_height(&mut genesis_base, &mut block_store, 1)?;
             genesis_base
         };
+        validate_manifest_if_present(&config, &state, &mut block_store, &epoch_store)?;
         eprintln!("{startup_log}");
 
         let mempool = Mempool::new(indra_consensus::mempool::MempoolConfig {
@@ -662,9 +668,36 @@ impl NodeEngine {
         {
             self.state_store.save(&self.state)?;
         }
+        self.write_chain_manifest()?;
         self.evict_committed_staking_ops(&block.staking_ops);
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
+        Ok(())
+    }
+
+    /// Persist a durable manifest for the currently committed state.
+    pub fn write_chain_manifest(&mut self) -> NodeResult<()> {
+        let last_qc_height = load_last_qc(&self.config.state_dir())
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                let mut reader = ByteReader::new(&bytes);
+                indra_core::types::qc::QuorumCertificateV1::decode(&mut reader)
+                    .ok()
+                    .map(|qc| qc.height)
+            })
+            .unwrap_or(0);
+        let manifest = ChainManifest {
+            committed_height: self.state.height,
+            committed_block_hash: self.state.tip_hash,
+            state_root: indra_state::compute_state_root(&self.state),
+            snapshot_height: self.state_store.latest_snapshot_height()?.unwrap_or(0),
+            block_log_next_height: self.block_store.next_height(),
+            last_qc_height,
+            epoch_log_latest_epoch: self.epoch_store.latest_epoch(),
+            chain_id: self.state.chain_id.clone(),
+        };
+        save_chain_manifest(&self.config.data_dir, &manifest)?;
         Ok(())
     }
 }
@@ -730,9 +763,113 @@ fn rebuild_state_from_height(
 
     for height in start_height.max(1)..block_store.next_height() {
         let block = block_store.get(height)?;
+        verify_block_state_root(&block, state).map_err(|err| NodeError::StartupReplayFailed {
+            height: block.header.height,
+            reason: format!(
+                "stored block failed header commitment verification during startup replay: {err}"
+            ),
+        })?;
         indra_state::apply_block(state, &block, 0)?;
     }
 
+    Ok(())
+}
+
+fn verify_snapshot_tip_against_retained_block(
+    snapshot: &ChainState,
+    block_store: &mut BlockStore,
+) -> NodeResult<()> {
+    if snapshot.height == 0 || block_store.is_empty() {
+        return Ok(());
+    }
+    if snapshot.height < block_store.lowest_height() {
+        return Ok(());
+    }
+    if snapshot.height >= block_store.next_height() {
+        return Err(NodeError::SnapshotBlockMismatch {
+            height: snapshot.height,
+            reason: format!(
+                "snapshot is ahead of retained block log tip (next_height={})",
+                block_store.next_height()
+            ),
+        });
+    }
+    let block = block_store.get(snapshot.height)?;
+    let block_hash = block.header.block_hash();
+    if block_hash != snapshot.tip_hash {
+        return Err(NodeError::SnapshotBlockMismatch {
+            height: snapshot.height,
+            reason: format!(
+                "snapshot tip {} does not match retained block {}",
+                hex::encode(snapshot.tip_hash.0),
+                hex::encode(block_hash.0)
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_manifest_if_present(
+    config: &NodeConfig,
+    state: &ChainState,
+    block_store: &mut BlockStore,
+    epoch_store: &EpochStore,
+) -> NodeResult<()> {
+    let Some(manifest) = load_chain_manifest(&config.data_dir)? else {
+        eprintln!("[storage] warning: no chain manifest found; accepting legacy storage layout");
+        return Ok(());
+    };
+    if manifest.chain_id != state.chain_id {
+        return Err(indra_storage::StorageError::ManifestMismatch {
+            detail: format!(
+                "manifest chain_id {} does not match state {}",
+                manifest.chain_id, state.chain_id
+            ),
+        }
+        .into());
+    }
+    if block_store.next_height() < manifest.block_log_next_height {
+        return Err(indra_storage::StorageError::ManifestMismatch {
+            detail: format!(
+                "block log next_height {} is behind manifest {}",
+                block_store.next_height(),
+                manifest.block_log_next_height
+            ),
+        }
+        .into());
+    }
+    if state.height < manifest.committed_height {
+        return Err(indra_storage::StorageError::ManifestMismatch {
+            detail: format!(
+                "state height {} is behind manifest committed height {}",
+                state.height, manifest.committed_height
+            ),
+        }
+        .into());
+    }
+    if state.height == manifest.committed_height {
+        if state.tip_hash != manifest.committed_block_hash {
+            return Err(indra_storage::StorageError::ManifestMismatch {
+                detail: "state tip hash does not match manifest".into(),
+            }
+            .into());
+        }
+        let state_root = indra_state::compute_state_root(state);
+        if state_root != manifest.state_root {
+            return Err(indra_storage::StorageError::ManifestMismatch {
+                detail: "state root does not match manifest".into(),
+            }
+            .into());
+        }
+    }
+    if let Some(epoch) = manifest.epoch_log_latest_epoch {
+        if !epoch_store.has(epoch) {
+            return Err(indra_storage::StorageError::ManifestMismatch {
+                detail: format!("epoch log missing manifest epoch {epoch}"),
+            }
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -809,6 +946,24 @@ mod tests {
             })
             .unwrap();
         hybrid
+    }
+
+    fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32]) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let vrf = VrfKeypair::from_seed(&seed);
+        let validator_id = indra_crypto::sha256(&classical.public_key().0);
+        let genesis_path = dir.join("genesis.toml");
+        let genesis = format!(
+            "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+            hex::encode(validator_id),
+            hex::encode(classical.public_key().0),
+            hex::encode(pq.public_key().0),
+            hex::encode(vrf.public_key()),
+        );
+        std::fs::write(&genesis_path, genesis).unwrap();
+        genesis_path.to_string_lossy().to_string()
     }
 
     fn dummy_signature() -> HybridSignature {
@@ -1091,15 +1246,28 @@ mod tests {
 
         engine.commit_block(&block).unwrap();
         assert_eq!(engine.height(), 1);
+        let manifest = indra_storage::load_chain_manifest(&dir)
+            .unwrap()
+            .expect("commit should write manifest");
+        assert_eq!(manifest.committed_height, 1);
+        assert_eq!(manifest.committed_block_hash, engine.state.tip_hash);
+        assert_eq!(
+            manifest.state_root,
+            indra_state::compute_state_root(&engine.state)
+        );
+        assert_eq!(
+            manifest.block_log_next_height,
+            engine.block_store.next_height()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn restart_rebuilds_state_from_block_log() {
         let dir = temp_dir("d");
-        let config = NodeConfig::local_test(dir.clone());
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
         let mut engine = NodeEngine::init(config.clone()).unwrap();
-        install_active_validator(&mut engine, [0x42u8; 32], "local");
         let mut last_qc = Vec::new();
 
         for height in 1..=3u64 {
@@ -1113,6 +1281,76 @@ mod tests {
         let restarted = NodeEngine::init(config).unwrap();
         assert_eq!(restarted.state.height, 3);
         assert_eq!(restarted.state.tip_hash, engine.state.tip_hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_replay_detects_corrupt_block_via_state_root_mismatch() {
+        let dir = temp_dir("replay_bad_root");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            let mut block = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
+            block.header.state_root = Bytes32::from([0xEE; 32]);
+            engine.block_store.append(&build_genesis_block()).unwrap();
+            engine.block_store.append(&block).unwrap();
+        }
+
+        assert!(matches!(
+            NodeEngine::init(config),
+            Err(NodeError::StartupReplayFailed { height: 1, .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_detects_block_log_behind_manifest() {
+        let dir = temp_dir("manifest_block_log_behind");
+        let config = NodeConfig::local_test(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        indra_storage::save_chain_manifest(
+            &dir,
+            &ChainManifest {
+                committed_height: 99,
+                committed_block_hash: Bytes32::from([0xAA; 32]),
+                state_root: Bytes32::from([0xBB; 32]),
+                snapshot_height: 0,
+                block_log_next_height: 100,
+                last_qc_height: 99,
+                epoch_log_latest_epoch: None,
+                chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID.into(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            NodeEngine::init(config),
+            Err(NodeError::Storage(
+                indra_storage::StorageError::ManifestMismatch { .. }
+            ))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_tip_hash_mismatch_with_retained_block_fails_startup() {
+        let dir = temp_dir("snapshot_retained_block_mismatch");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            let block = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
+            engine.commit_block(&block).unwrap();
+            let mut bad_snapshot = engine.state.clone();
+            bad_snapshot.tip_hash = Bytes32::from([0xDD; 32]);
+            engine.state_store.save(&bad_snapshot).unwrap();
+        }
+
+        assert!(matches!(
+            NodeEngine::init(config),
+            Err(NodeError::SnapshotBlockMismatch { height: 1, .. })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

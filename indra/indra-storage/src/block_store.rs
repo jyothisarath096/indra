@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indra_core::{
     codec::{Decode, Encode},
@@ -28,6 +28,7 @@ use indra_core::{
     },
 };
 
+use crate::atomic::fsync_dir;
 use crate::error::{StorageError, StorageResult};
 
 /// The header size for each block entry: u64 height + u32 length.
@@ -66,6 +67,7 @@ impl PruneConfig {
 
 /// An append-only block log with an in-memory height→offset index.
 pub struct BlockStore {
+    path: PathBuf,
     file: File,
     index: HashMap<u64, u64>, // height → file offset of the entry header
     next_height: u64,
@@ -80,16 +82,18 @@ impl BlockStore {
     /// On first open, scans the file to rebuild the index.
     /// Truncates any incomplete final entry.
     pub fn open(path: impl AsRef<Path>, prune_cfg: PruneConfig) -> StorageResult<Self> {
+        let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(&path)?;
 
         let data_start = initialise_block_log_header(&mut file)?;
 
         let mut store = Self {
+            path,
             file,
             index: HashMap::new(),
             next_height: 0,
@@ -149,6 +153,7 @@ impl BlockStore {
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&block_bytes)?;
         self.file.flush()?;
+        self.file.sync_all()?;
 
         self.index.insert(height, offset);
         self.next_height += 1;
@@ -246,26 +251,43 @@ impl BlockStore {
             return Ok(());
         }
 
-        let file_len = self.file.seek(SeekFrom::End(0))?;
-        let keep_bytes = (file_len - keep_offset) as usize;
-        let mut kept_data = vec![0u8; keep_bytes];
-        self.file.seek(SeekFrom::Start(keep_offset))?;
-        self.file.read_exact(&mut kept_data)?;
+        let tmp_path = self.path.with_extension("tmp");
+        let mut tmp = File::create(&tmp_path)?;
+        tmp.write_all(BLOCK_MAGIC)?;
+        tmp.write_all(&[BLOCK_FILE_VERSION])?;
+        tmp.write_all(&[0u8; 11])?;
 
-        self.file.seek(SeekFrom::Start(self.data_start))?;
-        self.file.set_len(self.data_start)?;
-        self.file.write_all(&kept_data)?;
-        self.file.flush()?;
-
-        let offset_adjustment = keep_offset.saturating_sub(self.data_start);
-        let mut new_index = HashMap::new();
-        for (&height, &old_offset) in &self.index {
-            if height >= keep_from_height {
-                new_index.insert(height, old_offset.saturating_sub(offset_adjustment));
-            }
+        let mut heights: Vec<u64> = self
+            .index
+            .keys()
+            .copied()
+            .filter(|height| *height >= keep_from_height)
+            .collect();
+        heights.sort_unstable();
+        for height in heights {
+            let block = self.get(height)?;
+            let block_bytes = block.encode_to_vec();
+            tmp.write_all(&height.to_le_bytes())?;
+            tmp.write_all(&(block_bytes.len() as u32).to_le_bytes())?;
+            tmp.write_all(&block_bytes)?;
         }
-        self.index = new_index;
-        self.lowest_height = self.index.keys().min().copied().unwrap_or(0);
+        tmp.flush()?;
+        tmp.sync_all()?;
+        drop(tmp);
+
+        std::fs::rename(&tmp_path, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            fsync_dir(parent)?;
+        }
+        self.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?;
+        self.data_start = initialise_block_log_header(&mut self.file)?;
+        self.index.clear();
+        self.rebuild_index()?;
         Ok(())
     }
 

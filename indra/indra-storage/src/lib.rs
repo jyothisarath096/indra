@@ -36,9 +36,11 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+pub(crate) mod atomic;
 pub mod block_store;
 pub mod epoch_store;
 pub mod error;
+pub mod manifest;
 pub mod migration;
 pub mod qc_store;
 pub mod state_store;
@@ -48,8 +50,9 @@ pub mod wal;
 pub use block_store::{BlockStore, PruneConfig};
 pub use epoch_store::EpochStore;
 pub use error::{StorageError, StorageResult};
+pub use manifest::{load_chain_manifest, save_chain_manifest, ChainManifest};
 pub use migration::{migrate_chain_state, migration_record, MigrationLog, MigrationRecord};
 pub use qc_store::{load_last_qc, save_last_qc};
 pub use state_store::StateStore;
-pub use vote_safety::{VoteSafetyRecord, VoteSafetyStore};
+pub use vote_safety::{VoteSafetyLoadResult, VoteSafetyRecord, VoteSafetyStore};
 pub use wal::MempoolWal;

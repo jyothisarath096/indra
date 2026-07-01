@@ -19,7 +19,7 @@ use indra_core::types::{
     transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
 };
-use indra_storage::VoteSafetyStore;
+use indra_storage::{VoteSafetyLoadResult, VoteSafetyStore};
 
 use crate::{
     engine::NodeEngine,
@@ -211,6 +211,8 @@ pub struct ConsensusDriver {
     sync: SyncState,
     /// Persisted local vote safety guard.
     pub vote_safety: VoteSafetyStore,
+    /// If set, local voting is disabled until operator recovery.
+    vote_safety_unavailable: Option<String>,
 }
 
 impl ConsensusDriver {
@@ -238,6 +240,7 @@ impl ConsensusDriver {
             current_phase: RoundPhase::Propose,
             sync: SyncState::follower(0),
             vote_safety,
+            vote_safety_unavailable: None,
         };
         driver.sync = if driver.engine.config.bootstrap_peers.is_empty() {
             SyncState::bootstrap(driver.engine.state.height)
@@ -448,14 +451,27 @@ impl ConsensusDriver {
     /// Check persisted vote safety record and advance past already-voted rounds.
     fn apply_vote_safety(&mut self) {
         let next_height = self.engine.state.height.saturating_add(1);
-        if let Some(record) = self.vote_safety.load() {
-            if record.height == next_height && record.round >= self.current_round {
-                let safe_round = record.round.saturating_add(1);
-                eprintln!(
-                    "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
-                    safe_round, record.height, record.round, record.step
+        match self.vote_safety.load() {
+            VoteSafetyLoadResult::NoRecord => {
+                self.vote_safety_unavailable = None;
+            }
+            VoteSafetyLoadResult::Record(record) => {
+                self.vote_safety_unavailable = None;
+                if record.height == next_height && record.round >= self.current_round {
+                    let safe_round = record.round.saturating_add(1);
+                    eprintln!(
+                        "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
+                        safe_round, record.height, record.round, record.step
+                    );
+                    self.start_round(safe_round);
+                }
+            }
+            VoteSafetyLoadResult::Corrupt(reason) => {
+                let msg = format!(
+                    "vote_safety.dat is corrupt or unreadable: {reason}; refusing to vote until operator recovery"
                 );
-                self.start_round(safe_round);
+                eprintln!("[vote_safety] CRITICAL: {msg}");
+                self.vote_safety_unavailable = Some(msg);
             }
         }
     }
@@ -791,13 +807,20 @@ impl ConsensusDriver {
         if self.collector_has_vote_from(height, round, step, local_validator_id) {
             return vec![];
         }
+        if let Some(reason) = &self.vote_safety_unavailable {
+            eprintln!("[vote_safety] refusing to sign local vote: {reason}");
+            return vec![DriverAction::None];
+        }
 
         let step_byte = match step {
             VoteStep::Prevote => 0u8,
             VoteStep::Precommit => 1u8,
         };
         if let Err(err) = self.vote_safety.record(height, round, step_byte) {
-            eprintln!("[vote_safety] failed to persist vote safety record: {err}");
+            eprintln!(
+                "[vote_safety] CRITICAL: failed to persist vote safety record before signing: {err}; refusing to vote"
+            );
+            return vec![DriverAction::None];
         }
 
         match self.engine.sign_vote(height, round, step, block_hash) {
@@ -1255,6 +1278,9 @@ impl ConsensusDriver {
                 ) {
                     eprintln!("[driver] WARNING: failed to persist last_qc_bytes: {e}");
                 }
+                if let Err(e) = self.engine.write_chain_manifest() {
+                    eprintln!("[driver] WARNING: failed to persist chain manifest: {e}");
+                }
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
                 self.sync.mark_caught_up(self.engine.state.height);
@@ -1462,6 +1488,11 @@ impl ConsensusDriver {
             indra_storage::save_last_qc(&self.engine.config.state_dir(), &self.last_qc_bytes)
         {
             eprintln!("[driver] WARNING: failed to persist recovered last_qc_bytes: {err}");
+        }
+        if let Err(err) = self.engine.write_chain_manifest() {
+            eprintln!(
+                "[driver] WARNING: failed to persist chain manifest after QC recovery: {err}"
+            );
         }
         eprintln!(
             "[driver] recovered last_qc_bytes from peer at height {}",
@@ -1679,6 +1710,20 @@ mod tests {
         let dir = temp_dir(suffix);
         let mut config = NodeConfig::local_test(dir.clone());
         let pq = PqKeypair::from_seed(&seed).unwrap();
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let vrf = VrfKeypair::from_seed(&seed);
+        let validator_id = indra_crypto::sha256(&classical.public_key().0);
+        let genesis_path = dir.join("genesis.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = format!(
+            "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+            hex::encode(validator_id),
+            hex::encode(classical.public_key().0),
+            hex::encode(pq.public_key().0),
+            hex::encode(vrf.public_key()),
+        );
+        std::fs::write(&genesis_path, genesis).unwrap();
+        config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
@@ -2577,6 +2622,68 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_vote_safety_record_prevents_voting() {
+        let (mut driver, dir) = local_driver([0x71u8; 32], "vote_safety_corrupt_blocks");
+        std::fs::write(driver.engine.config.vote_safety_path(), [0xAA, 0xBB]).unwrap();
+        driver.apply_vote_safety();
+        let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "corrupt vote_safety.dat must fail closed and block vote broadcast"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_vote_safety_record_allows_voting_on_fresh_start() {
+        let (mut driver, dir) = local_driver([0x72u8; 32], "vote_safety_missing_allows");
+        let _ = std::fs::remove_file(driver.engine.config.vote_safety_path());
+        driver.apply_vote_safety();
+        let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "missing vote_safety.dat on a fresh start should allow voting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vote_safety_write_failure_prevents_vote_broadcast() {
+        let (mut driver, dir) = local_driver([0x73u8; 32], "vote_safety_write_fail");
+        let safety_path = driver.engine.config.vote_safety_path();
+        let _ = std::fs::remove_file(&safety_path);
+        std::fs::create_dir_all(&safety_path).unwrap();
+        let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "vote safety persistence failure must block vote broadcast"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_vote_safety_record_constrains_future_rounds() {
+        let (mut driver, dir) = local_driver([0x74u8; 32], "vote_safety_valid_constrains");
+        driver.vote_safety.record(1, 2, 0).unwrap();
+        driver.apply_vote_safety();
+        assert_eq!(driver.current_round(), 3);
+        let actions = driver.sign_and_record_local_vote(1, 3, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "higher round after persisted vote-safety record should remain allowed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn driver_detects_double_precommit() {
         let (mut driver, dir) = local_driver([0x48u8; 32], "double_precommit");
         let remote = install_active_validator(&mut driver, [0x49u8; 32], "remote");
@@ -2760,6 +2867,7 @@ mod tests {
 
         let mut config = NodeConfig::local_test(dir.clone());
         let pq = PqKeypair::from_seed(&seed).unwrap();
+        config.genesis_path = Some(dir.join("genesis.toml").to_string_lossy().to_string());
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
@@ -2807,15 +2915,7 @@ mod tests {
         let dir = temp_dir("restore_qc");
         let seed = [0x62u8; 32];
         {
-            let mut config = NodeConfig::local_test(dir.clone());
-            let pq = PqKeypair::from_seed(&seed).unwrap();
-            config.validator_seed = Some(seed);
-            config.vrf_seed = Some(seed);
-            config.pq_pk = Some(pq.public_key().0.to_vec());
-            config.pq_sk = Some(pq.secret_key_bytes());
-            let engine = NodeEngine::init(config).unwrap();
-            let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
-            let mut driver = ConsensusDriver::new(engine, vote_safety);
+            let (mut driver, _) = local_driver(seed, "restore_qc");
             let _local = install_active_validator(&mut driver, seed, "local");
             driver.refresh_registered_voters();
             let block = make_strict_block(&driver, seed, 0, vec![]);
@@ -2825,6 +2925,7 @@ mod tests {
 
         let mut config = NodeConfig::local_test(dir.clone());
         let pq = PqKeypair::from_seed(&seed).unwrap();
+        config.genesis_path = Some(dir.join("genesis.toml").to_string_lossy().to_string());
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
@@ -3211,6 +3312,10 @@ mod tests {
         ] {
             install_active_validator(&mut driver_b, seed, name);
         }
+        // Both simulated nodes must start from byte-identical genesis state;
+        // local_driver seeds each node with its own genesis UTXO, so copy the
+        // consensus state after installing the shared validator set.
+        driver_b.engine.state = driver_a.engine.state.clone();
         driver_a.refresh_registered_voters();
         driver_b.refresh_registered_voters();
 

@@ -56,6 +56,31 @@ pub enum StorageError {
         /// Actual height provided.
         actual: u64,
     },
+
+    /// A snapshot sidecar root did not match the decoded snapshot.
+    #[error("snapshot root mismatch at height {height}: {detail}")]
+    SnapshotRootMismatch {
+        /// Snapshot height.
+        height: u64,
+        /// What did not match.
+        detail: String,
+    },
+
+    /// A snapshot tip hash did not match its sidecar or retained block.
+    #[error("snapshot tip mismatch at height {height}: {detail}")]
+    SnapshotTipMismatch {
+        /// Snapshot height.
+        height: u64,
+        /// What did not match.
+        detail: String,
+    },
+
+    /// Durable chain manifest did not match component storage.
+    #[error("chain manifest mismatch: {detail}")]
+    ManifestMismatch {
+        /// What did not match.
+        detail: String,
+    },
 }
 
 /// Convenience alias.

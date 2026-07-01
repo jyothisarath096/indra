@@ -96,6 +96,24 @@ pub enum NodeError {
         /// Schema version supported by this node.
         node_version: u8,
     },
+
+    /// Startup replay failed while verifying a persisted block.
+    #[error("startup replay failed at height {height}: {reason}")]
+    StartupReplayFailed {
+        /// Height being replayed.
+        height: u64,
+        /// Why replay failed.
+        reason: String,
+    },
+
+    /// Snapshot and retained block log disagree.
+    #[error("snapshot/block mismatch at height {height}: {reason}")]
+    SnapshotBlockMismatch {
+        /// Snapshot height.
+        height: u64,
+        /// Why the snapshot and block log disagree.
+        reason: String,
+    },
 }
 
 /// Convenience alias.

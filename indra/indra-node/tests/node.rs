@@ -182,6 +182,25 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
     hybrid
 }
 
+fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &str) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let classical = ClassicalKeypair::from_seed(&seed);
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    let vrf = VrfKeypair::from_seed(&seed);
+    let validator_id = indra_crypto::sha256(&classical.public_key().0);
+    let genesis_path = dir.join("genesis.toml");
+    let genesis = format!(
+        "[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+        name,
+        hex::encode(validator_id),
+        hex::encode(classical.public_key().0),
+        hex::encode(pq.public_key().0),
+        hex::encode(vrf.public_key()),
+    );
+    std::fs::write(&genesis_path, genesis).unwrap();
+    genesis_path.to_string_lossy().to_string()
+}
+
 fn build_single_validator_qc_bytes(
     height: u64,
     round: u32,
@@ -372,11 +391,11 @@ fn block_store_survives_reopen() {
 fn restarted_block_store_preserves_hash_chain() {
     let dir = temp_dir("restart_chain");
     std::fs::create_dir_all(&dir).unwrap();
-    let config = NodeConfig::local_test(dir.clone());
+    let mut config = NodeConfig::local_test(dir.clone());
+    config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32], "local"));
 
     {
         let mut engine = NodeEngine::init(config.clone()).unwrap();
-        install_state_validator(&mut engine.state, [0x42u8; 32], "local");
         let mut last_qc = Vec::new();
         for _ in 0..5u64 {
             let height = engine.state.height + 1;

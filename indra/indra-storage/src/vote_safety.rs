@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::atomic::{crc32, write_atomic_synced};
 use crate::error::StorageResult;
 
 /// The persisted vote safety record.
@@ -18,6 +19,17 @@ pub struct VoteSafetyRecord {
     pub round: u32,
     /// Vote step: 0 = prevote, 1 = precommit.
     pub step: u8,
+}
+
+/// Result of reading the vote safety file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoteSafetyLoadResult {
+    /// No record exists yet — fresh validator start.
+    NoRecord,
+    /// A valid record was loaded.
+    Record(VoteSafetyRecord),
+    /// The file exists but is invalid/corrupt and voting must fail closed.
+    Corrupt(String),
 }
 
 /// Manages vote safety persistence.
@@ -43,53 +55,54 @@ impl VoteSafetyStore {
         let crc = crc32(&buf[0..13]);
         buf[13..17].copy_from_slice(&crc.to_le_bytes());
 
-        fs::write(&self.tmp_path, buf)?;
-        fs::rename(&self.tmp_path, &self.path)?;
+        write_atomic_synced(&self.tmp_path, &self.path, &buf)?;
         Ok(())
     }
 
     /// Load the persisted vote safety record.
     ///
-    /// Returns `None` if the file does not exist or fails CRC validation.
-    pub fn load(&self) -> Option<VoteSafetyRecord> {
-        let buf = fs::read(&self.path).ok()?;
+    /// Returns a distinct corrupt result when a present file cannot be trusted.
+    pub fn load(&self) -> VoteSafetyLoadResult {
+        let buf = match fs::read(&self.path) {
+            Ok(buf) => buf,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return VoteSafetyLoadResult::NoRecord;
+            }
+            Err(err) => return VoteSafetyLoadResult::Corrupt(err.to_string()),
+        };
         if buf.len() != 17 {
-            return None;
+            return VoteSafetyLoadResult::Corrupt(format!(
+                "invalid length {}, expected 17",
+                buf.len()
+            ));
         }
 
-        let stored_crc = u32::from_le_bytes(buf[13..17].try_into().ok()?);
+        let stored_crc = match buf[13..17].try_into() {
+            Ok(bytes) => u32::from_le_bytes(bytes),
+            Err(_) => return VoteSafetyLoadResult::Corrupt("CRC field truncated".into()),
+        };
         let computed_crc = crc32(&buf[0..13]);
         if stored_crc != computed_crc {
-            eprintln!("[vote_safety] corrupt vote safety file — ignoring");
-            return None;
+            return VoteSafetyLoadResult::Corrupt(format!(
+                "CRC mismatch: stored {stored_crc:#x}, computed {computed_crc:#x}"
+            ));
         }
 
-        let height = u64::from_le_bytes(buf[0..8].try_into().ok()?);
-        let round = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+        let height = match buf[0..8].try_into() {
+            Ok(bytes) => u64::from_le_bytes(bytes),
+            Err(_) => return VoteSafetyLoadResult::Corrupt("height field truncated".into()),
+        };
+        let round = match buf[8..12].try_into() {
+            Ok(bytes) => u32::from_le_bytes(bytes),
+            Err(_) => return VoteSafetyLoadResult::Corrupt("round field truncated".into()),
+        };
         let step = buf[12];
-        Some(VoteSafetyRecord {
+        VoteSafetyLoadResult::Record(VoteSafetyRecord {
             height,
             round,
             step,
         })
     }
-}
-
-/// CRC32 using the IEEE polynomial.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        let mut b = byte as u32;
-        for _ in 0..8 {
-            let mix = (crc ^ b) & 1;
-            crc >>= 1;
-            if mix != 0 {
-                crc ^= 0xEDB8_8320;
-            }
-            b >>= 1;
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]
@@ -112,7 +125,9 @@ mod tests {
         let path = tmp_path("round_trip");
         let store = VoteSafetyStore::open(&path);
         store.record(42, 7, 0).unwrap();
-        let loaded = store.load().unwrap();
+        let VoteSafetyLoadResult::Record(loaded) = store.load() else {
+            panic!("expected valid vote safety record");
+        };
         assert_eq!(loaded.height, 42);
         assert_eq!(loaded.round, 7);
         assert_eq!(loaded.step, 0);
@@ -122,18 +137,18 @@ mod tests {
     #[test]
     fn load_nonexistent_returns_none() {
         let store = VoteSafetyStore::open(tmp_path("nonexistent"));
-        assert!(store.load().is_none());
+        assert_eq!(store.load(), VoteSafetyLoadResult::NoRecord);
     }
 
     #[test]
-    fn corrupt_crc_returns_none() {
+    fn corrupt_crc_returns_corrupt() {
         let path = tmp_path("corrupt");
         let store = VoteSafetyStore::open(&path);
         store.record(1, 1, 0).unwrap();
         let mut buf = std::fs::read(&path).unwrap();
         buf[0] ^= 0xFF;
         std::fs::write(&path, &buf).unwrap();
-        assert!(store.load().is_none());
+        assert!(matches!(store.load(), VoteSafetyLoadResult::Corrupt(_)));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -144,7 +159,9 @@ mod tests {
         store.record(1, 0, 0).unwrap();
         store.record(1, 1, 0).unwrap();
         store.record(1, 1, 1).unwrap();
-        let loaded = store.load().unwrap();
+        let VoteSafetyLoadResult::Record(loaded) = store.load() else {
+            panic!("expected valid vote safety record");
+        };
         assert_eq!(loaded.round, 1);
         assert_eq!(loaded.step, 1);
         let _ = std::fs::remove_file(&path);
@@ -155,7 +172,9 @@ mod tests {
         let path = tmp_path("precommit");
         let store = VoteSafetyStore::open(&path);
         store.record(100, 15, 1).unwrap();
-        let loaded = store.load().unwrap();
+        let VoteSafetyLoadResult::Record(loaded) = store.load() else {
+            panic!("expected valid vote safety record");
+        };
         assert_eq!(loaded.height, 100);
         assert_eq!(loaded.round, 15);
         assert_eq!(loaded.step, 1);

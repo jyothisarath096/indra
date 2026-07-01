@@ -1,8 +1,8 @@
 //! Persistence for the most recently committed quorum certificate bytes.
 
-use std::fs;
 use std::path::Path;
 
+use crate::atomic::write_atomic_synced;
 use crate::error::StorageResult;
 
 const LAST_QC_FILE: &str = "last_qc.bin";
@@ -13,11 +13,10 @@ const LAST_QC_TMP_FILE: &str = "last_qc.bin.tmp";
 /// The file is replaced atomically via write-then-rename so a crash cannot
 /// leave behind a partially written QC blob.
 pub fn save_last_qc(state_dir: &Path, qc_bytes: &[u8]) -> StorageResult<()> {
-    fs::create_dir_all(state_dir)?;
+    std::fs::create_dir_all(state_dir)?;
     let tmp = state_dir.join(LAST_QC_TMP_FILE);
     let final_path = state_dir.join(LAST_QC_FILE);
-    fs::write(&tmp, qc_bytes)?;
-    fs::rename(&tmp, final_path)?;
+    write_atomic_synced(&tmp, &final_path, qc_bytes)?;
     Ok(())
 }
 
@@ -26,7 +25,7 @@ pub fn save_last_qc(state_dir: &Path, qc_bytes: &[u8]) -> StorageResult<()> {
 /// Returns `Ok(None)` when no QC has been persisted yet.
 pub fn load_last_qc(state_dir: &Path) -> StorageResult<Option<Vec<u8>>> {
     let path = state_dir.join(LAST_QC_FILE);
-    match fs::read(path) {
+    match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),

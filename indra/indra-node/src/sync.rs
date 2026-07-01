@@ -430,7 +430,7 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
     verify_qc_strict(&qc, &validators, total_stake, &state.chain_id).map_err(NodeError::Consensus)
 }
 
-fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
 
