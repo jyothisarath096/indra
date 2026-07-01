@@ -378,27 +378,7 @@ impl NodeEngine {
             );
             return false;
         }
-        let slot = compute_proposer_vrf(
-            validator_id,
-            vrf_kp,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        let mut effective_election = ProposerElection {
-            epoch_seed: election.epoch_seed,
-            height: election.height,
-            round: election.round,
-            candidates: election.candidates.clone(),
-        };
-        if let Some(candidate) = effective_election
-            .candidates
-            .iter_mut()
-            .find(|candidate| candidate.validator_id == slot.proposer_id)
-        {
-            candidate.verified_vrf_output = Some(slot.vrf_output.clone());
-        }
-        let elected = match elect_proposer(&effective_election, election.height) {
+        let elected = match elect_proposer(election, election.height) {
             Ok(id) => id,
             Err(_) => {
                 eprintln!(
@@ -408,7 +388,7 @@ impl NodeEngine {
                 return false;
             }
         };
-        elected == slot.proposer_id
+        elected == validator_id
     }
 
     /// Propose a block for the next height (only if this node is the proposer).
@@ -487,21 +467,7 @@ impl NodeEngine {
             election.height,
             election.round,
         );
-        let mut effective_election = ProposerElection {
-            epoch_seed: election.epoch_seed,
-            height: election.height,
-            round: election.round,
-            candidates: election.candidates.clone(),
-        };
-        if let Some(candidate) = effective_election
-            .candidates
-            .iter_mut()
-            .find(|candidate| candidate.validator_id == slot.proposer_id)
-        {
-            candidate.verified_vrf_output = Some(slot.vrf_output.clone());
-        }
-        let elected =
-            elect_proposer(&effective_election, election.height).map_err(NodeError::Consensus)?;
+        let elected = elect_proposer(election, election.height).map_err(NodeError::Consensus)?;
         if elected != slot.proposer_id {
             return Err(NodeError::NotProposer {
                 height: proposal_height,
@@ -1319,6 +1285,63 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_one_validator_is_proposer_per_height_round_in_4_validator_set() {
+        let seeds = [[0x51u8; 32], [0x52u8; 32], [0x53u8; 32], [0x54u8; 32]];
+        let mut engines = Vec::new();
+        let mut dirs = Vec::new();
+
+        for (idx, seed) in seeds.iter().enumerate() {
+            let dir = temp_dir(&format!("unique_proposer_{idx}"));
+            let mut config = NodeConfig::local_test(dir.clone());
+            config.validator_seed = Some(*seed);
+            config.vrf_seed = Some(*seed);
+            let mut engine = NodeEngine::init(config).unwrap();
+            for validator_seed in seeds {
+                install_active_validator(&mut engine, validator_seed, "validator");
+            }
+            dirs.push(dir);
+            engines.push(engine);
+        }
+
+        for height in 1..=12u64 {
+            for round in 0..8u32 {
+                let epoch_seed = Bytes32::from(indra_crypto::sha256(&engines[0].state.tip_hash.0));
+                let candidates: Vec<_> = engines[0]
+                    .state
+                    .validators
+                    .active_validators()
+                    .filter_map(|validator| {
+                        validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                            validator_id: validator.validator_id,
+                            vrf_pubkey: vrf_pk,
+                            verified_vrf_output: None,
+                            stake: validator.stake_spark,
+                        })
+                    })
+                    .collect();
+                let election = ProposerElection {
+                    epoch_seed,
+                    height,
+                    round,
+                    candidates,
+                };
+                let proposer_count = engines
+                    .iter()
+                    .filter(|engine| engine.is_proposer(&election))
+                    .count();
+                assert_eq!(
+                    proposer_count, 1,
+                    "exactly one validator must be proposer at height={height} round={round}"
+                );
+            }
+        }
+
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Deterministic proposer election and VRF proof generation.
 
-use indra_core::types::primitives::{vrf_verified_output_active, Bytes32, MAX_ROUNDS_PER_HEIGHT};
+use indra_core::types::primitives::{
+    public_proposer_election_active, vrf_verified_output_active, Bytes32, MAX_ROUNDS_PER_HEIGHT,
+};
 use indra_crypto::{sha256, vrf_prove, VrfKeypair, VrfOutput, VrfProof};
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -102,6 +104,31 @@ pub fn candidate_output(vrf_pubkey: &[u8; 32], vrf_input: &[u8; 32]) -> VrfOutpu
     VrfOutput(sha256(&data))
 }
 
+/// Compute a deterministic public proposer score for a candidate.
+///
+/// This replaces the old mixed-output election (one real VRF output vs.
+/// public SHA256 fallbacks for others) with a single fully public function
+/// evaluated identically by every validator.
+///
+/// The VRF proof in the block header still proves ownership of the registered
+/// VRF key, but is not used for winner selection while
+/// `PUBLIC_PROPOSER_ELECTION_HEIGHT` is active.
+pub fn public_proposer_output(
+    epoch_seed: &Bytes32,
+    height: u64,
+    round: u32,
+    validator_id: &Bytes32,
+    vrf_pubkey: &[u8; 32],
+) -> VrfOutput {
+    let mut data = b"INDRA-PROPOSER-PUBLIC-v1".to_vec();
+    data.extend_from_slice(&epoch_seed.0);
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(&round.to_le_bytes());
+    data.extend_from_slice(&validator_id.0);
+    data.extend_from_slice(vrf_pubkey);
+    VrfOutput(sha256(&data))
+}
+
 /// Elect the proposer for a given height.
 pub fn elect_proposer(election: &ProposerElection, height: u64) -> ConsensusResult<Bytes32> {
     if election.candidates.is_empty() {
@@ -118,7 +145,21 @@ pub fn elect_proposer(election: &ProposerElection, height: u64) -> ConsensusResu
         .candidates
         .iter()
         .map(|candidate| {
-            let output = if vrf_verified_output_active(height) {
+            let output = if public_proposer_election_active(height) {
+                // DETERMINISM SAFETY: winner selection must be a single public
+                // function over the full candidate set. Do not use
+                // `verified_vrf_output` here; a proposal only reveals one
+                // validator's actual VRF output, which makes the old mixed
+                // election perspective-dependent and permits multiple
+                // apparent proposers for the same slot.
+                public_proposer_output(
+                    &election.epoch_seed,
+                    election.height,
+                    election.round,
+                    &candidate.validator_id,
+                    &candidate.vrf_pubkey,
+                )
+            } else if vrf_verified_output_active(height) {
                 candidate
                     .verified_vrf_output
                     .clone()
@@ -298,24 +339,83 @@ mod tests {
     }
 
     #[test]
-    fn election_score_uses_verified_vrf_output_not_public_hash() {
-        let vrf_input = compute_vrf_input(&[0x42u8; 32], 100, 0);
+    fn elect_proposer_returns_same_winner_regardless_of_verified_vrf_output() {
+        let mut candidates_with_verified = vec![
+            candidate(0x01, 1_000_000),
+            candidate(0x02, 1_000_000),
+            candidate(0x03, 1_000_000),
+            candidate(0x04, 1_000_000),
+        ];
+        candidates_with_verified[2].verified_vrf_output = Some(VrfOutput([0u8; 32]));
 
-        let keypairs: Vec<VrfKeypair> = (0u8..100)
-            .map(|i| VrfKeypair::from_seed(&[i; 32]))
-            .collect();
+        let election_with_verified = election(candidates_with_verified);
+        let election_without_verified = election(vec![
+            candidate(0x01, 1_000_000),
+            candidate(0x02, 1_000_000),
+            candidate(0x03, 1_000_000),
+            candidate(0x04, 1_000_000),
+        ]);
 
-        let vrf_outputs: Vec<VrfOutput> = keypairs
-            .iter()
-            .map(|kp| vrf_prove(kp, &vrf_input).0)
-            .collect();
+        assert_eq!(
+            elect_proposer(&election_with_verified, election_with_verified.height).unwrap(),
+            elect_proposer(&election_without_verified, election_without_verified.height).unwrap(),
+            "verified_vrf_output must not affect public deterministic election"
+        );
+    }
 
-        for (i, kp) in keypairs.iter().enumerate() {
-            let public_hash = candidate_output(&kp.public_key(), &vrf_input);
-            assert_ne!(
-                public_hash.0, vrf_outputs[i].0,
-                "public hash must not predict verified VRF output"
-            );
+    #[test]
+    fn public_proposer_output_is_deterministic_and_domain_separated() {
+        let epoch_seed = Bytes32::from([0x42u8; 32]);
+        let validator_id = Bytes32::from([0x11u8; 32]);
+        let vrf_pubkey = VrfKeypair::from_seed(&[0x11u8; 32]).public_key();
+
+        let a = public_proposer_output(&epoch_seed, 10, 2, &validator_id, &vrf_pubkey);
+        let b = public_proposer_output(&epoch_seed, 10, 2, &validator_id, &vrf_pubkey);
+        assert_eq!(a.0, b.0, "same public election inputs must be stable");
+
+        let mut other_domain = b"INDRA-PROPOSER-OTHER-v1".to_vec();
+        other_domain.extend_from_slice(&epoch_seed.0);
+        other_domain.extend_from_slice(&10u64.to_le_bytes());
+        other_domain.extend_from_slice(&2u32.to_le_bytes());
+        other_domain.extend_from_slice(&validator_id.0);
+        other_domain.extend_from_slice(&vrf_pubkey);
+        assert_ne!(
+            a.0,
+            sha256(&other_domain),
+            "public proposer output must be domain separated"
+        );
+    }
+
+    #[test]
+    fn proposer_election_is_stake_weighted() {
+        let candidates = vec![candidate(0x01, 2_000_000), candidate(0x02, 1_000_000)];
+        let mut high_stake_wins = 0usize;
+        let mut low_stake_wins = 0usize;
+
+        for height in 1..=500u64 {
+            for round in 0..10u32 {
+                let election = ProposerElection {
+                    epoch_seed: Bytes32::from([0x42u8; 32]),
+                    height,
+                    round,
+                    candidates: candidates.clone(),
+                };
+                match elect_proposer(&election, election.height).unwrap().0[0] {
+                    0x01 => high_stake_wins += 1,
+                    0x02 => low_stake_wins += 1,
+                    other => panic!("unexpected winner {other:#x}"),
+                }
+            }
         }
+
+        assert!(
+            high_stake_wins > low_stake_wins,
+            "higher stake candidate should win more slots"
+        );
+        let ratio = high_stake_wins as f64 / low_stake_wins as f64;
+        assert!(
+            (1.5..=2.5).contains(&ratio),
+            "2x stake should win roughly 2x slots, got ratio {ratio:.3}"
+        );
     }
 }

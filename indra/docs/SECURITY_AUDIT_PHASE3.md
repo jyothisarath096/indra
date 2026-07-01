@@ -8,7 +8,7 @@
 | CS-02 | Safety | POLC rule uses full hash for vote target and value hash for same-value reproposal checks | SAFE | Checked |
 | CS-03 | Safety | QC verification requires quorum stake plus PQ and Ed25519 signatures; stale strict-wrapper comment corrected | SAFE | FIXED |
 | CS-04 | Liveness | Timeout progression is local and uncapped; peer-status round jumps are capped | SAFE / LOW | Checked |
-| CS-05 | Liveness | VRF proposer election can accept multiple apparent proposers in the same round | HIGH | NEEDS FIX |
+| CS-05 | Liveness | Proposer election now uses a public deterministic score; VRF proof remains key-ownership evidence | SAFE | FIXED |
 | CS-06 | Liveness | Sync catch-up refreshes voter set and recovers stale/missing tip QC | SAFE | Checked |
 | CS-07 | Equivocation | Slash detector compares vote full `block_hash()` and no stale `value_hash` path was found | SAFE | Checked |
 | CS-08 | Equivocation | Slash evidence requires forged hybrid precommit signatures; prevote conflicts are explicitly non-slashable | SAFE | FIXED |
@@ -105,31 +105,35 @@ The remaining liveness caveat is that timeouts are constant rather than adaptive
 
 **Recommended fix:** Consider adaptive timeout growth in Phase 3 follow-up, especially for geographically distributed validator sets.
 
-### CS-05 — VRF proposer election can accept multiple apparent proposers in the same round
+### CS-05 — Proposer election uniqueness
 
-**Description:** The verified-output VRF election fix is incomplete as a uniqueness mechanism. `elect_proposer` uses a candidate's `verified_vrf_output` when present, but falls back to `candidate_output(vrf_pubkey, vrf_input)` for candidates without a published proof. During local production, only the local validator's actual VRF output is known. During block verification, only the block proposer's actual VRF output is known. Therefore different validators' blocks for the same `(height, round)` can each be verified against "my actual output vs everyone else's public fallback."
+**Description:** FIXED. `elect_proposer` now uses `public_proposer_output(epoch_seed, height, round, validator_id, vrf_pubkey)` for every candidate while `PUBLIC_PROPOSER_ELECTION_HEIGHT` is active. It no longer uses `verified_vrf_output` for winner selection. This makes proposer election a single public deterministic function evaluated identically by every validator.
 
-**Attack scenario:** Validators A and B can both honestly believe they are proposer for the same height/round if:
+The VRF proof/output remains in the block header and is still verified by proposal intake/import code, but it now serves as key-ownership evidence for the registered VRF public key rather than as the election score.
 
-1. A's actual VRF output beats all public fallback scores, so A produces a block.
-2. B's actual VRF output also beats all public fallback scores, so B produces a block.
-3. Verifiers of A's block verify A's actual VRF and compare it against fallback scores for B/C/D; A passes.
-4. Verifiers of B's block verify B's actual VRF and compare it against fallback scores for A/C/D; B passes.
+**Attack scenario blocked:** Before the fix, validators A and B could both honestly believe they were proposer for the same height/round because each compared their own actual VRF output against other candidates' public fallback hashes. After the fix, A, B, and all verifiers compute the same public score for every candidate, so exactly one validator wins each slot by the shared score/tiebreak rule.
 
-With full-hash voting, this should not allow two different blocks to both reach 2/3 quorum with < 1/3 Byzantine stake. It can, however, split votes and cause avoidable liveness failures/reproposal churn. It also means the protocol does not have a single globally determined proposer per round, even though the driver assumes one.
+With full-hash voting, the pre-fix issue was primarily liveness, not safety. The fix removes the avoidable vote splitting/zero-proposer churn caused by perspective-dependent winner selection.
 
 **Code location:**
 
 - `indra-consensus/src/proposer.rs::elect_proposer`
+- `indra-consensus/src/proposer.rs::public_proposer_output`
 - `indra-node/src/engine.rs::is_proposer`
+- `indra-consensus/src/producer.rs::produce_block`
 - `indra-node/src/sync.rs::verify_proposer_vrf`
-- `indra-node/src/bin/node.rs` proposal loop builds elections with all `verified_vrf_output: None`
+- `indra-core/src/types/primitives.rs::PUBLIC_PROPOSER_ELECTION_HEIGHT`
 
-**Analysis/proof:** The winner is computed from a mixture of one actual VRF output and public fallback outputs. Because the actual VRF outputs of non-claiming candidates are not available, the comparison is not the same function for every candidate. A deterministic total order over all candidates' actual VRF outputs is not currently possible from a single proposal's proof.
+**Analysis/proof:** The new tests verify that:
 
-**Severity:** HIGH.
+- `elect_proposer` returns the same winner even when `verified_vrf_output` is populated for one candidate;
+- `NodeEngine::is_proposer` returns true for exactly one validator across a 4-validator set over multiple heights/rounds;
+- two validators with valid VRF proofs for the same slot cannot both pass `verify_proposer_vrf`;
+- the public proposer score is deterministic/domain-separated and remains stake-sensitive.
 
-**Recommended fix:** Redesign proposer election so all validators can derive the same unique proposer without knowing every candidate's secret output. Options include deterministic weighted round-robin, public-key based election with known grinding tradeoffs, a pre-round VRF-output gossip/commit-reveal phase, or a protocol where proposals are valid if they meet an eligibility threshold rather than claiming a single total-order winner.
+**Severity:** SAFE after fix. This is a consensus-rule change for proposer validity and should be activated from genesis after a fresh testnet reset or via a hard-fork height. It does not change cryptographic derivation, block wire format, state schema, or genesis validator key material.
+
+**Recommended fix:** Complete. For mainnet design, consider a commit-reveal VRF election if private/unpredictable per-round proposer selection is required; the current public deterministic rule intentionally prioritizes a unique globally-computable proposer.
 
 ### CS-06 — Sync and catch-up correctness
 
@@ -206,11 +210,11 @@ With full-hash voting, this should not allow two different blocks to both reach 
 
 **Analysis/proof:** For each slot, `process_block_internal` stages one block and rejects later different blocks for that same `(height, proposer_round)` locally. Votes are for the full staged block hash. If the network splits, each subset votes for a different full hash. With 4 equal validators, one conflicting full hash needs 3 votes to reach quorum; two conflicting full hashes cannot both obtain 3 votes unless at least 2 validators equivocate, exceeding f=1. `VoteCollector` returns quorum per exact full hash.
 
-This remains affected by CS-05: multiple apparent proposers in one round can cause split votes and liveness stalls. It does not by itself allow two QCs under the BFT fault assumption.
+The CS-05 public deterministic proposer-election fix now removes the known honest multi-proposer source of split votes for the same slot. A Byzantine proposer can still equivocate by sending different blocks to different peers, but full-hash voting means conflicting full hashes cannot both reach quorum under the f < n/3 assumption.
 
-**Severity:** SAFE, affected by CS-05 liveness.
+**Severity:** SAFE.
 
-**Recommended fix:** Fix CS-05 to reduce competing proposal frequency; keep full-hash voting.
+**Recommended fix:** None for safety. Keep full-hash voting and the public deterministic proposer election.
 
 ### CS-10 — Invalid proposal early rejection
 
@@ -271,8 +275,8 @@ This remains affected by CS-05: multiple apparent proposers in one round can cau
 
 ## Fix Priority
 
-1. **CS-05 — VRF proposer uniqueness/liveness:** redesign proposer election so all validators evaluate the same candidate set with the same data. This is the most likely source of repeated competing proposals and round churn under honest operation.
-2. **CS-04 — adaptive timeouts:** consider exponential/adaptive round timeouts for WAN stability. This is operational liveness hardening, not a correctness blocker.
+1. **CS-04 — adaptive timeouts:** consider exponential/adaptive round timeouts for WAN stability. This is operational liveness hardening, not a correctness blocker.
+2. **Mainnet proposer-election design:** public deterministic election is now safe and unique, but it is predictable once the epoch seed and validator set are known. If mainnet requires private/unpredictable per-round proposer selection, design a commit-reveal VRF scheme as a separate protocol upgrade.
 
 ## Proof-of-Concept Tests
 

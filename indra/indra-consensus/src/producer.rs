@@ -85,21 +85,7 @@ pub fn produce_block(
         election.round,
     );
 
-    let mut effective_election = ProposerElection {
-        epoch_seed: election.epoch_seed,
-        height: election.height,
-        round: election.round,
-        candidates: election.candidates.clone(),
-    };
-    if let Some(candidate) = effective_election
-        .candidates
-        .iter_mut()
-        .find(|candidate| candidate.validator_id == slot.proposer_id)
-    {
-        candidate.verified_vrf_output = Some(slot.vrf_output.clone());
-    }
-
-    let elected = elect_proposer(&effective_election, election.height)?;
+    let elected = elect_proposer(election, election.height)?;
     if elected != slot.proposer_id {
         return Err(ConsensusError::WrongProposer);
     }

@@ -294,6 +294,11 @@ pub mod hard_forks {
     pub const HYBRID_QC_HEIGHT: u64 = 0;
     /// Vote signatures include the chain ID in their signing domain.
     pub const VOTE_CHAIN_ID_HEIGHT: u64 = 0;
+    /// Proposer election uses a fully public deterministic score.
+    ///
+    /// Testnet activates this from genesis after a fresh reset. Mainnet may
+    /// choose a future height if migrating an existing chain.
+    pub const PUBLIC_PROPOSER_ELECTION_HEIGHT: u64 = 0;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -318,6 +323,12 @@ pub fn hybrid_qc_active(height: u64) -> bool {
 #[inline]
 pub fn vote_chain_id_active(height: u64) -> bool {
     height >= hard_forks::VOTE_CHAIN_ID_HEIGHT
+}
+
+/// Whether proposer election must use the fully public deterministic score.
+#[inline]
+pub fn public_proposer_election_active(height: u64) -> bool {
+    height >= hard_forks::PUBLIC_PROPOSER_ELECTION_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

@@ -1772,27 +1772,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate.vrf_pubkey == keypair.public_key())?
             .validator_id;
-        let slot = indra_consensus::proposer::compute_proposer_vrf(
-            validator_id,
-            &keypair,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        let mut effective = indra_consensus::proposer::ProposerElection {
-            epoch_seed: election.epoch_seed,
-            height: election.height,
-            round: election.round,
-            candidates: election.candidates.clone(),
-        };
-        if let Some(candidate) = effective
-            .candidates
-            .iter_mut()
-            .find(|candidate| candidate.validator_id == slot.proposer_id)
-        {
-            candidate.verified_vrf_output = Some(slot.vrf_output);
-        }
-        indra_consensus::proposer::elect_proposer(&effective, effective.height).ok()
+        let elected = indra_consensus::proposer::elect_proposer(election, election.height).ok()?;
+        (elected == validator_id).then_some(elected)
     }
 
     fn pick_tip_hash_for_round_winners(

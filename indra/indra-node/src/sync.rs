@@ -271,7 +271,7 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
         });
     }
 
-    let mut candidates: Vec<ProposerCandidate> = state
+    let candidates: Vec<ProposerCandidate> = state
         .validators
         .active_validators()
         .filter_map(|validator| {
@@ -329,11 +329,6 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
     }
 
     let matched_validator_id = matching_candidates[0].validator_id;
-    for candidate in &mut candidates {
-        if candidate.validator_id == matched_validator_id {
-            candidate.verified_vrf_output = Some(output.clone());
-        }
-    }
     let election = ProposerElection {
         epoch_seed,
         height: block.header.height,
@@ -597,27 +592,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate.vrf_pubkey == keypair.public_key())?
             .validator_id;
-        let slot = compute_proposer_vrf(
-            validator_id,
-            &keypair,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        let mut effective = ProposerElection {
-            epoch_seed: election.epoch_seed,
-            height: election.height,
-            round: election.round,
-            candidates: election.candidates.clone(),
-        };
-        if let Some(candidate) = effective
-            .candidates
-            .iter_mut()
-            .find(|candidate| candidate.validator_id == slot.proposer_id)
-        {
-            candidate.verified_vrf_output = Some(slot.vrf_output);
-        }
-        elect_proposer(&effective, effective.height).ok()
+        let elected = elect_proposer(election, election.height).ok()?;
+        (elected == validator_id).then_some(elected)
     }
 
     fn make_strict_block(
@@ -1118,6 +1094,58 @@ mod tests {
         match err {
             NodeError::BlockInvalid { reason, .. } => {
                 assert!(reason.contains("proposer VRF mismatch"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_validators_with_valid_vrf_proofs_cannot_both_pass_verify_proposer() {
+        let mut state = ChainState::new_genesis();
+        let (validator_a, _hybrid_a) =
+            install_active_validator(&mut state, 0x41, 10_000, true, true);
+        let (validator_b, _hybrid_b) =
+            install_active_validator(&mut state, 0x42, 10_000, true, true);
+
+        let round = 2u32;
+        let election = build_election(&state, 1, round);
+        let elected = elect_proposer(&election, election.height).unwrap();
+        let (winner_seed, loser_seed, loser_id) = if elected == validator_a {
+            (0x41u8, 0x42u8, validator_b)
+        } else if elected == validator_b {
+            (0x42u8, 0x41u8, validator_a)
+        } else {
+            panic!(
+                "unexpected elected proposer {}",
+                hex::encode(&elected.0[..4])
+            );
+        };
+
+        let winner_block = make_strict_block(&state, winner_seed, round, vec![]);
+        assert!(
+            verify_proposer_vrf(&winner_block, &state).is_ok(),
+            "public deterministic winner must pass proposer verification"
+        );
+
+        let mut loser_block = winner_block.clone();
+        let loser_slot = compute_proposer_vrf(
+            loser_id,
+            &VrfKeypair::from_seed(&[loser_seed; 32]),
+            &election.epoch_seed,
+            1,
+            round,
+        );
+        loser_block.header.proposer_vrf_output = Bytes32::from(loser_slot.vrf_output.0);
+        loser_block.header.proposer_vrf_proof =
+            VariableBytes::from_slice(&loser_slot.vrf_proof.0).unwrap();
+
+        let err = verify_proposer_vrf(&loser_block, &state).unwrap_err();
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("proposer VRF mismatch"),
+                    "unexpected rejection reason: {reason}"
+                );
             }
             other => panic!("unexpected error: {other:?}"),
         }

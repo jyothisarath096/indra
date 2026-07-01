@@ -290,3 +290,25 @@ Minimum tests:
 - It does not require a wire-format change if existing VRF proof/output header fields remain.
 - It should be gated behind a hard-fork height or activated from genesis on a fresh testnet reset.
 
+## Implementation Status
+
+**Status:** IMPLEMENTED.
+
+The selected Option D fix is now in place:
+
+- `indra-core/src/types/primitives.rs` defines `PUBLIC_PROPOSER_ELECTION_HEIGHT = 0` and `public_proposer_election_active(height)`.
+- `indra-consensus/src/proposer.rs::public_proposer_output` computes a domain-separated public score from epoch seed, height, round, validator ID, and VRF public key.
+- `indra-consensus/src/proposer.rs::elect_proposer` uses that public score for every candidate and intentionally ignores `verified_vrf_output` for winner selection while the hard fork is active.
+- `indra-node/src/engine.rs::is_proposer` verifies local validator/VRF-key identity, then checks the public deterministic winner without computing/injecting local VRF output.
+- `indra-consensus/src/producer.rs::produce_block` still computes and embeds the VRF proof/output, but verifies proposer eligibility through the public election.
+- `indra-node/src/sync.rs::verify_proposer_vrf` still verifies the header VRF proof to identify key ownership, then checks that the matched validator is the public deterministic winner.
+
+Regression coverage added:
+
+- `elect_proposer_returns_same_winner_regardless_of_verified_vrf_output`
+- `only_one_validator_is_proposer_per_height_round_in_4_validator_set`
+- `two_validators_with_valid_vrf_proofs_cannot_both_pass_verify_proposer`
+- `public_proposer_output_is_deterministic_and_domain_separated`
+- `proposer_election_is_stake_weighted`
+
+Migration note: this is a consensus-rule change and should be activated with a fresh testnet state wipe or a scheduled hard-fork height. It does **not** require key regeneration, genesis validator-entry changes, cryptographic derivation changes, block wire-format changes, or state-schema changes.
