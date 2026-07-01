@@ -10,7 +10,7 @@ use toml::Value;
 
 use crate::config::NodeConfig;
 use indra_core::types::primitives::{
-    DEFAULT_PRUNE_KEEP_BLOCKS, DNS_SEED_HOST, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT,
+    DEFAULT_PRUNE_KEEP_BLOCKS, DNS_SEED_HOSTS, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT,
 };
 
 /// Parsed key material loaded from `keys.json`.
@@ -229,7 +229,7 @@ impl NodeConfigFile {
             dns_seed_host: self
                 .dns_seed_host
                 .clone()
-                .unwrap_or_else(|| DNS_SEED_HOST.to_string()),
+                .unwrap_or_else(|| DNS_SEED_HOSTS.join(",")),
             peers_file,
             snapshot_interval: self.snapshot_interval.unwrap_or(300),
             mempool_capacity: self.mempool_capacity.unwrap_or(5_000),
@@ -492,7 +492,7 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
             .to_node_config(Some(&keys()))
             .unwrap_or_else(|e| panic!("{}", e));
         assert_eq!(node.p2p_addr, "0.0.0.0:30303");
-        assert_eq!(node.dns_seed_host, DNS_SEED_HOST);
+        assert_eq!(node.dns_seed_host, DNS_SEED_HOSTS.join(","));
         assert_eq!(node.peers_file, "/tmp/indra/peers.json");
         assert_eq!(node.prune_keep_blocks, Some(DEFAULT_PRUNE_KEEP_BLOCKS));
         assert_eq!(

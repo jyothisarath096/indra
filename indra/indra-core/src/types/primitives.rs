@@ -474,6 +474,14 @@ pub const MIN_OUTBOUND_PEERS: usize = 8;
 /// Default DNS seed hostname for peer discovery.
 pub const DNS_SEED_HOST: &str = "seeds.indraprotocol.com";
 
+/// Default DNS seed hostnames for peer discovery.
+///
+/// Multiple independent seeds reduce reliance on any single poisoned or
+/// unavailable DNS seed. DNSSEC validation is still a mainnet TODO in the
+/// discovery layer; validator identity authentication remains the consensus
+/// trust boundary.
+pub const DNS_SEED_HOSTS: &[&str] = &[DNS_SEED_HOST, "seeds2.indraprotocol.com"];
+
 /// Maximum peers to share in a single PeerList message.
 pub const MAX_PEER_LIST_SIZE: usize = 20;
 

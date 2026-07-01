@@ -2,42 +2,82 @@
 
 use std::{
     collections::HashSet,
+    io,
     net::{SocketAddr, ToSocketAddrs},
 };
 
-use indra_core::types::primitives::{DNS_SEED_HOST, MAX_PEER_LIST_SIZE};
+use indra_core::types::primitives::{DNS_SEED_HOSTS, MAX_PEER_LIST_SIZE};
+
+/// Encode the default DNS seed list into the existing config string field.
+pub fn default_dns_seed_hosts_config() -> String {
+    DNS_SEED_HOSTS.join(",")
+}
+
+fn parse_dns_seed_hosts(hosts: &str) -> Vec<String> {
+    hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn resolve_dns_seed_hosts_with<F>(hosts: &[String], port: u16, mut resolver: F) -> Vec<SocketAddr>
+where
+    F: FnMut(&str) -> io::Result<Vec<SocketAddr>>,
+{
+    let mut addrs = HashSet::new();
+    for host in hosts {
+        let addr_str = format!("{host}:{port}");
+        match resolver(&addr_str) {
+            Ok(resolved) => {
+                if !resolved.is_empty() {
+                    eprintln!(
+                        "[discovery] DNS seed {} resolved to {} addresses",
+                        host,
+                        resolved.len()
+                    );
+                }
+                addrs.extend(resolved);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[discovery] DNS seed {} resolution failed: {} — using bootstrap peers only",
+                    host, e
+                );
+            }
+        }
+    }
+
+    let mut resolved: Vec<SocketAddr> = addrs.into_iter().collect();
+    resolved.sort();
+    resolved
+}
 
 /// Resolve DNS seed hostname to a list of socket addresses.
 ///
 /// Returns an empty vec on failure. Discovery is best-effort and must not
 /// prevent node startup.
-pub fn resolve_dns_seeds(host: &str, port: u16) -> Vec<SocketAddr> {
-    let addr_str = format!("{host}:{port}");
-    match addr_str.to_socket_addrs() {
-        Ok(addrs) => {
-            let resolved: Vec<SocketAddr> = addrs.collect();
-            if !resolved.is_empty() {
-                eprintln!(
-                    "[discovery] DNS seed {} resolved to {} addresses",
-                    host,
-                    resolved.len()
-                );
-            }
-            resolved
-        }
-        Err(e) => {
-            eprintln!(
-                "[discovery] DNS seed {} resolution failed: {} — using bootstrap peers only",
-                host, e
-            );
-            vec![]
-        }
-    }
+///
+/// `hosts` may contain one hostname or a comma-separated host list. DNS seeds
+/// supplement configured bootstrap peers but never replace them; a node with
+/// configured bootstrap peers can function if DNS resolution returns nothing.
+///
+/// TODO(mainnet): add DNSSEC or signed seed validation. A poisoned DNS response
+/// can cause dial churn, but cannot eclipse consensus because the validator
+/// transport rejects unknown validator identities.
+pub fn resolve_dns_seeds(hosts: &str, port: u16) -> Vec<SocketAddr> {
+    let hosts = parse_dns_seed_hosts(hosts);
+    resolve_dns_seed_hosts_with(&hosts, port, |addr_str| {
+        addr_str
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<SocketAddr>>())
+    })
 }
 
-/// Resolve the default DNS seed hostname.
+/// Resolve the default DNS seed hostnames.
 pub fn resolve_default_dns_seeds(port: u16) -> Vec<SocketAddr> {
-    resolve_dns_seeds(DNS_SEED_HOST, port)
+    resolve_dns_seeds(&default_dns_seed_hosts_config(), port)
 }
 
 /// Resolve a single peer address string to a socket address.
@@ -99,6 +139,40 @@ mod tests {
     #[test]
     fn dns_resolve_returns_empty_on_failure() {
         assert!(resolve_dns_seeds("invalid.invalid.indraprotocol.test", 30303).is_empty());
+    }
+
+    #[test]
+    fn multiple_dns_seeds_are_queried() {
+        let hosts = vec!["seed-a.example".to_string(), "seed-b.example".to_string()];
+        let resolved = resolve_dns_seed_hosts_with(&hosts, 30303, |addr_str| match addr_str {
+            "seed-a.example:30303" => Ok(vec!["203.0.113.10:30303".parse().unwrap()]),
+            "seed-b.example:30303" => Ok(vec![
+                "203.0.113.11:30303".parse().unwrap(),
+                "203.0.113.10:30303".parse().unwrap(),
+            ]),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "unexpected seed")),
+        });
+
+        assert_eq!(
+            resolved,
+            vec![
+                "203.0.113.10:30303".parse().unwrap(),
+                "203.0.113.11:30303".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_failure_does_not_prevent_bootstrap_peer_connection() {
+        let bootstrap_peers = vec!["198.51.100.10:30303".to_string()];
+        let dns_peers =
+            resolve_dns_seed_hosts_with(&["bad-seed.example".to_string()], 30303, |_| {
+                Err(io::Error::new(io::ErrorKind::NotFound, "dns unavailable"))
+            });
+        let mut dial_candidates = bootstrap_peers.clone();
+        dial_candidates.extend(dns_peers.into_iter().map(|addr| addr.to_string()));
+
+        assert_eq!(dial_candidates, bootstrap_peers);
     }
 
     #[test]

@@ -5,14 +5,14 @@
 | ID | Component | Finding | Severity | Status |
 |----|-----------|---------|----------|--------|
 | NET-01 | Eclipse | Validator transport authenticates peers by active validator identity and keeps one connection per validator, but has no subnet/ASN diversity policy | LOW | PARTIAL |
-| NET-02 | Eclipse | PeerList gossip rejects self/private/local addresses, but accepts arbitrary public IPs and uses lexicographic eviction | MEDIUM | NEEDS HARDENING |
-| NET-03 | Eclipse | DNS seed is a single configurable/default hostname with no DNSSEC or multi-seed trust model | MEDIUM | NEEDS HARDENING |
+| NET-02 | Eclipse | PeerList gossip now uses trust-aware eviction that protects bootstrap and recently authenticated peer addresses | MEDIUM | FIXED |
+| NET-03 | Eclipse | DNS seed discovery now supports multiple seed hosts and treats DNS as bootstrap-supplemental, with DNSSEC documented as a mainnet TODO | MEDIUM | FIXED |
 | NET-04 | Eclipse | Bootstrap peers are config/genesis hints and are preferred before discovered peers; not on-chain mutable | SAFE | VERIFIED |
 | NET-05 | Eclipse | `peers.json` is bounded and parse-safe, but has no freshness or trust scoring across restarts | LOW | NEEDS HARDENING |
-| NET-06 | Resource | Authenticated P2P handshakes are semaphore-limited, but `MAX_INBOUND_PEERS` is not enforced as a connection-slot cap | MEDIUM | NEEDS FIX |
+| NET-06 | Resource | Inbound authenticated P2P connections are capped before handshake by total and per-IP admission budgets | MEDIUM | FIXED |
 | NET-07 | Resource | Handshake rejects unknown validators before ML-DSA verification, but responder still performs ML-KEM/X25519 work for known-id attempts | LOW | ACCEPTABLE |
 | NET-08 | Resource | Observer/full-node frame allocation now uses a smaller 2 MB frame cap plus per-connection byte/request budgets | HIGH | FIXED |
-| NET-09 | Rate limit | Authenticated validator messages are rate-limited by class; observer `RequestBlocks` now has a dedicated bucket, and future observer message types should follow the same policy | MEDIUM | PARTIAL |
+| NET-09 | Rate limit | Authenticated validator messages and observer `RequestBlocks` are rate-limited; future observer message types should follow the same policy | MEDIUM | FIXED |
 | NET-10 | Rate limit | Rate limits are per authenticated connection, but duplicate validator connections are tie-broken to one live connection | LOW | VERIFIED |
 | NET-11 | Rate limit | Penalty escalation can disconnect rate-limited peers, but TCP identity and validator-auth reduce spoof/disconnect manipulation risk | LOW | VERIFIED |
 | NET-12 | Validation | Validator transport processes no application messages before authenticated handshake | SAFE | VERIFIED |
@@ -39,23 +39,23 @@ Recommended fix: add optional peer diversity accounting by IP prefix/ASN for lar
 
 PeerList handling has important hygiene checks. It limits processing to `MAX_PEER_LIST_SIZE` entries (`indra-node/src/bin/node.rs:1115`), rejects configured self-addresses, rejects loopback/private/link-local/unspecified addresses (`indra-node/src/bin/node.rs:147-163`, `indra-node/src/bin/node.rs:1119-1125`), skips already-connected IPs, and inserts into a bounded 256-entry table (`indra-node/src/bin/node.rs:47`, `indra-node/src/bin/node.rs:115-130`).
 
-However, PeerList entries are still unauthenticated public address hints from any authenticated validator peer. An attacker controlling one active validator can feed 20 attacker-controlled public addresses per PeerList. The table cap prevents unbounded growth, but the eviction policy sorts strings and truncates (`indra-node/src/bin/node.rs:119-123`), which is deterministic but not trust-aware. A carefully chosen address set can crowd out honest discovered addresses until bootstrap peers reinsert them.
+However, PeerList entries are still unauthenticated public address hints from any authenticated validator peer. An attacker controlling one active validator can feed 20 attacker-controlled public addresses per PeerList. The original table cap prevented unbounded growth, but eviction sorted strings and truncated, which was deterministic but not trust-aware. A carefully chosen address set could crowd out honest discovered addresses until bootstrap peers reinserted them.
 
 This does not let unauthenticated nodes join consensus because handshake validation still rejects unknown validator IDs. The practical impact is dial churn and degraded discovery, not direct consensus eclipse.
 
 Severity: MEDIUM.
 
-Recommended fix: make discovered-peer eviction trust-aware: always retain configured/bootstrap/genesis peers, prefer recently successful authenticated validator addresses, and evict never-successful discovered entries first.
+Fix status: FIXED. Discovery insertion now protects configured bootstrap peers and recently authenticated peer addresses, prefers genesis hints over unauthenticated gossip entries, and evicts unauthenticated non-bootstrap/non-genesis entries first. Regression tests cover unauthenticated eviction preference and bootstrap peer survival.
 
 ### NET-03 — DNS seed trust model
 
-The default seed is a single hostname, `seeds.indraprotocol.com` (`indra-core/src/types/primitives.rs:474-475`). It is configurable through `network.dns_seed_host` (`indra-node/src/config_file.rs:48-51`, `indra-node/src/config_file.rs:224-232`) and resolved with ordinary `ToSocketAddrs` (`indra-node/src/discovery.rs:14-35`). There is no DNSSEC validation, signed seed records, or multiple independent seed list.
+The original default seed was a single hostname, `seeds.indraprotocol.com`. It is configurable through `network.dns_seed_host` and resolved with ordinary `ToSocketAddrs`. There is still no DNSSEC validation or signed seed records, but the default seed list now includes multiple seed hostnames and the resolver unions responses across all configured seeds.
 
 Because the validator transport requires active validator keys, a malicious DNS seed cannot directly inject non-validator consensus peers. It can, however, return attacker-controlled or dead public IPs and cause repeated dial churn. If a new node starts with no configured bootstrap peers and a poisoned DNS response, it may waste discovery effort until it learns peers through genesis hints, persisted peers, or operator config.
 
 Severity: MEDIUM.
 
-Recommended fix: support multiple DNS seeds, signed seed records, and a policy that never relies solely on DNS when genesis/config bootstrap peers are present.
+Fix status: FIXED for the Phase 6 medium finding. Multiple seed hosts are supported through the existing config string as a comma-separated list, DNS results are deduplicated/unioned, and comments document that DNS supplements configured bootstrap peers rather than replacing them. DNSSEC/signed seed validation remains a mainnet hardening item.
 
 ### NET-04 — Bootstrap peer list security
 
@@ -83,13 +83,13 @@ Recommended fix: persist metadata: last successful handshake, authenticated vali
 
 Inbound authenticated handshakes are protected by a semaphore of 50 concurrent handshakes (`indra-node/src/bin/node.rs:289`, `indra-node/src/bin/node.rs:381-406`). When the semaphore is exhausted, new streams are dropped immediately (`indra-node/src/bin/node.rs:385-390`). Handshake timeout is 10 seconds (`indra-node/src/bin/node.rs:255-260`).
 
-However, `MAX_INBOUND_PEERS = 64` is only a constant; grep found no runtime enforcement outside its definition. The peer manager naturally caps post-handshake live validator connections to one per active validator, but there is no explicit pre-handshake inbound connection cap beyond the 50 handshake semaphore and the OS listener backlog.
+The original gap was that `MAX_INBOUND_PEERS = 64` was only a constant; grep found no runtime enforcement outside its definition. The peer manager naturally caps post-handshake live validator connections to one per active validator, but there was no explicit pre-handshake inbound connection cap beyond the 50 handshake semaphore and the OS listener backlog.
 
 Attack scenario: an unauthenticated remote opens many TCP connections and stalls during the initial handshake. The semaphore limits concurrent expensive tasks to 50, but the kernel backlog and accept loop still absorb churn. This is substantially mitigated but not a complete inbound-slot policy.
 
 Severity: MEDIUM.
 
-Recommended fix: enforce a global inbound accepted-socket budget before handshake, ideally per-IP as well, and wire `MAX_INBOUND_PEERS` into the listener.
+Fix status: FIXED. The listener now reserves inbound capacity before spawning a handshake task, enforces `MAX_INBOUND_PEERS`, also caps pre-handshake connections per IP, and releases the reservation on handshake completion or rejection. Regression tests cover the total inbound cap and the per-IP cap.
 
 ### NET-07 — Handshake CPU amplification
 
@@ -123,7 +123,7 @@ Observer/full-node `RequestBlocks` handling was the main gap found here: a publi
 
 Severity: MEDIUM.
 
-Recommended fix: reuse `PeerRateLimiter` or a smaller observer-specific limiter in `handle_observer_connection`.
+Fix status: FIXED. Observer `RequestBlocks` now uses an observer-specific token bucket before disk reads and block serialization are served.
 
 ### NET-10 — Rate limit bypass via multiple connections
 
@@ -216,6 +216,12 @@ The follow-up HIGH-finding fix added executable regression coverage:
 8. `observer_large_frame_claim_is_rejected`
 9. `observer_byte_budget_is_enforced_per_connection`
 10. `observer_request_blocks_is_rate_limited`
+11. `discovery_eviction_prefers_unauthenticated_entries`
+12. `bootstrap_peers_are_never_evicted`
+13. `multiple_dns_seeds_are_queried`
+14. `dns_failure_does_not_prevent_bootstrap_peer_connection`
+15. `inbound_connection_limit_is_enforced`
+16. `inbound_per_ip_limit_is_enforced`
 
 These tests demonstrate the old count-allocation and observer-budget attack shapes now fail closed.
 
@@ -231,8 +237,7 @@ These tests demonstrate the old count-allocation and observer-budget attack shap
 
 ## Recommended Fix Order
 
-1. NET-09: extend observer rate limiting beyond `RequestBlocks` if more observer message types are added.
-2. NET-06: enforce `MAX_INBOUND_PEERS` and per-IP pre-handshake caps in the listener.
-3. NET-02 / NET-05 / NET-16: make discovery persistence trust-aware with last-success/failure metadata.
-4. NET-03: add multiple/signed DNS seeds or DNSSEC-aware resolution.
-5. NET-15: reduce tie-break churn by dialing by validator identity rather than IP-only state.
+1. NET-05 / NET-16: persist last-success/failure metadata and age out never-successful peers.
+2. NET-03: add DNSSEC-aware or signed seed validation for mainnet.
+3. NET-15: reduce tie-break churn by dialing by validator identity rather than IP-only state.
+4. NET-01: add optional subnet/ASN diversity accounting for larger deployments.

@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use fs2::available_space;
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
-    DNS_SEED_HOST, MAX_OBSERVER_CONNECTIONS, MAX_PEER_LIST_SIZE, MIN_PRUNE_KEEP_BLOCKS,
-    OBSERVER_PORT, PEER_LIST_INTERVAL_SECS, PEER_TABLE_SAVE_INTERVAL_SECS, TARGET_OUTBOUND_PEERS,
+    DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS, MAX_PEER_LIST_SIZE,
+    MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS, PEER_TABLE_SAVE_INTERVAL_SECS,
+    TARGET_OUTBOUND_PEERS,
 };
 use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_network::{
@@ -27,7 +28,10 @@ use indra_network::{
     ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle, TokenBucket,
 };
 use indra_node::{
-    discovery::{load_peers, peer_list_payload, resolve_dns_seeds, resolve_peer_addr, save_peers},
+    discovery::{
+        default_dns_seed_hosts_config, load_peers, peer_list_payload, resolve_dns_seeds,
+        resolve_peer_addr, save_peers,
+    },
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     genesis::load_genesis_seed_peers,
     metrics::{record_block_commit, DEFAULT_METRICS_ADDR},
@@ -47,6 +51,7 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const MAX_DISCOVERED_PEERS: usize = 256;
 const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
+const MAX_INBOUND_PER_IP: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
@@ -114,21 +119,63 @@ fn has_connected_ip_from_socket_addrs(connected_addrs: &[SocketAddr], addr: &Soc
         .any(|connected| connected.ip() == addr.ip())
 }
 
-fn trim_discovered_peers(discovered_peers: &mut HashSet<String>) {
-    if discovered_peers.len() <= MAX_DISCOVERED_PEERS {
-        return;
+fn choose_discovery_eviction_candidate(
+    discovered_peers: &HashSet<String>,
+    authenticated_peer_addrs: &HashSet<String>,
+    bootstrap_peers: &HashSet<String>,
+    genesis_peer_addrs: &HashSet<String>,
+) -> Option<String> {
+    let mut unauthenticated_discovered: Vec<String> = discovered_peers
+        .iter()
+        .filter(|peer| {
+            !authenticated_peer_addrs.contains(*peer)
+                && !bootstrap_peers.contains(*peer)
+                && !genesis_peer_addrs.contains(*peer)
+        })
+        .cloned()
+        .collect();
+    unauthenticated_discovered.sort();
+    if let Some(peer) = unauthenticated_discovered.into_iter().next() {
+        return Some(peer);
     }
-    let mut peers: Vec<String> = discovered_peers.iter().cloned().collect();
-    peers.sort();
-    peers.truncate(MAX_DISCOVERED_PEERS);
-    discovered_peers.clear();
-    discovered_peers.extend(peers);
+
+    let mut genesis_candidates: Vec<String> = discovered_peers
+        .iter()
+        .filter(|peer| {
+            !authenticated_peer_addrs.contains(*peer) && !bootstrap_peers.contains(*peer)
+        })
+        .cloned()
+        .collect();
+    genesis_candidates.sort();
+    genesis_candidates.into_iter().next()
 }
 
-fn insert_discovered_peer_bounded(discovered_peers: &mut HashSet<String>, peer: String) -> bool {
-    let inserted = discovered_peers.insert(peer);
-    trim_discovered_peers(discovered_peers);
-    inserted
+fn insert_discovered_peer_bounded(
+    discovered_peers: &mut HashSet<String>,
+    authenticated_peer_addrs: &HashSet<String>,
+    bootstrap_peers: &HashSet<String>,
+    genesis_peer_addrs: &HashSet<String>,
+    peer: String,
+) -> bool {
+    if discovered_peers.contains(&peer) {
+        return false;
+    }
+
+    if discovered_peers.len() < MAX_DISCOVERED_PEERS {
+        return discovered_peers.insert(peer);
+    }
+
+    let Some(evict) = choose_discovery_eviction_candidate(
+        discovered_peers,
+        authenticated_peer_addrs,
+        bootstrap_peers,
+        genesis_peer_addrs,
+    ) else {
+        return false;
+    };
+
+    discovered_peers.remove(&evict);
+    discovered_peers.insert(peer)
 }
 
 fn bounded_discovered_peer_addrs(discovered_peers: &HashSet<String>) -> Vec<SocketAddr> {
@@ -140,6 +187,53 @@ fn bounded_discovered_peer_addrs(discovered_peers: &HashSet<String>) -> Vec<Sock
     peers.dedup();
     peers.truncate(MAX_DISCOVERED_PEERS);
     peers
+}
+
+fn reserve_inbound_connection(
+    inbound_count: &AtomicU64,
+    inbound_by_ip: &Mutex<HashMap<IpAddr, u8>>,
+    ip: IpAddr,
+) -> bool {
+    let mut total = inbound_count.load(Ordering::Relaxed);
+    loop {
+        if total >= MAX_INBOUND_PEERS as u64 {
+            return false;
+        }
+        match inbound_count.compare_exchange_weak(
+            total,
+            total + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(next_total) => total = next_total,
+        }
+    }
+
+    let mut by_ip = inbound_by_ip.lock().unwrap();
+    let count = by_ip.entry(ip).or_insert(0);
+    if *count >= MAX_INBOUND_PER_IP {
+        inbound_count.fetch_sub(1, Ordering::Relaxed);
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+fn release_inbound_connection(
+    inbound_count: &AtomicU64,
+    inbound_by_ip: &Mutex<HashMap<IpAddr, u8>>,
+    ip: IpAddr,
+) {
+    inbound_count.fetch_sub(1, Ordering::Relaxed);
+    let mut by_ip = inbound_by_ip.lock().unwrap();
+    if let Some(count) = by_ip.get_mut(&ip) {
+        if *count <= 1 {
+            by_ip.remove(&ip);
+        } else {
+            *count -= 1;
+        }
+    }
 }
 
 fn is_configured_self_addr(addr: &SocketAddr, local_p2p_addr: &str) -> bool {
@@ -183,6 +277,9 @@ fn record_peer_connected_event(
     peer_addrs: &Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
     addr_validators: &Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
     discovered_peers: &Arc<Mutex<HashSet<String>>>,
+    authenticated_peer_addrs: &Arc<Mutex<HashSet<String>>>,
+    bootstrap_peer_addrs: &HashSet<String>,
+    genesis_peer_addrs: &HashSet<String>,
     retry_after: &Arc<Mutex<HashMap<String, Instant>>>,
     retry_delay: &Arc<Mutex<HashMap<String, Duration>>>,
 ) -> bool {
@@ -192,6 +289,10 @@ fn record_peer_connected_event(
             addr
         );
         discovered_peers.lock().unwrap().remove(&addr.to_string());
+        authenticated_peer_addrs
+            .lock()
+            .unwrap()
+            .remove(&addr.to_string());
         retry_after.lock().unwrap().remove(&addr.ip().to_string());
         retry_after.lock().unwrap().remove(&addr.to_string());
         retry_delay.lock().unwrap().remove(&addr.ip().to_string());
@@ -206,7 +307,18 @@ fn record_peer_connected_event(
         .or_insert(0) += 1;
     peer_addrs.lock().unwrap().insert(validator_id, addr);
     addr_validators.lock().unwrap().insert(addr, validator_id);
-    insert_discovered_peer_bounded(&mut discovered_peers.lock().unwrap(), addr.to_string());
+    authenticated_peer_addrs
+        .lock()
+        .unwrap()
+        .insert(addr.to_string());
+    let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+    insert_discovered_peer_bounded(
+        &mut discovered_peers.lock().unwrap(),
+        &authenticated,
+        bootstrap_peer_addrs,
+        genesis_peer_addrs,
+        addr.to_string(),
+    );
     retry_after.lock().unwrap().remove(&addr.ip().to_string());
     retry_after.lock().unwrap().remove(&addr.to_string());
     retry_delay.lock().unwrap().remove(&addr.ip().to_string());
@@ -278,17 +390,29 @@ fn start_network_runtime(
 ) -> (
     Arc<NetworkBridge>,
     Arc<Mutex<HashSet<String>>>,
+    Arc<Mutex<HashSet<String>>>,
     std::sync::mpsc::Receiver<NetworkEvent>,
 ) {
     let connected_addrs = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
     let peer_addrs = Arc::new(Mutex::new(HashMap::new()));
     let addr_validators = Arc::new(Mutex::new(HashMap::new()));
     let discovered_peers = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let authenticated_peer_addrs = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let bootstrap_peer_addrs =
+        Arc::new(bootstrap_peers.iter().cloned().collect::<HashSet<String>>());
+    let genesis_peer_addrs = Arc::new(
+        initial_discovered_peers
+            .iter()
+            .cloned()
+            .collect::<HashSet<String>>(),
+    );
     let (event_tx, event_rx) = std::sync::mpsc::channel::<NetworkEvent>();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<PeerManagerHandle>();
     let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
     let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
     let handshake_sem = Arc::new(tokio::sync::Semaphore::new(50));
+    let inbound_count = Arc::new(AtomicU64::new(0));
+    let inbound_by_ip = Arc::new(Mutex::new(HashMap::<IpAddr, u8>::new()));
 
     std::thread::spawn({
         let connected_addrs = Arc::clone(&connected_addrs);
@@ -298,6 +422,9 @@ fn start_network_runtime(
         let retry_delay = Arc::clone(&retry_delay);
         let handshake_sem = Arc::clone(&handshake_sem);
         let discovered_peers = Arc::clone(&discovered_peers);
+        let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+        let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
+        let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
         move || {
             let runtime = TokioRuntimeBuilder::new_multi_thread()
                 .enable_all()
@@ -322,6 +449,9 @@ fn start_network_runtime(
                     let retry_after = Arc::clone(&retry_after);
                     let retry_delay = Arc::clone(&retry_delay);
                     let discovered_peers = Arc::clone(&discovered_peers);
+                    let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+                    let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
+                    let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
                     let handshake_config = Arc::clone(&handshake_config);
                     async move {
                         while let Some(event) = async_event_rx.recv().await {
@@ -337,6 +467,9 @@ fn start_network_runtime(
                                         &peer_addrs,
                                         &addr_validators,
                                         &discovered_peers,
+                                        &authenticated_peer_addrs,
+                                        &bootstrap_peer_addrs,
+                                        &genesis_peer_addrs,
                                         &retry_after,
                                         &retry_delay,
                                     ) {
@@ -369,6 +502,8 @@ fn start_network_runtime(
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
                     let handshake_sem = Arc::clone(&handshake_sem);
+                    let inbound_count = Arc::clone(&inbound_count);
+                    let inbound_by_ip = Arc::clone(&inbound_by_ip);
                     let listener_addr = p2p_addr.clone();
                     async move {
                         let listener = match tokio::net::TcpListener::bind(&listener_addr).await {
@@ -384,16 +519,32 @@ fn start_network_runtime(
                             let Ok((stream, addr)) = listener.accept().await else {
                                 continue;
                             };
+                            if !reserve_inbound_connection(&inbound_count, &inbound_by_ip, addr.ip())
+                            {
+                                eprintln!(
+                                    "[p2p] dropping inbound connection from {}: at capacity",
+                                    addr
+                                );
+                                drop(stream);
+                                continue;
+                            }
                             let permit = match handshake_sem.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
                                     eprintln!("[p2p] handshake limit reached, rejecting connection from {}", addr);
+                                    release_inbound_connection(
+                                        &inbound_count,
+                                        &inbound_by_ip,
+                                        addr.ip(),
+                                    );
                                     drop(stream);
                                     continue;
                                 }
                             };
                             let peer_manager = PeerManagerHandle::clone(&peer_manager);
                             let handshake_config = Arc::clone(&handshake_config);
+                            let inbound_count = Arc::clone(&inbound_count);
+                            let inbound_by_ip = Arc::clone(&inbound_by_ip);
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 let config = handshake_config.read().unwrap().clone();
@@ -405,6 +556,11 @@ fn start_network_runtime(
                                         eprintln!("[p2p] inbound handshake failed from {}: {}", addr, e);
                                     }
                                 }
+                                release_inbound_connection(
+                                    &inbound_count,
+                                    &inbound_by_ip,
+                                    addr.ip(),
+                                );
                             });
                         }
                     }
@@ -418,6 +574,9 @@ fn start_network_runtime(
                     let retry_delay = Arc::clone(&retry_delay);
                     let handshake_sem = Arc::clone(&handshake_sem);
                     let discovered_peers = Arc::clone(&discovered_peers);
+                    let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+                    let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
+                    let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
                     let peer_addrs = Arc::clone(&peer_addrs);
                     let peers_file_path = peers_file_path.clone();
                     let dns_seed_host = dns_seed_host.clone();
@@ -427,11 +586,24 @@ fn start_network_runtime(
                         let persisted = load_peers(&peers_file_path);
                         {
                             let mut dp = discovered_peers.lock().unwrap();
+                            let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
                             for addr in &persisted {
-                                insert_discovered_peer_bounded(&mut dp, addr.to_string());
+                                insert_discovered_peer_bounded(
+                                    &mut dp,
+                                    &authenticated,
+                                    &bootstrap_peer_addrs,
+                                    &genesis_peer_addrs,
+                                    addr.to_string(),
+                                );
                             }
                             for addr in &initial_discovered_peers {
-                                insert_discovered_peer_bounded(&mut dp, addr.clone());
+                                insert_discovered_peer_bounded(
+                                    &mut dp,
+                                    &authenticated,
+                                    &bootstrap_peer_addrs,
+                                    &genesis_peer_addrs,
+                                    addr.clone(),
+                                );
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
@@ -443,8 +615,15 @@ fn start_network_runtime(
                         let dns_peers = resolve_dns_seeds(&dns_seed_host, p2p_port);
                         {
                             let mut dp = discovered_peers.lock().unwrap();
+                            let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
                             for addr in &dns_peers {
-                                insert_discovered_peer_bounded(&mut dp, addr.to_string());
+                                insert_discovered_peer_bounded(
+                                    &mut dp,
+                                    &authenticated,
+                                    &bootstrap_peer_addrs,
+                                    &genesis_peer_addrs,
+                                    addr.to_string(),
+                                );
                             }
                         }
                         eprintln!("[discovery] {} DNS seed peers discovered", dns_peers.len());
@@ -586,7 +765,7 @@ fn start_network_runtime(
         addr_validators,
     ));
 
-    (bridge, discovered_peers, event_rx)
+    (bridge, discovered_peers, authenticated_peer_addrs, event_rx)
 }
 
 fn start_observer_runtime(
@@ -925,7 +1104,7 @@ fn main() {
     let dns_seed_host = cfg_file
         .dns_seed_host
         .clone()
-        .unwrap_or_else(|| DNS_SEED_HOST.to_string());
+        .unwrap_or_else(default_dns_seed_hosts_config);
     let prune_keep_cfg = cfg_file
         .prune_keep_blocks
         .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS);
@@ -1046,14 +1225,15 @@ fn main() {
     let connected_validator_peers = Arc::new(AtomicUsize::new(0));
     let metrics_state = Arc::new(MetricsState::new());
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
-    let (gossip, discovered_peers, network_events) = start_network_runtime(
-        p2p_addr.clone(),
-        bootstrap_peers.clone(),
-        genesis_seed_peers,
-        peers_file.clone(),
-        dns_seed_host.clone(),
-        Arc::clone(&handshake_config),
-    );
+    let (gossip, discovered_peers, authenticated_peer_addrs, network_events) =
+        start_network_runtime(
+            p2p_addr.clone(),
+            bootstrap_peers.clone(),
+            genesis_seed_peers.clone(),
+            peers_file.clone(),
+            dns_seed_host.clone(),
+            Arc::clone(&handshake_config),
+        );
     if let Some(addr) = observer_addr {
         start_observer_runtime(addr, Arc::clone(&driver), Arc::clone(&observer_count));
     }
@@ -1077,6 +1257,12 @@ fn main() {
         let height_tx = height_tx.clone();
         let handshake_config = Arc::clone(&handshake_config);
         let discovered_peers = Arc::clone(&discovered_peers);
+        let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+        let bootstrap_peer_addrs = bootstrap_peers.iter().cloned().collect::<HashSet<String>>();
+        let genesis_peer_addrs = genesis_seed_peers
+            .iter()
+            .cloned()
+            .collect::<HashSet<String>>();
         let local_p2p_addr = p2p_addr.clone();
         let connected_validator_peers = Arc::clone(&connected_validator_peers);
         let metrics_state = Arc::clone(&metrics_state);
@@ -1128,6 +1314,8 @@ fn main() {
                         match &msg {
                             Message::PeerList(addrs) => {
                                 let mut new_peers = discovered_peers.lock().unwrap();
+                                let authenticated =
+                                    authenticated_peer_addrs.lock().unwrap().clone();
                                 let mut accepted = 0usize;
                                 for addr_str in addrs.iter().take(MAX_PEER_LIST_SIZE) {
                                     let Some(addr) = resolve_peer_addr(addr_str) else {
@@ -1140,11 +1328,15 @@ fn main() {
                                             &addr,
                                         )
                                     {
-                                        insert_discovered_peer_bounded(
+                                        if insert_discovered_peer_bounded(
                                             &mut new_peers,
+                                            &authenticated,
+                                            &bootstrap_peer_addrs,
+                                            &genesis_peer_addrs,
                                             addr.to_string(),
-                                        );
-                                        accepted = accepted.saturating_add(1);
+                                        ) {
+                                            accepted = accepted.saturating_add(1);
+                                        }
                                     }
                                 }
                                 eprintln!(
@@ -2115,7 +2307,7 @@ mempool_capacity  = 5000
         toml_escape(&keys_file),
         OBSERVER_PORT,
         bootstrap_toml,
-        DNS_SEED_HOST,
+        DNS_SEED_HOSTS.join(","),
         toml_escape(&data_dir),
         toml_escape(&rpc_addr),
         toml_escape(&metrics_addr),
@@ -2474,6 +2666,9 @@ mod tests {
         let addr_validators =
             Arc::new(Mutex::new(HashMap::<SocketAddr, indra_core::Bytes32>::new()));
         let discovered_peers = Arc::new(Mutex::new(HashSet::from([addr.to_string()])));
+        let authenticated_peer_addrs = Arc::new(Mutex::new(HashSet::new()));
+        let bootstrap_peer_addrs = HashSet::new();
+        let genesis_peer_addrs = HashSet::new();
         let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
         let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
 
@@ -2485,6 +2680,9 @@ mod tests {
             &peer_addrs,
             &addr_validators,
             &discovered_peers,
+            &authenticated_peer_addrs,
+            &bootstrap_peer_addrs,
+            &genesis_peer_addrs,
             &retry_after,
             &retry_delay,
         );
@@ -2494,15 +2692,22 @@ mod tests {
         assert!(peer_addrs.lock().unwrap().is_empty());
         assert!(addr_validators.lock().unwrap().is_empty());
         assert!(discovered_peers.lock().unwrap().is_empty());
+        assert!(authenticated_peer_addrs.lock().unwrap().is_empty());
     }
 
     #[test]
     fn discovered_peers_table_has_bounded_size() {
         let mut discovered_peers = HashSet::new();
+        let authenticated = HashSet::new();
+        let bootstrap = HashSet::new();
+        let genesis = HashSet::new();
 
         for port in 30_000..(30_000 + MAX_DISCOVERED_PEERS as u16 + 100) {
             insert_discovered_peer_bounded(
                 &mut discovered_peers,
+                &authenticated,
+                &bootstrap,
+                &genesis,
                 SocketAddr::from(([127, 0, 0, 1], port)).to_string(),
             );
         }
@@ -2512,6 +2717,111 @@ mod tests {
             bounded_discovered_peer_addrs(&discovered_peers).len(),
             MAX_DISCOVERED_PEERS
         );
+    }
+
+    #[test]
+    fn discovery_eviction_prefers_unauthenticated_entries() {
+        let authenticated_peer = "203.0.113.1:30303".to_string();
+        let mut discovered_peers = HashSet::from([authenticated_peer.clone()]);
+        let authenticated = HashSet::from([authenticated_peer.clone()]);
+        let bootstrap = HashSet::new();
+        let genesis = HashSet::new();
+
+        for idx in 2..=MAX_DISCOVERED_PEERS {
+            discovered_peers.insert(format!("203.0.{}.{}:30303", idx / 250, (idx % 250) + 1));
+        }
+        assert_eq!(discovered_peers.len(), MAX_DISCOVERED_PEERS);
+
+        let new_peer = "198.51.100.250:30303".to_string();
+        assert!(insert_discovered_peer_bounded(
+            &mut discovered_peers,
+            &authenticated,
+            &bootstrap,
+            &genesis,
+            new_peer.clone(),
+        ));
+
+        assert!(discovered_peers.contains(&authenticated_peer));
+        assert!(discovered_peers.contains(&new_peer));
+        assert_eq!(discovered_peers.len(), MAX_DISCOVERED_PEERS);
+    }
+
+    #[test]
+    fn bootstrap_peers_are_never_evicted() {
+        let bootstrap_peer = "203.0.113.10:30303".to_string();
+        let mut discovered_peers = HashSet::from([bootstrap_peer.clone()]);
+        let authenticated = HashSet::new();
+        let bootstrap = HashSet::from([bootstrap_peer.clone()]);
+        let genesis = HashSet::new();
+
+        for idx in 11..=(MAX_DISCOVERED_PEERS + 9) {
+            discovered_peers.insert(format!("203.0.{}.{}:30303", idx / 250, (idx % 250) + 1));
+        }
+        assert_eq!(discovered_peers.len(), MAX_DISCOVERED_PEERS);
+
+        assert!(insert_discovered_peer_bounded(
+            &mut discovered_peers,
+            &authenticated,
+            &bootstrap,
+            &genesis,
+            "198.51.100.99:30303".to_string(),
+        ));
+
+        assert!(discovered_peers.contains(&bootstrap_peer));
+        assert_eq!(discovered_peers.len(), MAX_DISCOVERED_PEERS);
+    }
+
+    #[test]
+    fn inbound_connection_limit_is_enforced() {
+        let inbound_count = AtomicU64::new(0);
+        let inbound_by_ip = Mutex::new(HashMap::<IpAddr, u8>::new());
+        let mut reserved_ips = Vec::new();
+
+        for idx in 0..MAX_INBOUND_PEERS {
+            let ip = IpAddr::from([198, 51, (idx / 250) as u8, (idx % 250 + 1) as u8]);
+            assert!(reserve_inbound_connection(
+                &inbound_count,
+                &inbound_by_ip,
+                ip
+            ));
+            reserved_ips.push(ip);
+        }
+
+        assert!(!reserve_inbound_connection(
+            &inbound_count,
+            &inbound_by_ip,
+            IpAddr::from([203, 0, 113, 250])
+        ));
+
+        for ip in reserved_ips {
+            release_inbound_connection(&inbound_count, &inbound_by_ip, ip);
+        }
+        assert_eq!(inbound_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn inbound_per_ip_limit_is_enforced() {
+        let inbound_count = AtomicU64::new(0);
+        let inbound_by_ip = Mutex::new(HashMap::<IpAddr, u8>::new());
+        let ip = IpAddr::from([203, 0, 113, 77]);
+
+        for _ in 0..MAX_INBOUND_PER_IP {
+            assert!(reserve_inbound_connection(
+                &inbound_count,
+                &inbound_by_ip,
+                ip
+            ));
+        }
+        assert!(!reserve_inbound_connection(
+            &inbound_count,
+            &inbound_by_ip,
+            ip
+        ));
+
+        for _ in 0..MAX_INBOUND_PER_IP {
+            release_inbound_connection(&inbound_count, &inbound_by_ip, ip);
+        }
+        assert_eq!(inbound_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
