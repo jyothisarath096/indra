@@ -391,6 +391,16 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
             ),
         });
     }
+    if qc.block_hash != block.header.prev_hash {
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!(
+                "embedded QC certifies block {} but parent is {} — QC must certify the exact parent block",
+                hex::encode(&qc.block_hash.0[..8]),
+                hex::encode(&block.header.prev_hash.0[..8]),
+            ),
+        });
+    }
 
     let mut active_validators: Vec<_> = state.validators.active_validators().collect();
     active_validators.sort_by_key(|validator| validator.validator_id.0);
@@ -970,6 +980,61 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_block_qc_rejects_qc_certifying_wrong_parent_hash() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x15, 10_000, true, true);
+
+        let block1 = make_strict_block(&state, 0x15, 0, vec![]);
+        let wrong_parent_hash = Bytes32::from([0xB0; 32]);
+        assert_ne!(wrong_parent_hash, block1.header.block_hash());
+        apply_block(&mut state, &block1, 0).unwrap();
+
+        let wrong_parent_qc_bytes = build_qc_bytes(
+            block1.header.height,
+            block1.header.proposer_round,
+            wrong_parent_hash,
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let block2 = make_strict_block(&state, 0x15, 0, wrong_parent_qc_bytes);
+
+        let err = verify_block_qc(&block2, &state).unwrap_err();
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("QC must certify the exact parent block"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_block_qc_accepts_qc_certifying_correct_parent_hash() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x16, 10_000, true, true);
+
+        let block1 = make_strict_block(&state, 0x16, 0, vec![]);
+        apply_block(&mut state, &block1, 0).unwrap();
+
+        let qc_bytes = build_qc_bytes(
+            block1.header.height,
+            block1.header.proposer_round,
+            block1.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let block2 = make_strict_block(&state, 0x16, 0, qc_bytes);
+
+        assert!(verify_block_qc(&block2, &state).is_ok());
     }
 
     #[test]

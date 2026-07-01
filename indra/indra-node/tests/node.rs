@@ -181,7 +181,7 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
 fn build_single_validator_qc_bytes(
     height: u64,
     round: u32,
-    value_hash: Bytes32,
+    block_hash: Bytes32,
     seed: [u8; 32],
 ) -> Vec<u8> {
     let classical = ClassicalKeypair::from_seed(&seed);
@@ -193,7 +193,7 @@ fn build_single_validator_qc_bytes(
         height,
         round,
         VoteStep::Precommit,
-        value_hash,
+        block_hash,
         validator_id,
         DEFAULT_CHAIN_ID,
         &hybrid,
@@ -202,7 +202,7 @@ fn build_single_validator_qc_bytes(
     let qc = build_qc(
         height,
         round,
-        value_hash,
+        block_hash,
         DEFAULT_CHAIN_ID,
         &[QcValidator {
             validator_id,
@@ -274,7 +274,7 @@ fn node_engine_init_and_commit() {
     for i in 1..=5u64 {
         let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
         engine.commit_block(&block).unwrap();
-        last_qc = build_single_validator_qc_bytes(i, 0, block.header.value_hash, [0x42u8; 32]);
+        last_qc = build_single_validator_qc_bytes(i, 0, block.header.block_hash(), [0x42u8; 32]);
         assert_eq!(engine.height(), i);
     }
 
@@ -308,7 +308,7 @@ fn state_root_changes_after_each_block() {
     .unwrap();
     let root1 = compute_state_root(&state);
 
-    let qc1 = build_single_validator_qc_bytes(1, 0, b1.header.value_hash, [0x11u8; 32]);
+    let qc1 = build_single_validator_qc_bytes(1, 0, b1.header.block_hash(), [0x11u8; 32]);
     let b2 = make_strict_block(&state, [0x11u8; 32], qc1);
     import_block(
         &b2,
@@ -351,7 +351,7 @@ fn block_store_survives_reopen() {
                 0,
             )
             .unwrap();
-            last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x12u8; 32]);
+            last_qc = build_single_validator_qc_bytes(i, 0, b.header.block_hash(), [0x12u8; 32]);
             assert_eq!(state.height, i);
         }
     }
@@ -379,7 +379,7 @@ fn restarted_block_store_preserves_hash_chain() {
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
             last_qc =
-                build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+                build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x42u8; 32]);
         }
     }
 
@@ -421,7 +421,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
         )
         .unwrap();
         source_last_qc =
-            build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x13u8; 32]);
+            build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x13u8; 32]);
     }
 
     let peer: std::net::SocketAddr = "127.0.0.1:30303".parse().unwrap();
@@ -474,7 +474,7 @@ fn current_binary_hashes_workspace_block_log_consistently() {
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
             last_qc =
-                build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x42u8; 32]);
+                build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x42u8; 32]);
         }
     }
 
@@ -545,7 +545,7 @@ fn full_node_pipeline() {
                 0,
             )
             .unwrap();
-            last_qc = build_single_validator_qc_bytes(i, 0, b.header.value_hash, [0x14u8; 32]);
+            last_qc = build_single_validator_qc_bytes(i, 0, b.header.block_hash(), [0x14u8; 32]);
             assert_eq!(state.height, i);
             compute_state_root(&state)
         })
@@ -769,7 +769,7 @@ fn full_restart_recovery_end_to_end() {
         )
         .unwrap();
         source_last_qc =
-            build_single_validator_qc_bytes(height, 0, block.header.value_hash, [0x15u8; 32]);
+            build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x15u8; 32]);
     }
 
     for (follower_log, follower_state_dir) in [
