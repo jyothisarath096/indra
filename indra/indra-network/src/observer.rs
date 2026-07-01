@@ -2,7 +2,10 @@
 //!
 //! This is intentionally separate from the authenticated validator transport.
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use indra_core::types::primitives::OBSERVER_HANDSHAKE_TIMEOUT_SECS;
 use tokio::{
@@ -13,7 +16,7 @@ use tokio::{
 
 use crate::{
     error::{NetworkError, NetworkResult},
-    message::MAX_MSG_BYTES,
+    rate_limit::TokenBucket,
 };
 
 /// Observer protocol magic bytes.
@@ -27,6 +30,93 @@ pub const NODE_TYPE_FULL: u8 = 0x02;
 /// Observer handshake timeout.
 pub const OBSERVER_HANDSHAKE_TIMEOUT: Duration =
     Duration::from_secs(OBSERVER_HANDSHAKE_TIMEOUT_SECS);
+
+/// Maximum frame size for observer/full-node connections.
+///
+/// Observer traffic is intentionally read-only and does not need the full
+/// validator transport frame budget. Keeping this lower prevents public
+/// observer clients from pinning large buffers per connection.
+pub const MAX_OBSERVER_FRAME_BYTES: usize = 2_097_152;
+
+/// Maximum bytes per second accepted from one observer connection.
+pub const OBSERVER_BYTE_BUDGET_PER_SEC: u64 = 1_048_576;
+
+/// Burst bytes accepted from one observer connection.
+pub const OBSERVER_BYTE_BURST: u64 = 4_194_304;
+
+/// Global cap on bytes actively allocated by observer frame reads.
+pub const MAX_OBSERVER_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+static OBSERVER_BYTES_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-connection observer frame budget.
+#[derive(Debug, Clone)]
+pub struct ObserverFrameLimiter {
+    byte_bucket: TokenBucket,
+}
+
+impl ObserverFrameLimiter {
+    /// Construct a new observer limiter.
+    pub fn new() -> Self {
+        Self {
+            byte_bucket: TokenBucket::new_bytes(OBSERVER_BYTE_BUDGET_PER_SEC, OBSERVER_BYTE_BURST),
+        }
+    }
+
+    fn check_frame(&mut self, len: usize) -> NetworkResult<()> {
+        if !self.byte_bucket.try_consume_bytes(len as u64) {
+            return Err(NetworkError::InvalidFrame {
+                reason: "observer byte budget exhausted".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for ObserverFrameLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ObserverAllocationGuard {
+    bytes: u64,
+}
+
+impl ObserverAllocationGuard {
+    fn reserve(bytes: u64) -> NetworkResult<Self> {
+        let mut current = OBSERVER_BYTES_ACTIVE.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return Err(NetworkError::MessageTooLarge {
+                    size: usize::MAX,
+                    max: MAX_OBSERVER_TOTAL_BYTES as usize,
+                });
+            };
+            if next > MAX_OBSERVER_TOTAL_BYTES {
+                return Err(NetworkError::MessageTooLarge {
+                    size: next as usize,
+                    max: MAX_OBSERVER_TOTAL_BYTES as usize,
+                });
+            }
+            match OBSERVER_BYTES_ACTIVE.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Self { bytes }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for ObserverAllocationGuard {
+    fn drop(&mut self) {
+        OBSERVER_BYTES_ACTIVE.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
 
 /// Result of a successful observer handshake.
 #[derive(Debug)]
@@ -101,15 +191,29 @@ pub async fn read_frame_plain<R>(stream: &mut R) -> NetworkResult<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
+    let mut limiter = ObserverFrameLimiter::new();
+    read_frame_plain_limited(stream, &mut limiter).await
+}
+
+/// Read a plain observer frame using a persistent per-connection limiter.
+pub async fn read_frame_plain_limited<R>(
+    stream: &mut R,
+    limiter: &mut ObserverFrameLimiter,
+) -> NetworkResult<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > MAX_MSG_BYTES {
+    if len > MAX_OBSERVER_FRAME_BYTES {
         return Err(NetworkError::MessageTooLarge {
             size: len,
-            max: MAX_MSG_BYTES,
+            max: MAX_OBSERVER_FRAME_BYTES,
         });
     }
+    limiter.check_frame(len)?;
+    let _allocation_guard = ObserverAllocationGuard::reserve(len as u64)?;
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
@@ -120,10 +224,10 @@ pub async fn write_frame_plain<W>(stream: &mut W, data: &[u8]) -> NetworkResult<
 where
     W: AsyncWrite + Unpin,
 {
-    if data.len() > MAX_MSG_BYTES {
+    if data.len() > MAX_OBSERVER_FRAME_BYTES {
         return Err(NetworkError::MessageTooLarge {
             size: data.len(),
-            max: MAX_MSG_BYTES,
+            max: MAX_OBSERVER_FRAME_BYTES,
         });
     }
     stream.write_all(&(data.len() as u32).to_le_bytes()).await?;
@@ -140,7 +244,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{message::Message, NetworkError};
+    use crate::{message::Message, message::MAX_MSG_BYTES, NetworkError};
 
     async fn listener_pair() -> (TcpListener, std::net::SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -228,10 +332,52 @@ mod tests {
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
-            .write_all(&((MAX_MSG_BYTES as u32) + 1).to_le_bytes())
+            .write_all(&((MAX_OBSERVER_FRAME_BYTES as u32) + 1).to_le_bytes())
             .await
             .unwrap();
         let err = server.await.unwrap().unwrap_err();
         assert!(matches!(err, NetworkError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn observer_frame_size_is_bounded_below_14mb() {
+        assert!(MAX_OBSERVER_FRAME_BYTES < MAX_MSG_BYTES);
+    }
+
+    #[tokio::test]
+    async fn observer_large_frame_claim_is_rejected() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let server_task = tokio::spawn(async move {
+            let mut limiter = ObserverFrameLimiter::new();
+            read_frame_plain_limited(&mut server, &mut limiter).await
+        });
+        client
+            .write_all(&((MAX_OBSERVER_FRAME_BYTES as u32) + 1).to_le_bytes())
+            .await
+            .unwrap();
+        let err = server_task.await.unwrap().unwrap_err();
+        assert!(matches!(err, NetworkError::MessageTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn observer_byte_budget_is_enforced_per_connection() {
+        let capacity = MAX_OBSERVER_FRAME_BYTES * 3 + 64;
+        let (mut client, mut server) = tokio::io::duplex(capacity);
+        let server_task = tokio::spawn(async move {
+            let mut limiter = ObserverFrameLimiter::new();
+            read_frame_plain_limited(&mut server, &mut limiter)
+                .await
+                .unwrap();
+            read_frame_plain_limited(&mut server, &mut limiter)
+                .await
+                .unwrap();
+            read_frame_plain_limited(&mut server, &mut limiter).await
+        });
+        let frame = vec![0xA5u8; MAX_OBSERVER_FRAME_BYTES];
+        write_frame_plain(&mut client, &frame).await.unwrap();
+        write_frame_plain(&mut client, &frame).await.unwrap();
+        write_frame_plain(&mut client, &frame).await.unwrap();
+        let err = server_task.await.unwrap().unwrap_err();
+        assert!(matches!(err, NetworkError::InvalidFrame { .. }));
     }
 }

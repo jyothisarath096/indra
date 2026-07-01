@@ -22,9 +22,9 @@ use indra_core::types::primitives::{
 use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_network::{
     message::Message, observer::NODE_TYPE_FULL, perform_handshake_initiator,
-    perform_handshake_responder, perform_observer_handshake_responder, read_frame_plain,
+    perform_handshake_responder, perform_observer_handshake_responder, read_frame_plain_limited,
     spawn_peer_manager, write_frame_plain, HandshakeConfig, NetworkCommand, NetworkEvent,
-    PeerManagerConfig, PeerManagerHandle,
+    ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle, TokenBucket,
 };
 use indra_node::{
     discovery::{load_peers, peer_list_payload, resolve_dns_seeds, resolve_peer_addr, save_peers},
@@ -45,6 +45,8 @@ const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const MAX_DISCOVERED_PEERS: usize = 256;
+const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
+const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
@@ -692,6 +694,9 @@ async fn handle_observer_connection(
     eprintln!("[observer] new connection from {} (total: {})", addr, total);
     let (mut reader, mut writer) = stream.into_split();
     let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Message>(64);
+    let mut frame_limiter = ObserverFrameLimiter::new();
+    let mut request_blocks_limiter =
+        TokenBucket::new(OBSERVER_REQUEST_BLOCKS_RATE, OBSERVER_REQUEST_BLOCKS_BURST);
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = write_rx.recv().await {
@@ -703,11 +708,19 @@ async fn handle_observer_connection(
 
     loop {
         tokio::select! {
-            frame = read_frame_plain(&mut reader) => {
+            frame = read_frame_plain_limited(&mut reader, &mut frame_limiter) => {
                 let frame = frame?;
                 let msg = Message::decode_wire(&frame)?;
                 match msg {
                     Message::RequestBlocks { from_height, to_height } => {
+                        if !observer_request_blocks_allowed(&mut request_blocks_limiter) {
+                            eprintln!(
+                                "[observer] rate-limited RequestBlocks from {}",
+                                addr
+                            );
+                            let _ = write_tx.send(Message::BlockResponse { blocks: Vec::new() }).await;
+                            continue;
+                        }
                         let blocks = observer_blocks_for_range(&driver, from_height, to_height);
                         let _ = write_tx.send(Message::BlockResponse { blocks }).await;
                     }
@@ -750,6 +763,10 @@ async fn handle_observer_connection(
         addr, remaining
     );
     Ok(())
+}
+
+fn observer_request_blocks_allowed(limiter: &mut TokenBucket) -> bool {
+    limiter.try_consume(1)
 }
 
 fn current_status_message(driver: &Arc<Mutex<ConsensusDriver>>) -> Message {
@@ -2563,6 +2580,20 @@ mod tests {
         assert_ne!(block.header.block_hash(), value_hash);
 
         assert!(!proposal_matches_request(&block, 7, 3, &value_hash));
+    }
+
+    #[test]
+    fn observer_request_blocks_is_rate_limited() {
+        let mut limiter =
+            TokenBucket::new(OBSERVER_REQUEST_BLOCKS_RATE, OBSERVER_REQUEST_BLOCKS_BURST);
+
+        for _ in 0..OBSERVER_REQUEST_BLOCKS_BURST {
+            assert!(observer_request_blocks_allowed(&mut limiter));
+        }
+        assert!(
+            !observer_request_blocks_allowed(&mut limiter),
+            "observer RequestBlocks bursts beyond the configured budget must be throttled"
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,18 @@ use crate::error::{NetworkError, NetworkResult};
 /// overhead during sync responses and proposal propagation.
 pub const MAX_MSG_BYTES: usize = 14_680_064;
 
+/// Maximum number of peer addresses accepted in a single `PeerList`.
+///
+/// This prevents an attacker-controlled internal count prefix from causing
+/// unbounded allocation before the payload has been validated.
+pub const MAX_PEER_LIST_ENTRIES: usize = 256;
+
+/// Maximum number of blocks accepted in a single `BlockResponse`.
+///
+/// This matches the node sync batch size and prevents unbounded allocation
+/// from a malicious `BlockResponse` count prefix.
+pub const MAX_BLOCK_RESPONSE_ENTRIES: usize = 50;
+
 /// Message type discriminant bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -289,6 +301,14 @@ impl Message {
                         reason: "invalid peer list length prefix".to_string(),
                     })?;
                 let count = u32::from_le_bytes(count_bytes) as usize;
+                if count > MAX_PEER_LIST_ENTRIES {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: format!(
+                            "PeerList count {} exceeds maximum {}",
+                            count, MAX_PEER_LIST_ENTRIES
+                        ),
+                    });
+                }
                 let mut peers = Vec::with_capacity(count);
                 let mut offset = 4;
                 for _ in 0..count {
@@ -371,6 +391,14 @@ impl Message {
                 let count = u32::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
                     reason: e.to_string(),
                 })? as usize;
+                if count > MAX_BLOCK_RESPONSE_ENTRIES {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: format!(
+                            "BlockResponse count {} exceeds maximum {}",
+                            count, MAX_BLOCK_RESPONSE_ENTRIES
+                        ),
+                    });
+                }
                 let mut blocks = Vec::with_capacity(count);
                 for _ in 0..count {
                     let len = u32::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
@@ -514,7 +542,35 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::Bytes32;
+    use indra_core::types::{
+        block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+        primitives::{Bytes32, ProtocolVersion, VariableBytes},
+    };
+
+    fn test_block(height: u64) -> BlockV1 {
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion::CURRENT,
+                height,
+                prev_hash: Bytes32::ZERO,
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::from([0x11u8; 32]),
+                validator_set_root: Bytes32::from([0x22u8; 32]),
+                mempool_set_root: Bytes32::from([0x33u8; 32]),
+                value_hash: Bytes32::from([0x44u8; 32]),
+                base_fee: 1,
+                proposer_round: 0,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::ZERO,
+                proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+        }
+    }
 
     #[test]
     fn ping_round_trip() {
@@ -621,6 +677,68 @@ mod tests {
             Message::PeerList(p) => assert_eq!(p, peers),
             _ => panic!("wrong type"),
         }
+    }
+
+    #[test]
+    fn peerlist_count_prefix_does_not_allocate_unbounded_vector() {
+        let mut data = vec![MessageType::PeerList as u8];
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let err = Message::decode_wire(&data).unwrap_err();
+        assert!(matches!(err, NetworkError::DecodeFailed { .. }));
+    }
+
+    #[test]
+    fn peerlist_count_at_maximum_is_accepted() {
+        let peers: Vec<String> = (0..MAX_PEER_LIST_ENTRIES)
+            .map(|idx| format!("203.0.113.{}:30303", idx % 255))
+            .collect();
+        let wire = Message::PeerList(peers.clone()).encode_wire().unwrap();
+
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+        assert!(matches!(decoded, Message::PeerList(got) if got == peers));
+    }
+
+    #[test]
+    fn peerlist_count_above_maximum_is_rejected() {
+        let mut data = vec![MessageType::PeerList as u8];
+        data.extend_from_slice(&((MAX_PEER_LIST_ENTRIES as u32) + 1).to_le_bytes());
+
+        let err = Message::decode_wire(&data).unwrap_err();
+        assert!(matches!(err, NetworkError::DecodeFailed { .. }));
+    }
+
+    #[test]
+    fn block_response_count_prefix_does_not_allocate_unbounded_vector() {
+        let mut data = vec![MessageType::BlockResponse as u8];
+        u32::MAX.encode(&mut data);
+
+        let err = Message::decode_wire(&data).unwrap_err();
+        assert!(matches!(err, NetworkError::DecodeFailed { .. }));
+    }
+
+    #[test]
+    fn block_response_count_at_maximum_is_accepted() {
+        let blocks: Vec<BlockV1> = (0..MAX_BLOCK_RESPONSE_ENTRIES)
+            .map(|idx| test_block(idx as u64 + 1))
+            .collect();
+        let wire = Message::BlockResponse {
+            blocks: blocks.clone(),
+        }
+        .encode_wire()
+        .unwrap();
+
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+        assert!(matches!(decoded, Message::BlockResponse { blocks: got } if got == blocks));
+    }
+
+    #[test]
+    fn block_response_count_above_maximum_is_rejected() {
+        let mut data = vec![MessageType::BlockResponse as u8];
+        ((MAX_BLOCK_RESPONSE_ENTRIES as u32) + 1).encode(&mut data);
+
+        let err = Message::decode_wire(&data).unwrap_err();
+        assert!(matches!(err, NetworkError::DecodeFailed { .. }));
     }
 
     #[test]
