@@ -379,7 +379,12 @@ pub fn verify_qc(
     Ok(())
 }
 
-/// Strict QC verification now aliases the same ML-DSA-only path.
+/// Verify a QC with full hybrid signature enforcement.
+///
+/// When `hybrid_qc_active(qc.height)` is true (which is always the case
+/// on testnet since `HYBRID_QC_HEIGHT = 0`), both ML-DSA-87 (PQ) and
+/// Ed25519 (classical) signatures are required for every signer.
+/// Delegates to `verify_qc`, which enforces the hybrid requirement.
 pub fn verify_qc_strict(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],

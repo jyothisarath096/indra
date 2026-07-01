@@ -6,12 +6,12 @@
 |----|----------|---------|----------|--------|
 | CS-01 | Safety | Votes/QCs certify full `block_hash()` and embedded QC is checked against parent `prev_hash` | SAFE | FIXED |
 | CS-02 | Safety | POLC rule uses full hash for vote target and value hash for same-value reproposal checks | SAFE | Checked |
-| CS-03 | Safety | QC verification requires quorum stake plus PQ and Ed25519 signatures; one stale comment remains | SAFE / INFO | Checked |
+| CS-03 | Safety | QC verification requires quorum stake plus PQ and Ed25519 signatures; stale strict-wrapper comment corrected | SAFE | FIXED |
 | CS-04 | Liveness | Timeout progression is local and uncapped; peer-status round jumps are capped | SAFE / LOW | Checked |
 | CS-05 | Liveness | VRF proposer election can accept multiple apparent proposers in the same round | HIGH | NEEDS FIX |
 | CS-06 | Liveness | Sync catch-up refreshes voter set and recovers stale/missing tip QC | SAFE | Checked |
 | CS-07 | Equivocation | Slash detector compares vote full `block_hash()` and no stale `value_hash` path was found | SAFE | Checked |
-| CS-08 | Equivocation | Slash evidence requires forged hybrid signatures to frame a validator | SAFE / LOW | Checked |
+| CS-08 | Equivocation | Slash evidence requires forged hybrid precommit signatures; prevote conflicts are explicitly non-slashable | SAFE | FIXED |
 | CS-09 | Byzantine | Equivocating proposer cannot create two QCs for different full hashes with < 1/3 Byzantine stake | SAFE, affected by CS-05 liveness | Checked |
 | CS-10 | Byzantine | Invalid proposals are rejected before voting, including VRF, embedded QC, and projected roots | SAFE | Checked |
 | CS-11 | Partition | 2/2 partition cannot reach 2/3 quorum; recovery depends on normal sync/status exchange | SAFE | Checked |
@@ -77,11 +77,11 @@ Height 1 remains correctly excluded because genesis has no meaningful previous Q
 
 **Analysis/proof:** `verify_qc` enforces `qc.classical_signatures.len() == signers.len()` when hybrid QC is active, maps signatures by validator ID, and verifies `vote_signing_bytes(qc.height, qc.round, Precommit, qc.block_hash, validator_id, chain_id)` with both `verify_pq` and `verify_classical`. Block import calls `verify_qc_strict` via `verify_block_qc`, and QC recovery responses call `verify_qc` before caching recovered `last_qc_bytes`.
 
-There is a stale comment above `verify_qc_strict` saying "ML-DSA-only path"; the function body is correct and delegates to hybrid `verify_qc`.
+The stale comment above `verify_qc_strict` has been corrected. The function body delegates to hybrid `verify_qc`.
 
-**Severity:** SAFE / INFO.
+**Severity:** SAFE.
 
-**Recommended fix:** Update the stale comment; no consensus code change required.
+**Fix applied:** Comment-only cleanup; no consensus logic changed.
 
 ### CS-04 — Round timeout and recovery
 
@@ -183,13 +183,13 @@ With full-hash voting, this should not allow two different blocks to both reach 
 - `indra-state/src/apply.rs::verify_vote_sig_with_keys`
 - `indra-node/src/driver.rs::process_vote`
 
-**Analysis/proof:** `apply_slash_at_height` loads the claimed validator's Ed25519 and PQ keys, verifies both votes with `verify_hybrid` over `vote_signing_bytes(..., chain_id)`, requires both votes' `validator_id` to match the evidence validator, requires same height/round, requires different non-nil block hashes, and requires same step. Forging evidence against a correct validator therefore requires forging that validator's hybrid vote signatures.
+**Analysis/proof:** `apply_slash_at_height` loads the claimed validator's Ed25519 and PQ keys, verifies both votes with `verify_hybrid` over `vote_signing_bytes(..., chain_id)`, requires both votes' `validator_id` to match the evidence validator, requires same height/round, requires different non-nil block hashes, and requires same step. It now accepts only precommit equivocation as slashable. Forging evidence against a correct validator therefore requires forging that validator's hybrid precommit signatures.
 
-**Caveat:** The state application layer accepts conflicting prevotes as slashable under `slash_surround_vote_bps`, while the node-side detector only emits evidence automatically for double precommit and treats same-slot prevote conflicts as non-slashable. This is an enforcement-coverage mismatch, not a forgery path.
+**Decision:** Prevote conflicts are intentionally non-slashable for now. POLC/valid-round rules make prevote semantics more subtle than precommit equivocation, and the node-side detector already treats same-slot prevote conflicts as non-slashable. The state layer has been aligned with that model by rejecting prevote slash evidence.
 
-**Severity:** SAFE / LOW.
+**Severity:** SAFE.
 
-**Recommended fix:** Clarify whether prevote equivocation should be slashable. If yes, update the node-side detector to emit prevote evidence consistently; if no, remove/rename the state-side prevote slash path.
+**Fix applied:** `apply_slash_at_height` now rejects `VoteStep::Prevote` evidence with `InvalidSlashEvidence`; `SlashDetector` has regression coverage that same-slot prevote conflicts do not emit slash evidence. Double-precommit slashing remains active.
 
 ### CS-09 — Byzantine equivocating proposer fork attempt
 
@@ -272,9 +272,7 @@ This remains affected by CS-05: multiple apparent proposers in one round can cau
 ## Fix Priority
 
 1. **CS-05 — VRF proposer uniqueness/liveness:** redesign proposer election so all validators evaluate the same candidate set with the same data. This is the most likely source of repeated competing proposals and round churn under honest operation.
-2. **CS-08 — slash-evidence semantics cleanup:** decide whether prevote equivocation is slashable and align node detection with state application.
-3. **CS-04 — adaptive timeouts:** consider exponential/adaptive round timeouts for WAN stability. This is operational liveness hardening, not a correctness blocker.
-4. **CS-03 — stale comment:** update `verify_qc_strict` comment to avoid future audit confusion.
+2. **CS-04 — adaptive timeouts:** consider exponential/adaptive round timeouts for WAN stability. This is operational liveness hardening, not a correctness blocker.
 
 ## Proof-of-Concept Tests
 
@@ -282,6 +280,12 @@ The CS-01 / CS-12 follow-up fix added regression tests in `indra-node/src/sync.r
 
 - `verify_block_qc_rejects_qc_certifying_wrong_parent_hash`
 - `verify_block_qc_accepts_qc_certifying_correct_parent_hash`
+
+The CS-08 cleanup added/updated regression tests for the chosen slashing model:
+
+- `apply_slash_rejects_prevote_conflict`
+- `same_slot_prevote_conflict_does_not_trigger_slash`
+- existing double-precommit slashing tests remain active.
 
 Remaining recommended follow-up test:
 

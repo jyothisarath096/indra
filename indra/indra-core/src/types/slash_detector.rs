@@ -269,6 +269,16 @@ mod tests {
     }
 
     #[test]
+    fn same_slot_prevote_conflict_does_not_trigger_slash() {
+        let mut detector = SlashDetector::new();
+        let v = [0x05u8; 32];
+
+        detector.observe_vote(dummy_vote(v, 5, 0, VoteStep::Prevote, [0xAAu8; 32]));
+        let evidence = detector.observe_vote(dummy_vote(v, 5, 0, VoteStep::Prevote, [0xBBu8; 32]));
+        assert!(evidence.is_none());
+    }
+
+    #[test]
     fn nil_to_real_precommit_upgrade_is_not_slashed() {
         let mut detector = SlashDetector::new();
         let v = [0x06u8; 32];

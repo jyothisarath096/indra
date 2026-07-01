@@ -165,7 +165,17 @@ pub fn apply_slash_at_height(
 
     let slash_bps = match evidence.vote_1.step {
         VoteStep::Precommit => state.governance.params.slash_double_precommit_bps,
-        VoteStep::Prevote => state.governance.params.slash_surround_vote_bps,
+        VoteStep::Prevote => {
+            // Prevote conflicts are intentionally not slashable right now.
+            // POLC/valid-round logic can make prevote semantics more subtle
+            // than precommit equivocation, and node-side detection only emits
+            // automatic evidence for double precommits. Keep the state layer
+            // aligned with the enforced slashing model until a future protocol
+            // version explicitly enables prevote slashing.
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "prevote conflicts are not slashable".into(),
+            });
+        }
     };
 
     let current_stake = state
@@ -1570,14 +1580,17 @@ mod tests {
     }
 
     #[test]
-    fn apply_slash_surround_vote_reduces_stake_10pct() {
+    fn apply_slash_rejects_prevote_conflict() {
         let (mut state, validator_id, keypair) = slash_validator_state([0x82; 32], 1_000_000);
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Prevote);
         let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
+        assert!(matches!(
+            apply_slash(&mut state, &evidence, &chain_id),
+            Err(StateError::InvalidSlashEvidence { .. })
+        ));
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
-            900_000
+            1_000_000
         );
     }
 
