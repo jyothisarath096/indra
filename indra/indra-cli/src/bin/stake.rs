@@ -54,12 +54,16 @@ fn run_register(args: &[String]) -> CliResult<()> {
     let keys = load_keys(args)?;
     let keypair = reconstruct_keypair(&keys)?;
     let commission_bps = parse_commission(args)?;
+    let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
+    let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
+    warn_if_wallet_utxo_unavailable(&wallet_path, &bond_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
     let built = indra_cli::tx_builder::build_register_validator_op(
         commission_bps,
+        bond_utxo_id,
         &keypair,
         keys.public.vrf_pk,
         nonce,
@@ -72,8 +76,11 @@ fn run_register(args: &[String]) -> CliResult<()> {
         &signer_id,
         nonce,
         &node_url,
-        &[("Commission", format!("{} bps", commission_bps))],
-        None,
+        &[
+            ("Commission", format!("{} bps", commission_bps)),
+            ("Bond UTXO", hex::encode(bond_utxo_id.0)),
+        ],
+        Some((&wallet_path, bond_utxo_id)),
     )
 }
 
@@ -517,7 +524,7 @@ fn print_help() {
 }
 
 fn print_register_help() {
-    println!("Usage: indra-stake register --commission <bps> [--keys keys.json] [--node url] [--dry-run]");
+    println!("Usage: indra-stake register --commission <bps> --utxo <utxo_id_hex> [--keys keys.json] [--wallet wallet.json] [--node url] [--dry-run]");
 }
 
 fn print_self_stake_help() {

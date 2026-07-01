@@ -26,6 +26,11 @@ pub const MAX_VALIDATORS: usize = 1_500;
 /// Epochs a validator's stake is locked after initiating exit.
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 1008; // 21 days at 2 epochs/hour (48 epochs/day × 21 days = 1008)
 
+/// Number of epochs after equivocation during which evidence is accepted
+/// and self-bonds that entered unbonding after the infraction remain slashable.
+/// This must be <= UNBONDING_PERIOD_EPOCHS so slashable funds are still locked.
+pub const SLASH_EVIDENCE_WINDOW_EPOCHS: u64 = 500;
+
 /// Epochs after exit during which a validator's signatures remain valid.
 /// AUTH_WINDOW = UNBONDING_PERIOD + 100
 pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
@@ -165,6 +170,9 @@ pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
 
 /// Minimum UTXO value in Spark. Outputs below this are rejected.
 pub const DUST_LIMIT_SPARK: u64 = 100_000;
+
+/// Minimum validator self-bond required for registration.
+pub const MINIMUM_VALIDATOR_BOND_SPARK: u64 = 1_000_000_000;
 
 /// Blocks per year assuming a 6 second target block time.
 pub const BLOCKS_PER_YEAR: u64 = 5_256_000;
@@ -734,6 +742,7 @@ mod tests {
         assert!(VALIDATOR_SET_PHASE3_MAX < VALIDATOR_SET_PHASE4_MAX);
         assert!(VALIDATOR_SET_PHASE4_MAX <= MAX_QC_SIGNERS);
         assert!(AUTH_WINDOW_EPOCHS >= UNBONDING_PERIOD_EPOCHS);
+        assert!(SLASH_EVIDENCE_WINDOW_EPOCHS <= UNBONDING_PERIOD_EPOCHS);
     }
 
     #[test]

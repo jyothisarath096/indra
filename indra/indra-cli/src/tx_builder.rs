@@ -279,6 +279,7 @@ pub fn build_self_stake_op(
 /// Build and sign a validator registration staking operation.
 pub fn build_register_validator_op(
     commission_bps: u32,
+    bond_utxo_id: Bytes32,
     keypair: &HybridKeypair,
     vrf_pk: [u8; 32],
     nonce: u64,
@@ -287,6 +288,7 @@ pub fn build_register_validator_op(
     build_signed_staking_op(
         StakingOpBody::RegisterValidator {
             commission_bps,
+            bond_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
         },
@@ -636,17 +638,26 @@ mod tests {
     #[test]
     fn build_register_validator_op_serialises_and_decodes() {
         let keypair = test_keypair(0x71);
-        let built =
-            build_register_validator_op(1_000, &keypair, [0xAA; 32], 9, DEFAULT_CHAIN_ID).unwrap();
+        let bond_utxo_id = Bytes32::from([0xAB; 32]);
+        let built = build_register_validator_op(
+            1_000,
+            bond_utxo_id,
+            &keypair,
+            [0xAA; 32],
+            9,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
         let op = decode_built(&built);
         assert_eq!(op.nonce, 9);
         assert!(matches!(
             op.body,
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
+                bond_utxo_id: id,
                 vrf_pk,
                 ..
-            } if vrf_pk == [0xAA; 32]
+            } if id == bond_utxo_id && vrf_pk == [0xAA; 32]
         ));
     }
 
@@ -764,7 +775,15 @@ mod tests {
         let validator_id = Bytes32::from([0x07; 32]);
         let bond_utxo_id = Bytes32::from([0x08; 32]);
         let ops = vec![
-            build_register_validator_op(1_000, &keypair, [0x11; 32], 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_register_validator_op(
+                1_000,
+                bond_utxo_id,
+                &keypair,
+                [0x11; 32],
+                42,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
             build_self_stake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_self_unstake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_delegate_op(validator_id, bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
@@ -792,7 +811,15 @@ mod tests {
         let validator_id = Bytes32::from([0x09; 32]);
         let bond_utxo_id = Bytes32::from([0x0A; 32]);
         let ops = vec![
-            build_register_validator_op(1_000, &keypair, [0x12; 32], 1, DEFAULT_CHAIN_ID).unwrap(),
+            build_register_validator_op(
+                1_000,
+                bond_utxo_id,
+                &keypair,
+                [0x12; 32],
+                1,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
             build_self_stake_op(bond_utxo_id, &keypair, 2, DEFAULT_CHAIN_ID).unwrap(),
             build_self_unstake_op(bond_utxo_id, &keypair, 3, DEFAULT_CHAIN_ID).unwrap(),
             build_delegate_op(validator_id, bond_utxo_id, &keypair, 4, DEFAULT_CHAIN_ID).unwrap(),

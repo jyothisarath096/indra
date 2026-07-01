@@ -127,6 +127,7 @@ int32_t indra_verify_range_proof(
 
 int32_t indra_build_register_validator(
     uint32_t commission_bps,
+    const uint8_t* bond_utxo_id,
     const uint8_t* classical_seed,
     const uint8_t* pq_pk,
     const uint8_t* pq_sk,

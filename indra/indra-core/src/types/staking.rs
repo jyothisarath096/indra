@@ -72,6 +72,8 @@ pub enum StakingOpBody {
     RegisterValidator {
         /// Commission rate in basis points (e.g. 1000 = 10%).
         commission_bps: u32,
+        /// Validator-owned UTXO atomically bonded at registration.
+        bond_utxo_id: Bytes32,
         /// Validator's public key.
         validator_pubkey: HybridPubKey,
         /// Validator's VRF public key for proposer election.
@@ -223,11 +225,13 @@ impl Encode for StakingOpBody {
             }
             StakingOpBody::RegisterValidator {
                 commission_bps,
+                bond_utxo_id,
                 validator_pubkey,
                 vrf_pk,
             } => {
                 buf.push(TAG_REGISTER_VALIDATOR);
                 commission_bps.encode(buf);
+                bond_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
                 buf.extend_from_slice(vrf_pk);
             }
@@ -279,7 +283,7 @@ impl Encode for StakingOpBody {
             } => 32 + delegator_pubkey.encoded_len(),
             StakingOpBody::RegisterValidator {
                 validator_pubkey, ..
-            } => 4 + validator_pubkey.encoded_len() + 32,
+            } => 4 + 32 + validator_pubkey.encoded_len() + 32,
             StakingOpBody::SetCommission { .. } => 32 + 4,
             StakingOpBody::SelfStake {
                 validator_pubkey, ..
@@ -313,6 +317,7 @@ impl Decode for StakingOpBody {
             }),
             TAG_REGISTER_VALIDATOR => Ok(StakingOpBody::RegisterValidator {
                 commission_bps: u32::decode(r)?,
+                bond_utxo_id: Bytes32::decode(r)?,
                 validator_pubkey: HybridPubKey::decode(r)?,
                 vrf_pk: r.read_bytes32()?,
             }),
@@ -412,6 +417,7 @@ mod tests {
             }),
             op(StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
+                bond_utxo_id: Bytes32::from([0x44; 32]),
                 validator_pubkey: dummy_pubkey(),
                 vrf_pk: [4u8; 32],
             }),
@@ -448,6 +454,7 @@ mod tests {
         });
         let register = op(StakingOpBody::RegisterValidator {
             commission_bps: 1_000,
+            bond_utxo_id: Bytes32::from([0x99; 32]),
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [9u8; 32],
         });
@@ -471,6 +478,7 @@ mod tests {
     fn staking_op_validate_structure_rejects_bad_commission() {
         let bad_register = op(StakingOpBody::RegisterValidator {
             commission_bps: 10_001,
+            bond_utxo_id: Bytes32::ZERO,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
         });
@@ -487,6 +495,7 @@ mod tests {
     fn commission_in_range_accepted() {
         let op = op(StakingOpBody::RegisterValidator {
             commission_bps: 1_000,
+            bond_utxo_id: Bytes32::ZERO,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
         });

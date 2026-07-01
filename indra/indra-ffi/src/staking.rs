@@ -137,6 +137,7 @@ struct StakingCommonArgs {
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_register_validator(
     commission_bps: u32,
+    bond_utxo_id: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -146,7 +147,7 @@ pub unsafe extern "C" fn indra_build_register_validator(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if vrf_pk.is_null() {
+    if bond_utxo_id.is_null() || vrf_pk.is_null() {
         return IndraError::NullPointer.code();
     }
     if commission_bps > 10_000 {
@@ -163,8 +164,9 @@ pub unsafe extern "C" fn indra_build_register_validator(
             out_len,
         },
         |keypair, nonce, chain| {
+            let bond = Bytes32::from(read_bytes32(bond_utxo_id));
             let vrf = read_bytes32(vrf_pk);
-            build_register_validator_op(commission_bps, keypair, vrf, nonce, chain)
+            build_register_validator_op(commission_bps, bond, keypair, vrf, nonce, chain)
                 .map(|built| built.op_hex)
                 .map_err(IndraError::from)
         },
@@ -595,11 +597,13 @@ mod tests {
     fn commission_out_of_range_rejected() {
         let keys = keys();
         let chain = CString::new("indra-testnet-1").unwrap();
+        let bond_utxo_id = [0x08u8; 32];
         let vrf_pk = [0x09u8; 32];
         let mut out = out();
         let result = unsafe {
             indra_build_register_validator(
                 10_001,
+                bond_utxo_id.as_ptr(),
                 keys.classical_seed.as_ptr(),
                 keys.pq_pk.as_ptr(),
                 keys.pq_sk.as_ptr(),

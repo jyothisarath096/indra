@@ -7,8 +7,9 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_VALIDATOR_BOND_SPARK,
+        MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        UNBONDING_PERIOD_EPOCHS,
     },
     staking::{StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -126,9 +127,17 @@ pub fn apply_staking_op(
         } => apply_claim_rewards(state, validator_id, delegator_pubkey, current_height),
         StakingOpBody::RegisterValidator {
             commission_bps,
+            bond_utxo_id,
             validator_pubkey,
             vrf_pk,
-        } => apply_register_validator(state, *commission_bps, validator_pubkey, *vrf_pk),
+        } => apply_register_validator(
+            state,
+            *commission_bps,
+            *bond_utxo_id,
+            validator_pubkey,
+            *vrf_pk,
+            current_height,
+        ),
         StakingOpBody::SetCommission {
             validator_id,
             new_commission_bps,
@@ -185,8 +194,10 @@ fn verify_staking_sig(
 fn apply_register_validator(
     state: &mut ChainState,
     commission_bps: u32,
+    bond_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
     vrf_pk: [u8; 32],
+    current_height: u64,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
         || commission_bps > state.governance.params.max_commission_bps
@@ -200,15 +211,73 @@ fn apply_register_validator(
     if state.validators.get(&validator_id).is_some() {
         return Err(StateError::ValidatorAlreadyRegistered);
     }
+    if state.validators.len() >= MAX_VALIDATORS {
+        return Err(StateError::InvariantViolation {
+            message: "validator set at maximum capacity",
+        });
+    }
+
+    let new_classical_pk = validator_pubkey.classical_pk.0;
+    let new_pq_pk = validator_pubkey.pq_pk.as_slice();
+    for existing in state.validators.all_validators() {
+        if existing.hybrid_classical_pk == Some(new_classical_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "hybrid_classical_pk already registered".into(),
+            });
+        }
+        if existing.hybrid_pq_pk.as_deref() == Some(new_pq_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "hybrid_pq_pk already registered".into(),
+            });
+        }
+        if existing.vrf_pk == Some(vrf_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "vrf_pk already registered".into(),
+            });
+        }
+    }
+
+    if state.staked_bonds.contains_key(&bond_utxo_id) {
+        return Err(StateError::InvalidStakingOp(
+            "registration bond UTXO is already bonded as stake".into(),
+        ));
+    }
+
+    let utxo_entry = state
+        .utxos
+        .get(&bond_utxo_id)
+        .ok_or(StateError::UnknownUtxo)?
+        .clone();
+    let utxo_owner_id = pubkey_to_id(&utxo_entry.output.owner_pubkey);
+    if utxo_owner_id != validator_id {
+        return Err(StateError::InvalidStakingOp(
+            "registration bond UTXO does not belong to the validator".into(),
+        ));
+    }
+    let amount_spark = utxo_entry.output.value_spark;
+    if amount_spark < MINIMUM_VALIDATOR_BOND_SPARK {
+        return Err(StateError::InvalidStakingOp(format!(
+            "registration self-bond {} Spark below minimum {} Spark",
+            amount_spark, MINIMUM_VALIDATOR_BOND_SPARK,
+        )));
+    }
 
     let current_epoch = epoch_for_height(state.height);
+    let original_output = utxo_entry.output;
+    let spent = state.utxos.spend(&bond_utxo_id);
+    if spent.is_none() {
+        return Err(StateError::InvariantViolation {
+            message: "registration bond UTXO disappeared during validator registration",
+        });
+    }
+
     let entry = ValidatorEntry {
         validator_id,
         name: hex::encode(&validator_id.0[..8]),
         hybrid_classical_pk: Some(validator_pubkey.classical_pk.0),
         hybrid_pq_pk: Some(validator_pubkey.pq_pk.as_slice().to_vec()),
         vrf_pk: Some(vrf_pk),
-        stake_spark: 0,
+        stake_spark: amount_spark,
         status: ValidatorStatus::Registered,
         registered_epoch: current_epoch,
         last_active_epoch: current_epoch,
@@ -219,7 +288,20 @@ fn apply_register_validator(
         min_delegation_spark: DUST_LIMIT_SPARK,
         auto_delegate_to: None,
     };
-    state.validators.upsert(entry)
+    state.validators.upsert(entry)?;
+    state.staked_bonds.insert(
+        bond_utxo_id,
+        StakeBondEntry {
+            utxo_id: bond_utxo_id,
+            validator_id,
+            delegator_id: validator_id,
+            amount_spark,
+            bonded_epoch: epoch_for_height(current_height),
+            unbonding_end_epoch: None,
+            original_output,
+        },
+    );
+    Ok(())
 }
 
 /// Delegate stake to a validator.
@@ -417,10 +499,16 @@ fn apply_self_unstake(
     current_height: u64,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
-    state
+    let validator = state
         .validators
         .get(&validator_id)
         .ok_or(StateError::ValidatorNotFound)?;
+    if !matches!(
+        validator.status,
+        ValidatorStatus::Active | ValidatorStatus::Registered
+    ) {
+        return Err(StateError::ValidatorNotActive);
+    }
 
     let bond = state
         .staked_bonds
@@ -642,6 +730,13 @@ mod tests {
         HybridKeypair::new(
             ClassicalKeypair::from_seed(&[seed; 32]),
             PqKeypair::from_seed(&[seed; 32]).unwrap(),
+        )
+    }
+
+    fn mixed_keypair(classical_seed: u8, pq_seed: u8) -> HybridKeypair {
+        HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[classical_seed; 32]),
+            PqKeypair::from_seed(&[pq_seed; 32]).unwrap(),
         )
     }
 
@@ -1406,10 +1501,17 @@ mod tests {
         let validator_keypair = keypair(0x04);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
         let validator_id = pubkey_to_id(&validator_pubkey);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA0,
+        );
         let vrf_pk = [0xA5; 32];
         let op = signed_op(
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
+                bond_utxo_id,
                 validator_pubkey,
                 vrf_pk,
             },
@@ -1423,6 +1525,12 @@ mod tests {
             state.validators.get(&validator_id).unwrap().vrf_pk,
             Some(vrf_pk)
         );
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            MINIMUM_VALIDATOR_BOND_SPARK
+        );
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
+        assert!(!state.utxos.contains(&bond_utxo_id));
     }
 
     #[test]
@@ -1430,9 +1538,16 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let validator_keypair = keypair(0x04);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA1,
+        );
         let first = signed_op(
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
+                bond_utxo_id,
                 validator_pubkey: validator_pubkey.clone(),
                 vrf_pk: [0xA5; 32],
             },
@@ -1443,6 +1558,7 @@ mod tests {
         let second = signed_op(
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
+                bond_utxo_id: Bytes32::ZERO,
                 validator_pubkey,
                 vrf_pk: [0x5A; 32],
             },
@@ -1456,6 +1572,255 @@ mod tests {
             apply_staking_op(&mut state, &second, &chain_id, 1),
             Err(StateError::ValidatorAlreadyRegistered)
         );
+    }
+
+    #[test]
+    fn registration_without_bond_is_rejected() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0x44);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: Bytes32::from([0xFE; 32]),
+                validator_pubkey,
+                vrf_pk: [0x44; 32],
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::UnknownUtxo)
+        );
+    }
+
+    #[test]
+    fn registration_with_bond_below_minimum_is_rejected() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0x45);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK - 1,
+            0xA2,
+        );
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey,
+                vrf_pk: [0x45; 32],
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(_))
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_duplicate_vrf_pk() {
+        let mut state = ChainState::new_genesis();
+        let first_keypair = keypair(0x46);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let first_bond = insert_delegator_utxo(
+            &mut state,
+            first_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA3,
+        );
+        let second_keypair = keypair(0x47);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let second_bond = insert_delegator_utxo(
+            &mut state,
+            second_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA4,
+        );
+        let duplicate_vrf = [0xDD; 32];
+        let first = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: first_bond,
+                validator_pubkey: first_pubkey,
+                vrf_pk: duplicate_vrf,
+            },
+            1,
+            &first_keypair,
+            &state.chain_id,
+        );
+        let second = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: second_bond,
+                validator_pubkey: second_pubkey,
+                vrf_pk: duplicate_vrf,
+            },
+            1,
+            &second_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::DuplicateValidatorKey { reason })
+                if reason.contains("vrf_pk")
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_duplicate_classical_pk() {
+        let mut state = ChainState::new_genesis();
+        let first_keypair = keypair(0x48);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let first_bond = insert_delegator_utxo(
+            &mut state,
+            first_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA5,
+        );
+        let second_keypair = mixed_keypair(0x48, 0x49);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let second_bond = insert_delegator_utxo(
+            &mut state,
+            second_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA6,
+        );
+        let first = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: first_bond,
+                validator_pubkey: first_pubkey,
+                vrf_pk: [0x48; 32],
+            },
+            1,
+            &first_keypair,
+            &state.chain_id,
+        );
+        let second = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: second_bond,
+                validator_pubkey: second_pubkey,
+                vrf_pk: [0x49; 32],
+            },
+            1,
+            &second_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::DuplicateValidatorKey { reason })
+                if reason.contains("hybrid_classical_pk")
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_duplicate_pq_pk() {
+        let mut state = ChainState::new_genesis();
+        let first_keypair = keypair(0x4A);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let first_bond = insert_delegator_utxo(
+            &mut state,
+            first_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA7,
+        );
+        let second_keypair = mixed_keypair(0x4B, 0x4A);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let second_bond = insert_delegator_utxo(
+            &mut state,
+            second_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA8,
+        );
+        let first = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: first_bond,
+                validator_pubkey: first_pubkey,
+                vrf_pk: [0x4A; 32],
+            },
+            1,
+            &first_keypair,
+            &state.chain_id,
+        );
+        let second = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: second_bond,
+                validator_pubkey: second_pubkey,
+                vrf_pk: [0x4B; 32],
+            },
+            1,
+            &second_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, 1),
+            Err(StateError::DuplicateValidatorKey { reason })
+                if reason.contains("hybrid_pq_pk")
+        ));
+    }
+
+    #[test]
+    fn registration_with_all_unique_keys_succeeds() {
+        let mut state = ChainState::new_genesis();
+        let first_keypair = keypair(0x4C);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let first_bond = insert_delegator_utxo(
+            &mut state,
+            first_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xA9,
+        );
+        let second_keypair = keypair(0x4D);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let second_bond = insert_delegator_utxo(
+            &mut state,
+            second_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xAA,
+        );
+        let first = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: first_bond,
+                validator_pubkey: first_pubkey,
+                vrf_pk: [0x4C; 32],
+            },
+            1,
+            &first_keypair,
+            &state.chain_id,
+        );
+        let second = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id: second_bond,
+                validator_pubkey: second_pubkey,
+                vrf_pk: [0x4D; 32],
+            },
+            1,
+            &second_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
+        apply_staking_op(&mut state, &second, &chain_id, 1).unwrap();
     }
 
     #[test]

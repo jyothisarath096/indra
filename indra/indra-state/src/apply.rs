@@ -41,7 +41,8 @@ use indra_core::{
         primitives::{
             bps_of, overflow_fix_active, Bytes32, ProtocolVersion, HARD_CAP_SPARK,
             MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-            MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+            MAX_TX_PER_BLOCK, PROTOCOL_VERSION, SLASH_EVIDENCE_WINDOW_EPOCHS,
+            UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
         slashing::SlashEvidenceV1,
@@ -146,6 +147,16 @@ pub fn apply_slash_at_height(
         });
     }
 
+    let infraction_epoch = epoch_for_height(evidence.vote_1.height);
+    let current_epoch = epoch_for_height(height);
+    if current_epoch > infraction_epoch.saturating_add(SLASH_EVIDENCE_WINDOW_EPOCHS) {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: format!(
+                "slash evidence outside evidence window: infraction_epoch={infraction_epoch}, current_epoch={current_epoch}, window={SLASH_EVIDENCE_WINDOW_EPOCHS}",
+            ),
+        });
+    }
+
     if evidence.vote_1.block_hash == evidence.vote_2.block_hash {
         return Err(StateError::InvalidSlashEvidence {
             reason: "votes have same block hash — not equivocation".into(),
@@ -178,11 +189,6 @@ pub fn apply_slash_at_height(
         }
     };
 
-    let current_stake = state
-        .validators
-        .get(&validator_id)
-        .map(|v| v.stake_spark)
-        .unwrap_or(0);
     let bps = |amount, rate| {
         if overflow_fix_active(height) {
             bps_of(amount, rate)
@@ -190,33 +196,64 @@ pub fn apply_slash_at_height(
             amount.saturating_mul(rate as u64) / 10_000
         }
     };
-    let slash_amount = bps(current_stake, slash_bps);
-    let reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
-    let burned = slash_amount.saturating_sub(reporter_reward);
-
-    if let Some(v) = state.validators.get_mut(&validator_id) {
-        v.stake_spark = v.stake_spark.saturating_sub(slash_amount);
-        v.status = ValidatorStatus::Slashed;
-    }
 
     let bond_ids: Vec<Bytes32> = state
         .staked_bonds
         .values()
         .filter(|bond| {
-            bond.validator_id == validator_id
-                && bond.delegator_id == validator_id
-                && bond.unbonding_end_epoch.is_none()
+            if bond.validator_id != validator_id || bond.delegator_id != validator_id {
+                return false;
+            }
+            match bond.unbonding_end_epoch {
+                None => true,
+                Some(end_epoch) => {
+                    let unbonding_start = end_epoch.saturating_sub(UNBONDING_PERIOD_EPOCHS);
+                    unbonding_start > infraction_epoch
+                }
+            }
         })
         .map(|bond| bond.utxo_id)
         .collect();
+    let slashable_bond_stake = bond_ids.iter().fold(0u64, |acc, bond_id| {
+        acc.saturating_add(
+            state
+                .staked_bonds
+                .get(bond_id)
+                .map(|bond| bond.amount_spark)
+                .unwrap_or(0),
+        )
+    });
+    let current_stake = state
+        .validators
+        .get(&validator_id)
+        .map(|v| v.stake_spark)
+        .unwrap_or(0);
+    let slash_base = slashable_bond_stake.max(current_stake);
+    let slash_amount = bps(slash_base, slash_bps);
+    let reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
+    let burned = slash_amount.saturating_sub(reporter_reward);
 
     let mut total_bond_slashed: u64 = 0;
+    let mut active_bond_slashed: u64 = 0;
     for bond_id in &bond_ids {
         if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
             let bond_slash = bps(bond.amount_spark, slash_bps);
+            if bond.unbonding_end_epoch.is_none() {
+                active_bond_slashed = active_bond_slashed.saturating_add(bond_slash);
+            }
             bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
             total_bond_slashed = total_bond_slashed.saturating_add(bond_slash);
         }
+    }
+
+    if let Some(v) = state.validators.get_mut(&validator_id) {
+        let stake_slash = if slashable_bond_stake > 0 {
+            active_bond_slashed
+        } else {
+            slash_amount
+        };
+        v.stake_spark = v.stake_spark.saturating_sub(stake_slash);
+        v.status = ValidatorStatus::Slashed;
     }
 
     state.total_supply = state.total_supply.saturating_sub(burned);
@@ -727,7 +764,11 @@ mod tests {
     use indra_core::{
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::{DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB},
+            primitives::{
+                DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
+                INITIAL_BASE_FEE_SPARK_PER_KB, MINIMUM_VALIDATOR_BOND_SPARK,
+                SLASH_EVIDENCE_WINDOW_EPOCHS, UNBONDING_PERIOD_EPOCHS,
+            },
             slashing::SlashEvidenceV1,
             staking::{StakingOp, StakingOpBody},
             transaction::{InputV1, OutputV1, TransactionV1},
@@ -787,15 +828,29 @@ mod tests {
     }
 
     fn signed_register_validator_op(
-        state: &ChainState,
+        state: &mut ChainState,
         seed: [u8; 32],
         nonce: u64,
     ) -> (StakingOp, Bytes32) {
         let (validator_pubkey, keypair) = make_test_keypair(seed);
         let validator_id = pubkey_to_id_for_test(&validator_pubkey);
+        let bond_utxo_id = state
+            .utxos
+            .insert(
+                output_with_value(
+                    MINIMUM_VALIDATOR_BOND_SPARK,
+                    validator_pubkey.clone(),
+                    seed[0],
+                ),
+                0,
+                0,
+                seed[0] as u32,
+            )
+            .unwrap();
         let mut op = StakingOp {
             body: StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
+                bond_utxo_id,
                 validator_pubkey,
                 vrf_pk: seed,
             },
@@ -934,6 +989,10 @@ mod tests {
 
     fn dummy_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
         let value = TEST_INPUT_VALUE + byte as u64;
+        output_with_value(value, owner_pubkey, byte)
+    }
+
+    fn output_with_value(value: u64, owner_pubkey: HybridPubKey, byte: u8) -> OutputV1 {
         let blinding = [byte; 32];
         let commitment = commit(value, &blinding);
         let mut rng = StdRng::from_seed([byte; 32]);
@@ -1030,8 +1089,8 @@ mod tests {
 
     #[test]
     fn apply_block_rejects_too_many_staking_ops() {
-        let state = ChainState::new_genesis();
-        let (op, _) = signed_register_validator_op(&state, [0x41; 32], 1);
+        let mut state = ChainState::new_genesis();
+        let (op, _) = signed_register_validator_op(&mut state, [0x41; 32], 1);
         let mut block = make_block(&state, vec![]);
         block.staking_ops = vec![op; MAX_STAKING_OPS_PER_BLOCK + 1];
         let mut check_state = state.clone();
@@ -1048,8 +1107,8 @@ mod tests {
     #[test]
     fn apply_block_with_staking_ops_atomicity() {
         let mut state = ChainState::new_genesis();
+        let (op, validator_id) = signed_register_validator_op(&mut state, [0x42; 32], 1);
         let original = state.clone();
-        let (op, validator_id) = signed_register_validator_op(&state, [0x42; 32], 1);
         let mut block = make_block(&state, vec![]);
         block.staking_ops = vec![op.clone(), op];
 
@@ -1752,6 +1811,118 @@ mod tests {
                 .staked_spark,
             200_000
         );
+    }
+
+    #[test]
+    fn self_unstake_before_slash_evidence_does_not_reduce_slash_amount() {
+        let original_bond = 1_000_000u64;
+        let (mut state, validator_id, keypair) = slash_validator_state([0x8F; 32], 0);
+        let bond_id = Bytes32::from([0xC1; 32]);
+        let (owner, _) = make_test_keypair([0x93; 32]);
+        state.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry {
+                utxo_id: bond_id,
+                validator_id,
+                delegator_id: validator_id,
+                amount_spark: original_bond,
+                bonded_epoch: 0,
+                unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
+                original_output: output_with_value(original_bond, owner, 0x22),
+            },
+        );
+
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash_at_height(&mut state, &evidence, &chain_id, EPOCH_DURATION_BLOCKS + 1).unwrap();
+
+        assert_eq!(
+            state.staked_bonds.get(&bond_id).unwrap().amount_spark,
+            950_000,
+            "unbonding self-bond must remain slashable for pre-unbonding equivocation"
+        );
+        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 47_500);
+    }
+
+    #[test]
+    fn self_unstake_after_evidence_window_is_not_slashable() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x90; 32], 1_000_000);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        let too_late_height =
+            (SLASH_EVIDENCE_WINDOW_EPOCHS + 1).saturating_mul(EPOCH_DURATION_BLOCKS);
+
+        assert!(matches!(
+            apply_slash_at_height(&mut state, &evidence, &chain_id, too_late_height),
+            Err(StateError::InvalidSlashEvidence { reason })
+                if reason.contains("outside evidence window")
+        ));
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn slash_covers_both_active_and_unbonding_bonds_within_window() {
+        let active_bond = 600_000u64;
+        let unbonding_bond = 400_000u64;
+        let (mut state, validator_id, keypair) = slash_validator_state([0x91; 32], active_bond);
+        let active_bond_id = Bytes32::from([0xC2; 32]);
+        let unbonding_bond_id = Bytes32::from([0xC3; 32]);
+        let (owner_active, _) = make_test_keypair([0x94; 32]);
+        let (owner_unbonding, _) = make_test_keypair([0x95; 32]);
+        state.staked_bonds.insert(
+            active_bond_id,
+            StakeBondEntry {
+                utxo_id: active_bond_id,
+                validator_id,
+                delegator_id: validator_id,
+                amount_spark: active_bond,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: output_with_value(active_bond, owner_active, 0x23),
+            },
+        );
+        state.staked_bonds.insert(
+            unbonding_bond_id,
+            StakeBondEntry {
+                utxo_id: unbonding_bond_id,
+                validator_id,
+                delegator_id: validator_id,
+                amount_spark: unbonding_bond,
+                bonded_epoch: 0,
+                unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
+                original_output: output_with_value(unbonding_bond, owner_unbonding, 0x24),
+            },
+        );
+
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash_at_height(&mut state, &evidence, &chain_id, EPOCH_DURATION_BLOCKS + 1).unwrap();
+
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&active_bond_id)
+                .unwrap()
+                .amount_spark,
+            570_000
+        );
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&unbonding_bond_id)
+                .unwrap()
+                .amount_spark,
+            380_000
+        );
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            570_000,
+            "active stake should track only the active bond slash"
+        );
+        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 47_500);
     }
 
     #[test]

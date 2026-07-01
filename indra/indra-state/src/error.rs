@@ -174,6 +174,13 @@ pub enum StateError {
     #[error("validator already registered")]
     ValidatorAlreadyRegistered,
 
+    /// Validator key material is already registered to another validator.
+    #[error("duplicate validator key: {reason}")]
+    DuplicateValidatorKey {
+        /// Specific duplicated key field.
+        reason: String,
+    },
+
     /// Staking op signature verification failed.
     #[error("staking op signature invalid: {reason}")]
     StakingOpSignatureInvalid {
