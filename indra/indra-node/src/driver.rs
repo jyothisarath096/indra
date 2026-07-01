@@ -1323,9 +1323,8 @@ impl ConsensusDriver {
             Err(_) => return vec![DriverAction::None],
         };
 
-        let base_fee = self.engine.state.base_fee;
-        let height = self.engine.state.height;
-        match self.engine.mempool.submit(tx.clone(), base_fee, height) {
+        let state = self.engine.state.clone();
+        match self.engine.mempool.submit_validated(tx.clone(), &state) {
             Ok(_) => vec![DriverAction::BroadcastTx(tx)],
             Err(_) => vec![DriverAction::None],
         }

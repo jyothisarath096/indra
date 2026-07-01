@@ -173,6 +173,74 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
 }
 
 #[test]
+fn transaction_with_overflowing_input_sum_is_rejected() {
+    let mut state = ChainState::new_genesis();
+    let (owner_pubkey, _owner_keypair) = keypair([0x45; 32]);
+    let huge_output_a = OutputV1 {
+        value_spark: u64::MAX,
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::ZERO,
+        },
+        owner_pubkey: owner_pubkey.clone(),
+        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
+        lock_height: 0,
+    };
+    let huge_output_b = OutputV1 {
+        value_spark: 1,
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::ZERO,
+        },
+        owner_pubkey,
+        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
+        lock_height: 0,
+    };
+    let utxo_a = state.utxos.insert(huge_output_a, 0, 0, 0).unwrap();
+    let utxo_b = state.utxos.insert(huge_output_b, 0, 0, 1).unwrap();
+
+    let tx = TransactionV1 {
+        version: ProtocolVersion::CURRENT,
+        signature_module_id: 1,
+        inputs: vec![
+            InputV1 {
+                utxo_id: utxo_a,
+                nullifier: Bytes32::from([0xE1; 32]),
+            },
+            InputV1 {
+                utxo_id: utxo_b,
+                nullifier: Bytes32::from([0xE2; 32]),
+            },
+        ],
+        outputs: vec![OutputV1 {
+            value_spark: INITIAL_BASE_FEE_SPARK_PER_KB,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::ZERO,
+            },
+            owner_pubkey: keypair([0x46; 32]).0,
+            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
+            lock_height: 0,
+        }],
+        fee_amount: INITIAL_BASE_FEE_SPARK_PER_KB,
+        fee_blinding: Bytes32::ZERO,
+        fee_commitment: CommitmentV1 {
+            compressed_point: Bytes32::ZERO,
+        },
+        signature: HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        },
+    };
+    let block = block_with_transactions(&state, vec![tx]);
+
+    assert_eq!(
+        apply_block(&mut state, &block, 0),
+        Err(StateError::ValueOverflow)
+    );
+    assert_eq!(state.height, 0);
+    assert!(state.utxos.contains(&utxo_a));
+    assert!(state.utxos.contains(&utxo_b));
+}
+
+#[test]
 fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
     let mut state = ChainState::new_genesis();
     let (owner_pubkey, owner_keypair) = keypair([0x42; 32]);

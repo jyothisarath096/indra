@@ -135,10 +135,9 @@ impl indra_rpc::handlers::RpcEngineMut for NodeEngine {
         &mut self,
         tx: indra_core::types::transaction::TransactionV1,
     ) -> Result<indra_core::Bytes32, String> {
-        let base_fee = self.state.base_fee;
-        let height = self.state.height;
+        let state = self.state.clone();
         self.mempool
-            .submit(tx, base_fee, height)
+            .submit_validated(tx, &state)
             .map_err(|error| error.to_string())
     }
 }

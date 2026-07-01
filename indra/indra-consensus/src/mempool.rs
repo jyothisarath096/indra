@@ -191,6 +191,40 @@ impl Mempool {
         Ok(tx_id)
     }
 
+    /// Submit a transaction after full state-machine validation.
+    ///
+    /// This is the admission path for RPC and P2P gossip. Final block
+    /// application still revalidates every transaction authoritatively, but
+    /// full admission validation keeps signature-invalid, unknown-UTXO, or
+    /// already-spent transactions out of the mempool and prevents gossiping
+    /// them to peers.
+    pub fn submit_validated(
+        &mut self,
+        tx: TransactionV1,
+        state: &indra_state::ChainState,
+    ) -> ConsensusResult<Bytes32> {
+        let mut block_nullifiers = HashSet::new();
+        let mut block_input_utxos = HashSet::new();
+        if let Err(error) = indra_state::apply::validate_transaction(
+            state,
+            &tx,
+            &state.chain_id,
+            &mut block_nullifiers,
+            &mut block_input_utxos,
+            state.height.saturating_add(1),
+        ) {
+            eprintln!(
+                "[mempool] rejected invalid tx {:?}: {}",
+                Self::tx_id(&tx),
+                error
+            );
+            return Err(ConsensusError::InvalidTransaction {
+                reason: "state validation failed",
+            });
+        }
+        self.submit(tx, state.base_fee, state.height)
+    }
+
     /// Remove a transaction by ID (called after block inclusion).
     pub fn evict(&mut self, tx_id: &Bytes32) -> Option<MempoolEntry> {
         self.entries.remove(tx_id)
@@ -284,14 +318,18 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         types::{
-            crypto::HybridSignature,
-            primitives::DUST_LIMIT_SPARK,
+            crypto::{CommitmentV1, HybridSignature},
+            primitives::{DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_RANGE_PROOF_BYTES},
             transaction::{InputV1, OutputV1, TransactionV1},
         },
-        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
+        Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
     };
+    use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_state::ChainState;
+    use rand::{rngs::StdRng, SeedableRng};
 
     fn dummy_tx(fee: u64, nullifier_byte: u8) -> TransactionV1 {
         TransactionV1 {
@@ -323,6 +361,94 @@ mod tests {
                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
         }
+    }
+
+    fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let keypair = HybridKeypair::new(classical, pq);
+        let public = keypair.public_key();
+        (
+            HybridPubKey {
+                classical_pk: Bytes32::from(public.classical.0),
+                pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+            },
+            keypair,
+        )
+    }
+
+    fn output(
+        value: u64,
+        blinding: [u8; 32],
+        owner_pubkey: HybridPubKey,
+        proof_seed: [u8; 32],
+    ) -> OutputV1 {
+        let commitment = commit(value, &blinding);
+        let mut rng = StdRng::from_seed(proof_seed);
+        let proof = prove_range(value, &blinding, &mut rng).unwrap();
+        OutputV1 {
+            value_spark: value,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commitment.0),
+            },
+            owner_pubkey,
+            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&proof).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> HybridSignature {
+        let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        }
+    }
+
+    fn valid_state_and_tx() -> (ChainState, TransactionV1) {
+        let mut state = ChainState::new_genesis();
+        let (owner_pubkey, owner_keypair) = keypair([0x42; 32]);
+        let input_value = 10_000_000_000u64;
+        let input_blinding = [0x11; 32];
+        let original_output = output(
+            input_value,
+            input_blinding,
+            owner_pubkey.clone(),
+            [0x51; 32],
+        );
+        let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
+        let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
+        let output_value = input_value - fee;
+        let output_blinding = [0x21; 32];
+        let fee_blinding = (Scalar::from_bytes_mod_order(input_blinding)
+            - Scalar::from_bytes_mod_order(output_blinding))
+        .to_bytes();
+        let fee_commitment = commit(fee, &fee_blinding);
+        let mut tx = TransactionV1 {
+            version: ProtocolVersion::CURRENT,
+            signature_module_id: 1,
+            inputs: vec![InputV1 {
+                utxo_id,
+                nullifier: Bytes32::from([0xA1; 32]),
+            }],
+            outputs: vec![output(
+                output_value,
+                output_blinding,
+                owner_pubkey,
+                [0x61; 32],
+            )],
+            fee_amount: fee,
+            fee_blinding: Bytes32::from(fee_blinding),
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(fee_commitment.0),
+            },
+            signature: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+            },
+        };
+        tx.signature = sign_tx(&tx, &owner_keypair, &state.chain_id);
+        (state, tx)
     }
 
     #[test]
@@ -484,5 +610,41 @@ mod tests {
         mp.evict_invalid(&state);
 
         assert!(!mp.contains(&tx_id));
+    }
+
+    #[test]
+    fn mempool_rejects_transaction_with_invalid_signature() {
+        let (state, mut tx) = valid_state_and_tx();
+        tx.signature.classical_sig = VariableBytes::from_slice(&[0u8; 64]).unwrap();
+        let mut mp = Mempool::default_config();
+
+        assert!(matches!(
+            mp.submit_validated(tx, &state),
+            Err(ConsensusError::InvalidTransaction { .. })
+        ));
+        assert!(mp.is_empty());
+    }
+
+    #[test]
+    fn mempool_rejects_transaction_spending_nonexistent_utxo() {
+        let (state, mut tx) = valid_state_and_tx();
+        tx.inputs[0].utxo_id = Bytes32::from([0xFF; 32]);
+        let mut mp = Mempool::default_config();
+
+        assert!(matches!(
+            mp.submit_validated(tx, &state),
+            Err(ConsensusError::InvalidTransaction { .. })
+        ));
+        assert!(mp.is_empty());
+    }
+
+    #[test]
+    fn mempool_accepts_valid_transaction() {
+        let (state, tx) = valid_state_and_tx();
+        let mut mp = Mempool::default_config();
+        let tx_id = mp.submit_validated(tx, &state).unwrap();
+
+        assert!(mp.contains(&tx_id));
+        assert_eq!(mp.len(), 1);
     }
 }

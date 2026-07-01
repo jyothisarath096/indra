@@ -44,6 +44,11 @@ pub fn compute_next_base_fee(current_base_fee: u64, tx_count: usize) -> u64 {
     let target_count =
         max_txs.saturating_mul(TARGET_UTILISATION_NUMERATOR) / TARGET_UTILISATION_DENOMINATOR;
 
+    // DETERMINISM/SAFETY NOTE: this base-fee adjustment intentionally uses
+    // saturating arithmetic. It is an EIP-1559-style control loop, not a
+    // transaction value balance equation: extreme inputs clamp the adjustment
+    // instead of overflowing or rejecting an otherwise valid block. Critical
+    // transaction input/output/fee sums use checked arithmetic in apply.rs.
     let new_fee = if count > target_count {
         // Above target: increase fee
         // delta = count - target_count

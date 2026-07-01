@@ -572,7 +572,9 @@ pub fn validate_transaction(
             entry.output.commitment.compressed_point.0,
         ));
 
-        total_input_value = total_input_value.saturating_add(entry.output.value_spark);
+        total_input_value = total_input_value
+            .checked_add(entry.output.value_spark)
+            .ok_or(StateError::ValueOverflow)?;
         match &owner_pubkey {
             Some(existing) if existing != &entry.output.owner_pubkey => {
                 return Err(StateError::InvariantViolation {
@@ -623,7 +625,10 @@ pub fn validate_transaction(
         let bytes = tx.encode_to_vec().len() as u64;
         bytes.div_ceil(1024)
     };
-    let required_fee = state.base_fee.saturating_mul(weight_kb);
+    let required_fee = state
+        .base_fee
+        .checked_mul(weight_kb)
+        .ok_or(StateError::ValueOverflow)?;
     if tx.fee_amount < required_fee {
         return Err(StateError::FeeTooLow {
             actual: tx.fee_amount,
@@ -634,8 +639,11 @@ pub fn validate_transaction(
     let total_output_value = tx
         .outputs
         .iter()
-        .fold(0u64, |acc, output| acc.saturating_add(output.value_spark));
-    let required_total = total_output_value.saturating_add(tx.fee_amount);
+        .try_fold(0u64, |acc, output| acc.checked_add(output.value_spark))
+        .ok_or(StateError::ValueOverflow)?;
+    let required_total = total_output_value
+        .checked_add(tx.fee_amount)
+        .ok_or(StateError::ValueOverflow)?;
     if total_input_value != required_total {
         return Err(StateError::InvariantViolation {
             message: "transaction inputs must equal outputs plus fee",

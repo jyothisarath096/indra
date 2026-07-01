@@ -161,6 +161,10 @@ pub enum StateError {
     #[error("commitment balance invalid")]
     CommitmentBalanceInvalid,
 
+    /// Transaction value arithmetic overflowed.
+    #[error("transaction value arithmetic overflow")]
+    ValueOverflow,
+
     // ── State integrity errors ─────────────────────────────────────────────
     /// A staking operation was invalid.
     #[error("invalid staking op: {0}")]

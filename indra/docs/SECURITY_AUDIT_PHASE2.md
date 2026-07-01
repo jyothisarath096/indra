@@ -8,13 +8,13 @@
 | T-02 | Nullifier | Same-block duplicate-UTXO spends with distinct nullifiers are rejected | CRITICAL | FIXED — regression tests added |
 | T-03 | Nullifier | Cross-block replay protection works for normal spends because UTXOs are removed and nullifiers persist | SAFE | Checked |
 | T-04 | apply.rs | `verify_balance` is called after duplicate input UTXO IDs are rejected | CRITICAL | FIXED via T-02 |
-| T-05 | apply.rs / fee.rs | Value arithmetic uses saturating operations; no panic/wrap found, but checked arithmetic would be safer | LOW | Hardening recommended |
+| T-05 | apply.rs / fee.rs | Transaction value sums and required-fee multiplication fail closed on overflow | LOW | FIXED — checked arithmetic regression test added |
 | T-06 | apply.rs | Zero-value / dust outputs are rejected in structure and state validation | SAFE | Checked |
 | T-07 | fee.rs | Base-fee and per-transaction fee enforcement are deterministic and enforced at block state | SAFE | Checked |
-| T-08 | apply.rs | Range proofs verify against stored commitments; aggregate commitment balance is enforced | SAFE / LOW | Checked; per-output public value binding should be documented/tested |
+| T-08 | apply.rs / staking | Range proofs verify against stored commitments; public `value_spark` semantics are documented and tested | SAFE / LOW | DOCUMENTED — protocol-level semantic retained |
 | T-09 | transaction.rs | Transaction/block input/output/resource limits exist | SAFE | Checked |
 | T-10 | transaction.rs | Transaction signatures cover canonical fields; tx hash includes signatures | SAFE | Checked |
-| T-11 | mempool admission | Mempool admission is lighter than block validation and relays invalid signed/UTXO-invalid transactions | MEDIUM | Live DoS/relay hygiene risk |
+| T-11 | mempool admission | RPC/P2P mempool admission now runs full state validation before insert/gossip | MEDIUM | FIXED — invalid-signature/nonexistent-UTXO tests added |
 | T-12 | apply_block | Transactions are applied in deterministic block order; producer canonicalizes selected tx order | SAFE | Checked |
 
 Severity key: CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE.
@@ -95,17 +95,17 @@ The PoC builds real range-proved, hybrid-signed transactions and confirms the vu
 
 ### T-05 — Value arithmetic uses saturating operations
 
-**Description:** Transaction and fee arithmetic uses `saturating_add`, `saturating_sub`, and `saturating_mul` rather than raw wrapping arithmetic. No panic-on-overflow or silent wrapping exploit was found in normal valid-chain state. The state hard cap is much lower than `u64::MAX`, and the final `state.total_supply > HARD_CAP_SPARK` invariant is checked after block application.
+**Description:** Consensus-critical transaction arithmetic now fails closed instead of saturating silently. `validate_transaction` uses checked arithmetic for input public-value totals, output public-value totals, output-plus-fee totals, and required-fee multiplication.
 
 **Attack scenario checked:** Carefully choose values/fees/output sums to overflow and wrap into an apparently valid balance.
 
-**Code location:** `indra-state/src/apply.rs:562`, `indra-state/src/apply.rs:613`, `indra-state/src/apply.rs:621-625`, `indra-state/src/apply.rs:677-681`; `indra-state/src/fee.rs:38-70`.
+**Code location:** `indra-state/src/apply.rs` transaction validation; `indra-state/src/error.rs::StateError::ValueOverflow`; `indra-state/src/fee.rs:38-70`.
 
-**Proof-of-concept / reasoning:** Saturating arithmetic does not wrap. In overlarge malformed states, saturation can turn arithmetic errors into equality comparisons against `u64::MAX`, so checked arithmetic would fail closed more clearly.
+**Proof-of-concept / reasoning:** `indra-state/tests/audit_phase2.rs::transaction_with_overflowing_input_sum_is_rejected` constructs a malformed state whose transaction inputs sum above `u64::MAX`; validation now returns `StateError::ValueOverflow` before signature/range-proof work or state mutation.
 
-**Recommended fix:** Replace consensus-critical transaction value sums with `checked_add` and return a validation error on overflow. Keep `fee.rs` saturating/clamping if that is the intended EIP-1559 behavior, but document it.
+**Fix:** Replaced transaction value sums and required-fee multiplication with `checked_add`/`checked_mul`. The EIP-1559-style base-fee controller in `fee.rs` intentionally remains saturating/clamping and now has a comment explaining why that is not a balance equation.
 
-**Status:** LOW hardening.
+**Status:** FIXED.
 
 ### T-06 — Dust outputs are rejected
 
@@ -145,11 +145,11 @@ The PoC builds real range-proved, hybrid-signed transactions and confirms the vu
 
 **Proof-of-concept / reasoning:** No alternate commitment is introduced between validation and storage; the output object is cloned directly into the UTXO set.
 
-**Caveat:** The public `OutputV1.value_spark` is not individually proven to match that output's commitment. The transaction-level public sum and aggregate commitment equation prevent simple inflation in normal UTXO spends, but staking/delegation paths consume `value_spark` directly when bonding. This should be explicitly tested in a follow-up: a transaction with two outputs whose public values are swapped relative to their commitments should not be usable to create an economically inconsistent stake bond.
+**Caveat:** The public `OutputV1.value_spark` is not individually proven to match that output's commitment. The transaction-level public sum and aggregate commitment equation prevent simple inflation in normal UTXO spends, but staking/delegation paths consume `value_spark` directly when bonding. Validators do not have each output's blinding factor, so locally enforcing per-output public-value-to-commitment equality would require a protocol/wire-format change.
 
-**Recommended fix:** Add a per-output opening check only where the sender intentionally reveals value/blinding, or document that public values are accounting metadata and add tests covering staking of transaction-created UTXOs. Consider removing public values if commitments are meant to be fully confidential.
+**Fix / hardening:** `OutputV1.value_spark` now carries an explicit warning that it is public accounting metadata, not an individually verified commitment opening. `indra-state/src/delegation.rs::staking_bond_amount_uses_public_value_metadata` documents the current staking behavior: stake amount follows the public field. This preserves the current protocol semantics and intentionally avoids a wire-format or state-schema change in this hardening pass.
 
-**Status:** SAFE for direct transaction inflation; LOW follow-up around public-value semantics.
+**Status:** DOCUMENTED / SAFE for direct transaction inflation; protocol-design follow-up remains if INDRA wants commitments, rather than public values, to be authoritative for staking economics.
 
 ### T-09 — Transaction size and resource limits exist
 
@@ -181,22 +181,22 @@ The PoC builds real range-proved, hybrid-signed transactions and confirms the vu
 
 ### T-11 — Mempool admission is weaker than block application
 
-**Description:** `Mempool::submit` validates only transaction structure, duplicate tx ID, and fee rate. It explicitly does not validate signatures, UTXO existence, or nullifier set. Invalid transactions can enter the mempool and be gossiped. Block production later projects `apply_block`, so invalid transactions should not be committed by honest proposers, but this is still a DoS and relay-quality risk.
+**Description:** RPC and P2P mempool admission now run full state-machine transaction validation before insertion or gossip. `Mempool::submit` remains the lightweight internal insertion primitive, while `Mempool::submit_validated` is the admission path for external transactions.
 
 **Attack scenario:**
 
 1. Attacker submits many structurally valid but signature-invalid or UTXO-invalid transactions with sufficient fee fields.
-2. Nodes accept them into mempool and gossip them.
-3. Proposers repeatedly select them; production projection rejects the block or `evict_invalid` must later clean them up.
-4. The attacker consumes memory, bandwidth, and validation/projection CPU without needing valid spend authority.
+2. Admission calls `validate_transaction` against current state with fresh per-admission duplicate-nullifier and duplicate-UTXO tracking.
+3. Signature-invalid, unknown-UTXO, locked-output, double-spend, or balance-invalid transactions are rejected before mempool insertion and before gossip.
+4. Final `apply_block` validation remains authoritative in case state changes between admission and inclusion.
 
-**Code location:** `indra-consensus/src/mempool.rs:116-191`; `indra-node/src/driver.rs:1319-1331`; `indra-node/src/bin/node.rs:2376-2392`; `indra-consensus/src/producer.rs:155-158`.
+**Code location:** `indra-consensus/src/mempool.rs::submit_validated`; `indra-node/src/driver.rs::process_tx`; `indra-node/src/bin/node.rs` transaction RPC path; `indra-node/src/lib.rs::rpc_submit_transaction`.
 
-**Proof-of-concept / reasoning:** The comment in `Mempool::submit` states the missing checks directly. `evict_invalid` can clean entries later, but admission and gossip happen first.
+**Proof-of-concept / reasoning:** Regression tests in `indra-consensus/src/mempool.rs` cover invalid signatures, nonexistent UTXOs, and successful admission of a fully valid transaction.
 
-**Recommended fix:** On RPC/network transaction admission, run `indra_state::apply::validate_transaction` against current state with a fresh per-tx nullifier set before inserting/gossiping. Keep final `apply_block` validation as authoritative. If full range-proof verification at admission is too costly, add a staged admission mode and do not gossip transactions until full validation succeeds.
+**Lock-contention note:** The node already holds the consensus/engine lock while processing inbound transaction events and RPC submission. The new validation uses a current state snapshot and does not acquire an additional nested lock, so it does not introduce a new deadlock pattern. The tradeoff is extra snapshot/validation work at admission; invalid transactions are rejected before network gossip, which is the intended DoS reduction.
 
-**Status:** MEDIUM.
+**Status:** FIXED.
 
 ### T-12 — Transaction order is deterministic
 
@@ -219,7 +219,12 @@ Added/updated:
 - `indra-state/tests/audit_phase2.rs::t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected`
 - `indra-state/tests/audit_phase2.rs::t02_duplicate_utxo_spend_within_single_transaction_inputs_is_rejected`
 - `indra-state/tests/audit_phase2.rs::legitimate_single_spend_still_works_after_duplicate_utxo_fix`
+- `indra-state/tests/audit_phase2.rs::transaction_with_overflowing_input_sum_is_rejected`
 - `indra-state/src/apply.rs::apply_transaction_fails_loudly_if_utxo_already_spent`
+- `indra-state/src/delegation.rs::staking_bond_amount_uses_public_value_metadata`
+- `indra-consensus/src/mempool.rs::mempool_rejects_transaction_with_invalid_signature`
+- `indra-consensus/src/mempool.rs::mempool_rejects_transaction_spending_nonexistent_utxo`
+- `indra-consensus/src/mempool.rs::mempool_accepts_valid_transaction`
 
 The original exploit PoC was inverted: the duplicate-UTXO block now fails with `StateError::DuplicateUtxoSpend`, the original UTXO remains unspent, nullifiers are unchanged, and height does not advance.
 
@@ -236,7 +241,9 @@ The original exploit PoC was inverted: the duplicate-UTXO block now fails with `
 ## Recommended Fix Order
 
 1. **Strengthen nullifier semantics:** if nullifiers are intended to prove ownership-secret derivation, add a verifiable spend/nullifier proof or redesign the input authorization model so arbitrary nullifiers cannot be chosen freely.
-2. **Harden mempool admission (T-11):** run full `validate_transaction` before accepting/gossiping transactions, or at minimum quarantine lightweight-admitted transactions until full validation succeeds.
-3. **Use checked arithmetic for transaction value sums (T-05):** fail closed on value-sum overflow rather than saturating.
-4. **Clarify public-value/commitment semantics (T-08):** add tests for staking/delegating transaction-created UTXOs whose public values do not individually match their commitments; decide whether public values are authoritative or confidential commitments are authoritative.
-5. **Fix CLI dust-change construction:** when positive change is below or equal to dust and omitted, either add it to `fee_amount` and fee commitment or reject construction before signing.
+2. **Decide public-value/commitment authority for staking (T-08 follow-up):** current behavior is documented and tested, but a future protocol design should decide whether staking must require a revealed opening or whether public values remain authoritative accounting metadata.
+3. **Fix CLI dust-change construction:** when positive change is below or equal to dust and omitted, either add it to `fee_amount` and fee commitment or reject construction before signing.
+
+## Phase 2 Hardening Change Scope
+
+The T-05/T-08/T-11 hardening pass did **not** change cryptographic derivation, wire format, state schema, genesis data, or validator/key material. T-08 intentionally avoided any per-output opening requirement because that would be a wire-format/protocol change.

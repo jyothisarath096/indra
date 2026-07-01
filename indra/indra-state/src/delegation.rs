@@ -686,6 +686,36 @@ mod tests {
             .unwrap()
     }
 
+    fn insert_mismatched_public_value_utxo(
+        state: &mut ChainState,
+        owner_pubkey: HybridPubKey,
+        public_value_spark: u64,
+        committed_value_spark: u64,
+        seed: u8,
+    ) -> Bytes32 {
+        let blinding = [seed; 32];
+        let commitment = commit(committed_value_spark, &blinding);
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let proof = prove_range(committed_value_spark, &blinding, &mut rng).unwrap();
+        state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: public_value_spark,
+                    commitment: CommitmentV1 {
+                        compressed_point: Bytes32::from(commitment.0),
+                    },
+                    owner_pubkey,
+                    range_proof: VariableBytes::from_slice(&proof).unwrap(),
+                    lock_height: 0,
+                },
+                1,
+                0,
+                seed as u32,
+            )
+            .unwrap()
+    }
+
     fn dummy_signature() -> HybridSignature {
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
@@ -842,6 +872,26 @@ mod tests {
         assert!(!state.utxos.contains(&bond_utxo_id));
         assert!(state.staked_bonds.contains_key(&bond_utxo_id));
         assert_eq!(state.delegations.total_delegated(&validator_id), 1_000_000);
+    }
+
+    #[test]
+    fn staking_bond_amount_uses_public_value_metadata() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id =
+            insert_mismatched_public_value_utxo(&mut state, pubkey, 1_000_000, 500_000, 0x30);
+
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert_eq!(
+            state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
+            1_000_000,
+            "staking currently consumes OutputV1.value_spark as public economic metadata"
+        );
     }
 
     #[test]

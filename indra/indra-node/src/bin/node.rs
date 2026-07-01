@@ -2379,9 +2379,8 @@ fn handle_rpc(
                 let mut reader = ByteReader::new(&tx_bytes);
                 match TransactionV1::decode(&mut reader) {
                     Ok(tx) => {
-                        let base_fee = guard.engine.state.base_fee;
-                        let height = guard.engine.state.height;
-                        match guard.engine.mempool.submit(tx.clone(), base_fee, height) {
+                        let state = guard.engine.state.clone();
+                        match guard.engine.mempool.submit_validated(tx.clone(), &state) {
                             Ok(tx_id) => {
                                 gossip.broadcast(&Message::Tx(tx));
                                 RpcResponse::ok(

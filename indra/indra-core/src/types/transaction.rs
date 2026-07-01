@@ -55,10 +55,15 @@ impl Decode for InputV1 {
 /// A transaction output: a new UTXO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputV1 {
-    /// Public amount in Spark.
+    /// Public value in Spark for this output.
     ///
-    /// This preserves simple balance accounting for the current node/RPC
-    /// implementation while commitments/range proofs still bind the value.
+    /// WARNING: this field is NOT individually proven to match the Pedersen
+    /// commitment. The aggregate commitment balance equation (`verify_balance`)
+    /// prevents inflation across the full transaction, but individual output
+    /// public values are unverified metadata. Code that consumes this field for
+    /// economic decisions (for example, staking bond amounts) must not trust it
+    /// as a commitment opening without additional verification, or must only use
+    /// it where the aggregate balance guarantee is sufficient.
     pub value_spark: u64,
     /// Pedersen commitment to the output value.
     pub commitment: CommitmentV1,
