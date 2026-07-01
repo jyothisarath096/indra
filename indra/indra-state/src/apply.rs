@@ -316,6 +316,20 @@ pub fn apply_block(
     block: &BlockV1,
     timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
 ) -> StateResult<Option<EpochRecord>> {
+    // Consensus atomicity: apply the entire block, including any epoch
+    // transition, to a scratch state first. Only commit the scratch state back
+    // to the caller after every validation and mutation step succeeds.
+    let mut scratch = state.clone();
+    let epoch_record = apply_block_inner(&mut scratch, block, timestamp_secs)?;
+    *state = scratch;
+    Ok(epoch_record)
+}
+
+fn apply_block_inner(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<Option<EpochRecord>> {
     // DETERMINISM NOTE: timestamp_secs is NOT written into ChainState.
     // It is only stored in the returned EpochRecord for historical records.
     // Replay passes 0 for this parameter — this is intentional and safe
@@ -767,7 +781,7 @@ mod tests {
             primitives::{
                 DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MINIMUM_VALIDATOR_BOND_SPARK,
-                SLASH_EVIDENCE_WINDOW_EPOCHS, UNBONDING_PERIOD_EPOCHS,
+                SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
             staking::{StakingOp, StakingOpBody},
@@ -1179,6 +1193,59 @@ mod tests {
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
+    }
+
+    #[test]
+    fn apply_block_success_at_epoch_boundary_commits_all_changes() {
+        let mut state = ChainState::new_genesis();
+        state.height = EPOCH_DURATION_BLOCKS - 1;
+        let block = make_block(&state, vec![]);
+        let expected_hash = block.header.block_hash();
+
+        let record = apply_block(&mut state, &block, 0).unwrap();
+
+        assert!(record.is_some());
+        assert_eq!(state.height, EPOCH_DURATION_BLOCKS);
+        assert_eq!(state.tip_hash, expected_hash);
+    }
+
+    #[test]
+    fn apply_block_epoch_transition_failure_leaves_state_unchanged() {
+        let mut state = ChainState::new_genesis();
+        state.height = EPOCH_DURATION_BLOCKS - 1;
+        let (owner_pubkey, _) = make_test_keypair([0x62; 32]);
+        let validator_id = Bytes32::from([0x63; 32]);
+        let bond_id = Bytes32::from([0x64; 32]);
+        let output = output_with_value(1_000_000, owner_pubkey, 0x65);
+        state
+            .utxos
+            .insert(output.clone(), EPOCH_DURATION_BLOCKS, STAKING_TX_IDX, 1)
+            .unwrap();
+        state.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry {
+                utxo_id: bond_id,
+                validator_id,
+                delegator_id: validator_id,
+                amount_spark: 1_000_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: Some(epoch_for_height(EPOCH_DURATION_BLOCKS)),
+                original_output: output,
+            },
+        );
+        let original = state.clone();
+        let block = make_block(&state, vec![]);
+
+        assert_eq!(
+            apply_block(&mut state, &block, 0),
+            Err(StateError::InvariantViolation {
+                message: "UTXO ID collision in staking bond release",
+            })
+        );
+        assert_eq!(
+            state, original,
+            "epoch-transition failure must not partially mutate block state"
+        );
     }
 
     #[test]

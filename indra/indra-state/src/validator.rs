@@ -429,14 +429,9 @@ impl ValidatorSet {
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
 
-    /// Stake of the lowest-ranked active validator, if any.
-    pub fn effective_min_active_stake(&self, delegations: &DelegationMap) -> Option<u64> {
-        self.active_validators()
-            .map(|v| {
-                v.stake_spark
-                    .saturating_add(delegations.total_delegated(&v.validator_id))
-            })
-            .min()
+    /// Self-stake of the lowest-ranked active validator, if any.
+    pub fn effective_min_active_stake(&self, _delegations: &DelegationMap) -> Option<u64> {
+        self.active_validators().map(|v| v.stake_spark).min()
     }
 
     /// Look up a validator by ID.
@@ -486,8 +481,14 @@ impl ValidatorSet {
         }
     }
 
-    /// Reselect the active validator set by stake ranking.
-    pub fn select_active_set(&mut self, delegations: &DelegationMap, total_staked_spark: u64) {
+    /// Reselect the active validator set by self-stake ranking.
+    ///
+    /// Consensus voting weight and epoch reward weights are based on
+    /// `validator.stake_spark` only, so active-set selection must use the same
+    /// self-stake model. Delegated stake affects delegator reward splitting,
+    /// but it does not increase validator selection weight in the current
+    /// protocol.
+    pub fn select_active_set(&mut self, _delegations: &DelegationMap, total_staked_spark: u64) {
         let max_active = max_active_validators(total_staked_spark);
         let mut candidates: Vec<(Bytes32, u64)> = self
             .validators
@@ -498,13 +499,7 @@ impl ValidatorSet {
                     ValidatorStatus::Active | ValidatorStatus::Registered
                 )
             })
-            .map(|v| {
-                (
-                    v.validator_id,
-                    v.stake_spark
-                        .saturating_add(delegations.total_delegated(&v.validator_id)),
-                )
-            })
+            .map(|v| (v.validator_id, v.stake_spark))
             .collect();
 
         candidates.sort_by(|(id_a, stake_a), (id_b, stake_b)| {
@@ -698,6 +693,35 @@ mod tests {
             vs.get(&Bytes32::from([0x03; 32])).unwrap().status,
             ValidatorStatus::Active
         ));
+    }
+
+    #[test]
+    fn select_active_set_uses_self_stake_not_delegations() {
+        let mut vs = ValidatorSet::new();
+        let mut delegations = DelegationMap::new();
+
+        for seed in 1u8..=20 {
+            let mut validator = make_validator(seed, 1_000 + seed as u64, 0);
+            validator.status = ValidatorStatus::Registered;
+            vs.upsert(validator).unwrap();
+        }
+
+        let low_self_id = Bytes32::from([0xFE; 32]);
+        let mut low_self = make_validator(0xFE, 1, 0);
+        low_self.status = ValidatorStatus::Registered;
+        vs.upsert(low_self).unwrap();
+        delegations.add_delegation(low_self_id, Bytes32::from([0xAA; 32]), 1_000_000_000, 0);
+
+        vs.select_active_set(&delegations, 0);
+
+        assert!(
+            matches!(
+                vs.get(&low_self_id).unwrap().status,
+                ValidatorStatus::Registered
+            ),
+            "delegated stake must not promote a validator with insufficient self-stake"
+        );
+        assert_eq!(vs.active_count(), 20);
     }
 
     #[test]

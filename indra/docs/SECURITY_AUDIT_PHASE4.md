@@ -2,9 +2,9 @@
 
 ## Executive Summary
 
-Phase 4 found three high-priority staking/economic issues and several medium/low hardening gaps. The three HIGH findings have now been fixed locally: validator registration requires an atomic minimum self-bond, validator key material is globally uniqueness-checked at registration, and unbonding self-stake remains slashable for valid evidence within the evidence window. The audit also confirmed several safe properties: staking operations are hybrid-signed with chain-id domain separation, delegation/unstake operations enforce ownership and unbonding delays, commission is capped by governance limits, duplicate slash evidence is rejected, and total-supply accounting is mostly explicit for rewards, fees, and slashing.
+Phase 4 found three high-priority staking/economic issues and several medium/low hardening gaps. The three HIGH findings have now been fixed locally: validator registration requires an atomic minimum self-bond, validator key material is globally uniqueness-checked at registration, and unbonding self-stake remains slashable for valid evidence within the evidence window. The main MEDIUM findings have also been addressed locally: active-set selection now uses the same self-stake model as consensus/reward weight, self-unstake below the active minimum demotes the validator immediately, block application is atomic across epoch-transition failures, and the public `value_spark` staking semantics are explicitly documented with specification tests. The audit also confirmed several safe properties: staking operations are hybrid-signed with chain-id domain separation, delegation/unstake operations enforce ownership and unbonding delays, commission is capped by governance limits, duplicate slash evidence is rejected, and total-supply accounting is mostly explicit for rewards, fees, and slashing.
 
-Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op wire format and requires a fresh testnet wipe after deployment. It does not require key regeneration. ST-02 and ST-13 do not change cryptographic derivation, key material, or block/QC wire formats.
+Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op wire format and requires a fresh testnet wipe after deployment. It does not require key regeneration. ST-02, ST-03, ST-05, ST-06, ST-09, ST-13, and ST-14 do not change cryptographic derivation, key material, state schema, or block/QC wire formats.
 
 ## Summary Table
 
@@ -12,18 +12,18 @@ Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op 
 |----|-----------|---------|----------|--------|
 | ST-01 | Registration | Validator registration is permissionless and does not require bond before consuming registry capacity | HIGH | FIXED |
 | ST-02 | Registration | Duplicate VRF keys are not rejected at registration | HIGH | FIXED |
-| ST-03 | Bonding | Staking trusts `OutputV1.value_spark` as bond amount without per-output commitment opening | MEDIUM | OPEN |
+| ST-03 | Bonding | Staking trusts `OutputV1.value_spark` as bond amount without per-output commitment opening | MEDIUM | DOCUMENTED / DEFERRED |
 | ST-04 | Unbonding | Unbonding delay exists and is state-enforced | SAFE | VERIFIED |
-| ST-05 | Unbonding | Self-unstake can leave an active validator below practical minimum stake until epoch reselection | MEDIUM | OPEN |
-| ST-06 | Rewards | Reward weights use validator self-stake, while active-set selection includes delegated stake | MEDIUM | OPEN |
+| ST-05 | Unbonding | Self-unstake can leave an active validator below practical minimum stake until epoch reselection | MEDIUM | FIXED |
+| ST-06 | Rewards | Reward weights use validator self-stake, while active-set selection includes delegated stake | MEDIUM | FIXED |
 | ST-07 | Rewards | Commission is capped, but changes take effect immediately for the next epoch distribution | LOW | OPEN |
 | ST-08 | Rewards | Reward arithmetic is mostly bounded; rounding remainders are deterministic but not always explicitly accounted | LOW | OPEN |
-| ST-09 | Rewards | Epoch transition is not transactionally atomic if a late transition step errors | MEDIUM | OPEN |
+| ST-09 | Rewards | Epoch transition is not transactionally atomic if a late transition step errors | MEDIUM | FIXED |
 | ST-10 | Slashing | Slash amount and fund accounting are deterministic for active self-stake | SAFE | VERIFIED |
 | ST-11 | Slashing | Double-slash protection prevents repeated penalties | SAFE | VERIFIED |
 | ST-12 | Slashing | Slash underflow is avoided with saturating arithmetic | SAFE | VERIFIED |
 | ST-13 | Slashing | Self-unstaking before evidence can avoid or reduce slashing | HIGH | FIXED |
-| ST-14 | Economic | Delegated stake affects active-set selection but not consensus voting power | MEDIUM | OPEN |
+| ST-14 | Economic | Delegated stake affects active-set selection but not consensus voting power | MEDIUM | FIXED |
 | ST-15 | Economic | Proposer timing can affect fees/censorship, but not mint extra block reward | LOW | OPEN |
 | ST-16 | Economic | Total-supply invariants are mostly preserved; liveness penalty and epoch failure paths need clearer policy/tests | LOW | OPEN |
 
@@ -102,7 +102,7 @@ Registration now scans the bounded validator set and rejects duplicate `hybrid_c
 ### ST-03 — Staking trusts public `value_spark` as bond amount
 
 Severity: MEDIUM  
-Status: OPEN
+Status: DOCUMENTED / DEFERRED
 
 Description: Phase 2 documented that `OutputV1.value_spark` is public metadata and is not individually proven to match the Pedersen commitment. Staking uses this field directly as the delegated or self-staked amount. The transaction-level aggregate balance equation prevents simple total-value inflation, but staking does not verify an individual opening for the bond output.
 
@@ -127,6 +127,10 @@ This is not a direct money-creation bug if transaction aggregate balance is enfo
 Recommended fix:
 
 Either make staking outputs explicitly public-value outputs and document that commitments are not authoritative for bonded stake, or require a per-output opening/ownership proof for any UTXO being bonded so `value_spark` and commitment are individually bound.
+
+Fix implemented:
+
+The current testnet protocol remains public-value-based for staking bonds. This was documented at every staking bond site (`RegisterValidator`, `Delegate`, and `SelfStake`), and specification tests now explicitly cover registration and self-stake UTXOs whose public `value_spark` differs from the committed value. Full per-output opening verification remains deferred because it is a protocol/wire-format design change.
 
 ### ST-04 — Unbonding delay exists and is state-enforced
 
@@ -153,7 +157,7 @@ None for the delay itself. See ST-13 for slash interaction during unbonding.
 ### ST-05 — Partial self-unstake can leave an active validator below practical minimum stake
 
 Severity: MEDIUM  
-Status: OPEN
+Status: FIXED
 
 Description: `apply_self_unstake` immediately subtracts the bond amount from `validator.stake_spark` and marks the bond as unbonding, but it does not change validator status to `Unbonding` or `Registered`, and it does not enforce a post-unstake minimum self-stake. Active-set reselection occurs at epoch transition; until then, an active validator can remain active with reduced or zero self-stake.
 
@@ -175,16 +179,20 @@ Recommended fix:
 
 Define and enforce a minimum active self-stake invariant. If self-unstake drops below it, immediately remove the validator from the active set or defer the unstake until epoch transition with the validator still slashable and stake weight stable through the epoch.
 
+Fix implemented:
+
+`MINIMUM_ACTIVE_SELF_STAKE_SPARK` now defines the active self-stake floor. `apply_self_unstake` still allows registered validators to manage their own bonds, but if an active validator's self-stake falls below the floor, it is immediately demoted to `Registered`. Consensus voter/QC construction reads the active validator set from state, so the demotion is reflected after the block commits and the node refreshes registered voters.
+
 ### ST-06 — Reward weights use self-stake while active-set selection includes delegated stake
 
 Severity: MEDIUM  
-Status: OPEN
+Status: FIXED
 
-Description: Active-set selection ranks validators by self-stake plus delegated stake, but reward distribution and consensus voter weights use only `validator.stake_spark`. This creates a mismatch: delegations can help a validator become active, but the validator's consensus weight and base reward share are calculated from self-stake only.
+Description: Before the fix, active-set selection ranked validators by self-stake plus delegated stake, while reward distribution and consensus voter weights used only `validator.stake_spark`. This created a mismatch: delegations could help a validator become active without providing corresponding consensus weight.
 
 Code locations:
 
-- `indra-state/src/validator.rs:490` — active-set ranking uses `stake_spark + delegations.total_delegated`
+- `indra-state/src/validator.rs:490` — active-set ranking now uses `stake_spark` only
 - `indra-state/src/validator.rs:412` — `total_active_stake` sums self-stake only
 - `indra-state/src/epoch.rs:578` — block rewards use `total_active_stake`
 - `indra-state/src/epoch.rs:637` — fee rewards use `total_active_stake`
@@ -193,13 +201,17 @@ Code locations:
 
 Attack/economic scenario:
 
-1. A validator attracts or self-directs large delegations and enters the active set.
-2. Consensus quorum and rewards use only its self-stake, not delegated stake.
-3. The active set composition is influenced by capital that does not provide corresponding consensus voting power.
+1. Before the fix, a validator could attract or self-direct large delegations and enter the active set.
+2. Consensus quorum and rewards would still use only its self-stake, not delegated stake.
+3. After the fix, delegated stake cannot promote that validator into the active set, so active-set composition and consensus weight use the same stake quantity.
 
 Recommended fix:
 
 Choose one staking model and apply it consistently. If delegated stake secures consensus, include it in consensus weights and reward weights. If delegated stake is only economic/reward metadata, do not use it for active-set selection.
+
+Fix implemented:
+
+INDRA testnet now uses the explicit self-stake model. Active-set selection ranks by `validator.stake_spark` only, matching `total_active_stake`, QC/registered-voter weights, proposer/election stake, and reward weights. Delegated stake still affects how a validator's reward pool is split between validator commission and delegators, but it no longer increases validator selection or consensus weight.
 
 ### ST-07 — Commission is capped, but changes apply immediately for the next epoch distribution
 
@@ -251,7 +263,7 @@ Document the monetary policy for reward dust and route all remainders explicitly
 ### ST-09 — Epoch transition is not transactionally atomic on late failure
 
 Severity: MEDIUM  
-Status: OPEN
+Status: FIXED
 
 Description: `apply_block` applies transactions, staking ops, governance ops, slashes, fee updates, and height/tip updates before calling epoch transition at an epoch boundary. If a late epoch-transition step returns an error, the caller receives an error after prior state mutations have already occurred. There is shadow validation for staking/governance earlier in `apply_block`, but epoch transition itself is not wrapped in rollback semantics.
 
@@ -271,6 +283,10 @@ Attack/failure scenario:
 Recommended fix:
 
 Make `apply_block` atomic by applying to a scratch clone and replacing state only on success, or split epoch transition into a deterministic precheck phase and a mutation phase with no fallible operations.
+
+Fix implemented:
+
+`apply_block` now applies the full block, including epoch-transition work, to a scratch clone and commits the scratch state back only after all steps succeed. A regression test forces a late unbonded-bond release collision at an epoch boundary and verifies the original state is unchanged.
 
 ### ST-10 — Slash amount and fund accounting are deterministic for active self-stake
 
@@ -370,27 +386,31 @@ Fix implemented:
 ### ST-14 — Delegated stake affects active-set selection but not consensus voting power
 
 Severity: MEDIUM  
-Status: OPEN
+Status: FIXED
 
-Description: This is the consensus/economic consequence of ST-06. A validator can be selected into the active set based on total self-plus-delegated stake, but once active, its consensus voting power is only self-stake. This can reduce effective voting power below what active-set selection implies and can produce unintuitive quorum/reward results.
+Description: This was the consensus/economic consequence of ST-06. Before the fix, a validator could be selected into the active set based on total self-plus-delegated stake, while its consensus voting power remained self-stake only. The active-set path now uses self-stake only, matching consensus weight.
 
 Code locations:
 
-- `indra-state/src/validator.rs:490` — active-set selection includes delegated stake
+- `indra-state/src/validator.rs:490` — active-set selection uses self-stake only
 - `indra-node/src/engine.rs:526` — registered voters use self-stake
 - `indra-node/src/engine.rs:543` — QC validators use self-stake
 - `indra-node/src/sync.rs:429` — QC verification uses `state.validators.total_active_stake`, self-stake only
 
 Attack/economic scenario:
 
-1. Attacker directs delegated stake to validators with minimal self-stake.
-2. Those validators enter the active set.
-3. Consensus total stake and quorum are calculated from small self-stake only.
-4. The apparent economic backing of active-set membership is not reflected in actual consensus security.
+1. Before the fix, an attacker could direct delegated stake to validators with minimal self-stake.
+2. Those validators could enter the active set.
+3. Consensus total stake and quorum would still be calculated from small self-stake only.
+4. After the fix, delegated stake no longer promotes a validator into the active set, so this mismatch is removed.
 
 Recommended fix:
 
 Unify stake semantics. The active-set ranking, proposer election weight, QC voting power, rewards, and slashing base should all use the same explicitly-defined stake quantity.
+
+Fix implemented:
+
+This is fixed together with ST-06 by choosing Model A: self-stake-only consensus/economic weight. Delegations remain reward-splitting metadata and no longer influence active-set selection.
 
 ### ST-15 — Reward manipulation via proposal timing is limited
 
@@ -440,6 +460,10 @@ The original Phase 4 audit was audit-only, so no tests were added then. The HIGH
 1. ST-01: registration without bond rejected, below-minimum bond rejected, valid bond succeeds and creates self-stake.
 2. ST-02: duplicate VRF, classical, and PQ keys rejected; distinct key registrations still succeed.
 3. ST-13: unbonding self-stake remains slashable within the evidence window; stale evidence is rejected; slash covers active plus slashable-unbonding bonds.
+4. ST-03: registration and self-stake specification tests document that bond amount is read from public `OutputV1.value_spark`.
+5. ST-05: active validator self-unstake below the active minimum demotes to `Registered`, while above-minimum and already-registered cases remain valid.
+6. ST-06/ST-14: active-set selection and reward distribution tests prove delegated stake does not increase consensus/reward weight.
+7. ST-09: epoch-boundary block application is tested for both successful commit and rollback on late epoch-transition failure.
 
 ## Findings NOT Present
 
@@ -455,8 +479,8 @@ The original Phase 4 audit was audit-only, so no tests were added then. The HIGH
 
 ## Recommended Fix Order
 
-1. ST-06/ST-14 — Unify delegated stake semantics across active-set selection, consensus voting power, proposer weight, rewards, and slashing.
-2. ST-09 — Make epoch-boundary block application atomic.
-3. ST-03 — Resolve whether staking bonds are public-value-only or require commitment opening checks.
-4. ST-05 — Enforce minimum active self-stake and deterministic active-status changes on self-unstake.
-5. ST-07/ST-08/ST-15/ST-16 — Clarify commission delay, reward dust, MEV policy, liveness-penalty policy, and total-supply invariant tests.
+1. ST-07 — Add commission-change activation delay or delegator notice/exit window.
+2. ST-08 — Route reward dust/remainders explicitly according to a documented monetary policy.
+3. ST-15 — Decide whether fee/MEV/censorship mitigations are in scope before mainnet.
+4. ST-16 — Add a consolidated monetary-policy invariant test suite and decide whether liveness penalties are intended.
+5. ST-03 follow-up — If mainnet requires private-value staking, design a per-output opening proof/wire-format upgrade; current testnet semantics are documented and tested.

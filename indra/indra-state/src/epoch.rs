@@ -90,10 +90,10 @@ pub fn apply_epoch_transition_at_height(
         .map(|v| v.validator_id)
         .collect();
     let active_validators_before = active_before.len() as u32;
-    let total_staked = state
-        .validators
-        .total_selectable_self_stake()
-        .saturating_add(state.delegations.total_staked());
+    // Active-set size and ranking use the same self-stake model as consensus
+    // voting weight and reward weight. Delegations affect reward splitting,
+    // but do not increase proposer/voter/election weight in this protocol.
+    let total_staked = state.validators.total_selectable_self_stake();
     let fee_pool_before = state.fee_reward_pool;
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
@@ -575,6 +575,9 @@ fn distribute_block_rewards(
     current_epoch: u64,
     height: u64,
 ) {
+    // Rewards are weighted by active validator self-stake, matching consensus
+    // voting weight and active-set selection. Delegations only split a
+    // validator's already-earned reward pool between validator and delegators.
     let total_stake = state.validators.total_active_stake();
     if total_stake == 0 || epoch_block_reward == 0 {
         return;
@@ -640,6 +643,7 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u6
         return;
     }
 
+    // Fee rewards use the same self-stake weighting as block rewards.
     let total_stake = state.validators.total_active_stake();
     if total_stake == 0 {
         return;
@@ -989,6 +993,41 @@ mod tests {
             raw, 89_190_000_000,
             "Epoch reward wrong: got {} expected 89190000000",
             raw
+        );
+    }
+
+    #[test]
+    fn rewards_are_weighted_by_self_stake_not_delegations() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let validator_a = make_validator(0xA1, 1_000);
+        let validator_b = make_validator(0xB1, 1_000);
+        let id_a = validator_a.validator_id;
+        let id_b = validator_b.validator_id;
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        state.validators.upsert(validator_a).unwrap();
+        state.validators.upsert(validator_b).unwrap();
+        state
+            .delegations
+            .add_delegation(id_b, delegator_id, 1_000_000, 0);
+
+        distribute_block_rewards(&mut state, 2_000, 1, 0);
+
+        assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 1_000);
+        assert_eq!(
+            state.validators.get(&id_b).unwrap().pending_rewards,
+            100,
+            "validator B gets 10% commission from its self-stake-weighted reward pool"
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&id_b)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            900,
+            "delegated stake splits validator B's reward pool but does not increase its size"
         );
     }
 

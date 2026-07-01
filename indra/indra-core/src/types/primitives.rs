@@ -174,6 +174,13 @@ pub const DUST_LIMIT_SPARK: u64 = 100_000;
 /// Minimum validator self-bond required for registration.
 pub const MINIMUM_VALIDATOR_BOND_SPARK: u64 = 1_000_000_000;
 
+/// Minimum active validator self-stake required to remain in the active set.
+///
+/// Falling below this floor after self-unstaking demotes the validator back to
+/// `Registered` immediately; it can re-enter the active set after adding enough
+/// self-stake and the next active-set selection.
+pub const MINIMUM_ACTIVE_SELF_STAKE_SPARK: u64 = MINIMUM_VALIDATOR_BOND_SPARK;
+
 /// Blocks per year assuming a 6 second target block time.
 pub const BLOCKS_PER_YEAR: u64 = 5_256_000;
 

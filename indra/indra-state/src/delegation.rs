@@ -7,9 +7,9 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_VALIDATOR_BOND_SPARK,
-        MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
-        UNBONDING_PERIOD_EPOCHS,
+        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
+        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -254,6 +254,11 @@ fn apply_register_validator(
             "registration bond UTXO does not belong to the validator".into(),
         ));
     }
+    // Bond amount is taken from output.value_spark (public metadata field).
+    // This field is not individually proven to match the Pedersen commitment;
+    // the transaction-level aggregate balance equation prevents total-value
+    // inflation, but individual output commitment binding is not enforced here.
+    // See: docs/SECURITY_AUDIT_PHASE4.md ST-03 and Phase 2 T-08.
     let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < MINIMUM_VALIDATOR_BOND_SPARK {
         return Err(StateError::InvalidStakingOp(format!(
@@ -349,6 +354,11 @@ fn apply_delegate(
         ));
     }
 
+    // Bond amount is taken from output.value_spark (public metadata field).
+    // This field is not individually proven to match the Pedersen commitment;
+    // the transaction-level aggregate balance equation prevents total-value
+    // inflation, but individual output commitment binding is not enforced here.
+    // See: docs/SECURITY_AUDIT_PHASE4.md ST-03 and Phase 2 T-08.
     let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < min_delegation {
         return Err(StateError::InvalidStakingOp(format!(
@@ -462,6 +472,11 @@ fn apply_self_stake(
         ));
     }
 
+    // Bond amount is taken from output.value_spark (public metadata field).
+    // This field is not individually proven to match the Pedersen commitment;
+    // the transaction-level aggregate balance equation prevents total-value
+    // inflation, but individual output commitment binding is not enforced here.
+    // See: docs/SECURITY_AUDIT_PHASE4.md ST-03 and Phase 2 T-08.
     let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < DUST_LIMIT_SPARK {
         return Err(StateError::InvalidStakingOp(format!(
@@ -536,6 +551,17 @@ fn apply_self_unstake(
     bond.unbonding_end_epoch = Some(unbonding_end);
     if let Some(v) = state.validators.get_mut(&validator_id) {
         v.stake_spark = v.stake_spark.saturating_sub(amount_spark);
+        if matches!(v.status, ValidatorStatus::Active)
+            && v.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK
+        {
+            eprintln!(
+                "[staking] validator {} self-stake {} below active minimum {}; demoting to Registered",
+                hex::encode(&validator_id.0[..4]),
+                v.stake_spark,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK
+            );
+            v.status = ValidatorStatus::Registered;
+        }
     }
     Ok(())
 }
@@ -990,6 +1016,74 @@ mod tests {
     }
 
     #[test]
+    fn register_validator_bond_amount_uses_public_value_spark_field() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0x20);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let validator_id = pubkey_to_id(&validator_pubkey);
+        let bond_utxo_id = insert_mismatched_public_value_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            MINIMUM_VALIDATOR_BOND_SPARK / 2,
+            0x21,
+        );
+
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey,
+                vrf_pk: [0x20; 32],
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            "registration self-bond currently records output.value_spark, not the committed value"
+        );
+        assert_eq!(
+            state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
+            MINIMUM_VALIDATOR_BOND_SPARK
+        );
+    }
+
+    #[test]
+    fn self_stake_with_mismatched_public_value_records_public_bond_amount() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x22);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_mismatched_public_value_utxo(
+            &mut state,
+            validator_pubkey,
+            2_000_000,
+            1_000_000,
+            0x23,
+        );
+
+        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            2_000_000,
+            "self-stake currently records output.value_spark, not the committed value"
+        );
+        assert_eq!(
+            state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
+            2_000_000
+        );
+    }
+
+    #[test]
     fn delegate_rejects_unknown_utxo() {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
@@ -1274,6 +1368,72 @@ mod tests {
             Some(UNBONDING_PERIOD_EPOCHS)
         );
         assert_eq!(state.validators.get(&validator_id).unwrap().stake_spark, 0);
+    }
+
+    #[test]
+    fn self_unstake_below_active_minimum_demotes_validator() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x24);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark =
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK - 1;
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x25);
+
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
+        let before = state.validators.get(&validator_id).unwrap().stake_spark;
+        assert!(before >= MINIMUM_ACTIVE_SELF_STAKE_SPARK);
+
+        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
+
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert!(validator.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK);
+        assert!(matches!(validator.status, ValidatorStatus::Registered));
+    }
+
+    #[test]
+    fn self_unstake_above_active_minimum_keeps_validator_active() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x26);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark =
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK + 5_000_000;
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x27);
+
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
+        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
+
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert!(validator.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK);
+        assert!(matches!(validator.status, ValidatorStatus::Active));
+    }
+
+    #[test]
+    fn registered_validator_self_unstake_remains_registered() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x28);
+        {
+            let validator = state.validators.get_mut(&validator_id).unwrap();
+            validator.status = ValidatorStatus::Registered;
+            validator.stake_spark = 0;
+        }
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x29);
+
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
+        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
+
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert_eq!(validator.stake_spark, 0);
+        assert!(matches!(validator.status, ValidatorStatus::Registered));
     }
 
     #[test]
