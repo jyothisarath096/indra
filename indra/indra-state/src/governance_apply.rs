@@ -135,6 +135,9 @@ fn apply_propose(
         })?
         .clone();
     let required_deposit = state.governance.params.proposal_deposit_spark;
+    if deposit.output.owner_pubkey != *proposer_pubkey {
+        return invalid("proposal deposit UTXO is not owned by the proposer");
+    }
     if deposit.output.value_spark < required_deposit {
         return invalid("deposit UTXO value below required proposal deposit");
     }
@@ -347,20 +350,26 @@ fn apply_execute(
     current_epoch: u64,
     proposal_id: &Bytes32,
 ) -> StateResult<()> {
-    let exec = state
+    let exec_index = state
         .governance
         .queued_executions
-        .iter_mut()
-        .find(|exec| exec.proposal_id == *proposal_id)
+        .iter()
+        .position(|exec| exec.proposal_id == *proposal_id)
         .ok_or(StateError::GovernanceProposalNotFound)?;
+    let exec = &state.governance.queued_executions[exec_index];
     if exec.executed {
         return invalid("proposal already executed");
     }
     if current_epoch < exec.executable_epoch {
         return invalid("proposal execution delay has not elapsed");
     }
-    state.governance.params.apply_action(&exec.action);
-    exec.executed = true;
+    let action = exec.action.clone();
+    if !revalidate_queued_governance_action_or_fail(state, *proposal_id, &action)? {
+        state.governance.queued_executions[exec_index].executed = true;
+        return Ok(());
+    }
+    state.governance.params.apply_action(&action);
+    state.governance.queued_executions[exec_index].executed = true;
     if let Some(proposal) = state.governance.proposals.get_mut(proposal_id) {
         proposal.phase = ProposalPhase::Executed;
     }
@@ -369,6 +378,31 @@ fn apply_execute(
         hex::encode(&proposal_id.0[..4])
     );
     Ok(())
+}
+
+/// Revalidate a queued governance action against the current parameter state.
+///
+/// Actions are validated when proposed, but governance parameters can change
+/// before execution. Rechecking here preserves monotonic safety constraints
+/// such as "quorum can only increase" even when multiple proposals are queued.
+pub(crate) fn revalidate_queued_governance_action_or_fail(
+    state: &mut ChainState,
+    proposal_id: Bytes32,
+    action: &indra_core::types::governance::GovernableAction,
+) -> StateResult<bool> {
+    if let Err(reason) = state.governance.params.validate_action(action) {
+        if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
+            proposal.phase = ProposalPhase::Failed;
+        }
+        eprintln!(
+            "[governance] queued proposal {} failed execution-time revalidation: {} — marking failed, not applying",
+            hex::encode(&proposal_id.0[..4]),
+            reason
+        );
+        return_governance_deposit(state, proposal_id)?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn apply_cancel(
@@ -518,6 +552,8 @@ pub fn return_governance_deposit(state: &mut ChainState, proposal_id: Bytes32) -
     if proposal.deposit_burned || proposal.deposit_spark == 0 {
         return Ok(());
     }
+    // Deposit refund goes to proposer_pubkey, which is the same entity that
+    // owns the deposit UTXO (enforced at proposal time).
     let output = governance_refund_output(
         &proposal.proposer_pubkey,
         proposal.deposit_spark,
@@ -582,3 +618,397 @@ fn invalid<T>(reason: impl Into<String>) -> StateResult<T> {
 
 #[allow(dead_code)]
 fn _assert_params_send(_: &GovernableParams, _: &GovernanceState) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indra_core::{
+        types::{
+            crypto::{CommitmentV1, HybridSignature},
+            governance::{GovernableAction, GovernanceActionType},
+            primitives::{
+                VariableBytes, DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+            },
+        },
+        Bytes32,
+    };
+    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
+
+    fn keypair(seed: u8) -> (HybridPubKey, HybridKeypair) {
+        let seed = [seed; 32];
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let keypair = HybridKeypair::new(classical, pq);
+        let public = keypair.public_key();
+        (
+            HybridPubKey {
+                classical_pk: Bytes32::from(public.classical.0),
+                pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+            },
+            keypair,
+        )
+    }
+
+    fn dummy_sig() -> HybridSignature {
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        }
+    }
+
+    fn sign_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair, chain_id: &str) {
+        let domain = governance_signing_domain(
+            op.action_type,
+            op.signer_id,
+            op.nonce,
+            &op.payload,
+            chain_id,
+        );
+        let msg_hash = sha256(&domain);
+        let sig = keypair.sign(&msg_hash).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
+    fn install_governance_validator(state: &mut ChainState, pubkey: &HybridPubKey) -> Bytes32 {
+        let validator_id = pubkey_to_id(pubkey);
+        state
+            .validators
+            .upsert(crate::validator::ValidatorEntry {
+                validator_id,
+                name: "governance-test-validator".into(),
+                hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
+                vrf_pk: Some([validator_id.0[0]; 32]),
+                stake_spark: 1_000,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: DEFAULT_COMMISSION_BPS,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
+            })
+            .unwrap();
+        validator_id
+    }
+
+    fn deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
+        OutputV1 {
+            value_spark,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::ZERO,
+            },
+            owner_pubkey,
+            range_proof: VariableBytes::from_slice(&[]).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn propose_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposer_pubkey: HybridPubKey,
+        deposit_utxo_id: Bytes32,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Propose {
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            deposit_utxo_id,
+            proposer_pubkey,
+            title: VariableBytes::from_slice(b"test").unwrap(),
+            description: VariableBytes::from_slice(b"test proposal").unwrap(),
+        };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ProposeChange,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
+    }
+
+    fn proposal_record(
+        proposal_id: Bytes32,
+        proposer_pubkey: HybridPubKey,
+        action: GovernableAction,
+        phase: ProposalPhase,
+    ) -> ProposalRecord {
+        ProposalRecord {
+            proposal_id,
+            proposer_id: pubkey_to_id(&proposer_pubkey),
+            proposer_pubkey,
+            tier: action.tier(),
+            action,
+            title: "queued".into(),
+            description: "queued".into(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch: 0,
+            commit_start_epoch: 0,
+            reveal_start_epoch: 0,
+            tally_epoch: 0,
+            exec_delay_epochs: 0,
+            executable_after_epoch: 0,
+            phase,
+            snapshot1: None,
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: Vec::new(),
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: Some(true),
+        }
+    }
+
+    #[test]
+    fn governance_proposal_rejects_deposit_utxo_not_owned_by_proposer() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (attacker_pubkey, attacker_keypair) = keypair(0x11);
+        let (victim_pubkey, _) = keypair(0x22);
+        let attacker_id = install_governance_validator(&mut state, &attacker_pubkey);
+        let victim_deposit = state
+            .utxos
+            .insert(deposit_output(victim_pubkey, 1_000), 0, 0, 0)
+            .unwrap();
+
+        let op = propose_op(
+            attacker_id,
+            &attacker_keypair,
+            attacker_pubkey,
+            victim_deposit,
+            1,
+        );
+        let result = apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID);
+
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidGovernanceOp { reason })
+                if reason.contains("not owned by the proposer")
+        ));
+        assert!(
+            state.utxos.get(&victim_deposit).is_some(),
+            "victim deposit UTXO must remain unspent"
+        );
+    }
+
+    #[test]
+    fn governance_proposal_accepts_deposit_utxo_owned_by_proposer() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair) = keypair(0x33);
+        let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
+        let deposit = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 1_000), 0, 0, 0)
+            .unwrap();
+        let op = propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey.clone(),
+            deposit,
+            1,
+        );
+
+        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+
+        assert!(state.utxos.get(&deposit).is_none());
+        assert_eq!(state.governance.proposals.len(), 1);
+        let proposal = state.governance.proposals.values().next().unwrap();
+        assert_eq!(proposal.proposer_pubkey, proposer_pubkey);
+    }
+
+    #[test]
+    fn governance_deposit_refund_goes_to_proposer() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair) = keypair(0x44);
+        let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
+        let deposit = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 1_000), 0, 0, 0)
+            .unwrap();
+        let op = propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey.clone(),
+            deposit,
+            1,
+        );
+        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+        let proposal_id = *state.governance.proposals.keys().next().unwrap();
+
+        return_governance_deposit(&mut state, proposal_id).unwrap();
+
+        assert!(state.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
+        }));
+        assert_eq!(
+            state
+                .governance
+                .proposals
+                .get(&proposal_id)
+                .unwrap()
+                .deposit_spark,
+            0
+        );
+    }
+
+    #[test]
+    fn queued_governance_action_revalidated_before_execution() {
+        let mut state = ChainState::new_genesis();
+        let (proposer_pubkey, _) = keypair(0x55);
+        state.governance.params.governance_quorum_bps = 7_000;
+        let proposal_id = Bytes32::from([0x55; 32]);
+        let stale_action = GovernableAction::SetGovernanceQuorumBps { value: 6_000 };
+        state.governance.proposals.insert(
+            proposal_id,
+            proposal_record(
+                proposal_id,
+                proposer_pubkey,
+                stale_action.clone(),
+                ProposalPhase::ExecDelay,
+            ),
+        );
+        state
+            .governance
+            .queued_executions
+            .push(crate::governance::QueuedExecution {
+                proposal_id,
+                action: stale_action,
+                executable_epoch: 0,
+                executed: false,
+            });
+
+        apply_execute(&mut state, 0, &proposal_id).unwrap();
+
+        assert_eq!(state.governance.params.governance_quorum_bps, 7_000);
+        assert_eq!(
+            state.governance.proposals[&proposal_id].phase,
+            ProposalPhase::Failed
+        );
+        assert!(state.governance.queued_executions[0].executed);
+    }
+
+    #[test]
+    fn valid_queued_governance_action_still_executes() {
+        let mut state = ChainState::new_genesis();
+        let (proposer_pubkey, _) = keypair(0x66);
+        state.governance.params.governance_quorum_bps = 5_000;
+        let proposal_id = Bytes32::from([0x66; 32]);
+        let action = GovernableAction::SetGovernanceQuorumBps { value: 6_000 };
+        state.governance.proposals.insert(
+            proposal_id,
+            proposal_record(
+                proposal_id,
+                proposer_pubkey,
+                action.clone(),
+                ProposalPhase::ExecDelay,
+            ),
+        );
+        state
+            .governance
+            .queued_executions
+            .push(crate::governance::QueuedExecution {
+                proposal_id,
+                action,
+                executable_epoch: 0,
+                executed: false,
+            });
+
+        apply_execute(&mut state, 0, &proposal_id).unwrap();
+
+        assert_eq!(state.governance.params.governance_quorum_bps, 6_000);
+        assert_eq!(
+            state.governance.proposals[&proposal_id].phase,
+            ProposalPhase::Executed
+        );
+        assert!(state.governance.queued_executions[0].executed);
+    }
+
+    #[test]
+    fn auto_execute_revalidates_stale_proposals() {
+        let mut state = ChainState::new_genesis();
+        let (proposer_pubkey, _) = keypair(0x77);
+        state.governance.params.governance_quorum_bps = 7_000;
+        let proposal_id = Bytes32::from([0x77; 32]);
+        let stale_action = GovernableAction::SetGovernanceQuorumBps { value: 6_000 };
+        state.governance.proposals.insert(
+            proposal_id,
+            proposal_record(
+                proposal_id,
+                proposer_pubkey,
+                stale_action.clone(),
+                ProposalPhase::ExecDelay,
+            ),
+        );
+        state
+            .governance
+            .queued_executions
+            .push(crate::governance::QueuedExecution {
+                proposal_id,
+                action: stale_action,
+                executable_epoch: 0,
+                executed: false,
+            });
+
+        crate::epoch::apply_governance_phase_transitions(&mut state, 0, 0).unwrap();
+
+        assert_eq!(state.governance.params.governance_quorum_bps, 7_000);
+        assert_eq!(
+            state.governance.proposals[&proposal_id].phase,
+            ProposalPhase::Failed
+        );
+        assert!(state.governance.queued_executions[0].executed);
+    }
+
+    #[test]
+    fn failed_execution_time_revalidation_marks_proposal_failed() {
+        let mut state = ChainState::new_genesis();
+        let (proposer_pubkey, _) = keypair(0x88);
+        state.governance.params.governance_quorum_bps = 7_000;
+        let proposal_id = Bytes32::from([0x88; 32]);
+        let stale_action = GovernableAction::SetGovernanceQuorumBps { value: 6_000 };
+        let mut proposal = proposal_record(
+            proposal_id,
+            proposer_pubkey.clone(),
+            stale_action.clone(),
+            ProposalPhase::ExecDelay,
+        );
+        proposal.deposit_spark = 1_000;
+        proposal.deposit_burned = false;
+        state.governance.proposals.insert(proposal_id, proposal);
+        state
+            .governance
+            .queued_executions
+            .push(crate::governance::QueuedExecution {
+                proposal_id,
+                action: stale_action,
+                executable_epoch: 0,
+                executed: false,
+            });
+
+        apply_execute(&mut state, 0, &proposal_id).unwrap();
+
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(proposal.phase, ProposalPhase::Failed);
+        assert_eq!(proposal.deposit_spark, 0);
+        assert!(state.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
+        }));
+    }
+}

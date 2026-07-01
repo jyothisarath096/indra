@@ -38,7 +38,7 @@ use crate::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
         GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS,
     },
-    governance_apply::return_governance_deposit,
+    governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
     validator::ValidatorStatus,
 };
 
@@ -363,13 +363,18 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
 }
 
 fn auto_execute_ready(state: &mut ChainState, proposal_id: Bytes32, current_epoch: u64) {
-    for exec in state.governance.queued_executions.iter_mut() {
-        if exec.proposal_id == proposal_id
-            && !exec.executed
-            && current_epoch >= exec.executable_epoch
-        {
-            state.governance.params.apply_action(&exec.action);
-            exec.executed = true;
+    let Some(exec_index) = state.governance.queued_executions.iter().position(|exec| {
+        exec.proposal_id == proposal_id && !exec.executed && current_epoch >= exec.executable_epoch
+    }) else {
+        return;
+    };
+    let action = state.governance.queued_executions[exec_index]
+        .action
+        .clone();
+    match revalidate_queued_governance_action_or_fail(state, proposal_id, &action) {
+        Ok(true) => {
+            state.governance.params.apply_action(&action);
+            state.governance.queued_executions[exec_index].executed = true;
             if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
                 proposal.phase = ProposalPhase::Executed;
             }
@@ -377,6 +382,16 @@ fn auto_execute_ready(state: &mut ChainState, proposal_id: Bytes32, current_epoc
                 "[governance] auto-executed proposal {} at epoch {}",
                 hex::encode(&proposal_id.0[..4]),
                 current_epoch
+            );
+        }
+        Ok(false) => {
+            state.governance.queued_executions[exec_index].executed = true;
+        }
+        Err(err) => {
+            eprintln!(
+                "[governance] auto-execute failed while handling proposal {}: {}",
+                hex::encode(&proposal_id.0[..4]),
+                err
             );
         }
     }
