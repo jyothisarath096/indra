@@ -90,7 +90,18 @@ pub fn produce_block(
         return Err(ConsensusError::WrongProposer);
     }
 
-    // Select transactions — age-eligible first, then by fee rate
+    // Transaction selection policy:
+    // - Transactions are selected from the mempool by age eligibility first,
+    //   then fee rate, up to MAX_TX_PER_BLOCK.
+    // - The proposer has discretion over whether to include any particular
+    //   non-consensus-mandatory transaction; empty blocks remain valid.
+    // - Proposers can censor or delay individual transactions by omitting
+    //   them, but cannot earn extra base block reward by doing so because
+    //   block rewards are epoch-based, not per-transaction.
+    // - Front-running within a block is possible within the deterministic
+    //   selected set/order constraints.
+    // - Future mainnet consideration: inclusion rules, ordering commitments,
+    //   or PBS may be needed if MEV risk grows.
     let selected: Vec<TransactionV1> = mempool
         .select_for_block(MAX_TX_PER_BLOCK, state.height)
         .into_iter()
@@ -98,6 +109,12 @@ pub fn produce_block(
         .collect();
     let mut selected = selected;
     selected.sort_by_key(|tx| tx.tx_hash().0);
+    if selected.is_empty() && mempool.has_fee_eligible_transactions(state.base_fee) {
+        eprintln!(
+            "[proposer] WARNING: producing empty block at height={} but mempool has fee-eligible transactions — possible censorship",
+            state.height.saturating_add(1),
+        );
+    }
 
     // Build VRF proof bytes for header
     let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)

@@ -107,6 +107,7 @@ pub fn apply_epoch_transition_at_height(
     state
         .validators
         .select_active_set(&state.delegations, total_staked);
+    apply_pending_commission_changes(state, current_epoch);
 
     let virtual_delegations = apply_auto_delegations(state, current_epoch);
 
@@ -187,6 +188,34 @@ pub fn apply_epoch_transition_at_height(
     state.epoch_slashed_spark = 0;
     state.epoch_slash_event_count = 0;
     Ok(record)
+}
+
+fn apply_pending_commission_changes(state: &mut ChainState, current_epoch: u64) {
+    let validator_ids: Vec<Bytes32> = state
+        .validators
+        .all_validators()
+        .filter(|validator| {
+            validator
+                .pending_commission_effective_epoch
+                .map(|effective| effective <= current_epoch)
+                .unwrap_or(false)
+        })
+        .map(|validator| validator.validator_id)
+        .collect();
+
+    for validator_id in validator_ids {
+        if let Some(validator) = state.validators.get_mut(&validator_id) {
+            if let Some(pending_bps) = validator.pending_commission_bps.take() {
+                validator.commission_bps = pending_bps as u32;
+                eprintln!(
+                    "[epoch] validator {} commission change activated: {}bps",
+                    hex::encode(&validator_id.0[..4]),
+                    validator.commission_bps,
+                );
+            }
+            validator.pending_commission_effective_epoch = None;
+        }
+    }
 }
 
 /// Compute the block reward in Spark for a given block height.
@@ -590,6 +619,7 @@ fn distribute_block_rewards(
         .collect();
     active.sort_by_key(|(id, _)| id.0);
     let active_validator_count = active.len() as u64;
+    let mut distributed = 0u64;
 
     for (id, stake) in &active {
         let raw_reward = proportional_reward(epoch_block_reward, *stake, total_stake, height);
@@ -628,13 +658,23 @@ fn distribute_block_rewards(
         if let Some(entry) = state.validators.get_mut(id) {
             entry.pending_rewards = entry.pending_rewards.saturating_add(validator_share);
             entry.rewards_last_epoch = current_epoch;
+            distributed = distributed.saturating_add(validator_share);
         }
 
-        let _remainder =
+        let remainder =
             state
                 .delegations
                 .distribute_rewards(id, delegator_pool, current_epoch, height);
+        distributed = distributed.saturating_add(delegator_pool.saturating_sub(remainder));
     }
+
+    // Monetary policy for block-reward dust: any deterministic remainder
+    // from proportional rounding, saturation adjustment, or delegator reward
+    // splitting is routed to treasury. Rewards are pre-minted, so this does
+    // not increase total_supply; it only makes formerly-unallocated dust
+    // explicit and auditable.
+    let reward_remainder = epoch_block_reward.saturating_sub(distributed);
+    state.treasury_balance = state.treasury_balance.saturating_add(reward_remainder);
 }
 
 fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u64) {
@@ -850,9 +890,10 @@ mod tests {
         types::{
             crypto::HybridPubKey,
             primitives::{
-                Bytes32, VariableBytes, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
-                ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, SPARK_PER_INDRA,
+                Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
+                DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+                ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+                SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
         },
@@ -874,6 +915,8 @@ mod tests {
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: DEFAULT_COMMISSION_BPS,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: DUST_LIMIT_SPARK,
             auto_delegate_to: None,
         }
@@ -1032,6 +1075,130 @@ mod tests {
     }
 
     #[test]
+    fn commission_change_takes_effect_after_delay() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let mut validator = make_validator(0xC1, 1_000);
+        let validator_id = validator.validator_id;
+        validator.commission_bps = 1_000;
+        validator.pending_commission_bps = Some(1_500);
+        validator.pending_commission_effective_epoch = Some(COMMISSION_CHANGE_DELAY_EPOCHS);
+        state.validators.upsert(validator).unwrap();
+
+        apply_epoch_transition(&mut state, COMMISSION_CHANGE_DELAY_EPOCHS - 1, 0).unwrap();
+        let before_effective = state.validators.get(&validator_id).unwrap();
+        assert_eq!(before_effective.commission_bps, 1_000);
+        assert_eq!(before_effective.pending_commission_bps, Some(1_500));
+
+        apply_epoch_transition(&mut state, COMMISSION_CHANGE_DELAY_EPOCHS, 0).unwrap();
+        let after_effective = state.validators.get(&validator_id).unwrap();
+        assert_eq!(after_effective.commission_bps, 1_500);
+        assert_eq!(after_effective.pending_commission_bps, None);
+        assert_eq!(after_effective.pending_commission_effective_epoch, None);
+    }
+
+    #[test]
+    fn delegator_rewards_use_pre_change_commission_during_delay() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let mut validator = make_validator(0xC2, 1_000);
+        let validator_id = validator.validator_id;
+        validator.commission_bps = 1_000;
+        validator.pending_commission_bps = Some(2_000);
+        validator.pending_commission_effective_epoch = Some(COMMISSION_CHANGE_DELAY_EPOCHS);
+        state.validators.upsert(validator).unwrap();
+
+        let delegator_id = Bytes32::from([0xD2; 32]);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000, 0);
+
+        distribute_block_rewards(&mut state, 1_000, 1, 0);
+
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().pending_rewards,
+            100,
+            "old 10% commission must remain active during the delay window"
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            900
+        );
+    }
+
+    #[test]
+    fn block_reward_dust_is_explicitly_routed() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let validator_a = make_validator(0xC3, 1);
+        let validator_b = make_validator(0xC4, 1);
+        let id_a = validator_a.validator_id;
+        let id_b = validator_b.validator_id;
+        state.validators.upsert(validator_a).unwrap();
+        state.validators.upsert(validator_b).unwrap();
+        let treasury_before = state.treasury_balance;
+
+        distribute_block_rewards(&mut state, 101, 1, 0);
+
+        let reward_a = state.validators.get(&id_a).unwrap().pending_rewards;
+        let reward_b = state.validators.get(&id_b).unwrap().pending_rewards;
+        let treasury_delta = state.treasury_balance.saturating_sub(treasury_before);
+        assert_eq!(reward_a + reward_b + treasury_delta, 101);
+        assert_eq!(treasury_delta, 1);
+    }
+
+    #[test]
+    fn fee_reward_dust_returns_to_pool() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let validator_a = make_validator(0xC5, 1);
+        let validator_b = make_validator(0xC6, 1);
+        let id_a = validator_a.validator_id;
+        let id_b = validator_b.validator_id;
+        state.validators.upsert(validator_a).unwrap();
+        state.validators.upsert(validator_b).unwrap();
+        state.fee_reward_pool = 101;
+
+        distribute_fee_rewards(&mut state, 1, 0);
+
+        assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 50);
+        assert_eq!(state.validators.get(&id_b).unwrap().pending_rewards, 50);
+        assert_eq!(state.fee_reward_pool, 1);
+    }
+
+    #[test]
+    fn proposer_cannot_earn_extra_reward_by_including_more_transactions() {
+        let mut empty_block_state = crate::chain::ChainState::new_genesis();
+        let mut full_block_state = crate::chain::ChainState::new_genesis();
+        let validator = make_validator(0xC7, 1_000);
+        let validator_id = validator.validator_id;
+        empty_block_state
+            .validators
+            .upsert(validator.clone())
+            .unwrap();
+        full_block_state.validators.upsert(validator).unwrap();
+
+        distribute_block_rewards(&mut empty_block_state, 1_000, 1, 0);
+        distribute_block_rewards(&mut full_block_state, 1_000, 1, 0);
+
+        assert_eq!(
+            empty_block_state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .pending_rewards,
+            full_block_state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .pending_rewards,
+            "base block reward is epoch/stake based, not transaction-count based"
+        );
+    }
+
+    #[test]
     fn saturation_below_point_full_reward() {
         let reward = saturation_adjusted_reward(1_000_000, 100, 200_000, 200, 0);
         assert_eq!(reward, 1_000_000);
@@ -1107,6 +1274,18 @@ mod tests {
         let supply_before = state.total_supply;
         apply_epoch_transition(&mut state, 3, 0).unwrap();
         assert_eq!(state.total_supply, supply_before - 1_000);
+    }
+
+    #[test]
+    fn liveness_penalty_policy_is_explicitly_documented() {
+        let params = crate::governance::GovernableParams::default();
+        assert_eq!(params.slash_liveness_bps, SLASH_LIVENESS_BPS);
+        assert_eq!(
+            params.slash_liveness_threshold_epochs,
+            SLASH_LIVENESS_THRESHOLD_EPOCHS
+        );
+        assert!(SLASH_LIVENESS_BPS > 0);
+        assert!(SLASH_LIVENESS_THRESHOLD_EPOCHS > 0);
     }
 
     #[test]

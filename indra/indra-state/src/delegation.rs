@@ -7,9 +7,9 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
-        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
+        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -141,7 +141,7 @@ pub fn apply_staking_op(
         StakingOpBody::SetCommission {
             validator_id,
             new_commission_bps,
-        } => apply_set_commission(state, validator_id, *new_commission_bps),
+        } => apply_set_commission(state, validator_id, *new_commission_bps, current_height),
         StakingOpBody::SetAutoDelegate {
             validator_id,
             target_validator_id,
@@ -290,6 +290,8 @@ fn apply_register_validator(
         rewards_last_epoch: current_epoch,
         self_report_count: 0,
         commission_bps,
+        pending_commission_bps: None,
+        pending_commission_effective_epoch: None,
         min_delegation_spark: DUST_LIMIT_SPARK,
         auto_delegate_to: None,
     };
@@ -648,14 +650,16 @@ fn apply_claim_rewards(
     Ok(())
 }
 
-/// Update a validator's commission rate.
+/// Stage a validator's commission-rate change.
 ///
-/// Takes effect immediately for future epoch reward distributions.
-/// Does not affect already-accrued pending rewards.
+/// The new rate does not affect reward distribution until
+/// `COMMISSION_CHANGE_DELAY_EPOCHS` epochs have elapsed, giving delegators a
+/// small observation/exit window.
 fn apply_set_commission(
     state: &mut ChainState,
     validator_id: &Bytes32,
     new_commission_bps: u32,
+    current_height: u64,
 ) -> StateResult<()> {
     if new_commission_bps < MIN_COMMISSION_BPS
         || new_commission_bps > state.governance.params.max_commission_bps
@@ -677,7 +681,18 @@ fn apply_set_commission(
         return Err(StateError::ValidatorNotActive);
     }
 
-    validator.commission_bps = new_commission_bps;
+    let pending = u16::try_from(new_commission_bps)
+        .map_err(|_| StateError::InvalidStakingOp("commission exceeds u16 range".into()))?;
+    let effective_epoch =
+        epoch_for_height(current_height).saturating_add(COMMISSION_CHANGE_DELAY_EPOCHS);
+    validator.pending_commission_bps = Some(pending);
+    validator.pending_commission_effective_epoch = Some(effective_epoch);
+    eprintln!(
+        "[staking] validator {} commission change staged: {}bps effective_epoch={}",
+        hex::encode(&validator_id.0[..4]),
+        new_commission_bps,
+        effective_epoch,
+    );
     Ok(())
 }
 
@@ -881,6 +896,8 @@ mod tests {
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
             auto_delegate_to: None,
         };
@@ -971,6 +988,24 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id,
                 target_validator_id,
+            },
+            nonce,
+            validator_keypair,
+            &state.chain_id,
+        )
+    }
+
+    fn set_commission_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        new_commission_bps: u32,
+        validator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps,
             },
             nonce,
             validator_keypair,
@@ -1080,6 +1115,28 @@ mod tests {
         assert_eq!(
             state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
             2_000_000
+        );
+    }
+
+    #[test]
+    fn commission_change_is_not_immediate() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x41);
+        let original_commission = state.validators.get(&validator_id).unwrap().commission_bps;
+
+        let op = set_commission_op(&state, validator_id, 1_500, &validator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert_eq!(
+            validator.commission_bps, original_commission,
+            "commission changes must be staged, not applied immediately"
+        );
+        assert_eq!(validator.pending_commission_bps, Some(1_500));
+        assert_eq!(
+            validator.pending_commission_effective_epoch,
+            Some(COMMISSION_CHANGE_DELAY_EPOCHS)
         );
     }
 

@@ -191,6 +191,8 @@ With full-hash voting, the pre-fix issue was primarily liveness, not safety. The
 
 **Decision:** Prevote conflicts are intentionally non-slashable for now. POLC/valid-round rules make prevote semantics more subtle than precommit equivocation, and the node-side detector already treats same-slot prevote conflicts as non-slashable. The state layer has been aligned with that model by rejecting prevote slash evidence.
 
+Separate policy note: epoch liveness penalties are intentionally retained as an inactivity penalty, not as slash evidence for equivocation. They are governed by the liveness penalty parameters in state/governance, burn stake/supply after the configured inactivity threshold, and are covered by Phase 4 monetary-invariant tests. This does not change the CS-08 conclusion that the slash-evidence path accepts only hybrid-signed precommit equivocation.
+
 **Severity:** SAFE.
 
 **Fix applied:** `apply_slash_at_height` now rejects `VoteStep::Prevote` evidence with `InvalidSlashEvidence`; `SlashDetector` has regression coverage that same-slot prevote conflicts do not emit slash evidence. Double-precommit slashing remains active.

@@ -429,6 +429,12 @@ pub const MAX_COMMISSION_BPS: u32 = 2_000;
 /// Default commission rate for validators that do not set one explicitly.
 pub const DEFAULT_COMMISSION_BPS: u32 = 1_000;
 
+/// Epoch delay before a requested validator commission change takes effect.
+///
+/// This gives delegators a small observation/exit window before a validator's
+/// new commission rate affects reward distribution.
+pub const COMMISSION_CHANGE_DELAY_EPOCHS: u64 = 2;
+
 /// Veto threshold — if this fraction of total stake votes No, the proposal fails
 /// regardless of the yes percentage. Prevents minority capture via voter apathy.
 /// A coordinated third of stake can block any proposal (lazy-majority attack defence).

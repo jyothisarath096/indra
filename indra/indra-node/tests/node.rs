@@ -140,6 +140,8 @@ fn install_active_validator(
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
             auto_delegate_to: None,
         })
@@ -171,6 +173,8 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
             auto_delegate_to: None,
         })

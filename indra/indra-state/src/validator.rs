@@ -104,6 +104,13 @@ pub struct ValidatorEntry {
     /// Commission rate in basis points (e.g. 1000 = 10%).
     /// Bounded by [MIN_COMMISSION_BPS, MAX_COMMISSION_BPS].
     pub commission_bps: u32,
+    /// Pending commission rate in basis points.
+    ///
+    /// Staged commission changes are applied at epoch transition once
+    /// `pending_commission_effective_epoch <= current_epoch`.
+    pub pending_commission_bps: Option<u16>,
+    /// Epoch at which the pending commission change becomes active.
+    pub pending_commission_effective_epoch: Option<u64>,
     /// Validator-specific minimum delegation amount in Spark.
     pub min_delegation_spark: u64,
     /// Optional target validator for epoch-scoped reward auto-delegation.
@@ -138,6 +145,16 @@ impl Encode for ValidatorEntry {
         self.rewards_last_epoch.encode(buf);
         self.self_report_count.encode(buf);
         self.commission_bps.encode(buf);
+        self.pending_commission_bps.is_some().encode(buf);
+        if let Some(pending) = self.pending_commission_bps {
+            pending.encode(buf);
+        }
+        self.pending_commission_effective_epoch
+            .is_some()
+            .encode(buf);
+        if let Some(epoch) = self.pending_commission_effective_epoch {
+            epoch.encode(buf);
+        }
         self.min_delegation_spark.encode(buf);
         self.auto_delegate_to.is_some().encode(buf);
         if let Some(target) = self.auto_delegate_to {
@@ -146,7 +163,8 @@ impl Encode for ValidatorEntry {
     }
 
     fn encoded_len(&self) -> usize {
-        32 + 4
+        1 + 32
+            + 4
             + self.name.len()
             + 1
             + self.hybrid_classical_pk.map(|_| 32).unwrap_or(0)
@@ -166,8 +184,14 @@ impl Encode for ValidatorEntry {
             + 8
             + 4
             + 4
-            + 8
             + 1
+            + self.pending_commission_bps.map(|_| 2).unwrap_or(0)
+            + 1
+            + self
+                .pending_commission_effective_epoch
+                .map(|_| 8)
+                .unwrap_or(0)
+            + 8
             + 1
             + self.auto_delegate_to.map(|_| 32).unwrap_or(0)
     }
@@ -178,7 +202,7 @@ impl Decode for ValidatorEntry {
         let marker = u8::decode(r)?;
         match marker {
             SCHEMA_VERSION_GENESIS => decode_validator_entry_v1(r, None),
-            SCHEMA_VERSION => decode_validator_entry_v2(r, None),
+            SCHEMA_VERSION => decode_validator_entry_v3(r, None),
             other if r.remaining() == 0 => Err(unsupported_schema("ValidatorEntry", other)),
             first_byte => decode_validator_entry_v1(r, Some(first_byte)),
         }
@@ -212,14 +236,21 @@ fn decode_validator_entry_v1(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, false)
+    decode_validator_entry_fields(r, first_byte, false, false)
 }
 
 fn decode_validator_entry_v2(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true)
+    decode_validator_entry_fields(r, first_byte, true, false)
+}
+
+fn decode_validator_entry_v3(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<ValidatorEntry> {
+    decode_validator_entry_fields(r, first_byte, true, true)
 }
 
 impl ValidatorEntry {
@@ -238,6 +269,7 @@ fn decode_validator_entry_fields(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
     has_auto_delegate_to: bool,
+    has_pending_commission: bool,
 ) -> IndraResult<ValidatorEntry> {
     let validator_id = decode_bytes32_with_first(r, first_byte)?;
     let name_len = u32::decode(r)? as usize;
@@ -278,20 +310,46 @@ fn decode_validator_entry_fields(
         None
     };
 
+    let stake_spark = u64::decode(r)?;
+    let status = ValidatorStatus::decode(r)?;
+    let registered_epoch = u64::decode(r)?;
+    let last_active_epoch = u64::decode(r)?;
+    let pending_rewards = u64::decode(r)?;
+    let rewards_last_epoch = u64::decode(r)?;
+    let self_report_count = u32::decode(r)?;
+    let commission_bps = u32::decode(r)?;
+    let (pending_commission_bps, pending_commission_effective_epoch) = if has_pending_commission {
+        let pending_bps = if bool::decode(r)? {
+            Some(u16::decode(r)?)
+        } else {
+            None
+        };
+        let pending_epoch = if bool::decode(r)? {
+            Some(u64::decode(r)?)
+        } else {
+            None
+        };
+        (pending_bps, pending_epoch)
+    } else {
+        (None, None)
+    };
+
     Ok(ValidatorEntry {
         validator_id,
         name,
         hybrid_classical_pk,
         hybrid_pq_pk,
         vrf_pk,
-        stake_spark: u64::decode(r)?,
-        status: ValidatorStatus::decode(r)?,
-        registered_epoch: u64::decode(r)?,
-        last_active_epoch: u64::decode(r)?,
-        pending_rewards: u64::decode(r)?,
-        rewards_last_epoch: u64::decode(r)?,
-        self_report_count: u32::decode(r)?,
-        commission_bps: u32::decode(r)?,
+        stake_spark,
+        status,
+        registered_epoch,
+        last_active_epoch,
+        pending_rewards,
+        rewards_last_epoch,
+        self_report_count,
+        commission_bps,
+        pending_commission_bps,
+        pending_commission_effective_epoch,
         min_delegation_spark: u64::decode(r)?,
         auto_delegate_to: if has_auto_delegate_to && bool::decode(r)? {
             Some(Bytes32::decode(r)?)
@@ -537,6 +595,8 @@ mod tests {
             rewards_last_epoch: epoch,
             self_report_count: 0,
             commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: DUST_LIMIT_SPARK,
             auto_delegate_to: None,
         }

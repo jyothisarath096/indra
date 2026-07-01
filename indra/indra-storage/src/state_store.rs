@@ -473,6 +473,8 @@ mod tests {
                 rewards_last_epoch: 6,
                 self_report_count: 1,
                 commission_bps: 900,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
                 min_delegation_spark: DUST_LIMIT_SPARK,
                 auto_delegate_to: None,
             })

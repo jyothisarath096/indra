@@ -98,6 +98,8 @@ fn install_validator(
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: DUST_LIMIT_SPARK,
             auto_delegate_to: None,
         })
@@ -264,6 +266,8 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
                     rewards_last_epoch: 0,
                     self_report_count: 0,
                     commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+                    pending_commission_bps: None,
+                    pending_commission_effective_epoch: None,
                     min_delegation_spark: DUST_LIMIT_SPARK,
                     auto_delegate_to: None,
                 })

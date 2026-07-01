@@ -4,7 +4,7 @@
 
 Phase 4 found three high-priority staking/economic issues and several medium/low hardening gaps. The three HIGH findings have now been fixed locally: validator registration requires an atomic minimum self-bond, validator key material is globally uniqueness-checked at registration, and unbonding self-stake remains slashable for valid evidence within the evidence window. The main MEDIUM findings have also been addressed locally: active-set selection now uses the same self-stake model as consensus/reward weight, self-unstake below the active minimum demotes the validator immediately, block application is atomic across epoch-transition failures, and the public `value_spark` staking semantics are explicitly documented with specification tests. The audit also confirmed several safe properties: staking operations are hybrid-signed with chain-id domain separation, delegation/unstake operations enforce ownership and unbonding delays, commission is capped by governance limits, duplicate slash evidence is rejected, and total-supply accounting is mostly explicit for rewards, fees, and slashing.
 
-Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op wire format and requires a fresh testnet wipe after deployment. It does not require key regeneration. ST-02, ST-03, ST-05, ST-06, ST-09, ST-13, and ST-14 do not change cryptographic derivation, key material, state schema, or block/QC wire formats.
+Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op wire format and requires a fresh testnet wipe after deployment. ST-07 appends pending commission fields to `ValidatorEntry`, so it changes persisted validator-entry state layout and should also be deployed with a fresh state wipe. Neither change requires key regeneration or genesis validator-key changes. ST-02, ST-03, ST-05, ST-06, ST-08, ST-09, ST-13, ST-14, ST-15, and ST-16 do not change cryptographic derivation, key material, block/QC wire formats, or genesis keys.
 
 ## Summary Table
 
@@ -16,16 +16,16 @@ Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op 
 | ST-04 | Unbonding | Unbonding delay exists and is state-enforced | SAFE | VERIFIED |
 | ST-05 | Unbonding | Self-unstake can leave an active validator below practical minimum stake until epoch reselection | MEDIUM | FIXED |
 | ST-06 | Rewards | Reward weights use validator self-stake, while active-set selection includes delegated stake | MEDIUM | FIXED |
-| ST-07 | Rewards | Commission is capped, but changes take effect immediately for the next epoch distribution | LOW | OPEN |
-| ST-08 | Rewards | Reward arithmetic is mostly bounded; rounding remainders are deterministic but not always explicitly accounted | LOW | OPEN |
+| ST-07 | Rewards | Commission changes are staged with an activation delay | LOW | FIXED |
+| ST-08 | Rewards | Reward dust routing is explicit and covered by conservation tests | LOW | FIXED |
 | ST-09 | Rewards | Epoch transition is not transactionally atomic if a late transition step errors | MEDIUM | FIXED |
 | ST-10 | Slashing | Slash amount and fund accounting are deterministic for active self-stake | SAFE | VERIFIED |
 | ST-11 | Slashing | Double-slash protection prevents repeated penalties | SAFE | VERIFIED |
 | ST-12 | Slashing | Slash underflow is avoided with saturating arithmetic | SAFE | VERIFIED |
 | ST-13 | Slashing | Self-unstaking before evidence can avoid or reduce slashing | HIGH | FIXED |
 | ST-14 | Economic | Delegated stake affects active-set selection but not consensus voting power | MEDIUM | FIXED |
-| ST-15 | Economic | Proposer timing can affect fees/censorship, but not mint extra block reward | LOW | OPEN |
-| ST-16 | Economic | Total-supply invariants are mostly preserved; liveness penalty and epoch failure paths need clearer policy/tests | LOW | OPEN |
+| ST-15 | Economic | Proposer MEV/censorship surface is documented and empty-block warnings added | LOW | FIXED |
+| ST-16 | Economic | Total-supply invariants and liveness-penalty policy are explicitly tested/documented | LOW | FIXED |
 
 Severity scale: CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE.
 
@@ -216,7 +216,7 @@ INDRA testnet now uses the explicit self-stake model. Active-set selection ranks
 ### ST-07 — Commission is capped, but changes apply immediately for the next epoch distribution
 
 Severity: LOW  
-Status: OPEN
+Status: FIXED
 
 Description: Registration and commission update operations enforce commission within governance bounds. Defaults currently cap maximum commission at 20%, and governance can only decrease the maximum. However, `apply_set_commission` updates `validator.commission_bps` immediately; delegators do not appear to receive a delay window before the new commission affects the next epoch reward distribution.
 
@@ -238,10 +238,16 @@ Recommended fix:
 
 Apply commission changes with an activation delay of at least one unbonding/reward period, or store pending commission with an effective epoch.
 
+Fix implemented:
+
+`ValidatorEntry` now stores `pending_commission_bps` and `pending_commission_effective_epoch`. `apply_set_commission` stages the requested rate and leaves `commission_bps` unchanged until `COMMISSION_CHANGE_DELAY_EPOCHS` has elapsed. `apply_epoch_transition` applies pending commission changes before reward distribution when the effective epoch is reached, then clears the pending fields. Regression tests cover immediate non-application, delayed activation, and delegator rewards using the pre-change commission during the delay window.
+
+Serialization note: the pending commission fields are appended to the current encoded `ValidatorEntry` layout. This is a persisted state-schema change and should be deployed with a fresh state wipe. It does not require key regeneration or genesis validator-key changes.
+
 ### ST-08 — Reward arithmetic and precision are deterministic but not fully explicit
 
 Severity: LOW  
-Status: OPEN
+Status: FIXED
 
 Description: Reward calculations use deterministic proportional arithmetic and post-overflow-fix basis-point helpers. Some older code paths still use saturating operations when the hard-fork gate is inactive; all testnet gates are active from genesis. Delegator reward distribution can leave deterministic remainders. Fee reward remainders are returned to `fee_reward_pool`, while block reward remainders are ignored after being computed.
 
@@ -259,6 +265,10 @@ No direct overflow exploit was identified in the active configuration. The remai
 Recommended fix:
 
 Document the monetary policy for reward dust and route all remainders explicitly.
+
+Fix implemented:
+
+Block-reward rounding/saturation/delegator-split dust is explicitly routed to `state.treasury_balance`. This keeps the preminted reward budget auditable without increasing `total_supply`. Fee reward dust remains carried forward in `state.fee_reward_pool`, preserving the existing policy for fees. Regression tests cover block-reward dust conservation and fee-reward dust carry-forward.
 
 ### ST-09 — Epoch transition is not transactionally atomic on late failure
 
@@ -415,7 +425,7 @@ This is fixed together with ST-06 by choosing Model A: self-stake-only consensus
 ### ST-15 — Reward manipulation via proposal timing is limited
 
 Severity: LOW  
-Status: OPEN
+Status: FIXED
 
 Description: Block rewards are distributed by epoch and active self-stake, not by proposer slot, so a proposer cannot mint extra block reward by proposing more or fewer transactions. A proposer can still censor, delay, or include/exclude transactions, which affects fee pool timing and normal MEV/censorship risk.
 
@@ -429,10 +439,14 @@ Recommended fix:
 
 Treat this as a policy/MEV issue rather than a direct accounting bug. If needed, add inclusion rules or fee-market anti-censorship mechanisms later.
 
+Fix implemented:
+
+`producer.rs` now documents the current transaction-selection policy: mempool selection is fee-rate ordered, proposers can censor or delay transactions, block rewards are epoch/stake based rather than per-proposal, and future mainnet MEV mitigations may require ordering commitments or PBS-style design. The producer also logs a warning if it emits an empty block while fee-eligible transactions are present, making possible censorship or selection bugs visible operationally. A regression test confirms transaction count does not change the base proposer reward share.
+
 ### ST-16 — Total supply invariants are mostly preserved, but policy/test coverage should improve
 
 Severity: LOW  
-Status: OPEN
+Status: FIXED
 
 Description: Bonding/unbonding moves UTXOs into and out of `staked_bonds` without changing total supply. Block rewards appear preminted and do not increase total supply at epoch transition. Fee burn and slash burns reduce total supply; reporter rewards move to treasury. The code also applies liveness penalties at epoch transition, even though the current stated model says slashing is precommit-equivocation only.
 
@@ -453,6 +467,10 @@ Recommended fix:
 
 Write a single monetary-policy invariant test suite covering bond, unbond, slash, reward, fee burn, liveness penalty, and claim paths. Decide whether liveness penalties are intended; if not, gate or remove them in a future fix task.
 
+Fix implemented:
+
+Liveness penalties are documented as intentional protocol penalties separate from the CS-08 equivocation-slashing model. They trigger when a validator remains inactive beyond the configured epoch threshold and burn the configured penalty amount from stake/supply. `indra-state/tests/monetary_invariants.rs` now covers bond/unbond, slash burn plus reporter reward, preminted epoch rewards, fee burn, liveness penalty burn, and a full block-plus-epoch cycle. `epoch.rs` also has a policy regression test that pins the current liveness penalty constants so future changes must update the test and documentation.
+
 ## Proof-of-Concept Tests
 
 The original Phase 4 audit was audit-only, so no tests were added then. The HIGH-finding fix added regression tests covering:
@@ -464,6 +482,10 @@ The original Phase 4 audit was audit-only, so no tests were added then. The HIGH
 5. ST-05: active validator self-unstake below the active minimum demotes to `Registered`, while above-minimum and already-registered cases remain valid.
 6. ST-06/ST-14: active-set selection and reward distribution tests prove delegated stake does not increase consensus/reward weight.
 7. ST-09: epoch-boundary block application is tested for both successful commit and rollback on late epoch-transition failure.
+8. ST-07: commission changes are staged, activate only after the delay, and rewards during the delay use the old rate.
+9. ST-08: block-reward dust is routed to treasury and fee-reward dust remains in the fee reward pool.
+10. ST-15: proposer base rewards are independent of transaction count.
+11. ST-16: consolidated monetary invariant tests cover bond/unbond, slash, rewards, fee burn, liveness penalty burn, and block-plus-epoch cycles.
 
 ## Findings NOT Present
 
@@ -472,15 +494,14 @@ The original Phase 4 audit was audit-only, so no tests were added then. The HIGH
 - Delegation and self-stake reject a UTXO already present in `staked_bonds`.
 - Undelegation/self-unstake enforce a state-level unbonding delay before releasing UTXOs.
 - Commission cannot exceed the governance maximum in the state transition path.
+- Commission changes do not apply immediately; they are staged until the configured activation epoch.
 - Slash evidence requires valid hybrid signatures from the slashed validator and only precommit equivocation is slashable.
+- Liveness penalties are a separate intentional inactivity penalty, not equivocation slash evidence.
 - Double-slash protection is enforced both by evidence-hash deduplication and by the validator `Slashed` status.
 - Slash arithmetic avoids underflow.
-- Block rewards do not increase `total_supply` during epoch transition; the model appears preminted.
+- Block rewards do not increase `total_supply` during epoch transition; the model is preminted and block-reward dust is routed to treasury.
 
 ## Recommended Fix Order
 
-1. ST-07 — Add commission-change activation delay or delegator notice/exit window.
-2. ST-08 — Route reward dust/remainders explicitly according to a documented monetary policy.
-3. ST-15 — Decide whether fee/MEV/censorship mitigations are in scope before mainnet.
-4. ST-16 — Add a consolidated monetary-policy invariant test suite and decide whether liveness penalties are intended.
-5. ST-03 follow-up — If mainnet requires private-value staking, design a per-output opening proof/wire-format upgrade; current testnet semantics are documented and tested.
+1. ST-03 follow-up — If mainnet requires private-value staking, design a per-output opening proof/wire-format upgrade; current testnet semantics are documented and tested.
+2. Mainnet MEV policy — The ST-15 documentation/logging fix makes the current surface explicit, but inclusion rules, ordering commitments, or PBS remain future design work if the fee market becomes material.

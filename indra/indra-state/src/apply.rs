@@ -911,6 +911,8 @@ mod tests {
             rewards_last_epoch: 0,
             self_report_count: 0,
             commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
             min_delegation_spark: 1,
             auto_delegate_to: None,
         }
@@ -939,6 +941,8 @@ mod tests {
                 rewards_last_epoch: 0,
                 self_report_count: 0,
                 commission_bps: 1_000,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
                 min_delegation_spark: 1,
                 auto_delegate_to: None,
             })
