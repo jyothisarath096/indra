@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -29,6 +30,7 @@ use crate::{
 
 const SMALL_QUEUE_CAPACITY: usize = 256;
 const LARGE_QUEUE_CAPACITY: usize = 4;
+const TIE_BREAK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -78,6 +80,7 @@ struct PeerManagerActor {
     connected_peers: Arc<AtomicUsize>,
     global_limiter: GlobalRateLimiter,
     transport_slash_detector: Arc<Mutex<SlashDetector>>,
+    last_tie_break_log: HashMap<Bytes32, Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +98,34 @@ fn short_validator_id(id: &Bytes32) -> String {
 
 fn is_self_connection(local_validator_id: Bytes32, peer_validator_id: Bytes32) -> bool {
     local_validator_id == peer_validator_id
+}
+
+fn should_log_tie_break(
+    last_tie_break_log: &mut HashMap<Bytes32, Instant>,
+    validator_id: Bytes32,
+    now: Instant,
+) -> bool {
+    let should_log = last_tie_break_log
+        .get(&validator_id)
+        .map(|last| now.duration_since(*last) >= TIE_BREAK_LOG_INTERVAL)
+        .unwrap_or(true);
+    if should_log {
+        last_tie_break_log.insert(validator_id, now);
+    }
+    should_log
+}
+
+fn tie_break_keep_new(
+    local_validator_id: Bytes32,
+    peer_validator_id: Bytes32,
+    new_connection_is_initiator: bool,
+) -> bool {
+    let (initiator_id, responder_id) = if new_connection_is_initiator {
+        (local_validator_id, peer_validator_id)
+    } else {
+        (peer_validator_id, local_validator_id)
+    };
+    initiator_id < responder_id
 }
 
 fn message_queue(msg: &Message) -> QueueType {
@@ -250,28 +281,39 @@ impl PeerManagerActor {
         }
 
         if let Some(existing) = self.peers_by_validator.get(&peer_validator_id) {
-            let (initiator_id, responder_id) = if handshake.is_initiator {
-                (self.local_validator_id, peer_validator_id)
-            } else {
-                (peer_validator_id, self.local_validator_id)
-            };
-            let keep_new = initiator_id < responder_id;
+            let keep_new = tie_break_keep_new(
+                self.local_validator_id,
+                peer_validator_id,
+                handshake.is_initiator,
+            );
             if keep_new {
                 let existing_addr = existing.addr;
-                eprintln!(
-                    "[p2p] tie-break: replacing connection to {} with new {} (validator {})",
-                    existing_addr,
-                    addr,
-                    short_validator_id(&peer_validator_id),
-                );
+                if should_log_tie_break(
+                    &mut self.last_tie_break_log,
+                    peer_validator_id,
+                    Instant::now(),
+                ) {
+                    eprintln!(
+                        "[p2p] tie-break: replacing connection to {} with new {} (validator {})",
+                        existing_addr,
+                        addr,
+                        short_validator_id(&peer_validator_id),
+                    );
+                }
                 self.drop_peer(peer_validator_id, existing_addr).await;
             } else {
-                eprintln!(
-                    "[p2p] tie-break: keeping existing connection to {} (validator {}), dropping new {}",
-                    existing.addr,
-                    short_validator_id(&peer_validator_id),
-                    addr,
-                );
+                if should_log_tie_break(
+                    &mut self.last_tie_break_log,
+                    peer_validator_id,
+                    Instant::now(),
+                ) {
+                    eprintln!(
+                        "[p2p] tie-break: keeping existing connection to {} (validator {}), dropping new {}",
+                        existing.addr,
+                        short_validator_id(&peer_validator_id),
+                        addr,
+                    );
+                }
                 return;
             }
         }
@@ -551,6 +593,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         connected_peers: Arc::clone(&connected_peers),
         global_limiter: GlobalRateLimiter::new(),
         transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
+        last_tie_break_log: HashMap::new(),
     };
     tokio::spawn(actor.run());
     PeerManagerHandle {
@@ -591,6 +634,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             global_limiter: GlobalRateLimiter::new(),
             transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
+            last_tie_break_log: HashMap::new(),
         }
     }
 
@@ -643,6 +687,39 @@ mod tests {
         }
         assert_eq!(connected, 2);
         assert_eq!(disconnected, 1);
+    }
+
+    #[test]
+    fn tie_break_with_same_validator_resolves_deterministically() {
+        let local = Bytes32::from([0x01; 32]);
+        let peer = Bytes32::from([0x02; 32]);
+
+        assert!(tie_break_keep_new(local, peer, true));
+        assert!(!tie_break_keep_new(local, peer, false));
+        assert_eq!(
+            tie_break_keep_new(local, peer, true),
+            tie_break_keep_new(local, peer, true),
+            "same validator pair and connection direction must resolve the same way"
+        );
+    }
+
+    #[test]
+    fn tie_break_log_is_rate_limited_per_validator() {
+        let validator = Bytes32::from([0xAA; 32]);
+        let now = Instant::now();
+        let mut last = HashMap::new();
+
+        assert!(should_log_tie_break(&mut last, validator, now));
+        assert!(!should_log_tie_break(
+            &mut last,
+            validator,
+            now + Duration::from_secs(1)
+        ));
+        assert!(should_log_tie_break(
+            &mut last,
+            validator,
+            now + TIE_BREAK_LOG_INTERVAL + Duration::from_secs(1)
+        ));
     }
 
     #[test]

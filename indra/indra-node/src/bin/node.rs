@@ -52,6 +52,7 @@ const MAX_DISCOVERED_PEERS: usize = 256;
 const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
 const MAX_INBOUND_PER_IP: u8 = 3;
+const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
@@ -236,6 +237,41 @@ fn release_inbound_connection(
     }
 }
 
+fn should_skip_dial_for_connected_validator(
+    peer_addr: &str,
+    authenticated_addr_validators: &HashMap<String, indra_core::Bytes32>,
+    connected_validator_ids: &HashSet<indra_core::Bytes32>,
+) -> bool {
+    authenticated_addr_validators
+        .get(peer_addr)
+        .is_some_and(|validator_id| connected_validator_ids.contains(validator_id))
+}
+
+fn record_dial_failure(
+    peer_addr: &str,
+    discovered_peers: &mut HashSet<String>,
+    retry_after: &mut HashMap<String, Instant>,
+    retry_delay: &mut HashMap<String, Duration>,
+    failure_counts: &mut HashMap<String, u32>,
+    bootstrap_peer_addrs: &HashSet<String>,
+) -> bool {
+    let count = failure_counts.entry(peer_addr.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    if *count < MAX_DIAL_FAILURES_BEFORE_EVICTION || bootstrap_peer_addrs.contains(peer_addr) {
+        return false;
+    }
+
+    discovered_peers.remove(peer_addr);
+    retry_after.remove(peer_addr);
+    retry_delay.remove(peer_addr);
+    failure_counts.remove(peer_addr);
+    true
+}
+
+fn clear_dial_failure(peer_addr: &str, failure_counts: &mut HashMap<String, u32>) {
+    failure_counts.remove(peer_addr);
+}
+
 fn is_configured_self_addr(addr: &SocketAddr, local_p2p_addr: &str) -> bool {
     resolve_peer_addr(local_p2p_addr).is_some_and(|local| *addr == local)
 }
@@ -278,10 +314,13 @@ fn record_peer_connected_event(
     addr_validators: &Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
     discovered_peers: &Arc<Mutex<HashSet<String>>>,
     authenticated_peer_addrs: &Arc<Mutex<HashSet<String>>>,
+    authenticated_addr_validators: &Arc<Mutex<HashMap<String, indra_core::Bytes32>>>,
+    connected_validator_ids: &Arc<Mutex<HashSet<indra_core::Bytes32>>>,
     bootstrap_peer_addrs: &HashSet<String>,
     genesis_peer_addrs: &HashSet<String>,
     retry_after: &Arc<Mutex<HashMap<String, Instant>>>,
     retry_delay: &Arc<Mutex<HashMap<String, Duration>>>,
+    failure_counts: &Arc<Mutex<HashMap<String, u32>>>,
 ) -> bool {
     if validator_id == local_validator_id {
         eprintln!(
@@ -293,10 +332,15 @@ fn record_peer_connected_event(
             .lock()
             .unwrap()
             .remove(&addr.to_string());
+        authenticated_addr_validators
+            .lock()
+            .unwrap()
+            .remove(&addr.to_string());
         retry_after.lock().unwrap().remove(&addr.ip().to_string());
         retry_after.lock().unwrap().remove(&addr.to_string());
         retry_delay.lock().unwrap().remove(&addr.ip().to_string());
         retry_delay.lock().unwrap().remove(&addr.to_string());
+        failure_counts.lock().unwrap().remove(&addr.to_string());
         return false;
     }
 
@@ -307,10 +351,15 @@ fn record_peer_connected_event(
         .or_insert(0) += 1;
     peer_addrs.lock().unwrap().insert(validator_id, addr);
     addr_validators.lock().unwrap().insert(addr, validator_id);
+    connected_validator_ids.lock().unwrap().insert(validator_id);
     authenticated_peer_addrs
         .lock()
         .unwrap()
         .insert(addr.to_string());
+    authenticated_addr_validators
+        .lock()
+        .unwrap()
+        .insert(addr.to_string(), validator_id);
     let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
     insert_discovered_peer_bounded(
         &mut discovered_peers.lock().unwrap(),
@@ -323,6 +372,7 @@ fn record_peer_connected_event(
     retry_after.lock().unwrap().remove(&addr.to_string());
     retry_delay.lock().unwrap().remove(&addr.ip().to_string());
     retry_delay.lock().unwrap().remove(&addr.to_string());
+    clear_dial_failure(&addr.to_string(), &mut failure_counts.lock().unwrap());
     true
 }
 
@@ -398,6 +448,9 @@ fn start_network_runtime(
     let addr_validators = Arc::new(Mutex::new(HashMap::new()));
     let discovered_peers = Arc::new(Mutex::new(HashSet::<String>::new()));
     let authenticated_peer_addrs = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let authenticated_addr_validators =
+        Arc::new(Mutex::new(HashMap::<String, indra_core::Bytes32>::new()));
+    let connected_validator_ids = Arc::new(Mutex::new(HashSet::<indra_core::Bytes32>::new()));
     let bootstrap_peer_addrs =
         Arc::new(bootstrap_peers.iter().cloned().collect::<HashSet<String>>());
     let genesis_peer_addrs = Arc::new(
@@ -410,6 +463,7 @@ fn start_network_runtime(
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<PeerManagerHandle>();
     let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
     let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
+    let failure_counts = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
     let handshake_sem = Arc::new(tokio::sync::Semaphore::new(50));
     let inbound_count = Arc::new(AtomicU64::new(0));
     let inbound_by_ip = Arc::new(Mutex::new(HashMap::<IpAddr, u8>::new()));
@@ -423,8 +477,11 @@ fn start_network_runtime(
         let handshake_sem = Arc::clone(&handshake_sem);
         let discovered_peers = Arc::clone(&discovered_peers);
         let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+        let authenticated_addr_validators = Arc::clone(&authenticated_addr_validators);
+        let connected_validator_ids = Arc::clone(&connected_validator_ids);
         let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
         let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
+        let failure_counts = Arc::clone(&failure_counts);
         move || {
             let runtime = TokioRuntimeBuilder::new_multi_thread()
                 .enable_all()
@@ -450,8 +507,11 @@ fn start_network_runtime(
                     let retry_delay = Arc::clone(&retry_delay);
                     let discovered_peers = Arc::clone(&discovered_peers);
                     let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+                    let authenticated_addr_validators = Arc::clone(&authenticated_addr_validators);
+                    let connected_validator_ids = Arc::clone(&connected_validator_ids);
                     let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
                     let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
+                    let failure_counts = Arc::clone(&failure_counts);
                     let handshake_config = Arc::clone(&handshake_config);
                     async move {
                         while let Some(event) = async_event_rx.recv().await {
@@ -468,10 +528,13 @@ fn start_network_runtime(
                                         &addr_validators,
                                         &discovered_peers,
                                         &authenticated_peer_addrs,
+                                        &authenticated_addr_validators,
+                                        &connected_validator_ids,
                                         &bootstrap_peer_addrs,
                                         &genesis_peer_addrs,
                                         &retry_after,
                                         &retry_delay,
+                                        &failure_counts,
                                     ) {
                                         continue;
                                     }
@@ -490,6 +553,7 @@ fn start_network_runtime(
                                     }
                                     peer_addrs.lock().unwrap().remove(validator_id);
                                     addr_validators.lock().unwrap().remove(addr);
+                                    connected_validator_ids.lock().unwrap().remove(validator_id);
                                 }
                                 NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
                             }
@@ -575,9 +639,12 @@ fn start_network_runtime(
                     let handshake_sem = Arc::clone(&handshake_sem);
                     let discovered_peers = Arc::clone(&discovered_peers);
                     let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
+                    let authenticated_addr_validators = Arc::clone(&authenticated_addr_validators);
+                    let connected_validator_ids = Arc::clone(&connected_validator_ids);
                     let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
                     let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
                     let peer_addrs = Arc::clone(&peer_addrs);
+                    let failure_counts = Arc::clone(&failure_counts);
                     let peers_file_path = peers_file_path.clone();
                     let dns_seed_host = dns_seed_host.clone();
                     let p2p_addr_for_port = p2p_addr.clone();
@@ -661,6 +728,15 @@ fn start_network_runtime(
                                     retry_delay.lock().unwrap().remove(peer_addr_str);
                                     continue;
                                 }
+                                if should_skip_dial_for_connected_validator(
+                                    peer_addr_str,
+                                    &authenticated_addr_validators.lock().unwrap(),
+                                    &connected_validator_ids.lock().unwrap(),
+                                ) {
+                                    retry_after.lock().unwrap().remove(peer_addr_str);
+                                    retry_delay.lock().unwrap().remove(peer_addr_str);
+                                    continue;
+                                }
                                 if let Some(next_attempt) = retry_after.lock().unwrap().get(peer_addr_str).copied() {
                                     if Instant::now() < next_attempt {
                                         continue;
@@ -682,6 +758,9 @@ fn start_network_runtime(
                                         let handshake_config = Arc::clone(&handshake_config);
                                         let retry_after = Arc::clone(&retry_after);
                                         let retry_delay = Arc::clone(&retry_delay);
+                                        let discovered_peers = Arc::clone(&discovered_peers);
+                                        let failure_counts = Arc::clone(&failure_counts);
+                                        let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
                                         let peer_key = peer_addr_str.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit;
@@ -697,7 +776,24 @@ fn start_network_runtime(
                                                     let next = (current * 2).min(MAX_BACKOFF);
                                                     delays.insert(peer_key.clone(), next);
                                                     drop(delays);
-                                                    retry_after.lock().unwrap().insert(peer_key, Instant::now() + current);
+                                                    retry_after
+                                                        .lock()
+                                                        .unwrap()
+                                                        .insert(peer_key.clone(), Instant::now() + current);
+                                                    if record_dial_failure(
+                                                        &peer_key,
+                                                        &mut discovered_peers.lock().unwrap(),
+                                                        &mut retry_after.lock().unwrap(),
+                                                        &mut retry_delay.lock().unwrap(),
+                                                        &mut failure_counts.lock().unwrap(),
+                                                        &bootstrap_peer_addrs,
+                                                    ) {
+                                                        eprintln!(
+                                                            "[p2p] evicting permanently unreachable peer {} after {} failures",
+                                                            peer_key,
+                                                            MAX_DIAL_FAILURES_BEFORE_EVICTION
+                                                        );
+                                                    }
                                                 }
                                             }
                                         });
@@ -713,6 +809,20 @@ fn start_network_runtime(
                                             .lock()
                                             .unwrap()
                                             .insert(peer_addr_str.clone(), Instant::now() + current);
+                                        if record_dial_failure(
+                                            peer_addr_str,
+                                            &mut discovered_peers.lock().unwrap(),
+                                            &mut retry_after.lock().unwrap(),
+                                            &mut retry_delay.lock().unwrap(),
+                                            &mut failure_counts.lock().unwrap(),
+                                            &bootstrap_peer_addrs,
+                                        ) {
+                                            eprintln!(
+                                                "[p2p] evicting permanently unreachable peer {} after {} failures",
+                                                peer_addr_str,
+                                                MAX_DIAL_FAILURES_BEFORE_EVICTION
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2667,10 +2777,14 @@ mod tests {
             Arc::new(Mutex::new(HashMap::<SocketAddr, indra_core::Bytes32>::new()));
         let discovered_peers = Arc::new(Mutex::new(HashSet::from([addr.to_string()])));
         let authenticated_peer_addrs = Arc::new(Mutex::new(HashSet::new()));
+        let authenticated_addr_validators =
+            Arc::new(Mutex::new(HashMap::<String, indra_core::Bytes32>::new()));
+        let connected_validator_ids = Arc::new(Mutex::new(HashSet::<indra_core::Bytes32>::new()));
         let bootstrap_peer_addrs = HashSet::new();
         let genesis_peer_addrs = HashSet::new();
         let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
         let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
+        let failure_counts = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
 
         let accepted = record_peer_connected_event(
             local,
@@ -2681,10 +2795,13 @@ mod tests {
             &addr_validators,
             &discovered_peers,
             &authenticated_peer_addrs,
+            &authenticated_addr_validators,
+            &connected_validator_ids,
             &bootstrap_peer_addrs,
             &genesis_peer_addrs,
             &retry_after,
             &retry_delay,
+            &failure_counts,
         );
 
         assert!(!accepted);
@@ -2693,6 +2810,9 @@ mod tests {
         assert!(addr_validators.lock().unwrap().is_empty());
         assert!(discovered_peers.lock().unwrap().is_empty());
         assert!(authenticated_peer_addrs.lock().unwrap().is_empty());
+        assert!(authenticated_addr_validators.lock().unwrap().is_empty());
+        assert!(connected_validator_ids.lock().unwrap().is_empty());
+        assert!(failure_counts.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2822,6 +2942,137 @@ mod tests {
             release_inbound_connection(&inbound_count, &inbound_by_ip, ip);
         }
         assert_eq!(inbound_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dial_loop_skips_already_connected_validator_identity() {
+        let validator_id = indra_core::Bytes32::from([0x42; 32]);
+        let peer_addr = "203.0.113.42:30303".to_string();
+        let authenticated_addr_validators = HashMap::from([(peer_addr.clone(), validator_id)]);
+        let connected_validator_ids = HashSet::from([validator_id]);
+
+        assert!(should_skip_dial_for_connected_validator(
+            &peer_addr,
+            &authenticated_addr_validators,
+            &connected_validator_ids,
+        ));
+
+        let unknown_addr = "203.0.113.43:30303".to_string();
+        assert!(!should_skip_dial_for_connected_validator(
+            &unknown_addr,
+            &authenticated_addr_validators,
+            &connected_validator_ids,
+        ));
+    }
+
+    #[test]
+    fn permanently_unreachable_peer_is_evicted_after_max_failures() {
+        let peer = "203.0.113.55:30303".to_string();
+        let mut discovered_peers = HashSet::from([peer.clone()]);
+        let mut retry_after = HashMap::from([(peer.clone(), Instant::now())]);
+        let mut retry_delay = HashMap::from([(peer.clone(), Duration::from_secs(60))]);
+        let mut failure_counts = HashMap::new();
+        let bootstrap = HashSet::new();
+
+        for _ in 0..(MAX_DIAL_FAILURES_BEFORE_EVICTION - 1) {
+            assert!(!record_dial_failure(
+                &peer,
+                &mut discovered_peers,
+                &mut retry_after,
+                &mut retry_delay,
+                &mut failure_counts,
+                &bootstrap,
+            ));
+            assert!(discovered_peers.contains(&peer));
+        }
+
+        assert!(record_dial_failure(
+            &peer,
+            &mut discovered_peers,
+            &mut retry_after,
+            &mut retry_delay,
+            &mut failure_counts,
+            &bootstrap,
+        ));
+        assert!(!discovered_peers.contains(&peer));
+        assert!(!retry_after.contains_key(&peer));
+        assert!(!retry_delay.contains_key(&peer));
+        assert!(!failure_counts.contains_key(&peer));
+    }
+
+    #[test]
+    fn successful_connection_resets_failure_count() {
+        let local = indra_core::Bytes32::from([0x01; 32]);
+        let validator = indra_core::Bytes32::from([0x02; 32]);
+        let addr: SocketAddr = "203.0.113.80:30303".parse().unwrap();
+        let connected_addrs = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+        let peer_addrs = Arc::new(Mutex::new(HashMap::<indra_core::Bytes32, SocketAddr>::new()));
+        let addr_validators =
+            Arc::new(Mutex::new(HashMap::<SocketAddr, indra_core::Bytes32>::new()));
+        let discovered_peers = Arc::new(Mutex::new(HashSet::from([addr.to_string()])));
+        let authenticated_peer_addrs = Arc::new(Mutex::new(HashSet::new()));
+        let authenticated_addr_validators =
+            Arc::new(Mutex::new(HashMap::<String, indra_core::Bytes32>::new()));
+        let connected_validator_ids = Arc::new(Mutex::new(HashSet::<indra_core::Bytes32>::new()));
+        let bootstrap_peer_addrs = HashSet::new();
+        let genesis_peer_addrs = HashSet::new();
+        let retry_after = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
+        let retry_delay = Arc::new(Mutex::new(HashMap::<String, Duration>::new()));
+        let failure_counts = Arc::new(Mutex::new(HashMap::from([(addr.to_string(), 7)])));
+
+        assert!(record_peer_connected_event(
+            local,
+            validator,
+            addr,
+            &connected_addrs,
+            &peer_addrs,
+            &addr_validators,
+            &discovered_peers,
+            &authenticated_peer_addrs,
+            &authenticated_addr_validators,
+            &connected_validator_ids,
+            &bootstrap_peer_addrs,
+            &genesis_peer_addrs,
+            &retry_after,
+            &retry_delay,
+            &failure_counts,
+        ));
+
+        assert!(!failure_counts
+            .lock()
+            .unwrap()
+            .contains_key(&addr.to_string()));
+        assert!(discovered_peers.lock().unwrap().contains(&addr.to_string()));
+        assert!(connected_validator_ids.lock().unwrap().contains(&validator));
+    }
+
+    #[test]
+    fn bootstrap_peers_are_not_evicted_by_failure_count() {
+        let peer = "198.51.100.1:30303".to_string();
+        let mut discovered_peers = HashSet::from([peer.clone()]);
+        let mut retry_after = HashMap::from([(peer.clone(), Instant::now())]);
+        let mut retry_delay = HashMap::from([(peer.clone(), Duration::from_secs(60))]);
+        let mut failure_counts = HashMap::new();
+        let bootstrap = HashSet::from([peer.clone()]);
+
+        for _ in 0..MAX_DIAL_FAILURES_BEFORE_EVICTION {
+            assert!(!record_dial_failure(
+                &peer,
+                &mut discovered_peers,
+                &mut retry_after,
+                &mut retry_delay,
+                &mut failure_counts,
+                &bootstrap,
+            ));
+        }
+
+        assert!(discovered_peers.contains(&peer));
+        assert!(retry_after.contains_key(&peer));
+        assert!(retry_delay.contains_key(&peer));
+        assert_eq!(
+            failure_counts.get(&peer).copied(),
+            Some(MAX_DIAL_FAILURES_BEFORE_EVICTION)
+        );
     }
 
     #[test]

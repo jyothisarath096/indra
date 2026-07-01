@@ -18,8 +18,8 @@
 | NET-12 | Validation | Validator transport processes no application messages before authenticated handshake | SAFE | VERIFIED |
 | NET-13 | Validation | `PeerList` and `BlockResponse` decoded counts are bounded before allocation | HIGH | FIXED |
 | NET-14 | Validation | Non-validator consensus message injection is blocked by transport handshake active-validator allowlist | SAFE | VERIFIED |
-| NET-15 | Dial hygiene | Tie-break is deterministic and identity-based; recurring churn mostly indicates redundant dial attempts, not safety risk | LOW | OPERATIONAL |
-| NET-16 | Dial hygiene | Dial loop skips connected IPs and backs off failures, but does not age out poisoned unreachable peers except bounded table truncation | LOW | NEEDS HARDENING |
+| NET-15 | Dial hygiene | Dial loop now suppresses known already-connected validator identities and tie-break logs are rate-limited per validator | LOW | FIXED |
+| NET-16 | Dial hygiene | Never-successful discovered peers are evicted after repeated dial failures while bootstrap peers remain protected | LOW | FIXED |
 
 ## Detailed Findings
 
@@ -184,23 +184,23 @@ Recommended fix: none.
 
 Tie-break occurs when a second authenticated connection for the same validator ID is registered. The code computes a deterministic rule from initiator/responder IDs and either replaces or drops the new connection (`indra-network/src/peer_manager.rs:220-240`). Stale disconnects from the replaced connection are ignored if they do not match the current address (`indra-network/src/peer_manager.rs:340-353`).
 
-Frequent tie-break log spam therefore indicates both sides are repeatedly dialing despite already having or recently having a connection. The dial loop skips connected IPs using node-side `connected_addrs` (`indra-node/src/bin/node.rs:478-482`), but this is IP/socket-derived state, not a “connected validator ID” check in the dial planner. Races between disconnect bookkeeping, address changes, and simultaneous retry can still create churn.
+Frequent tie-break log spam therefore indicates both sides are repeatedly dialing despite already having or recently having a connection. The original dial loop skipped connected IPs using node-side `connected_addrs`, but this was IP/socket-derived state, not a “connected validator ID” check in the dial planner. Races between disconnect bookkeeping, address changes, and simultaneous retry could still create churn.
 
 Safety impact is low because identity tie-break is deterministic and only one live connection remains. Operational impact is noisy logs and extra handshake work.
 
 Severity: LOW.
 
-Recommended fix: have the dialer consult connected validator IDs / recently handshaked validator IDs, not only IP strings.
+Fix status: FIXED. The dialer now tracks live connected validator IDs and previously authenticated address-to-validator mappings, skips dialing a known address for a validator that is already connected, and rate-limits tie-break log lines per validator.
 
 ### NET-16 — Dial loop efficiency and retry behavior
 
 The dial loop runs every 5 seconds (`DIAL_RETRY`, `indra-node/src/bin/node.rs:45`, `indra-node/src/bin/node.rs:548`). It backs off failed dials exponentially from 2 seconds to 60 seconds (`indra-node/src/bin/node.rs:450-451`, `indra-node/src/bin/node.rs:524-535`) and skips currently connected IPs (`indra-node/src/bin/node.rs:478-482`). Self-addresses are removed from discovery/retry maps (`indra-node/src/bin/node.rs:472-477`).
 
-The loop does not permanently age out unreachable discovered peers; it keeps retrying at the max backoff as long as they remain in the bounded peer set. Since discovered peer eviction is lexicographic rather than success-aware, dead entries can persist until overwritten by sorted truncation or manual cleanup.
+The original loop did not permanently age out unreachable discovered peers; it kept retrying at the max backoff as long as they remained in the bounded peer set. Dead entries could persist until overwritten by bounded discovery eviction or manual cleanup.
 
 Severity: LOW.
 
-Recommended fix: add failure-count and last-success metadata to discovery entries, and evict never-successful peers before authenticated peers.
+Fix status: FIXED. Dial failures are now counted per peer address. Non-bootstrap discovered peers are evicted after `MAX_DIAL_FAILURES_BEFORE_EVICTION`, with retry metadata cleared. Successful authenticated connections reset the failure count. Bootstrap peers are configuration roots and are not evicted by failure count.
 
 ## Proof-of-Concept Tests
 
@@ -222,6 +222,12 @@ The follow-up HIGH-finding fix added executable regression coverage:
 14. `dns_failure_does_not_prevent_bootstrap_peer_connection`
 15. `inbound_connection_limit_is_enforced`
 16. `inbound_per_ip_limit_is_enforced`
+17. `dial_loop_skips_already_connected_validator_identity`
+18. `tie_break_with_same_validator_resolves_deterministically`
+19. `tie_break_log_is_rate_limited_per_validator`
+20. `permanently_unreachable_peer_is_evicted_after_max_failures`
+21. `successful_connection_resets_failure_count`
+22. `bootstrap_peers_are_not_evicted_by_failure_count`
 
 These tests demonstrate the old count-allocation and observer-budget attack shapes now fail closed.
 
@@ -237,7 +243,6 @@ These tests demonstrate the old count-allocation and observer-budget attack shap
 
 ## Recommended Fix Order
 
-1. NET-05 / NET-16: persist last-success/failure metadata and age out never-successful peers.
+1. NET-05: persist richer peer metadata across restarts, including authenticated validator ID, last success, and failure count.
 2. NET-03: add DNSSEC-aware or signed seed validation for mainnet.
-3. NET-15: reduce tie-break churn by dialing by validator identity rather than IP-only state.
-4. NET-01: add optional subnet/ASN diversity accounting for larger deployments.
+3. NET-01: add optional subnet/ASN diversity accounting for larger deployments.
