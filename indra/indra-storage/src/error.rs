@@ -41,6 +41,26 @@ pub enum StorageError {
         detail: String,
     },
 
+    /// A block log entry checksum did not match the stored bytes.
+    #[error(
+        "block log checksum mismatch at height {height}: expected {expected:#010x}, got {actual:#010x}"
+    )]
+    BlockChecksumMismatch {
+        /// Entry height.
+        height: u64,
+        /// Stored checksum.
+        expected: u32,
+        /// Recomputed checksum.
+        actual: u32,
+    },
+
+    /// The block log has a missing height inside its retained range.
+    #[error("block log gap: missing retained height {missing_height}")]
+    BlockLogGap {
+        /// Missing block height.
+        missing_height: u64,
+    },
+
     /// The WAL entry was truncated — incomplete write, safe to discard.
     #[error("truncated WAL entry at offset {offset}")]
     TruncatedEntry {

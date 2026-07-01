@@ -368,7 +368,11 @@ mod tests {
     #[test]
     fn legitimate_sync_burst_does_not_trigger_rate_limit_penalty() {
         let mut limiter = PeerRateLimiter::new();
-        let msg = Message::BlockResponse { blocks: Vec::new() };
+        let msg = Message::BlockResponse {
+            blocks: Vec::new(),
+            lowest_available: None,
+            highest_available: None,
+        };
 
         for _ in 0..50 {
             assert_eq!(
@@ -382,7 +386,11 @@ mod tests {
     #[test]
     fn unsolicited_block_response_flood_still_rate_limited() {
         let mut limiter = PeerRateLimiter::new();
-        let msg = Message::BlockResponse { blocks: Vec::new() };
+        let msg = Message::BlockResponse {
+            blocks: Vec::new(),
+            lowest_available: None,
+            highest_available: None,
+        };
 
         let mut limited = false;
         for _ in 0..100 {

@@ -274,7 +274,15 @@ async fn serve_observer_peer(
                         .filter_map(|height| engine.block_store.get(height).ok())
                         .collect()
                 };
-                write_message(&mut stream, &Message::BlockResponse { blocks }).await?;
+                write_message(
+                    &mut stream,
+                    &Message::BlockResponse {
+                        blocks,
+                        lowest_available: None,
+                        highest_available: None,
+                    },
+                )
+                .await?;
             }
             Message::Status { .. } => {}
             Message::Ping(nonce) => write_message(&mut stream, &Message::Pong(nonce)).await?,
@@ -437,7 +445,7 @@ async fn connect_and_sync(
                     Message::Block(block) => {
                         import_observer_block(&engine, block, &metrics_state, &last_block_timestamp)?;
                     }
-                    Message::BlockResponse { blocks } => {
+                    Message::BlockResponse { blocks, .. } => {
                         for block in blocks {
                             import_observer_block(
                                 &engine,

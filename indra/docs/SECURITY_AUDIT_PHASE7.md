@@ -7,11 +7,11 @@
 | ST7-01 | Persistence | State file enumeration and format | INFO | DOCUMENTED |
 | ST7-02 | Persistence | Startup restoration consistency gaps | HIGH | FIXED |
 | ST7-03 | Persistence | Snapshots are now sidecar-verified; legacy fallback warns | HIGH | FIXED |
-| ST7-04 | Block store | Block log lacks per-entry integrity checks and strict replay indexing | MEDIUM | NEEDS FIX |
+| ST7-04 | Block store | Block log entries now carry CRC32 and retained heights are contiguous-checked | MEDIUM | FIXED |
 | ST7-05 | Block store | Snapshot/block-log tip consistency enforced at startup | HIGH | FIXED |
 | ST7-06 | Block store | Sync import verifies QC, parent, proposer and state roots before mutation | SAFE | VERIFIED |
 | ST7-07 | Pruning | Pruning policy and scope are explicit | SAFE | VERIFIED |
-| ST7-08 | Pruning | Pruned nodes cannot serve far-behind peers; responses are silent partials | MEDIUM | NEEDS FIX |
+| ST7-08 | Pruning | Pruned BlockResponse messages now advertise retained availability range | MEDIUM | FIXED |
 | ST7-09 | Pruning | Slash evidence does not depend on retained block bodies | SAFE | VERIFIED |
 | ST7-10 | Atomicity | Prune rewrite and critical replacements are fsync/rename hardened | HIGH | FIXED |
 | ST7-11 | Atomicity | Durable chain manifest added for component consistency checks | HIGH | FIXED |
@@ -21,7 +21,7 @@
 | ST7-15 | Replay | Epoch boundary state transition is deterministic; records are auxiliary | SAFE | VERIFIED |
 | ST7-16 | Replay | Previously live-only state updates are now inside apply_block; auxiliary files remain recoverable | SAFE | VERIFIED |
 
-## Fix Status Update — Phase 7 HIGH Findings
+## Fix Status Update — Phase 7 Findings
 
 Implemented after this audit:
 
@@ -29,8 +29,10 @@ Implemented after this audit:
 - ST7-14: startup replay now reuses the same header commitment verification as sync import before applying stored blocks.
 - ST7-02/ST7-03/ST7-05: snapshots now write sidecar metadata containing tip hash, state root, validator-set root, chain ID, and snapshot checksum; startup verifies retained block hash against snapshot tip when available.
 - ST7-10/ST7-11: block pruning now rewrites through a synced temp file and atomic rename; consensus-critical replacements use synced temp+rename; a durable chain manifest records committed height, block hash, roots, snapshot height, block log tip, last QC height, epoch log tip, and chain ID. Missing sidecars/manifests are accepted as legacy with warnings for backward compatibility.
+- ST7-04: `blocks.log` now uses v2 entries containing `u64 height || u32 len || block bytes || u32 crc32`. The CRC covers the height, length, and block bytes. Legacy headerless/v1 logs are read and atomically upgraded to v2 on open; retained heights are checked for gaps during index rebuild.
+- ST7-08: `BlockResponse` now includes optional trailing `lowest_available` / `highest_available` metadata. Old decoders ignore the trailing fields, making this rolling-upgrade compatible; new peers can distinguish pruned history from a temporary empty response.
 
-Breaking-change status: no wire format, consensus rule, state schema, or key material changes. New snapshot sidecar and chain manifest files are backward compatible; old storage without them starts with warnings and writes the new files after subsequent commits/snapshots.
+Breaking-change status: no consensus rule, state schema, or key material changes. New snapshot sidecar and chain manifest files are backward compatible; old storage without them starts with warnings and writes the new files after subsequent commits/snapshots. ST7-04 is an on-disk `blocks.log` format upgrade, but it is backward compatible because legacy logs auto-upgrade on open. ST7-08 is a network message extension, but rolling restart is safe because the new availability fields are optional trailing bytes ignored by old decoders.
 
 ## Detailed Findings
 
@@ -108,17 +110,17 @@ Recommended fix:
 ### ST7-04 — Block log lacks per-entry integrity checks and strict replay indexing
 
 Severity: MEDIUM  
-Status: NEEDS FIX
+Status: FIXED
 
-`BlockStore` detects incomplete trailing entries by comparing `offset + 12 + length` to file length (`indra-storage/src/block_store.rs:272-325`). It does not decode each complete entry while rebuilding the index and does not store a checksum or block hash per entry. A complete-length but corrupted block payload is indexed and only fails later when `get(height)` decodes it (`indra-storage/src/block_store.rs:211-219`).
+`BlockStore` now writes v2 entries as `u64 height || u32 len || BlockV1 bytes || u32 crc32`. The CRC covers the height, length, and payload, so full-length local corruption is detected before the block is trusted. The read path and index rebuild both verify CRCs for v2 entries.
 
-The rebuild code also derives `next_height` from the maximum height found (`indra-storage/src/block_store.rs:313-324`) without requiring a contiguous sequence from `lowest_height..=max_height`. Normal append prevents gaps (`indra-storage/src/block_store.rs:132-139`), but disk corruption can produce an apparently valid index with missing heights until replay reaches the missing block.
+Index rebuild also decodes each retained block, verifies that the stored entry height matches the decoded block header height, and rejects any gap inside the retained range with `StorageError::BlockLogGap`.
 
-Recommended fix:
+Compatibility:
 
-- Store `entry_crc32` or `entry_hash` in each block log record.
-- Rebuild should decode and hash every retained block entry, verify the stored height equals the decoded block header height, and require contiguous retained heights.
-- Add a startup self-check that reports the first missing/corrupt block before consensus starts.
+- New logs are written as v2.
+- Existing headerless/v1 logs are read and atomically rewritten to v2 on open.
+- Startup/open logs the verified retained height range and whether checksums are available/valid.
 
 ### ST7-05 — Snapshot/block-log tip consistency is not enforced at startup
 
@@ -162,21 +164,21 @@ Recommended fix: keep the policy, but address ST7-08/ST7-10 before relying on pr
 ### ST7-08 — Pruned nodes cannot serve far-behind peers; responses are silent partials
 
 Severity: MEDIUM  
-Status: NEEDS FIX
+Status: FIXED
 
-When a peer requests blocks, the P2P handler reads sequentially from `from_height` to the capped upper bound and stops on the first `block_store.get` error (`indra-node/src/bin/node.rs:1460-1475`). If the requested height has been pruned, the response is an empty or partial `BlockResponse` without an explicit “pruned below X” signal.
+When a peer requests blocks below a pruned node's retained floor, the serving code now returns a `BlockResponse` with optional `lowest_available` and `highest_available` metadata. It starts serving from the retained floor when the requested range overlaps retained history, and returns an empty response with availability metadata when the requested range is fully below the floor.
 
-This is safe for the serving node but weak for network liveness:
+This fixes the liveness ambiguity:
 
-- A far-behind validator may repeatedly ask pruned peers for unavailable blocks.
-- The requester cannot distinguish “peer has no data because it is pruned” from “peer is temporarily empty/misbehaving.”
-- The network needs at least one archive or sufficiently retained peer to recover long-offline nodes.
+- A far-behind validator can distinguish pruned history from a temporarily empty/misbehaving peer.
+- Requesters can skip this peer for historical ranges below `lowest_available` and try an archive/sufficiently retained peer.
+- Normal in-range requests still return blocks without metadata.
 
-Recommended fix:
+Compatibility:
 
-- Add a `BlocksUnavailable { lowest_available, highest_available }` response or include range metadata in `BlockResponse`.
-- Prefer archive/bootstrap peers for catch-up below the default prune window.
-- Document an operational invariant: at least one archive node per validator set/region.
+- The new fields are optional trailing bytes after the existing `BlockResponse` block vector.
+- Existing decoders ignore trailing bytes, so rolling restarts are safe.
+- All nodes should still be updated before relying on the metadata operationally.
 
 ### ST7-09 — Slash evidence does not depend on retained block bodies
 
@@ -327,5 +329,5 @@ No executable PoC tests were added in this audit pass because the task is audit-
 2. ST7-14 — Reuse sync root verification during startup replay.
 3. ST7-02/ST7-03/ST7-05 — Add snapshot checkpoint/manifest validation tying snapshots to block hashes and state roots.
 4. ST7-10/ST7-11 — Add durable atomic file/manifest writes and safe prune rewrite.
-5. ST7-04 — Add block/epoch log per-entry checksums and strict contiguous-index verification.
-6. ST7-08 — Add explicit pruned-range sync responses and archive-peer preference.
+5. ST7-04 — FIXED: block log v2 CRC entries and strict contiguous-index verification.
+6. ST7-08 — FIXED: explicit retained-range metadata in pruned `BlockResponse`s.

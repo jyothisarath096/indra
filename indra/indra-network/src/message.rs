@@ -110,6 +110,10 @@ pub enum Message {
     BlockResponse {
         /// Blocks returned to the requester.
         blocks: Vec<BlockV1>,
+        /// Lowest height this peer can currently serve, when known.
+        lowest_available: Option<u64>,
+        /// Highest height this peer can currently serve, when known.
+        highest_available: Option<u64>,
     },
     /// Announce current chain tip.
     Status {
@@ -223,13 +227,37 @@ impl Message {
                 buf.extend_from_slice(&to_height.to_le_bytes());
                 buf
             }
-            Self::BlockResponse { blocks } => {
+            Self::BlockResponse {
+                blocks,
+                lowest_available,
+                highest_available,
+            } => {
                 let mut buf = Vec::new();
                 (blocks.len() as u32).encode(&mut buf);
                 for block in blocks {
                     let block_bytes = block.encode_to_vec();
                     (block_bytes.len() as u32).encode(&mut buf);
                     buf.extend_from_slice(&block_bytes);
+                }
+                // Optional trailing availability metadata. Older decoders ignore
+                // these bytes after reading the block vector, so this is safe for
+                // rolling upgrades while giving new requesters explicit pruned
+                // range information.
+                if lowest_available.is_some() || highest_available.is_some() {
+                    let mut flags = 0u8;
+                    if lowest_available.is_some() {
+                        flags |= 0x01;
+                    }
+                    if highest_available.is_some() {
+                        flags |= 0x02;
+                    }
+                    flags.encode(&mut buf);
+                    if let Some(height) = lowest_available {
+                        height.encode(&mut buf);
+                    }
+                    if let Some(height) = highest_available {
+                        height.encode(&mut buf);
+                    }
                 }
                 buf
             }
@@ -417,7 +445,38 @@ impl Message {
                     })?;
                     blocks.push(block);
                 }
-                Ok(Self::BlockResponse { blocks })
+                let mut lowest_available = None;
+                let mut highest_available = None;
+                if reader.remaining() > 0 {
+                    let flags =
+                        u8::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                            reason: e.to_string(),
+                        })?;
+                    if flags & 0x01 != 0 {
+                        lowest_available = Some(u64::decode(&mut reader).map_err(|e| {
+                            NetworkError::DecodeFailed {
+                                reason: e.to_string(),
+                            }
+                        })?);
+                    }
+                    if flags & 0x02 != 0 {
+                        highest_available = Some(u64::decode(&mut reader).map_err(|e| {
+                            NetworkError::DecodeFailed {
+                                reason: e.to_string(),
+                            }
+                        })?);
+                    }
+                    if flags & !0x03 != 0 || reader.remaining() != 0 {
+                        return Err(NetworkError::DecodeFailed {
+                            reason: "invalid BlockResponse availability metadata".to_string(),
+                        });
+                    }
+                }
+                Ok(Self::BlockResponse {
+                    blocks,
+                    lowest_available,
+                    highest_available,
+                })
             }
             MessageType::Status => {
                 let height_bytes: [u8; 8] = payload
@@ -724,12 +783,43 @@ mod tests {
             .collect();
         let wire = Message::BlockResponse {
             blocks: blocks.clone(),
+            lowest_available: None,
+            highest_available: None,
         }
         .encode_wire()
         .unwrap();
 
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
-        assert!(matches!(decoded, Message::BlockResponse { blocks: got } if got == blocks));
+        assert!(matches!(
+            decoded,
+            Message::BlockResponse {
+                blocks: got,
+                lowest_available: None,
+                highest_available: None,
+            } if got == blocks
+        ));
+    }
+
+    #[test]
+    fn block_response_availability_metadata_round_trip() {
+        let blocks = vec![test_block(1000)];
+        let wire = Message::BlockResponse {
+            blocks: blocks.clone(),
+            lowest_available: Some(1000),
+            highest_available: Some(2000),
+        }
+        .encode_wire()
+        .unwrap();
+
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::BlockResponse {
+                blocks: got,
+                lowest_available: Some(1000),
+                highest_available: Some(2000),
+            } if got == blocks
+        ));
     }
 
     #[test]

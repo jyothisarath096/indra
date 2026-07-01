@@ -1007,11 +1007,24 @@ async fn handle_observer_connection(
                                 "[observer] rate-limited RequestBlocks from {}",
                                 addr
                             );
-                            let _ = write_tx.send(Message::BlockResponse { blocks: Vec::new() }).await;
+                            let _ = write_tx
+                                .send(Message::BlockResponse {
+                                    blocks: Vec::new(),
+                                    lowest_available: None,
+                                    highest_available: None,
+                                })
+                                .await;
                             continue;
                         }
-                        let blocks = observer_blocks_for_range(&driver, from_height, to_height);
-                        let _ = write_tx.send(Message::BlockResponse { blocks }).await;
+                        let (blocks, lowest_available, highest_available) =
+                            observer_blocks_for_range(&driver, from_height, to_height);
+                        let _ = write_tx
+                            .send(Message::BlockResponse {
+                                blocks,
+                                lowest_available,
+                                highest_available,
+                            })
+                            .await;
                     }
                     Message::Status { height, .. } => {
                         eprintln!("[observer] {} status height={}", addr, height);
@@ -1071,16 +1084,51 @@ fn observer_blocks_for_range(
     driver: &Arc<Mutex<ConsensusDriver>>,
     from_height: u64,
     to_height: u64,
-) -> Vec<indra_core::types::block::BlockV1> {
+) -> (
+    Vec<indra_core::types::block::BlockV1>,
+    Option<u64>,
+    Option<u64>,
+) {
     let mut d = driver.lock().unwrap();
-    let end = to_height.min(
-        from_height
-            .saturating_add(SYNC_BATCH_SIZE)
-            .saturating_sub(1),
-    );
-    (from_height..=end)
-        .filter_map(|height| d.engine.block_store.get(height).ok())
-        .collect()
+    blocks_for_range_with_availability(&mut d.engine.block_store, from_height, to_height)
+}
+
+fn blocks_for_range_with_availability(
+    block_store: &mut indra_storage::BlockStore,
+    from_height: u64,
+    to_height: u64,
+) -> (
+    Vec<indra_core::types::block::BlockV1>,
+    Option<u64>,
+    Option<u64>,
+) {
+    if block_store.is_empty() || from_height > to_height {
+        return (Vec::new(), None, None);
+    }
+
+    let lowest = block_store.lowest_height();
+    let highest = block_store.next_height().saturating_sub(1);
+    let range_was_unavailable = from_height < lowest || to_height > highest;
+    let start = from_height.max(lowest);
+    let end = to_height
+        .min(highest)
+        .min(start.saturating_add(SYNC_BATCH_SIZE).saturating_sub(1));
+
+    let mut blocks = Vec::new();
+    if start <= end {
+        for height in start..=end {
+            match block_store.get(height) {
+                Ok(block) => blocks.push(block),
+                Err(_) => break,
+            }
+        }
+    }
+
+    if range_was_unavailable {
+        (blocks, Some(lowest), Some(highest))
+    } else {
+        (blocks, None, None)
+    }
 }
 
 async fn write_message_plain<W>(writer: &mut W, msg: &Message) -> indra_network::NetworkResult<()>
@@ -1461,23 +1509,23 @@ fn main() {
                                 from_height,
                                 to_height,
                             } => {
-                                let upper = (*to_height)
-                                    .min((*from_height).saturating_add(SYNC_BATCH_SIZE - 1));
-                                let blocks_to_send = {
+                                let (blocks_to_send, lowest_available, highest_available) = {
                                     let mut d = driver.lock().unwrap();
-                                    let mut blocks = Vec::new();
-                                    for height in *from_height..=upper {
-                                        match d.engine.block_store.get(height) {
-                                            Ok(block) => blocks.push(block),
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    blocks
+                                    blocks_for_range_with_availability(
+                                        &mut d.engine.block_store,
+                                        *from_height,
+                                        *to_height,
+                                    )
                                 };
+                                // If the requested range is partially or fully pruned,
+                                // include the retained range so the requester can try
+                                // an archive peer instead of retrying this peer blindly.
                                 gossip.send_to_validator(
                                     validator_id,
                                     &Message::BlockResponse {
                                         blocks: blocks_to_send,
+                                        lowest_available,
+                                        highest_available,
                                     },
                                 );
                                 continue;
@@ -1500,7 +1548,21 @@ fn main() {
                                 }
                                 continue;
                             }
-                            Message::BlockResponse { blocks } => {
+                            Message::BlockResponse {
+                                blocks,
+                                lowest_available,
+                                highest_available,
+                            } => {
+                                if blocks.is_empty() {
+                                    if let (Some(lowest), Some(highest)) =
+                                        (lowest_available, highest_available)
+                                    {
+                                        eprintln!(
+                                            "[sync] peer {} cannot serve requested historical range; available heights {}..={}",
+                                            addr, lowest, highest
+                                        );
+                                    }
+                                }
                                 let response_blocks = blocks.clone();
                                 let request_more;
                                 let mut caught_up_height = None;
@@ -3126,6 +3188,34 @@ mod tests {
         }
     }
 
+    fn block_response_test_block(height: u64) -> indra_core::types::block::BlockV1 {
+        use indra_core::types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND};
+        use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
+
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion::CURRENT,
+                height,
+                prev_hash: Bytes32::from([0x01; 32]),
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::from([0x02; 32]),
+                validator_set_root: Bytes32::from([0x03; 32]),
+                mempool_set_root: Bytes32::from([0x04; 32]),
+                value_hash: Bytes32::from([0x05; 32]),
+                base_fee: 1,
+                proposer_round: 0,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::ZERO,
+                proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+        }
+    }
+
     #[test]
     fn request_proposal_serves_by_full_block_hash() {
         let block = request_proposal_test_block();
@@ -3141,6 +3231,62 @@ mod tests {
         assert_ne!(block.header.block_hash(), value_hash);
 
         assert!(!proposal_matches_request(&block, 7, 3, &value_hash));
+    }
+
+    #[test]
+    fn request_blocks_below_prune_window_returns_lowest_available() {
+        let path = std::env::temp_dir().join(format!(
+            "indra_node_pruned_blocks_{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = indra_storage::BlockStore::open(
+            &path,
+            indra_storage::PruneConfig {
+                keep_blocks: Some(11),
+            },
+        )
+        .unwrap();
+        for height in 0..=20u64 {
+            store.append(&block_response_test_block(height)).unwrap();
+        }
+        assert_eq!(store.lowest_height(), 10);
+
+        let (blocks, lowest_available, highest_available) =
+            blocks_for_range_with_availability(&mut store, 5, 6);
+        assert!(blocks.is_empty());
+        assert_eq!(lowest_available, Some(10));
+        assert_eq!(highest_available, Some(20));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn request_blocks_within_range_returns_blocks_normally() {
+        let path = std::env::temp_dir().join(format!(
+            "indra_node_in_range_blocks_{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store =
+            indra_storage::BlockStore::open(&path, indra_storage::PruneConfig::archive()).unwrap();
+        for height in 0..=20u64 {
+            store.append(&block_response_test_block(height)).unwrap();
+        }
+
+        let (blocks, lowest_available, highest_available) =
+            blocks_for_range_with_availability(&mut store, 5, 7);
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.header.height)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
+        assert_eq!(lowest_available, None);
+        assert_eq!(highest_available, None);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

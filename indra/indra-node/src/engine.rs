@@ -1458,13 +1458,14 @@ mod tests {
     fn startup_fails_on_snapshot_replay_gap() {
         let dir = temp_dir("snapshot_gap");
         let mut config = NodeConfig::local_test(dir.clone());
-        config.prune_keep_blocks = Some(1_000);
+        config.snapshot_interval = 30;
+        config.prune_keep_blocks = Some(100);
 
-        {
+        let extra_block = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
             install_active_validator(&mut engine, [0x42u8; 32], "local");
             let mut last_qc = Vec::new();
-            for _ in 0..1_600u64 {
+            for _ in 0..160u64 {
                 let height = engine.state.height + 1;
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
@@ -1475,6 +1476,19 @@ mod tests {
                     [0x42u8; 32],
                 );
             }
+            make_strict_block(&engine.state, [0x42u8; 32], last_qc)
+        };
+
+        {
+            let mut store = BlockStore::open(
+                dir.join("blocks.log"),
+                indra_storage::PruneConfig {
+                    keep_blocks: Some(100),
+                },
+            )
+            .unwrap();
+            store.append(&extra_block).unwrap();
+            assert_eq!(store.lowest_height(), 62);
         }
 
         let state_dir = dir.join("state");
@@ -1487,7 +1501,7 @@ mod tests {
 
         let state_store = StateStore::open(&state_dir).unwrap();
         let mut snapshot = ChainState::new_genesis();
-        snapshot.height = 100;
+        snapshot.height = 10;
         snapshot.tip_hash = Bytes32::from([0x55; 32]);
         state_store.save(&snapshot).unwrap();
 
@@ -1497,9 +1511,9 @@ mod tests {
                 lowest_block,
                 gap,
             }) => {
-                assert_eq!(snapshot_height, 100);
-                assert_eq!(lowest_block, 601);
-                assert_eq!(gap, 500);
+                assert_eq!(snapshot_height, 10);
+                assert_eq!(lowest_block, 62);
+                assert_eq!(gap, 51);
             }
             Err(other) => panic!("expected SnapshotReplayGap, got {other}"),
             Ok(_) => panic!("expected SnapshotReplayGap, got successful startup"),
