@@ -428,54 +428,65 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 /// `indra_getBalance` — returns total UTXO balance for an address.
 fn get_balance(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let address_hex = first_param(params, "address")?;
+    let address = parse_address_hex(&address_hex)?;
     let mut balance = 0u64;
-    if address_hex.len() == 64 {
-        for entry in state.chain.utxos.all_entries() {
-            let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
-            if hex::encode(owner_address) == address_hex {
-                balance = balance.saturating_add(entry.output.value_spark);
-            }
+    for entry in state.chain.utxos.all_entries() {
+        let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
+        if owner_address == address {
+            balance = balance.saturating_add(entry.output.value_spark);
         }
     }
     Ok(format!(
-        r#"{{"address":"{}","balance":{}}}"#,
-        address_hex, balance
+        r#"{{"address":"{}","balance":{},"privacy_note":"{}"}}"#,
+        address_hex, balance, UTXO_PRIVACY_NOTE
     ))
 }
 
 /// `indra_getUtxos` — returns UTXOs for an address.
 fn get_utxos(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let address_hex = first_param(params, "address")?;
-    let utxos: Vec<String> = if address_hex.len() == 64 {
-        state
-            .chain
-            .utxos
-            .all_entries()
-            .filter(|entry| {
-                hex::encode(indra_crypto::sha256(
-                    &entry.output.owner_pubkey.classical_pk.0,
-                )) == address_hex
-            })
-            .map(|entry| {
-                format!(
-                    r#"{{"utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{}}}"#,
-                    hex::encode(entry.utxo_id.0),
-                    entry.output.value_spark,
-                    entry.created_height,
-                    entry.tx_index,
-                    entry.output_index,
-                    entry.output.lock_height,
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let address = parse_address_hex(&address_hex)?;
+    let utxos: Vec<String> = state
+        .chain
+        .utxos
+        .all_entries()
+        .filter(|entry| {
+            indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0) == address
+        })
+        .map(|entry| {
+            format!(
+                r#"{{"utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{}}}"#,
+                hex::encode(entry.utxo_id.0),
+                entry.output.value_spark,
+                entry.created_height,
+                entry.tx_index,
+                entry.output_index,
+                entry.output.lock_height,
+            )
+        })
+        .collect();
     Ok(format!(
-        r#"{{"address":"{}","utxos":[{}]}}"#,
+        r#"{{"address":"{}","utxos":[{}],"privacy_note":"{}"}}"#,
         address_hex,
-        utxos.join(",")
+        utxos.join(","),
+        UTXO_PRIVACY_NOTE
     ))
+}
+
+const UTXO_PRIVACY_NOTE: &str =
+    "queries are public; UTXO amounts reflect public value_spark metadata, not committed values";
+
+fn parse_address_hex(address_hex: &str) -> RpcResult<[u8; 32]> {
+    if address_hex.len() != 64 {
+        return Err(RpcError::InvalidParams(
+            "invalid address: expected 32-byte hex".into(),
+        ));
+    }
+    let bytes = hex::decode(address_hex)
+        .map_err(|_| RpcError::InvalidParams("invalid address: expected 32-byte hex".into()))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// `indra_getPeers` — returns public aggregate peer counts.

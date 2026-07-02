@@ -54,6 +54,41 @@ pub const MAX_RPC_BODY_BYTES: usize = 1_048_576;
 /// Per-request timeout for blocking stdlib RPC handlers.
 pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum public UTXO/balance scans per minute from one IP.
+pub const UTXO_SCAN_RATE_PER_MIN: u64 = 10;
+
+/// Shared per-IP fixed-window limiter for expensive UTXO scan endpoints.
+#[derive(Debug, Default)]
+pub struct RpcWindowRateLimiter {
+    windows: Mutex<HashMap<IpAddr, (Instant, u64)>>,
+}
+
+impl RpcWindowRateLimiter {
+    /// Create an empty window limiter.
+    pub fn new() -> Self {
+        Self {
+            windows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return true if `ip` is still within the configured per-minute budget.
+    pub fn allow(&self, ip: IpAddr, limit_per_min: u64) -> bool {
+        let mut windows = match self.windows.lock() {
+            Ok(windows) => windows,
+            Err(_) => return false,
+        };
+        let entry = windows.entry(ip).or_insert((Instant::now(), 0));
+        if entry.0.elapsed() >= Duration::from_secs(60) {
+            *entry = (Instant::now(), 0);
+        }
+        if entry.1 >= limit_per_min {
+            return false;
+        }
+        entry.1 = entry.1.saturating_add(1);
+        true
+    }
+}
+
 /// Minimal token bucket for RPC request admission.
 #[derive(Debug, Clone)]
 pub struct RpcTokenBucket {
@@ -132,6 +167,47 @@ pub fn rpc_rate_limited_response() -> String {
     )
 }
 
+/// Return true when an RPC method triggers a full public UTXO scan.
+pub fn is_utxo_scan_method(method: &str) -> bool {
+    matches!(method, "indra_getBalance" | "indra_getUtxos")
+}
+
+/// Return true when the request body is a JSON-RPC batch request.
+pub fn is_batch_request_body(body: &str) -> bool {
+    body.trim_start().starts_with('[')
+}
+
+/// Build CORS response headers. Empty allowlist means no browser cross-origin access.
+pub fn cors_headers(origin: Option<&str>, allowlist: &[String]) -> String {
+    let Some(origin) = origin else {
+        return String::new();
+    };
+    if allowlist.iter().any(|allowed| allowed == origin) {
+        format!(
+            "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Admin-Token\r\n",
+            origin
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Build a JSON HTTP error with a non-200 status.
+pub fn http_json_error(status: &str, code: i32, message: &str, cors: &str) -> String {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"{}"}},"id":null}}"#,
+        code,
+        message.replace('"', "\\\"")
+    );
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        cors,
+        body.len(),
+        body
+    )
+}
+
 /// The JSON-RPC HTTP server.
 pub struct RpcServer<E> {
     addr: String,
@@ -175,10 +251,19 @@ where
         };
 
         let http_response = if response == "__OPTIONS__" {
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n".to_string()
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+        } else if response == "__METHOD_NOT_ALLOWED__" {
+            http_json_error("405 Method Not Allowed", -32600, "Method Not Allowed", "")
+        } else if response == "__PAYLOAD_TOO_LARGE__" {
+            http_json_error(
+                "413 Payload Too Large",
+                -32600,
+                "request body too large",
+                "",
+            )
         } else {
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response.len(),
                 response
             )
@@ -198,7 +283,7 @@ where
 
         // Read HTTP headers to find Content-Length and method
         let mut content_length = 0usize;
-        let mut is_options = false;
+        let mut method = String::new();
         let mut line = String::new();
         let mut first_line = true;
 
@@ -207,9 +292,11 @@ where
             reader.read_line(&mut line)?;
             let trimmed = line.trim();
             if first_line {
-                if trimmed.starts_with("OPTIONS") {
-                    is_options = true;
-                }
+                method = trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
                 first_line = false;
             }
             if trimmed.is_empty() {
@@ -221,9 +308,11 @@ where
             }
         }
 
-        // Respond to CORS preflight immediately
-        if is_options {
+        if method == "OPTIONS" {
             return Ok("__OPTIONS__".to_string());
+        }
+        if method != "POST" {
+            return Ok("__METHOD_NOT_ALLOWED__".to_string());
         }
 
         if content_length == 0 {
@@ -237,18 +326,21 @@ where
 
         // Read body
         if content_length > MAX_RPC_BODY_BYTES {
-            return Ok(RpcResponse::err(
-                JsonId::Null,
-                ERR_PARSE_ERROR,
-                format!("request body exceeds {} bytes", MAX_RPC_BODY_BYTES),
-            )
-            .to_json());
+            return Ok("__PAYLOAD_TOO_LARGE__".to_string());
         }
 
         let mut body = vec![0u8; content_length];
         use std::io::Read;
         reader.read_exact(&mut body)?;
         let body_str = String::from_utf8_lossy(&body);
+        if is_batch_request_body(&body_str) {
+            return Ok(RpcResponse::err(
+                JsonId::Null,
+                -32600,
+                "batch requests not supported".to_string(),
+            )
+            .to_json());
+        }
 
         // Parse JSON-RPC request
         let req = match parse_request(&body_str) {
@@ -285,10 +377,19 @@ pub fn handle_with_engine<E: RpcEngineView>(stream: TcpStream, engine: &E) {
     };
 
     let http_response = if response == "__OPTIONS__" {
-        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n".to_string()
+        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+    } else if response == "__METHOD_NOT_ALLOWED__" {
+        http_json_error("405 Method Not Allowed", -32600, "Method Not Allowed", "")
+    } else if response == "__PAYLOAD_TOO_LARGE__" {
+        http_json_error(
+            "413 Payload Too Large",
+            -32600,
+            "request body too large",
+            "",
+        )
     } else {
         format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             response.len(),
             response
         )
@@ -306,7 +407,7 @@ fn read_and_process_ref<E: RpcEngineView>(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut content_length = 0usize;
-    let mut is_options = false;
+    let mut method = String::new();
     let mut line = String::new();
     let mut first_line = true;
 
@@ -315,9 +416,11 @@ fn read_and_process_ref<E: RpcEngineView>(
         reader.read_line(&mut line)?;
         let trimmed = line.trim();
         if first_line {
-            if trimmed.starts_with("OPTIONS") {
-                is_options = true;
-            }
+            method = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
             first_line = false;
         }
         if trimmed.is_empty() {
@@ -329,8 +432,11 @@ fn read_and_process_ref<E: RpcEngineView>(
         }
     }
 
-    if is_options {
+    if method == "OPTIONS" {
         return Ok("__OPTIONS__".to_string());
+    }
+    if method != "POST" {
+        return Ok("__METHOD_NOT_ALLOWED__".to_string());
     }
 
     if content_length == 0 {
@@ -343,18 +449,21 @@ fn read_and_process_ref<E: RpcEngineView>(
     }
 
     if content_length > MAX_RPC_BODY_BYTES {
-        return Ok(RpcResponse::err(
-            JsonId::Null,
-            ERR_PARSE_ERROR,
-            format!("request body exceeds {} bytes", MAX_RPC_BODY_BYTES),
-        )
-        .to_json());
+        return Ok("__PAYLOAD_TOO_LARGE__".to_string());
     }
 
     let mut body = vec![0u8; content_length];
     use std::io::Read;
     reader.read_exact(&mut body)?;
     let body_str = String::from_utf8_lossy(&body);
+    if is_batch_request_body(&body_str) {
+        return Ok(RpcResponse::err(
+            JsonId::Null,
+            -32600,
+            "batch requests not supported".to_string(),
+        )
+        .to_json());
+    }
 
     let req = match parse_request(&body_str) {
         Ok(r) => r,
@@ -492,6 +601,24 @@ mod tests {
     }
 
     #[test]
+    fn rpc_get_balance_returns_error_for_invalid_address() {
+        let engine = ChainState::new_genesis();
+        let resp = call_rpc("indra_getBalance", &["not-hex".to_string()], &engine);
+        assert!(resp.contains("\"error\""));
+        assert!(resp.contains("invalid address"));
+        assert!(!resp.contains("\"balance\":0"));
+    }
+
+    #[test]
+    fn utxo_query_privacy_caveat_is_documented_in_response() {
+        let engine = ChainState::new_genesis();
+        let address = hex::encode([0u8; 32]);
+        let resp = call_rpc("indra_getUtxos", &[address], &engine);
+        assert!(resp.contains("privacy_note"));
+        assert!(resp.contains("queries are public"));
+    }
+
+    #[test]
     fn rpc_per_ip_rate_limit_returns_429() {
         let ip = "203.0.113.9".parse().unwrap();
         let limiter = RpcRateLimiter::new();
@@ -503,6 +630,57 @@ mod tests {
         let response = rpc_rate_limited_response();
         assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
         assert!(response.contains("RPC rate limit exceeded"));
+    }
+
+    #[test]
+    fn utxo_query_is_rate_limited_independently() {
+        let ip = "203.0.113.10".parse().unwrap();
+        let limiter = RpcWindowRateLimiter::new();
+        for _ in 0..UTXO_SCAN_RATE_PER_MIN {
+            assert!(limiter.allow(ip, UTXO_SCAN_RATE_PER_MIN));
+        }
+        assert!(!limiter.allow(ip, UTXO_SCAN_RATE_PER_MIN));
+    }
+
+    #[test]
+    fn rpc_rejects_batch_requests() {
+        assert!(is_batch_request_body(r#"[{"jsonrpc":"2.0"}]"#));
+        assert!(!is_batch_request_body(r#"{"jsonrpc":"2.0"}"#));
+    }
+
+    #[test]
+    fn rpc_rejects_oversized_body_before_allocation() {
+        let response = http_json_error(
+            "413 Payload Too Large",
+            -32600,
+            "request body too large",
+            "",
+        );
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("request body too large"));
+    }
+
+    #[test]
+    fn rpc_rejects_non_post_method() {
+        let response = http_json_error("405 Method Not Allowed", -32600, "Method Not Allowed", "");
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+    }
+
+    #[test]
+    fn rpc_cors_default_is_restrictive() {
+        let headers = cors_headers(Some("http://localhost:3000"), &[]);
+        assert!(!headers.contains("Access-Control-Allow-Origin: *"));
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn rpc_cors_reflects_allowlisted_origin() {
+        let headers = cors_headers(
+            Some("http://localhost:3000"),
+            &["http://localhost:3000".to_string()],
+        );
+        assert!(headers.contains("Access-Control-Allow-Origin: http://localhost:3000"));
+        assert!(!headers.contains("Access-Control-Allow-Origin: *"));
     }
 
     #[test]

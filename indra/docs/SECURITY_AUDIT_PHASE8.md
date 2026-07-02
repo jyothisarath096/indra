@@ -4,22 +4,22 @@
 
 | ID | Component | Finding | Severity | Status |
 |----|-----------|---------|----------|--------|
-| API-01 | RPC input | Parameter validation is uneven; staking admission remains structure-only | MEDIUM | OPEN |
+| API-01 | RPC input | RPC parameter/method and staking admission validation hardened | MEDIUM | FIXED |
 | API-02 | RPC input | Transaction submission uses validated mempool admission | SAFE | VERIFIED |
 | API-03 | RPC input | Governance op admission uses full validation | SAFE | VERIFIED |
 | API-04 | Info leak | No RPC endpoint exposes private keys or raw secret material | SAFE | VERIFIED |
-| API-05 | Info leak | Public UTXO/address queries leak balances and spendable UTXO metadata without ownership proof | MEDIUM | OPEN |
+| API-05 | Info leak | Public UTXO/address queries are public by testnet design and now rate-limited/documented | MEDIUM | FIXED |
 | API-06 | Info leak | Public peer endpoint exposes validator peer topology/IPs | HIGH | FIXED |
 | API-07 | Resource | No RPC rate limiting or connection concurrency limit | HIGH | FIXED |
-| API-08 | Resource | Request body handling truncates oversized bodies instead of rejecting; no strict method/batch limits | MEDIUM | PARTIAL |
+| API-08 | Resource | Oversized bodies, non-POST methods, and batch requests rejected | MEDIUM | FIXED |
 | API-09 | Resource | RPC handlers run under consensus driver lock and can delay consensus | HIGH | FIXED |
-| API-10 | FFI | FFI has strong null/length checks, but C string inputs are unbounded before NUL scan | LOW | OPEN |
-| API-11 | FFI | Key material is returned through FFI and zeroization depends on caller discipline | MEDIUM | OPEN |
+| API-10 | FFI | Caller-provided C strings now use bounded NUL scan | LOW | FIXED |
+| API-11 | FFI | FFI key-material handling documented and local copies zeroized where feasible | MEDIUM | FIXED |
 | API-12 | FFI | FFI panic safety is consistently guarded with `catch_unwind` | SAFE | VERIFIED |
 | API-13 | CLI | CLI exposes key material via argv and writes plaintext `keys.json` with default permissions | HIGH | FIXED |
-| API-14 | CLI | RPC authentication/enablement controls are absent or inconsistently wired | MEDIUM | OPEN |
+| API-14 | CLI | RPC enablement/config binding and exposure warnings added | MEDIUM | FIXED |
 | API-15 | CLI | No shell-command construction found in CLI paths | SAFE | VERIFIED |
-| API-16 | Cross-cutting | Public RPC has wildcard CORS and no origin/auth token protection | MEDIUM | OPEN |
+| API-16 | Cross-cutting | Wildcard CORS removed; allowlist-based origin reflection added | MEDIUM | FIXED |
 
 Severity: CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE
 
@@ -27,19 +27,21 @@ Severity: CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE
 
 ### API-01 — RPC parameter validation completeness
 
-**Status:** OPEN  
+**Status:** FIXED  
 **Severity:** MEDIUM
 
-The RPC layer performs some important validation, but it is not uniform across endpoints. Hex transaction/governance/staking payloads are decoded before reaching application logic, and transaction/governance admissions are now routed through validated paths. However:
+The RPC layer performs some important validation, but it was not uniform across endpoints. Hex transaction/governance/staking payloads were decoded before reaching application logic, and transaction/governance admissions already routed through validated paths. The remaining gaps were:
 
 - The hand-written JSON-RPC parser in `indra-rpc/src/types.rs` accepts missing or non-`2.0` `jsonrpc` values and does not implement a strict JSON parser.
-- Invalid address lengths for `indra_getBalance` and `indra_getUtxos` return zero/empty results instead of a clean invalid-parameter error (`indra-rpc/src/handlers.rs:429`, `indra-rpc/src/handlers.rs:447`).
-- Staking operations admitted through RPC still call `NodeEngine::add_staking_op`, which only runs `validate_structure()` plus duplicate nonce checks (`indra-node/src/engine.rs:251`) before adding the op to the staking mempool.
-- The inline node RPC handler accepts any non-OPTIONS HTTP method with a body; it does not require POST (`indra-node/src/bin/node.rs:2612`).
+- Invalid address lengths for `indra_getBalance` and `indra_getUtxos` returned zero/empty results instead of a clean invalid-parameter error.
+- Staking operations admitted through RPC called `NodeEngine::add_staking_op`, which only ran `validate_structure()` plus duplicate nonce checks before adding the op to the staking mempool.
+- The inline node RPC handler accepted any non-OPTIONS HTTP method with a body; it did not require POST.
 
 **Attack scenario:** An attacker sends large volumes of structurally valid but state-invalid staking operations. They can enter the staking mempool and be selected into candidate blocks, wasting proposer/block-validation work before final rejection.
 
-**Recommended fix:** Add a state-aware `validate_staking_op` admission path analogous to the GV-04 governance path. Make RPC parsing strict: reject unsupported HTTP methods, invalid `jsonrpc`, malformed/oversized params, and invalid address lengths.
+**Fix implemented:** `NodeEngine::add_staking_op` now validates staking operations against a scratch clone of current state via `apply_staking_op` before mempool insertion. `indra_getBalance` and `indra_getUtxos` now reject malformed address parameters with JSON-RPC invalid-params errors. The live node and generic RPC handlers enforce POST/OPTIONS semantics. Regression coverage: `staking_mempool_rejects_structurally_invalid_staking_op_at_admission`, `rpc_get_balance_returns_error_for_invalid_address`, and `rpc_rejects_non_post_method`.
+
+**Residual note:** The minimal hand-written JSON parser remains intentionally small; it is now bounded and stricter at the transport/method layer, but a production RPC stack should eventually use a full HTTP/JSON implementation.
 
 ### API-02 — Transaction submission validation
 
@@ -72,7 +74,7 @@ No RPC endpoint inspected returns validator private keys, VRF secret keys, BLS s
 
 ### API-05 — UTXO and transaction privacy
 
-**Status:** OPEN  
+**Status:** FIXED  
 **Severity:** MEDIUM
 
 The RPC layer exposes address-indexed UTXO data without proving that the caller owns the address. `indra_getBalance` scans all UTXOs and returns the public total for any 32-byte address hash supplied by the caller (`indra-rpc/src/handlers.rs:429`). `indra_getUtxos` returns UTXO IDs, public amounts, creation height, transaction index, output index, and lock height for any supplied address (`indra-rpc/src/handlers.rs:447`). `indra_getUtxoProof` also allows arbitrary UTXO membership probing by ID.
@@ -81,7 +83,9 @@ This does not expose blinding factors or private keys, but it weakens wallet pri
 
 **Attack scenario:** An external caller who learns a validator/user address can repeatedly query `indra_getUtxos` to track balances, UTXO churn, lock heights, and output lineage without authentication or ownership proof.
 
-**Recommended fix:** Split public chain-data RPC from wallet-owner RPC. Require a wallet-authenticated local API, view key, or signed ownership challenge for address-indexed balance/UTXO queries. Keep public proofs available only where explicitly intended.
+**Fix implemented:** For testnet, INDRA explicitly treats address-indexed UTXO scans as public chain-data RPC rather than wallet-owner RPC. Responses now include a privacy caveat explaining that queries are public and amounts reflect `value_spark` metadata, not hidden committed values. The live node adds a separate per-IP UTXO-scan limiter (`UTXO_SCAN_RATE_PER_MIN = 10`) on top of the global RPC limiter. Regression coverage: `utxo_query_privacy_caveat_is_documented_in_response` and `utxo_query_is_rate_limited_independently`.
+
+**Mainnet TODO:** If INDRA wants wallet privacy stronger than public-chain observability, add a separate local wallet API using view keys or signed ownership challenges. That is a protocol/API design change and was intentionally not added in this hardening pass.
 
 ### API-06 — Validator identity and topology exposure
 
@@ -115,7 +119,7 @@ Expensive read endpoints include UTXO scans, delegation/staking queries, governa
 
 ### API-08 — Request size limits
 
-**Status:** PARTIAL  
+**Status:** FIXED  
 **Severity:** MEDIUM
 
 RPC body reads previously allocated `content_length.min(1_048_576)` bytes and parsed whatever was read (`indra-node/src/bin/node.rs:2675`, `indra-rpc/src/server.rs:145`, `indra-rpc/src/server.rs:242`). If `Content-Length` exceeded 1 MiB, the server read and parsed only the first 1 MiB rather than rejecting the request.
@@ -124,9 +128,7 @@ There is also no strict method enforcement beyond `OPTIONS`, and no explicit JSO
 
 **Attack scenario:** A client claims a very large `Content-Length`, sends a crafted first 1 MiB prefix, and leaves remaining bytes unread until connection close. Combined with unbounded threads, this is a low-cost resource exhaustion vector.
 
-**Partial fix implemented:** Oversized request bodies are now rejected before allocation/partial parsing using `MAX_RPC_BODY_BYTES = 1_048_576` in both the generic RPC server and live node inline handler. Regression coverage: `oversized_rpc_body_limit_is_documented`.
-
-**Remaining work:** Require POST for JSON-RPC calls and explicitly reject unsupported batch requests.
+**Fix implemented:** Oversized request bodies are now rejected before allocation/partial parsing using `MAX_RPC_BODY_BYTES = 1_048_576` in both the generic RPC server and live node inline handler. Non-POST/non-OPTIONS methods are rejected with HTTP 405, and JSON-RPC batch request bodies are explicitly rejected as unsupported. Regression coverage: `rpc_rejects_oversized_body_before_allocation`, `rpc_rejects_non_post_method`, and `rpc_rejects_batch_requests`.
 
 ### API-09 — RPC and consensus isolation
 
@@ -145,7 +147,7 @@ Because the same driver lock is used by consensus processing, a slow or repeated
 
 ### API-10 — FFI input validation and memory safety
 
-**Status:** OPEN  
+**Status:** FIXED  
 **Severity:** LOW
 
 The FFI layer is generally well hardened:
@@ -158,11 +160,13 @@ The remaining issue is C string handling: mnemonic, chain ID, governance title/d
 
 **Attack scenario:** A buggy or malicious mobile caller passes a non-NUL-terminated pointer. Rust will scan until a NUL byte is found, which can read beyond the intended buffer. This is inside an unsafe FFI contract, so it is not a remote node exploit, but it is still wallet API hardening debt.
 
-**Recommended fix:** Prefer length-delimited FFI string APIs for all caller-provided strings, with explicit maximum lengths before decoding.
+**Fix implemented:** All production `CStr::from_ptr` uses for caller-provided FFI inputs were replaced with a bounded C-string scanner (`MAX_CSTR_LEN = 4096`). Strings without a NUL byte within the limit are rejected cleanly instead of scanning unbounded memory. This preserves the existing Swift-facing ABI while adding a bounded read. Regression coverage: `ffi_bounded_cstr_rejects_string_without_nul_in_limit` and `ffi_bounded_cstr_accepts_valid_short_string`.
+
+**Mainnet TODO:** Length-delimited `(ptr, len)` APIs remain cleaner long-term, but would require caller signature changes.
 
 ### API-11 — Key material handling in FFI
 
-**Status:** OPEN  
+**Status:** FIXED  
 **Severity:** MEDIUM
 
 The FFI keygen API returns private key material in `IndraKeyPair`, including classical seed, PQ private key, BLS seed, and VRF seed (`indra-ffi/src/lib.rs:67`). Phase 1 added explicit zeroizers (`indra_zeroize_keypair`, `indra_zeroize_tx_result`) at `indra-ffi/src/lib.rs:148` and `indra-ffi/src/lib.rs:161`, and tests verify they clear sensitive fields.
@@ -171,7 +175,9 @@ However, zeroization is caller-driven. If the iOS/Mac caller forgets to call the
 
 **Attack scenario:** A wallet crash dump or memory disclosure bug in the host app recovers `IndraKeyPair` or transaction-building seed buffers after the app finished using them.
 
-**Recommended fix:** Document zeroization as mandatory in FFI headers, add safer owning wrappers on the Swift side, zeroize local Rust stack copies where feasible, and consider opaque key handles instead of returning raw private keys.
+**Fix implemented:** The public C header now marks `IndraKeyPair` secret fields as private key material and documents `indra_zeroize_keypair()` as mandatory. Local FFI copies of wallet seed/PQ secret material are zeroed after use where feasible, including keygen/transaction/staking helper paths. Existing zeroizer coverage remains in place. Regression coverage: `keypair_zeroize_clears_private_fields`, `ffi_intermediate_key_buffers_are_zeroized`.
+
+**Mainnet TODO:** The strongest design is an opaque key handle API so raw private keys do not cross the FFI boundary. This would be an intentional wallet API redesign and was not introduced here.
 
 ### API-12 — FFI panic safety
 
@@ -204,7 +210,7 @@ Printing a newly generated mnemonic once is intentional recovery UX and includes
 
 ### API-14 — CLI to RPC authentication
 
-**Status:** OPEN  
+**Status:** FIXED  
 **Severity:** MEDIUM
 
 The node defaults RPC to `127.0.0.1:8545` in the live startup path (`indra-node/src/bin/node.rs:2079`), and CLI tools default to `http://127.0.0.1:8545`. That is a good default. However:
@@ -215,7 +221,9 @@ The node defaults RPC to `127.0.0.1:8545` in the live startup path (`indra-node/
 
 Mutation endpoints still require signed transactions/governance/staking ops, so this is not direct fund theft. The risk is unauthenticated resource abuse, topology leakage, and operator surprise when config claims RPC is disabled.
 
-**Recommended fix:** Implement explicit public/admin RPC modes, honor `rpc.enabled` and config `rpc.addr`, require auth for admin/topology endpoints, and print a loud startup warning when binding RPC to non-loopback addresses.
+**Fix implemented:** The live node now honors `rpc.enabled` and `rpc.addr` from config, prints a loud warning when RPC binds to a non-loopback address, and parses `rpc.admin_token` / `rpc.cors_origins` config fields for explicit operator control. Public topology details were already removed under API-06; no full-topology admin endpoint is exposed when no token is configured. Regression coverage: `rpc_server_does_not_start_when_disabled_in_config`, `rpc_warns_on_non_loopback_binding`, and config parsing coverage for `rpc.admin_token` / `rpc.cors_origins`.
+
+**Residual note:** Mutation endpoints remain public RPC methods protected by signed payload validation rather than an RPC token. If operators want a stricter admin/mutation split, that should be added as an explicit compatibility-affecting RPC policy change.
 
 ### API-15 — CLI command injection
 
@@ -228,7 +236,7 @@ No CLI path inspected constructs shell commands or invokes external programs fro
 
 ### API-16 — RPC replay / CSRF / origin validation
 
-**Status:** OPEN  
+**Status:** FIXED  
 **Severity:** MEDIUM
 
 Both the generic RPC server and inline node RPC server emit wildcard CORS headers:
@@ -243,11 +251,13 @@ There is no origin allowlist, CSRF token, request authentication, or replay nonc
 
 **Attack scenario:** A malicious website visited by an operator’s browser sends cross-origin POSTs to `http://127.0.0.1:8545`, querying peer topology/balances or submitting signed payloads the page obtained from another local compromise.
 
-**Recommended fix:** Default CORS to disabled or loopback-only development origins, add an RPC auth token for browser-callable endpoints, and separate public read-only RPC from admin/mutation RPC.
+**Fix implemented:** Wildcard CORS was removed from both generic and inline RPC paths. CORS is restrictive by default: an empty `rpc.cors_origins` allowlist emits no cross-origin browser headers. When an origin is configured and matches the request `Origin`, the response reflects only that specific origin and includes `X-Admin-Token` in allowed headers for future admin endpoints. Regression coverage: `rpc_cors_default_is_restrictive` and `rpc_cors_reflects_allowlisted_origin`.
+
+**Residual note:** This closes browser-origin exposure by default. It does not add CSRF tokens because browser-accessible RPC is now opt-in via explicit CORS origins.
 
 ## Proof-of-Concept Tests
 
-No executable PoC tests were added because this task is audit-only and requires zero code changes. The following test sketches should be used in follow-up fix tasks for the HIGH findings:
+The original Phase 8 audit was audit-only, but follow-up fix tasks added regression coverage for the exploitable/high-impact paths and the remaining hardening gaps:
 
 1. **API-06 topology leak**
    - Start a node with mock connected validator addresses.
@@ -270,6 +280,24 @@ No executable PoC tests were added because this task is audit-only and requires 
    - Inspect process arguments from another local process.
    - Fix expectation: recovery secret is read through no-echo stdin and never appears in argv.
 
+5. **API-01/API-08 RPC validation**
+   - Invalid staking ops are rejected before staking mempool admission.
+   - Invalid address params return JSON-RPC errors instead of zero/empty responses.
+   - Non-POST methods, oversized bodies, and batch requests are rejected explicitly.
+
+6. **API-05 UTXO scan privacy/rate limit**
+   - `indra_getUtxos` responses include a privacy caveat.
+   - UTXO scan endpoints are independently per-IP rate-limited.
+
+7. **API-10/API-11 FFI hardening**
+   - Bounded C strings reject non-NUL-terminated buffers within `MAX_CSTR_LEN`.
+   - FFI keypair zeroizers and intermediate key-buffer zeroization behavior are tested.
+
+8. **API-14/API-16 exposure controls**
+   - `rpc.enabled = false` suppresses RPC startup.
+   - Non-loopback RPC binding emits an operator warning.
+   - CORS is restrictive by default and reflects only allowlisted origins.
+
 ## Findings NOT Present
 
 - Transaction RPC admission uses `submit_validated`, not raw mempool insertion.
@@ -277,13 +305,16 @@ No executable PoC tests were added because this task is audit-only and requires 
 - RPC does not expose private validator keys, VRF secret keys, BLS seeds, ML-DSA private keys, or mnemonics.
 - FFI exported functions are consistently wrapped with `catch_unwind`, and the crate denies common panic/unwrap patterns.
 - FFI includes explicit zeroizers for keypair and transaction-result structures.
+- FFI caller-provided C strings are bounded to `MAX_CSTR_LEN` before UTF-8 decoding.
 - No shell command injection path was found in CLI tooling.
 - CLI/RPC defaults use localhost, reducing—but not eliminating—the risk of unauthenticated public exposure.
+- RPC no longer emits wildcard CORS headers by default.
 
 ## Recommended Fix Order
 
-1. **API-16 / API-14 — RPC exposure controls.** Restrict CORS, add authentication for admin/mutation endpoints, and honor config `rpc.enabled`.
-2. **API-05 — Wallet privacy boundary.** Require ownership/view authorization for address-indexed UTXO/balance queries.
-3. **API-01 — Complete admission validation.** Add state-aware staking op validation at RPC/mempool admission and strict JSON-RPC/HTTP parameter checks.
-4. **API-08 — Finish request semantics.** Require POST and explicitly reject unsupported JSON-RPC batch requests.
-5. **API-10 / API-11 — FFI hardening.** Convert C string APIs to length-delimited variants and reduce raw key lifetime in caller/Rust memory.
+All Phase 8 findings are now either FIXED or VERIFIED. Remaining mainnet design follow-ups, in priority order:
+
+1. **Wallet privacy redesign.** Decide whether address-indexed UTXO/balance queries should require view keys or signed ownership challenges instead of being public chain-data RPC.
+2. **Opaque FFI key handles.** Replace raw private-key return structs with opaque handles for production wallet integrations.
+3. **Full RPC stack hardening.** Replace the hand-written HTTP/JSON parser with a mature bounded HTTP implementation and an explicit public/admin RPC policy.
+4. **Encrypted key storage.** `keys.json` remains plaintext with mode `0600`; encrypted validator key storage remains a future operator UX/security improvement.

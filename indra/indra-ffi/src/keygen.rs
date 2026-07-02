@@ -7,8 +7,9 @@ const PQ_PK_BYTES: usize = 2592;
 const PQ_SK_BYTES: usize = 32;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
-pub fn generate(seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
+pub fn generate(mut seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
     let derived = derive_all_seeds(&seed);
+    seed.fill(0);
     let keys = generate_keypairs(
         String::new(),
         derived.hybrid_seed,

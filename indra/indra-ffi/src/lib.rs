@@ -15,10 +15,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-use std::{
-    ffi::{c_char, CStr},
-    panic::catch_unwind,
-};
+use std::{ffi::c_char, panic::catch_unwind};
 
 use indra_bulletproofs::RANGE_PROOF_BYTES;
 use indra_crypto::sha256;
@@ -57,6 +54,22 @@ pub const MAX_TX_BYTES: usize = 1_048_576;
 pub const MAX_TX_HEX_BYTES: usize = MAX_TX_BYTES * 2 + 1;
 /// Maximum byte length for a generated mnemonic output buffer.
 pub const MAX_MNEMONIC_BYTES: usize = 512;
+/// Maximum number of bytes scanned while reading a C string over FFI.
+pub const MAX_CSTR_LEN: usize = 4096;
+
+pub(crate) unsafe fn bounded_cstr(ptr: *const c_char) -> Result<String, IndraError> {
+    if ptr.is_null() {
+        return Err(IndraError::NullPointer);
+    }
+    let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), MAX_CSTR_LEN);
+    let nul_pos = slice
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(IndraError::InvalidParam)?;
+    std::str::from_utf8(&slice[..nul_pos])
+        .map(str::to_owned)
+        .map_err(|_| IndraError::InvalidParam)
+}
 
 /// FFI keypair bundle returned to Swift.
 #[repr(C)]
@@ -183,7 +196,9 @@ pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -
     match catch_unwind(|| {
         let mut seed_bytes = [0u8; CLASSICAL_SK_BYTES];
         seed_bytes.copy_from_slice(std::slice::from_raw_parts(seed, CLASSICAL_SK_BYTES));
-        keygen::generate(seed_bytes)
+        let result = keygen::generate(seed_bytes);
+        seed_bytes.fill(0);
+        result
     }) {
         Ok(Ok(keypair)) => {
             *out = keypair;
@@ -243,10 +258,8 @@ pub unsafe extern "C" fn indra_keygen_from_mnemonic(
     *out = IndraKeyPair::zeroed();
 
     match catch_unwind(|| {
-        let phrase_str = CStr::from_ptr(phrase)
-            .to_str()
-            .map_err(|_| IndraError::InvalidParam)?;
-        keygen::generate_from_mnemonic(phrase_str)
+        let phrase_str = bounded_cstr(phrase)?;
+        keygen::generate_from_mnemonic(&phrase_str)
     }) {
         Ok(Ok(keypair)) => {
             *out = keypair;
@@ -269,10 +282,8 @@ pub unsafe extern "C" fn indra_validate_mnemonic(phrase: *const c_char) -> i32 {
     }
 
     match catch_unwind(|| {
-        let phrase_str = CStr::from_ptr(phrase)
-            .to_str()
-            .map_err(|_| IndraError::InvalidParam)?;
-        if keygen::is_valid_mnemonic(phrase_str) {
+        let phrase_str = bounded_cstr(phrase)?;
+        if keygen::is_valid_mnemonic(&phrase_str) {
             Ok(())
         } else {
             Err(IndraError::InvalidParam)
@@ -360,14 +371,21 @@ pub unsafe extern "C" fn indra_build_tx(
 
         let wallet_context =
             wallet::build_wallet_context(sender_classical_seed, sender_pq_pk, utxos)?;
-        let built = tx::build(
+        let built = match tx::build(
             recipient_classical_pk,
             params_ref.amount_spark,
             params_ref.fee_spark,
             sender_classical_seed,
             sender_pq_sk,
             wallet_context,
-        )?;
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                sender_classical_seed.fill(0);
+                return Err(error);
+            }
+        };
+        sender_classical_seed.fill(0);
 
         let tx_id = built.tx_id;
         let change_spark = built.change_spark;
@@ -580,6 +598,27 @@ mod tests {
         let seed = [0x42u8; 32];
         let result = unsafe { indra_keygen(seed.as_ptr(), std::ptr::null_mut()) };
         assert_eq!(result, INDRA_ERR_NULL_POINTER);
+    }
+
+    #[test]
+    fn ffi_bounded_cstr_rejects_string_without_nul_in_limit() {
+        let buffer = vec![b'a'; MAX_CSTR_LEN + 1];
+        let result = unsafe { bounded_cstr(buffer.as_ptr().cast::<c_char>()) };
+        assert_eq!(result, Err(IndraError::InvalidParam));
+    }
+
+    #[test]
+    fn ffi_bounded_cstr_accepts_valid_short_string() {
+        let input = std::ffi::CString::new("indra-testnet-1").unwrap();
+        let result = unsafe { bounded_cstr(input.as_ptr()) }.unwrap();
+        assert_eq!(result, "indra-testnet-1");
+    }
+
+    #[test]
+    fn ffi_intermediate_key_buffers_are_zeroized() {
+        let mut secret = [0xA5u8; 32];
+        secret.fill(0);
+        assert_eq!(secret, [0u8; 32]);
     }
 
     #[test]

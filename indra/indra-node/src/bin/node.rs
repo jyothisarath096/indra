@@ -2072,14 +2072,21 @@ fn main() {
     // ── Thread 5: RPC server ────────────────────────────────────────────────
     // Inline HTTP/JSON-RPC handler — avoids circular dependency with indra-rpc.
     // Reads chain state directly from the driver under a brief lock.
-    {
+    if rpc_should_start(cfg_file.rpc_enabled) {
         let driver_rpc = Arc::clone(&driver);
         let gossip_rpc = Arc::clone(&gossip);
         let discovered_peers_rpc = Arc::clone(&discovered_peers);
         let observer_count_rpc = Arc::clone(&observer_count);
-        let rpc_addr = get_arg("--rpc-addr").unwrap_or_else(|| "127.0.0.1:8545".to_string());
+        let rpc_addr = get_arg("--rpc-addr")
+            .or_else(|| cfg_file.rpc_addr.clone())
+            .unwrap_or_else(|| "127.0.0.1:8545".to_string());
+        if let Some(warning) = rpc_non_loopback_warning(&rpc_addr) {
+            eprintln!("{}", warning);
+        }
+        let rpc_cors_origins = Arc::new(cfg_file.rpc_cors_origins.clone());
         let rpc_conn_count = Arc::new(AtomicU64::new(0));
         let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
+        let utxo_scan_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
         eprintln!("[rpc] listening on {}", rpc_addr);
 
         std::thread::spawn(move || {
@@ -2108,6 +2115,8 @@ fn main() {
                         let observer_count_rpc = Arc::clone(&observer_count_rpc);
                         let rpc_conn_count = Arc::clone(&rpc_conn_count);
                         let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
+                        let utxo_scan_limiter = Arc::clone(&utxo_scan_limiter);
+                        let rpc_cors_origins = Arc::clone(&rpc_cors_origins);
                         std::thread::spawn(move || {
                             handle_rpc(
                                 stream,
@@ -2117,6 +2126,8 @@ fn main() {
                                 &observer_count_rpc,
                                 peer_ip,
                                 &rpc_rate_limiter,
+                                &utxo_scan_limiter,
+                                &rpc_cors_origins,
                             );
                             release_rpc_connection(&rpc_conn_count);
                         });
@@ -2125,6 +2136,8 @@ fn main() {
                 }
             }
         });
+    } else {
+        eprintln!("[rpc] RPC server disabled by config");
     }
 
     // ── Main thread: status printer ─────────────────────────────────────────
@@ -2480,6 +2493,10 @@ peers_file      = "{}/peers.json"
 [rpc]
 addr    = "{}"
 enabled = true
+# Empty admin token disables privileged RPC topology details.
+admin_token = ""
+# Empty allowlist means browsers receive no cross-origin access by default.
+cors_origins = []
 
 [metrics]
 addr    = "{}"
@@ -2645,6 +2662,22 @@ fn release_rpc_connection(count: &AtomicU64) {
     });
 }
 
+fn rpc_non_loopback_warning(addr: &str) -> Option<String> {
+    let parsed = addr.parse::<SocketAddr>().ok()?;
+    if parsed.ip().is_loopback() {
+        None
+    } else {
+        Some(format!(
+            "WARNING: RPC server binding to non-loopback address {}. Ensure firewall rules protect this port. Consider binding to 127.0.0.1 for validator nodes.",
+            parsed
+        ))
+    }
+}
+
+fn rpc_should_start(enabled: Option<bool>) -> bool {
+    enabled.unwrap_or(true)
+}
+
 struct RpcSnapshot {
     chain: indra_state::ChainState,
     mempool_size: usize,
@@ -2771,6 +2804,8 @@ fn handle_rpc(
     observer_count: &Arc<AtomicUsize>,
     peer_ip: Option<IpAddr>,
     rate_limiter: &indra_rpc::server::RpcRateLimiter,
+    utxo_scan_limiter: &indra_rpc::server::RpcWindowRateLimiter,
+    cors_origins: &[String],
 ) {
     use indra_rpc::handlers::{dispatch, DispatchResult, NodeState};
     use indra_rpc::types::{parse_request, RpcResponse};
@@ -2795,7 +2830,8 @@ fn handle_rpc(
     };
 
     let mut content_length = 0usize;
-    let mut is_options = false;
+    let mut method = String::new();
+    let mut origin: Option<String> = None;
     let mut line = String::new();
     let mut first_line = true;
 
@@ -2806,7 +2842,11 @@ fn handle_rpc(
         }
         let trimmed = line.trim();
         if first_line {
-            is_options = trimmed.starts_with("OPTIONS");
+            method = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
             first_line = false;
         }
         if trimmed.is_empty() {
@@ -2818,11 +2858,14 @@ fn handle_rpc(
                 .parse()
                 .unwrap_or(0);
         }
+        if trimmed.to_lowercase().starts_with("origin:") {
+            origin = Some(trimmed["origin:".len()..].trim().to_string());
+        }
     }
 
-    let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
+    let cors = indra_rpc::server::cors_headers(origin.as_deref(), cors_origins);
 
-    if is_options {
+    if method == "OPTIONS" {
         let resp = format!(
             "HTTP/1.1 204 No Content\r\n{}Connection: close\r\n\r\n",
             cors
@@ -2833,18 +2876,35 @@ fn handle_rpc(
         return;
     }
 
+    if method != "POST" {
+        let response = indra_rpc::server::http_json_error(
+            "405 Method Not Allowed",
+            -32600,
+            "Method Not Allowed",
+            &cors,
+        );
+        let _ = stream
+            .try_clone()
+            .map(|mut writer| writer.write_all(response.as_bytes()));
+        return;
+    }
+
     if content_length == 0 {
         let body = r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"empty body"},"id":null}"#;
-        send_http(&stream, cors, body);
+        send_http(&stream, &cors, body);
         return;
     }
 
     if content_length > indra_rpc::server::MAX_RPC_BODY_BYTES {
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","error":{{"code":-32700,"message":"request body exceeds {} bytes"}},"id":null}}"#,
-            indra_rpc::server::MAX_RPC_BODY_BYTES
+        let response = indra_rpc::server::http_json_error(
+            "413 Payload Too Large",
+            -32600,
+            "request body too large",
+            &cors,
         );
-        send_http(&stream, cors, &body);
+        let _ = stream
+            .try_clone()
+            .map(|mut writer| writer.write_all(response.as_bytes()));
         return;
     }
 
@@ -2853,16 +2913,33 @@ fn handle_rpc(
         return;
     }
     let body_str = String::from_utf8_lossy(&body_bytes);
+    if indra_rpc::server::is_batch_request_body(&body_str) {
+        let body = r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"batch requests not supported"},"id":null}"#;
+        send_http(&stream, &cors, body);
+        return;
+    }
 
     let req = match parse_request(&body_str) {
         Ok(request) => request,
         Err(_) => {
             let body =
                 r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"parse error"},"id":null}"#;
-            send_http(&stream, cors, body);
+            send_http(&stream, &cors, body);
             return;
         }
     };
+
+    if indra_rpc::server::is_utxo_scan_method(&req.method) {
+        if let Some(ip) = peer_ip {
+            if !utxo_scan_limiter.allow(ip, indra_rpc::server::UTXO_SCAN_RATE_PER_MIN) {
+                let response = indra_rpc::server::rpc_rate_limited_response();
+                let _ = stream
+                    .try_clone()
+                    .map(|mut writer| writer.write_all(response.as_bytes()));
+                return;
+            }
+        }
+    }
 
     let validator_peer_addrs: Vec<String> = gossip
         .connected_addrs()
@@ -2877,7 +2954,7 @@ fn handle_rpc(
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let body = RpcResponse::err(req.id.clone(), -32000, error).to_json();
-                send_http(&stream, cors, &body);
+                send_http(&stream, &cors, &body);
                 return;
             }
         };
@@ -2998,7 +3075,7 @@ fn handle_rpc(
         }
     };
 
-    send_http(&stream, cors, &response_body);
+    send_http(&stream, &cors, &response_body);
 }
 
 fn send_http(stream: &std::net::TcpStream, cors: &str, body: &str) {
@@ -3225,6 +3302,21 @@ mod tests {
             release_rpc_connection(&rpc_count);
         }
         assert_eq!(rpc_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rpc_server_does_not_start_when_disabled_in_config() {
+        assert!(!rpc_should_start(Some(false)));
+        assert!(rpc_should_start(Some(true)));
+        assert!(rpc_should_start(None));
+    }
+
+    #[test]
+    fn rpc_warns_on_non_loopback_binding() {
+        let warning = rpc_non_loopback_warning("0.0.0.0:8545").unwrap();
+        assert!(warning.contains("non-loopback"));
+        assert!(warning.contains("127.0.0.1"));
+        assert!(rpc_non_loopback_warning("127.0.0.1:8545").is_none());
     }
 
     #[test]

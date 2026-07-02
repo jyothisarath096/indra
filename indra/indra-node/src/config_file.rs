@@ -55,6 +55,10 @@ pub struct NodeConfigFile {
     pub rpc_addr: Option<String>,
     /// `[rpc].enabled`.
     pub rpc_enabled: Option<bool>,
+    /// `[rpc].admin_token`.
+    pub rpc_admin_token: Option<String>,
+    /// `[rpc].cors_origins`.
+    pub rpc_cors_origins: Vec<String>,
     /// `[metrics].addr`.
     pub metrics_addr: Option<String>,
     /// `[metrics].enabled`.
@@ -87,6 +91,8 @@ impl NodeConfigFile {
             peers_file: get_str(&table, "network", "peers_file"),
             rpc_addr: get_str(&table, "rpc", "addr"),
             rpc_enabled: get_bool(&table, "rpc", "enabled"),
+            rpc_admin_token: get_str(&table, "rpc", "admin_token"),
+            rpc_cors_origins: get_str_array(&table, "rpc", "cors_origins"),
             metrics_addr: get_str(&table, "metrics", "addr"),
             metrics_enabled: get_bool(&table, "metrics", "enabled"),
             prune_keep_blocks: get_u64(&table, "storage", "prune_keep_blocks"),
@@ -132,6 +138,13 @@ impl NodeConfigFile {
         if let Some(addr) = self.rpc_addr.as_deref() {
             if !addr.is_empty() && !is_valid_addr(addr) {
                 errors.push("rpc.addr must be valid host:port, empty, or omitted".to_string());
+            }
+        }
+        for origin in &self.rpc_cors_origins {
+            if origin.trim().is_empty() || origin == "*" {
+                errors.push(
+                    "rpc.cors_origins entries must be explicit non-wildcard origins".to_string(),
+                );
             }
         }
         if let Some(keep) = self.prune_keep_blocks {
@@ -379,6 +392,8 @@ peers_file = "/root/.indra/data/peers.json"
 [rpc]
 addr = "127.0.0.1:8545"
 enabled = true
+admin_token = "local-admin"
+cors_origins = ["http://localhost:3000"]
 
 [metrics]
 addr = "0.0.0.0:9615"
@@ -394,6 +409,11 @@ mempool_capacity = 5000
         assert_eq!(cfg.p2p_addr.as_deref(), Some("0.0.0.0:30303"));
         assert_eq!(cfg.bootstrap_peers.len(), 2);
         assert_eq!(cfg.rpc_enabled, Some(true));
+        assert_eq!(cfg.rpc_admin_token.as_deref(), Some("local-admin"));
+        assert_eq!(
+            cfg.rpc_cors_origins,
+            vec!["http://localhost:3000".to_string()]
+        );
         assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9615"));
         assert_eq!(cfg.mempool_capacity, Some(5000));
     }

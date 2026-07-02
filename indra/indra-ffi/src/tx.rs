@@ -22,7 +22,7 @@ pub fn build(
     wallet_context: WalletContext,
 ) -> Result<BuiltTxOwned, IndraError> {
     let recipient_pubkey_hex = hex::encode(recipient_classical_pk);
-    let params = TxParams {
+    let mut params = TxParams {
         chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
         recipient_pubkey_hex: &recipient_pubkey_hex,
         amount_spark,
@@ -33,7 +33,16 @@ pub fn build(
         sender_pubkey: wallet_context.sender_pubkey,
     };
 
-    let built = build_transaction(&params).map_err(IndraError::from)?;
+    let built = match build_transaction(&params) {
+        Ok(built) => built,
+        Err(error) => {
+            params.hybrid_seed.fill(0);
+            params.pq_sk_bytes.fill(0);
+            return Err(IndraError::from(error));
+        }
+    };
+    params.hybrid_seed.fill(0);
+    params.pq_sk_bytes.fill(0);
     let tx_bytes = hex::decode(&built.tx_hex).map_err(|_| IndraError::Internal)?;
     let _ = decode_transaction(&tx_bytes)?;
     let tx_id = tx_id_from_bytes(&tx_bytes);

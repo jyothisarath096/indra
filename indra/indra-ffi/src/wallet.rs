@@ -18,7 +18,7 @@ pub struct WalletContext {
 
 /// Rebuild a CLI wallet and sender pubkey from FFI parameters.
 pub fn build_wallet_context(
-    sender_classical_seed: [u8; 32],
+    mut sender_classical_seed: [u8; 32],
     sender_pq_pk: &[u8],
     utxos: &[IndraUtxoEntry],
 ) -> Result<WalletContext, IndraError> {
@@ -48,6 +48,7 @@ pub fn build_wallet_context(
         classical_pk: Bytes32::from(classical.public_key().0),
         pq_pk,
     };
+    sender_classical_seed.fill(0);
 
     Ok(WalletContext {
         wallet,

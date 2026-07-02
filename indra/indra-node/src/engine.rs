@@ -39,6 +39,7 @@ use indra_crypto::{
 };
 use indra_state::{
     apply::compute_slash_evidence_hash,
+    apply_staking_op,
     epoch::epoch_for_height,
     governance_apply::{apply_governance_op, validate_governance_op},
     ChainState,
@@ -253,6 +254,11 @@ impl NodeEngine {
             .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
         let signer_id = op.signer_id();
         let nonce = op.nonce;
+        let mut scratch = self.state.clone();
+        let chain_id = self.state.chain_id.clone();
+        let validation_height = self.state.height.saturating_add(1);
+        apply_staking_op(&mut scratch, &op, &chain_id, validation_height)
+            .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
         if self
             .staking_mempool
             .iter()
@@ -986,6 +992,33 @@ mod tests {
             nonce,
             signature: dummy_signature(),
         }
+    }
+
+    fn sign_staking_op(op: &mut StakingOp, keypair: &HybridKeypair, chain_id: &str) {
+        let sig = keypair.sign(&op.signing_bytes(chain_id)).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
+    fn valid_set_commission_staking_op(
+        engine: &NodeEngine,
+        keypair: &HybridKeypair,
+        nonce: u64,
+        new_commission_bps: u32,
+    ) -> StakingOp {
+        let validator_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let mut op = StakingOp {
+            body: StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps,
+            },
+            nonce,
+            signature: dummy_signature(),
+        };
+        sign_staking_op(&mut op, keypair, &engine.state.chain_id);
+        op
     }
 
     fn governance_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
@@ -1740,7 +1773,8 @@ mod tests {
         let dir = temp_dir("staking_mempool_dedup");
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
-        let op = dummy_staking_op(0x11, 1);
+        let keypair = install_active_validator(&mut engine, [0x71; 32], "stake");
+        let op = valid_set_commission_staking_op(&engine, &keypair, 1, 1_100);
 
         engine.add_staking_op(op.clone()).unwrap();
         assert!(matches!(
@@ -1748,6 +1782,22 @@ mod tests {
             Err(NodeError::InvalidStakingOp(_))
         ));
         assert_eq!(engine.staking_mempool.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staking_mempool_rejects_structurally_invalid_staking_op_at_admission() {
+        let dir = temp_dir("staking_mempool_invalid");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let op = dummy_staking_op(0x11, 1);
+
+        assert!(matches!(
+            engine.add_staking_op(op),
+            Err(NodeError::InvalidStakingOp(_))
+        ));
+        assert!(engine.staking_mempool.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1818,8 +1868,10 @@ mod tests {
         let dir = temp_dir("staking_mempool_evict");
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
-        let committed = dummy_staking_op(0x11, 1);
-        let retained = dummy_staking_op(0x11, 2);
+        let keypair = install_active_validator(&mut engine, [0x72; 32], "stake");
+        let retained_keypair = install_active_validator(&mut engine, [0x73; 32], "stake2");
+        let committed = valid_set_commission_staking_op(&engine, &keypair, 1, 1_100);
+        let retained = valid_set_commission_staking_op(&engine, &retained_keypair, 1, 1_200);
 
         engine.add_staking_op(committed.clone()).unwrap();
         engine.add_staking_op(retained.clone()).unwrap();

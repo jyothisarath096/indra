@@ -40,6 +40,9 @@ typedef struct {
     uint8_t validator_id[INDRA_VALIDATOR_ID_BYTES];
     uint8_t classical_pk[INDRA_CLASSICAL_PK_BYTES];
     uint8_t pq_pk[INDRA_PQ_PK_BYTES];
+    /* PRIVATE KEY MATERIAL below. MANDATORY: call indra_zeroize_keypair()
+       immediately after extracting needed fields. Failure to zeroize leaves
+       private key material in caller memory. */
     uint8_t classical_seed[INDRA_CLASSICAL_SK_BYTES];
     uint8_t pq_sk[INDRA_PQ_SK_BYTES];
     uint8_t bls_seed[INDRA_BYTES32_LEN];

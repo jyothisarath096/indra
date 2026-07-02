@@ -1,7 +1,7 @@
 //! C FFI builders for INDRA staking operations.
 
 use std::{
-    ffi::{c_char, CStr},
+    ffi::c_char,
     panic::{catch_unwind, UnwindSafe},
 };
 
@@ -14,7 +14,8 @@ use indra_core::types::primitives::Bytes32;
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
 use crate::{
-    errors::IndraError, CLASSICAL_SK_BYTES, INDRA_OP_HEX_MAX_BYTES, PQ_PK_BYTES, PQ_SK_BYTES,
+    bounded_cstr, errors::IndraError, CLASSICAL_SK_BYTES, INDRA_OP_HEX_MAX_BYTES, PQ_PK_BYTES,
+    PQ_SK_BYTES,
 };
 
 fn reconstruct_keypair(
@@ -47,14 +48,14 @@ pub(crate) unsafe fn read_keypair(
     pk.copy_from_slice(std::slice::from_raw_parts(pq_pk, PQ_PK_BYTES));
     let mut sk = [0u8; PQ_SK_BYTES];
     sk.copy_from_slice(std::slice::from_raw_parts(pq_sk, PQ_SK_BYTES));
-    reconstruct_keypair(&seed, &pk, &sk)
+    let result = reconstruct_keypair(&seed, &pk, &sk);
+    seed.fill(0);
+    sk.fill(0);
+    result
 }
 
 pub(crate) unsafe fn read_chain_id(chain_id: *const c_char) -> Result<String, IndraError> {
-    CStr::from_ptr(chain_id)
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| IndraError::InvalidParam)
+    bounded_cstr(chain_id)
 }
 
 pub(crate) unsafe fn write_hex_to_buf(

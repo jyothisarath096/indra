@@ -1,7 +1,7 @@
 //! C FFI builders for INDRA governance operations.
 
 use std::{
-    ffi::{c_char, CStr},
+    ffi::c_char,
     panic::{catch_unwind, UnwindSafe},
 };
 
@@ -19,6 +19,7 @@ use indra_crypto::{hybrid::HybridKeypair, sha256};
 use serde_json::Value;
 
 use crate::{
+    bounded_cstr,
     errors::IndraError,
     staking::{read_bytes32, read_chain_id, read_keypair, write_hex_to_buf},
 };
@@ -63,10 +64,8 @@ fn build_governance_op(
 }
 
 fn parse_action_json(action_json: *const c_char) -> Result<GovernableAction, IndraError> {
-    let raw = unsafe { CStr::from_ptr(action_json) }
-        .to_str()
-        .map_err(|_| IndraError::InvalidJson)?;
-    let value: Value = serde_json::from_str(raw).map_err(|_| IndraError::InvalidJson)?;
+    let raw = unsafe { bounded_cstr(action_json) }.map_err(|_| IndraError::InvalidJson)?;
+    let value: Value = serde_json::from_str(&raw).map_err(|_| IndraError::InvalidJson)?;
     let action_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -229,12 +228,8 @@ pub unsafe extern "C" fn indra_build_governance_propose(
             out_len,
         },
         |keypair| {
-            let title_str = CStr::from_ptr(title)
-                .to_str()
-                .map_err(|_| IndraError::InvalidParam)?;
-            let description_str = CStr::from_ptr(description)
-                .to_str()
-                .map_err(|_| IndraError::InvalidParam)?;
+            let title_str = bounded_cstr(title)?;
+            let description_str = bounded_cstr(description)?;
             Ok(GovernancePayload::Propose {
                 action: parse_action_json(action_json)?,
                 deposit_utxo_id: Bytes32::from(read_bytes32(deposit_utxo_id)),
