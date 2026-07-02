@@ -54,5 +54,5 @@ pub mod types;
 
 pub use error::{RpcError, RpcResult};
 pub use handlers::{dispatch, DispatchResult, NetworkContext, NodeState};
-pub use server::RpcServer;
+pub use server::{RpcRateLimiter, RpcServer, MAX_RPC_CONNECTIONS, RPC_REQUEST_TIMEOUT};
 pub use types::{RpcErrorBody, RpcRequest, RpcResponse};

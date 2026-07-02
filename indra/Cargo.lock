@@ -513,6 +513,7 @@ dependencies = [
  "indra-node",
  "indra-rpc",
  "indra-state",
+ "libc",
  "rand 0.8.6",
  "thiserror",
 ]

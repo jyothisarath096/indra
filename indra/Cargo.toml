@@ -38,6 +38,7 @@ zeroize            = { version = "1.7", default-features = false, features = ["a
 rand_core          = { version = "0.6", default-features = false }
 rand               = { version = "0.8", default-features = false, features = ["std"] }
 toml               = { version = "0.8", default-features = false, features = ["parse"] }
+libc               = { version = "0.2" }
 
 [profile.release]
 opt-level     = 3

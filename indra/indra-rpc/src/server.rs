@@ -24,10 +24,11 @@
 //! // server.run(); // blocks forever
 //! ```
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     error::{ERR_INTERNAL_ERROR, ERR_PARSE_ERROR},
@@ -37,6 +38,99 @@ use crate::{
 
 /// Read timeout for client connections.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent RPC connections accepted by the node.
+pub const MAX_RPC_CONNECTIONS: u64 = 64;
+
+/// Maximum RPC requests per second accepted from one IP address.
+pub const RPC_RATE_LIMIT_PER_SEC: u64 = 20;
+
+/// Maximum burst of RPC requests accepted from one IP address.
+pub const RPC_RATE_BURST: u64 = 40;
+
+/// Maximum RPC request body size.
+pub const MAX_RPC_BODY_BYTES: usize = 1_048_576;
+
+/// Per-request timeout for blocking stdlib RPC handlers.
+pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minimal token bucket for RPC request admission.
+#[derive(Debug, Clone)]
+pub struct RpcTokenBucket {
+    tokens: u64,
+    capacity: u64,
+    refill_per_sec: u64,
+    last_refill: Instant,
+}
+
+impl RpcTokenBucket {
+    /// Create a token bucket with the given refill rate and burst capacity.
+    pub fn new(refill_per_sec: u64, capacity: u64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_per_sec,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Try to consume one request token.
+    pub fn allow(&mut self) -> bool {
+        self.refill();
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens = self.tokens.saturating_sub(1);
+        true
+    }
+
+    fn refill(&mut self) {
+        let elapsed = self.last_refill.elapsed().as_secs();
+        if elapsed == 0 {
+            return;
+        }
+        let added = elapsed.saturating_mul(self.refill_per_sec);
+        self.tokens = self.tokens.saturating_add(added).min(self.capacity);
+        self.last_refill = Instant::now();
+    }
+}
+
+/// Shared per-IP RPC limiter.
+#[derive(Debug, Default)]
+pub struct RpcRateLimiter {
+    buckets: Mutex<HashMap<IpAddr, RpcTokenBucket>>,
+}
+
+impl RpcRateLimiter {
+    /// Create an empty RPC rate limiter.
+    pub fn new() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return true if a request from `ip` is within the rate limit.
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        let mut buckets = match self.buckets.lock() {
+            Ok(buckets) => buckets,
+            Err(_) => return false,
+        };
+        buckets
+            .entry(ip)
+            .or_insert_with(|| RpcTokenBucket::new(RPC_RATE_LIMIT_PER_SEC, RPC_RATE_BURST))
+            .allow()
+    }
+}
+
+/// Build an HTTP 429 response body.
+pub fn rpc_rate_limited_response() -> String {
+    let body = r#"{"jsonrpc":"2.0","error":{"code":-32029,"message":"RPC rate limit exceeded"},"id":null}"#;
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
 
 /// The JSON-RPC HTTP server.
 pub struct RpcServer<E> {
@@ -142,7 +236,16 @@ where
         }
 
         // Read body
-        let mut body = vec![0u8; content_length.min(1_048_576)]; // max 1 MB
+        if content_length > MAX_RPC_BODY_BYTES {
+            return Ok(RpcResponse::err(
+                JsonId::Null,
+                ERR_PARSE_ERROR,
+                format!("request body exceeds {} bytes", MAX_RPC_BODY_BYTES),
+            )
+            .to_json());
+        }
+
+        let mut body = vec![0u8; content_length];
         use std::io::Read;
         reader.read_exact(&mut body)?;
         let body_str = String::from_utf8_lossy(&body);
@@ -239,7 +342,16 @@ fn read_and_process_ref<E: RpcEngineView>(
         .to_json());
     }
 
-    let mut body = vec![0u8; content_length.min(1_048_576)];
+    if content_length > MAX_RPC_BODY_BYTES {
+        return Ok(RpcResponse::err(
+            JsonId::Null,
+            ERR_PARSE_ERROR,
+            format!("request body exceeds {} bytes", MAX_RPC_BODY_BYTES),
+        )
+        .to_json());
+    }
+
+    let mut body = vec![0u8; content_length];
     use std::io::Read;
     reader.read_exact(&mut body)?;
     let body_str = String::from_utf8_lossy(&body);
@@ -377,5 +489,24 @@ mod tests {
         let engine = ChainState::new_genesis();
         let resp = call_rpc("indra_getValidatorSet", &[], &engine);
         assert!(resp.contains("\"validators\""));
+    }
+
+    #[test]
+    fn rpc_per_ip_rate_limit_returns_429() {
+        let ip = "203.0.113.9".parse().unwrap();
+        let limiter = RpcRateLimiter::new();
+        for _ in 0..RPC_RATE_BURST {
+            assert!(limiter.allow(ip));
+        }
+        assert!(!limiter.allow(ip));
+
+        let response = rpc_rate_limited_response();
+        assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(response.contains("RPC rate limit exceeded"));
+    }
+
+    #[test]
+    fn oversized_rpc_body_limit_is_documented() {
+        assert_eq!(MAX_RPC_BODY_BYTES, 1_048_576);
     }
 }

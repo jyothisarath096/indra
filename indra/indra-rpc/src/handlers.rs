@@ -478,37 +478,20 @@ fn get_utxos(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     ))
 }
 
-/// `indra_getPeers` — returns connected peer counts.
+/// `indra_getPeers` — returns public aggregate peer counts.
 fn get_peers(state: &NodeState<'_>) -> RpcResult<String> {
     match &state.network {
         None => Ok(
-            r#"{"connected":[],"connected_count":0,"discovered_count":0,"validator_peers":[],"observer_peer_count":0}"#
+            r#"{"peer_count":0,"target_peers":0,"discovered_count":0,"observer_peer_count":0}"#
                 .to_string(),
         ),
-        Some(network) => {
-            let connected_json = format!(
-                "[{}]",
-                network
-                    .validator_peer_addrs
-                    .iter()
-                    .map(|addr| format!(r#""{}""#, addr))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            let validator_peers: Vec<String> = network
-                .validator_peer_addrs
-                .iter()
-                .map(|addr| format!(r#"{{"addr":"{}"}}"#, addr))
-                .collect();
-            Ok(format!(
-                r#"{{"connected":{},"connected_count":{},"discovered_count":{},"validator_peers":[{}],"observer_peer_count":{}}}"#,
-                connected_json,
-                network.validator_peer_addrs.len(),
-                network.discovered_peer_count,
-                validator_peers.join(","),
-                network.observer_peer_count,
-            ))
-        }
+        Some(network) => Ok(format!(
+            r#"{{"peer_count":{},"target_peers":{},"discovered_count":{},"observer_peer_count":{}}}"#,
+            network.validator_peer_addrs.len(),
+            indra_core::types::primitives::TARGET_OUTBOUND_PEERS,
+            network.discovered_peer_count,
+            network.observer_peer_count,
+        )),
     }
 }
 
@@ -1568,5 +1551,29 @@ mod tests {
             hex::encode(target_id.0)
         )));
         assert!(result.contains(r#""target_name":"target""#));
+    }
+
+    #[test]
+    fn get_peers_public_returns_only_count() {
+        let engine = make_state("peers");
+        let state = NodeState::with_network(
+            &engine,
+            vec![
+                "203.0.113.10:30303".to_string(),
+                "198.51.100.22:30303".to_string(),
+            ],
+            7,
+            3,
+        );
+
+        let result = get_peers(&state).unwrap();
+
+        assert!(result.contains(r#""peer_count":2"#));
+        assert!(result.contains(r#""target_peers":"#));
+        assert!(result.contains(r#""discovered_count":7"#));
+        assert!(!result.contains("203.0.113.10"));
+        assert!(!result.contains("198.51.100.22"));
+        assert!(!result.contains("validator_peers"));
+        assert!(!result.contains("connected\""));
     }
 }

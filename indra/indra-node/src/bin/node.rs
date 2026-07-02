@@ -53,6 +53,7 @@ const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
 const MAX_INBOUND_PER_IP: u8 = 3;
 const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
+const MAX_RPC_CONNECTIONS: u64 = indra_rpc::server::MAX_RPC_CONNECTIONS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
@@ -2077,6 +2078,8 @@ fn main() {
         let discovered_peers_rpc = Arc::clone(&discovered_peers);
         let observer_count_rpc = Arc::clone(&observer_count);
         let rpc_addr = get_arg("--rpc-addr").unwrap_or_else(|| "127.0.0.1:8545".to_string());
+        let rpc_conn_count = Arc::new(AtomicU64::new(0));
+        let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
         eprintln!("[rpc] listening on {}", rpc_addr);
 
         std::thread::spawn(move || {
@@ -2090,10 +2093,21 @@ fn main() {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        if !reserve_rpc_connection(&rpc_conn_count) {
+                            eprintln!(
+                                "[rpc] connection limit reached ({}), dropping new connection",
+                                MAX_RPC_CONNECTIONS
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
                         let driver_rpc = Arc::clone(&driver_rpc);
                         let gossip_rpc = Arc::clone(&gossip_rpc);
                         let discovered_peers_rpc = Arc::clone(&discovered_peers_rpc);
                         let observer_count_rpc = Arc::clone(&observer_count_rpc);
+                        let rpc_conn_count = Arc::clone(&rpc_conn_count);
+                        let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
                         std::thread::spawn(move || {
                             handle_rpc(
                                 stream,
@@ -2101,7 +2115,10 @@ fn main() {
                                 &gossip_rpc,
                                 &discovered_peers_rpc,
                                 &observer_count_rpc,
+                                peer_ip,
+                                &rpc_rate_limiter,
                             );
+                            release_rpc_connection(&rpc_conn_count);
                         });
                     }
                     Err(e) => eprintln!("[rpc] accept error: {}", e),
@@ -2604,6 +2621,143 @@ fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
     arr
 }
 
+fn reserve_rpc_connection(count: &AtomicU64) -> bool {
+    let mut current = count.load(Ordering::Relaxed);
+    loop {
+        if current >= MAX_RPC_CONNECTIONS {
+            return false;
+        }
+        match count.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn release_rpc_connection(count: &AtomicU64) {
+    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+struct RpcSnapshot {
+    chain: indra_state::ChainState,
+    mempool_size: usize,
+    pruned_mode: bool,
+    lowest_block: u64,
+    blocks_retained: usize,
+    latest_epoch: Option<u64>,
+    epoch_records: HashMap<u64, indra_core::EpochRecord>,
+    migration_history: Vec<indra_rpc::handlers::MigrationRecordView>,
+}
+
+impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
+    fn chain_state(&self) -> &indra_state::ChainState {
+        &self.chain
+    }
+
+    fn mempool_size(&self) -> usize {
+        self.mempool_size
+    }
+
+    fn pruned_mode(&self) -> bool {
+        self.pruned_mode
+    }
+
+    fn lowest_block(&self) -> u64 {
+        self.lowest_block
+    }
+
+    fn blocks_retained(&self) -> usize {
+        self.blocks_retained
+    }
+
+    fn get_epoch_record(&self, epoch: u64) -> Result<Option<indra_core::EpochRecord>, String> {
+        Ok(self.epoch_records.get(&epoch).cloned())
+    }
+
+    fn latest_epoch(&self) -> Result<Option<u64>, String> {
+        Ok(self.latest_epoch)
+    }
+
+    fn get_epoch_range(
+        &self,
+        to_epoch: u64,
+        limit: usize,
+    ) -> Result<Vec<indra_core::EpochRecord>, String> {
+        let mut epochs: Vec<u64> = self
+            .epoch_records
+            .keys()
+            .copied()
+            .filter(|epoch| *epoch <= to_epoch)
+            .collect();
+        epochs.sort_by(|a, b| b.cmp(a));
+        Ok(epochs
+            .into_iter()
+            .take(limit)
+            .filter_map(|epoch| self.epoch_records.get(&epoch).cloned())
+            .collect())
+    }
+
+    fn migration_history(&self) -> Result<Vec<indra_rpc::handlers::MigrationRecordView>, String> {
+        Ok(self.migration_history.clone())
+    }
+}
+
+fn snapshot_rpc_state(
+    driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+) -> Result<RpcSnapshot, String> {
+    let guard = driver
+        .lock()
+        .map_err(|_| "consensus driver lock poisoned".to_string())?;
+    let engine = &guard.engine;
+    let latest_epoch = engine.epoch_store.latest_epoch();
+    let epoch_records = match latest_epoch {
+        Some(latest) => {
+            let limit = usize::try_from(latest.saturating_add(1))
+                .unwrap_or(usize::MAX)
+                .min(10_000);
+            engine
+                .epoch_store
+                .get_range(latest, limit)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|record| (record.epoch, record))
+                .collect()
+        }
+        None => HashMap::new(),
+    };
+    let migration_history = engine
+        .migration_log
+        .load_all()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|record| indra_rpc::handlers::MigrationRecordView {
+            timestamp_secs: record.timestamp_secs,
+            from_version: record.from_version,
+            to_version: record.to_version,
+            state_height: record.state_height,
+            validators_migrated: record.validators_migrated,
+            utxos_migrated: record.utxos_migrated,
+        })
+        .collect();
+    Ok(RpcSnapshot {
+        chain: engine.state.clone(),
+        mempool_size: engine.mempool.len(),
+        pruned_mode: !engine.block_store.is_archive(),
+        lowest_block: engine.block_store.lowest_height(),
+        blocks_retained: engine.block_store.len(),
+        latest_epoch,
+        epoch_records,
+        migration_history,
+    })
+}
+
 /// Inline JSON-RPC handler for the node binary.
 ///
 /// Reads one HTTP request, dispatches to the appropriate chain query,
@@ -2615,12 +2769,25 @@ fn handle_rpc(
     gossip: &Arc<NetworkBridge>,
     discovered_peers: &Arc<Mutex<HashSet<String>>>,
     observer_count: &Arc<AtomicUsize>,
+    peer_ip: Option<IpAddr>,
+    rate_limiter: &indra_rpc::server::RpcRateLimiter,
 ) {
     use indra_rpc::handlers::{dispatch, DispatchResult, NodeState};
     use indra_rpc::types::{parse_request, RpcResponse};
     use std::io::{BufRead, BufReader, Read};
 
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(indra_rpc::server::RPC_REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(indra_rpc::server::RPC_REQUEST_TIMEOUT));
+
+    if let Some(ip) = peer_ip {
+        if !rate_limiter.allow(ip) {
+            let response = indra_rpc::server::rpc_rate_limited_response();
+            let _ = stream
+                .try_clone()
+                .map(|mut writer| writer.write_all(response.as_bytes()));
+            return;
+        }
+    }
 
     let mut reader = match stream.try_clone() {
         Ok(stream) => BufReader::new(stream),
@@ -2672,7 +2839,16 @@ fn handle_rpc(
         return;
     }
 
-    let mut body_bytes = vec![0u8; content_length.min(1_048_576)];
+    if content_length > indra_rpc::server::MAX_RPC_BODY_BYTES {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","error":{{"code":-32700,"message":"request body exceeds {} bytes"}},"id":null}}"#,
+            indra_rpc::server::MAX_RPC_BODY_BYTES
+        );
+        send_http(&stream, cors, &body);
+        return;
+    }
+
+    let mut body_bytes = vec![0u8; content_length];
     if reader.read_exact(&mut body_bytes).is_err() {
         return;
     }
@@ -2688,23 +2864,29 @@ fn handle_rpc(
         }
     };
 
-    let response_body = {
-        let mut guard = driver.lock().unwrap();
-        let validator_peer_addrs: Vec<String> = gossip
-            .connected_addrs()
-            .iter()
-            .map(|addr| addr.to_string())
-            .collect();
-        let discovered_count = discovered_peers.lock().unwrap().len();
-        let observer_count_val = observer_count.load(Ordering::Relaxed);
+    let validator_peer_addrs: Vec<String> = gossip
+        .connected_addrs()
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    let discovered_count = discovered_peers.lock().unwrap().len();
+    let observer_count_val = observer_count.load(Ordering::Relaxed);
 
+    let response_body = {
+        let snapshot = match snapshot_rpc_state(driver) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let body = RpcResponse::err(req.id.clone(), -32000, error).to_json();
+                send_http(&stream, cors, &body);
+                return;
+            }
+        };
         let state = NodeState::with_network(
-            &guard.engine,
+            &snapshot,
             validator_peer_addrs,
             discovered_count,
             observer_count_val,
         );
-
         match dispatch(&req.method, &req.params, &state) {
             DispatchResult::Ready(Ok(result)) => RpcResponse::ok(req.id.clone(), result).to_json(),
             DispatchResult::Ready(Err(error)) => {
@@ -2715,7 +2897,12 @@ fn handle_rpc(
                 use indra_core::codec::Decode;
                 use indra_core::types::staking::StakingOp;
                 match StakingOp::decode_exact(&op_bytes) {
-                    Ok(op) => match guard.engine.add_staking_op(op) {
+                    Ok(op) => match driver
+                        .lock()
+                        .map_err(|_| "consensus driver lock poisoned".to_string())
+                        .and_then(|mut guard| {
+                            guard.engine.add_staking_op(op).map_err(|e| e.to_string())
+                        }) {
                         Ok(()) => {
                             RpcResponse::ok(req.id.clone(), r#"{"status":"accepted"}"#.to_string())
                                 .to_json()
@@ -2737,7 +2924,15 @@ fn handle_rpc(
                 use indra_core::codec::Decode;
                 use indra_core::types::governance::GovernanceOpV2;
                 match GovernanceOpV2::decode_exact(&op_bytes) {
-                    Ok(op) => match guard.engine.add_governance_op(op) {
+                    Ok(op) => match driver
+                        .lock()
+                        .map_err(|_| "consensus driver lock poisoned".to_string())
+                        .and_then(|mut guard| {
+                            guard
+                                .engine
+                                .add_governance_op(op)
+                                .map_err(|e| e.to_string())
+                        }) {
                         Ok(()) => {
                             RpcResponse::ok(req.id.clone(), r#"{"status":"accepted"}"#.to_string())
                                 .to_json()
@@ -2761,8 +2956,18 @@ fn handle_rpc(
                 let mut reader = ByteReader::new(&tx_bytes);
                 match TransactionV1::decode(&mut reader) {
                     Ok(tx) => {
-                        let state = guard.engine.state.clone();
-                        match guard.engine.mempool.submit_validated(tx.clone(), &state) {
+                        let submit_result = driver
+                            .lock()
+                            .map_err(|_| "consensus driver lock poisoned".to_string())
+                            .and_then(|mut guard| {
+                                let state = guard.engine.state.clone();
+                                guard
+                                    .engine
+                                    .mempool
+                                    .submit_validated(tx.clone(), &state)
+                                    .map_err(|e| e.to_string())
+                            });
+                        match submit_result {
                             Ok(tx_id) => {
                                 gossip.broadcast(&Message::Tx(tx));
                                 RpcResponse::ok(
@@ -3004,6 +3209,46 @@ mod tests {
             release_inbound_connection(&inbound_count, &inbound_by_ip, ip);
         }
         assert_eq!(inbound_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rpc_connection_limit_is_enforced() {
+        let rpc_count = AtomicU64::new(0);
+
+        for _ in 0..MAX_RPC_CONNECTIONS {
+            assert!(reserve_rpc_connection(&rpc_count));
+        }
+
+        assert!(!reserve_rpc_connection(&rpc_count));
+
+        for _ in 0..MAX_RPC_CONNECTIONS {
+            release_rpc_connection(&rpc_count);
+        }
+        assert_eq!(rpc_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rpc_read_state_is_consistent_snapshot() {
+        let mut chain = indra_state::ChainState::new_genesis();
+        chain.height = 42;
+        let snapshot = RpcSnapshot {
+            chain,
+            mempool_size: 3,
+            pruned_mode: false,
+            lowest_block: 0,
+            blocks_retained: 43,
+            latest_epoch: None,
+            epoch_records: HashMap::new(),
+            migration_history: Vec::new(),
+        };
+        let state = indra_rpc::handlers::NodeState::with_network(&snapshot, Vec::new(), 0, 0);
+
+        match indra_rpc::handlers::dispatch("indra_getHeight", &[], &state) {
+            indra_rpc::handlers::DispatchResult::Ready(Ok(result)) => {
+                assert_eq!(result, r#"{"height":42}"#);
+            }
+            _ => panic!("height query should be served from snapshot"),
+        }
     }
 
     #[test]

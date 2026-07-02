@@ -47,8 +47,9 @@ pub mod wallet;
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
 pub use keygen::{
-    generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs, recover_from_mnemonic,
-    KeysFile, ValidatorKeys,
+    generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs,
+    has_secret_value_in_argv, recover_from_mnemonic, warn_if_key_file_permissive,
+    write_keys_file_secure, KeysFile, ValidatorKeys,
 };
 pub use query::{rpc_call, QueryResult};
 pub use staking::{

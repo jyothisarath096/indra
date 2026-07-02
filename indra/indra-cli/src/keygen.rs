@@ -40,6 +40,9 @@ use indra_crypto::{
 
 use crate::error::{CliError, CliResult};
 
+/// Required filesystem mode for key files on Unix: owner read/write only.
+pub const KEY_FILE_MODE: u32 = 0o600;
+
 /// All public keys for a validator.
 #[derive(Debug, Clone)]
 pub struct ValidatorKeys {
@@ -142,9 +145,72 @@ impl KeysFile {
 
     /// Load and parse a `keys.json` file from disk.
     pub fn load(path: &str) -> CliResult<Self> {
+        warn_if_key_file_permissive(path);
         let json =
             std::fs::read_to_string(path).map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
         Self::from_json(&json)
+    }
+}
+
+/// Return true if a secret-bearing CLI flag was supplied with an argv value.
+///
+/// `--recover` and `--passphrase` are allowed only as prompt-triggering flags.
+/// Supplying the secret as the next argv value leaks it through shell history
+/// and process listings, so callers must reject that shape.
+pub fn has_secret_value_in_argv(args: &[String], flag: &str) -> bool {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|idx| args.get(idx.saturating_add(1)))
+        .is_some_and(|next| !next.starts_with("--"))
+}
+
+/// Securely write a key file with owner-only permissions.
+pub fn write_keys_file_secure(path: &str, contents: &str) -> CliResult<()> {
+    write_secret_file_secure(path, contents.as_bytes())
+}
+
+#[cfg(unix)]
+fn write_secret_file_secure(path: &str, contents: &[u8]) -> CliResult<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(KEY_FILE_MODE)
+        .open(path)
+        .map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
+    file.write_all(contents)
+        .map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
+    file.sync_all()
+        .map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE))
+        .map_err(|e| CliError::Io(format!("{}: {}", path, e)))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_secret_file_secure(path: &str, contents: &[u8]) -> CliResult<()> {
+    std::fs::write(path, contents).map_err(|e| CliError::Io(format!("{}: {}", path, e)))
+}
+
+/// Print a warning if an existing key file is readable by group/other users.
+pub fn warn_if_key_file_permissive(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "WARNING: {} has permissive permissions ({:o}). Run: chmod 600 {}",
+                path, mode, path
+            );
+        }
     }
 }
 
@@ -256,6 +322,11 @@ pub fn generate_keypairs(
 /// This is NOT cryptographically secure — use proper random seeds in production.
 /// This is for testnet convenience only.
 pub fn generate_from_passphrase(passphrase: &str, name: String) -> CliResult<KeysFile> {
+    eprintln!(
+        "WARNING: passphrase-derived key generation uses SHA-256, NOT a password KDF \
+         (bcrypt/argon2/scrypt). This is NOT suitable for mainnet or production use. \
+         Use secure mnemonic generation for production keys."
+    );
     use indra_crypto::hash::domain_hash;
     let hybrid_seed = domain_hash(b"INDRA-KEYGEN-HYBRID-v1", passphrase.as_bytes());
     let bls_seed = domain_hash(b"INDRA-KEYGEN-BLS-v1", passphrase.as_bytes());
@@ -354,6 +425,48 @@ mod tests {
         let k2 = generate_from_passphrase("testnet-validator-1", "validator".to_string()).unwrap();
         assert_eq!(k1.public.validator_id, k2.public.validator_id);
         assert_eq!(k1.name, "validator");
+    }
+
+    #[test]
+    fn keygen_does_not_accept_mnemonic_as_argv() {
+        let args = vec![
+            "indra-keygen".to_string(),
+            "--recover".to_string(),
+            "abandon abandon abandon".to_string(),
+        ];
+        assert!(has_secret_value_in_argv(&args, "--recover"));
+
+        let prompt_only = vec!["indra-keygen".to_string(), "--recover".to_string()];
+        assert!(!has_secret_value_in_argv(&prompt_only, "--recover"));
+    }
+
+    #[test]
+    fn passphrase_secret_value_in_argv_is_detected() {
+        let args = vec![
+            "indra-keygen".to_string(),
+            "--passphrase".to_string(),
+            "correct horse battery staple".to_string(),
+        ];
+        assert!(has_secret_value_in_argv(&args, "--passphrase"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keys_json_written_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "indra_keys_mode_{}_{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        write_keys_file_secure(&path_str, "{}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, KEY_FILE_MODE);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

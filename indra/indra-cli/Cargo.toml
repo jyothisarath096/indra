@@ -17,6 +17,7 @@ thiserror.workspace = true
 hex.workspace = true
 bip39.workspace = true
 rand.workspace = true
+libc.workspace = true
 indra-bulletproofs = { path = "../indra-bulletproofs" }
 curve25519-dalek.workspace = true
 
