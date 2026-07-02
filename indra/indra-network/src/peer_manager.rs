@@ -26,13 +26,17 @@ use crate::{
     message::Message,
     net_types::{NetworkCommand, NetworkEvent},
     peer::{PeerTable, ScoreEvent, BAN_DURATION_RATE_LIMIT},
-    rate_limit::{GlobalRateLimiter, MessageClass, PeerRateLimiter},
+    rate_limit::{
+        GlobalRateLimiter, MessageClass, PeerRateLimiter, RateLimitReason,
+        RateLimitViolation as RateLimitViolationInfo,
+    },
 };
 
 const SMALL_QUEUE_CAPACITY: usize = 256;
 const LARGE_QUEUE_CAPACITY: usize = 4;
 const TIE_BREAK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CONSENSUS_DUPLICATE_FILTER_CAPACITY: usize = 512;
+const STATUS_COALESCE_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -52,7 +56,7 @@ enum PeerManagerMessage {
     RateLimitViolation {
         validator_id: Bytes32,
         addr: SocketAddr,
-        penalty: i32,
+        violation: RateLimitViolationInfo,
     },
     InboundMessage {
         validator_id: Bytes32,
@@ -151,6 +155,38 @@ impl ConsensusDuplicateFilter {
     }
 }
 
+struct StatusCoalescer {
+    last_forwarded: Option<Instant>,
+    window: Duration,
+}
+
+impl StatusCoalescer {
+    fn new(window: Duration) -> Self {
+        Self {
+            last_forwarded: None,
+            window,
+        }
+    }
+
+    /// Returns true when a Status message is inside the coalescing window and
+    /// should be dropped before it takes driver-lock time. Non-Status messages
+    /// are never coalesced.
+    fn should_drop(&mut self, msg: &Message, now: Instant) -> bool {
+        if !matches!(msg, Message::Status { .. }) {
+            return false;
+        }
+        if self
+            .last_forwarded
+            .map(|last| now.duration_since(last) < self.window)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.last_forwarded = Some(now);
+        false
+    }
+}
+
 fn consensus_message_key(msg: &Message) -> Option<ConsensusMessageKey> {
     let wire = msg.encode_wire().ok()?;
     let content_hash = Bytes32::from(sha256(&wire));
@@ -228,6 +264,21 @@ fn message_queue(msg: &Message) -> QueueType {
         }
         _ => QueueType::Small,
     }
+}
+
+fn format_rate_limit_log(
+    addr: SocketAddr,
+    validator_id: Bytes32,
+    violation: RateLimitViolationInfo,
+) -> String {
+    format!(
+        "[p2p] rate limit: dropped {:?} message from {} (validator {}), reason={:?}, penalty=-{}",
+        violation.class,
+        addr,
+        short_validator_id(&validator_id),
+        violation.reason,
+        violation.penalty,
+    )
 }
 
 async fn write_message(
@@ -321,11 +372,22 @@ impl PeerManagerActor {
             PeerManagerMessage::RateLimitViolation {
                 validator_id,
                 addr,
-                penalty,
+                violation,
             } => {
+                if violation.reason == RateLimitReason::Count
+                    && violation.class.is_protocol_necessary_for_validators()
+                {
+                    eprintln!(
+                        "[p2p] dropping excess {:?} from authenticated validator {} ({}) — no score penalty",
+                        violation.class,
+                        short_validator_id(&validator_id),
+                        addr,
+                    );
+                    return;
+                }
                 self.peer_table.adjust_score_with_duration(
                     &addr,
-                    -penalty,
+                    -violation.penalty,
                     BAN_DURATION_RATE_LIMIT,
                 );
                 if self
@@ -341,12 +403,7 @@ impl PeerManagerActor {
                     );
                     self.drop_peer(validator_id, addr).await;
                 } else {
-                    eprintln!(
-                        "[p2p] rate limit: dropped message from {} (validator {}), penalty=-{}",
-                        addr,
-                        short_validator_id(&validator_id),
-                        penalty,
-                    );
+                    eprintln!("{}", format_rate_limit_log(addr, validator_id, violation));
                 }
             }
             PeerManagerMessage::InboundMessage {
@@ -440,9 +497,10 @@ impl PeerManagerActor {
 
         let read_task = tokio::spawn(async move {
             let mut reader = FrameReader::new(reader_half, recv_key);
-            let mut rate_limiter = PeerRateLimiter::new();
+            let mut rate_limiter = PeerRateLimiter::new_for_authenticated_validator();
             let mut duplicate_filter =
                 ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
+            let mut status_coalescer = StatusCoalescer::new(STATUS_COALESCE_WINDOW);
             loop {
                 let plaintext = match reader.read_frame().await {
                     Ok(bytes) => bytes,
@@ -479,12 +537,15 @@ impl PeerManagerActor {
                         continue;
                     }
                 }
-                if let Some(penalty) = rate_limiter.check(&msg, msg_size) {
+                if status_coalescer.should_drop(&msg, Instant::now()) {
+                    continue;
+                }
+                if let Some(violation) = rate_limiter.check(&msg, msg_size) {
                     let _ = control_tx
                         .send(PeerManagerMessage::RateLimitViolation {
                             validator_id: peer_validator_id,
                             addr,
-                            penalty,
+                            violation,
                         })
                         .await;
                     continue;
@@ -919,6 +980,124 @@ mod tests {
         let mut filter = ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
         assert!(!filter.is_duplicate(key));
         assert!(filter.is_duplicate(key));
+    }
+
+    #[test]
+    fn status_coalescer_drops_burst_within_window() {
+        let mut coalescer = StatusCoalescer::new(Duration::from_millis(500));
+        let now = Instant::now();
+        let status_a = Message::Status {
+            height: 1,
+            tip_hash: Bytes32::from([0x01; 32]),
+            round: 0,
+        };
+        let status_b = Message::Status {
+            height: 2,
+            tip_hash: Bytes32::from([0x02; 32]),
+            round: 1,
+        };
+        assert!(!coalescer.should_drop(&status_a, now));
+        assert!(coalescer.should_drop(&status_b, now + Duration::from_millis(100)));
+        assert!(!coalescer.should_drop(&status_b, now + Duration::from_millis(600)));
+    }
+
+    #[tokio::test]
+    async fn authenticated_validator_status_burst_does_not_trigger_penalty() {
+        let validator = Bytes32::from([0xAA; 32]);
+        let addr: SocketAddr = "127.0.0.1:32001".parse().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.peer_table.add(addr).unwrap();
+        actor.peer_table.set_validator_id(&addr, validator);
+        actor.peer_table.mark_connected(&addr);
+        let before = actor.peer_table.get(&addr).unwrap().score;
+
+        actor
+            .handle_control(PeerManagerMessage::RateLimitViolation {
+                validator_id: validator,
+                addr,
+                violation: RateLimitViolationInfo {
+                    class: MessageClass::Status,
+                    penalty: 10,
+                    reason: RateLimitReason::Count,
+                },
+            })
+            .await;
+
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, before);
+        assert!(!actor.peer_table.get(&addr).unwrap().is_banned());
+    }
+
+    #[tokio::test]
+    async fn authenticated_validator_block_request_burst_does_not_ban() {
+        let validator = Bytes32::from([0xAB; 32]);
+        let addr: SocketAddr = "127.0.0.1:32002".parse().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.peer_table.add(addr).unwrap();
+        actor.peer_table.set_validator_id(&addr, validator);
+        actor.peer_table.mark_connected(&addr);
+        let before = actor.peer_table.get(&addr).unwrap().score;
+
+        for _ in 0..20 {
+            actor
+                .handle_control(PeerManagerMessage::RateLimitViolation {
+                    validator_id: validator,
+                    addr,
+                    violation: RateLimitViolationInfo {
+                        class: MessageClass::BlockRequest,
+                        penalty: 10,
+                        reason: RateLimitReason::Count,
+                    },
+                })
+                .await;
+        }
+
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, before);
+        assert!(!actor.peer_table.get(&addr).unwrap().is_banned());
+    }
+
+    #[tokio::test]
+    async fn authenticated_validator_byte_budget_violation_still_penalizes() {
+        let validator = Bytes32::from([0xAC; 32]);
+        let addr: SocketAddr = "127.0.0.1:32003".parse().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.peer_table.add(addr).unwrap();
+        actor.peer_table.set_validator_id(&addr, validator);
+        actor.peer_table.mark_connected(&addr);
+        let before = actor.peer_table.get(&addr).unwrap().score;
+
+        actor
+            .handle_control(PeerManagerMessage::RateLimitViolation {
+                validator_id: validator,
+                addr,
+                violation: RateLimitViolationInfo {
+                    class: MessageClass::BlockResponse,
+                    penalty: 10,
+                    reason: RateLimitReason::Byte,
+                },
+            })
+            .await;
+
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, before - 10);
+    }
+
+    #[test]
+    fn rate_limit_log_includes_message_class() {
+        let validator = Bytes32::from([0xAD; 32]);
+        let addr: SocketAddr = "127.0.0.1:32004".parse().unwrap();
+        let line = format_rate_limit_log(
+            addr,
+            validator,
+            RateLimitViolationInfo {
+                class: MessageClass::PingPong,
+                penalty: 5,
+                reason: RateLimitReason::Count,
+            },
+        );
+        assert!(line.contains("PingPong"));
+        assert!(line.contains("penalty=-5"));
     }
 
     #[tokio::test]

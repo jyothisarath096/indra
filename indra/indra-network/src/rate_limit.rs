@@ -79,8 +79,10 @@ pub enum MessageClass {
     Vote,
     /// Proposals and full blocks.
     BlockOrProposal,
-    /// Status announcements and peer lists.
+    /// Status announcements.
     Status,
+    /// Peer discovery gossip.
+    PeerList,
     /// Block/QC/proposal requests.
     BlockRequest,
     /// Transactions.
@@ -101,7 +103,8 @@ impl MessageClass {
         match msg {
             Message::Vote(_) => Self::Vote,
             Message::Block(_) => Self::BlockOrProposal,
-            Message::Status { .. } | Message::PeerList(_) => Self::Status,
+            Message::Status { .. } => Self::Status,
+            Message::PeerList(_) => Self::PeerList,
             Message::RequestBlocks { .. }
             | Message::RequestProposal { .. }
             | Message::RequestQC { .. } => Self::BlockRequest,
@@ -122,6 +125,21 @@ impl MessageClass {
     /// gossip can fragment BFT liveness.
     pub fn is_consensus_slot_message(self) -> bool {
         matches!(self, Self::Vote | Self::VrfElection)
+    }
+
+    /// True for messages that authenticated validator peers must be able to
+    /// send during consensus, sync, and recovery without punitive count-bucket
+    /// ban risk. These classes may still be subject to byte-budget protection.
+    pub fn is_protocol_necessary_for_validators(self) -> bool {
+        matches!(
+            self,
+            Self::Vote
+                | Self::VrfElection
+                | Self::Status
+                | Self::BlockRequest
+                | Self::BlockResponse
+                | Self::QCResponse
+        )
     }
 
     /// True when a per-peer byte bucket applies.
@@ -179,15 +197,53 @@ pub struct PeerRateLimiter {
     count_buckets: HashMap<MessageClass, TokenBucket>,
     per_peer_byte_bucket: TokenBucket,
     strikes: StrikeCounter,
+    authenticated_validator: bool,
+}
+
+/// Why a message exceeded the rate limiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitReason {
+    /// Message count bucket for the class was exhausted.
+    Count,
+    /// Per-peer byte bucket was exhausted.
+    Byte,
+}
+
+/// A rate-limit violation with enough context for peer-manager policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitViolation {
+    /// Message class that exceeded a limiter.
+    pub class: MessageClass,
+    /// Score penalty suggested by the strike escalation schedule.
+    pub penalty: i32,
+    /// Which limiter was exhausted.
+    pub reason: RateLimitReason,
 }
 
 impl PeerRateLimiter {
     /// Construct the default transport rate limiter.
     pub fn new() -> Self {
+        Self::new_for_authenticated_validator()
+    }
+
+    /// Construct a rate limiter for a cryptographically authenticated validator
+    /// transport connection.
+    pub fn new_for_authenticated_validator() -> Self {
+        Self::with_authentication(true)
+    }
+
+    /// Construct a rate limiter for unauthenticated/observer-like callers.
+    #[cfg(test)]
+    pub fn new_for_unauthenticated() -> Self {
+        Self::with_authentication(false)
+    }
+
+    fn with_authentication(authenticated_validator: bool) -> Self {
         let mut count_buckets = HashMap::new();
         count_buckets.insert(MessageClass::Vote, TokenBucket::new(20, 80));
         count_buckets.insert(MessageClass::BlockOrProposal, TokenBucket::new(5, 10));
         count_buckets.insert(MessageClass::Status, TokenBucket::new(2, 4));
+        count_buckets.insert(MessageClass::PeerList, TokenBucket::new(2, 4));
         count_buckets.insert(MessageClass::BlockRequest, TokenBucket::new(5, 10));
         count_buckets.insert(MessageClass::Tx, TokenBucket::new(50, 200));
         count_buckets.insert(MessageClass::PingPong, TokenBucket::new(2, 4));
@@ -204,15 +260,18 @@ impl PeerRateLimiter {
             count_buckets,
             per_peer_byte_bucket: TokenBucket::new_bytes(33_554_432, 67_108_864),
             strikes: StrikeCounter::new(),
+            authenticated_validator,
         }
     }
 
     /// Check whether a message should be accepted.
     ///
-    /// Returns `Some(penalty)` when rate limited, `None` when allowed.
-    pub fn check(&mut self, msg: &Message, msg_size: usize) -> Option<i32> {
+    /// Returns `Some(violation)` when rate limited, `None` when allowed.
+    pub fn check(&mut self, msg: &Message, msg_size: usize) -> Option<RateLimitViolation> {
         let class = MessageClass::from_message(msg);
-        let count_ok = if class.is_consensus_slot_message() {
+        let bypass_count_bucket =
+            self.authenticated_validator && class.is_protocol_necessary_for_validators();
+        let count_ok = if bypass_count_bucket {
             true
         } else {
             self.count_buckets
@@ -227,11 +286,21 @@ impl PeerRateLimiter {
             true
         };
 
-        if count_ok && byte_ok {
-            None
-        } else {
-            Some(self.strikes.record())
+        if !byte_ok {
+            return Some(RateLimitViolation {
+                class,
+                penalty: self.strikes.record(),
+                reason: RateLimitReason::Byte,
+            });
         }
+        if !count_ok {
+            return Some(RateLimitViolation {
+                class,
+                penalty: self.strikes.record(),
+                reason: RateLimitReason::Count,
+            });
+        }
+        None
     }
 }
 
@@ -414,6 +483,66 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_validator_status_burst_does_not_trigger_penalty() {
+        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
+        let msg = Message::Status {
+            height: 42,
+            tip_hash: Bytes32::from([0x42; 32]),
+            round: 7,
+        };
+        for _ in 0..100 {
+            assert_eq!(limiter.check(&msg, 256), None);
+        }
+    }
+
+    #[test]
+    fn authenticated_validator_block_request_burst_does_not_ban() {
+        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
+        let msg = Message::RequestBlocks {
+            from_height: 1,
+            to_height: 50,
+        };
+        for _ in 0..100 {
+            assert_eq!(limiter.check(&msg, 256), None);
+        }
+    }
+
+    #[test]
+    fn unauthenticated_peer_status_flood_still_rate_limited() {
+        let mut limiter = PeerRateLimiter::new_for_unauthenticated();
+        let msg = Message::Status {
+            height: 42,
+            tip_hash: Bytes32::from([0x42; 32]),
+            round: 7,
+        };
+        let mut limited = false;
+        for _ in 0..10 {
+            if let Some(violation) = limiter.check(&msg, 256) {
+                assert_eq!(violation.class, MessageClass::Status);
+                assert_eq!(violation.reason, RateLimitReason::Count);
+                limited = true;
+                break;
+            }
+        }
+        assert!(limited);
+    }
+
+    #[test]
+    fn authenticated_validator_protocol_messages_still_hit_byte_limits() {
+        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
+        let msg = Message::BlockResponse {
+            blocks: Vec::new(),
+            lowest_available: None,
+            highest_available: None,
+        };
+        let violation = limiter
+            .check(&msg, 128 * 1024 * 1024)
+            .expect("large response should exhaust per-peer byte bucket");
+        assert_eq!(violation.class, MessageClass::BlockResponse);
+        assert_eq!(violation.reason, RateLimitReason::Byte);
+    }
+
+    #[test]
     fn test_global_rate_limiter() {
         let mut limiter = GlobalRateLimiter::new();
         assert!(limiter.check_large_payload(64 * 1024 * 1024));
@@ -462,7 +591,7 @@ mod tests {
 
     #[test]
     fn unsolicited_block_response_flood_still_rate_limited() {
-        let mut limiter = PeerRateLimiter::new();
+        let mut limiter = PeerRateLimiter::new_for_unauthenticated();
         let msg = Message::BlockResponse {
             blocks: Vec::new(),
             lowest_available: None,
