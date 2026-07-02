@@ -13,11 +13,16 @@ use std::net::SocketAddr;
 
 use indra_consensus::mempool::Mempool;
 use indra_consensus::{
-    proposer::{compute_vrf_input, elect_proposer, ProposerCandidate, ProposerElection},
+    proposer::{
+        compute_vrf_input, elect_proposer, ProposerCandidate, ProposerElection,
+        VRF_FALLBACK_OUTPUT,
+    },
     qc::{verify_qc_strict, QcValidator},
 };
 use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
+use indra_core::types::primitives::vrf_commit_reveal_election_active;
+use indra_core::types::vrf_election::VrfElectionResult;
 use indra_core::EpochRecord;
 use indra_crypto::{vrf_verify, VrfOutput, VrfProof};
 use indra_state::{apply_block, ChainState};
@@ -258,6 +263,40 @@ pub fn import_block(
 }
 
 pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+    let (matched_validator_id, candidates, epoch_seed) =
+        verify_proposer_vrf_key_ownership(block, state)?;
+
+    if vrf_commit_reveal_election_active(block.header.height) {
+        return verify_commit_reveal_proposer_result(block, matched_validator_id);
+    }
+
+    let election = ProposerElection {
+        epoch_seed,
+        height: block.header.height,
+        round: block.header.proposer_round,
+        candidates,
+    };
+    let elected = elect_proposer(&election, block.header.height).map_err(NodeError::Consensus)?;
+    if matched_validator_id != elected {
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!(
+                "proposer VRF mismatch: block claims proposer {} but elected proposer is {} at height {} round {}",
+                hex::encode(&matched_validator_id.0[..4]),
+                hex::encode(&elected.0[..4]),
+                block.header.height,
+                block.header.proposer_round,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn verify_proposer_vrf_key_ownership(
+    block: &BlockV1,
+    state: &ChainState,
+) -> NodeResult<(indra_core::Bytes32, Vec<ProposerCandidate>, indra_core::Bytes32)> {
     let proof_bytes = block.header.proposer_vrf_proof.as_slice();
     let output = block.header.proposer_vrf_output;
 
@@ -328,21 +367,47 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
         });
     }
 
-    let matched_validator_id = matching_candidates[0].validator_id;
-    let election = ProposerElection {
-        epoch_seed,
-        height: block.header.height,
-        round: block.header.proposer_round,
-        candidates,
-    };
-    let elected = elect_proposer(&election, block.header.height).map_err(NodeError::Consensus)?;
-    if matched_validator_id != elected {
+    Ok((matching_candidates[0].validator_id, candidates, epoch_seed))
+}
+
+fn verify_commit_reveal_proposer_result(
+    block: &BlockV1,
+    proposer_id: indra_core::Bytes32,
+) -> NodeResult<()> {
+    let Some(header_hash) = block.header.election_result_hash else {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
-                "proposer VRF mismatch: block claims proposer {} but elected proposer is {} at height {} round {}",
-                hex::encode(&matched_validator_id.0[..4]),
-                hex::encode(&elected.0[..4]),
+                "missing election_result_hash for commit-reveal proposer election at height {} round {}",
+                block.header.height, block.header.proposer_round,
+            ),
+        });
+    };
+
+    let normal = VrfElectionResult {
+        height: block.header.height,
+        round: block.header.proposer_round,
+        elected_validator_id: proposer_id,
+        elected_vrf_output: block.header.proposer_vrf_output,
+        fallback_used: false,
+    }
+    .hash();
+    let fallback = VrfElectionResult {
+        height: block.header.height,
+        round: block.header.proposer_round,
+        elected_validator_id: proposer_id,
+        elected_vrf_output: VRF_FALLBACK_OUTPUT,
+        fallback_used: true,
+    }
+    .hash();
+
+    if header_hash != normal && header_hash != fallback {
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!(
+                "election_result_hash {} does not certify proposer {} at height {} round {}",
+                hex::encode(&header_hash.0[..4]),
+                hex::encode(&proposer_id.0[..4]),
                 block.header.height,
                 block.header.proposer_round,
             ),
@@ -605,8 +670,30 @@ mod tests {
         prev_qc_bytes: Vec<u8>,
     ) -> BlockV1 {
         let election = build_election(state, state.height + 1, round);
+        let proposer_vrf = VrfKeypair::from_seed(&[proposer_seed; 32]);
+        let proposer_id = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.vrf_pubkey == proposer_vrf.public_key())
+            .expect("proposer must be in active validator set")
+            .validator_id;
+        let slot = compute_proposer_vrf(
+            proposer_id,
+            &proposer_vrf,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let election_result_hash = VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id: proposer_id,
+            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+            fallback_used: false,
+        }
+        .hash();
         let template = BlockTemplate {
-            proposer_vrf_keypair: VrfKeypair::from_seed(&[proposer_seed; 32]),
+            proposer_vrf_keypair: proposer_vrf,
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp: 1_700_000_000 + state.height + 1,
@@ -614,6 +701,7 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            election_result_hash: Some(election_result_hash),
         };
         produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
     }
@@ -672,6 +760,7 @@ mod tests {
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
                 quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],
@@ -1036,6 +1125,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: block1.header.block_hash(),
+            election_result_hash: None,
             signer_bitfield: {
                 let mut bf = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                 bf[0] = 1;
@@ -1095,57 +1185,39 @@ mod tests {
         let err = verify_proposer_vrf(&tampered, &state).unwrap_err();
         match err {
             NodeError::BlockInvalid { reason, .. } => {
-                assert!(reason.contains("proposer VRF mismatch"));
+                assert!(reason.contains("election_result_hash"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
     }
 
     #[test]
-    fn two_validators_with_valid_vrf_proofs_cannot_both_pass_verify_proposer() {
+    fn sync_verify_accepts_commit_reveal_header_hash_without_ephemeral_messages() {
         let mut state = ChainState::new_genesis();
-        let (validator_a, _hybrid_a) =
-            install_active_validator(&mut state, 0x41, 10_000, true, true);
-        let (validator_b, _hybrid_b) =
-            install_active_validator(&mut state, 0x42, 10_000, true, true);
+        install_active_validator(&mut state, 0x41, 10_000, true, true);
+        install_active_validator(&mut state, 0x42, 10_000, true, true);
 
         let round = 2u32;
-        let election = build_election(&state, 1, round);
-        let elected = elect_proposer(&election, election.height).unwrap();
-        let (winner_seed, loser_seed, loser_id) = if elected == validator_a {
-            (0x41u8, 0x42u8, validator_b)
-        } else if elected == validator_b {
-            (0x42u8, 0x41u8, validator_a)
-        } else {
-            panic!(
-                "unexpected elected proposer {}",
-                hex::encode(&elected.0[..4])
-            );
-        };
-
-        let winner_block = make_strict_block(&state, winner_seed, round, vec![]);
+        let winner_block = make_strict_block(&state, 0x41, round, vec![]);
         assert!(
             verify_proposer_vrf(&winner_block, &state).is_ok(),
-            "public deterministic winner must pass proposer verification"
+            "sync proposer verification must not require ephemeral commit/reveal messages"
         );
+    }
 
-        let mut loser_block = winner_block.clone();
-        let loser_slot = compute_proposer_vrf(
-            loser_id,
-            &VrfKeypair::from_seed(&[loser_seed; 32]),
-            &election.epoch_seed,
-            1,
-            round,
-        );
-        loser_block.header.proposer_vrf_output = Bytes32::from(loser_slot.vrf_output.0);
-        loser_block.header.proposer_vrf_proof =
-            VariableBytes::from_slice(&loser_slot.vrf_proof.0).unwrap();
+    #[test]
+    fn sync_verify_rejects_tampered_election_result_hash() {
+        let mut state = ChainState::new_genesis();
+        install_active_validator(&mut state, 0x41, 10_000, true, true);
+
+        let mut loser_block = make_strict_block(&state, 0x41, 2, vec![]);
+        loser_block.header.election_result_hash = Some(Bytes32::from([0xEE; 32]));
 
         let err = verify_proposer_vrf(&loser_block, &state).unwrap_err();
         match err {
             NodeError::BlockInvalid { reason, .. } => {
                 assert!(
-                    reason.contains("proposer VRF mismatch"),
+                    reason.contains("election_result_hash"),
                     "unexpected rejection reason: {reason}"
                 );
             }

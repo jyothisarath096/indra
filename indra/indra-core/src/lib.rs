@@ -35,4 +35,5 @@ pub use types::{
     slashing::SlashEvidenceV1,
     transaction::{InputV1, OutputV1, TransactionV1, TxId},
     vote::VoteV1,
+    vrf_election::{VrfCommit, VrfElectionResult, VrfReveal},
 };

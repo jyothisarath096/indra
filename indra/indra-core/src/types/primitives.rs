@@ -62,6 +62,18 @@ pub const MAX_ROUND_TIME_MS: u64 = 15_000;
 /// `(height, round)` and is not a runtime cap on retries.
 pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
 
+/// Close VRF commit window after this duration or when quorum stake committed.
+pub const VRF_COMMIT_WINDOW_MS: u64 = 500;
+
+/// Close VRF reveal window after this duration or when quorum stake revealed.
+pub const VRF_REVEAL_WINDOW_MS: u64 = 500;
+
+/// After this many consecutive empty-reveal rounds, use public deterministic fallback.
+pub const MAX_VRF_EMPTY_REVEAL_ROUNDS: u32 = 3;
+
+/// Memory cap for commit/reveal entries retained for one election round.
+pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
+
 /// Epochs delay before a governance-approved timeout change takes effect.
 pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 
@@ -322,6 +334,11 @@ pub mod hard_forks {
     /// Testnet activates this from genesis after a fresh reset. Mainnet may
     /// choose a future height if migrating an existing chain.
     pub const PUBLIC_PROPOSER_ELECTION_HEIGHT: u64 = 0;
+    /// Commit-reveal VRF proposer election.
+    ///
+    /// Testnet activates this from genesis after a fresh reset. Mainnet must
+    /// choose a future announced hard-fork height.
+    pub const VRF_COMMIT_REVEAL_ELECTION_HEIGHT: u64 = 0;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -352,6 +369,12 @@ pub fn vote_chain_id_active(height: u64) -> bool {
 #[inline]
 pub fn public_proposer_election_active(height: u64) -> bool {
     height >= hard_forks::PUBLIC_PROPOSER_ELECTION_HEIGHT
+}
+
+/// Whether proposer election must use commit-reveal VRF election.
+#[inline]
+pub fn vrf_commit_reveal_election_active(height: u64) -> bool {
+    height >= hard_forks::VRF_COMMIT_REVEAL_ELECTION_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

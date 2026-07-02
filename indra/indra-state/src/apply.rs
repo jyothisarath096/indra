@@ -300,6 +300,7 @@ fn verify_vote_sig_with_keys(
         vote.step,
         &vote.block_hash,
         &vote.validator_id,
+        vote.election_result_hash.as_ref(),
         chain_id,
     );
     let pk = HybridPublicKey {
@@ -964,6 +965,7 @@ mod tests {
             step,
             &block_hash,
             &validator_id,
+            None,
             DEFAULT_CHAIN_ID,
         );
         let sig = keypair.sign(&signing_bytes).unwrap();
@@ -973,6 +975,7 @@ mod tests {
             step,
             block_hash,
             validator_id,
+            election_result_hash: None,
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
                 pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -1095,6 +1098,7 @@ mod tests {
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                election_result_hash: None,
             },
             transactions: txs,
             slashing_evidence: vec![],

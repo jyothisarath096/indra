@@ -51,7 +51,12 @@ pub struct VoteV1 {
     pub block_hash: Bytes32,
     /// Validator's identity.
     pub validator_id: Bytes32,
-    /// Hybrid signature over (height || round || step || block_hash || validator_id).
+    /// Hash of the commit-reveal election result observed by this validator.
+    ///
+    /// Present on precommit votes when commit-reveal proposer election is active.
+    /// Absent on prevotes and pre-activation votes.
+    pub election_result_hash: Option<Bytes32>,
+    /// Hybrid signature over the canonical vote signing bytes.
     pub signature: HybridSignature,
 }
 
@@ -62,23 +67,72 @@ impl Encode for VoteV1 {
         self.step.encode(buf);
         self.block_hash.encode(buf);
         self.validator_id.encode(buf);
+        if let Some(hash) = self.election_result_hash {
+            1u8.encode(buf);
+            hash.encode(buf);
+        } else {
+            0u8.encode(buf);
+        }
         self.signature.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        8 + 4 + 1 + 32 + 32 + self.signature.encoded_len()
+        8 + 4
+            + 1
+            + 32
+            + 32
+            + 1
+            + self.election_result_hash.map(|_| 32).unwrap_or(0)
+            + self.signature.encoded_len()
     }
 }
 
 impl Decode for VoteV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let height = u64::decode(r)?;
+        let round = u32::decode(r)?;
+        let step = VoteStep::decode(r)?;
+        let block_hash = Bytes32::decode(r)?;
+        let validator_id = Bytes32::decode(r)?;
+        let flag = u8::decode(r)?;
+        let election_result_hash = match flag {
+            0 => None,
+            1 => Some(Bytes32::decode(r)?),
+            b => return Err(IndraError::InvalidBool { byte: b }),
+        };
         Ok(Self {
-            height: u64::decode(r)?,
-            round: u32::decode(r)?,
-            step: VoteStep::decode(r)?,
-            block_hash: Bytes32::decode(r)?,
-            validator_id: Bytes32::decode(r)?,
+            height,
+            round,
+            step,
+            block_hash,
+            validator_id,
+            election_result_hash,
             signature: HybridSignature::decode(r)?,
         })
+    }
+}
+
+impl VoteV1 {
+    /// Construct a vote from the legacy pre-commit-reveal wire shape.
+    ///
+    /// This is only used by tests/tooling that deliberately decode old fixtures;
+    /// the active encoder always writes the explicit election-result flag.
+    pub fn legacy_without_election_result(
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+        validator_id: Bytes32,
+        signature: HybridSignature,
+    ) -> Self {
+        Self {
+            height,
+            round,
+            step,
+            block_hash,
+            validator_id,
+            election_result_hash: None,
+            signature,
+        }
     }
 }
 
@@ -102,6 +156,7 @@ mod tests {
             step: VoteStep::Precommit,
             block_hash: Bytes32::from([0xAAu8; 32]),
             validator_id: Bytes32::from([0xBBu8; 32]),
+            election_result_hash: Some(Bytes32::from([0xCCu8; 32])),
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),

@@ -41,6 +41,8 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
             height,
             qc_bytes,
         }),
+        Message::VrfCommit(commit) => Some(DriverEvent::InboundVrfCommit { from, commit }),
+        Message::VrfReveal(reveal) => Some(DriverEvent::InboundVrfReveal { from, reveal }),
         _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse, RequestProposal handled elsewhere
     }
 }
@@ -51,6 +53,8 @@ pub fn action_to_message(action: &DriverAction) -> Option<Message> {
         DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
         DriverAction::BroadcastVote(vote) => Some(Message::Vote(vote.clone())),
         DriverAction::BroadcastTx(tx) => Some(Message::Tx(tx.clone())),
+        DriverAction::BroadcastVrfCommit(commit) => Some(Message::VrfCommit(commit.clone())),
+        DriverAction::BroadcastVrfReveal(reveal) => Some(Message::VrfReveal(reveal.clone())),
         DriverAction::RequestQC { .. } => None,
         _ => None,
     }

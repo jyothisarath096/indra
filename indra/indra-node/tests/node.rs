@@ -75,8 +75,31 @@ fn make_strict_block(
         round: 0,
         candidates,
     };
+    let proposer_vrf_keypair = VrfKeypair::from_seed(&proposer_seed);
+    let proposer_vrf_pk = proposer_vrf_keypair.public_key();
+    let proposer_id = election
+        .candidates
+        .iter()
+        .find(|candidate| candidate.vrf_pubkey == proposer_vrf_pk)
+        .map(|candidate| candidate.validator_id)
+        .expect("test proposer must be in the active validator set");
+    let slot = indra_consensus::proposer::compute_proposer_vrf(
+        proposer_id,
+        &proposer_vrf_keypair,
+        &election.epoch_seed,
+        election.height,
+        election.round,
+    );
+    let election_result_hash = indra_core::types::vrf_election::VrfElectionResult {
+        height: election.height,
+        round: election.round,
+        elected_validator_id: proposer_id,
+        elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+        fallback_used: false,
+    }
+    .hash();
     let template = BlockTemplate {
-        proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+        proposer_vrf_keypair,
         epoch_seed: election.epoch_seed,
         prev_qc_bytes,
         timestamp: 1_700_000_000 + state.height + 1,
@@ -84,6 +107,7 @@ fn make_strict_block(
         slash_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
+        election_result_hash: Some(election_result_hash),
     };
     produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
 }
@@ -103,6 +127,7 @@ fn dummy_vote() -> VoteV1 {
         step: VoteStep::Precommit,
         block_hash: Bytes32::from([0xAB; 32]),
         validator_id: Bytes32::from([0xCD; 32]),
+        election_result_hash: None,
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),

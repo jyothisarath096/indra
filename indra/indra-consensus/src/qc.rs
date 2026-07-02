@@ -48,6 +48,7 @@ pub fn qc_signing_bytes(height: u64, round: u32, block_hash: &Bytes32, chain_id:
         VoteStep::Precommit,
         block_hash,
         &Bytes32::ZERO,
+        None,
         chain_id,
     )
 }
@@ -173,6 +174,17 @@ fn build_qc_from_votes(
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_sigs = Vec::new();
     let mut classical_sigs = Vec::new();
+    let election_result_hash = votes
+        .iter()
+        .find_map(|vote| vote.election_result_hash);
+    if votes
+        .iter()
+        .any(|vote| vote.election_result_hash != election_result_hash)
+    {
+        return Err(ConsensusError::CryptoError {
+            detail: "QC votes disagree on election_result_hash".to_string(),
+        });
+    }
 
     for vote in &votes {
         let Some(validator) = by_id.get(&vote.validator_id) else {
@@ -216,6 +228,7 @@ fn build_qc_from_votes(
         height,
         round,
         block_hash,
+        election_result_hash,
         signer_bitfield,
         pq_signatures: pq_sigs,
         classical_signatures: classical_sigs,
@@ -322,6 +335,7 @@ pub fn verify_qc(
             VoteStep::Precommit,
             &qc.block_hash,
             &validator.validator_id,
+            qc.election_result_hash.as_ref(),
             chain_id,
         );
         let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
@@ -492,6 +506,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
+            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![PQVoteSig {
                 validator_id: v.validator_id,
@@ -640,6 +655,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
+            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![PQVoteSig {
                 validator_id: v.validator_id,
@@ -665,6 +681,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: Bytes32::from([0x11u8; 32]),
+            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![],
             classical_signatures: vec![],
@@ -699,6 +716,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
+            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![
                 PQVoteSig {

@@ -1035,6 +1035,8 @@ async fn handle_observer_connection(
                     }
                     Message::Pong(_) | Message::PeerList(_) => {}
                     Message::Vote(_)
+                    | Message::VrfCommit(_)
+                    | Message::VrfReveal(_)
                     | Message::RequestProposal { .. }
                     | Message::RequestQC { .. }
                     | Message::QCResponse { .. } => {
@@ -1810,8 +1812,8 @@ fn main() {
                 if sync_target.is_none() {
                     match phase {
                         RoundPhase::Propose => {
-                            let (should_propose, next_height) = {
-                                let d = driver.lock().unwrap();
+                            let (should_propose, next_height, election_result_hash, vrf_actions) = {
+                                let mut d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                     indra_crypto::sha256(&d.engine.state.tip_hash.0),
                                 );
@@ -1839,6 +1841,8 @@ fn main() {
                                         d.can_propose()
                                             && d.engine.config.bootstrap_peers.is_empty(),
                                         height,
+                                        None,
+                                        Vec::new(),
                                     )
                                 } else {
                                     let election = indra_consensus::proposer::ProposerElection {
@@ -1847,9 +1851,36 @@ fn main() {
                                         round,
                                         candidates,
                                     };
-                                    (d.can_propose() && d.engine.is_proposer(&election), height)
+                                    let vrf_actions = d.ensure_vrf_election_for_round(&election);
+                                    let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
+                                    let election_result = if active {
+                                        d.vrf_election_result(height, round)
+                                    } else {
+                                        None
+                                    };
+                                    let should = if active {
+                                        d.can_propose()
+                                            && election_result
+                                                .is_some_and(|result| Some(result.elected_validator_id) == d.engine.validator_id())
+                                    } else {
+                                        d.can_propose() && d.engine.is_proposer(&election)
+                                    };
+                                    (should, height, election_result.map(|result| result.hash()), vrf_actions)
                                 }
                             };
+                            if !vrf_actions.is_empty() {
+                                let previous_height = driver.lock().unwrap().height();
+                                process_driver_actions(
+                                    &driver,
+                                    &gossip,
+                                    &height_tx,
+                                    &handshake_config,
+                                    previous_height,
+                                    vrf_actions,
+                                    &metrics_state,
+                                    &last_block_timestamp,
+                                );
+                            }
 
                             let already_have_proposal = proposed_at_slot
                                 == Some((next_height, round))
@@ -1942,6 +1973,7 @@ fn main() {
                                                 &election,
                                                 valid_block.header.timestamp,
                                                 last_qc_bytes,
+                                                election_result_hash,
                                             )
                                         } else {
                                             d.engine.propose(
@@ -1949,6 +1981,7 @@ fn main() {
                                                 timestamp,
                                                 last_qc_bytes,
                                                 polc_round,
+                                                election_result_hash,
                                             )
                                         };
                                     match proposal_result {
@@ -3517,6 +3550,7 @@ mod tests {
                 proposer_vrf_output: Bytes32::from([0x05; 32]),
                 proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],
@@ -3545,6 +3579,7 @@ mod tests {
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],

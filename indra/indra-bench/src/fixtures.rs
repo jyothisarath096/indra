@@ -74,6 +74,7 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockV1 
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
             quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+            election_result_hash: None,
         },
         transactions: txs,
         slashing_evidence: vec![],

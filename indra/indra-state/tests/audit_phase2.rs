@@ -164,6 +164,7 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),
+            election_result_hash: None,
         },
         transactions,
         slashing_evidence: vec![],

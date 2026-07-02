@@ -1,8 +1,11 @@
 //! Deterministic proposer election and VRF proof generation.
 
+use std::collections::BTreeMap;
+
 use indra_core::types::primitives::{
     public_proposer_election_active, vrf_verified_output_active, Bytes32, MAX_ROUNDS_PER_HEIGHT,
 };
+use indra_core::types::vrf_election::VrfElectionResult;
 use indra_crypto::{sha256, vrf_prove, VrfKeypair, VrfOutput, VrfProof};
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -181,6 +184,73 @@ pub fn elect_proposer(election: &ProposerElection, height: u64) -> ConsensusResu
         .map(|(candidate, _, _)| candidate.validator_id);
 
     winner.ok_or(ConsensusError::EmptyValidatorSet)
+}
+
+/// Sentinel VRF output used in the election-result hash for public fallback.
+pub const VRF_FALLBACK_OUTPUT: Bytes32 = Bytes32([0xFF; 32]);
+
+/// Compute the public deterministic fallback election result.
+pub fn compute_fallback_election_result(
+    election: &ProposerElection,
+) -> ConsensusResult<VrfElectionResult> {
+    let elected = elect_proposer(election, election.height)?;
+    Ok(VrfElectionResult {
+        height: election.height,
+        round: election.round,
+        elected_validator_id: elected,
+        elected_vrf_output: VRF_FALLBACK_OUTPUT,
+        fallback_used: true,
+    })
+}
+
+/// Elect a proposer from a validated reveal set.
+///
+/// `revealed_outputs` maps validator ID to verified VRF output. Missing
+/// validators receive the worst possible score. The denominator remains total
+/// active stake, not revealed stake.
+pub fn elect_proposer_from_reveals(
+    election: &ProposerElection,
+    revealed_outputs: &BTreeMap<Bytes32, Bytes32>,
+) -> ConsensusResult<VrfElectionResult> {
+    if election.candidates.is_empty() {
+        return Err(ConsensusError::EmptyValidatorSet);
+    }
+    if revealed_outputs.is_empty() {
+        return compute_fallback_election_result(election);
+    }
+    let total_stake: u64 = election
+        .candidates
+        .iter()
+        .map(|c| c.stake)
+        .fold(0u64, |a, b| a.saturating_add(b));
+
+    let winner = election
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let output = revealed_outputs
+                .get(&candidate.validator_id)
+                .copied()
+                .unwrap_or(VRF_FALLBACK_OUTPUT);
+            let score = election_score(&VrfOutput(output.0), candidate.stake, total_stake);
+            (candidate.validator_id, score, output)
+        })
+        .min_by(|(id_a, score_a, output_a), (id_b, score_b, output_b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| output_a.0.cmp(&output_b.0))
+                .then_with(|| id_a.0.cmp(&id_b.0))
+        });
+
+    winner
+        .map(|(elected_validator_id, _, elected_vrf_output)| VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id,
+            elected_vrf_output,
+            fallback_used: false,
+        })
+        .ok_or(ConsensusError::EmptyValidatorSet)
 }
 
 /// Compute the VRF output and proof for a validator at a given height.
@@ -417,5 +487,67 @@ mod tests {
             (1.5..=2.5).contains(&ratio),
             "2x stake should win roughly 2x slots, got ratio {ratio:.3}"
         );
+    }
+
+    #[test]
+    fn commit_reveal_election_is_deterministic_from_same_reveals() {
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from([0x99u8; 32]),
+            height: 11,
+            round: 3,
+            candidates: vec![
+                candidate(0x01, 1_000_000),
+                candidate(0x02, 1_000_000),
+                candidate(0x03, 1_000_000),
+                candidate(0x04, 1_000_000),
+            ],
+        };
+        let mut reveals = BTreeMap::new();
+        reveals.insert(Bytes32::from([0x01u8; 32]), Bytes32::from([0x31u8; 32]));
+        reveals.insert(Bytes32::from([0x02u8; 32]), Bytes32::from([0x12u8; 32]));
+        reveals.insert(Bytes32::from([0x03u8; 32]), Bytes32::from([0x23u8; 32]));
+
+        let a = elect_proposer_from_reveals(&election, &reveals).unwrap();
+        let b = elect_proposer_from_reveals(&election, &reveals).unwrap();
+
+        assert_eq!(a, b);
+        assert!(!a.fallback_used);
+        assert_eq!(a.hash(), b.hash());
+    }
+
+    #[test]
+    fn withholding_validator_gets_worst_score() {
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from([0x42u8; 32]),
+            height: 2,
+            round: 1,
+            candidates: vec![candidate(0x01, 1_000_000), candidate(0x02, 1_000_000)],
+        };
+        let mut reveals = BTreeMap::new();
+        reveals.insert(Bytes32::from([0x02u8; 32]), Bytes32::ZERO);
+
+        let result = elect_proposer_from_reveals(&election, &reveals).unwrap();
+
+        assert_eq!(result.elected_validator_id, Bytes32::from([0x02u8; 32]));
+        assert_eq!(result.elected_vrf_output, Bytes32::ZERO);
+        assert!(!result.fallback_used);
+    }
+
+    #[test]
+    fn zero_reveals_use_public_fallback_result() {
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from([0x42u8; 32]),
+            height: 2,
+            round: 1,
+            candidates: vec![candidate(0x01, 1_000_000), candidate(0x02, 1_000_000)],
+        };
+        let reveals = BTreeMap::new();
+
+        let result = elect_proposer_from_reveals(&election, &reveals).unwrap();
+        let fallback = compute_fallback_election_result(&election).unwrap();
+
+        assert_eq!(result, fallback);
+        assert_eq!(result.elected_vrf_output, VRF_FALLBACK_OUTPUT);
+        assert!(result.fallback_used);
     }
 }

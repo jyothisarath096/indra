@@ -131,6 +131,7 @@ fn signed_vote(
         step,
         &block_hash,
         &validator_id,
+        None,
         indra_core::types::primitives::DEFAULT_CHAIN_ID,
     );
     let sig = keypair.sign(&signing_bytes).unwrap();
@@ -140,6 +141,7 @@ fn signed_vote(
         step,
         block_hash,
         validator_id,
+        election_result_hash: None,
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -238,6 +240,7 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            election_result_hash: None,
         },
         transactions: txs,
         slashing_evidence: vec![],
@@ -289,6 +292,7 @@ fn qc_bytes_for_signers(
         height: certified_height,
         round: 0,
         block_hash: Bytes32::from([0xC1; 32]),
+        election_result_hash: None,
         signer_bitfield,
         pq_signatures: signer_ids
             .iter()

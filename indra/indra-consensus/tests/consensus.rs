@@ -15,11 +15,12 @@ use indra_core::{
         crypto::HybridSignature,
         primitives::DEFAULT_CHAIN_ID,
         transaction::{InputV1, OutputV1, TransactionV1},
+        vrf_election::VrfElectionResult,
         vote::VoteStep,
     },
     Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
 };
-use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_state::ChainState;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -179,21 +180,38 @@ fn mempool_to_block_pipeline() {
 
     // Set up election with single validator
     let seed = [0x42u8; 32];
-    let vrf_pubkey = indra_crypto::VrfKeypair::from_seed(&seed).public_key();
+    let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&seed);
+    let vrf_pubkey = vrf_keypair.public_key();
+    let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
     let election = ProposerElection {
         epoch_seed: Bytes32::from(seed),
         height: 1,
         round: 0,
         candidates: vec![ProposerCandidate {
-            validator_id: Bytes32::from(indra_crypto::sha256(&vrf_pubkey)),
+            validator_id,
             vrf_pubkey,
             verified_vrf_output: None,
             stake: 1_000_000,
         }],
     };
+    let slot = indra_consensus::proposer::compute_proposer_vrf(
+        validator_id,
+        &vrf_keypair,
+        &election.epoch_seed,
+        election.height,
+        election.round,
+    );
+    let election_result_hash = VrfElectionResult {
+        height: election.height,
+        round: election.round,
+        elected_validator_id: validator_id,
+        elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+        fallback_used: false,
+    }
+    .hash();
 
     let template = BlockTemplate {
-        proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+        proposer_vrf_keypair: vrf_keypair,
         epoch_seed: Bytes32::from(seed),
         prev_qc_bytes: vec![],
         timestamp: 1_700_000_001,
@@ -201,6 +219,7 @@ fn mempool_to_block_pipeline() {
         slash_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
+        election_result_hash: Some(election_result_hash),
     };
 
     let block = produce_block(&template, &state, &mempool, &election).unwrap();
@@ -412,6 +431,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         height,
         round,
         block_hash,
+        election_result_hash: None,
         signer_bitfield,
         pq_signatures,
         classical_signatures,

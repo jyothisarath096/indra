@@ -19,12 +19,13 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK,
-        MAX_VRF_PROOF_BYTES,
+        vrf_commit_reveal_election_active, Bytes32, ProtocolVersion, VariableBytes,
+        MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
     slashing::SlashEvidenceV1,
     staking::StakingOp,
     transaction::TransactionV1,
+    vrf_election::VrfElectionResult,
 };
 use indra_crypto::VrfKeypair;
 use indra_state::{apply_block, compute_state_root, compute_validator_set_root, ChainState};
@@ -32,7 +33,7 @@ use indra_state::{apply_block, compute_state_root, compute_validator_set_root, C
 use crate::{
     error::{ConsensusError, ConsensusResult},
     mempool::Mempool,
-    proposer::{compute_proposer_vrf, elect_proposer, ProposerElection},
+    proposer::{compute_proposer_vrf, elect_proposer, ProposerElection, VRF_FALLBACK_OUTPUT},
 };
 
 /// A block template — the inputs needed to produce a block.
@@ -54,6 +55,8 @@ pub struct BlockTemplate {
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Slash evidence selected for inclusion.
     pub slash_evidence: Vec<SlashEvidenceV1>,
+    /// Commit-reveal election result hash for this proposal, when active.
+    pub election_result_hash: Option<Bytes32>,
 }
 
 /// Produce a block from the current state and mempool.
@@ -85,9 +88,33 @@ pub fn produce_block(
         election.round,
     );
 
-    let elected = elect_proposer(election, election.height)?;
-    if elected != slot.proposer_id {
-        return Err(ConsensusError::WrongProposer);
+    if vrf_commit_reveal_election_active(election.height) {
+        let expected_normal = VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id: slot.proposer_id,
+            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+            fallback_used: false,
+        }
+        .hash();
+        let expected_fallback = VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id: slot.proposer_id,
+            elected_vrf_output: VRF_FALLBACK_OUTPUT,
+            fallback_used: true,
+        }
+        .hash();
+        if template.election_result_hash != Some(expected_normal)
+            && template.election_result_hash != Some(expected_fallback)
+        {
+            return Err(ConsensusError::WrongProposer);
+        }
+    } else {
+        let elected = elect_proposer(election, election.height)?;
+        if elected != slot.proposer_id {
+            return Err(ConsensusError::WrongProposer);
+        }
     }
 
     // Transaction selection policy:
@@ -145,6 +172,7 @@ pub fn produce_block(
         proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
         proposer_vrf_proof: vrf_proof_bytes,
         quorum_certificate: qc_bytes,
+        election_result_hash: template.election_result_hash,
     };
 
     let mut block = BlockV1 {
@@ -210,6 +238,31 @@ mod tests {
         }
     }
 
+    fn election_hash_for(election: &ProposerElection, vrf_seed: [u8; 32]) -> Bytes32 {
+        let vrf = VrfKeypair::from_seed(&vrf_seed);
+        let validator_id = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+            .unwrap()
+            .validator_id;
+        let slot = compute_proposer_vrf(
+            validator_id,
+            &vrf,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id: validator_id,
+            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+            fallback_used: false,
+        }
+        .hash()
+    }
+
     #[test]
     fn produce_empty_block() {
         let state = ChainState::new_genesis();
@@ -226,12 +279,41 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            election_result_hash: Some(election_hash_for(&election, seed)),
         };
 
         let block = produce_block(&template, &state, &mempool, &election).unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.header.prev_hash, state.tip_hash);
         assert_eq!(block.transactions.len(), 0);
+    }
+
+    #[test]
+    fn block_header_commits_to_election_result_hash() {
+        let state = ChainState::new_genesis();
+        let mempool = Mempool::default_config();
+        let seed = [0x43u8; 32];
+        let election = make_election(&seed, 1, 0, seed, 1_000_000);
+        let election_hash = election_hash_for(&election, seed);
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+            epoch_seed: Bytes32::from(seed),
+            prev_qc_bytes: vec![],
+            timestamp: 1_700_000_001,
+            polc_round: None,
+            slash_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            election_result_hash: Some(election_hash),
+        };
+
+        let block = produce_block(&template, &state, &mempool, &election).unwrap();
+        let original_hash = block.header.block_hash();
+        let mut tampered = block.header.clone();
+        tampered.election_result_hash = Some(Bytes32::from([0x44; 32]));
+
+        assert_eq!(block.header.election_result_hash, Some(election_hash));
+        assert_ne!(original_hash, tampered.block_hash());
     }
 
     #[test]
@@ -252,6 +334,7 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            election_result_hash: Some(election_hash_for(&election, seed)),
         };
 
         assert_eq!(
@@ -275,6 +358,7 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            election_result_hash: Some(election_hash_for(&election, seed)),
         };
         let block = produce_block(&template, &state, &mempool, &election).unwrap();
         assert_eq!(block.header.height, state.height + 1);

@@ -10,7 +10,10 @@
 
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
-    types::{block::BlockV1, primitives::Bytes32, transaction::TransactionV1, vote::VoteV1},
+    types::{
+        block::BlockV1, primitives::Bytes32, transaction::TransactionV1, vote::VoteV1,
+        vrf_election::{VrfCommit, VrfReveal},
+    },
 };
 
 use crate::error::{NetworkError, NetworkResult};
@@ -61,6 +64,10 @@ pub enum MessageType {
     RequestQC = 0x0B,
     /// Respond with encoded QC bytes for a committed height.
     QCResponse = 0x0C,
+    /// Commit to a validator's per-round VRF output.
+    VrfCommit = 0x0D,
+    /// Reveal a committed per-round VRF output.
+    VrfReveal = 0x0E,
 }
 
 impl MessageType {
@@ -79,6 +86,8 @@ impl MessageType {
             0x0A => Ok(Self::RequestProposal),
             0x0B => Ok(Self::RequestQC),
             0x0C => Ok(Self::QCResponse),
+            0x0D => Ok(Self::VrfCommit),
+            0x0E => Ok(Self::VrfReveal),
             other => Err(NetworkError::UnexpectedMessage { got: other }),
         }
     }
@@ -145,6 +154,10 @@ pub enum Message {
         /// Raw encoded QC bytes.
         qc_bytes: Vec<u8>,
     },
+    /// Commit to a validator's per-round VRF output.
+    VrfCommit(VrfCommit),
+    /// Reveal a committed per-round VRF output.
+    VrfReveal(VrfReveal),
 }
 
 impl Message {
@@ -163,6 +176,8 @@ impl Message {
             Self::RequestProposal { .. } => MessageType::RequestProposal,
             Self::RequestQC { .. } => MessageType::RequestQC,
             Self::QCResponse { .. } => MessageType::QCResponse,
+            Self::VrfCommit(_) => MessageType::VrfCommit,
+            Self::VrfReveal(_) => MessageType::VrfReveal,
         }
     }
 
@@ -291,6 +306,8 @@ impl Message {
                 buf.extend_from_slice(qc_bytes);
                 buf
             }
+            Self::VrfCommit(commit) => commit.encode_to_vec(),
+            Self::VrfReveal(reveal) => reveal.encode_to_vec(),
         }
     }
 
@@ -593,6 +610,20 @@ impl Message {
                     height: u64::from_le_bytes(height_bytes),
                     qc_bytes,
                 })
+            }
+            MessageType::VrfCommit => {
+                let mut r = ByteReader::new(payload);
+                let commit = VrfCommit::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
+                    reason: e.to_string(),
+                })?;
+                Ok(Self::VrfCommit(commit))
+            }
+            MessageType::VrfReveal => {
+                let mut r = ByteReader::new(payload);
+                let reveal = VrfReveal::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
+                    reason: e.to_string(),
+                })?;
+                Ok(Self::VrfReveal(reveal))
             }
         }
     }

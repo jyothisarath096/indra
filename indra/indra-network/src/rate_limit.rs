@@ -91,6 +91,8 @@ pub enum MessageClass {
     BlockResponse,
     /// QC sync responses.
     QCResponse,
+    /// Commit-reveal VRF election gossip.
+    VrfElection,
 }
 
 impl MessageClass {
@@ -107,6 +109,7 @@ impl MessageClass {
             Message::Ping(_) | Message::Pong(_) => Self::PingPong,
             Message::BlockResponse { .. } => Self::BlockResponse,
             Message::QCResponse { .. } => Self::QCResponse,
+            Message::VrfCommit(_) | Message::VrfReveal(_) => Self::VrfElection,
         }
     }
 
@@ -184,6 +187,7 @@ impl PeerRateLimiter {
         // payloads.
         count_buckets.insert(MessageClass::BlockResponse, TokenBucket::new(20, 64));
         count_buckets.insert(MessageClass::QCResponse, TokenBucket::new(5, 10));
+        count_buckets.insert(MessageClass::VrfElection, TokenBucket::new(8, 16));
 
         Self {
             count_buckets,

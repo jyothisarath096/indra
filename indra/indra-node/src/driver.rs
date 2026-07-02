@@ -4,20 +4,38 @@
 //! node while preserving the existing INDRA driver interface used by
 //! `node.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use indra_consensus::{
     build_qc, verify_qc,
+    proposer::{
+        compute_fallback_election_result, compute_proposer_vrf, compute_vrf_input,
+        elect_proposer_from_reveals, ProposerCandidate, ProposerElection,
+    },
     vote::{RegisteredVoter, VoteCollector, VoteDecision},
 };
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
-    primitives::Bytes32,
+    crypto::HybridSignature,
+    primitives::{
+        bps_of, vrf_commit_reveal_election_active, Bytes32, VariableBytes,
+        CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
+        MAX_VRF_EMPTY_REVEAL_ROUNDS, MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS,
+        VRF_REVEAL_WINDOW_MS,
+    },
     qc::QuorumCertificateV1,
     transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
+    vrf_election::{
+        chain_id_hash, compute_vrf_commit_hash, VrfCommit, VrfElectionResult, VrfReveal,
+    },
+};
+use indra_crypto::{
+    hybrid::{verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey},
+    vrf_verify, VrfOutput, VrfProof,
 };
 use indra_storage::{VoteSafetyLoadResult, VoteSafetyStore};
 
@@ -62,6 +80,64 @@ pub enum RoundPhase {
     Prevote,
     /// Collecting precommits for the current height/round.
     Precommit,
+}
+
+/// Commit-reveal VRF phase for one height/round election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrfRoundPhase {
+    /// Collecting hidden VRF commitments.
+    Commit,
+    /// Collecting VRF reveals whose commitments were observed.
+    Reveal,
+    /// Election result computed.
+    Complete,
+    /// Public deterministic fallback result computed.
+    Fallback,
+}
+
+/// Ephemeral commit-reveal state for one election round.
+#[derive(Debug, Clone)]
+pub struct VrfRoundState {
+    /// Election height.
+    pub height: u64,
+    /// Election round.
+    pub round: u32,
+    /// Current VRF phase.
+    pub phase: VrfRoundPhase,
+    /// Commit window start time.
+    pub commit_started_at: Instant,
+    /// Reveal window start time.
+    pub reveal_started_at: Option<Instant>,
+    /// validator_id → signed commit.
+    pub commits: BTreeMap<Bytes32, VrfCommit>,
+    /// validator_id → signed reveal.
+    pub reveals: BTreeMap<Bytes32, VrfReveal>,
+    /// Reveals received before their matching commit.
+    pub pending_reveals: BTreeMap<Bytes32, VrfReveal>,
+    /// Deterministic result after reveal window closes.
+    pub election_result: Option<VrfElectionResult>,
+}
+
+impl VrfRoundState {
+    fn new(height: u64, round: u32) -> Self {
+        Self {
+            height,
+            round,
+            phase: VrfRoundPhase::Commit,
+            commit_started_at: Instant::now(),
+            reveal_started_at: None,
+            commits: BTreeMap::new(),
+            reveals: BTreeMap::new(),
+            pending_reveals: BTreeMap::new(),
+            election_result: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalVrfRoundState {
+    vrf_output: Bytes32,
+    vrf_proof: Vec<u8>,
 }
 
 /// An inbound event for the driver to process.
@@ -115,6 +191,20 @@ pub enum DriverEvent {
         /// The committed height the peer wants certified.
         height: u64,
     },
+    /// A validator sent a VRF commit.
+    InboundVrfCommit {
+        /// The sender.
+        from: SocketAddr,
+        /// Commit payload.
+        commit: VrfCommit,
+    },
+    /// A validator sent a VRF reveal.
+    InboundVrfReveal {
+        /// The sender.
+        from: SocketAddr,
+        /// Reveal payload.
+        reveal: VrfReveal,
+    },
 }
 
 /// An action the driver wants to perform in response to an event.
@@ -160,6 +250,10 @@ pub enum DriverAction {
         /// Raw encoded QC bytes.
         qc_bytes: Vec<u8>,
     },
+    /// Broadcast a VRF commit.
+    BroadcastVrfCommit(VrfCommit),
+    /// Broadcast a VRF reveal.
+    BroadcastVrfReveal(VrfReveal),
     /// Re-process a buffered future proposal after the local tip advances.
     ActivateBufferedProposal(BlockV1),
     /// Slash evidence was detected.
@@ -213,6 +307,12 @@ pub struct ConsensusDriver {
     pub vote_safety: VoteSafetyStore,
     /// If set, local voting is disabled until operator recovery.
     vote_safety_unavailable: Option<String>,
+    /// Current and next-round commit-reveal VRF election states.
+    vrf_states: [Option<VrfRoundState>; 2],
+    /// Locally computed VRF outputs retained until reveal.
+    local_vrf_rounds: BTreeMap<(u64, u32), LocalVrfRoundState>,
+    /// Consecutive empty-reveal rounds at the current height.
+    consecutive_empty_reveal_rounds: u32,
 }
 
 impl ConsensusDriver {
@@ -241,6 +341,9 @@ impl ConsensusDriver {
             sync: SyncState::follower(0),
             vote_safety,
             vote_safety_unavailable: None,
+            vrf_states: [None, None],
+            local_vrf_rounds: BTreeMap::new(),
+            consecutive_empty_reveal_rounds: 0,
         };
         driver.sync = if driver.engine.config.bootstrap_peers.is_empty() {
             SyncState::bootstrap(driver.engine.state.height)
@@ -408,6 +511,9 @@ impl ConsensusDriver {
         self.pending_precommit_quorum.clear();
         self.vote_collectors.clear();
         self.seen_round_votes.clear();
+        self.vrf_states = [None, None];
+        self.local_vrf_rounds.clear();
+        self.consecutive_empty_reveal_rounds = 0;
         self.locked_round = None;
         self.locked_value = None;
         self.locked_value_hash = None;
@@ -436,6 +542,12 @@ impl ConsensusDriver {
                 qc_bytes,
             } => self.handle_qc_response(from, height, qc_bytes),
             DriverEvent::QcRequest { from, height } => self.handle_qc_request(from, height),
+            DriverEvent::InboundVrfCommit { from, commit } => {
+                self.process_vrf_commit(from, commit)
+            }
+            DriverEvent::InboundVrfReveal { from, reveal } => {
+                self.process_vrf_reveal(from, reveal)
+            }
         }
     }
 
@@ -446,6 +558,404 @@ impl ConsensusDriver {
     fn start_round(&mut self, round: u32) {
         self.current_round = round;
         self.current_phase = RoundPhase::Propose;
+        let height = self.next_height();
+        if vrf_commit_reveal_election_active(height) {
+            let next = self
+                .vrf_states
+                .iter()
+                .filter_map(|state| state.as_ref())
+                .filter(|state| state.height == height && state.round == round)
+                .next()
+                .cloned();
+            self.vrf_states[0] = next.or_else(|| Some(VrfRoundState::new(height, round)));
+            self.vrf_states[1] = Some(VrfRoundState::new(height, round.saturating_add(1)));
+            self.local_vrf_rounds
+                .retain(|(h, r), _| *h == height && (*r == round || *r == round.saturating_add(1)));
+        } else {
+            self.vrf_states = [None, None];
+            self.local_vrf_rounds.clear();
+        }
+    }
+
+    fn vrf_slot_index(&self, height: u64, round: u32) -> Option<usize> {
+        self.vrf_states
+            .iter()
+            .position(|state| state.as_ref().is_some_and(|s| s.height == height && s.round == round))
+    }
+
+    fn active_vrf_candidates(&self, height: u64, round: u32) -> ProposerElection {
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
+        let candidates = self
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .filter_map(|validator| {
+                validator.vrf_pk.map(|vrf_pubkey| ProposerCandidate {
+                    validator_id: validator.validator_id,
+                    vrf_pubkey,
+                    verified_vrf_output: None,
+                    stake: validator.stake_spark,
+                })
+            })
+            .collect();
+        ProposerElection {
+            epoch_seed,
+            height,
+            round,
+            candidates,
+        }
+    }
+
+    fn vrf_input_for(&self, height: u64, round: u32) -> [u8; 32] {
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
+        compute_vrf_input(&epoch_seed.0, height, round)
+    }
+
+    fn total_active_stake(&self) -> u64 {
+        self.engine
+            .state
+            .validators
+            .active_validators()
+            .map(|validator| validator.stake_spark)
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    fn revealed_stake(&self, state: &VrfRoundState) -> u64 {
+        state
+            .reveals
+            .keys()
+            .filter_map(|id| self.engine.state.validators.get(id))
+            .map(|validator| validator.stake_spark)
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    fn quorum_stake_reached(&self, stake: u64) -> bool {
+        let total = self.total_active_stake();
+        total > 0 && stake >= bps_of(total, CONSENSUS_QUORUM_BPS)
+    }
+
+    fn empty_signature() -> Option<HybridSignature> {
+        Some(HybridSignature {
+            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[]).ok()?,
+            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&[]).ok()?,
+        })
+    }
+
+    fn convert_signature(sig: indra_crypto::HybridSignature) -> Option<HybridSignature> {
+        Some(HybridSignature {
+            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&sig.classical.0)
+                .ok()?,
+            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&sig.pq.0).ok()?,
+        })
+    }
+
+    fn validator_hybrid_public_key(&self, validator_id: &Bytes32) -> Option<HybridPublicKey> {
+        let validator = self.engine.state.validators.get(validator_id)?;
+        let classical = validator.hybrid_classical_pk?;
+        let pq_vec = validator.hybrid_pq_pk.as_ref()?;
+        let pq: [u8; indra_crypto::PQ_PK_BYTES] = pq_vec.as_slice().try_into().ok()?;
+        Some(HybridPublicKey {
+            classical: ClassicalPublicKey(classical),
+            pq: PqPublicKey(pq),
+        })
+    }
+
+    fn validator_vrf_pk_matches(&self, validator_id: &Bytes32, vrf_pubkey: &[u8; 32]) -> bool {
+        self.engine
+            .state
+            .validators
+            .get(validator_id)
+            .and_then(|validator| validator.vrf_pk)
+            .is_some_and(|registered| registered == *vrf_pubkey)
+            && self
+                .engine
+                .state
+                .validators
+                .active_validators()
+                .any(|validator| validator.validator_id == *validator_id)
+    }
+
+    fn verify_commit_signature(&self, commit: &VrfCommit) -> bool {
+        let Some(pk) = self.validator_hybrid_public_key(&commit.validator_id) else {
+            return false;
+        };
+        let Ok(sig) = commit.signature.to_crypto_sig() else {
+            return false;
+        };
+        verify_hybrid(&commit.signing_bytes(), &sig, &pk).is_ok()
+    }
+
+    fn verify_reveal_signature(&self, reveal: &VrfReveal) -> bool {
+        let Some(pk) = self.validator_hybrid_public_key(&reveal.validator_id) else {
+            return false;
+        };
+        let Ok(sig) = reveal.signature.to_crypto_sig() else {
+            return false;
+        };
+        verify_hybrid(&reveal.signing_bytes(), &sig, &pk).is_ok()
+    }
+
+    fn make_local_vrf_commit(&mut self, height: u64, round: u32) -> Option<VrfCommit> {
+        if self.local_vrf_rounds.contains_key(&(height, round)) {
+            return None;
+        }
+        let validator_id = self.engine.validator_id()?;
+        let vrf_keypair = self.engine.local_vrf_keypair()?;
+        let hybrid_keypair = self.engine.local_hybrid_keypair()?;
+        let vrf_pubkey = vrf_keypair.public_key();
+        let election = self.active_vrf_candidates(height, round);
+        if !election
+            .candidates
+            .iter()
+            .any(|candidate| candidate.validator_id == validator_id && candidate.vrf_pubkey == vrf_pubkey)
+        {
+            return None;
+        }
+        let slot = compute_proposer_vrf(validator_id, vrf_keypair, &election.epoch_seed, height, round);
+        let vrf_output = Bytes32::from(slot.vrf_output.0);
+        let vrf_proof = slot.vrf_proof.0.clone();
+        let chain_id_hash = chain_id_hash(&self.engine.state.chain_id);
+        let commit_hash = compute_vrf_commit_hash(
+            &chain_id_hash,
+            height,
+            round,
+            &validator_id,
+            &vrf_pubkey,
+            &slot.vrf_input,
+            &vrf_output,
+            &vrf_proof,
+        );
+        let mut commit = VrfCommit {
+            chain_id_hash,
+            height,
+            round,
+            validator_id,
+            vrf_pubkey,
+            commit_hash,
+            signature: Self::empty_signature()?,
+        };
+        let sig = hybrid_keypair.sign(&commit.signing_bytes()).ok()?;
+        commit.signature = Self::convert_signature(sig)?;
+        self.local_vrf_rounds.insert(
+            (height, round),
+            LocalVrfRoundState {
+                vrf_output,
+                vrf_proof,
+            },
+        );
+        Some(commit)
+    }
+
+    fn make_local_vrf_reveal(&self, height: u64, round: u32) -> Option<VrfReveal> {
+        let validator_id = self.engine.validator_id()?;
+        let hybrid_keypair = self.engine.local_hybrid_keypair()?;
+        let local = self.local_vrf_rounds.get(&(height, round))?;
+        let slot_index = self.vrf_slot_index(height, round)?;
+        let state = self.vrf_states[slot_index].as_ref()?;
+        let commit = state.commits.get(&validator_id)?;
+        let mut reveal = VrfReveal {
+            chain_id_hash: commit.chain_id_hash,
+            height,
+            round,
+            validator_id,
+            vrf_pubkey: commit.vrf_pubkey,
+            vrf_output: local.vrf_output,
+            vrf_proof: VariableBytes::from_slice(&local.vrf_proof).ok()?,
+            commit_hash: commit.commit_hash,
+            signature: Self::empty_signature()?,
+        };
+        let sig = hybrid_keypair.sign(&reveal.signing_bytes()).ok()?;
+        reveal.signature = Self::convert_signature(sig)?;
+        Some(reveal)
+    }
+
+    fn validate_vrf_commit(&self, commit: &VrfCommit) -> bool {
+        commit.chain_id_hash == chain_id_hash(&self.engine.state.chain_id)
+            && self.validator_vrf_pk_matches(&commit.validator_id, &commit.vrf_pubkey)
+            && self.verify_commit_signature(commit)
+    }
+
+    fn validate_vrf_reveal(&self, reveal: &VrfReveal) -> bool {
+        if reveal.chain_id_hash != chain_id_hash(&self.engine.state.chain_id)
+            || !self.validator_vrf_pk_matches(&reveal.validator_id, &reveal.vrf_pubkey)
+            || !self.verify_reveal_signature(reveal)
+        {
+            return false;
+        }
+        let vrf_input = self.vrf_input_for(reveal.height, reveal.round);
+        let proof = VrfProof(reveal.vrf_proof.as_slice().to_vec());
+        if vrf_verify(
+            &reveal.vrf_pubkey,
+            &vrf_input,
+            &VrfOutput(reveal.vrf_output.0),
+            &proof,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let expected = compute_vrf_commit_hash(
+            &reveal.chain_id_hash,
+            reveal.height,
+            reveal.round,
+            &reveal.validator_id,
+            &reveal.vrf_pubkey,
+            &vrf_input,
+            &reveal.vrf_output,
+            reveal.vrf_proof.as_slice(),
+        );
+        expected == reveal.commit_hash
+    }
+
+    /// Ensure local commit/reveal state exists for a round and drive timeouts.
+    pub fn ensure_vrf_election_for_round(
+        &mut self,
+        election: &ProposerElection,
+    ) -> Vec<DriverAction> {
+        if !vrf_commit_reveal_election_active(election.height) {
+            return vec![];
+        }
+        if self.vrf_slot_index(election.height, election.round).is_none() {
+            self.vrf_states[0] = Some(VrfRoundState::new(election.height, election.round));
+        }
+        let mut actions = Vec::new();
+        if let Some(commit) = self.make_local_vrf_commit(election.height, election.round) {
+            let validator_id = commit.validator_id;
+            if let Some(slot) = self.vrf_slot_index(election.height, election.round) {
+                if let Some(state) = self.vrf_states[slot].as_mut() {
+                    state.commits.insert(validator_id, commit.clone());
+                }
+            }
+            actions.push(DriverAction::BroadcastVrfCommit(commit));
+        }
+        actions.extend(self.advance_vrf_round(election.height, election.round));
+        actions
+    }
+
+    fn advance_vrf_round(&mut self, height: u64, round: u32) -> Vec<DriverAction> {
+        let mut actions = Vec::new();
+        let Some(slot) = self.vrf_slot_index(height, round) else {
+            return actions;
+        };
+        let open_reveal = self
+            .vrf_states
+            .get(slot)
+            .and_then(|state| state.as_ref())
+            .is_some_and(|state| {
+                state.phase == VrfRoundPhase::Commit
+                    && (self.quorum_stake_reached(
+                        state
+                            .commits
+                            .keys()
+                            .filter_map(|id| self.engine.state.validators.get(id))
+                            .map(|validator| validator.stake_spark)
+                            .fold(0u64, |a, b| a.saturating_add(b)),
+                    ) || state.commit_started_at.elapsed().as_millis()
+                        >= VRF_COMMIT_WINDOW_MS as u128)
+            });
+        if open_reveal {
+            if let Some(state) = self.vrf_states[slot].as_mut() {
+                state.phase = VrfRoundPhase::Reveal;
+                state.reveal_started_at = Some(Instant::now());
+            }
+            if let Some(reveal) = self.make_local_vrf_reveal(height, round) {
+                actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true));
+            }
+        }
+
+        let should_compute = self
+            .vrf_states
+            .get(slot)
+            .and_then(|state| state.as_ref())
+            .is_some_and(|state| {
+                state.election_result.is_none()
+                    && state.phase == VrfRoundPhase::Reveal
+                    && (self.quorum_stake_reached(self.revealed_stake(state))
+                        || state
+                            .reveal_started_at
+                            .is_some_and(|t| t.elapsed().as_millis() >= VRF_REVEAL_WINDOW_MS as u128))
+            });
+        if should_compute {
+            self.compute_and_store_vrf_election(slot);
+        }
+        actions
+    }
+
+    fn compute_and_store_vrf_election(&mut self, slot: usize) {
+        let Some(state) = self.vrf_states.get(slot).and_then(|state| state.as_ref()) else {
+            return;
+        };
+        let election = self.active_vrf_candidates(state.height, state.round);
+        let revealed: BTreeMap<Bytes32, Bytes32> = state
+            .reveals
+            .iter()
+            .map(|(id, reveal)| (*id, reveal.vrf_output))
+            .collect();
+        let result = elect_proposer_from_reveals(&election, &revealed)
+            .or_else(|_| compute_fallback_election_result(&election));
+        let Ok(result) = result else {
+            return;
+        };
+        if let Some(state) = self.vrf_states[slot].as_mut() {
+            if result.fallback_used {
+                self.consecutive_empty_reveal_rounds =
+                    self.consecutive_empty_reveal_rounds.saturating_add(1);
+                state.phase = if self.consecutive_empty_reveal_rounds
+                    >= MAX_VRF_EMPTY_REVEAL_ROUNDS
+                {
+                    VrfRoundPhase::Fallback
+                } else {
+                    VrfRoundPhase::Complete
+                };
+            } else {
+                self.consecutive_empty_reveal_rounds = 0;
+                state.phase = VrfRoundPhase::Complete;
+            }
+            state.election_result = Some(result);
+        }
+    }
+
+    fn insert_valid_vrf_reveal(
+        &mut self,
+        slot: usize,
+        reveal: VrfReveal,
+        gossip: bool,
+    ) -> Vec<DriverAction> {
+        let mut actions = Vec::new();
+        if !self.validate_vrf_reveal(&reveal) {
+            return actions;
+        }
+        let Some(state) = self.vrf_states[slot].as_mut() else {
+            return actions;
+        };
+        let Some(commit) = state.commits.get(&reveal.validator_id) else {
+            if state.pending_reveals.len() < MAX_VRF_ROUND_ENTRIES {
+                state.pending_reveals.insert(reveal.validator_id, reveal);
+            }
+            return actions;
+        };
+        if commit.commit_hash != reveal.commit_hash
+            || state.reveals.contains_key(&reveal.validator_id)
+            || state.reveals.len() >= MAX_VRF_ROUND_ENTRIES
+        {
+            return actions;
+        }
+        state.reveals.insert(reveal.validator_id, reveal.clone());
+        if gossip {
+            actions.push(DriverAction::BroadcastVrfReveal(reveal));
+        }
+        let height = state.height;
+        let round = state.round;
+        actions.extend(self.advance_vrf_round(height, round));
+        actions
+    }
+
+    /// Return the computed election result for a slot, when available.
+    pub fn vrf_election_result(&self, height: u64, round: u32) -> Option<VrfElectionResult> {
+        self.vrf_slot_index(height, round)
+            .and_then(|slot| self.vrf_states[slot].as_ref())
+            .and_then(|state| state.election_result)
     }
 
     /// Check persisted vote safety record and advance past already-voted rounds.
@@ -760,6 +1270,30 @@ impl ConsensusDriver {
         };
         let hash = block.header.block_hash();
         let value_hash = block.header.value_hash;
+        let election_mismatch = vrf_commit_reveal_election_active(height)
+            && block.header.election_result_hash
+                != self
+                    .vrf_election_result(height, self.current_round)
+                    .map(|result| result.hash());
+
+        if election_mismatch {
+            if self.vrf_election_result(height, self.current_round).is_none() {
+                return vec![];
+            }
+            eprintln!(
+                "[vote] nil-prevoting proposal {} at height={} round={} because election_result_hash does not match local commit-reveal result",
+                hex::encode(&hash.0[..4]),
+                height,
+                self.current_round,
+            );
+            self.current_phase = RoundPhase::Prevote;
+            return self.sign_and_record_local_vote(
+                height,
+                self.current_round,
+                VoteStep::Prevote,
+                Bytes32::ZERO,
+            );
+        }
 
         let vote_hash = if block.header.polc_round == NO_POLC_ROUND {
             // Rule 2
@@ -823,7 +1357,23 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         }
 
-        match self.engine.sign_vote(height, round, step, block_hash) {
+        let election_result_hash = if vrf_commit_reveal_election_active(height)
+            && step == VoteStep::Precommit
+        {
+            self.vrf_election_result(height, round)
+                .map(|result| result.hash())
+                .or_else(|| {
+                    self.pending_block(&block_hash)
+                        .and_then(|block| block.header.election_result_hash)
+                })
+        } else {
+            None
+        };
+
+        match self
+            .engine
+            .sign_vote_with_election_result(height, round, step, block_hash, election_result_hash)
+        {
             Ok(local_vote) => {
                 eprintln!(
                     "[vote] produced {:?} for height={} round={} hash={}",
@@ -895,6 +1445,21 @@ impl ConsensusDriver {
                 block.header.proposer_round,
             );
             return vec![DriverAction::None];
+        }
+        if vrf_commit_reveal_election_active(block.header.height) {
+            if let Some(local_result) =
+                self.vrf_election_result(block.header.height, block.header.proposer_round)
+            {
+                if block.header.election_result_hash != Some(local_result.hash()) {
+                    eprintln!(
+                        "[vote] rejecting proposal {} at height={} round={} because election_result_hash does not match local commit-reveal result",
+                        hex::encode(&block.header.block_hash().0[..4]),
+                        block.header.height,
+                        block.header.proposer_round,
+                    );
+                    return vec![DriverAction::None];
+                }
+            }
         }
 
         if block.header.height > 1 {
@@ -973,6 +1538,13 @@ impl ConsensusDriver {
 
         // Rules 2 and 3 — if this is the proposal for our current slot, react
         // immediately instead of waiting for the propose timeout.
+        if vrf_commit_reveal_election_active(proposal_height)
+            && proposal_height == self.next_height()
+            && proposal_round == self.current_round
+        {
+            let election = self.active_vrf_candidates(proposal_height, proposal_round);
+            actions.extend(self.ensure_vrf_election_for_round(&election));
+        }
         actions.extend(self.maybe_prevote_current_round_proposal());
         actions
     }
@@ -1356,6 +1928,48 @@ impl ConsensusDriver {
         }
     }
 
+    fn process_vrf_commit(&mut self, _from: SocketAddr, commit: VrfCommit) -> Vec<DriverAction> {
+        if !vrf_commit_reveal_election_active(commit.height) || !self.validate_vrf_commit(&commit) {
+            return vec![DriverAction::None];
+        }
+        let Some(slot) = self.vrf_slot_index(commit.height, commit.round) else {
+            return vec![DriverAction::None];
+        };
+        let pending = {
+            let Some(state) = self.vrf_states[slot].as_mut() else {
+                return vec![DriverAction::None];
+            };
+            if state.commits.contains_key(&commit.validator_id)
+                || state.commits.len() >= MAX_VRF_ROUND_ENTRIES
+            {
+                return vec![DriverAction::None];
+            }
+            state.commits.insert(commit.validator_id, commit.clone());
+            state.pending_reveals.remove(&commit.validator_id)
+        };
+        let mut actions = vec![DriverAction::BroadcastVrfCommit(commit.clone())];
+        if let Some(reveal) = pending {
+            actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true));
+        }
+        actions.extend(self.advance_vrf_round(commit.height, commit.round));
+        actions
+    }
+
+    fn process_vrf_reveal(&mut self, _from: SocketAddr, reveal: VrfReveal) -> Vec<DriverAction> {
+        if !vrf_commit_reveal_election_active(reveal.height) {
+            return vec![DriverAction::None];
+        }
+        let Some(slot) = self.vrf_slot_index(reveal.height, reveal.round) else {
+            return vec![DriverAction::None];
+        };
+        let actions = self.insert_valid_vrf_reveal(slot, reveal, true);
+        if actions.is_empty() {
+            vec![DriverAction::None]
+        } else {
+            actions
+        }
+    }
+
     fn process_status(
         &mut self,
         from: SocketAddr,
@@ -1603,6 +2217,7 @@ mod tests {
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
                 quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],
@@ -1631,6 +2246,7 @@ mod tests {
             step,
             block_hash,
             validator_id: test_hash(round as usize),
+            election_result_hash: None,
             signature: indra_core::types::crypto::HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
@@ -1733,6 +2349,98 @@ mod tests {
         (ConsensusDriver::new(engine, vote_safety), dir)
     }
 
+    fn signed_vrf_pair(
+        driver: &ConsensusDriver,
+        seed: [u8; 32],
+        height: u64,
+        round: u32,
+        chain_id: &str,
+    ) -> (VrfCommit, VrfReveal) {
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let hybrid = HybridKeypair::new(classical, pq);
+        let vrf = VrfKeypair::from_seed(&seed);
+        let vrf_pubkey = vrf.public_key();
+        let validator_id = driver
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .find(|validator| validator.vrf_pk == Some(vrf_pubkey))
+            .expect("seed must be registered as active validator")
+            .validator_id;
+        let election = election_for_round(driver, height, round);
+        let slot = compute_proposer_vrf(validator_id, &vrf, &election.epoch_seed, height, round);
+        let vrf_output = Bytes32::from(slot.vrf_output.0);
+        let chain_id_hash = chain_id_hash(chain_id);
+        let commit_hash = compute_vrf_commit_hash(
+            &chain_id_hash,
+            height,
+            round,
+            &validator_id,
+            &vrf_pubkey,
+            &slot.vrf_input,
+            &vrf_output,
+            &slot.vrf_proof.0,
+        );
+        let mut commit = VrfCommit {
+            chain_id_hash,
+            height,
+            round,
+            validator_id,
+            vrf_pubkey,
+            commit_hash,
+            signature: ConsensusDriver::empty_signature().unwrap(),
+        };
+        commit.signature =
+            ConsensusDriver::convert_signature(hybrid.sign(&commit.signing_bytes()).unwrap())
+                .unwrap();
+        let mut reveal = VrfReveal {
+            chain_id_hash,
+            height,
+            round,
+            validator_id,
+            vrf_pubkey,
+            vrf_output,
+            vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
+                .unwrap(),
+            commit_hash,
+            signature: ConsensusDriver::empty_signature().unwrap(),
+        };
+        reveal.signature =
+            ConsensusDriver::convert_signature(hybrid.sign(&reveal.signing_bytes()).unwrap())
+                .unwrap();
+        (commit, reveal)
+    }
+
+    fn seed_vrf_result_for_seed(
+        driver: &mut ConsensusDriver,
+        height: u64,
+        round: u32,
+        seed: [u8; 32],
+    ) {
+        let election = election_for_round(driver, height, round);
+        let vrf = VrfKeypair::from_seed(&seed);
+        let proposer_id = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+            .expect("seed must be registered as active validator")
+            .validator_id;
+        let slot = compute_proposer_vrf(proposer_id, &vrf, &election.epoch_seed, height, round);
+        let result = VrfElectionResult {
+            height,
+            round,
+            elected_validator_id: proposer_id,
+            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+            fallback_used: false,
+        };
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Complete;
+        state.election_result = Some(result);
+        driver.vrf_states[0] = Some(state);
+    }
+
     fn make_strict_block(
         driver: &ConsensusDriver,
         proposer_seed: [u8; 32],
@@ -1761,8 +2469,30 @@ mod tests {
             round,
             candidates,
         };
+        let proposer_vrf = VrfKeypair::from_seed(&proposer_seed);
+        let proposer_id = election
+            .candidates
+            .iter()
+            .find(|candidate| candidate.vrf_pubkey == proposer_vrf.public_key())
+            .expect("proposer must be in active validator set")
+            .validator_id;
+        let slot = compute_proposer_vrf(
+            proposer_id,
+            &proposer_vrf,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let election_result_hash = VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id: proposer_id,
+            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+            fallback_used: false,
+        }
+        .hash();
         let template = BlockTemplate {
-            proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+            proposer_vrf_keypair: proposer_vrf,
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp: 1_700_000_000 + driver.engine.state.height + 1,
@@ -1770,6 +2500,7 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            election_result_hash: Some(election_result_hash),
         };
         produce_block(
             &template,
@@ -1821,6 +2552,133 @@ mod tests {
             .validator_id;
         let elected = indra_consensus::proposer::elect_proposer(election, election.height).ok()?;
         (elected == validator_id).then_some(elected)
+    }
+
+    #[test]
+    fn vrf_reveal_without_prior_commit_is_not_accepted() {
+        let (mut driver, dir) = local_driver([0x11; 32], "vrf_reveal_without_commit");
+        install_active_validator(&mut driver, [0x21; 32], "peer");
+        let height = driver.next_height();
+        let round = driver.current_round;
+        let election = election_for_round(&driver, height, round);
+        driver.ensure_vrf_election_for_round(&election);
+        let (_commit, reveal) =
+            signed_vrf_pair(&driver, [0x21; 32], height, round, DEFAULT_CHAIN_ID);
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        let external_validator_id = reveal.validator_id;
+
+        let actions = driver.process(DriverEvent::InboundVrfReveal {
+            from: "127.0.0.1:10001".parse().unwrap(),
+            reveal,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_)))
+        );
+        assert!(!driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .reveals
+            .contains_key(&external_validator_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vrf_reveal_commitment_mismatch_is_rejected() {
+        let (mut driver, dir) = local_driver([0x12; 32], "vrf_commitment_mismatch");
+        install_active_validator(&mut driver, [0x22; 32], "peer");
+        let height = driver.next_height();
+        let round = driver.current_round;
+        let election = election_for_round(&driver, height, round);
+        driver.ensure_vrf_election_for_round(&election);
+        let (commit, mut reveal) =
+            signed_vrf_pair(&driver, [0x22; 32], height, round, DEFAULT_CHAIN_ID);
+        let external_validator_id = reveal.validator_id;
+        reveal.commit_hash = Bytes32::from([0xEE; 32]);
+
+        driver.process(DriverEvent::InboundVrfCommit {
+            from: "127.0.0.1:10001".parse().unwrap(),
+            commit,
+        });
+        let actions = driver.process(DriverEvent::InboundVrfReveal {
+            from: "127.0.0.1:10001".parse().unwrap(),
+            reveal,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_)))
+        );
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        assert!(!driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .reveals
+            .contains_key(&external_validator_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vrf_reveal_with_invalid_proof_is_rejected() {
+        let (mut driver, dir) = local_driver([0x13; 32], "vrf_invalid_proof");
+        install_active_validator(&mut driver, [0x23; 32], "peer");
+        let height = driver.next_height();
+        let round = driver.current_round;
+        let election = election_for_round(&driver, height, round);
+        driver.ensure_vrf_election_for_round(&election);
+        let (commit, mut reveal) =
+            signed_vrf_pair(&driver, [0x23; 32], height, round, DEFAULT_CHAIN_ID);
+        let external_validator_id = reveal.validator_id;
+        let bad_proof = vec![0xAB; reveal.vrf_proof.as_slice().len().max(1)];
+        reveal.vrf_proof = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&bad_proof).unwrap();
+
+        driver.process(DriverEvent::InboundVrfCommit {
+            from: "127.0.0.1:10001".parse().unwrap(),
+            commit,
+        });
+        let actions = driver.process(DriverEvent::InboundVrfReveal {
+            from: "127.0.0.1:10001".parse().unwrap(),
+            reveal,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_)))
+        );
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        assert!(!driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .reveals
+            .contains_key(&external_validator_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vrf_commit_for_wrong_chain_is_rejected() {
+        let (mut driver, dir) = local_driver([0x14; 32], "vrf_wrong_chain");
+        let height = driver.next_height();
+        let round = driver.current_round;
+        let election = election_for_round(&driver, height, round);
+        driver.ensure_vrf_election_for_round(&election);
+        let (commit, _reveal) =
+            signed_vrf_pair(&driver, [0x14; 32], height, round, "other-chain");
+
+        let actions = driver.process(DriverEvent::InboundVrfCommit {
+            from: "127.0.0.1:10001".parse().unwrap(),
+            commit,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVrfCommit(_)))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn pick_tip_hash_for_round_winners(
@@ -2151,22 +3009,24 @@ mod tests {
             &remote_b,
         )
         .unwrap();
-        let precommit_a = indra_consensus::vote::produce_vote(
+        let precommit_a = indra_consensus::vote::produce_vote_with_election_result(
             1,
             0,
             VoteStep::Precommit,
             block_hash,
             remote_a_id,
+            block.header.election_result_hash,
             DEFAULT_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
-        let precommit_b = indra_consensus::vote::produce_vote(
+        let precommit_b = indra_consensus::vote::produce_vote_with_election_result(
             1,
             0,
             VoteStep::Precommit,
             block_hash,
             remote_b_id,
+            block.header.election_result_hash,
             DEFAULT_CHAIN_ID,
             &remote_b,
         )
@@ -2187,6 +3047,7 @@ mod tests {
             .any(|a| matches!(a, DriverAction::RequestProposal { .. })));
         assert!(actions_b.is_empty());
 
+        seed_vrf_result_for_seed(&mut driver, 1, 0, [0x42u8; 32]);
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: Some(peer_a),
             block,
@@ -2233,28 +3094,14 @@ mod tests {
     #[test]
     fn proposal_drives_round_advancement() {
         let (mut driver, dir) = local_driver([0x4Fu8; 32], "proposal_round_advance");
-        let validator_seeds = [[0x4Fu8; 32], [0x52u8; 32], [0x53u8; 32], [0x54u8; 32]];
-        for seed in validator_seeds {
-            install_active_validator(&mut driver, seed, "validator");
-        }
+        install_active_validator(&mut driver, [0x4Fu8; 32], "validator");
         driver.refresh_registered_voters();
 
-        let proposer_seed = validator_seeds
-            .into_iter()
-            .find_map(|seed| {
-                driver.engine.state.tip_hash =
-                    pick_tip_hash_for_verified_winner(&driver, 1, 5, seed);
-                let proposer_election = election_for_round(&driver, 1, 5);
-                let elected = elect_with_verified_output_for_seed(&proposer_election, seed)?;
-                let validator_id = validator_id_for_seed(seed);
-                (elected == validator_id).then_some(seed)
-            })
-            .expect("expected one validator to win with verified VRF output");
-        let block = make_strict_block(&driver, proposer_seed, 5, vec![]);
+        let block = make_strict_block(&driver, [0x4Fu8; 32], 5, vec![]);
         let block_hash = block.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
 
-        assert_eq!(driver.current_round(), 5);
+        assert_eq!(driver.height(), 1);
         assert!(actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote)
@@ -3222,6 +4069,7 @@ mod tests {
                 &election,
                 valid_block.header.timestamp,
                 driver.last_qc_bytes(),
+                None,
             )
             .expect("reproposal should succeed");
 
@@ -3232,6 +4080,7 @@ mod tests {
         driver.on_precommit_timeout();
         let reproposed_hash = reproposed.header.block_hash();
         driver.pending_blocks.insert(reproposed_hash, reproposed);
+        seed_vrf_result_for_seed(&mut driver, height, 1, [0x73u8; 32]);
         let reproposal_actions = driver.maybe_prevote_current_round_proposal();
         assert!(reproposal_actions.iter().any(|action| matches!(
             action,
@@ -3256,6 +4105,7 @@ mod tests {
                 &election_round_zero,
                 1_700_000_001,
                 driver.last_qc_bytes(),
+                None,
                 None,
             )
             .expect("initial proposal should succeed");
@@ -3286,6 +4136,7 @@ mod tests {
                 &election_round_one,
                 proposal.header.timestamp,
                 driver.last_qc_bytes(),
+                None,
             )
             .expect("reproposal should succeed");
 
@@ -3341,11 +4192,13 @@ mod tests {
                 1_700_000_100,
                 driver_a.last_qc_bytes(),
                 None,
+                None,
             )
             .expect("A should propose round 0");
         let value_hash = block_x.header.value_hash;
         let block_x_hash = block_x.header.block_hash();
 
+        seed_vrf_result_for_seed(&mut driver_b, 1, 0, [0x81u8; 32]);
         let stage_actions = driver_b.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9801".parse().unwrap()),
             block: block_x.clone(),
@@ -3410,12 +4263,14 @@ mod tests {
                 &election_round_one,
                 valid_block.header.timestamp,
                 driver_b.last_qc_bytes(),
+                None,
             )
             .expect("B should repropose valid value at round 1");
         assert_eq!(block_y.header.value_hash, value_hash);
         let block_y_hash = block_y.header.block_hash();
         assert_ne!(block_y_hash, block_x_hash);
 
+        seed_vrf_result_for_seed(&mut driver_b, 1, 1, [0x82u8; 32]);
         let reproposal_actions = driver_b.process(DriverEvent::InboundBlock {
             from: None,
             block: block_y.clone(),
@@ -3452,12 +4307,13 @@ mod tests {
             ("127.0.0.1:9822", c_id, &c),
             ("127.0.0.1:9823", d_id, &d),
         ] {
-            let vote = indra_consensus::vote::produce_vote(
+            let vote = indra_consensus::vote::produce_vote_with_election_result(
                 1,
                 1,
                 VoteStep::Precommit,
                 block_y_hash,
                 validator_id,
+                block_y.header.election_result_hash,
                 DEFAULT_CHAIN_ID,
                 signer,
             )

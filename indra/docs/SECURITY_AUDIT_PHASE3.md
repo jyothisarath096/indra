@@ -8,7 +8,7 @@
 | CS-02 | Safety | POLC rule uses full hash for vote target and value hash for same-value reproposal checks | SAFE | Checked |
 | CS-03 | Safety | QC verification requires quorum stake plus PQ and Ed25519 signatures; stale strict-wrapper comment corrected | SAFE | FIXED |
 | CS-04 | Liveness | Timeout progression is local and uncapped; peer-status round jumps are capped | SAFE / LOW | Checked |
-| CS-05 | Liveness | Proposer election now uses a public deterministic score; VRF proof remains key-ownership evidence | SAFE | FIXED |
+| CS-05 | Liveness | Proposer election uses commit-reveal VRF with QC-attested election result hash | SAFE | FIXED |
 | CS-06 | Liveness | Sync catch-up refreshes voter set and recovers stale/missing tip QC | SAFE | Checked |
 | CS-07 | Equivocation | Slash detector compares vote full `block_hash()` and no stale `value_hash` path was found | SAFE | Checked |
 | CS-08 | Equivocation | Slash evidence requires forged hybrid precommit signatures; prevote conflicts are explicitly non-slashable | SAFE | FIXED |
@@ -107,31 +107,38 @@ The remaining liveness caveat is that timeouts are constant rather than adaptive
 
 ### CS-05 — Proposer election uniqueness
 
-**Description:** FIXED. `elect_proposer` now uses `public_proposer_output(epoch_seed, height, round, validator_id, vrf_pubkey)` for every candidate while `PUBLIC_PROPOSER_ELECTION_HEIGHT` is active. It no longer uses `verified_vrf_output` for winner selection. This makes proposer election a single public deterministic function evaluated identically by every validator.
+**Description:** FIXED. Proposer election now uses a short-lived commit-reveal VRF round for each `(height, round)`. Validators first gossip `VrfCommit`, then open with `VrfReveal`. The local live voting path elects the winner from verified reveals, assigning non-revealers the worst score and falling back to the public deterministic election only when no reveals are available.
 
-The VRF proof/output remains in the block header and is still verified by proposal intake/import code, but it now serves as key-ownership evidence for the registered VRF public key rather than as the election score.
+The elected result is represented by `VrfElectionResult` and committed as `election_result_hash` in `BlockHeaderV1`. Precommit votes sign the same hash, `QuorumCertificateV1` stores it for signature verification, and `block_hash()` includes it. Thus the QC attests both the block hash and the proposer-election result hash.
 
-**Attack scenario blocked:** Before the fix, validators A and B could both honestly believe they were proposer for the same height/round because each compared their own actual VRF output against other candidates' public fallback hashes. After the fix, A, B, and all verifiers compute the same public score for every candidate, so exactly one validator wins each slot by the shared score/tiebreak rule.
+Sync/import verification remains bounded: historical nodes verify the proposer owns the registered VRF key and that the header `election_result_hash` certifies that proposer/output (or the fallback sentinel). They do not need historical ephemeral commit/reveal gossip.
 
-With full-hash voting, the pre-fix issue was primarily liveness, not safety. The fix removes the avoidable vote splitting/zero-proposer churn caused by perspective-dependent winner selection.
+**Attack scenario blocked:** The original CS-05 bug let validators A and B both honestly believe they were proposer for the same height/round because each compared their own actual VRF output against other candidates' public fallback hashes. The interim public deterministic fix removed multi-winner rounds but made the schedule predictable. The commit-reveal fix removes the perspective-dependent winner while restoring per-round private VRF unpredictability until reveal.
 
 **Code location:**
 
-- `indra-consensus/src/proposer.rs::elect_proposer`
-- `indra-consensus/src/proposer.rs::public_proposer_output`
-- `indra-node/src/engine.rs::is_proposer`
+- `indra-consensus/src/proposer.rs::elect_proposer_from_reveals`
+- `indra-core/src/types/vrf_election.rs::VrfCommit`
+- `indra-core/src/types/vrf_election.rs::VrfReveal`
+- `indra-core/src/types/vrf_election.rs::VrfElectionResult`
+- `indra-node/src/driver.rs::ensure_vrf_election_for_round`
+- `indra-node/src/driver.rs::process_vrf_commit`
+- `indra-node/src/driver.rs::process_vrf_reveal`
 - `indra-consensus/src/producer.rs::produce_block`
 - `indra-node/src/sync.rs::verify_proposer_vrf`
-- `indra-core/src/types/primitives.rs::PUBLIC_PROPOSER_ELECTION_HEIGHT`
+- `indra-core/src/types/primitives.rs::VRF_COMMIT_REVEAL_ELECTION_HEIGHT`
 
 **Analysis/proof:** The new tests verify that:
 
-- `elect_proposer` returns the same winner even when `verified_vrf_output` is populated for one candidate;
-- `NodeEngine::is_proposer` returns true for exactly one validator across a 4-validator set over multiple heights/rounds;
-- two validators with valid VRF proofs for the same slot cannot both pass `verify_proposer_vrf`;
-- the public proposer score is deterministic/domain-separated and remains stake-sensitive.
+- the same reveal set deterministically produces the same `VrfElectionResult`;
+- validators that withhold reveals receive the worst score;
+- zero-reveal rounds use the explicit fallback result hash;
+- reveals without prior commits, mismatched commitments, invalid VRF proofs, and wrong-chain commits are rejected;
+- block headers commit to `election_result_hash`;
+- precommit votes carry `election_result_hash`, while prevotes do not;
+- sync verification accepts a correct commit-reveal header hash without ephemeral messages and rejects tampered result hashes.
 
-**Severity:** SAFE after fix. This is a consensus-rule change for proposer validity and should be activated from genesis after a fresh testnet reset or via a hard-fork height. It does not change cryptographic derivation, block wire format, state schema, or genesis validator key material.
+**Severity:** SAFE after fix. This is a consensus-rule and wire-format change for proposer validity, votes/QCs, and P2P gossip. It should be activated from genesis after a fresh testnet reset or via a hard-fork height. It does not change cryptographic derivation or genesis validator key material.
 
 **Recommended fix:** Complete. For mainnet design, consider a commit-reveal VRF election if private/unpredictable per-round proposer selection is required; the current public deterministic rule intentionally prioritizes a unique globally-computable proposer.
 

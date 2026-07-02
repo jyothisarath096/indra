@@ -581,6 +581,7 @@ mod tests {
                 proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0u8; 64])
                     .unwrap(),
                 quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],

@@ -66,6 +66,12 @@ pub struct BlockHeaderV1 {
     pub proposer_vrf_proof: VariableBytes<MAX_VRF_PROOF_BYTES>,
     /// Quorum certificate for the PREVIOUS block (proving it was finalised).
     pub quorum_certificate: VariableBytes<MAX_QC_SIZE_BYTES>,
+    /// Hash of the commit-reveal VRF election result for this proposal.
+    ///
+    /// Present when commit-reveal proposer election is active. Because
+    /// `block_hash()` hashes the canonical header encoding, QCs over the block
+    /// hash also certify this election result hash.
+    pub election_result_hash: Option<Bytes32>,
 }
 
 impl BlockHeaderV1 {
@@ -114,6 +120,12 @@ impl Encode for BlockHeaderV1 {
         self.quorum_certificate.encode(buf);
         self.polc_round.encode(buf);
         self.value_hash.encode(buf);
+        if let Some(hash) = self.election_result_hash {
+            1u8.encode(buf);
+            hash.encode(buf);
+        } else {
+            0u8.encode(buf);
+        }
     }
     fn encoded_len(&self) -> usize {
         2 + 8
@@ -129,6 +141,8 @@ impl Encode for BlockHeaderV1 {
             + 32
             + self.proposer_vrf_proof.encoded_len()
             + self.quorum_certificate.encoded_len()
+            + 1
+            + self.election_result_hash.map(|_| 32).unwrap_or(0)
     }
 }
 
@@ -149,6 +163,12 @@ impl Decode for BlockHeaderV1 {
             quorum_certificate: VariableBytes::decode(r)?,
             polc_round: u32::decode(r).unwrap_or(NO_POLC_ROUND),
             value_hash: Bytes32::decode(r).unwrap_or(Bytes32::ZERO),
+            election_result_hash: match u8::decode(r) {
+                Ok(0) => None,
+                Ok(1) => Some(Bytes32::decode(r)?),
+                Ok(b) => return Err(crate::error::IndraError::InvalidBool { byte: b }),
+                Err(_) => None,
+            },
         })
     }
 }
@@ -235,6 +255,7 @@ mod tests {
             proposer_vrf_output: Bytes32::from([0x44u8; 32]),
             proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
             quorum_certificate: VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),
+            election_result_hash: Some(Bytes32::from([0xCCu8; 32])),
         }
     }
 

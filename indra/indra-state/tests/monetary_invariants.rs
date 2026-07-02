@@ -206,6 +206,7 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),
+            election_result_hash: None,
         },
         transactions,
         slashing_evidence: vec![],
@@ -221,6 +222,7 @@ fn signed_vote(keypair: &HybridKeypair, validator_id: Bytes32, block_hash: Bytes
         VoteStep::Precommit,
         &block_hash,
         &validator_id,
+        None,
         DEFAULT_CHAIN_ID,
     );
     let sig = keypair.sign(&signing_bytes).unwrap();
@@ -230,6 +232,7 @@ fn signed_vote(keypair: &HybridKeypair, validator_id: Bytes32, block_hash: Bytes
         step: VoteStep::Precommit,
         block_hash,
         validator_id,
+        election_result_hash: None,
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),

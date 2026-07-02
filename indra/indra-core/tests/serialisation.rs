@@ -85,6 +85,7 @@ fn dummy_header() -> BlockHeaderV1 {
         proposer_vrf_output: Bytes32::from([0x44u8; 32]),
         proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
         quorum_certificate: VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),
+        election_result_hash: None,
     }
 }
 
@@ -141,6 +142,7 @@ fn vote_round_trip() {
         step: VoteStep::Prevote,
         block_hash: Bytes32::from([0x77u8; 32]),
         validator_id: Bytes32::from([0x88u8; 32]),
+        election_result_hash: None,
         signature: sig(),
     };
     assert_eq!(v, VoteV1::decode_exact(&v.encode_to_vec()).unwrap());
@@ -170,6 +172,7 @@ fn quorum_certificate_round_trip() {
         height: 42,
         round: 0,
         block_hash: Bytes32::from([0xFFu8; 32]),
+        election_result_hash: None,
         signer_bitfield: [0b10101010u8; SIGNER_BITFIELD_BYTES],
         pq_signatures: vec![],
         classical_signatures: vec![],

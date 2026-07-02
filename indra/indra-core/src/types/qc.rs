@@ -60,6 +60,8 @@ pub struct QuorumCertificateV1 {
     pub round: u32,
     /// Certified full block hash.
     pub block_hash: Bytes32,
+    /// Election result hash that precommit signers attested, when active.
+    pub election_result_hash: Option<Bytes32>,
     /// Bitfield: bit i = 1 → validator at slot i signed.
     pub signer_bitfield: [u8; SIGNER_BITFIELD_BYTES],
     /// Individual ML-DSA-87 signatures for included validators.
@@ -99,6 +101,12 @@ impl Encode for QuorumCertificateV1 {
         self.height.encode(buf);
         self.round.encode(buf);
         self.block_hash.encode(buf);
+        if let Some(hash) = self.election_result_hash {
+            1u8.encode(buf);
+            hash.encode(buf);
+        } else {
+            0u8.encode(buf);
+        }
         buf.extend_from_slice(&self.signer_bitfield);
         encode_list(&self.pq_signatures, buf);
         if hybrid_qc_active(self.height) {
@@ -109,6 +117,8 @@ impl Encode for QuorumCertificateV1 {
         1 + 8
             + 4
             + 32
+            + 1
+            + self.election_result_hash.map(|_| 32).unwrap_or(0)
             + SIGNER_BITFIELD_BYTES
             + list_encoded_len(&self.pq_signatures)
             + if hybrid_qc_active(self.height) {
@@ -128,6 +138,12 @@ impl Decode for QuorumCertificateV1 {
         let height = u64::decode(r)?;
         let round = u32::decode(r)?;
         let block_hash = Bytes32::decode(r)?;
+        let election_result_hash = match u8::decode(r) {
+            Ok(0) => None,
+            Ok(1) => Some(Bytes32::decode(r)?),
+            Ok(byte) => return Err(IndraError::InvalidBool { byte }),
+            Err(_) => None,
+        };
         let bf_bytes = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield.copy_from_slice(bf_bytes);
@@ -141,6 +157,7 @@ impl Decode for QuorumCertificateV1 {
             height,
             round,
             block_hash,
+            election_result_hash,
             signer_bitfield,
             pq_signatures,
             classical_signatures,
@@ -158,6 +175,7 @@ mod tests {
             height: 1_000,
             round: 0,
             block_hash: Bytes32::from([0x77u8; 32]),
+            election_result_hash: Some(Bytes32::from([0x88u8; 32])),
             signer_bitfield: [0b11111111u8; SIGNER_BITFIELD_BYTES],
             pq_signatures: vec![],
             classical_signatures: vec![],
@@ -179,6 +197,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: Bytes32::from([0x01; 32]),
+            election_result_hash: None,
             signer_bitfield: [0u8; SIGNER_BITFIELD_BYTES],
             pq_signatures: vec![],
             classical_signatures: vec![],
@@ -189,6 +208,7 @@ mod tests {
         qc.height.encode(&mut buf);
         qc.round.encode(&mut buf);
         qc.block_hash.encode(&mut buf);
+        0u8.encode(&mut buf);
         buf.extend_from_slice(&qc.signer_bitfield);
         encode_list(&qc.pq_signatures, &mut buf);
 
@@ -206,6 +226,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: Bytes32::from([0x01; 32]),
+            election_result_hash: None,
             signer_bitfield: [0u8; SIGNER_BITFIELD_BYTES],
             pq_signatures: vec![],
             classical_signatures: vec![ClassicalVoteSig {

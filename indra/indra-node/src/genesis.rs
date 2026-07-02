@@ -43,6 +43,7 @@ pub fn build_genesis_block() -> BlockV1 {
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::default(),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::default(),
+            election_result_hash: None,
         },
         transactions: vec![],
         slashing_evidence: vec![],

@@ -13,5 +13,6 @@ pub mod staking;
 pub mod transaction;
 pub mod vote;
 pub mod vote_signing;
+pub mod vrf_election;
 
 pub use epoch_record::EpochRecord;
