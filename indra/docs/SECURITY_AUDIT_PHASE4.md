@@ -302,7 +302,7 @@ Fix implemented:
 Severity: SAFE  
 Status: VERIFIED
 
-Description: Precommit equivocation slashing verifies both vote signatures, rejects non-slashable prevote conflicts, computes slash amount as basis points of current self-stake, reduces validator self-stake, reduces active self-bond amounts, burns the non-reporter portion, credits treasury with the reporter reward, and marks the validator `Slashed`.
+Description: Precommit equivocation slashing verifies both vote signatures, rejects non-slashable prevote conflicts, computes slash amount as basis points of slashable self-stake, reduces validator self-stake, reduces slashable self-bond amounts, pays a 50% reporter reward directly to the block proposer as a spendable UTXO when the proposer can be resolved and the reward is above dust, burns the remainder, and marks the validator `Slashed`. If no reporter/proposer is available or the reward is below dust, the full slash amount is burned.
 
 Code locations:
 
@@ -310,14 +310,13 @@ Code locations:
 - `indra-state/src/apply.rs:116` — vote signatures verified with validator keys and chain ID
 - `indra-state/src/apply.rs:139` — same-hash votes are not equivocation
 - `indra-state/src/apply.rs:155` — only precommit equivocation is slashable
-- `indra-state/src/apply.rs:193` — slash amount calculation
-- `indra-state/src/apply.rs:199` — validator stake and status updated
-- `indra-state/src/apply.rs:208` — active self-bonds reduced
-- `indra-state/src/apply.rs:224` — total supply and treasury updated
+- `indra-state/src/apply.rs` — slash amount calculation and slashable self-bond reduction
+- `indra-state/src/apply.rs` — deterministic slash reporter reward UTXO creation
+- `indra-state/src/apply.rs` — total supply reduced only by the burned slash amount
 
 Recommended fix:
 
-None for active self-stake accounting. See ST-13 for unbonding self-stake escape.
+None. Slash accounting now burns the non-reward portion and routes qualifying reporter rewards directly to the reporting block proposer; treasury is not used for slash reporter rewards.
 
 ### ST-11 — Double-slash protection prevents repeated penalties
 
@@ -447,14 +446,14 @@ Fix implemented:
 Severity: LOW  
 Status: FIXED
 
-Description: Bonding/unbonding moves UTXOs into and out of `staked_bonds` without changing total supply. Block rewards appear preminted and do not increase total supply at epoch transition. Fee burn and slash burns reduce total supply; reporter rewards move to treasury. The code also applies liveness penalties at epoch transition, even though the current stated model says slashing is precommit-equivocation only.
+Description: Bonding/unbonding moves UTXOs into and out of `staked_bonds` without changing total supply. Block rewards appear preminted and do not increase total supply at epoch transition. Fee burn and slash burns reduce total supply; slash reporter rewards are paid directly to the reporting block proposer as spendable UTXOs when above dust, while the remaining slash amount is burned. The code also applies liveness penalties at epoch transition, even though the current stated model says slashing is precommit-equivocation only.
 
 Code locations:
 
 - `indra-state/src/chain.rs` — genesis total supply constants and initial state
 - `indra-state/src/delegation.rs:288` and `indra-state/src/delegation.rs:401` — bonding spends UTXO into bond table
 - `indra-state/src/epoch.rs:720` — unbonding releases UTXO back to set
-- `indra-state/src/apply.rs:224` — equivocation slash burn and treasury credit
+- `indra-state/src/apply.rs` — equivocation slash burn plus direct reporter reward UTXO
 - `indra-state/src/epoch.rs:790` — liveness penalties burn stake
 - `indra-state/src/epoch.rs:114` — block reward distribution occurs at epoch transition
 
@@ -468,7 +467,7 @@ Write a single monetary-policy invariant test suite covering bond, unbond, slash
 
 Fix implemented:
 
-Liveness penalties are documented as intentional protocol penalties separate from the CS-08 equivocation-slashing model. They trigger when a validator remains inactive beyond the configured epoch threshold and burn the configured penalty amount from stake/supply. `indra-state/tests/monetary_invariants.rs` now covers bond/unbond, slash burn plus reporter reward, preminted epoch rewards, fee burn, liveness penalty burn, and a full block-plus-epoch cycle. `epoch.rs` also has a policy regression test that pins the current liveness penalty constants so future changes must update the test and documentation.
+Liveness penalties are documented as intentional protocol penalties separate from the CS-08 equivocation-slashing model. They trigger when a validator remains inactive beyond the configured epoch threshold and burn the configured penalty amount from stake/supply. `indra-state/tests/monetary_invariants.rs` now covers bond/unbond, slash burn accounting, preminted epoch rewards, fee burn, liveness penalty burn, and a full block-plus-epoch cycle. `epoch.rs` also has a policy regression test that pins the current liveness penalty constants so future changes must update the test and documentation.
 
 ## Proof-of-Concept Tests
 

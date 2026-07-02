@@ -38,23 +38,26 @@ use indra_core::{
     codec::{ByteReader, Decode, Encode},
     types::{
         block::BlockV1,
+        crypto::{CommitmentV1, HybridPubKey},
         primitives::{
-            bps_of, overflow_fix_active, Bytes32, ProtocolVersion, HARD_CAP_SPARK,
-            MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-            MAX_TX_PER_BLOCK, PROTOCOL_VERSION, SLASH_EVIDENCE_WINDOW_EPOCHS,
-            UNBONDING_PERIOD_EPOCHS,
+            bps_of, overflow_fix_active, vrf_commit_reveal_election_active, Bytes32,
+            ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK,
+            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
         slashing::SlashEvidenceV1,
-        transaction::TransactionV1,
+        transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
+        vrf_election::VrfElectionResult,
     },
     EpochRecord,
 };
 use indra_crypto::{
-    verify_balance, verify_hybrid, verify_opening, verify_range, PedersenCommitment,
-    PedersenOpening,
+    verify_balance, verify_hybrid, verify_opening, verify_range, vrf_verify, PedersenCommitment,
+    PedersenOpening, VrfOutput, VrfProof,
 };
+use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
     chain::ChainState,
@@ -73,7 +76,7 @@ pub fn apply_slash(
     evidence: &SlashEvidenceV1,
     chain_id: &str,
 ) -> StateResult<()> {
-    apply_slash_at_height(state, evidence, chain_id, state.height)
+    apply_slash_at_height(state, evidence, chain_id, state.height, None)
 }
 
 /// Apply slash evidence using the arithmetic rules active at `height`.
@@ -82,9 +85,31 @@ pub fn apply_slash_at_height(
     evidence: &SlashEvidenceV1,
     chain_id: &str,
     height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
 ) -> StateResult<()> {
+    apply_slash_at_height_with_accounting(state, evidence, chain_id, height, reporter_pubkey)
+        .map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlashAccounting {
+    slash_amount: u64,
+    burned: u64,
+    reporter_reward: u64,
+}
+
+fn apply_slash_at_height_with_accounting(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV1,
+    chain_id: &str,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<SlashAccounting> {
     use crate::ValidatorStatus;
-    use indra_core::types::{primitives::SLASH_REPORTER_REWARD_BPS, vote::VoteStep};
+    use indra_core::types::{
+        primitives::{DUST_LIMIT_SPARK, SLASH_REPORTER_REWARD_BPS},
+        vote::VoteStep,
+    };
 
     let evidence_hash = compute_slash_evidence_hash(evidence);
     if state.applied_slash_hashes.contains(&evidence_hash) {
@@ -230,8 +255,7 @@ pub fn apply_slash_at_height(
         .unwrap_or(0);
     let slash_base = slashable_bond_stake.max(current_stake);
     let slash_amount = bps(slash_base, slash_bps);
-    let reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
-    let burned = slash_amount.saturating_sub(reporter_reward);
+    let potential_reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
 
     let mut total_bond_slashed: u64 = 0;
     let mut active_bond_slashed: u64 = 0;
@@ -256,12 +280,28 @@ pub fn apply_slash_at_height(
         v.status = ValidatorStatus::Slashed;
     }
 
+    let reporter_reward = if potential_reporter_reward >= DUST_LIMIT_SPARK {
+        if let Some(pubkey) = reporter_pubkey {
+            create_slash_reporter_reward_utxo(
+                state,
+                &evidence_hash,
+                height,
+                potential_reporter_reward,
+                pubkey,
+            )?;
+            potential_reporter_reward
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let burned = slash_amount.saturating_sub(reporter_reward);
     state.total_supply = state.total_supply.saturating_sub(burned);
-    state.treasury_balance = state.treasury_balance.saturating_add(reporter_reward);
     state.applied_slash_hashes.insert(evidence_hash);
 
     eprintln!(
-        "[slash] validator {} slashed {}bps — stake_burned={} self_bond_slashed={} treasury_reward={}",
+        "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
         hex::encode(&validator_id.0[..4]),
         slash_bps,
         burned,
@@ -269,12 +309,138 @@ pub fn apply_slash_at_height(
         reporter_reward,
     );
 
-    Ok(())
+    Ok(SlashAccounting {
+        slash_amount,
+        burned,
+        reporter_reward,
+    })
 }
 
 /// Compute the canonical slash-evidence hash used for deduplication.
 pub fn compute_slash_evidence_hash(evidence: &SlashEvidenceV1) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
+}
+
+fn derive_slash_reward_blinding(evidence_hash: &Bytes32, block_height: u64) -> [u8; 32] {
+    let mut data = b"INDRA-SLASH-REWARD-BLINDING-v1".to_vec();
+    data.extend_from_slice(&evidence_hash.0);
+    data.extend_from_slice(&block_height.to_le_bytes());
+    indra_crypto::sha256(&data)
+}
+
+fn create_slash_reporter_reward_utxo(
+    state: &mut ChainState,
+    evidence_hash: &Bytes32,
+    block_height: u64,
+    reporter_reward: u64,
+    reporter_pubkey: &HybridPubKey,
+) -> StateResult<Bytes32> {
+    let blinding = derive_slash_reward_blinding(evidence_hash, block_height);
+    let commitment = indra_crypto::commit(reporter_reward, &blinding);
+    let mut rng = StdRng::from_seed(blinding);
+    let proof = indra_crypto::prove_range(reporter_reward, &blinding, &mut rng).map_err(|_| {
+        StateError::InvalidSlashEvidence {
+            reason: "failed to generate range proof for slash reporter reward".into(),
+        }
+    })?;
+    let output = OutputV1 {
+        value_spark: reporter_reward,
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(commitment.0),
+        },
+        owner_pubkey: reporter_pubkey.clone(),
+        range_proof: indra_core::VariableBytes::from_slice(&proof).map_err(|_| {
+            StateError::InvalidSlashEvidence {
+                reason: "slash reporter reward range proof too large".into(),
+            }
+        })?,
+        lock_height: 0,
+    };
+    let reward_utxo_id = state
+        .utxos
+        .insert(output, block_height, STAKING_TX_IDX, 0)
+        .map_err(|_| StateError::InvariantViolation {
+            message: "UTXO ID collision in slash reporter reward output",
+        })?;
+    eprintln!(
+        "[slash] reporter reward {} Spark -> UTXO {} for proposer {}",
+        reporter_reward,
+        hex::encode(&reward_utxo_id.0[..4]),
+        hex::encode(&reporter_pubkey.classical_pk.0[..4]),
+    );
+    Ok(reward_utxo_id)
+}
+
+const VRF_FALLBACK_OUTPUT_BYTES: Bytes32 = Bytes32([0xFF; 32]);
+
+fn slash_reporter_pubkey_for_block(state: &ChainState, block: &BlockV1) -> Option<HybridPubKey> {
+    let proposer_id = slash_reporter_validator_id_for_block(state, block)?;
+    let validator = state.validators.get(&proposer_id)?;
+    Some(HybridPubKey {
+        classical_pk: Bytes32::from(validator.hybrid_classical_pk?),
+        pq_pk: indra_core::VariableBytes::from_slice(validator.hybrid_pq_pk.as_deref()?).ok()?,
+    })
+}
+
+fn slash_reporter_validator_id_for_block(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
+    let proposer_id = proposer_id_from_vrf_proof(state, block)?;
+    if !vrf_commit_reveal_election_active(block.header.height) {
+        return Some(proposer_id);
+    }
+    let header_hash = block.header.election_result_hash?;
+    let normal = VrfElectionResult {
+        height: block.header.height,
+        round: block.header.proposer_round,
+        elected_validator_id: proposer_id,
+        elected_vrf_output: block.header.proposer_vrf_output,
+        fallback_used: false,
+    }
+    .hash();
+    let fallback = VrfElectionResult {
+        height: block.header.height,
+        round: block.header.proposer_round,
+        elected_validator_id: proposer_id,
+        elected_vrf_output: VRF_FALLBACK_OUTPUT_BYTES,
+        fallback_used: true,
+    }
+    .hash();
+    (header_hash == normal || header_hash == fallback).then_some(proposer_id)
+}
+
+fn proposer_id_from_vrf_proof(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
+    let proof_bytes = block.header.proposer_vrf_proof.as_slice();
+    if proof_bytes.is_empty() || block.header.proposer_vrf_output == Bytes32::ZERO {
+        return None;
+    }
+    let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
+    let vrf_input = compute_vrf_input_for_block(
+        &epoch_seed,
+        block.header.height,
+        block.header.proposer_round,
+    );
+    let proof = VrfProof(proof_bytes.to_vec());
+    let output = VrfOutput(block.header.proposer_vrf_output.0);
+    let mut matches = state
+        .validators
+        .active_validators()
+        .filter_map(|validator| {
+            let vrf_pk = validator.vrf_pk?;
+            vrf_verify(&vrf_pk, &vrf_input, &output, &proof)
+                .is_ok()
+                .then_some(validator.validator_id)
+        });
+    let proposer_id = matches.next()?;
+    matches.next().is_none().then_some(proposer_id)
+}
+
+fn compute_vrf_input_for_block(epoch_seed: &Bytes32, height: u64, round: u32) -> [u8; 32] {
+    use indra_crypto::hash::domains::VRF_INPUT;
+    let mut input = Vec::new();
+    input.extend_from_slice(VRF_INPUT);
+    input.extend_from_slice(&height.to_le_bytes());
+    input.extend_from_slice(&round.to_le_bytes());
+    input.extend_from_slice(&epoch_seed.0[..8]);
+    indra_crypto::sha256(&input)
 }
 
 fn verify_vote_sig_with_keys(
@@ -415,8 +581,15 @@ fn apply_block_inner(
     if !block.slashing_evidence.is_empty() {
         let mut shadow = state.clone();
         let chain_id_clone = state.chain_id.clone();
+        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block);
         for evidence in &block.slashing_evidence {
-            apply_slash_at_height(&mut shadow, evidence, &chain_id_clone, block.header.height)?;
+            apply_slash_at_height(
+                &mut shadow,
+                evidence,
+                &chain_id_clone,
+                block.header.height,
+                reporter_pubkey.as_ref(),
+            )?;
         }
     }
 
@@ -447,16 +620,19 @@ fn apply_block_inner(
     }
 
     let chain_id_for_slash = state.chain_id.clone();
+    let reporter_pubkey = slash_reporter_pubkey_for_block(state, block);
     for evidence in &block.slashing_evidence {
-        let supply_before = state.total_supply;
-        let treasury_before = state.treasury_balance;
-        apply_slash_at_height(state, evidence, &chain_id_for_slash, block.header.height)
-            .expect("slash failed on real state after shadow validation — invariant violation");
-        let burned = supply_before.saturating_sub(state.total_supply);
-        let treasury_reward = state.treasury_balance.saturating_sub(treasury_before);
+        let accounting = apply_slash_at_height_with_accounting(
+            state,
+            evidence,
+            &chain_id_for_slash,
+            block.header.height,
+            reporter_pubkey.as_ref(),
+        )
+        .expect("slash failed on real state after shadow validation — invariant violation");
         state.epoch_slashed_spark = state
             .epoch_slashed_spark
-            .saturating_add(burned.saturating_add(treasury_reward));
+            .saturating_add(accounting.slash_amount);
         state.epoch_slash_event_count = state.epoch_slash_event_count.saturating_add(1);
     }
 
@@ -1832,16 +2008,163 @@ mod tests {
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
         let chain_id = state.chain_id.clone();
         apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(state.total_supply, before - 47_500);
+        assert_eq!(state.total_supply, before - 50_000);
     }
 
     #[test]
-    fn apply_slash_rewards_treasury_5pct_of_slash() {
+    fn slash_without_reporter_burns_full_amount() {
         let (mut state, validator_id, keypair) = slash_validator_state([0x89; 32], 1_000_000);
+        let supply_before = state.total_supply;
+        let treasury_before = state.treasury_balance;
+        let utxo_count_before = state.utxos.len();
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
         let chain_id = state.chain_id.clone();
         apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(state.treasury_balance, 2_500);
+        assert_eq!(state.total_supply, supply_before - 50_000);
+        assert_eq!(state.treasury_balance, treasury_before);
+        assert_eq!(state.utxos.len(), utxo_count_before);
+    }
+
+    #[test]
+    fn slash_reporter_reward_is_50_percent() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x97; 32], 10_000_000);
+        let (reporter_pubkey, _) = make_test_keypair([0xA1; 32]);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        let supply_before = state.total_supply;
+
+        let accounting = apply_slash_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            9,
+            Some(&reporter_pubkey),
+        )
+        .unwrap();
+
+        assert_eq!(accounting.slash_amount, 500_000);
+        assert_eq!(accounting.reporter_reward, 250_000);
+        assert_eq!(accounting.burned, 250_000);
+        assert_eq!(state.total_supply, supply_before - 250_000);
+    }
+
+    #[test]
+    fn slash_creates_utxo_for_reporter() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x98; 32], 10_000_000);
+        let (reporter_pubkey, _) = make_test_keypair([0xA2; 32]);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let evidence_hash = compute_slash_evidence_hash(&evidence);
+        let blinding = derive_slash_reward_blinding(&evidence_hash, 9);
+        let chain_id = state.chain_id.clone();
+
+        apply_slash_at_height(&mut state, &evidence, &chain_id, 9, Some(&reporter_pubkey)).unwrap();
+
+        let reward = state
+            .utxos
+            .all_entries()
+            .find(|entry| {
+                entry.created_height == 9
+                    && entry.output.owner_pubkey == reporter_pubkey
+                    && entry.output.value_spark == 250_000
+            })
+            .expect("reporter reward UTXO must exist");
+        assert!(indra_crypto::verify_opening(
+            &PedersenCommitment(reward.output.commitment.compressed_point.0),
+            &PedersenOpening {
+                value: 250_000,
+                blinding,
+            }
+        )
+        .is_ok());
+        assert!(indra_crypto::verify_range(
+            &reward.output.commitment.compressed_point.0,
+            reward.output.range_proof.as_slice(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn slash_reward_utxo_blinding_is_deterministic() {
+        let hash = Bytes32::from([0xC7; 32]);
+        assert_eq!(
+            derive_slash_reward_blinding(&hash, 123),
+            derive_slash_reward_blinding(&hash, 123)
+        );
+        assert_ne!(
+            derive_slash_reward_blinding(&hash, 123),
+            derive_slash_reward_blinding(&hash, 124)
+        );
+    }
+
+    #[test]
+    fn slash_reward_below_dust_limit_burns_entirely() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x99; 32], 1_000_000);
+        let (reporter_pubkey, _) = make_test_keypair([0xA3; 32]);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        let supply_before = state.total_supply;
+        let utxo_count_before = state.utxos.len();
+
+        let accounting = apply_slash_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            9,
+            Some(&reporter_pubkey),
+        )
+        .unwrap();
+
+        assert_eq!(accounting.slash_amount, 50_000);
+        assert_eq!(accounting.reporter_reward, 0);
+        assert_eq!(accounting.burned, 50_000);
+        assert_eq!(state.total_supply, supply_before - 50_000);
+        assert_eq!(state.utxos.len(), utxo_count_before);
+    }
+
+    #[test]
+    fn treasury_no_longer_receives_slash_reporter_reward() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x9A; 32], 10_000_000);
+        let (reporter_pubkey, _) = make_test_keypair([0xA4; 32]);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        let treasury_before = state.treasury_balance;
+
+        apply_slash_at_height(&mut state, &evidence, &chain_id, 9, Some(&reporter_pubkey)).unwrap();
+
+        assert_eq!(state.treasury_balance, treasury_before);
+    }
+
+    #[test]
+    fn total_supply_invariant_after_slash_with_reporter() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0x9B; 32], 10_000_000);
+        let (reporter_pubkey, _) = make_test_keypair([0xA5; 32]);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        let supply_before = state.total_supply;
+        let treasury_before = state.treasury_balance;
+
+        let accounting = apply_slash_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            9,
+            Some(&reporter_pubkey),
+        )
+        .unwrap();
+
+        assert_eq!(
+            accounting.slash_amount,
+            accounting.burned + accounting.reporter_reward
+        );
+        assert_eq!(state.total_supply, supply_before - accounting.burned);
+        assert_eq!(state.treasury_balance, treasury_before);
+        let reporter_utxo_total: u64 = state
+            .utxos
+            .all_entries()
+            .filter(|entry| entry.output.owner_pubkey == reporter_pubkey)
+            .map(|entry| entry.output.value_spark)
+            .sum();
+        assert_eq!(reporter_utxo_total, accounting.reporter_reward);
     }
 
     #[test]
@@ -1925,14 +2248,21 @@ mod tests {
 
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
         let chain_id = state.chain_id.clone();
-        apply_slash_at_height(&mut state, &evidence, &chain_id, EPOCH_DURATION_BLOCKS + 1).unwrap();
+        apply_slash_at_height(
+            &mut state,
+            &evidence,
+            &chain_id,
+            EPOCH_DURATION_BLOCKS + 1,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             state.staked_bonds.get(&bond_id).unwrap().amount_spark,
             950_000,
             "unbonding self-bond must remain slashable for pre-unbonding equivocation"
         );
-        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 47_500);
+        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 50_000);
     }
 
     #[test]
@@ -1944,7 +2274,7 @@ mod tests {
             (SLASH_EVIDENCE_WINDOW_EPOCHS + 1).saturating_mul(EPOCH_DURATION_BLOCKS);
 
         assert!(matches!(
-            apply_slash_at_height(&mut state, &evidence, &chain_id, too_late_height),
+            apply_slash_at_height(&mut state, &evidence, &chain_id, too_late_height, None),
             Err(StateError::InvalidSlashEvidence { reason })
                 if reason.contains("outside evidence window")
         ));
@@ -1990,7 +2320,14 @@ mod tests {
 
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
         let chain_id = state.chain_id.clone();
-        apply_slash_at_height(&mut state, &evidence, &chain_id, EPOCH_DURATION_BLOCKS + 1).unwrap();
+        apply_slash_at_height(
+            &mut state,
+            &evidence,
+            &chain_id,
+            EPOCH_DURATION_BLOCKS + 1,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             state
@@ -2013,7 +2350,7 @@ mod tests {
             570_000,
             "active stake should track only the active bond slash"
         );
-        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 47_500);
+        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 50_000);
     }
 
     #[test]

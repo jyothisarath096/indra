@@ -9,7 +9,7 @@ use indra_core::{
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID,
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES,
-            MAX_VRF_PROOF_BYTES, SLASH_REPORTER_REWARD_BPS, UNBONDING_PERIOD_EPOCHS,
+            MAX_VRF_PROOF_BYTES, UNBONDING_PERIOD_EPOCHS,
         },
         slashing::SlashEvidenceV1,
         staking::{StakingOp, StakingOpBody},
@@ -321,15 +321,12 @@ fn slash_reduces_total_supply_by_burn_amount() {
     let treasury_before = state.treasury_balance;
     let slash_bps = state.governance.params.slash_double_precommit_bps;
     let slash_amount = INPUT_VALUE.saturating_mul(slash_bps as u64) / 10_000;
-    let reporter_reward = slash_amount.saturating_mul(SLASH_REPORTER_REWARD_BPS as u64) / 10_000;
-    let burned = slash_amount.saturating_sub(reporter_reward);
     let chain_id = state.chain_id.clone();
 
-    apply_slash_at_height(&mut state, &evidence, &chain_id, 7).unwrap();
+    apply_slash_at_height(&mut state, &evidence, &chain_id, 7, None).unwrap();
 
-    assert_eq!(state.total_supply, supply_before - burned);
-    assert_eq!(state.treasury_balance, treasury_before + reporter_reward);
-    assert_eq!(burned + reporter_reward, slash_amount);
+    assert_eq!(state.total_supply, supply_before - slash_amount);
+    assert_eq!(state.treasury_balance, treasury_before);
 }
 
 #[test]

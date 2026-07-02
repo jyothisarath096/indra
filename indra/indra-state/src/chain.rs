@@ -44,7 +44,12 @@ pub struct ChainState {
     /// Total supply of Spark in existence (minted - burned).
     pub total_supply: u64,
 
-    /// Treasury balance in Spark.
+    /// Accumulated block reward dust from proportional distribution rounding.
+    ///
+    /// This balance has no spend path and is effectively locked. Reporter slash
+    /// rewards are not routed here; they are paid directly to the reporting
+    /// block proposer as spendable UTXOs. Future cleanup: burn reward dust
+    /// directly and remove treasury accounting entirely.
     pub treasury_balance: u64,
 
     /// Burn buffer balance in Spark (pending governance-directed burns).

@@ -105,9 +105,12 @@ pub const SLASH_SURROUND_VOTE_BPS: u32 = 1_000;
 /// Validator reports own equivocation within SLASH_GRACE_PERIOD_EPOCHS.
 pub const SLASH_SELF_REPORT_BPS: u32 = 100;
 
-/// Reporter reward: 5% of slashed amount to treasury.
-/// Incentivizes evidence submission.
-pub const SLASH_REPORTER_REWARD_BPS: u32 = 500;
+/// Reporter reward: 50% of slashed amount paid directly to the block
+/// proposer who included the slash evidence as a spendable UTXO.
+/// The remaining 50% is burned (reduces total_supply).
+/// This provides meaningful economic incentive for validators to actively
+/// monitor for equivocation and submit evidence.
+pub const SLASH_REPORTER_REWARD_BPS: u32 = 5_000;
 
 /// Liveness slash: 0.1% per missed epoch after threshold.
 pub const SLASH_LIVENESS_BPS: u32 = 10;
