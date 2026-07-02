@@ -356,7 +356,11 @@ impl ConsensusDriver {
             local_vrf_rounds: BTreeMap::new(),
             consecutive_empty_reveal_rounds: 0,
         };
-        driver.sync = if driver.engine.config.bootstrap_peers.is_empty() {
+        driver.sync = if driver.engine.state.height == 0 {
+            // At genesis every validator already has genesis state — no sync needed.
+            // Start in consensus mode immediately regardless of bootstrap config.
+            SyncState::bootstrap(0)
+        } else if driver.engine.config.bootstrap_peers.is_empty() {
             SyncState::bootstrap(driver.engine.state.height)
         } else {
             SyncState::follower(driver.engine.state.height)
