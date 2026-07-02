@@ -170,6 +170,23 @@ pub enum StateError {
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
 
+    /// A bond-producing staking op omitted the required commitment proof.
+    #[error("staking bond proof required")]
+    BondProofRequired,
+
+    /// A staking bond proof does not open to the bonded UTXO commitment.
+    #[error("staking bond commitment mismatch")]
+    StakingBondCommitmentMismatch,
+
+    /// A staking bond proof opens to a value different from the UTXO public value.
+    #[error("staking bond value mismatch: public {public_value}, committed {committed_value}")]
+    StakingBondValueMismatch {
+        /// Public `OutputV1.value_spark` on the bonded UTXO.
+        public_value: u64,
+        /// Value proven by the commitment opening.
+        committed_value: u64,
+    },
+
     /// Validator is already registered.
     #[error("validator already registered")]
     ValidatorAlreadyRegistered,

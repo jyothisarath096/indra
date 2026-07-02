@@ -11,7 +11,10 @@
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
     types::{
-        block::BlockV1, primitives::Bytes32, transaction::TransactionV1, vote::VoteV1,
+        block::BlockV1,
+        primitives::Bytes32,
+        transaction::TransactionV1,
+        vote::VoteV1,
         vrf_election::{VrfCommit, VrfReveal},
     },
 };

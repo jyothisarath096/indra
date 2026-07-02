@@ -7,11 +7,12 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
-        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        staking_commitment_proof_required, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
+        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
-    staking::{StakingOp, StakingOpBody},
+    staking::{StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
 };
 use rand::SeedableRng;
@@ -96,18 +97,18 @@ pub fn apply_staking_op(
         }
     }
 
-    state.staking_nonces.insert(signer_id, op.nonce);
-
-    match &op.body {
+    let result = match &op.body {
         StakingOpBody::Delegate {
             validator_id,
             bond_utxo_id,
             delegator_pubkey,
+            bond_proof,
         } => apply_delegate(
             state,
             validator_id,
             *bond_utxo_id,
             delegator_pubkey,
+            bond_proof.as_ref(),
             current_height,
         ),
         StakingOpBody::Undelegate {
@@ -130,12 +131,14 @@ pub fn apply_staking_op(
             bond_utxo_id,
             validator_pubkey,
             vrf_pk,
+            bond_proof,
         } => apply_register_validator(
             state,
             *commission_bps,
             *bond_utxo_id,
             validator_pubkey,
             *vrf_pk,
+            bond_proof.as_ref(),
             current_height,
         ),
         StakingOpBody::SetCommission {
@@ -149,12 +152,23 @@ pub fn apply_staking_op(
         StakingOpBody::SelfStake {
             bond_utxo_id,
             validator_pubkey,
-        } => apply_self_stake(state, *bond_utxo_id, validator_pubkey, current_height),
+            bond_proof,
+        } => apply_self_stake(
+            state,
+            *bond_utxo_id,
+            validator_pubkey,
+            bond_proof.as_ref(),
+            current_height,
+        ),
         StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey,
         } => apply_self_unstake(state, *bond_utxo_id, validator_pubkey, current_height),
-    }
+    };
+
+    result?;
+    state.staking_nonces.insert(signer_id, op.nonce);
+    Ok(())
 }
 
 fn verify_staking_sig(
@@ -191,12 +205,55 @@ fn verify_staking_sig(
     })
 }
 
+/// Verify that a staking bond proof correctly opens the bonded UTXO
+/// commitment to its public `value_spark`.
+///
+/// This must be called before spending the UTXO so a failed proof leaves
+/// spendable state untouched.
+pub fn validate_staking_bond_proof(output: &OutputV1, proof: &StakingBondProof) -> StateResult<()> {
+    use indra_crypto::{verify_opening, PedersenCommitment, PedersenOpening};
+
+    let opening = PedersenOpening {
+        value: proof.committed_value_spark,
+        blinding: proof.blinding_factor.0,
+    };
+    verify_opening(
+        &PedersenCommitment(output.commitment.compressed_point.0),
+        &opening,
+    )
+    .map_err(|_| StateError::StakingBondCommitmentMismatch)?;
+
+    if proof.committed_value_spark != output.value_spark {
+        return Err(StateError::StakingBondValueMismatch {
+            public_value: output.value_spark,
+            committed_value: proof.committed_value_spark,
+        });
+    }
+
+    Ok(())
+}
+
+fn require_and_validate_bond_proof(
+    current_height: u64,
+    output: &OutputV1,
+    proof: Option<&StakingBondProof>,
+) -> StateResult<()> {
+    match proof {
+        Some(proof) => validate_staking_bond_proof(output, proof),
+        None if staking_commitment_proof_required(current_height) => {
+            Err(StateError::BondProofRequired)
+        }
+        None => Ok(()),
+    }
+}
+
 fn apply_register_validator(
     state: &mut ChainState,
     commission_bps: u32,
     bond_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
     vrf_pk: [u8; 32],
+    bond_proof: Option<&StakingBondProof>,
     current_height: u64,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
@@ -254,6 +311,8 @@ fn apply_register_validator(
             "registration bond UTXO does not belong to the validator".into(),
         ));
     }
+    require_and_validate_bond_proof(current_height, &utxo_entry.output, bond_proof)?;
+
     // Bond amount is taken from output.value_spark (public metadata field).
     // This field is not individually proven to match the Pedersen commitment;
     // the transaction-level aggregate balance equation prevents total-value
@@ -320,6 +379,7 @@ fn apply_delegate(
     validator_id: &Bytes32,
     bond_utxo_id: Bytes32,
     delegator_pubkey: &HybridPubKey,
+    bond_proof: Option<&StakingBondProof>,
     current_height: u64,
 ) -> StateResult<()> {
     let validator = state
@@ -355,6 +415,7 @@ fn apply_delegate(
             "UTXO does not belong to the delegator".into(),
         ));
     }
+    require_and_validate_bond_proof(current_height, &utxo_entry.output, bond_proof)?;
 
     // Bond amount is taken from output.value_spark (public metadata field).
     // This field is not individually proven to match the Pedersen commitment;
@@ -442,6 +503,7 @@ fn apply_self_stake(
     state: &mut ChainState,
     bond_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
+    bond_proof: Option<&StakingBondProof>,
     current_height: u64,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
@@ -473,6 +535,7 @@ fn apply_self_stake(
             "UTXO does not belong to the validator".into(),
         ));
     }
+    require_and_validate_bond_proof(current_height, &utxo_entry.output, bond_proof)?;
 
     // Bond amount is taken from output.value_spark (public metadata field).
     // This field is not individually proven to match the Pedersen commitment;
@@ -805,6 +868,26 @@ mod tests {
         }
     }
 
+    fn bond_proof(value_spark: u64, seed: u8) -> StakingBondProof {
+        StakingBondProof {
+            committed_value_spark: value_spark,
+            blinding_factor: Bytes32::from([seed; 32]),
+        }
+    }
+
+    fn proof_for_bond_utxo(state: &ChainState, bond_utxo_id: Bytes32) -> StakingBondProof {
+        let Some(entry) = state.utxos.get(&bond_utxo_id) else {
+            return bond_proof(0, 0);
+        };
+        for seed in 0u8..=u8::MAX {
+            let candidate = commit(entry.output.value_spark, &[seed; 32]);
+            if candidate.0 == entry.output.commitment.compressed_point.0 {
+                return bond_proof(entry.output.value_spark, seed);
+            }
+        }
+        bond_proof(entry.output.value_spark, 0)
+    }
+
     fn insert_delegator_utxo(
         state: &mut ChainState,
         delegator_pubkey: HybridPubKey,
@@ -905,6 +988,82 @@ mod tests {
         (validator_id, keypair)
     }
 
+    #[test]
+    fn staking_bond_proof_accepts_correct_opening() {
+        let owner = pubkey_from_keypair(&keypair(0xE1));
+        let output = test_output(1_000, owner, 0xE1);
+        assert!(validate_staking_bond_proof(&output, &bond_proof(1_000, 0xE1)).is_ok());
+    }
+
+    #[test]
+    fn staking_bond_proof_rejects_wrong_blinding() {
+        let owner = pubkey_from_keypair(&keypair(0xE2));
+        let output = test_output(1_000, owner, 0xE2);
+        assert_eq!(
+            validate_staking_bond_proof(&output, &bond_proof(1_000, 0xE3)),
+            Err(StateError::StakingBondCommitmentMismatch)
+        );
+    }
+
+    #[test]
+    fn staking_bond_proof_rejects_committed_value_mismatch() {
+        let owner = pubkey_from_keypair(&keypair(0xE4));
+        let output = test_output(1_000, owner, 0xE4);
+        assert_eq!(
+            validate_staking_bond_proof(&output, &bond_proof(999, 0xE4)),
+            Err(StateError::StakingBondCommitmentMismatch)
+        );
+    }
+
+    #[test]
+    fn st03_attack_is_closed() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0xE5);
+        let delegator_keypair = keypair(0xE6);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id =
+            insert_mismatched_public_value_utxo(&mut state, pubkey, 100, 1_000_000, 0xE7);
+
+        let chain_id = state.chain_id.clone();
+        let correct_opening_wrong_public = signed_op(
+            StakingOpBody::Delegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
+                bond_proof: Some(bond_proof(1_000_000, 0xE7)),
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        assert_eq!(
+            apply_staking_op(&mut state, &correct_opening_wrong_public, &chain_id, 1),
+            Err(StateError::StakingBondValueMismatch {
+                public_value: 100,
+                committed_value: 1_000_000,
+            })
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+
+        let public_value_wrong_opening = signed_op(
+            StakingOpBody::Delegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
+                bond_proof: Some(bond_proof(100, 0xE7)),
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        assert_eq!(
+            apply_staking_op(&mut state, &public_value_wrong_opening, &chain_id, 1),
+            Err(StateError::StakingBondCommitmentMismatch)
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
+    }
+
     fn delegate_op(
         state: &ChainState,
         validator_id: Bytes32,
@@ -912,11 +1071,13 @@ mod tests {
         delegator_keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
+        let bond_proof = proof_for_bond_utxo(state, bond_utxo_id);
         signed_op(
             StakingOpBody::Delegate {
                 validator_id,
                 bond_utxo_id,
                 delegator_pubkey: pubkey_from_keypair(delegator_keypair),
+                bond_proof: Some(bond_proof),
             },
             nonce,
             delegator_keypair,
@@ -949,10 +1110,12 @@ mod tests {
         validator_keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
+        let bond_proof = proof_for_bond_utxo(state, bond_utxo_id);
         signed_op(
             StakingOpBody::SelfStake {
                 bond_utxo_id,
                 validator_pubkey: pubkey_from_keypair(validator_keypair),
+                bond_proof: Some(bond_proof),
             },
             nonce,
             validator_keypair,
@@ -1031,7 +1194,62 @@ mod tests {
     }
 
     #[test]
-    fn staking_bond_amount_uses_public_value_metadata() {
+    fn delegate_without_proof_fails_at_activation() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x18);
+
+        let op = signed_op(
+            StakingOpBody::Delegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
+                bond_proof: None,
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::BondProofRequired)
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+    }
+
+    #[test]
+    fn delegate_mismatch_does_not_spend_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x01);
+        let delegator_keypair = keypair(0x02);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x19);
+
+        let op = signed_op(
+            StakingOpBody::Delegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
+                bond_proof: Some(bond_proof(1_000_000, 0x1A)),
+            },
+            1,
+            &delegator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::StakingBondCommitmentMismatch)
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
+    }
+
+    #[test]
+    fn delegate_rejects_mismatched_public_value_commitment() {
         let mut state = ChainState::new_genesis();
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
@@ -1041,17 +1259,16 @@ mod tests {
 
         let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-
         assert_eq!(
-            state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
-            1_000_000,
-            "staking currently consumes OutputV1.value_spark as public economic metadata"
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::StakingBondCommitmentMismatch)
         );
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
     }
 
     #[test]
-    fn register_validator_bond_amount_uses_public_value_spark_field() {
+    fn register_validator_rejects_mismatched_public_value_commitment() {
         let mut state = ChainState::new_genesis();
         let validator_keypair = keypair(0x20);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
@@ -1070,27 +1287,26 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey,
                 vrf_pk: [0x20; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK / 2, 0x21)),
             },
             1,
             &validator_keypair,
             &state.chain_id,
         );
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-
         assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            "registration self-bond currently records output.value_spark, not the committed value"
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::StakingBondValueMismatch {
+                public_value: MINIMUM_VALIDATOR_BOND_SPARK,
+                committed_value: MINIMUM_VALIDATOR_BOND_SPARK / 2,
+            })
         );
-        assert_eq!(
-            state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
-            MINIMUM_VALIDATOR_BOND_SPARK
-        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(state.validators.get(&validator_id).is_none());
     }
 
     #[test]
-    fn self_stake_with_mismatched_public_value_records_public_bond_amount() {
+    fn self_stake_rejects_mismatched_public_value_commitment() {
         let mut state = ChainState::new_genesis();
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x22);
         state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
@@ -1103,19 +1319,26 @@ mod tests {
             0x23,
         );
 
-        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        let op = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: pubkey_from_keypair(&validator_keypair),
+                bond_proof: Some(bond_proof(1_000_000, 0x23)),
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
         let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-
         assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            2_000_000,
-            "self-stake currently records output.value_spark, not the committed value"
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::StakingBondValueMismatch {
+                public_value: 2_000_000,
+                committed_value: 1_000_000,
+            })
         );
-        assert_eq!(
-            state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
-            2_000_000
-        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
     }
 
     #[test]
@@ -1305,6 +1528,54 @@ mod tests {
     }
 
     #[test]
+    fn self_stake_without_proof_fails_at_activation() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey.clone(), 2_000_000, 0x3B);
+        let op = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: pubkey,
+                bond_proof: None,
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::BondProofRequired)
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+    }
+
+    #[test]
+    fn self_stake_mismatch_does_not_spend_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey.clone(), 2_000_000, 0x3C);
+        let op = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: pubkey,
+                bond_proof: Some(bond_proof(2_000_000, 0x3D)),
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::StakingBondCommitmentMismatch)
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
+    }
+
+    #[test]
     fn self_stake_rejects_unknown_utxo() {
         let mut state = ChainState::new_genesis();
         let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
@@ -1390,6 +1661,7 @@ mod tests {
             StakingOpBody::SelfStake {
                 bond_utxo_id,
                 validator_pubkey: pubkey,
+                bond_proof: Some(bond_proof(2_000_000, 0x36)),
             },
             1,
             &wrong_keypair,
@@ -1557,6 +1829,7 @@ mod tests {
                 validator_id,
                 bond_utxo_id: Bytes32::from([0x31; 32]),
                 delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
+                bond_proof: None,
             },
             5,
             &delegator_keypair,
@@ -1602,6 +1875,7 @@ mod tests {
                 validator_id,
                 bond_utxo_id: Bytes32::from([0x32; 32]),
                 delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
+                bond_proof: None,
             },
             1,
             &wrong_keypair,
@@ -1731,6 +2005,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey,
                 vrf_pk,
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA0)),
             },
             1,
             &validator_keypair,
@@ -1767,6 +2042,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: validator_pubkey.clone(),
                 vrf_pk: [0xA5; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA1)),
             },
             1,
             &validator_keypair,
@@ -1778,6 +2054,7 @@ mod tests {
                 bond_utxo_id: Bytes32::ZERO,
                 validator_pubkey,
                 vrf_pk: [0x5A; 32],
+                bond_proof: None,
             },
             2,
             &validator_keypair,
@@ -1802,6 +2079,7 @@ mod tests {
                 bond_utxo_id: Bytes32::from([0xFE; 32]),
                 validator_pubkey,
                 vrf_pk: [0x44; 32],
+                bond_proof: None,
             },
             1,
             &validator_keypair,
@@ -1812,6 +2090,37 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::UnknownUtxo)
         );
+    }
+
+    #[test]
+    fn register_validator_without_proof_fails_at_activation() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0x4E);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xAB,
+        );
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey,
+                vrf_pk: [0x4E; 32],
+                bond_proof: None,
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::BondProofRequired)
+        );
+        assert!(state.utxos.contains(&bond_utxo_id));
     }
 
     #[test]
@@ -1831,6 +2140,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey,
                 vrf_pk: [0x45; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK - 1, 0xA2)),
             },
             1,
             &validator_keypair,
@@ -1869,6 +2179,7 @@ mod tests {
                 bond_utxo_id: first_bond,
                 validator_pubkey: first_pubkey,
                 vrf_pk: duplicate_vrf,
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA3)),
             },
             1,
             &first_keypair,
@@ -1880,6 +2191,7 @@ mod tests {
                 bond_utxo_id: second_bond,
                 validator_pubkey: second_pubkey,
                 vrf_pk: duplicate_vrf,
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA4)),
             },
             1,
             &second_keypair,
@@ -1919,6 +2231,7 @@ mod tests {
                 bond_utxo_id: first_bond,
                 validator_pubkey: first_pubkey,
                 vrf_pk: [0x48; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA5)),
             },
             1,
             &first_keypair,
@@ -1930,6 +2243,7 @@ mod tests {
                 bond_utxo_id: second_bond,
                 validator_pubkey: second_pubkey,
                 vrf_pk: [0x49; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA6)),
             },
             1,
             &second_keypair,
@@ -1969,6 +2283,7 @@ mod tests {
                 bond_utxo_id: first_bond,
                 validator_pubkey: first_pubkey,
                 vrf_pk: [0x4A; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA7)),
             },
             1,
             &first_keypair,
@@ -1980,6 +2295,7 @@ mod tests {
                 bond_utxo_id: second_bond,
                 validator_pubkey: second_pubkey,
                 vrf_pk: [0x4B; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA8)),
             },
             1,
             &second_keypair,
@@ -2019,6 +2335,7 @@ mod tests {
                 bond_utxo_id: first_bond,
                 validator_pubkey: first_pubkey,
                 vrf_pk: [0x4C; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA9)),
             },
             1,
             &first_keypair,
@@ -2030,6 +2347,7 @@ mod tests {
                 bond_utxo_id: second_bond,
                 validator_pubkey: second_pubkey,
                 vrf_pk: [0x4D; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xAA)),
             },
             1,
             &second_keypair,

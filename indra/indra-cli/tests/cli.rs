@@ -9,7 +9,10 @@ use indra_cli::{
 };
 use indra_core::{
     codec::Decode,
-    types::{primitives::DUST_LIMIT_SPARK, staking::StakingOp},
+    types::{
+        primitives::DUST_LIMIT_SPARK,
+        staking::{StakingBondProof, StakingOp},
+    },
     Bytes32,
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
@@ -218,13 +221,33 @@ fn test_build_and_decode_all_staking_ops() {
     );
     let validator_id = Bytes32::from([0xA1; 32]);
     let bond_utxo_id = Bytes32::from([0xB2; 32]);
+    let bond_proof = StakingBondProof {
+        committed_value_spark: 1_000_000,
+        blinding_factor: Bytes32::from([0xB2; 32]),
+    };
     let chain_id = "indra-testnet-1";
     let built = vec![
-        build_register_validator_op(1_000, bond_utxo_id, &keypair, [0xC3; 32], 1, chain_id)
-            .unwrap(),
-        build_self_stake_op(bond_utxo_id, &keypair, 2, chain_id).unwrap(),
+        build_register_validator_op(
+            1_000,
+            bond_utxo_id,
+            bond_proof.clone(),
+            &keypair,
+            [0xC3; 32],
+            1,
+            chain_id,
+        )
+        .unwrap(),
+        build_self_stake_op(bond_utxo_id, bond_proof.clone(), &keypair, 2, chain_id).unwrap(),
         build_self_unstake_op(bond_utxo_id, &keypair, 3, chain_id).unwrap(),
-        build_delegate_op(validator_id, bond_utxo_id, &keypair, 4, chain_id).unwrap(),
+        build_delegate_op(
+            validator_id,
+            bond_utxo_id,
+            bond_proof,
+            &keypair,
+            4,
+            chain_id,
+        )
+        .unwrap(),
         build_undelegate_op(validator_id, bond_utxo_id, &keypair, 5, chain_id).unwrap(),
         build_claim_rewards_op(validator_id, &keypair, 6, chain_id).unwrap(),
         build_set_commission_op(validator_id, 1_250, &keypair, 7, chain_id).unwrap(),

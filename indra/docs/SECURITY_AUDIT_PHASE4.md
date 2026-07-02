@@ -2,9 +2,9 @@
 
 ## Executive Summary
 
-Phase 4 found three high-priority staking/economic issues and several medium/low hardening gaps. The three HIGH findings have now been fixed locally: validator registration requires an atomic minimum self-bond, validator key material is globally uniqueness-checked at registration, and unbonding self-stake remains slashable for valid evidence within the evidence window. The main MEDIUM findings have also been addressed locally: active-set selection now uses the same self-stake model as consensus/reward weight, self-unstake below the active minimum demotes the validator immediately, block application is atomic across epoch-transition failures, and the public `value_spark` staking semantics are explicitly documented with specification tests. The audit also confirmed several safe properties: staking operations are hybrid-signed with chain-id domain separation, delegation/unstake operations enforce ownership and unbonding delays, commission is capped by governance limits, duplicate slash evidence is rejected, and total-supply accounting is mostly explicit for rewards, fees, and slashing.
+Phase 4 found three high-priority staking/economic issues and several medium/low hardening gaps. The three HIGH findings have now been fixed locally: validator registration requires an atomic minimum self-bond, validator key material is globally uniqueness-checked at registration, and unbonding self-stake remains slashable for valid evidence within the evidence window. The main MEDIUM findings have also been addressed locally: active-set selection now uses the same self-stake model as consensus/reward weight, self-unstake below the active minimum demotes the validator immediately, block application is atomic across epoch-transition failures, and staking bond operations now require a per-output commitment opening proof that binds the public bond amount to the stored Pedersen commitment. The audit also confirmed several safe properties: staking operations are hybrid-signed with chain-id domain separation, delegation/unstake operations enforce ownership and unbonding delays, commission is capped by governance limits, duplicate slash evidence is rejected, and total-supply accounting is mostly explicit for rewards, fees, and slashing.
 
-Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op wire format and requires a fresh testnet wipe after deployment. ST-07 appends pending commission fields to `ValidatorEntry`, so it changes persisted validator-entry state layout and should also be deployed with a fresh state wipe. Neither change requires key regeneration or genesis validator-key changes. ST-02, ST-03, ST-05, ST-06, ST-08, ST-09, ST-13, ST-14, ST-15, and ST-16 do not change cryptographic derivation, key material, block/QC wire formats, or genesis keys.
+Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op wire format and requires a fresh testnet wipe after deployment. ST-03 intentionally changes the staking-op wire format for `RegisterValidator`, `SelfStake`, and `Delegate` by adding an optional `StakingBondProof`; because activation is height 0 on testnet, deployment requires a fresh testnet wipe or coordinated hard-fork activation. ST-07 appends pending commission fields to `ValidatorEntry`, so it changes persisted validator-entry state layout and should also be deployed with a fresh state wipe. None of these changes require key regeneration or genesis validator-key changes. ST-02, ST-05, ST-06, ST-08, ST-09, ST-13, ST-14, ST-15, and ST-16 do not change cryptographic derivation, key material, block/QC wire formats, or genesis keys.
 
 ## Summary Table
 
@@ -12,7 +12,7 @@ Fix status note: ST-01 intentionally changes the `RegisterValidator` staking-op 
 |----|-----------|---------|----------|--------|
 | ST-01 | Registration | Validator registration is permissionless and does not require bond before consuming registry capacity | HIGH | FIXED |
 | ST-02 | Registration | Duplicate VRF keys are not rejected at registration | HIGH | FIXED |
-| ST-03 | Bonding | Staking trusts `OutputV1.value_spark` as bond amount without per-output commitment opening | MEDIUM | DOCUMENTED / DEFERRED |
+| ST-03 | Bonding | Staking bond ops require per-output commitment opening proof | MEDIUM | FIXED |
 | ST-04 | Unbonding | Unbonding delay exists and is state-enforced | SAFE | VERIFIED |
 | ST-05 | Unbonding | Self-unstake can leave an active validator below practical minimum stake until epoch reselection | MEDIUM | FIXED |
 | ST-06 | Rewards | Reward weights use validator self-stake, while active-set selection includes delegated stake | MEDIUM | FIXED |
@@ -99,19 +99,20 @@ Fix implemented:
 
 Registration now scans the bounded validator set and rejects duplicate `hybrid_classical_pk`, `hybrid_pq_pk`, or `vrf_pk` with `StateError::DuplicateValidatorKey`. The existing duplicate `validator_id` check remains in place.
 
-### ST-03 — Staking trusts public `value_spark` as bond amount
+### ST-03 — Staking bond UTXOs now prove public value matches commitment
 
 Severity: MEDIUM  
-Status: DOCUMENTED / DEFERRED
+Status: FIXED
 
-Description: Phase 2 documented that `OutputV1.value_spark` is public metadata and is not individually proven to match the Pedersen commitment. Staking uses this field directly as the delegated or self-staked amount. The transaction-level aggregate balance equation prevents simple total-value inflation, but staking does not verify an individual opening for the bond output.
+Description: Phase 2 documented that `OutputV1.value_spark` is public metadata and was not individually proven to match the Pedersen commitment. Staking used this field directly as the delegated or self-staked amount. The transaction-level aggregate balance equation prevented simple total-value inflation, but staking did not verify an individual opening for the bond output.
 
 Code locations:
 
-- `indra-core/src/types/transaction.rs:67` — `OutputV1.value_spark` comment warns it is not individually proven to match commitment
-- `indra-state/src/delegation.rs:270` — delegated bond amount is `utxo_entry.output.value_spark`
-- `indra-state/src/delegation.rs:383` — self-stake amount is `utxo_entry.output.value_spark`
-- `indra-state/src/delegation.rs:692` and nearby tests — existing test constructs mismatched public and committed values
+- `indra-core/src/types/staking.rs` — `StakingBondProof` and optional proof fields on `RegisterValidator`, `SelfStake`, and `Delegate`
+- `indra-core/src/types/primitives.rs` — `STAKING_COMMITMENT_PROOF_HEIGHT = 0`
+- `indra-state/src/delegation.rs` — staking bond proof validation before UTXO spend
+- `indra-cli/src/bin/stake.rs` and `indra-cli/src/tx_builder.rs` — CLI staking builders load the wallet blinding factor and construct the proof
+- `indra-ffi/src/staking.rs` — FFI staking builders accept bond value and blinding factor inputs
 
 Attack scenario:
 
@@ -124,13 +125,11 @@ Impact:
 
 This is not a direct money-creation bug if transaction aggregate balance is enforced. It is still a staking-accounting design gap because stake weight and released bond outputs rely on an amount that is not individually bound to the output commitment.
 
-Recommended fix:
-
-Either make staking outputs explicitly public-value outputs and document that commitments are not authoritative for bonded stake, or require a per-output opening/ownership proof for any UTXO being bonded so `value_spark` and commitment are individually bound.
-
 Fix implemented:
 
-The current testnet protocol remains public-value-based for staking bonds. This was documented at every staking bond site (`RegisterValidator`, `Delegate`, and `SelfStake`), and specification tests now explicitly cover registration and self-stake UTXOs whose public `value_spark` differs from the committed value. Full per-output opening verification remains deferred because it is a protocol/wire-format design change.
+`RegisterValidator`, `SelfStake`, and `Delegate` now carry an optional `StakingBondProof { committed_value_spark, blinding_factor }`. At and above `STAKING_COMMITMENT_PROOF_HEIGHT` (height 0 on testnet), the proof is mandatory. If a proof is present below activation, it is still validated. State validation verifies that `Commit(committed_value_spark, blinding_factor)` opens the exact stored output commitment and that `committed_value_spark == output.value_spark` before the bond UTXO is spent. Missing proofs fail with `BondProofRequired`; invalid openings fail with `StakingBondCommitmentMismatch`; public/committed value mismatches fail with `StakingBondValueMismatch`.
+
+The CLI staking path now loads the wallet entry for the bond UTXO and fails hard if the blinding factor is missing or zero. FFI staking builders now require the bond value and blinding factor so mobile/wallet callers can construct the same proof. This is a staking-op wire-format change and requires a fresh testnet wipe or coordinated hard-fork activation. It does not require key regeneration, cryptographic-derivation changes, or genesis validator-key changes.
 
 ### ST-04 — Unbonding delay exists and is state-enforced
 
@@ -478,7 +477,7 @@ The original Phase 4 audit was audit-only, so no tests were added then. The HIGH
 1. ST-01: registration without bond rejected, below-minimum bond rejected, valid bond succeeds and creates self-stake.
 2. ST-02: duplicate VRF, classical, and PQ keys rejected; distinct key registrations still succeed.
 3. ST-13: unbonding self-stake remains slashable within the evidence window; stale evidence is rejected; slash covers active plus slashable-unbonding bonds.
-4. ST-03: registration and self-stake specification tests document that bond amount is read from public `OutputV1.value_spark`.
+4. ST-03: staking bond proof tests prove correct openings are accepted, missing proofs are rejected at activation, wrong blindings are rejected, public/committed value mismatches are rejected, and failed proof validation does not spend the UTXO or advance the staking nonce.
 5. ST-05: active validator self-unstake below the active minimum demotes to `Registered`, while above-minimum and already-registered cases remain valid.
 6. ST-06/ST-14: active-set selection and reward distribution tests prove delegated stake does not increase consensus/reward weight.
 7. ST-09: epoch-boundary block application is tested for both successful commit and rollback on late epoch-transition failure.
@@ -503,5 +502,4 @@ The original Phase 4 audit was audit-only, so no tests were added then. The HIGH
 
 ## Recommended Fix Order
 
-1. ST-03 follow-up — If mainnet requires private-value staking, design a per-output opening proof/wire-format upgrade; current testnet semantics are documented and tested.
-2. Mainnet MEV policy — The ST-15 documentation/logging fix makes the current surface explicit, but inclusion rules, ordering commitments, or PBS remain future design work if the fee market becomes material.
+1. Mainnet MEV policy — The ST-15 documentation/logging fix makes the current surface explicit, but inclusion rules, ordering commitments, or PBS remain future design work if the fee market becomes material.

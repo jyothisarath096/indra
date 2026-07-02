@@ -174,9 +174,7 @@ fn build_qc_from_votes(
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_sigs = Vec::new();
     let mut classical_sigs = Vec::new();
-    let election_result_hash = votes
-        .iter()
-        .find_map(|vote| vote.election_result_hash);
+    let election_result_hash = votes.iter().find_map(|vote| vote.election_result_hash);
     if votes
         .iter()
         .any(|vote| vote.election_result_hash != election_result_hash)

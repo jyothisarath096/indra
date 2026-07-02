@@ -15,7 +15,7 @@ use indra_core::{
     types::{
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES},
-        staking::{StakingOp, StakingOpBody},
+        staking::{StakingBondProof, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
@@ -261,6 +261,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
 /// Build and sign a validator self-stake operation.
 pub fn build_self_stake_op(
     bond_utxo_id: Bytes32,
+    bond_proof: StakingBondProof,
     validator_keypair: &HybridKeypair,
     nonce: u64,
     chain_id: &str,
@@ -269,6 +270,7 @@ pub fn build_self_stake_op(
         StakingOpBody::SelfStake {
             bond_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
+            bond_proof: Some(bond_proof),
         },
         validator_keypair,
         nonce,
@@ -280,6 +282,7 @@ pub fn build_self_stake_op(
 pub fn build_register_validator_op(
     commission_bps: u32,
     bond_utxo_id: Bytes32,
+    bond_proof: StakingBondProof,
     keypair: &HybridKeypair,
     vrf_pk: [u8; 32],
     nonce: u64,
@@ -291,6 +294,7 @@ pub fn build_register_validator_op(
             bond_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
+            bond_proof: Some(bond_proof),
         },
         keypair,
         nonce,
@@ -302,6 +306,7 @@ pub fn build_register_validator_op(
 pub fn build_delegate_op(
     validator_id: Bytes32,
     bond_utxo_id: Bytes32,
+    bond_proof: StakingBondProof,
     delegator_keypair: &HybridKeypair,
     nonce: u64,
     chain_id: &str,
@@ -311,6 +316,7 @@ pub fn build_delegate_op(
             validator_id,
             bond_utxo_id,
             delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
+            bond_proof: Some(bond_proof),
         },
         delegator_keypair,
         nonce,
@@ -530,6 +536,13 @@ mod tests {
         StakingOp::decode_exact(&bytes).unwrap()
     }
 
+    fn bond_proof(byte: u8, value: u64) -> StakingBondProof {
+        StakingBondProof {
+            committed_value_spark: value,
+            blinding_factor: Bytes32::from([byte; 32]),
+        }
+    }
+
     #[test]
     fn build_basic_transaction() {
         let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
@@ -598,7 +611,9 @@ mod tests {
         let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
         let bond_utxo_id = Bytes32::from([0xA5; 32]);
 
-        let built = build_self_stake_op(bond_utxo_id, &keypair, 7, DEFAULT_CHAIN_ID).unwrap();
+        let proof = bond_proof(0xA5, 1_000_000);
+        let built = build_self_stake_op(bond_utxo_id, proof.clone(), &keypair, 7, DEFAULT_CHAIN_ID)
+            .unwrap();
         let bytes = hex::decode(&built.op_hex).unwrap();
         let op = StakingOp::decode_exact(&bytes).unwrap();
 
@@ -608,8 +623,11 @@ mod tests {
             op.body,
             StakingOpBody::SelfStake {
                 bond_utxo_id: id,
-                validator_pubkey
-            } if id == bond_utxo_id && validator_pubkey.classical_pk == spk.classical_pk
+                validator_pubkey,
+                bond_proof
+            } if id == bond_utxo_id
+                && validator_pubkey.classical_pk == spk.classical_pk
+                && bond_proof == Some(proof)
         ));
     }
 
@@ -642,6 +660,7 @@ mod tests {
         let built = build_register_validator_op(
             1_000,
             bond_utxo_id,
+            bond_proof(0xAB, 2_000_000),
             &keypair,
             [0xAA; 32],
             9,
@@ -666,8 +685,15 @@ mod tests {
         let keypair = test_keypair(0x72);
         let validator_id = Bytes32::from([0x01; 32]);
         let bond_utxo_id = Bytes32::from([0x02; 32]);
-        let built =
-            build_delegate_op(validator_id, bond_utxo_id, &keypair, 10, DEFAULT_CHAIN_ID).unwrap();
+        let built = build_delegate_op(
+            validator_id,
+            bond_utxo_id,
+            bond_proof(0x02, 500_000),
+            &keypair,
+            10,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
         let op = decode_built(&built);
         assert!(matches!(
             op.body,
@@ -778,15 +804,31 @@ mod tests {
             build_register_validator_op(
                 1_000,
                 bond_utxo_id,
+                bond_proof(0x11, 1_000),
                 &keypair,
                 [0x11; 32],
                 42,
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_self_stake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_stake_op(
+                bond_utxo_id,
+                bond_proof(0x12, 1_000),
+                &keypair,
+                42,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
             build_self_unstake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
-            build_delegate_op(validator_id, bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_delegate_op(
+                validator_id,
+                bond_utxo_id,
+                bond_proof(0x13, 1_000),
+                &keypair,
+                42,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
             build_undelegate_op(validator_id, bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID)
                 .unwrap(),
             build_claim_rewards_op(validator_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
@@ -814,15 +856,31 @@ mod tests {
             build_register_validator_op(
                 1_000,
                 bond_utxo_id,
+                bond_proof(0x21, 1_000),
                 &keypair,
                 [0x12; 32],
                 1,
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_self_stake_op(bond_utxo_id, &keypair, 2, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_stake_op(
+                bond_utxo_id,
+                bond_proof(0x22, 1_000),
+                &keypair,
+                2,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
             build_self_unstake_op(bond_utxo_id, &keypair, 3, DEFAULT_CHAIN_ID).unwrap(),
-            build_delegate_op(validator_id, bond_utxo_id, &keypair, 4, DEFAULT_CHAIN_ID).unwrap(),
+            build_delegate_op(
+                validator_id,
+                bond_utxo_id,
+                bond_proof(0x23, 1_000),
+                &keypair,
+                4,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
             build_undelegate_op(validator_id, bond_utxo_id, &keypair, 5, DEFAULT_CHAIN_ID).unwrap(),
             build_claim_rewards_op(validator_id, &keypair, 6, DEFAULT_CHAIN_ID).unwrap(),
             build_set_commission_op(validator_id, 1_200, &keypair, 7, DEFAULT_CHAIN_ID).unwrap(),

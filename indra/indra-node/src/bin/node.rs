@@ -1860,12 +1860,19 @@ fn main() {
                                     };
                                     let should = if active {
                                         d.can_propose()
-                                            && election_result
-                                                .is_some_and(|result| Some(result.elected_validator_id) == d.engine.validator_id())
+                                            && election_result.is_some_and(|result| {
+                                                Some(result.elected_validator_id)
+                                                    == d.engine.validator_id()
+                                            })
                                     } else {
                                         d.can_propose() && d.engine.is_proposer(&election)
                                     };
-                                    (should, height, election_result.map(|result| result.hash()), vrf_actions)
+                                    (
+                                        should,
+                                        height,
+                                        election_result.map(|result| result.hash()),
+                                        vrf_actions,
+                                    )
                                 }
                             };
                             if !vrf_actions.is_empty() {

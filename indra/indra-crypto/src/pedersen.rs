@@ -8,6 +8,7 @@ use curve25519_dalek::{
     scalar::Scalar,
 };
 use sha2::Sha512;
+use subtle::ConstantTimeEq;
 
 use crate::error::{CryptoError, CryptoResult};
 
@@ -75,7 +76,8 @@ pub fn verify_opening(
     commitment: &PedersenCommitment,
     opening: &PedersenOpening,
 ) -> CryptoResult<()> {
-    if commit(opening.value, &opening.blinding) == *commitment {
+    let expected = commit(opening.value, &opening.blinding);
+    if bool::from(expected.0.ct_eq(&commitment.0)) {
         Ok(())
     } else {
         Err(CryptoError::CommitmentOpeningFailed)

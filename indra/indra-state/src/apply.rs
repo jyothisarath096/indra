@@ -868,6 +868,10 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey,
                 vrf_pk: seed,
+                bond_proof: Some(indra_core::types::staking::StakingBondProof {
+                    committed_value_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+                    blinding_factor: Bytes32::from([seed[0]; 32]),
+                }),
             },
             nonce,
             signature: dummy_sig(),
@@ -884,11 +888,23 @@ mod tests {
         keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
+        let bond_proof = state.utxos.get(&bond_utxo_id).and_then(|entry| {
+            (0u8..=u8::MAX).find_map(|seed| {
+                let candidate = commit(entry.output.value_spark, &[seed; 32]);
+                (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
+                    indra_core::types::staking::StakingBondProof {
+                        committed_value_spark: entry.output.value_spark,
+                        blinding_factor: Bytes32::from([seed; 32]),
+                    }
+                })
+            })
+        });
         let mut op = StakingOp {
             body: StakingOpBody::Delegate {
                 validator_id,
                 bond_utxo_id,
                 delegator_pubkey,
+                bond_proof,
             },
             nonce,
             signature: dummy_sig(),

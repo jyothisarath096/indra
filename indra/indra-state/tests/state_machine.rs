@@ -686,6 +686,10 @@ fn test_self_stake_full_lifecycle() {
         StakingOpBody::SelfStake {
             bond_utxo_id,
             validator_pubkey: validator_pubkey.clone(),
+            bond_proof: Some(indra_core::types::staking::StakingBondProof {
+                committed_value_spark: bond_value,
+                blinding_factor: Bytes32::from([0x40; 32]),
+            }),
         },
         1,
         &validator_keypair,
@@ -815,6 +819,10 @@ fn test_self_stake_slash_reduces_bond_amount() {
         StakingOpBody::SelfStake {
             bond_utxo_id,
             validator_pubkey,
+            bond_proof: Some(indra_core::types::staking::StakingBondProof {
+                committed_value_spark: bond_value,
+                blinding_factor: Bytes32::from([0x50; 32]),
+            }),
         },
         1,
         &validator_keypair,

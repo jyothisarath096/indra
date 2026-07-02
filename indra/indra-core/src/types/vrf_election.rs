@@ -126,14 +126,7 @@ impl Encode for VrfReveal {
     }
 
     fn encoded_len(&self) -> usize {
-        32 + 8
-            + 4
-            + 32
-            + 32
-            + 32
-            + self.vrf_proof.encoded_len()
-            + 32
-            + self.signature.encoded_len()
+        32 + 8 + 4 + 32 + 32 + 32 + self.vrf_proof.encoded_len() + 32 + self.signature.encoded_len()
     }
 }
 
@@ -239,7 +232,10 @@ mod tests {
             commit_hash: Bytes32::from([4; 32]),
             signature: dummy_sig(),
         };
-        assert_eq!(commit, VrfCommit::decode_exact(&commit.encode_to_vec()).unwrap());
+        assert_eq!(
+            commit,
+            VrfCommit::decode_exact(&commit.encode_to_vec()).unwrap()
+        );
     }
 
     #[test]
@@ -255,7 +251,10 @@ mod tests {
             commit_hash: Bytes32::from([6; 32]),
             signature: dummy_sig(),
         };
-        assert_eq!(reveal, VrfReveal::decode_exact(&reveal.encode_to_vec()).unwrap());
+        assert_eq!(
+            reveal,
+            VrfReveal::decode_exact(&reveal.encode_to_vec()).unwrap()
+        );
     }
 
     #[test]

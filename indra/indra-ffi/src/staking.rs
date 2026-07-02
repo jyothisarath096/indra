@@ -11,6 +11,7 @@ use indra_cli::tx_builder::{
     build_undelegate_op,
 };
 use indra_core::types::primitives::Bytes32;
+use indra_core::types::staking::StakingBondProof;
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
 use crate::{
@@ -32,6 +33,19 @@ pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(std::slice::from_raw_parts(ptr, 32));
     out
+}
+
+unsafe fn read_staking_bond_proof(
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
+) -> StakingBondProof {
+    let mut blinding = read_bytes32(bond_blinding_factor);
+    let proof = StakingBondProof {
+        committed_value_spark: bond_value_spark,
+        blinding_factor: Bytes32::from(blinding),
+    };
+    blinding.fill(0);
+    proof
 }
 
 pub(crate) unsafe fn read_keypair(
@@ -139,6 +153,8 @@ struct StakingCommonArgs {
 pub unsafe extern "C" fn indra_build_register_validator(
     commission_bps: u32,
     bond_utxo_id: *const u8,
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -148,7 +164,7 @@ pub unsafe extern "C" fn indra_build_register_validator(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if bond_utxo_id.is_null() || vrf_pk.is_null() {
+    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() || vrf_pk.is_null() {
         return IndraError::NullPointer.code();
     }
     if commission_bps > 10_000 {
@@ -167,7 +183,8 @@ pub unsafe extern "C" fn indra_build_register_validator(
         |keypair, nonce, chain| {
             let bond = Bytes32::from(read_bytes32(bond_utxo_id));
             let vrf = read_bytes32(vrf_pk);
-            build_register_validator_op(commission_bps, bond, keypair, vrf, nonce, chain)
+            let proof = read_staking_bond_proof(bond_value_spark, bond_blinding_factor);
+            build_register_validator_op(commission_bps, bond, proof, keypair, vrf, nonce, chain)
                 .map(|built| built.op_hex)
                 .map_err(IndraError::from)
         },
@@ -184,6 +201,8 @@ pub unsafe extern "C" fn indra_build_register_validator(
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_stake(
     bond_utxo_id: *const u8,
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -192,7 +211,7 @@ pub unsafe extern "C" fn indra_build_self_stake(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if bond_utxo_id.is_null() {
+    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_keypair(
@@ -208,6 +227,7 @@ pub unsafe extern "C" fn indra_build_self_stake(
         |keypair, nonce, chain| {
             build_self_stake_op(
                 Bytes32::from(read_bytes32(bond_utxo_id)),
+                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
                 keypair,
                 nonce,
                 chain,
@@ -273,6 +293,8 @@ pub unsafe extern "C" fn indra_build_self_unstake(
 pub unsafe extern "C" fn indra_build_delegate(
     validator_id: *const u8,
     bond_utxo_id: *const u8,
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -281,7 +303,7 @@ pub unsafe extern "C" fn indra_build_delegate(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if validator_id.is_null() || bond_utxo_id.is_null() {
+    if validator_id.is_null() || bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_keypair(
@@ -298,6 +320,7 @@ pub unsafe extern "C" fn indra_build_delegate(
             build_delegate_op(
                 Bytes32::from(read_bytes32(validator_id)),
                 Bytes32::from(read_bytes32(bond_utxo_id)),
+                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
                 keypair,
                 nonce,
                 chain,

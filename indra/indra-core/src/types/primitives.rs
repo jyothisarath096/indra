@@ -74,6 +74,19 @@ pub const MAX_VRF_EMPTY_REVEAL_ROUNDS: u32 = 3;
 /// Memory cap for commit/reveal entries retained for one election round.
 pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
 
+/// Block height at which staking bond operations must include a per-output
+/// commitment binding proof (`StakingBondProof`).
+///
+/// `0` means required from genesis on fresh testnet. For mainnet, set this to
+/// a future announced hard-fork height.
+pub const STAKING_COMMITMENT_PROOF_HEIGHT: u64 = 0;
+
+/// True when staking bond operations must prove that the bonded UTXO's
+/// Pedersen commitment opens to its public `value_spark` field.
+pub fn staking_commitment_proof_required(height: u64) -> bool {
+    height >= STAKING_COMMITMENT_PROOF_HEIGHT
+}
+
 /// Epochs delay before a governance-approved timeout change takes effect.
 pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 

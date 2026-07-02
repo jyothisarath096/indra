@@ -14,8 +14,7 @@ use std::net::SocketAddr;
 use indra_consensus::mempool::Mempool;
 use indra_consensus::{
     proposer::{
-        compute_vrf_input, elect_proposer, ProposerCandidate, ProposerElection,
-        VRF_FALLBACK_OUTPUT,
+        compute_vrf_input, elect_proposer, ProposerCandidate, ProposerElection, VRF_FALLBACK_OUTPUT,
     },
     qc::{verify_qc_strict, QcValidator},
 };
@@ -296,7 +295,11 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
 fn verify_proposer_vrf_key_ownership(
     block: &BlockV1,
     state: &ChainState,
-) -> NodeResult<(indra_core::Bytes32, Vec<ProposerCandidate>, indra_core::Bytes32)> {
+) -> NodeResult<(
+    indra_core::Bytes32,
+    Vec<ProposerCandidate>,
+    indra_core::Bytes32,
+)> {
     let proof_bytes = block.header.proposer_vrf_proof.as_slice();
     let output = block.header.proposer_vrf_output;
 

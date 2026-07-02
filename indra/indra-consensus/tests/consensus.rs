@@ -15,8 +15,8 @@ use indra_core::{
         crypto::HybridSignature,
         primitives::DEFAULT_CHAIN_ID,
         transaction::{InputV1, OutputV1, TransactionV1},
-        vrf_election::VrfElectionResult,
         vote::VoteStep,
+        vrf_election::VrfElectionResult,
     },
     Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
 };

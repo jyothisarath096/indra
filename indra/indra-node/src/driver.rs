@@ -9,11 +9,12 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use indra_consensus::{
-    build_qc, verify_qc,
+    build_qc,
     proposer::{
         compute_fallback_election_result, compute_proposer_vrf, compute_vrf_input,
         elect_proposer_from_reveals, ProposerCandidate, ProposerElection,
     },
+    verify_qc,
     vote::{RegisteredVoter, VoteCollector, VoteDecision},
 };
 use indra_core::codec::{ByteReader, Decode, Encode};
@@ -21,10 +22,9 @@ use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
     crypto::HybridSignature,
     primitives::{
-        bps_of, vrf_commit_reveal_election_active, Bytes32, VariableBytes,
-        CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
-        MAX_VRF_EMPTY_REVEAL_ROUNDS, MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS,
-        VRF_REVEAL_WINDOW_MS,
+        bps_of, vrf_commit_reveal_election_active, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS,
+        MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VRF_EMPTY_REVEAL_ROUNDS,
+        MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS, VRF_REVEAL_WINDOW_MS,
     },
     qc::QuorumCertificateV1,
     transaction::TransactionV1,
@@ -542,12 +542,8 @@ impl ConsensusDriver {
                 qc_bytes,
             } => self.handle_qc_response(from, height, qc_bytes),
             DriverEvent::QcRequest { from, height } => self.handle_qc_request(from, height),
-            DriverEvent::InboundVrfCommit { from, commit } => {
-                self.process_vrf_commit(from, commit)
-            }
-            DriverEvent::InboundVrfReveal { from, reveal } => {
-                self.process_vrf_reveal(from, reveal)
-            }
+            DriverEvent::InboundVrfCommit { from, commit } => self.process_vrf_commit(from, commit),
+            DriverEvent::InboundVrfReveal { from, reveal } => self.process_vrf_reveal(from, reveal),
         }
     }
 
@@ -578,9 +574,11 @@ impl ConsensusDriver {
     }
 
     fn vrf_slot_index(&self, height: u64, round: u32) -> Option<usize> {
-        self.vrf_states
-            .iter()
-            .position(|state| state.as_ref().is_some_and(|s| s.height == height && s.round == round))
+        self.vrf_states.iter().position(|state| {
+            state
+                .as_ref()
+                .is_some_and(|s| s.height == height && s.round == round)
+        })
     }
 
     fn active_vrf_candidates(&self, height: u64, round: u32) -> ProposerElection {
@@ -705,14 +703,18 @@ impl ConsensusDriver {
         let hybrid_keypair = self.engine.local_hybrid_keypair()?;
         let vrf_pubkey = vrf_keypair.public_key();
         let election = self.active_vrf_candidates(height, round);
-        if !election
-            .candidates
-            .iter()
-            .any(|candidate| candidate.validator_id == validator_id && candidate.vrf_pubkey == vrf_pubkey)
-        {
+        if !election.candidates.iter().any(|candidate| {
+            candidate.validator_id == validator_id && candidate.vrf_pubkey == vrf_pubkey
+        }) {
             return None;
         }
-        let slot = compute_proposer_vrf(validator_id, vrf_keypair, &election.epoch_seed, height, round);
+        let slot = compute_proposer_vrf(
+            validator_id,
+            vrf_keypair,
+            &election.epoch_seed,
+            height,
+            round,
+        );
         let vrf_output = Bytes32::from(slot.vrf_output.0);
         let vrf_proof = slot.vrf_proof.0.clone();
         let chain_id_hash = chain_id_hash(&self.engine.state.chain_id);
@@ -816,7 +818,10 @@ impl ConsensusDriver {
         if !vrf_commit_reveal_election_active(election.height) {
             return vec![];
         }
-        if self.vrf_slot_index(election.height, election.round).is_none() {
+        if self
+            .vrf_slot_index(election.height, election.round)
+            .is_none()
+        {
             self.vrf_states[0] = Some(VrfRoundState::new(election.height, election.round));
         }
         let mut actions = Vec::new();
@@ -872,9 +877,9 @@ impl ConsensusDriver {
                 state.election_result.is_none()
                     && state.phase == VrfRoundPhase::Reveal
                     && (self.quorum_stake_reached(self.revealed_stake(state))
-                        || state
-                            .reveal_started_at
-                            .is_some_and(|t| t.elapsed().as_millis() >= VRF_REVEAL_WINDOW_MS as u128))
+                        || state.reveal_started_at.is_some_and(|t| {
+                            t.elapsed().as_millis() >= VRF_REVEAL_WINDOW_MS as u128
+                        }))
             });
         if should_compute {
             self.compute_and_store_vrf_election(slot);
@@ -901,8 +906,7 @@ impl ConsensusDriver {
             if result.fallback_used {
                 self.consecutive_empty_reveal_rounds =
                     self.consecutive_empty_reveal_rounds.saturating_add(1);
-                state.phase = if self.consecutive_empty_reveal_rounds
-                    >= MAX_VRF_EMPTY_REVEAL_ROUNDS
+                state.phase = if self.consecutive_empty_reveal_rounds >= MAX_VRF_EMPTY_REVEAL_ROUNDS
                 {
                     VrfRoundPhase::Fallback
                 } else {
@@ -1277,7 +1281,10 @@ impl ConsensusDriver {
                     .map(|result| result.hash());
 
         if election_mismatch {
-            if self.vrf_election_result(height, self.current_round).is_none() {
+            if self
+                .vrf_election_result(height, self.current_round)
+                .is_none()
+            {
                 return vec![];
             }
             eprintln!(
@@ -1357,23 +1364,25 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         }
 
-        let election_result_hash = if vrf_commit_reveal_election_active(height)
-            && step == VoteStep::Precommit
-        {
-            self.vrf_election_result(height, round)
-                .map(|result| result.hash())
-                .or_else(|| {
-                    self.pending_block(&block_hash)
-                        .and_then(|block| block.header.election_result_hash)
-                })
-        } else {
-            None
-        };
+        let election_result_hash =
+            if vrf_commit_reveal_election_active(height) && step == VoteStep::Precommit {
+                self.vrf_election_result(height, round)
+                    .map(|result| result.hash())
+                    .or_else(|| {
+                        self.pending_block(&block_hash)
+                            .and_then(|block| block.header.election_result_hash)
+                    })
+            } else {
+                None
+            };
 
-        match self
-            .engine
-            .sign_vote_with_election_result(height, round, step, block_hash, election_result_hash)
-        {
+        match self.engine.sign_vote_with_election_result(
+            height,
+            round,
+            step,
+            block_hash,
+            election_result_hash,
+        ) {
             Ok(local_vote) => {
                 eprintln!(
                     "[vote] produced {:?} for height={} round={} hash={}",
@@ -2402,8 +2411,7 @@ mod tests {
             validator_id,
             vrf_pubkey,
             vrf_output,
-            vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
-                .unwrap(),
+            vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0).unwrap(),
             commit_hash,
             signature: ConsensusDriver::empty_signature().unwrap(),
         };
@@ -2572,11 +2580,9 @@ mod tests {
             reveal,
         });
 
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_)))
-        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_))));
         assert!(!driver.vrf_states[slot]
             .as_ref()
             .unwrap()
@@ -2607,11 +2613,9 @@ mod tests {
             reveal,
         });
 
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_)))
-        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_))));
         let slot = driver.vrf_slot_index(height, round).unwrap();
         assert!(!driver.vrf_states[slot]
             .as_ref()
@@ -2644,11 +2648,9 @@ mod tests {
             reveal,
         });
 
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_)))
-        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_))));
         let slot = driver.vrf_slot_index(height, round).unwrap();
         assert!(!driver.vrf_states[slot]
             .as_ref()
@@ -2665,19 +2667,16 @@ mod tests {
         let round = driver.current_round;
         let election = election_for_round(&driver, height, round);
         driver.ensure_vrf_election_for_round(&election);
-        let (commit, _reveal) =
-            signed_vrf_pair(&driver, [0x14; 32], height, round, "other-chain");
+        let (commit, _reveal) = signed_vrf_pair(&driver, [0x14; 32], height, round, "other-chain");
 
         let actions = driver.process(DriverEvent::InboundVrfCommit {
             from: "127.0.0.1:10001".parse().unwrap(),
             commit,
         });
 
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, DriverAction::BroadcastVrfCommit(_)))
-        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfCommit(_))));
         let _ = std::fs::remove_dir_all(dir);
     }
 

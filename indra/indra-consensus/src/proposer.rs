@@ -243,13 +243,15 @@ pub fn elect_proposer_from_reveals(
         });
 
     winner
-        .map(|(elected_validator_id, _, elected_vrf_output)| VrfElectionResult {
-            height: election.height,
-            round: election.round,
-            elected_validator_id,
-            elected_vrf_output,
-            fallback_used: false,
-        })
+        .map(
+            |(elected_validator_id, _, elected_vrf_output)| VrfElectionResult {
+                height: election.height,
+                round: election.round,
+                elected_validator_id,
+                elected_vrf_output,
+                fallback_used: false,
+            },
+        )
         .ok_or(ConsensusError::EmptyValidatorSet)
 }
 

@@ -554,6 +554,7 @@ dependencies = [
  "indra-bulletproofs",
  "ml-dsa",
  "sha2",
+ "subtle",
  "thiserror",
  "zeroize",
 ]

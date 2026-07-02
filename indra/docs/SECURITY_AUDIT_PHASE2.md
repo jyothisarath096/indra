@@ -11,7 +11,7 @@
 | T-05 | apply.rs / fee.rs | Transaction value sums and required-fee multiplication fail closed on overflow | LOW | FIXED — checked arithmetic regression test added |
 | T-06 | apply.rs | Zero-value / dust outputs are rejected in structure and state validation | SAFE | Checked |
 | T-07 | fee.rs | Base-fee and per-transaction fee enforcement are deterministic and enforced at block state | SAFE | Checked |
-| T-08 | apply.rs / staking | Range proofs verify against stored commitments; public `value_spark` semantics are documented and tested | SAFE / LOW | DOCUMENTED — protocol-level semantic retained |
+| T-08 | apply.rs / staking | Range proofs verify stored commitments; staking bonds now require explicit commitment opening | SAFE / LOW | FIXED for staking |
 | T-09 | transaction.rs | Transaction/block input/output/resource limits exist | SAFE | Checked |
 | T-10 | transaction.rs | Transaction signatures cover canonical fields; tx hash includes signatures | SAFE | Checked |
 | T-11 | mempool admission | RPC/P2P mempool admission now runs full state validation before insert/gossip | MEDIUM | FIXED — invalid-signature/nonexistent-UTXO tests added |
@@ -145,11 +145,11 @@ The PoC builds real range-proved, hybrid-signed transactions and confirms the vu
 
 **Proof-of-concept / reasoning:** No alternate commitment is introduced between validation and storage; the output object is cloned directly into the UTXO set.
 
-**Caveat:** The public `OutputV1.value_spark` is not individually proven to match that output's commitment. The transaction-level public sum and aggregate commitment equation prevent simple inflation in normal UTXO spends, but staking/delegation paths consume `value_spark` directly when bonding. Validators do not have each output's blinding factor, so locally enforcing per-output public-value-to-commitment equality would require a protocol/wire-format change.
+**Caveat:** For ordinary transaction outputs, the public `OutputV1.value_spark` field remains public accounting metadata; the transaction-level public sum and aggregate commitment equation prevent simple inflation in normal UTXO spends. Staking/delegation is different because it consumes an individual output as economic collateral, so that path now requires the spender to reveal a staking-specific opening proof for the bond UTXO.
 
-**Fix / hardening:** `OutputV1.value_spark` now carries an explicit warning that it is public accounting metadata, not an individually verified commitment opening. `indra-state/src/delegation.rs::staking_bond_amount_uses_public_value_metadata` documents the current staking behavior: stake amount follows the public field. This preserves the current protocol semantics and intentionally avoids a wire-format or state-schema change in this hardening pass.
+**Fix / hardening:** `RegisterValidator`, `SelfStake`, and `Delegate` now carry `StakingBondProof { committed_value_spark, blinding_factor }`. At activation height, state validation requires this proof and verifies that it opens the exact stored output commitment and that the opened value equals `output.value_spark` before the UTXO is spent. This closes the staking-specific T-08/ST-03 risk while preserving the existing aggregate balance model for ordinary transaction outputs.
 
-**Status:** DOCUMENTED / SAFE for direct transaction inflation; protocol-design follow-up remains if INDRA wants commitments, rather than public values, to be authoritative for staking economics.
+**Status:** FIXED for staking; SAFE for direct transaction inflation.
 
 ### T-09 — Transaction size and resource limits exist
 
@@ -221,7 +221,7 @@ Added/updated:
 - `indra-state/tests/audit_phase2.rs::legitimate_single_spend_still_works_after_duplicate_utxo_fix`
 - `indra-state/tests/audit_phase2.rs::transaction_with_overflowing_input_sum_is_rejected`
 - `indra-state/src/apply.rs::apply_transaction_fails_loudly_if_utxo_already_spent`
-- `indra-state/src/delegation.rs::staking_bond_amount_uses_public_value_metadata`
+- `indra-state/src/delegation.rs` staking bond proof tests covering accepted openings, missing proofs, wrong blindings, value mismatches, and rollback/no-spend behavior on failure
 - `indra-consensus/src/mempool.rs::mempool_rejects_transaction_with_invalid_signature`
 - `indra-consensus/src/mempool.rs::mempool_rejects_transaction_spending_nonexistent_utxo`
 - `indra-consensus/src/mempool.rs::mempool_accepts_valid_transaction`
@@ -241,9 +241,8 @@ The original exploit PoC was inverted: the duplicate-UTXO block now fails with `
 ## Recommended Fix Order
 
 1. **Strengthen nullifier semantics:** if nullifiers are intended to prove ownership-secret derivation, add a verifiable spend/nullifier proof or redesign the input authorization model so arbitrary nullifiers cannot be chosen freely.
-2. **Decide public-value/commitment authority for staking (T-08 follow-up):** current behavior is documented and tested, but a future protocol design should decide whether staking must require a revealed opening or whether public values remain authoritative accounting metadata.
-3. **Fix CLI dust-change construction:** when positive change is below or equal to dust and omitted, either add it to `fee_amount` and fee commitment or reject construction before signing.
+2. **Fix CLI dust-change construction:** when positive change is below or equal to dust and omitted, either add it to `fee_amount` and fee commitment or reject construction before signing.
 
 ## Phase 2 Hardening Change Scope
 
-The T-05/T-08/T-11 hardening pass did **not** change cryptographic derivation, wire format, state schema, genesis data, or validator/key material. T-08 intentionally avoided any per-output opening requirement because that would be a wire-format/protocol change.
+The original T-05/T-08/T-11 hardening pass did **not** change cryptographic derivation, wire format, state schema, genesis data, or validator/key material. The later ST-03/T-08 follow-up intentionally adds a staking-op wire-format change for `RegisterValidator`, `SelfStake`, and `Delegate` by carrying `StakingBondProof`; on testnet this requires a fresh wipe or coordinated hard-fork activation. It does **not** change cryptographic derivation, key material, genesis validator keys, or the block/QC wire format.
