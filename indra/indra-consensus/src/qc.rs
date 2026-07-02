@@ -409,7 +409,7 @@ pub fn verify_qc_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vote::produce_vote;
+    use crate::vote::{produce_vote, produce_vote_with_election_result};
     use indra_core::types::primitives::{CONSENSUS_QUORUM_BPS, DEFAULT_CHAIN_ID};
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
@@ -455,6 +455,131 @@ mod tests {
         assert_eq!(qc.height, 1);
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.signer_count(), 1);
+    }
+
+    #[test]
+    fn qc_build_fails_loudly_on_election_result_hash_disagreement() {
+        let (v1, kp1) = make_validator(0x21, 0, 5_000);
+        let (v2, kp2) = make_validator(0x22, 1, 5_000);
+        let block_hash = Bytes32::from([0x21u8; 32]);
+        let election_hash = Bytes32::from([0xE1u8; 32]);
+        let vote_with_hash = produce_vote_with_election_result(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v1.validator_id,
+            Some(election_hash),
+            DEFAULT_CHAIN_ID,
+            &kp1,
+        )
+        .unwrap();
+        let vote_without_hash = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v2.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp2,
+        )
+        .unwrap();
+
+        let err = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v1, v2],
+            vec![&vote_with_hash, &vote_without_hash],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConsensusError::CryptoError { detail } if detail.contains("QC votes disagree")
+        ));
+    }
+
+    #[test]
+    fn qc_build_succeeds_when_all_votes_agree_on_election_result_hash() {
+        let (v1, kp1) = make_validator(0x23, 0, 5_000);
+        let (v2, kp2) = make_validator(0x24, 1, 5_000);
+        let block_hash = Bytes32::from([0x23u8; 32]);
+        let election_hash = Bytes32::from([0xE2u8; 32]);
+        let vote1 = produce_vote_with_election_result(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v1.validator_id,
+            Some(election_hash),
+            DEFAULT_CHAIN_ID,
+            &kp1,
+        )
+        .unwrap();
+        let vote2 = produce_vote_with_election_result(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v2.validator_id,
+            Some(election_hash),
+            DEFAULT_CHAIN_ID,
+            &kp2,
+        )
+        .unwrap();
+
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v1, v2],
+            vec![&vote1, &vote2],
+        )
+        .unwrap();
+
+        assert_eq!(qc.election_result_hash, Some(election_hash));
+    }
+
+    #[test]
+    fn qc_build_succeeds_when_all_votes_have_none_election_result_hash() {
+        let (v1, kp1) = make_validator(0x25, 0, 5_000);
+        let (v2, kp2) = make_validator(0x26, 1, 5_000);
+        let block_hash = Bytes32::from([0x25u8; 32]);
+        let vote1 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v1.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp1,
+        )
+        .unwrap();
+        let vote2 = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            v2.validator_id,
+            DEFAULT_CHAIN_ID,
+            &kp2,
+        )
+        .unwrap();
+
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &[v1, v2],
+            vec![&vote1, &vote2],
+        )
+        .unwrap();
+
+        assert_eq!(qc.election_result_hash, None);
     }
 
     #[test]
