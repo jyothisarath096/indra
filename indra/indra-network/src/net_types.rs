@@ -53,4 +53,15 @@ pub enum NetworkCommand {
         /// Remote validator identity to drop.
         validator_id: Bytes32,
     },
+    /// Disconnect a peer that sent an invalid consensus message.
+    ///
+    /// This applies an invalid-message score penalty, but unlike the rate
+    /// limiter path it does not impose an immediate 10-minute ban for one
+    /// bad consensus payload.
+    DisconnectInvalidConsensusPeer {
+        /// Remote validator identity to drop.
+        validator_id: Bytes32,
+        /// Human-readable reason for logs.
+        reason: String,
+    },
 }

@@ -113,6 +113,17 @@ impl MessageClass {
         }
     }
 
+    /// True for consensus messages whose legitimate volume is bounded by
+    /// protocol slots rather than wall-clock message rate.
+    ///
+    /// These messages must not trigger punitive count-bucket penalties:
+    /// the consensus driver already enforces one vote/commit/reveal per
+    /// validator slot, and banning authenticated validators for duplicate
+    /// gossip can fragment BFT liveness.
+    pub fn is_consensus_slot_message(self) -> bool {
+        matches!(self, Self::Vote | Self::VrfElection)
+    }
+
     /// True when a per-peer byte bucket applies.
     pub fn needs_per_peer_byte_limit(msg: &Message) -> bool {
         matches!(
@@ -201,11 +212,14 @@ impl PeerRateLimiter {
     /// Returns `Some(penalty)` when rate limited, `None` when allowed.
     pub fn check(&mut self, msg: &Message, msg_size: usize) -> Option<i32> {
         let class = MessageClass::from_message(msg);
-        let count_ok = self
-            .count_buckets
-            .get_mut(&class)
-            .map(|bucket| bucket.try_consume(1))
-            .unwrap_or(true);
+        let count_ok = if class.is_consensus_slot_message() {
+            true
+        } else {
+            self.count_buckets
+                .get_mut(&class)
+                .map(|bucket| bucket.try_consume(1))
+                .unwrap_or(true)
+        };
 
         let byte_ok = if MessageClass::needs_per_peer_byte_limit(msg) {
             self.per_peer_byte_bucket.try_consume_bytes(msg_size as u64)
@@ -249,7 +263,15 @@ mod tests {
         crypto::HybridSignature,
         primitives::{Bytes32, VariableBytes},
         vote::{VoteStep, VoteV1},
+        vrf_election::{VrfCommit, VrfReveal},
     };
+
+    fn dummy_signature() -> HybridSignature {
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        }
+    }
 
     fn dummy_vote() -> Message {
         Message::Vote(VoteV1 {
@@ -258,10 +280,34 @@ mod tests {
             step: VoteStep::Prevote,
             block_hash: Bytes32::ZERO,
             validator_id: Bytes32::ZERO,
-            signature: HybridSignature {
-                classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-                pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
-            },
+            election_result_hash: None,
+            signature: dummy_signature(),
+        })
+    }
+
+    fn dummy_vrf_commit() -> Message {
+        Message::VrfCommit(VrfCommit {
+            chain_id_hash: Bytes32::from([0x01; 32]),
+            height: 1,
+            round: 0,
+            validator_id: Bytes32::from([0x02; 32]),
+            vrf_pubkey: [0x03; 32],
+            commit_hash: Bytes32::from([0x04; 32]),
+            signature: dummy_signature(),
+        })
+    }
+
+    fn dummy_vrf_reveal() -> Message {
+        Message::VrfReveal(VrfReveal {
+            chain_id_hash: Bytes32::from([0x01; 32]),
+            height: 1,
+            round: 0,
+            validator_id: Bytes32::from([0x02; 32]),
+            vrf_pubkey: [0x03; 32],
+            vrf_output: Bytes32::from([0x04; 32]),
+            vrf_proof: VariableBytes::from_slice(&[0x05; 80]).unwrap(),
+            commit_hash: Bytes32::from([0x06; 32]),
+            signature: dummy_signature(),
         })
     }
 
@@ -327,11 +373,38 @@ mod tests {
     }
 
     #[test]
-    fn test_attack_vote_rate_triggers_limit() {
+    fn vote_duplicate_does_not_penalize_authenticated_validator() {
         let mut limiter = PeerRateLimiter::new();
         let msg = dummy_vote();
-        let mut limited = false;
         for _ in 0..100 {
+            assert_eq!(limiter.check(&msg, 512), None);
+        }
+    }
+
+    #[test]
+    fn vrf_commit_duplicate_does_not_penalize_authenticated_validator() {
+        let mut limiter = PeerRateLimiter::new();
+        let msg = dummy_vrf_commit();
+        for _ in 0..100 {
+            assert_eq!(limiter.check(&msg, 512), None);
+        }
+    }
+
+    #[test]
+    fn vrf_reveal_duplicate_does_not_penalize_authenticated_validator() {
+        let mut limiter = PeerRateLimiter::new();
+        let msg = dummy_vrf_reveal();
+        for _ in 0..100 {
+            assert_eq!(limiter.check(&msg, 512), None);
+        }
+    }
+
+    #[test]
+    fn non_consensus_flood_still_triggers_rate_limit() {
+        let mut limiter = PeerRateLimiter::new();
+        let msg = Message::Ping(1);
+        let mut limited = false;
+        for _ in 0..10 {
             if limiter.check(&msg, 512).is_some() {
                 limited = true;
                 break;

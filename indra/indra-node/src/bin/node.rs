@@ -95,6 +95,17 @@ impl NetworkBridge {
         });
     }
 
+    fn disconnect_invalid_consensus_peer(&self, addr: &SocketAddr, reason: String) {
+        if let Some(validator_id) = self.validator_for_addr(addr) {
+            let _ = self
+                .handle
+                .send_blocking(NetworkCommand::DisconnectInvalidConsensusPeer {
+                    validator_id,
+                    reason,
+                });
+        }
+    }
+
     fn connection_count(&self) -> usize {
         self.handle.connected_peer_count()
     }
@@ -2301,6 +2312,22 @@ fn process_driver_actions(
                 "[slash] equivocation detected from validator {} — evidence queued",
                 hex::encode(&slash_evidence.validator_id.0[..4])
             );
+            continue;
+        }
+
+        if let DriverAction::DisconnectInvalidConsensusPeer {
+            from,
+            validator_id,
+            reason,
+        } = &action
+        {
+            eprintln!(
+                "[p2p] invalid consensus message from {} claiming validator {}: {}",
+                from,
+                hex::encode(&validator_id.0[..4]),
+                reason
+            );
+            gossip.disconnect_invalid_consensus_peer(from, reason.clone());
             continue;
         }
 

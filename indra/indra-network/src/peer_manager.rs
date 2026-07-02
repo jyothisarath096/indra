@@ -1,7 +1,7 @@
 //! Async peer-manager actor for the authenticated Tokio transport.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -15,6 +15,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+use indra_core::ssz::sha256;
 use indra_core::types::{
     primitives::Bytes32, slash_detector::SlashDetector, slashing::SlashEvidenceV1,
 };
@@ -31,6 +32,7 @@ use crate::{
 const SMALL_QUEUE_CAPACITY: usize = 256;
 const LARGE_QUEUE_CAPACITY: usize = 4;
 const TIE_BREAK_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const CONSENSUS_DUPLICATE_FILTER_CAPACITY: usize = 512;
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -87,6 +89,97 @@ struct PeerManagerActor {
 enum QueueType {
     Small,
     Large,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsensusMessageKey {
+    VrfCommit {
+        validator_id: Bytes32,
+        height: u64,
+        round: u32,
+        commit_hash: Bytes32,
+        content_hash: Bytes32,
+    },
+    VrfReveal {
+        validator_id: Bytes32,
+        height: u64,
+        round: u32,
+        commit_hash: Bytes32,
+        vrf_output: Bytes32,
+        content_hash: Bytes32,
+    },
+    Vote {
+        validator_id: Bytes32,
+        height: u64,
+        round: u32,
+        step: u8,
+        block_hash: Bytes32,
+        content_hash: Bytes32,
+    },
+}
+
+struct ConsensusDuplicateFilter {
+    seen: VecDeque<ConsensusMessageKey>,
+    capacity: usize,
+}
+
+impl ConsensusDuplicateFilter {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn is_duplicate(&mut self, key: ConsensusMessageKey) -> bool {
+        if self.seen.contains(&key) {
+            return true;
+        }
+        if self.capacity == 0 {
+            return false;
+        }
+        if self.seen.len() >= self.capacity {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(key);
+        false
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+fn consensus_message_key(msg: &Message) -> Option<ConsensusMessageKey> {
+    let wire = msg.encode_wire().ok()?;
+    let content_hash = Bytes32::from(sha256(&wire));
+    match msg {
+        Message::VrfCommit(commit) => Some(ConsensusMessageKey::VrfCommit {
+            validator_id: commit.validator_id,
+            height: commit.height,
+            round: commit.round,
+            commit_hash: commit.commit_hash,
+            content_hash,
+        }),
+        Message::VrfReveal(reveal) => Some(ConsensusMessageKey::VrfReveal {
+            validator_id: reveal.validator_id,
+            height: reveal.height,
+            round: reveal.round,
+            commit_hash: reveal.commit_hash,
+            vrf_output: reveal.vrf_output,
+            content_hash,
+        }),
+        Message::Vote(vote) => Some(ConsensusMessageKey::Vote {
+            validator_id: vote.validator_id,
+            height: vote.height,
+            round: vote.round,
+            step: vote.step as u8,
+            block_hash: vote.block_hash,
+            content_hash,
+        }),
+        _ => None,
+    }
 }
 
 fn short_validator_id(id: &Bytes32) -> String {
@@ -195,6 +288,23 @@ impl PeerManagerActor {
             NetworkCommand::Disconnect { validator_id } => {
                 if let Some(peer) = self.peers_by_validator.get(&validator_id) {
                     self.drop_peer(validator_id, peer.addr).await;
+                }
+            }
+            NetworkCommand::DisconnectInvalidConsensusPeer {
+                validator_id,
+                reason,
+            } => {
+                if let Some(peer) = self.peers_by_validator.get(&validator_id) {
+                    let addr = peer.addr;
+                    self.peer_table
+                        .score_event(&addr, ScoreEvent::InvalidMessage);
+                    eprintln!(
+                        "[p2p] disconnecting validator {} ({}) for invalid consensus message: {}",
+                        short_validator_id(&validator_id),
+                        addr,
+                        reason
+                    );
+                    self.drop_peer(validator_id, addr).await;
                 }
             }
         }
@@ -331,6 +441,8 @@ impl PeerManagerActor {
         let read_task = tokio::spawn(async move {
             let mut reader = FrameReader::new(reader_half, recv_key);
             let mut rate_limiter = PeerRateLimiter::new();
+            let mut duplicate_filter =
+                ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
             loop {
                 let plaintext = match reader.read_frame().await {
                     Ok(bytes) => bytes,
@@ -360,6 +472,11 @@ impl PeerManagerActor {
                         let _ = event_tx
                             .send(NetworkEvent::SlashDetected(wire_evidence))
                             .await;
+                    }
+                }
+                if let Some(key) = consensus_message_key(&msg) {
+                    if duplicate_filter.is_duplicate(key) {
+                        continue;
                     }
                 }
                 if let Some(penalty) = rate_limiter.check(&msg, msg_size) {
@@ -606,6 +723,12 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::types::{
+        crypto::HybridSignature,
+        primitives::VariableBytes,
+        vote::{VoteStep, VoteV1},
+        vrf_election::VrfCommit,
+    };
     use tokio::net::{TcpListener, TcpStream};
 
     async fn stream_pair() -> (TcpStream, TcpStream) {
@@ -730,6 +853,72 @@ mod tests {
 
         assert!(is_self_connection(local, remote_self));
         assert!(!is_self_connection(local, remote_peer));
+    }
+
+    fn dummy_signature() -> HybridSignature {
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        }
+    }
+
+    #[test]
+    fn consensus_duplicate_filter_is_bounded() {
+        let mut filter = ConsensusDuplicateFilter::new(3);
+        for i in 0..4u8 {
+            assert!(!filter.is_duplicate(ConsensusMessageKey::VrfCommit {
+                validator_id: Bytes32::from([i; 32]),
+                height: 1,
+                round: 0,
+                commit_hash: Bytes32::from([i.saturating_add(10); 32]),
+                content_hash: Bytes32::from([i.saturating_add(20); 32]),
+            }));
+        }
+        assert_eq!(filter.len(), 3);
+        assert!(
+            !filter.is_duplicate(ConsensusMessageKey::VrfCommit {
+                validator_id: Bytes32::from([0; 32]),
+                height: 1,
+                round: 0,
+                commit_hash: Bytes32::from([10; 32]),
+                content_hash: Bytes32::from([20; 32]),
+            }),
+            "oldest entry should be evicted when capacity is exceeded"
+        );
+    }
+
+    #[test]
+    fn consensus_duplicate_filter_detects_exact_vote_duplicates() {
+        let vote = Message::Vote(VoteV1 {
+            height: 7,
+            round: 2,
+            step: VoteStep::Prevote,
+            block_hash: Bytes32::from([0xAA; 32]),
+            validator_id: Bytes32::from([0xBB; 32]),
+            election_result_hash: None,
+            signature: dummy_signature(),
+        });
+        let key = consensus_message_key(&vote).expect("vote key");
+        let mut filter = ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
+        assert!(!filter.is_duplicate(key));
+        assert!(filter.is_duplicate(key));
+    }
+
+    #[test]
+    fn consensus_duplicate_filter_detects_exact_vrf_commit_duplicates() {
+        let commit = Message::VrfCommit(VrfCommit {
+            chain_id_hash: Bytes32::from([0x01; 32]),
+            height: 7,
+            round: 2,
+            validator_id: Bytes32::from([0xBB; 32]),
+            vrf_pubkey: [0xCC; 32],
+            commit_hash: Bytes32::from([0xDD; 32]),
+            signature: dummy_signature(),
+        });
+        let key = consensus_message_key(&commit).expect("vrf commit key");
+        let mut filter = ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
+        assert!(!filter.is_duplicate(key));
+        assert!(filter.is_duplicate(key));
     }
 
     #[tokio::test]

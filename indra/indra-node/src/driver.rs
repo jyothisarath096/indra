@@ -258,6 +258,16 @@ pub enum DriverAction {
     ActivateBufferedProposal(BlockV1),
     /// Slash evidence was detected.
     SlashDetected(SlashEvidence),
+    /// A connected peer sent a consensus message that passed cheap routing
+    /// checks but failed cryptographic/protocol validation.
+    DisconnectInvalidConsensusPeer {
+        /// Socket address that sent the invalid message.
+        from: SocketAddr,
+        /// Claimed validator identity inside the invalid message.
+        validator_id: Bytes32,
+        /// Human-readable reason for logs/scoring.
+        reason: String,
+    },
     /// No action needed.
     None,
 }
@@ -772,12 +782,6 @@ impl ConsensusDriver {
         Some(reveal)
     }
 
-    fn validate_vrf_commit(&self, commit: &VrfCommit) -> bool {
-        commit.chain_id_hash == chain_id_hash(&self.engine.state.chain_id)
-            && self.validator_vrf_pk_matches(&commit.validator_id, &commit.vrf_pubkey)
-            && self.verify_commit_signature(commit)
-    }
-
     fn validate_vrf_reveal(&self, reveal: &VrfReveal) -> bool {
         if reveal.chain_id_hash != chain_id_hash(&self.engine.state.chain_id)
             || !self.validator_vrf_pk_matches(&reveal.validator_id, &reveal.vrf_pubkey)
@@ -865,7 +869,7 @@ impl ConsensusDriver {
                 state.reveal_started_at = Some(Instant::now());
             }
             if let Some(reveal) = self.make_local_vrf_reveal(height, round) {
-                actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true));
+                actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true, None));
             }
         }
 
@@ -925,23 +929,60 @@ impl ConsensusDriver {
         slot: usize,
         reveal: VrfReveal,
         gossip: bool,
+        invalid_from: Option<SocketAddr>,
     ) -> Vec<DriverAction> {
         let mut actions = Vec::new();
+        let (height, round) = {
+            let Some(state) = self.vrf_states[slot].as_mut() else {
+                return actions;
+            };
+            // Cheap duplicate/cap checks happen before signature/VRF proof
+            // verification. Exact duplicates are normal gossip during stalls
+            // and should cost neither crypto work nor peer penalties.
+            if state.reveals.contains_key(&reveal.validator_id)
+                || state.reveals.len() >= MAX_VRF_ROUND_ENTRIES
+            {
+                return actions;
+            }
+            let Some(commit) = state.commits.get(&reveal.validator_id) else {
+                if !state.pending_reveals.contains_key(&reveal.validator_id)
+                    && state.pending_reveals.len() < MAX_VRF_ROUND_ENTRIES
+                {
+                    state.pending_reveals.insert(reveal.validator_id, reveal);
+                }
+                return actions;
+            };
+            if commit.commit_hash != reveal.commit_hash {
+                if let Some(from) = invalid_from {
+                    actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                        from,
+                        validator_id: reveal.validator_id,
+                        reason: "VrfReveal commit hash does not match prior commit".to_string(),
+                    });
+                }
+                return actions;
+            }
+            (state.height, state.round)
+        };
         if !self.validate_vrf_reveal(&reveal) {
+            if let Some(from) = invalid_from {
+                actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                    from,
+                    validator_id: reveal.validator_id,
+                    reason: "VrfReveal signature or proof verification failed".to_string(),
+                });
+            }
             return actions;
         }
         let Some(state) = self.vrf_states[slot].as_mut() else {
             return actions;
         };
-        let Some(commit) = state.commits.get(&reveal.validator_id) else {
-            if state.pending_reveals.len() < MAX_VRF_ROUND_ENTRIES {
-                state.pending_reveals.insert(reveal.validator_id, reveal);
-            }
-            return actions;
-        };
-        if commit.commit_hash != reveal.commit_hash
-            || state.reveals.contains_key(&reveal.validator_id)
+        if state.reveals.contains_key(&reveal.validator_id)
             || state.reveals.len() >= MAX_VRF_ROUND_ENTRIES
+            || state
+                .commits
+                .get(&reveal.validator_id)
+                .is_none_or(|commit| commit.commit_hash != reveal.commit_hash)
         {
             return actions;
         }
@@ -949,8 +990,6 @@ impl ConsensusDriver {
         if gossip {
             actions.push(DriverAction::BroadcastVrfReveal(reveal));
         }
-        let height = state.height;
-        let round = state.round;
         actions.extend(self.advance_vrf_round(height, round));
         actions
     }
@@ -1613,7 +1652,7 @@ impl ConsensusDriver {
         self.prune_seen_round_votes();
 
         if !self.sync.is_caught_up() {
-            self.record_vote_passive(from, vote);
+            actions.extend(self.record_vote_passive(from, vote));
             return actions;
         }
 
@@ -1644,7 +1683,8 @@ impl ConsensusDriver {
         actions
     }
 
-    fn record_vote_passive(&mut self, from: SocketAddr, vote: VoteV1) {
+    fn record_vote_passive(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+        let mut actions = Vec::new();
         let key = Self::collector_key(vote.height, vote.round, vote.step);
         let decision = {
             let collector = self.vote_collectors.entry(key).or_insert_with(|| {
@@ -1671,8 +1711,14 @@ impl ConsensusDriver {
                     vote.round,
                     err,
                 );
+                actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                    from,
+                    validator_id: vote.validator_id,
+                    reason: format!("Vote validation failed: {err}"),
+                });
             }
         }
+        actions
     }
 
     fn record_vote_and_actions(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
@@ -1767,6 +1813,11 @@ impl ConsensusDriver {
                     vote.round,
                     err,
                 );
+                actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                    from,
+                    validator_id: vote.validator_id,
+                    reason: format!("Vote validation failed: {err}"),
+                });
             }
         }
 
@@ -1937,13 +1988,47 @@ impl ConsensusDriver {
         }
     }
 
-    fn process_vrf_commit(&mut self, _from: SocketAddr, commit: VrfCommit) -> Vec<DriverAction> {
-        if !vrf_commit_reveal_election_active(commit.height) || !self.validate_vrf_commit(&commit) {
+    fn process_vrf_commit(&mut self, from: SocketAddr, commit: VrfCommit) -> Vec<DriverAction> {
+        if !vrf_commit_reveal_election_active(commit.height) {
             return vec![DriverAction::None];
         }
+        if commit.chain_id_hash != chain_id_hash(&self.engine.state.chain_id) {
+            return vec![DriverAction::DisconnectInvalidConsensusPeer {
+                from,
+                validator_id: commit.validator_id,
+                reason: "VrfCommit chain_id_hash mismatch".to_string(),
+            }];
+        }
+        // Cheap slot/range check before expensive hybrid signature
+        // verification. Only current/next VRF rounds are retained.
         let Some(slot) = self.vrf_slot_index(commit.height, commit.round) else {
             return vec![DriverAction::None];
         };
+        if !self.validator_vrf_pk_matches(&commit.validator_id, &commit.vrf_pubkey) {
+            return vec![DriverAction::DisconnectInvalidConsensusPeer {
+                from,
+                validator_id: commit.validator_id,
+                reason: "VrfCommit validator is inactive or VRF key does not match registry"
+                    .to_string(),
+            }];
+        }
+        {
+            let Some(state) = self.vrf_states[slot].as_ref() else {
+                return vec![DriverAction::None];
+            };
+            if state.commits.contains_key(&commit.validator_id)
+                || state.commits.len() >= MAX_VRF_ROUND_ENTRIES
+            {
+                return vec![DriverAction::None];
+            }
+        }
+        if !self.verify_commit_signature(&commit) {
+            return vec![DriverAction::DisconnectInvalidConsensusPeer {
+                from,
+                validator_id: commit.validator_id,
+                reason: "VrfCommit hybrid signature verification failed".to_string(),
+            }];
+        }
         let pending = {
             let Some(state) = self.vrf_states[slot].as_mut() else {
                 return vec![DriverAction::None];
@@ -1958,20 +2043,27 @@ impl ConsensusDriver {
         };
         let mut actions = vec![DriverAction::BroadcastVrfCommit(commit.clone())];
         if let Some(reveal) = pending {
-            actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true));
+            actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true, None));
         }
         actions.extend(self.advance_vrf_round(commit.height, commit.round));
         actions
     }
 
-    fn process_vrf_reveal(&mut self, _from: SocketAddr, reveal: VrfReveal) -> Vec<DriverAction> {
+    fn process_vrf_reveal(&mut self, from: SocketAddr, reveal: VrfReveal) -> Vec<DriverAction> {
         if !vrf_commit_reveal_election_active(reveal.height) {
             return vec![DriverAction::None];
+        }
+        if reveal.chain_id_hash != chain_id_hash(&self.engine.state.chain_id) {
+            return vec![DriverAction::DisconnectInvalidConsensusPeer {
+                from,
+                validator_id: reveal.validator_id,
+                reason: "VrfReveal chain_id_hash mismatch".to_string(),
+            }];
         }
         let Some(slot) = self.vrf_slot_index(reveal.height, reveal.round) else {
             return vec![DriverAction::None];
         };
-        let actions = self.insert_valid_vrf_reveal(slot, reveal, true);
+        let actions = self.insert_valid_vrf_reveal(slot, reveal, true, Some(from));
         if actions.is_empty() {
             vec![DriverAction::None]
         } else {
@@ -2631,6 +2723,7 @@ mod tests {
         install_active_validator(&mut driver, [0x23; 32], "peer");
         let height = driver.next_height();
         let round = driver.current_round;
+        let from: SocketAddr = "127.0.0.1:10001".parse().unwrap();
         let election = election_for_round(&driver, height, round);
         driver.ensure_vrf_election_for_round(&election);
         let (commit, mut reveal) =
@@ -2639,24 +2732,78 @@ mod tests {
         let bad_proof = vec![0xAB; reveal.vrf_proof.as_slice().len().max(1)];
         reveal.vrf_proof = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&bad_proof).unwrap();
 
-        driver.process(DriverEvent::InboundVrfCommit {
-            from: "127.0.0.1:10001".parse().unwrap(),
-            commit,
-        });
-        let actions = driver.process(DriverEvent::InboundVrfReveal {
-            from: "127.0.0.1:10001".parse().unwrap(),
-            reveal,
-        });
+        driver.process(DriverEvent::InboundVrfCommit { from, commit });
+        let actions = driver.process(DriverEvent::InboundVrfReveal { from, reveal });
 
         assert!(!actions
             .iter()
             .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_))));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::DisconnectInvalidConsensusPeer { from: got, .. } if *got == from
+        )));
         let slot = driver.vrf_slot_index(height, round).unwrap();
         assert!(!driver.vrf_states[slot]
             .as_ref()
             .unwrap()
             .reveals
             .contains_key(&external_validator_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_vrf_commit_signature_triggers_disconnect_not_ban() {
+        let (mut driver, dir) = local_driver([0x15; 32], "vrf_bad_commit_sig");
+        install_active_validator(&mut driver, [0x25; 32], "peer");
+        let height = driver.next_height();
+        let round = driver.current_round;
+        let from: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let election = election_for_round(&driver, height, round);
+        driver.ensure_vrf_election_for_round(&election);
+        let (mut commit, _reveal) =
+            signed_vrf_pair(&driver, [0x25; 32], height, round, DEFAULT_CHAIN_ID);
+        commit.signature = ConsensusDriver::empty_signature().unwrap();
+        let validator_id = commit.validator_id;
+
+        let actions = driver.process(DriverEvent::InboundVrfCommit { from, commit });
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::DisconnectInvalidConsensusPeer {
+                from: got,
+                validator_id: claimed,
+                reason
+            } if *got == from
+                && *claimed == validator_id
+                && reason.contains("signature")
+        )));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfCommit(_))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn far_future_vrf_commit_dropped_before_signature_verification() {
+        let (mut driver, dir) = local_driver([0x16; 32], "vrf_future_commit");
+        install_active_validator(&mut driver, [0x26; 32], "peer");
+        let height = driver.next_height() + 99;
+        let round = driver.current_round;
+        let from: SocketAddr = "127.0.0.1:10003".parse().unwrap();
+        let (mut commit, _reveal) =
+            signed_vrf_pair(&driver, [0x26; 32], height, round, DEFAULT_CHAIN_ID);
+        commit.signature = ConsensusDriver::empty_signature().unwrap();
+
+        let actions = driver.process(DriverEvent::InboundVrfCommit { from, commit });
+
+        assert!(
+            actions.iter().all(|action| !matches!(
+                action,
+                DriverAction::DisconnectInvalidConsensusPeer { .. }
+                    | DriverAction::BroadcastVrfCommit(_)
+            )),
+            "far-future commits must be cheap-dropped at the slot check before signature verification"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

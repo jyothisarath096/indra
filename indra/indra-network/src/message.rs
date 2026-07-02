@@ -654,6 +654,7 @@ mod tests {
                 base_fee: 1,
                 proposer_round: 0,
                 polc_round: NO_POLC_ROUND,
+                election_result_hash: Some(Bytes32::ZERO),
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
