@@ -902,6 +902,47 @@ impl ConsensusDriver {
         total > 0 && stake >= bps_of(total, CONSENSUS_QUORUM_BPS)
     }
 
+    fn missing_reveal_validator_ids(&self, state: &VrfRoundState) -> Vec<Bytes32> {
+        self.engine
+            .state
+            .validators
+            .active_validators()
+            .filter(|validator| validator.vrf_pk.is_some())
+            .filter_map(|validator| {
+                (!state.reveals.contains_key(&validator.validator_id))
+                    .then_some(validator.validator_id)
+            })
+            .collect()
+    }
+
+    fn request_missing_reveals_for_slot(&self, slot: usize) -> Vec<DriverAction> {
+        let Some(state) = self.vrf_states.get(slot).and_then(|state| state.as_ref()) else {
+            return vec![];
+        };
+        if !reveal_set_commitment_active(state.height)
+            || self.quorum_stake_reached(self.revealed_stake(state))
+        {
+            return vec![];
+        }
+
+        let missing_validator_ids = self.missing_reveal_validator_ids(state);
+        if missing_validator_ids.is_empty() {
+            return vec![];
+        }
+
+        eprintln!(
+            "[vrf] local reveal set below quorum for height={} round={} — requesting {} missing reveal(s)",
+            state.height,
+            state.round,
+            missing_validator_ids.len(),
+        );
+        vec![DriverAction::RequestVrfReveals {
+            height: state.height,
+            round: state.round,
+            missing_validator_ids,
+        }]
+    }
+
     fn empty_signature() -> Option<HybridSignature> {
         Some(HybridSignature {
             classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[]).ok()?,
@@ -1194,6 +1235,8 @@ impl ConsensusDriver {
                 {
                     actions.extend(self.maybe_precommit_current_round_proposal());
                 }
+            } else {
+                actions.extend(self.request_missing_reveals_for_slot(slot));
             }
         }
         actions
@@ -1211,6 +1254,20 @@ impl ConsensusDriver {
             .iter()
             .map(|(id, reveal)| (*id, reveal.vrf_output))
             .collect();
+        if reveal_set_commitment_active(state_height) {
+            let revealed_stake = self.revealed_stake(state);
+            if !self.quorum_stake_reached(revealed_stake) {
+                eprintln!(
+                    "[vrf] election pending for height={} round={}: reveal set below quorum (revealed_stake={} total_stake={} quorum_bps={})",
+                    state_height,
+                    state_round,
+                    revealed_stake,
+                    self.total_active_stake(),
+                    CONSENSUS_QUORUM_BPS,
+                );
+                return None;
+            }
+        }
         if revealed.is_empty() {
             self.consecutive_empty_reveal_rounds =
                 self.consecutive_empty_reveal_rounds.saturating_add(1);
@@ -3920,6 +3977,224 @@ mod tests {
             "recovered block should enter normal pending-block processing after reveal response"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_election_requires_quorum_reveal_set() {
+        let local_seed = [0xD5u8; 32];
+        let seed_b = [0xD6u8; 32];
+        let seed_c = [0xD7u8; 32];
+        let seed_d = [0xD8u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "local_election_quorum_required");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xEE; 32]);
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.commits.insert(commit_a.validator_id, commit_a);
+        state.reveals.insert(reveal_a.validator_id, reveal_a);
+        driver.vrf_states[0] = Some(state);
+
+        let result = driver.compute_and_store_vrf_election(0);
+
+        assert!(
+            result.is_none(),
+            "sub-quorum reveal set must remain pending, not produce a local election result"
+        );
+        assert!(driver.vrf_election_result(height, round).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sparse_reveal_election_triggers_reveal_request() {
+        let local_seed = [0xD9u8; 32];
+        let seed_b = [0xDAu8; 32];
+        let seed_c = [0xDBu8; 32];
+        let seed_d = [0xDCu8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "sparse_reveal_request");
+        install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.commits.insert(commit_a.validator_id, commit_a);
+        state.reveals.insert(reveal_a.validator_id, reveal_a);
+        driver.vrf_states[0] = Some(state);
+
+        let actions = driver.advance_vrf_round(height, round);
+        let mut expected_missing = vec![
+            validator_id_for(&b),
+            validator_id_for(&c),
+            validator_id_for(&d),
+        ];
+        expected_missing.sort_by_key(|id| id.0);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [DriverAction::RequestVrfReveals {
+                height: requested_height,
+                round: requested_round,
+                missing_validator_ids
+            }] if *requested_height == height
+                && *requested_round == round
+                && *missing_validator_ids == expected_missing
+        ));
+        assert!(driver.vrf_election_result(height, round).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn election_completes_after_reveal_recovery() {
+        let local_seed = [0xDDu8; 32];
+        let seed_b = [0xDEu8; 32];
+        let seed_c = [0xDFu8; 32];
+        let seed_d = [0xE0u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "sparse_reveal_recovers");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xEF; 32]);
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let (commit_b, reveal_b) =
+            signed_vrf_pair(&driver, seed_b, height, round, DEFAULT_CHAIN_ID);
+        let (commit_c, reveal_c) =
+            signed_vrf_pair(&driver, seed_c, height, round, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.commits.insert(commit_a.validator_id, commit_a);
+        state.commits.insert(commit_b.validator_id, commit_b);
+        state.commits.insert(commit_c.validator_id, commit_c);
+        state
+            .reveals
+            .insert(reveal_a.validator_id, reveal_a.clone());
+        driver.vrf_states[0] = Some(state);
+
+        let actions = driver.advance_vrf_round(height, round);
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::RequestVrfReveals { .. })));
+
+        let _actions = driver.process(DriverEvent::VrfRevealsResponse {
+            from: "127.0.0.1:9913".parse().unwrap(),
+            height,
+            round,
+            reveals: vec![reveal_b.clone(), reveal_c.clone()],
+        });
+        let result = driver
+            .vrf_election_result(height, round)
+            .expect("quorum reveal recovery should complete local election");
+        assert!(!result.fallback_used);
+
+        let block = reveal_set_block_from_reveals(
+            &driver,
+            &[local_seed, seed_b, seed_c, seed_d],
+            &[reveal_a, reveal_b, reveal_c],
+        );
+        assert_eq!(block.header.election_result_hash, Some(result.hash()));
+        assert!(
+            crate::sync::verify_reveal_set_evidence(&block, &driver.engine.state).is_ok(),
+            "quorum-backed reveal evidence should be independently verifiable"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_sparse_reveal_cache_does_not_produce_self_rejecting_proposal() {
+        let local_seed = [0xE1u8; 32];
+        let seed_b = [0xE2u8; 32];
+        let seed_c = [0xE3u8; 32];
+        let seed_d = [0xE4u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "restart_sparse_reveals");
+        install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xE5; 32]);
+        driver.sync.mark_caught_up(driver.engine.state.height);
+        driver.start_round(0);
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.commits.insert(commit_a.validator_id, commit_a);
+        state.reveals.insert(reveal_a.validator_id, reveal_a);
+        driver.vrf_states[0] = Some(state);
+
+        let actions = driver.advance_vrf_round(height, round);
+        let mut expected_missing = vec![
+            validator_id_for(&b),
+            validator_id_for(&c),
+            validator_id_for(&d),
+        ];
+        expected_missing.sort_by_key(|id| id.0);
+
+        assert!(driver.vrf_election_result(height, round).is_none());
+        assert!(matches!(
+            actions.as_slice(),
+            [DriverAction::RequestVrfReveals {
+                height: requested_height,
+                round: requested_round,
+                missing_validator_ids
+            }] if *requested_height == height
+                && *requested_round == round
+                && *missing_validator_ids == expected_missing
+        ));
+
+        let election = election_for_round(&driver, height, round);
+        let last_qc_bytes = driver.last_qc_bytes();
+        let election_result_hash = driver
+            .vrf_election_result(height, round)
+            .map(|result| result.hash());
+        let vrf_reveals = driver.vrf_reveal_evidence(height, round);
+        let proposal = driver.engine.propose(
+            &election,
+            1_900_000_001,
+            last_qc_bytes,
+            None,
+            election_result_hash,
+            vrf_reveals,
+        );
+        assert!(
+            proposal.is_err(),
+            "post-activation proposal must not be produced without a quorum-backed election hash"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

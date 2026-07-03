@@ -26,8 +26,9 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
     primitives::{
-        vrf_commit_reveal_election_active, Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK,
-        MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+        reveal_set_commitment_active, vrf_commit_reveal_election_active, Bytes32, VariableBytes,
+        MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+        MAX_VRF_PROOF_BYTES,
     },
     slashing::SlashEvidenceV1,
     staking::StakingOp,
@@ -455,6 +456,12 @@ impl NodeEngine {
 
     fn local_election_result_hash(&self, election: &ProposerElection) -> Option<Bytes32> {
         if !vrf_commit_reveal_election_active(election.height) {
+            return None;
+        }
+        if reveal_set_commitment_active(election.height) {
+            // Post reveal-set activation the election hash commits to quorum
+            // reveal evidence. The engine does not own that ephemeral evidence;
+            // callers must pass the driver's quorum-backed result explicitly.
             return None;
         }
         let validator_id = self.validator_id?;
