@@ -96,6 +96,7 @@ fn make_strict_block(
         elected_validator_id: proposer_id,
         elected_vrf_output: Bytes32::from(slot.vrf_output.0),
         fallback_used: false,
+        reveal_set_commitment: Bytes32::ZERO,
     }
     .hash();
     let template = BlockTemplate {
@@ -108,6 +109,7 @@ fn make_strict_block(
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
+        vrf_reveals: vec![],
     };
     produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
 }

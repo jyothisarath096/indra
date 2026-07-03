@@ -9,16 +9,17 @@ No direct consensus safety break was found. Full `block_hash()` voting remains t
 Fix status update:
 
 - **VRF-03 — FIXED:** non-nil precommit no longer immediately falls back to nil when the local VRF election result is missing. The driver now waits up to `VRF_ELECTION_SETTLE_MS = 1500ms`, retries during the precommit phase, and only nil-precommits after the settle window expires.
+- **VRF-04 — FIXED / HEIGHT-GATED:** post-activation proposals carry the exact signed reveal evidence set in the block body, and voters verify the proposer-specified set instead of each validator's local reveal view. The reveal set must represent quorum stake and its Merkle commitment is folded into `election_result_hash`.
 - **VRF-05 — FIXED:** before finalizing a precommit quorum, the driver now verifies that the subgroup agreeing on `(block_hash, election_result_hash)` independently reaches consensus quorum. Mixed election-result precommits no longer feed a QC build that later fails.
 - **VRF-06 — FIXED:** zero-reveal fallback now matches the mainnet-grade policy: fallback is produced only after `MAX_VRF_EMPTY_REVEAL_ROUNDS = 3` consecutive empty reveal rounds. Earlier empty rounds produce no election result and advance normally.
+- **VRF-07 — FIXED / HEIGHT-GATED:** post-activation blocks contain durable reveal evidence sufficient for a syncing/auditing node to reconstruct and verify the reveal-set commitment and election result from block data alone.
 
-The main remaining issues are liveness/performance and mainnet evidence design:
+The main remaining issues are liveness/performance and larger-validator-set scalability:
 
-1. Next-height pipelining is not implemented. The driver keeps current and next-round VRF state for the same height, but there is no equivalent state for height `N+1` during height `N` consensus. This adds a cold commit-reveal cycle to every block.
-2. The node loop enforces a 6-second minimum interval before proposing, which dominates the theoretical 1-second VRF window and explains the observed ~6-12 second block times.
-3. Sync/import verification is O(1) and practical, but it does not verify durable commit/reveal evidence. It verifies that the header hash certifies the proposer identity/output or fallback sentinel, then relies on the parent QC. This matches the current implemented design but is weaker than a full election certificate.
+1. The node loop enforces a 6-second minimum interval before proposing, which dominates the theoretical 1-second VRF window and explains the observed ~6-12 second block times.
+2. Commit/reveal gossip remains O(n) signed messages per round before gossip fanout. The new reveal-set body evidence is modest at the current and planned active-set bounds, but larger-validator-set benchmarking remains required before increasing limits.
 
-Overall status: the previously open VRF timing/quorum/fallback correctness issues are fixed for testnet operation. The remaining mainnet work is performance/pipelining and durable proposer-election evidence.
+Overall status: the previously open VRF timing/quorum/fallback correctness issues are fixed for testnet operation. VRF-04/VRF-07 are implemented behind `REVEAL_SET_COMMITMENT_HEIGHT`; the activation height is intentionally unscheduled until coordinated validator deployment is approved.
 
 ## Investigation 1: Pipelining
 
@@ -258,10 +259,10 @@ Severity: Safe.
 | VRF-01 | Pipelining | Next-height pipelining is not implemented; only next-round same-height state exists. | Medium | Add height `N+1` VRF precompute once parent seed is known, or document 6s testnet-only latency. |
 | VRF-02 | Performance | 6-second minimum proposal interval dominates block time. | Low | Keep for testnet stability or make target-driven/configurable after measuring. |
 | VRF-03 | Liveness | Precommit gate can nil-precommit if local election result has not advanced, and cannot retry block precommit after nil vote. | Medium | **FIXED:** added `VRF_ELECTION_SETTLE_MS` wait, precommit retry hook, and nil fallback only after settle window. |
-| VRF-04 | Safety/Liveness | Validators can compute different election results from different reveal subsets. Safety holds via block hash/QC, but liveness can churn. | Medium | Add durable election certificate or threshold reveal-set agreement for mainnet design. |
+| VRF-04 | Safety/Liveness | Validators can compute different election results from different reveal subsets. Safety holds via block hash/QC, but liveness can churn. | Medium | **FIXED / HEIGHT-GATED:** proposal body carries the signed reveal set; voters verify that exact quorum set and its Merkle commitment. |
 | VRF-05 | QC/Votes | `VoteCollector` quorum is keyed by `block_hash` only, while QC requires `election_result_hash` agreement. | Medium | **FIXED:** finalization now requires an ERH-agreeing precommit subgroup to independently reach quorum before QC build. |
 | VRF-06 | Fallback policy | Zero-reveal fallback is available immediately; `MAX_VRF_EMPTY_REVEAL_ROUNDS` only changes phase labeling. | Medium | **FIXED:** fallback is now gated until `MAX_VRF_EMPTY_REVEAL_ROUNDS` consecutive empty reveal rounds. |
-| VRF-07 | Sync evidence | Sync verifies header digest/proposer output but not durable commit/reveal evidence. | Medium | For mainnet, add compact election certificate or QC extension attesting reveal set/result. |
+| VRF-07 | Sync evidence | Sync verifies header digest/proposer output but not durable commit/reveal evidence. | Medium | **FIXED / HEIGHT-GATED:** block body carries full reveal evidence; sync/audit recomputes the reveal-set Merkle root and election hash. |
 | VRF-08 | Scalability | Commit/reveal gossip is O(n) signed messages per round before gossip fanout; hybrid signatures make this costly at 1000 validators. | Medium | Benchmark at 100/1000 validators; consider aggregation, committees, or compact certificates. |
 | VRF-09 | Restart | Mid-round restart can lose local reveal contribution for already accepted commits. | Low | Accept as round-level liveness loss or persist local VRF slot proof until round/height exits. |
 | VRF-10 | Bounds | `vrf_states`, `local_vrf_rounds`, and `pending_reveals` are bounded. | Safe | No action required. |
@@ -285,9 +286,11 @@ Severity: Safe.
    - The implementation now enforces fallback only after `MAX_VRF_EMPTY_REVEAL_ROUNDS` consecutive empty reveal rounds.
    - A successful reveal round resets the empty-round counter.
 
-5. **VRF-07 — Add durable election evidence before mainnet**
-   - The current digest-only sync verifier is efficient but does not independently reconstruct the reveal set.
-   - Mainnet should add a compact election certificate, QC extension, or equivalent attestation design.
+5. **VRF-04 / VRF-07 — Proposer-specified reveal set and durable evidence — FIXED / HEIGHT-GATED**
+   - `BlockV1` carries full sorted `(validator_id, vrf_output, vrf_proof)` evidence at/after `REVEAL_SET_COMMITMENT_HEIGHT`.
+   - `VrfElectionResult::hash()` includes the reveal-set Merkle commitment at/after the same height, making the set QC-attested through the existing `election_result_hash`.
+   - Voters verify the proposer-specified quorum reveal set instead of their local superset/subset; missing specified reveals trigger `RequestVrfReveals`/`VrfRevealsResponse` recovery.
+   - Retention follows normal block-body retention: pruned validators retain reveal evidence for their configured block window, while archive/full-history nodes retain it for as long as they retain full blocks. No special indefinite retention guarantee is introduced for reveal evidence.
 
 6. **VRF-08 — Benchmark and optimize at larger validator counts**
    - Measure commit/reveal CPU and network fanout at 100 and 1000 validators before increasing active-set size.

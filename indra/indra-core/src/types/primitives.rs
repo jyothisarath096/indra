@@ -367,6 +367,12 @@ pub mod hard_forks {
     /// Testnet activates this from genesis after a fresh reset. Mainnet must
     /// choose a future announced hard-fork height.
     pub const VRF_COMMIT_REVEAL_ELECTION_HEIGHT: u64 = 0;
+    /// Block bodies commit to full proposer-specified VRF reveal evidence.
+    ///
+    /// This is intentionally unscheduled in source. A concrete testnet/mainnet
+    /// activation height must be selected during coordinated deployment, after
+    /// all validators have upgraded.
+    pub const REVEAL_SET_COMMITMENT_HEIGHT: u64 = 5400;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -403,6 +409,13 @@ pub fn public_proposer_election_active(height: u64) -> bool {
 #[inline]
 pub fn vrf_commit_reveal_election_active(height: u64) -> bool {
     height >= hard_forks::VRF_COMMIT_REVEAL_ELECTION_HEIGHT
+}
+
+/// Whether block bodies must carry full VRF reveal evidence and
+/// VrfElectionResult hashes must include its Merkle commitment.
+#[inline]
+pub fn reveal_set_commitment_active(height: u64) -> bool {
+    height >= hard_forks::REVEAL_SET_COMMITMENT_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -580,8 +593,26 @@ pub const PRUNE_WINDOW_EPOCHS: u64 = 500;
 
 // ── Protocol Version ──────────────────────────────────────────────────────────
 
-/// The only protocol version this implementation supports.
+/// The baseline protocol version for transactions and pre-reveal-set blocks.
 pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Block protocol version used at/after REVEAL_SET_COMMITMENT_HEIGHT.
+///
+/// Transactions continue to use PROTOCOL_VERSION = 1; this value is only for
+/// block headers. Old binaries reject this at header decode, preventing them
+/// from silently accepting post-activation blocks while ignoring the new body
+/// evidence field.
+pub const BLOCK_PROTOCOL_VERSION_REVEAL_SET: u16 = 2;
+
+/// Protocol version required for a block at the supplied height.
+#[inline]
+pub fn block_protocol_version_for_height(height: u64) -> u16 {
+    if reveal_set_commitment_active(height) {
+        BLOCK_PROTOCOL_VERSION_REVEAL_SET
+    } else {
+        PROTOCOL_VERSION
+    }
+}
 
 /// Current schema version for all persisted structs.
 ///
@@ -738,7 +769,7 @@ impl ProtocolVersion {
 
     /// True if this version is supported.
     pub fn is_supported(&self) -> bool {
-        self.0 == PROTOCOL_VERSION
+        self.0 == PROTOCOL_VERSION || self.0 == BLOCK_PROTOCOL_VERSION_REVEAL_SET
     }
 }
 
@@ -754,7 +785,7 @@ impl Encode for ProtocolVersion {
 impl Decode for ProtocolVersion {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let v = r.read_u16_le()?;
-        if v != PROTOCOL_VERSION {
+        if v != PROTOCOL_VERSION && v != BLOCK_PROTOCOL_VERSION_REVEAL_SET {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
         Ok(Self(v))

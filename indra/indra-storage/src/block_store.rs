@@ -587,6 +587,7 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            vrf_reveals: vec![],
         }
     }
 

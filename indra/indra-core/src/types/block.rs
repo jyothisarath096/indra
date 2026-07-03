@@ -7,13 +7,14 @@ use crate::{
     types::{
         governance::GovernanceOpV2,
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES,
-            MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-            MAX_VRF_PROOF_BYTES,
+            Bytes32, ProtocolVersion, VariableBytes, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+            MAX_ACTIVE_VALIDATORS, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
         },
         slashing::SlashEvidenceV1,
         staking::StakingOp,
         transaction::TransactionV1,
+        vrf_election::VrfRevealEvidence,
     },
 };
 
@@ -186,6 +187,13 @@ pub struct BlockV1 {
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Staking operations (0–10).
     pub staking_ops: Vec<StakingOp>,
+    /// Full VRF reveal evidence used to compute the commit-reveal election result.
+    ///
+    /// Present at/after REVEAL_SET_COMMITMENT_HEIGHT via block protocol version
+    /// 2. Retention follows ordinary block-body retention: pruned validators keep
+    /// it for their configured block window, while archive nodes keep it for
+    /// full history.
+    pub vrf_reveals: Vec<VrfRevealEvidence>,
 }
 
 impl Encode for BlockV1 {
@@ -195,6 +203,9 @@ impl Encode for BlockV1 {
         encode_list(&self.slashing_evidence, buf);
         encode_list(&self.governance_ops, buf);
         encode_list(&self.staking_ops, buf);
+        if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET {
+            encode_list(&self.vrf_reveals, buf);
+        }
     }
     fn encoded_len(&self) -> usize {
         self.header.encoded_len()
@@ -202,17 +213,29 @@ impl Encode for BlockV1 {
             + list_encoded_len(&self.slashing_evidence)
             + list_encoded_len(&self.governance_ops)
             + list_encoded_len(&self.staking_ops)
+            + if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET {
+                list_encoded_len(&self.vrf_reveals)
+            } else {
+                0
+            }
     }
 }
 
 impl Decode for BlockV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let header = BlockHeaderV1::decode(r)?;
+        let use_reveal_set_body = header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET;
         Ok(Self {
-            header: BlockHeaderV1::decode(r)?,
+            header,
             transactions: decode_list(r, MAX_TX_PER_BLOCK, "transactions")?,
             slashing_evidence: decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence")?,
             governance_ops: decode_list(r, MAX_GOV_OPS_PER_BLOCK, "governance_ops")?,
             staking_ops: decode_list(r, MAX_STAKING_OPS_PER_BLOCK, "staking_ops")?,
+            vrf_reveals: if use_reveal_set_body {
+                decode_list(r, MAX_ACTIVE_VALIDATORS, "vrf_reveals")?
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -355,7 +378,33 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            vrf_reveals: vec![],
         };
         assert_eq!(b, BlockV1::decode_exact(&b.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn old_binary_decode_rejects_post_activation_block() {
+        let mut h = dummy_header();
+        h.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET);
+        let legacy_body = BlockV1 {
+            header: h.clone(),
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            vrf_reveals: vec![],
+        };
+        let mut bytes = Vec::new();
+        h.encode(&mut bytes);
+        encode_list(&legacy_body.transactions, &mut bytes);
+        encode_list(&legacy_body.slashing_evidence, &mut bytes);
+        encode_list(&legacy_body.governance_ops, &mut bytes);
+        encode_list(&legacy_body.staking_ops, &mut bytes);
+
+        assert!(
+            BlockV1::decode_exact(&bytes).is_err(),
+            "post-activation block protocol version must not decode without the reveal evidence body field"
+        );
     }
 }

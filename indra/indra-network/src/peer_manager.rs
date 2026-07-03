@@ -259,9 +259,10 @@ fn tie_break_keep_new(
 
 fn message_queue(msg: &Message) -> QueueType {
     match msg {
-        Message::Block(_) | Message::BlockResponse { .. } | Message::QCResponse { .. } => {
-            QueueType::Large
-        }
+        Message::Block(_)
+        | Message::BlockResponse { .. }
+        | Message::QCResponse { .. }
+        | Message::VrfRevealsResponse { .. } => QueueType::Large,
         _ => QueueType::Small,
     }
 }

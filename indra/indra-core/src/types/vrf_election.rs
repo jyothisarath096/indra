@@ -6,7 +6,10 @@ use crate::{
     ssz::sha256,
     types::{
         crypto::HybridSignature,
-        primitives::{Bytes32, VariableBytes, MAX_VRF_PROOF_BYTES},
+        primitives::{
+            reveal_set_commitment_active, Bytes32, VariableBytes, MAX_ACTIVE_VALIDATORS,
+            MAX_VRF_PROOF_BYTES,
+        },
     },
 };
 
@@ -96,6 +99,44 @@ pub struct VrfReveal {
     pub signature: HybridSignature,
 }
 
+/// Durable block-body evidence for one VRF reveal that contributed to a
+/// commit-reveal election result.
+///
+/// Retention follows normal block-body retention. Pruned validators retain
+/// this evidence for their configured block window; archive nodes retain it
+/// for full history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VrfRevealEvidence {
+    /// Validator identity.
+    pub validator_id: Bytes32,
+    /// Revealed VRF output.
+    pub vrf_output: Bytes32,
+    /// Revealed VRF proof.
+    pub vrf_proof: VariableBytes<MAX_VRF_PROOF_BYTES>,
+}
+
+impl Encode for VrfRevealEvidence {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.validator_id.encode(buf);
+        self.vrf_output.encode(buf);
+        self.vrf_proof.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + 32 + self.vrf_proof.encoded_len()
+    }
+}
+
+impl Decode for VrfRevealEvidence {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            validator_id: Bytes32::decode(r)?,
+            vrf_output: Bytes32::decode(r)?,
+            vrf_proof: VariableBytes::decode(r)?,
+        })
+    }
+}
+
 impl VrfReveal {
     /// Canonical bytes signed by the validator.
     pub fn signing_bytes(&self) -> Vec<u8> {
@@ -159,6 +200,12 @@ pub struct VrfElectionResult {
     pub elected_vrf_output: Bytes32,
     /// Whether the round used the public deterministic fallback.
     pub fallback_used: bool,
+    /// Merkle root over the full sorted reveal evidence set.
+    ///
+    /// This is included in the election result hash only when
+    /// reveal_set_commitment_active(height) is true, preserving pre-fork
+    /// election hashes before the activation boundary.
+    pub reveal_set_commitment: Bytes32,
 }
 
 impl VrfElectionResult {
@@ -170,8 +217,67 @@ impl VrfElectionResult {
         self.elected_validator_id.encode(&mut data);
         self.elected_vrf_output.encode(&mut data);
         (self.fallback_used as u8).encode(&mut data);
+        if reveal_set_commitment_active(self.height) {
+            self.reveal_set_commitment.encode(&mut data);
+        }
         Bytes32::from(sha256(&data))
     }
+}
+
+/// Canonical Merkle root over sorted `(validator_id, vrf_output, vrf_proof)`
+/// reveal tuples.
+///
+/// Leaves are sorted by validator_id. Each leaf and internal node is domain
+/// separated. The empty-set root is a domain-separated hash, not all-zero.
+pub fn compute_reveal_set_commitment(reveals: &[VrfRevealEvidence]) -> Bytes32 {
+    let mut sorted = reveals.to_vec();
+    sorted.sort_by_key(|reveal| reveal.validator_id.0);
+
+    let mut leaves: Vec<Bytes32> = sorted
+        .iter()
+        .map(|reveal| {
+            let mut data = b"INDRA-VRF-REVEAL-LEAF-v1".to_vec();
+            reveal.encode(&mut data);
+            Bytes32::from(sha256(&data))
+        })
+        .collect();
+
+    if leaves.is_empty() {
+        return Bytes32::from(sha256(b"INDRA-VRF-REVEAL-SET-EMPTY-v1"));
+    }
+
+    while leaves.len() > 1 {
+        let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
+        for pair in leaves.chunks(2) {
+            let left = pair[0];
+            let right = pair.get(1).copied().unwrap_or(left);
+            let mut data = b"INDRA-VRF-REVEAL-NODE-v1".to_vec();
+            left.encode(&mut data);
+            right.encode(&mut data);
+            next.push(Bytes32::from(sha256(&data)));
+        }
+        leaves = next;
+    }
+
+    leaves[0]
+}
+
+/// Build canonical block-body reveal evidence from full signed reveal gossip.
+pub fn reveal_evidence_from_reveals<I>(reveals: I) -> Vec<VrfRevealEvidence>
+where
+    I: IntoIterator<Item = VrfReveal>,
+{
+    let mut evidence: Vec<_> = reveals
+        .into_iter()
+        .map(|reveal| VrfRevealEvidence {
+            validator_id: reveal.validator_id,
+            vrf_output: reveal.vrf_output,
+            vrf_proof: reveal.vrf_proof,
+        })
+        .collect();
+    evidence.sort_by_key(|reveal| reveal.validator_id.0);
+    evidence.truncate(MAX_ACTIVE_VALIDATORS);
+    evidence
 }
 
 /// Compute the hidden commitment for a validator's VRF reveal.
@@ -265,11 +371,34 @@ mod tests {
             elected_validator_id: Bytes32::from([1; 32]),
             elected_vrf_output: Bytes32::from([2; 32]),
             fallback_used: false,
+            reveal_set_commitment: Bytes32::ZERO,
         };
         let b = VrfElectionResult {
             fallback_used: true,
             ..a
         };
         assert_ne!(a.hash(), b.hash());
+    }
+
+    #[test]
+    fn reveal_set_commitment_included_in_election_hash() {
+        let a = VrfElectionResult {
+            height: u64::MAX,
+            round: 0,
+            elected_validator_id: Bytes32::from([1; 32]),
+            elected_vrf_output: Bytes32::from([2; 32]),
+            fallback_used: false,
+            reveal_set_commitment: Bytes32::from([0xAA; 32]),
+        };
+        let b = VrfElectionResult {
+            reveal_set_commitment: Bytes32::from([0xBB; 32]),
+            ..a.clone()
+        };
+
+        assert_ne!(
+            a.hash(),
+            b.hash(),
+            "post-activation election hash must commit to reveal-set commitment"
+        );
     }
 }

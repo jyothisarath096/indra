@@ -200,6 +200,7 @@ pub fn compute_fallback_election_result(
         elected_validator_id: elected,
         elected_vrf_output: VRF_FALLBACK_OUTPUT,
         fallback_used: true,
+        reveal_set_commitment: Bytes32::ZERO,
     })
 }
 
@@ -250,6 +251,7 @@ pub fn elect_proposer_from_reveals(
                 elected_validator_id,
                 elected_vrf_output,
                 fallback_used: false,
+                reveal_set_commitment: Bytes32::ZERO,
             },
         )
         .ok_or(ConsensusError::EmptyValidatorSet)

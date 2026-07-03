@@ -40,10 +40,11 @@ use indra_core::{
         block::BlockV1,
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
-            bps_of, overflow_fix_active, vrf_commit_reveal_election_active, Bytes32,
-            ProtocolVersion, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK,
-            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
-            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+            block_protocol_version_for_height, bps_of, overflow_fix_active,
+            vrf_commit_reveal_election_active, Bytes32, ProtocolVersion, HARD_CAP_SPARK,
+            MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+            MAX_TX_PER_BLOCK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
         slashing::SlashEvidenceV1,
@@ -383,28 +384,62 @@ fn slash_reporter_pubkey_for_block(state: &ChainState, block: &BlockV1) -> Optio
 }
 
 fn slash_reporter_validator_id_for_block(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
-    let proposer_id = proposer_id_from_vrf_proof(state, block)?;
     if !vrf_commit_reveal_election_active(block.header.height) {
-        return Some(proposer_id);
+        // Legacy pre-commit-reveal path: there is no QC-attested
+        // election_result_hash to recover the proposer from, so retain the
+        // original live VRF proof verification for alternate/future chain
+        // configurations. With VRF_COMMIT_REVEAL_ELECTION_HEIGHT = 0 this
+        // branch is unreachable on the current chain configuration.
+        return proposer_id_from_vrf_proof(state, block);
     }
+
+    slash_reporter_validator_id_from_election_hash(state, block)
+}
+
+fn slash_reporter_validator_id_from_election_hash(
+    state: &ChainState,
+    block: &BlockV1,
+) -> Option<Bytes32> {
+    slash_reporter_validator_id_from_candidate_ids(
+        state
+            .validators
+            .active_validators()
+            .map(|validator| validator.validator_id),
+        block,
+    )
+}
+
+fn slash_reporter_validator_id_from_candidate_ids<I>(
+    candidate_ids: I,
+    block: &BlockV1,
+) -> Option<Bytes32>
+where
+    I: IntoIterator<Item = Bytes32>,
+{
     let header_hash = block.header.election_result_hash?;
-    let normal = VrfElectionResult {
-        height: block.header.height,
-        round: block.header.proposer_round,
-        elected_validator_id: proposer_id,
-        elected_vrf_output: block.header.proposer_vrf_output,
-        fallback_used: false,
-    }
-    .hash();
-    let fallback = VrfElectionResult {
-        height: block.header.height,
-        round: block.header.proposer_round,
-        elected_validator_id: proposer_id,
-        elected_vrf_output: VRF_FALLBACK_OUTPUT_BYTES,
-        fallback_used: true,
-    }
-    .hash();
-    (header_hash == normal || header_hash == fallback).then_some(proposer_id)
+    let mut matches = candidate_ids.into_iter().filter_map(|validator_id| {
+        let normal = VrfElectionResult {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            elected_validator_id: validator_id,
+            elected_vrf_output: block.header.proposer_vrf_output,
+            fallback_used: false,
+            reveal_set_commitment: Bytes32::ZERO,
+        }
+        .hash();
+        let fallback = VrfElectionResult {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            elected_validator_id: validator_id,
+            elected_vrf_output: VRF_FALLBACK_OUTPUT_BYTES,
+            fallback_used: true,
+            reveal_set_commitment: Bytes32::ZERO,
+        }
+        .hash();
+        (header_hash == normal || header_hash == fallback).then_some(validator_id)
+    });
+    let proposer_id = matches.next()?;
+    matches.next().is_none().then_some(proposer_id)
 }
 
 fn proposer_id_from_vrf_proof(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
@@ -695,7 +730,8 @@ fn update_last_active_epoch_from_block_qc(state: &mut ChainState, block: &BlockV
 /// Validate block-level invariants (does not touch state).
 fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()> {
     // Protocol version
-    if block.header.protocol_version.0 != PROTOCOL_VERSION {
+    let expected_protocol_version = block_protocol_version_for_height(block.header.height);
+    if block.header.protocol_version.0 != expected_protocol_version {
         return Err(StateError::UnsupportedVersion {
             version: block.header.protocol_version.0,
         });
@@ -1296,10 +1332,25 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            vrf_reveals: vec![],
         }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_protocol_version_validation_is_strict_allow_list() {
+        let mut state = ChainState::new_genesis();
+        let mut block = make_block(&state, vec![]);
+        block.header.protocol_version = ProtocolVersion(999);
+
+        let err = apply_block(&mut state, &block, 0).unwrap_err();
+        assert!(
+            matches!(err, StateError::UnsupportedVersion { version: 999 }),
+            "block validity must reject unrecognized protocol versions before applying state"
+        );
+        assert_eq!(state.height, 0);
+    }
 
     #[test]
     fn apply_block_rejects_too_many_staking_ops() {
@@ -2023,6 +2074,83 @@ mod tests {
         assert_eq!(state.total_supply, supply_before - 50_000);
         assert_eq!(state.treasury_balance, treasury_before);
         assert_eq!(state.utxos.len(), utxo_count_before);
+    }
+
+    #[test]
+    fn slash_reporter_identity_recovered_without_vrf_verify() {
+        let mut state = ChainState::new_genesis();
+        let proposer_id = Bytes32::from([0xA9; 32]);
+        let other_id = Bytes32::from([0xB9; 32]);
+        state
+            .validators
+            .upsert(active_validator(proposer_id))
+            .unwrap();
+        state.validators.upsert(active_validator(other_id)).unwrap();
+
+        let mut block = make_block(&state, vec![]);
+        block.header.proposer_vrf_output = Bytes32::from([0x4D; 32]);
+        block.header.proposer_vrf_proof = VariableBytes::from_slice(&[]).unwrap();
+        block.header.election_result_hash = Some(
+            VrfElectionResult {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                elected_validator_id: proposer_id,
+                elected_vrf_output: block.header.proposer_vrf_output,
+                fallback_used: false,
+                reveal_set_commitment: Bytes32::ZERO,
+            }
+            .hash(),
+        );
+
+        assert_eq!(
+            slash_reporter_validator_id_for_block(&state, &block),
+            Some(proposer_id),
+            "commit-reveal reporter identity must come from QC-attested election_result_hash, not live VRF proof verification"
+        );
+    }
+
+    #[test]
+    fn slash_reporter_identity_no_match_returns_none() {
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(active_validator(Bytes32::from([0xC1; 32])))
+            .unwrap();
+        state
+            .validators
+            .upsert(active_validator(Bytes32::from([0xC2; 32])))
+            .unwrap();
+
+        let mut block = make_block(&state, vec![]);
+        block.header.proposer_vrf_output = Bytes32::from([0x4E; 32]);
+        block.header.election_result_hash = Some(Bytes32::from([0xEE; 32]));
+
+        assert_eq!(slash_reporter_validator_id_for_block(&state, &block), None);
+    }
+
+    #[test]
+    fn slash_reporter_identity_multiple_match_returns_none() {
+        let proposer_id = Bytes32::from([0xD1; 32]);
+        let state = ChainState::new_genesis();
+        let mut block = make_block(&state, vec![]);
+        block.header.proposer_vrf_output = Bytes32::from([0x4F; 32]);
+        block.header.election_result_hash = Some(
+            VrfElectionResult {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                elected_validator_id: proposer_id,
+                elected_vrf_output: block.header.proposer_vrf_output,
+                fallback_used: false,
+                reveal_set_commitment: Bytes32::ZERO,
+            }
+            .hash(),
+        );
+
+        assert_eq!(
+            slash_reporter_validator_id_from_candidate_ids([proposer_id, proposer_id], &block),
+            None,
+            "ambiguous candidate matches must preserve the prior uniqueness-required behavior"
+        );
     }
 
     #[test]

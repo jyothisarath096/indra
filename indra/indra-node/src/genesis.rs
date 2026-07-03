@@ -49,6 +49,7 @@ pub fn build_genesis_block() -> BlockV1 {
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
+        vrf_reveals: vec![],
     }
 }
 

@@ -7,10 +7,12 @@ use indra_core::{
 use indra_storage::{BlockStore, PruneConfig};
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("indra-data/blocks.log"));
+    let inspect_height_arg = args.next();
 
     let mut store = BlockStore::open(&path, PruneConfig::archive())
         .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
@@ -18,6 +20,38 @@ fn main() {
     let block_count = store.next_height();
     println!("block_log={}", path.display());
     println!("next_height={}", block_count);
+
+    let inspect_height = inspect_height_arg
+        .as_deref()
+        .map(|s| {
+            s.parse::<u64>()
+                .unwrap_or_else(|e| panic!("invalid block height '{s}': {e}"))
+        })
+        .unwrap_or_else(|| {
+            block_count
+                .checked_sub(1)
+                .expect("block log is empty; no tip height to inspect")
+        });
+    let inspect_block = store
+        .get(inspect_height)
+        .unwrap_or_else(|e| panic!("failed to read inspect block {inspect_height}: {e}"));
+    println!("inspect.height={}", inspect_block.header.height);
+    println!(
+        "inspect.protocol_version={}",
+        inspect_block.header.protocol_version.0
+    );
+    println!(
+        "inspect.election_result_hash={}",
+        inspect_block
+            .header
+            .election_result_hash
+            .map(|h| hex::encode(h.0))
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "inspect.vrf_reveals_len={}",
+        inspect_block.vrf_reveals.len()
+    );
 
     if block_count <= 2 {
         println!("not enough blocks to compare block 1 against block 2 prev_hash");

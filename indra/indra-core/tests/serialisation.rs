@@ -162,6 +162,7 @@ fn block_with_transactions_round_trip() {
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
+        vrf_reveals: vec![],
     };
     assert_eq!(b, BlockV1::decode_exact(&b.encode_to_vec()).unwrap());
 }

@@ -107,11 +107,12 @@ impl MessageClass {
             Message::PeerList(_) => Self::PeerList,
             Message::RequestBlocks { .. }
             | Message::RequestProposal { .. }
-            | Message::RequestQC { .. } => Self::BlockRequest,
+            | Message::RequestQC { .. }
+            | Message::RequestVrfReveals { .. } => Self::BlockRequest,
             Message::Tx(_) => Self::Tx,
             Message::Ping(_) | Message::Pong(_) => Self::PingPong,
             Message::BlockResponse { .. } => Self::BlockResponse,
-            Message::QCResponse { .. } => Self::QCResponse,
+            Message::QCResponse { .. } | Message::VrfRevealsResponse { .. } => Self::QCResponse,
             Message::VrfCommit(_) | Message::VrfReveal(_) => Self::VrfElection,
         }
     }
@@ -146,13 +147,19 @@ impl MessageClass {
     pub fn needs_per_peer_byte_limit(msg: &Message) -> bool {
         matches!(
             msg,
-            Message::Block(_) | Message::BlockResponse { .. } | Message::Tx(_)
+            Message::Block(_)
+                | Message::BlockResponse { .. }
+                | Message::VrfRevealsResponse { .. }
+                | Message::Tx(_)
         )
     }
 
     /// True when a global byte bucket applies.
     pub fn needs_global_byte_limit(msg: &Message) -> bool {
-        matches!(msg, Message::Block(_) | Message::BlockResponse { .. })
+        matches!(
+            msg,
+            Message::Block(_) | Message::BlockResponse { .. } | Message::VrfRevealsResponse { .. }
+        )
     }
 }
 

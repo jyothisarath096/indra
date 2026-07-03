@@ -170,6 +170,7 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
+        vrf_reveals: vec![],
     }
 }
 

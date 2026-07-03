@@ -246,6 +246,7 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
+        vrf_reveals: vec![],
     }
 }
 

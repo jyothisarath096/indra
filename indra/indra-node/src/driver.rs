@@ -23,15 +23,17 @@ use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
     crypto::HybridSignature,
     primitives::{
-        bps_of, vrf_commit_reveal_election_active, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS,
-        MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VRF_EMPTY_REVEAL_ROUNDS,
-        MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS, VRF_ELECTION_SETTLE_MS, VRF_REVEAL_WINDOW_MS,
+        bps_of, reveal_set_commitment_active, vrf_commit_reveal_election_active, Bytes32,
+        VariableBytes, CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
+        MAX_VRF_EMPTY_REVEAL_ROUNDS, MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS,
+        VRF_ELECTION_SETTLE_MS, VRF_REVEAL_WINDOW_MS,
     },
     qc::QuorumCertificateV1,
     transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
     vrf_election::{
-        chain_id_hash, compute_vrf_commit_hash, VrfCommit, VrfElectionResult, VrfReveal,
+        chain_id_hash, compute_reveal_set_commitment, compute_vrf_commit_hash,
+        reveal_evidence_from_reveals, VrfCommit, VrfElectionResult, VrfReveal, VrfRevealEvidence,
     },
 };
 use indra_crypto::{
@@ -42,9 +44,9 @@ use indra_storage::{VoteSafetyLoadResult, VoteSafetyStore};
 
 use crate::{
     engine::NodeEngine,
-    error::NodeError,
+    error::{NodeError, NodeResult},
     slash::{SlashDetector, SlashEvidence},
-    sync::{verify_block_qc, verify_proposer_vrf, SyncState},
+    sync::{verify_block_qc, verify_proposer_vrf, verify_reveal_set_evidence, SyncState},
 };
 
 fn now_ms() -> u128 {
@@ -192,6 +194,28 @@ pub enum DriverEvent {
         /// The committed height the peer wants certified.
         height: u64,
     },
+    /// A peer is requesting signed VRF reveals for proposal verification.
+    VrfRevealsRequest {
+        /// The requesting peer.
+        from: SocketAddr,
+        /// Election height.
+        height: u64,
+        /// Election round.
+        round: u32,
+        /// Validator IDs whose reveals are requested.
+        missing_validator_ids: Vec<Bytes32>,
+    },
+    /// A peer responded with signed VRF reveals.
+    VrfRevealsResponse {
+        /// The sender.
+        from: SocketAddr,
+        /// Election height.
+        height: u64,
+        /// Election round.
+        round: u32,
+        /// Signed reveals.
+        reveals: Vec<VrfReveal>,
+    },
     /// A validator sent a VRF commit.
     InboundVrfCommit {
         /// The sender.
@@ -251,6 +275,26 @@ pub enum DriverAction {
         /// Raw encoded QC bytes.
         qc_bytes: Vec<u8>,
     },
+    /// Ask peers for signed VRF reveals needed to verify a proposal.
+    RequestVrfReveals {
+        /// Election height.
+        height: u64,
+        /// Election round.
+        round: u32,
+        /// Validator IDs whose signed reveals are missing locally.
+        missing_validator_ids: Vec<Bytes32>,
+    },
+    /// Send signed VRF reveals directly to one peer.
+    SendVrfRevealsResponse {
+        /// The peer to answer.
+        to: SocketAddr,
+        /// Election height.
+        height: u64,
+        /// Election round.
+        round: u32,
+        /// Signed reveals.
+        reveals: Vec<VrfReveal>,
+    },
     /// Broadcast a VRF commit.
     BroadcastVrfCommit(VrfCommit),
     /// Broadcast a VRF reveal.
@@ -292,6 +336,8 @@ pub struct ConsensusDriver {
     seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), Bytes32>,
     /// Blocks whose precommit quorum arrived before the proposal was staged.
     pending_precommit_quorum: HashSet<(u64, u32, Bytes32)>,
+    /// Proposals waiting on signed VRF reveal gossip before prevote.
+    pending_reveal_blocks: HashMap<(u64, u32, Bytes32), BlockV1>,
     /// Tendermint lock state for the current height.
     locked_round: Option<u32>,
     /// Full block hash this validator is locked on.
@@ -329,6 +375,9 @@ pub struct ConsensusDriver {
     local_vrf_rounds: BTreeMap<(u64, u32), LocalVrfRoundState>,
     /// Consecutive empty-reveal rounds at the current height.
     consecutive_empty_reveal_rounds: u32,
+    /// Highest block height for which this driver has already pipelined its
+    /// local round-0 VRF commit.
+    highest_pipelined_vrf_commit_height: u64,
 }
 
 impl ConsensusDriver {
@@ -344,6 +393,7 @@ impl ConsensusDriver {
             requested_proposals: HashSet::new(),
             seen_round_votes: HashMap::new(),
             pending_precommit_quorum: HashSet::new(),
+            pending_reveal_blocks: HashMap::new(),
             locked_round: None,
             locked_value: None,
             locked_value_hash: None,
@@ -361,7 +411,9 @@ impl ConsensusDriver {
             vrf_states: [None, None],
             local_vrf_rounds: BTreeMap::new(),
             consecutive_empty_reveal_rounds: 0,
+            highest_pipelined_vrf_commit_height: 0,
         };
+        driver.highest_pipelined_vrf_commit_height = driver.engine.state.height;
         driver.sync = if driver.engine.state.height == 0 {
             // At genesis every validator already has genesis state — no sync needed.
             // Start in consensus mode immediately regardless of bootstrap config.
@@ -430,6 +482,181 @@ impl ConsensusDriver {
     /// Return the serialised QC to place in the next proposal header.
     pub fn last_qc_bytes(&self) -> Vec<u8> {
         self.last_qc_bytes.clone()
+    }
+
+    /// Return the height certified by the cached QC, if it is present and decodable.
+    pub fn last_qc_height(&self) -> Option<u64> {
+        Self::decode_qc_height(&self.last_qc_bytes)
+    }
+
+    fn decode_qc_height(qc_bytes: &[u8]) -> Option<u64> {
+        if qc_bytes.is_empty() {
+            return None;
+        }
+        QuorumCertificateV1::decode_exact(qc_bytes)
+            .ok()
+            .map(|qc| qc.height)
+    }
+
+    fn qc_bytes_digest(qc_bytes: &[u8]) -> String {
+        hex::encode(&indra_crypto::sha256(qc_bytes)[..8])
+    }
+
+    /// Promotes `qc_bytes` as the driver's cached and persisted last QC when
+    /// it is newer than the currently cached QC.
+    ///
+    /// The QC's own encoded height is authoritative. The caller-supplied
+    /// `height` is an assertion that helps catch call-site mistakes.
+    pub fn set_last_qc_bytes_if_newer(&mut self, height: u64, qc_bytes: Vec<u8>) -> NodeResult<()> {
+        self.set_last_qc_bytes_if_newer_from_source(height, qc_bytes, "manual")
+    }
+
+    fn set_last_qc_bytes_if_newer_from_source(
+        &mut self,
+        height: u64,
+        qc_bytes: Vec<u8>,
+        source: &str,
+    ) -> NodeResult<()> {
+        let qc = QuorumCertificateV1::decode_exact(&qc_bytes).map_err(|err| {
+            NodeError::BlockInvalid {
+                height,
+                reason: format!("last_qc_bytes from {source} are not decodable: {err}"),
+            }
+        })?;
+        if qc.height != height {
+            eprintln!(
+                "[driver] WARNING: rejected last_qc_bytes from {} for claimed height {}: QC certifies height {}",
+                source, height, qc.height,
+            );
+            return Err(NodeError::BlockInvalid {
+                height,
+                reason: format!(
+                    "last_qc_bytes height mismatch: caller claimed {height}, QC certifies {}",
+                    qc.height
+                ),
+            });
+        }
+
+        let current_height = self.last_qc_height();
+        match current_height {
+            Some(current) if height < current => {
+                eprintln!(
+                    "[driver] last_qc_bytes no-op from {}: stale QC height {} ignored; current cached height {}",
+                    source, height, current,
+                );
+                return Ok(());
+            }
+            Some(current) if height == current && self.last_qc_bytes == qc_bytes => {
+                eprintln!(
+                    "[driver] last_qc_bytes no-op from {}: height {} already cached ({} bytes)",
+                    source,
+                    height,
+                    qc_bytes.len(),
+                );
+                return Ok(());
+            }
+            Some(current) if height == current => {
+                let current_qc =
+                    QuorumCertificateV1::decode_exact(&self.last_qc_bytes).map_err(|err| {
+                        NodeError::BlockInvalid {
+                            height,
+                            reason: format!("cached last_qc_bytes are not decodable: {err}"),
+                        }
+                    })?;
+                let validators = self.engine.qc_validators();
+                let total_stake = self.engine.state.validators.total_active_stake();
+                verify_qc(&qc, &validators, total_stake, &self.engine.state.chain_id).map_err(
+                    |err| NodeError::BlockInvalid {
+                        height,
+                        reason: format!(
+                            "last_qc_bytes from {source} failed QC verification: {err}"
+                        ),
+                    },
+                )?;
+
+                let current_digest = Self::qc_bytes_digest(&self.last_qc_bytes);
+                let incoming_digest = Self::qc_bytes_digest(&qc_bytes);
+                if current_qc.round == qc.round
+                    && current_qc.block_hash == qc.block_hash
+                    && current_qc.election_result_hash == qc.election_result_hash
+                {
+                    eprintln!(
+                        "[driver] equivalent last_qc_bytes from {} at height {}: keeping cached QC (current len={} sha256={}, incoming len={} sha256={})",
+                        source,
+                        height,
+                        self.last_qc_bytes.len(),
+                        current_digest,
+                        qc_bytes.len(),
+                        incoming_digest,
+                    );
+                    return Ok(());
+                }
+
+                eprintln!(
+                    "[driver] WARNING: conflicting last_qc_bytes from {} at height {}: current len={} sha256={} incoming len={} sha256={}",
+                    source,
+                    height,
+                    self.last_qc_bytes.len(),
+                    current_digest,
+                    qc_bytes.len(),
+                    incoming_digest,
+                );
+                return Err(NodeError::BlockInvalid {
+                    height,
+                    reason: format!(
+                        "conflicting last_qc_bytes at same height {height}: current sha256={current_digest}, incoming sha256={incoming_digest}"
+                    ),
+                });
+            }
+            Some(current) => {
+                eprintln!(
+                    "[driver] promoting last_qc_bytes from {}: height {} supersedes cached height {} ({} bytes)",
+                    source,
+                    height,
+                    current,
+                    qc_bytes.len(),
+                );
+            }
+            None if self.last_qc_bytes.is_empty() => {
+                eprintln!(
+                    "[driver] promoting last_qc_bytes from {}: height {} ({} bytes)",
+                    source,
+                    height,
+                    qc_bytes.len(),
+                );
+            }
+            None => {
+                eprintln!(
+                    "[driver] WARNING: replacing undecodable cached last_qc_bytes with QC from {} at height {} ({} bytes)",
+                    source,
+                    height,
+                    qc_bytes.len(),
+                );
+            }
+        }
+
+        self.last_qc_bytes = qc_bytes;
+        indra_storage::save_last_qc(&self.engine.config.state_dir(), &self.last_qc_bytes)?;
+        self.engine.write_chain_manifest()?;
+        Ok(())
+    }
+
+    /// Promote the QC embedded in an imported block header.
+    ///
+    /// A block at height H carries the QC certifying height H-1. Height-1
+    /// blocks usually carry no prior QC, so empty QC bytes are an explicit
+    /// no-op.
+    pub fn promote_block_header_qc(&mut self, block: &BlockV1, source: &str) -> NodeResult<()> {
+        let qc_bytes = block.header.quorum_certificate.as_slice().to_vec();
+        if qc_bytes.is_empty() {
+            eprintln!(
+                "[driver] last_qc_bytes no-op from {}: block height {} carries empty embedded QC",
+                source, block.header.height,
+            );
+            return Ok(());
+        }
+        let certified_height = block.header.height.saturating_sub(1);
+        self.set_last_qc_bytes_if_newer_from_source(certified_height, qc_bytes, source)
     }
 
     /// True when the cached QC does not certify the current committed tip.
@@ -535,6 +762,7 @@ impl ConsensusDriver {
         self.vrf_states = [None, None];
         self.local_vrf_rounds.clear();
         self.consecutive_empty_reveal_rounds = 0;
+        self.highest_pipelined_vrf_commit_height = self.engine.state.height;
         self.locked_round = None;
         self.locked_value = None;
         self.locked_value_hash = None;
@@ -563,6 +791,18 @@ impl ConsensusDriver {
                 qc_bytes,
             } => self.handle_qc_response(from, height, qc_bytes),
             DriverEvent::QcRequest { from, height } => self.handle_qc_request(from, height),
+            DriverEvent::VrfRevealsRequest {
+                from,
+                height,
+                round,
+                missing_validator_ids,
+            } => self.handle_vrf_reveals_request(from, height, round, missing_validator_ids),
+            DriverEvent::VrfRevealsResponse {
+                from,
+                height,
+                round,
+                reveals,
+            } => self.handle_vrf_reveals_response(from, height, round, reveals),
             DriverEvent::InboundVrfCommit { from, commit } => self.process_vrf_commit(from, commit),
             DriverEvent::InboundVrfReveal { from, reveal } => self.process_vrf_reveal(from, reveal),
         }
@@ -861,6 +1101,40 @@ impl ConsensusDriver {
         actions
     }
 
+    /// Start the next height's round-0 VRF commit immediately after the
+    /// parent block has been finalized and applied.
+    ///
+    /// This is intentionally finalization-driven, not round-loop driven:
+    /// once height N commits, `state.tip_hash` is the immutable seed source
+    /// for height N+1, so there is no reason to wait for the next node-loop
+    /// propose tick before broadcasting our round-0 commit.
+    fn pipeline_next_height_vrf_commit_after_finalization(&mut self) -> Vec<DriverAction> {
+        let height = self.next_height();
+        let round = 0;
+        if !vrf_commit_reveal_election_active(height)
+            || height <= self.highest_pipelined_vrf_commit_height
+        {
+            return vec![];
+        }
+
+        if self.vrf_slot_index(height, round).is_none() {
+            self.vrf_states[0] = Some(VrfRoundState::new(height, round));
+        }
+
+        let mut actions = Vec::new();
+        if let Some(commit) = self.make_local_vrf_commit(height, round) {
+            let validator_id = commit.validator_id;
+            if let Some(slot) = self.vrf_slot_index(height, round) {
+                if let Some(state) = self.vrf_states[slot].as_mut() {
+                    state.commits.insert(validator_id, commit.clone());
+                }
+            }
+            self.highest_pipelined_vrf_commit_height = height;
+            actions.push(DriverAction::BroadcastVrfCommit(commit));
+        }
+        actions
+    }
+
     fn advance_vrf_round(&mut self, height: u64, round: u32) -> Vec<DriverAction> {
         let mut actions = Vec::new();
         let Some(slot) = self.vrf_slot_index(height, round) else {
@@ -954,9 +1228,12 @@ impl ConsensusDriver {
                 return None;
             }
             let result = compute_fallback_election_result(&election);
-            let Ok(result) = result else {
+            let Ok(mut result) = result else {
                 return None;
             };
+            if reveal_set_commitment_active(state_height) {
+                result.reveal_set_commitment = compute_reveal_set_commitment(&[]);
+            }
             if let Some(state) = self.vrf_states[slot].as_mut() {
                 state.phase = VrfRoundPhase::Fallback;
                 state.election_result = Some(result);
@@ -971,9 +1248,18 @@ impl ConsensusDriver {
             return Some(result);
         }
         let result = elect_proposer_from_reveals(&election, &revealed);
-        let Ok(result) = result else {
+        let Ok(mut result) = result else {
             return None;
         };
+        if reveal_set_commitment_active(state_height) {
+            let evidence = self
+                .vrf_states
+                .get(slot)
+                .and_then(|state| state.as_ref())
+                .map(|state| reveal_evidence_from_reveals(state.reveals.values().cloned()))
+                .unwrap_or_default();
+            result.reveal_set_commitment = compute_reveal_set_commitment(&evidence);
+        }
         if let Some(state) = self.vrf_states[slot].as_mut() {
             self.consecutive_empty_reveal_rounds = 0;
             state.phase = VrfRoundPhase::Complete;
@@ -1091,6 +1377,45 @@ impl ConsensusDriver {
         self.vrf_slot_index(height, round)
             .and_then(|slot| self.vrf_states[slot].as_ref())
             .and_then(|state| state.election_result)
+    }
+
+    /// Return canonical full reveal evidence for a VRF election slot.
+    pub fn vrf_reveal_evidence(&self, height: u64, round: u32) -> Vec<VrfRevealEvidence> {
+        self.vrf_slot_index(height, round)
+            .and_then(|slot| self.vrf_states[slot].as_ref())
+            .map(|state| reveal_evidence_from_reveals(state.reveals.values().cloned()))
+            .unwrap_or_default()
+    }
+
+    fn missing_local_reveals_for_block(&self, block: &BlockV1) -> Vec<Bytes32> {
+        let Some(slot) = self.vrf_slot_index(block.header.height, block.header.proposer_round)
+        else {
+            return block
+                .vrf_reveals
+                .iter()
+                .map(|evidence| evidence.validator_id)
+                .collect();
+        };
+        let Some(state) = self.vrf_states[slot].as_ref() else {
+            return block
+                .vrf_reveals
+                .iter()
+                .map(|evidence| evidence.validator_id)
+                .collect();
+        };
+        block
+            .vrf_reveals
+            .iter()
+            .filter_map(|evidence| match state.reveals.get(&evidence.validator_id) {
+                Some(local)
+                    if local.vrf_output == evidence.vrf_output
+                        && local.vrf_proof.as_slice() == evidence.vrf_proof.as_slice() =>
+                {
+                    None
+                }
+                _ => Some(evidence.validator_id),
+            })
+            .collect()
     }
 
     /// Check persisted vote safety record and advance past already-voted rounds.
@@ -1621,7 +1946,35 @@ impl ConsensusDriver {
             );
             return vec![DriverAction::None];
         }
-        if vrf_commit_reveal_election_active(block.header.height) {
+        if reveal_set_commitment_active(block.header.height) {
+            match verify_reveal_set_evidence(&block, &self.engine.state) {
+                Ok(_) => {
+                    let missing = self.missing_local_reveals_for_block(&block);
+                    if !missing.is_empty() {
+                        let height = block.header.height;
+                        let round = block.header.proposer_round;
+                        let block_hash = block.header.block_hash();
+                        self.pending_reveal_blocks
+                            .insert((height, round, block_hash), block);
+                        return vec![DriverAction::RequestVrfReveals {
+                            height,
+                            round,
+                            missing_validator_ids: missing,
+                        }];
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[vote] rejecting proposal {} at height={} round={} because reveal-set evidence is invalid: {}",
+                        hex::encode(&block.header.block_hash().0[..4]),
+                        block.header.height,
+                        block.header.proposer_round,
+                        err,
+                    );
+                    return vec![DriverAction::None];
+                }
+            }
+        } else if vrf_commit_reveal_election_active(block.header.height) {
             if let Some(local_result) =
                 self.vrf_election_result(block.header.height, block.header.proposer_round)
             {
@@ -2168,15 +2521,15 @@ impl ConsensusDriver {
                     round,
                 );
 
-                self.last_qc_bytes = qc.encode_to_vec();
-                if let Err(e) = indra_storage::save_last_qc(
-                    &self.engine.config.state_dir(),
-                    &self.last_qc_bytes,
+                if let Err(e) = self.set_last_qc_bytes_if_newer_from_source(
+                    height,
+                    qc.encode_to_vec(),
+                    "consensus",
                 ) {
-                    eprintln!("[driver] WARNING: failed to persist last_qc_bytes: {e}");
-                }
-                if let Err(e) = self.engine.write_chain_manifest() {
-                    eprintln!("[driver] WARNING: failed to persist chain manifest: {e}");
+                    eprintln!(
+                        "[driver] WARNING: failed to promote consensus last_qc_bytes at height {}: {}",
+                        height, e,
+                    );
                 }
                 self.slash_detector.prune_below(height.saturating_sub(100));
                 self.refresh_registered_voters();
@@ -2189,6 +2542,7 @@ impl ConsensusDriver {
                 self.valid_round = None;
                 self.valid_value = None;
                 self.start_round(0);
+                actions.extend(self.pipeline_next_height_vrf_commit_after_finalization());
                 actions.extend(self.activate_buffered_proposals_for_new_tip());
 
                 self.vote_collectors
@@ -2463,22 +2817,85 @@ impl ConsensusDriver {
             return vec![];
         }
 
-        self.last_qc_bytes = qc_bytes;
         if let Err(err) =
-            indra_storage::save_last_qc(&self.engine.config.state_dir(), &self.last_qc_bytes)
+            self.set_last_qc_bytes_if_newer_from_source(height, qc_bytes, "qc-response")
         {
-            eprintln!("[driver] WARNING: failed to persist recovered last_qc_bytes: {err}");
-        }
-        if let Err(err) = self.engine.write_chain_manifest() {
             eprintln!(
-                "[driver] WARNING: failed to persist chain manifest after QC recovery: {err}"
+                "[driver] WARNING: failed to promote recovered last_qc_bytes at height {}: {}",
+                height, err,
             );
+            return vec![];
         }
         eprintln!(
             "[driver] recovered last_qc_bytes from peer at height {}",
             height
         );
         vec![]
+    }
+
+    fn handle_vrf_reveals_request(
+        &mut self,
+        from: SocketAddr,
+        height: u64,
+        round: u32,
+        missing_validator_ids: Vec<Bytes32>,
+    ) -> Vec<DriverAction> {
+        let Some(slot) = self.vrf_slot_index(height, round) else {
+            return vec![];
+        };
+        let Some(state) = self.vrf_states[slot].as_ref() else {
+            return vec![];
+        };
+        let reveals: Vec<_> = missing_validator_ids
+            .into_iter()
+            .filter_map(|validator_id| state.reveals.get(&validator_id).cloned())
+            .collect();
+        if reveals.is_empty() {
+            return vec![];
+        }
+        vec![DriverAction::SendVrfRevealsResponse {
+            to: from,
+            height,
+            round,
+            reveals,
+        }]
+    }
+
+    fn handle_vrf_reveals_response(
+        &mut self,
+        from: SocketAddr,
+        height: u64,
+        round: u32,
+        reveals: Vec<VrfReveal>,
+    ) -> Vec<DriverAction> {
+        let Some(slot) = self.vrf_slot_index(height, round) else {
+            return vec![];
+        };
+        let mut actions = Vec::new();
+        for reveal in reveals {
+            if reveal.height == height && reveal.round == round {
+                actions.extend(self.insert_valid_vrf_reveal(slot, reveal, false, Some(from)));
+            }
+        }
+
+        let ready: Vec<_> = self
+            .pending_reveal_blocks
+            .iter()
+            .filter_map(|(&(h, r, hash), block)| {
+                (h == height
+                    && r == round
+                    && self.missing_local_reveals_for_block(block).is_empty())
+                .then_some((h, r, hash))
+            })
+            .collect();
+
+        for key in ready {
+            if let Some(block) = self.pending_reveal_blocks.remove(&key) {
+                actions.extend(self.process_block_internal(Some(from), block));
+            }
+        }
+
+        actions
     }
 
     /// Rule 11 — on propose timeout, prevote nil unless the proposal for the
@@ -2589,6 +3006,7 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            vrf_reveals: vec![],
         };
 
         let mut projected = state.clone();
@@ -2644,6 +3062,45 @@ mod tests {
             DEFAULT_CHAIN_ID,
             &driver.engine.qc_validators(),
             vec![&vote],
+        )
+        .unwrap()
+        .encode_to_vec()
+    }
+
+    fn qc_bytes_from_signers(
+        driver: &ConsensusDriver,
+        signers: &[&HybridKeypair],
+        height: u64,
+        round: u32,
+        block_hash: Bytes32,
+        election_result_hash: Option<Bytes32>,
+    ) -> Vec<u8> {
+        let votes: Vec<_> = signers
+            .iter()
+            .map(|signer| {
+                let validator_id =
+                    Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+                indra_consensus::vote::produce_vote_with_election_result(
+                    height,
+                    round,
+                    VoteStep::Precommit,
+                    block_hash,
+                    validator_id,
+                    election_result_hash,
+                    DEFAULT_CHAIN_ID,
+                    signer,
+                )
+                .unwrap()
+            })
+            .collect();
+        let vote_refs: Vec<_> = votes.iter().collect();
+        build_qc(
+            height,
+            round,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &driver.engine.qc_validators(),
+            vote_refs,
         )
         .unwrap()
         .encode_to_vec()
@@ -2782,6 +3239,79 @@ mod tests {
         (commit, reveal)
     }
 
+    fn reveal_set_block_from_reveals(
+        driver: &ConsensusDriver,
+        active_seeds: &[[u8; 32]],
+        reveals: &[VrfReveal],
+    ) -> BlockV1 {
+        let height = u64::MAX;
+        let round = 0u32;
+        let election = election_for_round(driver, height, round);
+        let mut revealed_outputs = std::collections::BTreeMap::new();
+        let mut evidence = reveal_evidence_from_reveals(reveals.iter().cloned());
+        for evidence_item in &evidence {
+            revealed_outputs.insert(evidence_item.validator_id, evidence_item.vrf_output);
+        }
+
+        let mut result = elect_proposer_from_reveals(&election, &revealed_outputs).unwrap();
+        result.reveal_set_commitment = compute_reveal_set_commitment(&evidence);
+
+        let proposer_seed = active_seeds
+            .iter()
+            .find(|seed| {
+                let keypair = VrfKeypair::from_seed(seed);
+                election.candidates.iter().any(|candidate| {
+                    candidate.validator_id == result.elected_validator_id
+                        && candidate.vrf_pubkey == keypair.public_key()
+                })
+            })
+            .copied()
+            .expect("elected proposer must map to one active test seed");
+        let proposer_vrf = VrfKeypair::from_seed(&proposer_seed);
+        let proposer_slot = compute_proposer_vrf(
+            result.elected_validator_id,
+            &proposer_vrf,
+            &election.epoch_seed,
+            height,
+            round,
+        );
+
+        evidence.sort_by_key(|item| item.validator_id.0);
+        let mut block = BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion(
+                    indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                ),
+                height,
+                prev_hash: driver.engine.state.tip_hash,
+                timestamp: 1_900_000_000,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: driver.engine.state.base_fee,
+                proposer_round: round,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::from(proposer_slot.vrf_output.0),
+                proposer_vrf_proof: VariableBytes::from_slice(&proposer_slot.vrf_proof.0).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: Some(result.hash()),
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            vrf_reveals: evidence,
+        };
+
+        let mut projected = driver.engine.state.clone();
+        apply_block(&mut projected, &block, 0).unwrap();
+        block.header.state_root = compute_state_root(&projected);
+        block.header.validator_set_root = compute_validator_set_root(&projected);
+        block.header.value_hash = block.compute_value_hash(projected.total_supply);
+        block
+    }
+
     fn seed_vrf_result_for_seed(
         driver: &mut ConsensusDriver,
         height: u64,
@@ -2803,11 +3333,52 @@ mod tests {
             elected_validator_id: proposer_id,
             elected_vrf_output: Bytes32::from(slot.vrf_output.0),
             fallback_used: false,
+            reveal_set_commitment: Bytes32::ZERO,
         };
         let mut state = VrfRoundState::new(height, round);
         state.phase = VrfRoundPhase::Complete;
         state.election_result = Some(result);
         driver.vrf_states[0] = Some(state);
+    }
+
+    fn stage_block_with_precommit_quorum(
+        driver: &mut ConsensusDriver,
+        proposer_seed: [u8; 32],
+        round: u32,
+        signers: &[&HybridKeypair],
+    ) -> (BlockV1, Bytes32) {
+        let height = driver.next_height();
+        seed_vrf_result_for_seed(driver, height, round, proposer_seed);
+        let block = make_strict_block(driver, proposer_seed, round, driver.last_qc_bytes());
+        let block_hash = block.header.block_hash();
+        let election_result_hash = block.header.election_result_hash;
+        driver.pending_blocks.insert(block_hash, block.clone());
+
+        let mut collector = VoteCollector::new(
+            height,
+            round,
+            VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
+            driver.registered_voters.clone(),
+        );
+        for signer in signers {
+            let vote = indra_consensus::vote::produce_vote_with_election_result(
+                height,
+                round,
+                VoteStep::Precommit,
+                block_hash,
+                validator_id_for(signer),
+                election_result_hash,
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let _ = collector.add_vote(vote).unwrap();
+        }
+        driver
+            .vote_collectors
+            .insert((height, round, VoteStep::Precommit), collector);
+        (block, block_hash)
     }
 
     fn make_strict_block(
@@ -2858,6 +3429,7 @@ mod tests {
             elected_validator_id: proposer_id,
             elected_vrf_output: Bytes32::from(slot.vrf_output.0),
             fallback_used: false,
+            reveal_set_commitment: Bytes32::ZERO,
         }
         .hash();
         let template = BlockTemplate {
@@ -2870,6 +3442,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
+            vrf_reveals: vec![],
         };
         produce_block(
             &template,
@@ -2921,6 +3494,228 @@ mod tests {
             .validator_id;
         let elected = indra_consensus::proposer::elect_proposer(election, election.height).ok()?;
         (elected == validator_id).then_some(elected)
+    }
+
+    #[test]
+    fn vrf_commit_pipelines_immediately_on_finalization() {
+        let (mut driver, dir) = local_driver([0xC1u8; 32], "vrf_pipeline_immediate");
+        let local = install_active_validator(&mut driver, [0xC1u8; 32], "local");
+        let a = install_active_validator(&mut driver, [0xC2u8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xC3u8; 32], "b");
+        let _c = install_active_validator(&mut driver, [0xC4u8; 32], "c");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+
+        let (_block, block_hash) =
+            stage_block_with_precommit_quorum(&mut driver, [0xC1u8; 32], 0, &[&local, &a, &b]);
+
+        let actions = driver.finalize_block_on_quorum(1, 0, block_hash);
+
+        assert_eq!(driver.height(), 1);
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVrfCommit(commit)
+                if commit.height == 2 && commit.round == 0
+        )));
+        assert_eq!(driver.highest_pipelined_vrf_commit_height, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vrf_commit_not_duplicated_on_repeated_finalization_signal() {
+        let (mut driver, dir) = local_driver([0xC5u8; 32], "vrf_pipeline_no_duplicate");
+        let local = install_active_validator(&mut driver, [0xC5u8; 32], "local");
+        let a = install_active_validator(&mut driver, [0xC6u8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xC7u8; 32], "b");
+        let _c = install_active_validator(&mut driver, [0xC8u8; 32], "c");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+
+        let (_block, block_hash) =
+            stage_block_with_precommit_quorum(&mut driver, [0xC5u8; 32], 0, &[&local, &a, &b]);
+
+        let first = driver.finalize_block_on_quorum(1, 0, block_hash);
+        let guarded_retry = driver.pipeline_next_height_vrf_commit_after_finalization();
+        let second = driver.finalize_block_on_quorum(1, 0, block_hash);
+        let pipelined_count = first
+            .iter()
+            .chain(guarded_retry.iter())
+            .chain(second.iter())
+            .filter(|action| {
+                matches!(
+                    action,
+                    DriverAction::BroadcastVrfCommit(commit)
+                        if commit.height == 2 && commit.round == 0
+                )
+            })
+            .count();
+
+        assert_eq!(pipelined_count, 1);
+        assert!(
+            guarded_retry.is_empty(),
+            "explicit height guard should make repeated pipelining no-op"
+        );
+        assert!(!second.iter().any(|action| {
+            matches!(
+                action,
+                DriverAction::BroadcastVrfCommit(commit)
+                    if commit.height == 2 && commit.round == 0
+            )
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vrf_commit_pipelining_does_not_fire_on_round_timeout_without_finalization() {
+        let (mut driver, dir) = local_driver([0xC9u8; 32], "vrf_pipeline_no_timeout");
+        let _local = install_active_validator(&mut driver, [0xC9u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+        driver.current_phase = RoundPhase::Prevote;
+        driver.current_round = 0;
+
+        let prevote_timeout_actions = driver.on_prevote_timeout();
+        assert!(!prevote_timeout_actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfCommit(_))));
+        driver.on_precommit_timeout();
+
+        assert_eq!(driver.height(), 0);
+        assert_eq!(driver.current_round(), 1);
+        assert_eq!(driver.highest_pipelined_vrf_commit_height, 0);
+        assert!(!driver
+            .local_vrf_rounds
+            .keys()
+            .any(|(height, _)| *height == 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vrf_commit_pipelining_seed_matches_non_pipelined_seed() {
+        let (mut pipelined, pipelined_dir) =
+            local_driver([0xCAu8; 32], "vrf_pipeline_seed_pipelined");
+        let local = install_active_validator(&mut pipelined, [0xCAu8; 32], "local");
+        let a = install_active_validator(&mut pipelined, [0xCBu8; 32], "a");
+        let b = install_active_validator(&mut pipelined, [0xCCu8; 32], "b");
+        let _c = install_active_validator(&mut pipelined, [0xCDu8; 32], "c");
+        pipelined.refresh_registered_voters();
+        pipelined.sync.mark_caught_up(pipelined.height());
+        let (block, block_hash) =
+            stage_block_with_precommit_quorum(&mut pipelined, [0xCAu8; 32], 0, &[&local, &a, &b]);
+
+        let pipelined_actions = pipelined.finalize_block_on_quorum(1, 0, block_hash);
+        let pipelined_commit = pipelined_actions
+            .iter()
+            .find_map(|action| match action {
+                DriverAction::BroadcastVrfCommit(commit)
+                    if commit.height == 2 && commit.round == 0 =>
+                {
+                    Some(commit.clone())
+                }
+                _ => None,
+            })
+            .expect("finalization should pipeline the height-2 round-0 commit");
+        let pipelined_local = pipelined
+            .local_vrf_rounds
+            .get(&(2, 0))
+            .cloned()
+            .expect("pipelined local VRF output should be retained for reveal");
+
+        let (mut non_pipelined, non_pipelined_dir) =
+            local_driver([0xCAu8; 32], "vrf_pipeline_seed_non_pipelined");
+        let _local = install_active_validator(&mut non_pipelined, [0xCAu8; 32], "local");
+        let _a = install_active_validator(&mut non_pipelined, [0xCBu8; 32], "a");
+        let _b = install_active_validator(&mut non_pipelined, [0xCCu8; 32], "b");
+        let _c = install_active_validator(&mut non_pipelined, [0xCDu8; 32], "c");
+        non_pipelined.refresh_registered_voters();
+        non_pipelined.sync.mark_caught_up(non_pipelined.height());
+        non_pipelined.engine.commit_block(&block).unwrap();
+        non_pipelined.refresh_registered_voters();
+        non_pipelined
+            .sync
+            .mark_caught_up(non_pipelined.engine.state.height);
+        non_pipelined.start_round(0);
+        let election = election_for_round(&non_pipelined, 2, 0);
+        let non_pipelined_actions = non_pipelined.ensure_vrf_election_for_round(&election);
+        let non_pipelined_commit = non_pipelined_actions
+            .iter()
+            .find_map(|action| match action {
+                DriverAction::BroadcastVrfCommit(commit)
+                    if commit.height == 2 && commit.round == 0 =>
+                {
+                    Some(commit.clone())
+                }
+                _ => None,
+            })
+            .expect("old node-loop path should produce the same commit");
+        let non_pipelined_local = non_pipelined
+            .local_vrf_rounds
+            .get(&(2, 0))
+            .cloned()
+            .expect("non-pipelined local VRF output should be retained for reveal");
+
+        assert_eq!(pipelined_commit.height, non_pipelined_commit.height);
+        assert_eq!(pipelined_commit.round, non_pipelined_commit.round);
+        assert_eq!(
+            pipelined_commit.validator_id,
+            non_pipelined_commit.validator_id
+        );
+        assert_eq!(pipelined_commit.vrf_pubkey, non_pipelined_commit.vrf_pubkey);
+        assert_eq!(
+            pipelined_commit.commit_hash,
+            non_pipelined_commit.commit_hash
+        );
+        assert_eq!(pipelined_local.vrf_output, non_pipelined_local.vrf_output);
+        assert_eq!(pipelined_local.vrf_proof, non_pipelined_local.vrf_proof);
+
+        let _ = std::fs::remove_dir_all(&pipelined_dir);
+        let _ = std::fs::remove_dir_all(&non_pipelined_dir);
+    }
+
+    #[test]
+    fn vrf_commit_pipelining_skipped_on_restart_replay() {
+        let (mut source, dir) = local_driver([0xCEu8; 32], "vrf_pipeline_restart_replay");
+        let local = install_active_validator(&mut source, [0xCEu8; 32], "local");
+        source.refresh_registered_voters();
+        source.sync.mark_caught_up(source.height());
+
+        let block1 = make_strict_block(&source, [0xCEu8; 32], 0, vec![]);
+        source.engine.commit_block(&block1).unwrap();
+        source.promote_block_header_qc(&block1, "test").unwrap();
+        let qc_for_height_1 =
+            single_validator_qc_bytes(&source, &local, 1, block1.header.block_hash());
+        source
+            .set_last_qc_bytes_if_newer(1, qc_for_height_1.clone())
+            .unwrap();
+        let block2 = make_strict_block(&source, [0xCEu8; 32], 0, qc_for_height_1);
+        source.engine.commit_block(&block2).unwrap();
+
+        let config = source.engine.config.clone();
+        drop(source);
+
+        let engine = NodeEngine::init(config).unwrap();
+        assert_eq!(engine.state.height, 2);
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let restarted = ConsensusDriver::new(engine, vote_safety);
+
+        assert_eq!(restarted.height(), 2);
+        assert_eq!(restarted.highest_pipelined_vrf_commit_height, 2);
+        assert!(
+            restarted.local_vrf_rounds.is_empty(),
+            "startup replay must not emit or retain historical pipelined VRF commits"
+        );
+        assert!(
+            !restarted
+                .vrf_states
+                .iter()
+                .filter_map(|state| state.as_ref())
+                .any(|state| state.height <= restarted.height()),
+            "replay should not route through live finalization/pipelining state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3017,6 +3812,114 @@ mod tests {
             .unwrap()
             .reveals
             .contains_key(&external_validator_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_reveal_triggers_request_and_recovers() {
+        let local_seed = [0xD1u8; 32];
+        let seed_b = [0xD2u8; 32];
+        let seed_c = [0xD3u8; 32];
+        let seed_d = [0xD4u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "vrf_reveal_recovery");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let _d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xA5; 32]);
+        driver.sync.mark_caught_up(driver.engine.state.height);
+        driver.start_round(0);
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let (commit_b, reveal_b) =
+            signed_vrf_pair(&driver, seed_b, height, round, DEFAULT_CHAIN_ID);
+        let (commit_c, reveal_c) =
+            signed_vrf_pair(&driver, seed_c, height, round, DEFAULT_CHAIN_ID);
+        let mut block = reveal_set_block_from_reveals(
+            &driver,
+            &[local_seed, seed_b, seed_c, seed_d],
+            &[reveal_a.clone(), reveal_b.clone(), reveal_c.clone()],
+        );
+        let parent_votes: Vec<_> = [&local, &b, &c]
+            .iter()
+            .map(|signer| {
+                indra_consensus::vote::produce_vote(
+                    driver.engine.state.height,
+                    0,
+                    VoteStep::Precommit,
+                    driver.engine.state.tip_hash,
+                    validator_id_for(signer),
+                    DEFAULT_CHAIN_ID,
+                    signer,
+                )
+                .unwrap()
+            })
+            .collect();
+        let parent_vote_refs: Vec<_> = parent_votes.iter().collect();
+        let parent_qc = build_qc(
+            driver.engine.state.height,
+            0,
+            driver.engine.state.tip_hash,
+            DEFAULT_CHAIN_ID,
+            &driver.engine.qc_validators(),
+            parent_vote_refs,
+        )
+        .unwrap();
+        block.header.quorum_certificate =
+            VariableBytes::from_slice(&parent_qc.encode_to_vec()).unwrap();
+        let block_hash = block.header.block_hash();
+
+        let mut round_state = VrfRoundState::new(height, round);
+        round_state.commits.insert(commit_a.validator_id, commit_a);
+        round_state.commits.insert(commit_b.validator_id, commit_b);
+        round_state.commits.insert(commit_c.validator_id, commit_c);
+        round_state.reveals.insert(reveal_a.validator_id, reveal_a);
+        round_state.reveals.insert(reveal_b.validator_id, reveal_b);
+        driver.vrf_states[0] = Some(round_state);
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9911".parse().unwrap()),
+            block,
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [DriverAction::RequestVrfReveals {
+                height: requested_height,
+                round: requested_round,
+                missing_validator_ids
+            }] if *requested_height == height
+                && *requested_round == round
+                && missing_validator_ids == &vec![reveal_c.validator_id]
+        ));
+        assert!(
+            driver.pending_block(&block_hash).is_none(),
+            "block should be parked until specified reveal evidence is locally available"
+        );
+
+        let actions = driver.process(DriverEvent::VrfRevealsResponse {
+            from: "127.0.0.1:9912".parse().unwrap(),
+            height,
+            round,
+            reveals: vec![reveal_c],
+        });
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote)
+                if vote.height == height
+                    && vote.round == round
+                    && vote.step == VoteStep::Prevote
+                    && vote.block_hash == block_hash
+        )));
+        assert!(
+            driver.pending_block(&block_hash).is_some(),
+            "recovered block should enter normal pending-block processing after reveal response"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4418,35 +5321,332 @@ mod tests {
     }
 
     #[test]
-    fn sync_import_clears_stale_last_qc_bytes() {
-        let (mut driver, dir) = local_driver([0xA3u8; 32], "sync_import_stale_qc");
+    fn sync_path_promotes_last_qc_bytes() {
+        let (mut source, source_dir) = local_driver([0xA3u8; 32], "sync_promote_source");
+        let _source_local = install_active_validator(&mut source, [0xA3u8; 32], "local");
+        source.refresh_registered_voters();
+
+        let block1 = make_strict_block(&source, [0xA3u8; 32], 0, vec![]);
+        let _ = source.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1.clone(),
+        });
+        let qc_for_height_1 = source.last_qc_bytes();
+        assert!(!qc_for_height_1.is_empty());
+        let block2 = make_strict_block(&source, [0xA3u8; 32], 0, qc_for_height_1.clone());
+
+        let (mut driver, dir) = local_driver([0xA3u8; 32], "sync_promote_importer");
         let local = install_active_validator(&mut driver, [0xA3u8; 32], "local");
         driver.refresh_registered_voters();
 
-        let block1 = make_strict_block(&driver, [0xA3u8; 32], 0, vec![]);
-        let _ = driver.process(DriverEvent::InboundBlock {
-            from: None,
-            block: block1,
-        });
-        let qc_for_height_1 = driver.last_qc_bytes();
-        assert!(!qc_for_height_1.is_empty());
-
-        let block2 = make_strict_block(&driver, [0xA3u8; 32], 0, qc_for_height_1.clone());
+        driver.engine.commit_block(&block1).unwrap();
+        driver.promote_block_header_qc(&block1, "sync").unwrap();
         driver.engine.commit_block(&block2).unwrap();
+        driver.promote_block_header_qc(&block2, "sync").unwrap();
         driver.refresh_registered_voters();
         driver.sync_mut().on_block_imported(block2.header.height);
         driver.reset_round();
 
         assert_eq!(driver.height(), 2);
+        assert_eq!(driver.last_qc_bytes(), qc_for_height_1);
+        assert_eq!(driver.last_qc_height(), Some(1));
         assert!(driver.last_qc_is_stale());
-        assert!(driver.clear_last_qc_if_stale());
-        assert!(driver.last_qc_bytes().is_empty());
         assert!(matches!(
             driver.request_qc_if_needed().as_slice(),
             [DriverAction::RequestQC { height }] if *height == 2
         ));
 
         drop(local);
+        let _ = std::fs::remove_dir_all(&source_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_then_consensus_transition_recovers_after_qc_response() {
+        let (mut source, source_dir) = local_driver([0xB5u8; 32], "sync_transition_source");
+        let source_local = install_active_validator(&mut source, [0xB5u8; 32], "local");
+        source.refresh_registered_voters();
+
+        let block1 = make_strict_block(&source, [0xB5u8; 32], 0, vec![]);
+        let _ = source.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1.clone(),
+        });
+        let qc_for_height_1 = source.last_qc_bytes();
+        let block2 = make_strict_block(&source, [0xB5u8; 32], 0, qc_for_height_1.clone());
+
+        let (mut driver, dir) = local_driver([0xB5u8; 32], "sync_transition_importer");
+        let local = install_active_validator(&mut driver, [0xB5u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        for block in [&block1, &block2] {
+            driver.engine.commit_block(block).unwrap();
+            driver.promote_block_header_qc(block, "sync").unwrap();
+            driver.sync_mut().on_block_imported(block.header.height);
+            driver.reset_round();
+        }
+        driver.on_sync_caught_up();
+
+        assert_eq!(driver.height(), 2);
+        assert_eq!(driver.last_qc_height(), Some(1));
+        assert!(driver.last_qc_is_stale());
+        assert!(matches!(
+            driver.request_qc_if_needed().as_slice(),
+            [DriverAction::RequestQC { height }] if *height == 2
+        ));
+
+        let source_validator_id = validator_id_for(&source_local);
+        let qc_vote = indra_consensus::vote::produce_vote(
+            2,
+            block2.header.proposer_round,
+            VoteStep::Precommit,
+            block2.header.block_hash(),
+            source_validator_id,
+            DEFAULT_CHAIN_ID,
+            &source_local,
+        )
+        .unwrap();
+        let qc = indra_consensus::build_qc(
+            2,
+            block2.header.proposer_round,
+            block2.header.block_hash(),
+            DEFAULT_CHAIN_ID,
+            &driver.engine.qc_validators(),
+            vec![&qc_vote],
+        )
+        .unwrap();
+        let qc_bytes = qc.encode_to_vec();
+
+        let _ = driver.process(DriverEvent::QcResponse {
+            from: "127.0.0.1:9510".parse().unwrap(),
+            height: 2,
+            qc_bytes: qc_bytes.clone(),
+        });
+
+        assert_eq!(driver.last_qc_height(), Some(2));
+        assert_eq!(driver.last_qc_bytes(), qc_bytes);
+        assert!(
+            !driver.last_qc_is_stale(),
+            "current-tip QC response must clear sync-recovery staleness"
+        );
+        assert!(
+            driver.request_qc_if_needed().is_empty(),
+            "driver must stop requesting QC after current-tip QC recovery"
+        );
+        assert!(
+            driver
+                .engine
+                .propose(
+                    &election_for_round(&driver, 3, 0),
+                    1_700_000_003,
+                    driver.last_qc_bytes(),
+                    None,
+                    None,
+                    vec![],
+                )
+                .is_ok(),
+            "recovered current-tip QC should allow height-3 proposal construction"
+        );
+
+        drop(local);
+        let _ = std::fs::remove_dir_all(&source_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_batch_partial_failure_does_not_promote_orphaned_qc() {
+        let (mut source, source_dir) = local_driver([0xB6u8; 32], "sync_partial_source");
+        let _source_local = install_active_validator(&mut source, [0xB6u8; 32], "local");
+        source.refresh_registered_voters();
+
+        let block1 = make_strict_block(&source, [0xB6u8; 32], 0, vec![]);
+        let _ = source.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1.clone(),
+        });
+        let qc_for_height_1 = source.last_qc_bytes();
+        let block2 = make_strict_block(&source, [0xB6u8; 32], 0, qc_for_height_1.clone());
+        let _ = source.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block2.clone(),
+        });
+        let qc_for_height_2 = source.last_qc_bytes();
+        let mut bad_block3 = make_strict_block(&source, [0xB6u8; 32], 0, qc_for_height_2);
+        bad_block3.header.prev_hash = Bytes32::from([0xEEu8; 32]);
+
+        let (mut driver, dir) = local_driver([0xB6u8; 32], "sync_partial_importer");
+        install_active_validator(&mut driver, [0xB6u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        for block in [&block1, &block2] {
+            driver.engine.commit_block(block).unwrap();
+            driver.promote_block_header_qc(block, "sync").unwrap();
+        }
+        assert!(driver.engine.commit_block(&bad_block3).is_err());
+
+        assert_eq!(driver.height(), 2);
+        assert_eq!(driver.last_qc_height(), Some(1));
+        assert_eq!(driver.last_qc_bytes(), qc_for_height_1);
+
+        let _ = std::fs::remove_dir_all(&source_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_last_qc_bytes_if_newer_height_ordering() {
+        let (mut driver, dir) = local_driver([0xB7u8; 32], "last_qc_ordering");
+        let local = install_active_validator(&mut driver, [0xB7u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let qc_height_3 =
+            single_validator_qc_bytes(&driver, &local, 3, Bytes32::from([0x33u8; 32]));
+        let qc_height_5_a =
+            single_validator_qc_bytes(&driver, &local, 5, Bytes32::from([0x55u8; 32]));
+        let qc_height_5_b =
+            single_validator_qc_bytes(&driver, &local, 5, Bytes32::from([0x56u8; 32]));
+
+        driver
+            .set_last_qc_bytes_if_newer(5, qc_height_5_a.clone())
+            .unwrap();
+        assert_eq!(driver.last_qc_height(), Some(5));
+        assert_eq!(driver.last_qc_bytes(), qc_height_5_a);
+
+        driver.set_last_qc_bytes_if_newer(3, qc_height_3).unwrap();
+        assert_eq!(driver.last_qc_height(), Some(5));
+        assert_eq!(driver.last_qc_bytes(), qc_height_5_a);
+
+        driver
+            .set_last_qc_bytes_if_newer(5, qc_height_5_a.clone())
+            .unwrap();
+        assert_eq!(driver.last_qc_bytes(), qc_height_5_a);
+
+        assert!(driver.set_last_qc_bytes_if_newer(5, qc_height_5_b).is_err());
+        assert_eq!(driver.last_qc_height(), Some(5));
+        assert_eq!(driver.last_qc_bytes(), qc_height_5_a);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn equivalent_qc_different_signer_subset_no_conflict() {
+        let (mut driver, dir) = local_driver([0xB8u8; 32], "equivalent_qc_subset");
+        let a = install_active_validator(&mut driver, [0xB8u8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xB9u8; 32], "b");
+        let c = install_active_validator(&mut driver, [0xBAu8; 32], "c");
+        let d = install_active_validator(&mut driver, [0xBBu8; 32], "d");
+        driver.refresh_registered_voters();
+
+        let block_hash = Bytes32::from([0x88u8; 32]);
+        let election_result_hash = Some(Bytes32::from([0x89u8; 32]));
+        let qc_abc = qc_bytes_from_signers(
+            &driver,
+            &[&a, &b, &c],
+            5,
+            0,
+            block_hash,
+            election_result_hash,
+        );
+        let qc_abd = qc_bytes_from_signers(
+            &driver,
+            &[&a, &b, &d],
+            5,
+            0,
+            block_hash,
+            election_result_hash,
+        );
+        assert_ne!(
+            qc_abc, qc_abd,
+            "test setup must produce distinct QC bytes from different valid signer subsets"
+        );
+
+        driver
+            .set_last_qc_bytes_if_newer(5, qc_abc.clone())
+            .unwrap();
+        driver.set_last_qc_bytes_if_newer(5, qc_abd).unwrap();
+
+        assert_eq!(
+            driver.last_qc_bytes(),
+            qc_abc,
+            "benign equivalent QCs should not replace the cached bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_qc_matching_metadata_still_rejected() {
+        let (mut driver, dir) = local_driver([0xBCu8; 32], "invalid_equivalent_qc");
+        let a = install_active_validator(&mut driver, [0xBCu8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xBDu8; 32], "b");
+        let c = install_active_validator(&mut driver, [0xBEu8; 32], "c");
+        let d = install_active_validator(&mut driver, [0xBFu8; 32], "d");
+        driver.refresh_registered_voters();
+
+        let block_hash = Bytes32::from([0x8Au8; 32]);
+        let election_result_hash = Some(Bytes32::from([0x8Bu8; 32]));
+        let qc_abc = qc_bytes_from_signers(
+            &driver,
+            &[&a, &b, &c],
+            6,
+            0,
+            block_hash,
+            election_result_hash,
+        );
+        let mut invalid_qc = qc_bytes_from_signers(
+            &driver,
+            &[&a, &b, &d],
+            6,
+            0,
+            block_hash,
+            election_result_hash,
+        );
+        let last = invalid_qc.len() - 1;
+        invalid_qc[last] ^= 0x01;
+
+        driver
+            .set_last_qc_bytes_if_newer(6, qc_abc.clone())
+            .unwrap();
+        let err = driver
+            .set_last_qc_bytes_if_newer(6, invalid_qc)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, NodeError::BlockInvalid { .. }),
+            "invalid same-content QC must be rejected, not treated as benign equivalent"
+        );
+        assert_eq!(driver.last_qc_bytes(), qc_abc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genuinely_conflicting_content_still_hard_errors() {
+        let (mut driver, dir) = local_driver([0xC0u8; 32], "genuine_qc_conflict");
+        let a = install_active_validator(&mut driver, [0xC0u8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xC1u8; 32], "b");
+        let c = install_active_validator(&mut driver, [0xC2u8; 32], "c");
+        let d = install_active_validator(&mut driver, [0xC3u8; 32], "d");
+        driver.refresh_registered_voters();
+
+        let election_result_hash = Some(Bytes32::from([0x8Cu8; 32]));
+        let qc_a = qc_bytes_from_signers(
+            &driver,
+            &[&a, &b, &c],
+            7,
+            0,
+            Bytes32::from([0x8Du8; 32]),
+            election_result_hash,
+        );
+        let qc_b = qc_bytes_from_signers(
+            &driver,
+            &[&a, &b, &d],
+            7,
+            0,
+            Bytes32::from([0x8Eu8; 32]),
+            election_result_hash,
+        );
+
+        driver.set_last_qc_bytes_if_newer(7, qc_a.clone()).unwrap();
+        assert!(driver.set_last_qc_bytes_if_newer(7, qc_b).is_err());
+        assert_eq!(driver.last_qc_bytes(), qc_a);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4857,6 +6057,7 @@ mod tests {
                 valid_block.header.timestamp,
                 driver.last_qc_bytes(),
                 None,
+                vec![],
             )
             .expect("reproposal should succeed");
 
@@ -4894,6 +6095,7 @@ mod tests {
                 driver.last_qc_bytes(),
                 None,
                 None,
+                vec![],
             )
             .expect("initial proposal should succeed");
 
@@ -4924,6 +6126,7 @@ mod tests {
                 proposal.header.timestamp,
                 driver.last_qc_bytes(),
                 None,
+                vec![],
             )
             .expect("reproposal should succeed");
 
@@ -4980,6 +6183,7 @@ mod tests {
                 driver_a.last_qc_bytes(),
                 None,
                 None,
+                vec![],
             )
             .expect("A should propose round 0");
         let value_hash = block_x.header.value_hash;
@@ -5051,6 +6255,7 @@ mod tests {
                 valid_block.header.timestamp,
                 driver_b.last_qc_bytes(),
                 None,
+                vec![],
             )
             .expect("B should repropose valid value at round 1");
         assert_eq!(block_y.header.value_hash, value_hash);

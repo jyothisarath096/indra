@@ -32,7 +32,7 @@ use indra_core::types::{
     slashing::SlashEvidenceV1,
     staking::StakingOp,
     vote::VoteStep,
-    vrf_election::VrfElectionResult,
+    vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
 };
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
@@ -478,6 +478,7 @@ impl NodeEngine {
                 elected_validator_id: validator_id,
                 elected_vrf_output: Bytes32::from(slot.vrf_output.0),
                 fallback_used: false,
+                reveal_set_commitment: Bytes32::ZERO,
             }
             .hash(),
         )
@@ -491,6 +492,7 @@ impl NodeEngine {
         prev_qc_bytes: Vec<u8>,
         polc_round: Option<u32>,
         election_result_hash: Option<Bytes32>,
+        vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && prev_qc_bytes.is_empty() {
@@ -525,6 +527,7 @@ impl NodeEngine {
             governance_ops: self.select_governance_ops(),
             staking_ops: self.select_staking_ops(),
             election_result_hash,
+            vrf_reveals,
         };
 
         eprintln!(
@@ -545,6 +548,7 @@ impl NodeEngine {
         timestamp: u64,
         last_qc: Vec<u8>,
         election_result_hash: Option<Bytes32>,
+        vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && last_qc.is_empty() {
@@ -579,6 +583,7 @@ impl NodeEngine {
                 elected_validator_id: slot.proposer_id,
                 elected_vrf_output: Bytes32::from(slot.vrf_output.0),
                 fallback_used: false,
+                reveal_set_commitment: compute_reveal_set_commitment(&vrf_reveals),
             }
             .hash();
             if election_result_hash != Some(expected) {
@@ -630,6 +635,7 @@ impl NodeEngine {
             slashing_evidence: original_block.slashing_evidence.clone(),
             governance_ops: original_block.governance_ops.clone(),
             staking_ops: original_block.staking_ops.clone(),
+            vrf_reveals,
         };
 
         let mut projected = self.state.clone();
@@ -1240,6 +1246,7 @@ mod tests {
             elected_validator_id: proposer_id,
             elected_vrf_output: Bytes32::from(slot.vrf_output.0),
             fallback_used: false,
+            reveal_set_commitment: Bytes32::ZERO,
         }
         .hash();
         let template = BlockTemplate {
@@ -1252,6 +1259,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
+            vrf_reveals: vec![],
         };
         produce_block(
             &template,
@@ -1735,7 +1743,7 @@ mod tests {
         };
 
         let err = engine
-            .propose(&election, 1_700_000_003, Vec::new(), None, None)
+            .propose(&election, 1_700_000_003, Vec::new(), None, None, vec![])
             .unwrap_err();
         assert!(matches!(err, NodeError::MissingQc { height: 3 }));
 
@@ -1767,7 +1775,7 @@ mod tests {
             "single local validator should be eligible to produce height 1"
         );
         let block = engine
-            .propose(&election, 1_700_000_001, Vec::new(), None, None)
+            .propose(&election, 1_700_000_001, Vec::new(), None, None, vec![])
             .unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.header.prev_hash, engine.state.tip_hash);
@@ -1805,7 +1813,7 @@ mod tests {
             "a node must not claim proposer eligibility when its local VRF key does not match the registered validator VRF key"
         );
         let err = engine
-            .propose(&election, 1_700_000_001, Vec::new(), None, None)
+            .propose(&election, 1_700_000_001, Vec::new(), None, None, vec![])
             .unwrap_err();
         assert!(matches!(
             err,

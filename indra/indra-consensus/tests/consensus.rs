@@ -207,6 +207,7 @@ fn mempool_to_block_pipeline() {
         elected_validator_id: validator_id,
         elected_vrf_output: Bytes32::from(slot.vrf_output.0),
         fallback_used: false,
+        reveal_set_commitment: Bytes32::ZERO,
     }
     .hash();
 
@@ -220,6 +221,7 @@ fn mempool_to_block_pipeline() {
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
+        vrf_reveals: vec![],
     };
 
     let block = produce_block(&template, &state, &mempool, &election).unwrap();

@@ -1050,7 +1050,9 @@ async fn handle_observer_connection(
                     | Message::VrfReveal(_)
                     | Message::RequestProposal { .. }
                     | Message::RequestQC { .. }
-                    | Message::QCResponse { .. } => {
+                    | Message::QCResponse { .. }
+                    | Message::RequestVrfReveals { .. }
+                    | Message::VrfRevealsResponse { .. } => {
                         eprintln!("[observer] consensus message from {}, closing", addr);
                         break;
                     }
@@ -1600,15 +1602,17 @@ fn main() {
                                                     &d.engine,
                                                     &handshake_config,
                                                 );
+                                                if let Err(err) =
+                                                    d.promote_block_header_qc(&block, "sync")
+                                                {
+                                                    eprintln!(
+                                                        "[sync] WARNING: imported height={} from {} but failed to promote embedded QC: {}",
+                                                        block.header.height, addr, err,
+                                                    );
+                                                }
                                                 d.refresh_registered_voters();
                                                 d.sync_mut().on_block_imported(block.header.height);
                                                 d.reset_round();
-                                                if d.clear_last_qc_if_stale() {
-                                                    eprintln!(
-                                                        "[sync] imported height={} with stale last_qc_bytes — clearing and recovering QC for new tip",
-                                                        block.header.height,
-                                                    );
-                                                }
                                                 if should_log_sync_height(block.header.height) {
                                                     eprintln!(
                                                         "[sync] imported block at height={} from {}",
@@ -1823,7 +1827,13 @@ fn main() {
                 if sync_target.is_none() {
                     match phase {
                         RoundPhase::Propose => {
-                            let (should_propose, next_height, election_result_hash, vrf_actions) = {
+                            let (
+                                should_propose,
+                                next_height,
+                                election_result_hash,
+                                vrf_reveals,
+                                vrf_actions,
+                            ) = {
                                 let mut d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                     indra_crypto::sha256(&d.engine.state.tip_hash.0),
@@ -1854,6 +1864,7 @@ fn main() {
                                         height,
                                         None,
                                         Vec::new(),
+                                        Vec::new(),
                                     )
                                 } else {
                                     let election = indra_consensus::proposer::ProposerElection {
@@ -1882,6 +1893,7 @@ fn main() {
                                         should,
                                         height,
                                         election_result.map(|result| result.hash()),
+                                        d.vrf_reveal_evidence(height, round),
                                         vrf_actions,
                                     )
                                 }
@@ -1992,6 +2004,7 @@ fn main() {
                                                 valid_block.header.timestamp,
                                                 last_qc_bytes,
                                                 election_result_hash,
+                                                vrf_reveals.clone(),
                                             )
                                         } else {
                                             d.engine.propose(
@@ -2000,6 +2013,7 @@ fn main() {
                                                 last_qc_bytes,
                                                 polc_round,
                                                 election_result_hash,
+                                                vrf_reveals.clone(),
                                             )
                                         };
                                     match proposal_result {
@@ -2310,6 +2324,33 @@ fn process_driver_actions(
             continue;
         }
 
+        if let DriverAction::RequestVrfReveals {
+            height,
+            round,
+            missing_validator_ids,
+        } = &action
+        {
+            let peers: Vec<SocketAddr> = gossip.connected_addrs();
+            eprintln!(
+                "[vrf] requesting {} reveal(s) for height={} round={} from {} peers",
+                missing_validator_ids.len(),
+                height,
+                round,
+                peers.len()
+            );
+            let msg = Message::RequestVrfReveals {
+                height: *height,
+                round: *round,
+                validator_ids: missing_validator_ids.clone(),
+            };
+            for peer in &peers {
+                if let Some(peer_validator_id) = gossip.validator_for_addr(peer) {
+                    gossip.send_to_validator(peer_validator_id, &msg);
+                }
+            }
+            continue;
+        }
+
         if let DriverAction::SlashDetected(slash_evidence) = &action {
             metrics_state
                 .slash_events_total
@@ -2403,6 +2444,23 @@ fn process_driver_actions(
             let msg = Message::QCResponse {
                 height: *height,
                 qc_bytes: qc_bytes.clone(),
+            };
+            if let Some(peer_validator_id) = gossip.validator_for_addr(to) {
+                gossip.send_to_validator(peer_validator_id, &msg);
+            }
+        }
+
+        if let DriverAction::SendVrfRevealsResponse {
+            to,
+            height,
+            round,
+            reveals,
+        } = &action
+        {
+            let msg = Message::VrfRevealsResponse {
+                height: *height,
+                round: *round,
+                reveals: reveals.clone(),
             };
             if let Some(peer_validator_id) = gossip.validator_for_addr(to) {
                 gossip.send_to_validator(peer_validator_id, &msg);
@@ -3603,6 +3661,7 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            vrf_reveals: vec![],
         }
     }
 
@@ -3632,6 +3691,7 @@ mod tests {
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
+            vrf_reveals: vec![],
         }
     }
 

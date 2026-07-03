@@ -43,6 +43,26 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
         }),
         Message::VrfCommit(commit) => Some(DriverEvent::InboundVrfCommit { from, commit }),
         Message::VrfReveal(reveal) => Some(DriverEvent::InboundVrfReveal { from, reveal }),
+        Message::RequestVrfReveals {
+            height,
+            round,
+            validator_ids,
+        } => Some(DriverEvent::VrfRevealsRequest {
+            from,
+            height,
+            round,
+            missing_validator_ids: validator_ids,
+        }),
+        Message::VrfRevealsResponse {
+            height,
+            round,
+            reveals,
+        } => Some(DriverEvent::VrfRevealsResponse {
+            from,
+            height,
+            round,
+            reveals,
+        }),
         _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse, RequestProposal handled elsewhere
     }
 }
@@ -56,6 +76,8 @@ pub fn action_to_message(action: &DriverAction) -> Option<Message> {
         DriverAction::BroadcastVrfCommit(commit) => Some(Message::VrfCommit(commit.clone())),
         DriverAction::BroadcastVrfReveal(reveal) => Some(Message::VrfReveal(reveal.clone())),
         DriverAction::RequestQC { .. } => None,
+        DriverAction::RequestVrfReveals { .. } => None,
+        DriverAction::SendVrfRevealsResponse { .. } => None,
         _ => None,
     }
 }
