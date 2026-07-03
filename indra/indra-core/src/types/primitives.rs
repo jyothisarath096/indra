@@ -68,7 +68,19 @@ pub const VRF_COMMIT_WINDOW_MS: u64 = 500;
 /// Close VRF reveal window after this duration or when quorum stake revealed.
 pub const VRF_REVEAL_WINDOW_MS: u64 = 500;
 
-/// After this many consecutive empty-reveal rounds, use public deterministic fallback.
+/// Delay nil precommit up to this long while waiting for the local
+/// commit-reveal election result to settle.
+///
+/// This is intentionally longer than `VRF_REVEAL_WINDOW_MS` so a fast prevote
+/// quorum does not force a nil precommit just before the reveal timeout
+/// computes the election result.
+pub const VRF_ELECTION_SETTLE_MS: u64 = 1_500;
+
+/// Use public deterministic fallback only after this many consecutive
+/// zero-reveal rounds at the same height.
+///
+/// Before this threshold is reached, an empty reveal round produces no
+/// election result and must advance to the next consensus round.
 pub const MAX_VRF_EMPTY_REVEAL_ROUNDS: u32 = 3;
 
 /// Memory cap for commit/reveal entries retained for one election round.

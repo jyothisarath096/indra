@@ -25,7 +25,7 @@ use indra_core::types::{
     primitives::{
         bps_of, vrf_commit_reveal_election_active, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS,
         MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VRF_EMPTY_REVEAL_ROUNDS,
-        MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS, VRF_REVEAL_WINDOW_MS,
+        MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS, VRF_ELECTION_SETTLE_MS, VRF_REVEAL_WINDOW_MS,
     },
     qc::QuorumCertificateV1,
     transaction::TransactionV1,
@@ -312,6 +312,11 @@ pub struct ConsensusDriver {
     current_round: u32,
     /// Current Tendermint phase within the round.
     current_phase: RoundPhase,
+    /// When the current precommit phase started.
+    ///
+    /// Used to give the commit-reveal VRF election result a short settle
+    /// window before falling back to nil precommit.
+    precommit_phase_started_at: Option<Instant>,
     /// Synchronization phase for this node.
     sync: SyncState,
     /// Persisted local vote safety guard.
@@ -349,6 +354,7 @@ impl ConsensusDriver {
             registered_voters: Vec::new(),
             current_round: 0,
             current_phase: RoundPhase::Propose,
+            precommit_phase_started_at: None,
             sync: SyncState::follower(0),
             vote_safety,
             vote_safety_unavailable: None,
@@ -569,6 +575,7 @@ impl ConsensusDriver {
     fn start_round(&mut self, round: u32) {
         self.current_round = round;
         self.current_phase = RoundPhase::Propose;
+        self.precommit_phase_started_at = None;
         let height = self.next_height();
         if vrf_commit_reveal_election_active(height) {
             let next = self
@@ -586,6 +593,13 @@ impl ConsensusDriver {
             self.vrf_states = [None, None];
             self.local_vrf_rounds.clear();
         }
+    }
+
+    fn enter_precommit_phase(&mut self) {
+        if self.current_phase != RoundPhase::Precommit {
+            self.precommit_phase_started_at = Some(Instant::now());
+        }
+        self.current_phase = RoundPhase::Precommit;
     }
 
     fn vrf_slot_index(&self, height: u64, round: u32) -> Option<usize> {
@@ -915,31 +929,54 @@ impl ConsensusDriver {
         let Some(state) = self.vrf_states.get(slot).and_then(|state| state.as_ref()) else {
             return None;
         };
+        let state_height = state.height;
+        let state_round = state.round;
         let election = self.active_vrf_candidates(state.height, state.round);
         let revealed: BTreeMap<Bytes32, Bytes32> = state
             .reveals
             .iter()
             .map(|(id, reveal)| (*id, reveal.vrf_output))
             .collect();
-        let result = elect_proposer_from_reveals(&election, &revealed)
-            .or_else(|_| compute_fallback_election_result(&election));
+        if revealed.is_empty() {
+            self.consecutive_empty_reveal_rounds =
+                self.consecutive_empty_reveal_rounds.saturating_add(1);
+            if self.consecutive_empty_reveal_rounds < MAX_VRF_EMPTY_REVEAL_ROUNDS {
+                if let Some(state) = self.vrf_states[slot].as_mut() {
+                    state.phase = VrfRoundPhase::Complete;
+                }
+                eprintln!(
+                    "[vrf] no reveals for height={} round={} (empty rounds {}/{}) — no fallback yet",
+                    state_height,
+                    state_round,
+                    self.consecutive_empty_reveal_rounds,
+                    MAX_VRF_EMPTY_REVEAL_ROUNDS,
+                );
+                return None;
+            }
+            let result = compute_fallback_election_result(&election);
+            let Ok(result) = result else {
+                return None;
+            };
+            if let Some(state) = self.vrf_states[slot].as_mut() {
+                state.phase = VrfRoundPhase::Fallback;
+                state.election_result = Some(result);
+            }
+            eprintln!(
+                "[vrf] election result computed for height={} round={}: elected={} fallback={}",
+                result.height,
+                result.round,
+                hex::encode(&result.elected_validator_id.0[..4]),
+                result.fallback_used,
+            );
+            return Some(result);
+        }
+        let result = elect_proposer_from_reveals(&election, &revealed);
         let Ok(result) = result else {
             return None;
         };
         if let Some(state) = self.vrf_states[slot].as_mut() {
-            if result.fallback_used {
-                self.consecutive_empty_reveal_rounds =
-                    self.consecutive_empty_reveal_rounds.saturating_add(1);
-                state.phase = if self.consecutive_empty_reveal_rounds >= MAX_VRF_EMPTY_REVEAL_ROUNDS
-                {
-                    VrfRoundPhase::Fallback
-                } else {
-                    VrfRoundPhase::Complete
-                };
-            } else {
-                self.consecutive_empty_reveal_rounds = 0;
-                state.phase = VrfRoundPhase::Complete;
-            }
+            self.consecutive_empty_reveal_rounds = 0;
+            state.phase = VrfRoundPhase::Complete;
             state.election_result = Some(result);
         }
         eprintln!(
@@ -966,6 +1003,17 @@ impl ConsensusDriver {
         }
         let block_hash = self.locked_value.unwrap_or(Bytes32::ZERO);
         self.sign_and_record_local_vote(height, round, VoteStep::Precommit, block_hash)
+    }
+
+    /// Retry a delayed precommit attempt.
+    ///
+    /// The commit-reveal election result may arrive shortly after a fast
+    /// prevote quorum enters precommit. The node loop calls this during the
+    /// precommit phase so the driver can either sign the block precommit as
+    /// soon as the result is available, or nil-precommit after the settle
+    /// window expires.
+    pub fn retry_precommit_if_waiting(&mut self) -> Vec<DriverAction> {
+        self.maybe_precommit_current_round_proposal()
     }
 
     fn insert_valid_vrf_reveal(
@@ -1461,9 +1509,22 @@ impl ConsensusDriver {
                     }
                 }
                 None => {
+                    let waited_enough = self
+                        .precommit_phase_started_at
+                        .map(|started| {
+                            started.elapsed().as_millis() >= VRF_ELECTION_SETTLE_MS as u128
+                        })
+                        .unwrap_or(false);
+                    if !waited_enough {
+                        eprintln!(
+                            "[consensus] precommit height={} round={}: VRF election result not yet available — delaying nil precommit for {}ms settle window",
+                            height, round, VRF_ELECTION_SETTLE_MS,
+                        );
+                        return vec![DriverAction::None];
+                    }
                     eprintln!(
-                        "[consensus] precommit for height={} round={}: VRF election result not yet available — casting nil precommit",
-                        height, round,
+                        "[consensus] precommit height={} round={}: VRF election result still unavailable after {}ms — casting nil precommit",
+                        height, round, VRF_ELECTION_SETTLE_MS,
                     );
                     vote_block_hash = Bytes32::ZERO;
                 }
@@ -1778,6 +1839,60 @@ impl ConsensusDriver {
         Ok(())
     }
 
+    fn precommit_votes_with_election_quorum(
+        &self,
+        collector: &VoteCollector,
+        block: &BlockV1,
+        block_hash: Bytes32,
+    ) -> Option<Vec<VoteV1>> {
+        let votes: Vec<&VoteV1> = collector
+            .accepted_votes()
+            .into_iter()
+            .filter(|vote| vote.block_hash == block_hash && vote.step == VoteStep::Precommit)
+            .collect();
+
+        if !vrf_commit_reveal_election_active(block.header.height) || block_hash == Bytes32::ZERO {
+            return Some(votes.into_iter().cloned().collect());
+        }
+
+        let target_hash = block.header.election_result_hash?;
+        let stake_by_validator: BTreeMap<Bytes32, u64> = self
+            .registered_voters
+            .iter()
+            .map(|voter| (voter.validator_id, voter.stake))
+            .collect();
+        let total_stake = self
+            .registered_voters
+            .iter()
+            .fold(0u64, |total, voter| total.saturating_add(voter.stake));
+        let threshold = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
+        let matching: Vec<VoteV1> = votes
+            .into_iter()
+            .filter(|vote| vote.election_result_hash == Some(target_hash))
+            .cloned()
+            .collect();
+        let matching_stake = matching.iter().fold(0u64, |total, vote| {
+            total.saturating_add(
+                stake_by_validator
+                    .get(&vote.validator_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        });
+
+        if matching_stake >= threshold {
+            Some(matching)
+        } else {
+            eprintln!(
+                "[consensus] quorum for {} at height={} round={} but election_result_hash does not independently reach quorum — waiting",
+                hex::encode(&block_hash.0[..4]),
+                block.header.height,
+                block.header.proposer_round,
+            );
+            None
+        }
+    }
+
     fn record_vote_passive(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
         if let Err(err) = self.validate_precommit_election_result_hash(&vote) {
@@ -1887,7 +2002,7 @@ impl ConsensusDriver {
                                     && vote.round == self.current_round
                                     && self.current_phase == RoundPhase::Prevote
                                 {
-                                    self.current_phase = RoundPhase::Precommit;
+                                    self.enter_precommit_phase();
                                     if block_hash != Bytes32::ZERO {
                                         self.locked_round = Some(vote.round);
                                         self.locked_value = Some(block_hash);
@@ -1969,8 +2084,6 @@ impl ConsensusDriver {
             self.prune_pending_precommit_quorum();
             return vec![DriverAction::None];
         };
-        self.pending_blocks.remove(&block_hash);
-
         let key = Self::collector_key(height, round, VoteStep::Precommit);
         let Some(collector) = self.vote_collectors.get(&key) else {
             eprintln!(
@@ -1993,11 +2106,12 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         }
 
-        let quorum_votes: Vec<&VoteV1> = collector
-            .accepted_votes()
-            .into_iter()
-            .filter(|vote| vote.block_hash == block_hash && vote.step == VoteStep::Precommit)
-            .collect();
+        let Some(quorum_vote_values) =
+            self.precommit_votes_with_election_quorum(collector, &block, block_hash)
+        else {
+            return vec![DriverAction::None];
+        };
+        let quorum_votes: Vec<&VoteV1> = quorum_vote_values.iter().collect();
         let qc = match build_qc(
             height,
             round,
@@ -2045,6 +2159,7 @@ impl ConsensusDriver {
         let old_height = self.engine.state.height;
         match self.engine.commit_block(&block) {
             Ok(()) => {
+                self.pending_blocks.remove(&block_hash);
                 let mut actions = vec![DriverAction::BroadcastBlock(block)];
                 eprintln!(
                     "[commit] finalizing {} at height={} round={}",
@@ -2392,7 +2507,7 @@ impl ConsensusDriver {
         if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Prevote {
             return vec![];
         }
-        self.current_phase = RoundPhase::Precommit;
+        self.enter_precommit_phase();
         self.sign_and_record_local_vote(
             self.next_height(),
             self.current_round,
@@ -2439,7 +2554,7 @@ mod tests {
         apply_block, compute_state_root, compute_validator_set_root, ChainState, ValidatorEntry,
         ValidatorStatus,
     };
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -2571,6 +2686,10 @@ mod tests {
             })
             .unwrap();
         hybrid
+    }
+
+    fn validator_id_for(signer: &HybridKeypair) -> Bytes32 {
+        Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0))
     }
 
     fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
@@ -3827,13 +3946,41 @@ mod tests {
     }
 
     #[test]
-    fn precommit_waits_for_vrf_election_result_before_casting() {
+    fn precommit_delayed_when_election_result_unavailable() {
+        let (mut driver, dir) = local_driver([0x75u8; 32], "precommit_missing_erh_delay");
+        let _local = install_active_validator(&mut driver, [0x75u8; 32], "local");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+        driver.current_phase = RoundPhase::Precommit;
+        driver.current_round = 0;
+        driver.precommit_phase_started_at = Some(Instant::now());
+        driver.vrf_states[0] = Some(VrfRoundState::new(1, 0));
+
+        let block = make_strict_block(&driver, [0x75u8; 32], 0, vec![]);
+        let block_hash = block.header.block_hash();
+        driver.pending_blocks.insert(block_hash, block);
+
+        let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Precommit, block_hash);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "fresh precommit phase should delay rather than casting nil immediately"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nil_precommit_cast_after_settle_window() {
         let (mut driver, dir) = local_driver([0x75u8; 32], "precommit_missing_erh_nil");
         let _local = install_active_validator(&mut driver, [0x75u8; 32], "local");
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
         driver.current_phase = RoundPhase::Precommit;
         driver.current_round = 0;
+        driver.precommit_phase_started_at = Some(
+            Instant::now() - Duration::from_millis(VRF_ELECTION_SETTLE_MS.saturating_add(500)),
+        );
         driver.vrf_states[0] = Some(VrfRoundState::new(1, 0));
 
         let block = make_strict_block(&driver, [0x75u8; 32], 0, vec![]);
@@ -3847,7 +3994,7 @@ mod tests {
                 DriverAction::BroadcastVote(vote) => Some(vote),
                 _ => None,
             })
-            .expect("missing VRF election result should still produce a safe nil precommit");
+            .expect("settle timeout should produce a safe nil precommit");
 
         assert_eq!(vote.block_hash, Bytes32::ZERO);
         assert_eq!(vote.election_result_hash, None);
@@ -3855,20 +4002,29 @@ mod tests {
     }
 
     #[test]
-    fn precommit_cast_immediately_when_election_result_arrives() {
-        let (mut driver, dir) = local_driver([0x76u8; 32], "precommit_erh_available");
+    fn block_precommit_cast_when_election_result_arrives_during_wait() {
+        let (mut driver, dir) = local_driver([0x76u8; 32], "precommit_erh_arrives");
         let _local = install_active_validator(&mut driver, [0x76u8; 32], "local");
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
         driver.current_phase = RoundPhase::Precommit;
         driver.current_round = 0;
-
-        seed_vrf_result_for_seed(&mut driver, 1, 0, [0x76u8; 32]);
-        let expected_hash = driver.vrf_election_result(1, 0).unwrap().hash();
+        driver.precommit_phase_started_at = Some(Instant::now());
+        driver.vrf_states[0] = Some(VrfRoundState::new(1, 0));
         let block = make_strict_block(&driver, [0x76u8; 32], 0, vec![]);
         let block_hash = block.header.block_hash();
         driver.pending_blocks.insert(block_hash, block);
 
+        let delayed = driver.sign_and_record_local_vote(1, 0, VoteStep::Precommit, block_hash);
+        assert!(
+            !delayed
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "precommit should wait while election result is missing"
+        );
+
+        seed_vrf_result_for_seed(&mut driver, 1, 0, [0x76u8; 32]);
+        let expected_hash = driver.vrf_election_result(1, 0).unwrap().hash();
         let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Precommit, block_hash);
         let vote = actions
             .iter()
@@ -3880,6 +4036,217 @@ mod tests {
 
         assert_eq!(vote.block_hash, block_hash);
         assert_eq!(vote.election_result_hash, Some(expected_hash));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precommit_quorum_not_declared_when_election_result_hash_disagrees() {
+        let (mut driver, dir) = local_driver([0xA1u8; 32], "precommit_erh_disagree");
+        let local = install_active_validator(&mut driver, [0xA1u8; 32], "local");
+        let a = install_active_validator(&mut driver, [0xA2u8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xA3u8; 32], "b");
+        let c = install_active_validator(&mut driver, [0xA4u8; 32], "c");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+
+        seed_vrf_result_for_seed(&mut driver, 1, 0, [0xA1u8; 32]);
+        let block = make_strict_block(&driver, [0xA1u8; 32], 0, vec![]);
+        let block_hash = block.header.block_hash();
+        let erh_a = block.header.election_result_hash;
+        let erh_b = Some(Bytes32::from([0xBEu8; 32]));
+        driver.pending_blocks.insert(block_hash, block);
+
+        let signers = [
+            (&local, validator_id_for(&local), erh_a),
+            (&a, validator_id_for(&a), erh_a),
+            (&b, validator_id_for(&b), erh_b),
+            (&c, validator_id_for(&c), erh_b),
+        ];
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
+            driver.registered_voters.clone(),
+        );
+        for (signer, validator_id, election_result_hash) in signers {
+            let vote = indra_consensus::vote::produce_vote_with_election_result(
+                1,
+                0,
+                VoteStep::Precommit,
+                block_hash,
+                validator_id,
+                election_result_hash,
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let _ = collector.add_vote(vote).unwrap();
+        }
+        driver
+            .vote_collectors
+            .insert((1, 0, VoteStep::Precommit), collector);
+
+        let actions = driver.finalize_block_on_quorum(1, 0, block_hash);
+        assert_eq!(driver.height(), 0);
+        assert!(driver.pending_block(&block_hash).is_some());
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precommit_quorum_declared_when_election_result_hash_agrees() {
+        let (mut driver, dir) = local_driver([0xA5u8; 32], "precommit_erh_agree");
+        let local = install_active_validator(&mut driver, [0xA5u8; 32], "local");
+        let a = install_active_validator(&mut driver, [0xA6u8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xA7u8; 32], "b");
+        let _c = install_active_validator(&mut driver, [0xA8u8; 32], "c");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+
+        seed_vrf_result_for_seed(&mut driver, 1, 0, [0xA5u8; 32]);
+        let block = make_strict_block(&driver, [0xA5u8; 32], 0, vec![]);
+        let block_hash = block.header.block_hash();
+        let erh = block.header.election_result_hash;
+        driver.pending_blocks.insert(block_hash, block);
+
+        let signers = [
+            (&local, validator_id_for(&local)),
+            (&a, validator_id_for(&a)),
+            (&b, validator_id_for(&b)),
+        ];
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
+            driver.registered_voters.clone(),
+        );
+        for (signer, validator_id) in signers {
+            let vote = indra_consensus::vote::produce_vote_with_election_result(
+                1,
+                0,
+                VoteStep::Precommit,
+                block_hash,
+                validator_id,
+                erh,
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let _ = collector.add_vote(vote).unwrap();
+        }
+        driver
+            .vote_collectors
+            .insert((1, 0, VoteStep::Precommit), collector);
+
+        let actions = driver.finalize_block_on_quorum(1, 0, block_hash);
+        assert_eq!(driver.height(), 1);
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nil_precommit_quorum_not_affected_by_election_result_hash() {
+        let (mut driver, dir) = local_driver([0xA9u8; 32], "nil_precommit_erh");
+        let local = install_active_validator(&mut driver, [0xA9u8; 32], "local");
+        let a = install_active_validator(&mut driver, [0xAAu8; 32], "a");
+        let b = install_active_validator(&mut driver, [0xABu8; 32], "b");
+        let _c = install_active_validator(&mut driver, [0xACu8; 32], "c");
+        driver.refresh_registered_voters();
+
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
+            driver.registered_voters.clone(),
+        );
+        for signer in [&local, &a, &b] {
+            let vote = indra_consensus::vote::produce_vote(
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::ZERO,
+                validator_id_for(signer),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            match collector.add_vote(vote).unwrap() {
+                VoteDecision::Waiting => {}
+                VoteDecision::QuorumReached { block_hash, .. } => {
+                    assert_eq!(block_hash, Bytes32::ZERO);
+                }
+            }
+        }
+        assert!(matches!(
+            collector.current_decision(),
+            VoteDecision::QuorumReached {
+                block_hash,
+                stake_bps: _
+            } if block_hash == Bytes32::ZERO
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fallback_policy_matches_documented_behavior() {
+        let (mut driver, dir) = local_driver([0xADu8; 32], "vrf_empty_fallback_threshold");
+        install_active_validator(&mut driver, [0xADu8; 32], "local");
+        install_active_validator(&mut driver, [0xAEu8; 32], "a");
+        install_active_validator(&mut driver, [0xAFu8; 32], "b");
+        install_active_validator(&mut driver, [0xB0u8; 32], "c");
+        driver.refresh_registered_voters();
+
+        for round in 0..MAX_VRF_EMPTY_REVEAL_ROUNDS {
+            let mut state = VrfRoundState::new(1, round);
+            state.phase = VrfRoundPhase::Reveal;
+            state.reveal_started_at =
+                Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+            driver.vrf_states[0] = Some(state);
+
+            let result = driver.compute_and_store_vrf_election(0);
+            if round + 1 < MAX_VRF_EMPTY_REVEAL_ROUNDS {
+                assert!(
+                    result.is_none(),
+                    "fallback must wait until the configured empty-round threshold"
+                );
+            } else {
+                let result = result.expect("fallback should be produced at threshold");
+                assert!(result.fallback_used);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn consecutive_empty_rounds_counter_resets_on_successful_reveal() {
+        let (mut driver, dir) = local_driver([0xB1u8; 32], "vrf_empty_counter_reset");
+        install_active_validator(&mut driver, [0xB1u8; 32], "local");
+        install_active_validator(&mut driver, [0xB2u8; 32], "a");
+        install_active_validator(&mut driver, [0xB3u8; 32], "b");
+        install_active_validator(&mut driver, [0xB4u8; 32], "c");
+        driver.refresh_registered_voters();
+        driver.consecutive_empty_reveal_rounds = MAX_VRF_EMPTY_REVEAL_ROUNDS - 1;
+
+        let (_commit, reveal) = signed_vrf_pair(&driver, [0xB1u8; 32], 1, 0, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(1, 0);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.reveals.insert(reveal.validator_id, reveal);
+        driver.vrf_states[0] = Some(state);
+
+        let result = driver
+            .compute_and_store_vrf_election(0)
+            .expect("successful reveal should compute an election result");
+        assert!(!result.fallback_used);
+        assert_eq!(driver.consecutive_empty_reveal_rounds, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2072,6 +2072,19 @@ fn main() {
                             }
                         }
                         RoundPhase::Precommit => {
+                            let actions = driver.lock().unwrap().retry_precommit_if_waiting();
+                            if !actions.is_empty() {
+                                process_driver_actions(
+                                    &driver,
+                                    &gossip,
+                                    &height_tx,
+                                    &handshake_config,
+                                    height,
+                                    actions,
+                                    &metrics_state,
+                                    &last_block_timestamp,
+                                );
+                            }
                             if phase_started_at.elapsed() >= PRECOMMIT_TIMEOUT {
                                 let (old_round, height_before) = {
                                     let d = driver.lock().unwrap();
