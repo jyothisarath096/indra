@@ -39,8 +39,11 @@ pub enum ConsensusError {
 
     // ── Block production errors ───────────────────────────────────────────
     /// The proposer keypair does not match the elected proposer.
-    #[error("proposer identity mismatch")]
-    WrongProposer,
+    #[error("proposer identity mismatch: {reason}")]
+    WrongProposer {
+        /// Which proposer-identity check failed.
+        reason: &'static str,
+    },
 
     /// No transactions available to fill the block.
     #[error("no transactions available")]
@@ -123,6 +126,13 @@ pub enum ConsensusError {
 
 /// Convenience alias.
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
+
+impl ConsensusError {
+    /// Construct a proposer-identity error with a stable diagnostic reason.
+    pub fn wrong_proposer(reason: &'static str) -> Self {
+        Self::WrongProposer { reason }
+    }
+}
 
 impl From<indra_crypto::CryptoError> for ConsensusError {
     fn from(e: indra_crypto::CryptoError) -> Self {

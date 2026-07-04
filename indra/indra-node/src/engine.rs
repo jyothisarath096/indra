@@ -1900,7 +1900,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer)
+            NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer { reason })
+                if reason == "local VRF key is not in election candidates"
         ));
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -128,6 +128,15 @@ pub struct VrfRoundState {
     pub pending_reveals: BTreeMap<Bytes32, VrfReveal>,
     /// Deterministic result after reveal window closes.
     pub election_result: Option<VrfElectionResult>,
+    /// Exact reveal evidence set used to compute `election_result`.
+    ///
+    /// Any field committed by `VrfElectionResult::hash()` must be captured
+    /// atomically with the result and must not be re-derived later from live
+    /// mutable gossip state. In particular, `reveal_set_commitment` commits to
+    /// this exact evidence vector; valid reveals received after the result is
+    /// computed remain useful for gossip/recovery, but they are not part of
+    /// the already-committed election result.
+    pub election_reveal_evidence: Option<Vec<VrfRevealEvidence>>,
 }
 
 impl VrfRoundState {
@@ -142,6 +151,7 @@ impl VrfRoundState {
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
             election_result: None,
+            election_reveal_evidence: None,
         }
     }
 }
@@ -1340,6 +1350,7 @@ impl ConsensusDriver {
                 if let Some(state) = self.vrf_states[slot].as_mut() {
                     state.phase = VrfRoundPhase::Fallback;
                     state.election_result = Some(result);
+                    state.election_reveal_evidence = Some(Vec::new());
                 }
                 eprintln!(
                     "[vrf] election result computed for height={} round={}: elected={} fallback={} after insufficient reveal threshold",
@@ -1377,6 +1388,7 @@ impl ConsensusDriver {
             if let Some(state) = self.vrf_states[slot].as_mut() {
                 state.phase = VrfRoundPhase::Fallback;
                 state.election_result = Some(result);
+                state.election_reveal_evidence = Some(Vec::new());
             }
             eprintln!(
                 "[vrf] election result computed for height={} round={}: elected={} fallback={}",
@@ -1391,6 +1403,7 @@ impl ConsensusDriver {
         let Ok(mut result) = result else {
             return None;
         };
+        let mut election_reveal_evidence = None;
         if reveal_set_commitment_active(state_height) {
             let evidence = self
                 .vrf_states
@@ -1399,12 +1412,14 @@ impl ConsensusDriver {
                 .map(|state| reveal_evidence_from_reveals(state.reveals.values().cloned()))
                 .unwrap_or_default();
             result.reveal_set_commitment = compute_reveal_set_commitment(&evidence);
+            election_reveal_evidence = Some(evidence);
         }
         if let Some(state) = self.vrf_states[slot].as_mut() {
             self.consecutive_empty_reveal_rounds = 0;
             self.last_insufficient_reveal_round_counted = None;
             state.phase = VrfRoundPhase::Complete;
             state.election_result = Some(result);
+            state.election_reveal_evidence = election_reveal_evidence;
         }
         eprintln!(
             "[vrf] election result computed for height={} round={}: elected={} fallback={}",
@@ -1525,15 +1540,13 @@ impl ConsensusDriver {
         self.vrf_slot_index(height, round)
             .and_then(|slot| self.vrf_states[slot].as_ref())
             .map(|state| {
-                if state
-                    .election_result
-                    .is_some_and(|result| result.fallback_used)
-                {
-                    // Option-D fallback is a public deterministic election; no
-                    // reveal set produced it. Keep the committed evidence set
-                    // canonical and count-independent even if this node happened
-                    // to see a few sub-quorum reveals before fallback.
-                    Vec::new()
+                if state.election_result.is_some() {
+                    // Once an election result exists, return the evidence that
+                    // was frozen atomically with it. Rebuilding from
+                    // `state.reveals` here would make proposal construction
+                    // depend on later gossip and could diverge from the
+                    // already-committed `reveal_set_commitment`.
+                    state.election_reveal_evidence.clone().unwrap_or_default()
                 } else {
                     reveal_evidence_from_reveals(state.reveals.values().cloned())
                 }
@@ -4161,6 +4174,177 @@ mod tests {
                 && *missing_validator_ids == expected_missing
         ));
         assert!(driver.vrf_election_result(height, round).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reveal_evidence_frozen_at_election_result_computation() {
+        let seeds = [[0x91u8; 32], [0x92u8; 32], [0x93u8; 32], [0x94u8; 32]];
+        let (mut driver, dir) = local_driver(seeds[0], "reveal_evidence_frozen");
+        for (idx, seed) in seeds.iter().enumerate() {
+            install_active_validator(&mut driver, *seed, &format!("v{idx}"));
+        }
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0x91; 32]);
+
+        let height = u64::MAX;
+        let round = 0;
+        let signed: Vec<_> = seeds
+            .iter()
+            .map(|seed| signed_vrf_pair(&driver, *seed, height, round, DEFAULT_CHAIN_ID))
+            .collect();
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        for (commit, _) in &signed {
+            state.commits.insert(commit.validator_id, commit.clone());
+        }
+        for (_, reveal) in signed.iter().take(3) {
+            state.reveals.insert(reveal.validator_id, reveal.clone());
+        }
+        driver.vrf_states[0] = Some(state);
+
+        let result = driver
+            .compute_and_store_vrf_election(0)
+            .expect("three of four reveals should satisfy quorum");
+        let frozen = driver.vrf_reveal_evidence(height, round);
+        assert_eq!(frozen.len(), 3);
+        assert_eq!(
+            result.reveal_set_commitment,
+            compute_reveal_set_commitment(&frozen)
+        );
+
+        let late_reveal = signed[3].1.clone();
+        let actions = driver.insert_valid_vrf_reveal(0, late_reveal, false, None);
+        assert!(actions.is_empty());
+        assert_eq!(
+            driver.vrf_states[0]
+                .as_ref()
+                .expect("slot present")
+                .reveals
+                .len(),
+            4,
+            "late valid reveal should still be accepted into live gossip state"
+        );
+        assert_eq!(
+            driver.vrf_reveal_evidence(height, round),
+            frozen,
+            "proposal evidence must remain the frozen set, not the expanded live set"
+        );
+
+        let proposer_seed = seeds
+            .iter()
+            .copied()
+            .find(|seed| validator_id_for_seed(*seed) == result.elected_validator_id)
+            .expect("elected validator maps to one test seed");
+        let election = election_for_round(&driver, height, round);
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+            epoch_seed: election.epoch_seed,
+            prev_qc_bytes: vec![],
+            timestamp: 1_700_000_001,
+            polc_round: None,
+            slash_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            election_result_hash: Some(result.hash()),
+            election_result: Some(result),
+            vrf_reveals: frozen.clone(),
+        };
+        let block = produce_block(
+            &template,
+            &driver.engine.state,
+            &driver.engine.mempool,
+            &election,
+        )
+        .expect("frozen evidence should satisfy the authoritative result commitment");
+
+        assert_eq!(block.vrf_reveals, frozen);
+        assert_eq!(block.header.election_result_hash, Some(result.hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn late_reveals_after_quorum_result_do_not_reproduce_proposer_mismatch() {
+        let seeds = [[0x95u8; 32], [0x96u8; 32], [0x97u8; 32], [0x98u8; 32]];
+        let (mut driver, dir) = local_driver(seeds[0], "late_reveals_no_mismatch");
+        for (idx, seed) in seeds.iter().enumerate() {
+            install_active_validator(&mut driver, *seed, &format!("v{idx}"));
+        }
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0x95; 32]);
+
+        let height = u64::MAX;
+        let round = 0;
+        let signed: Vec<_> = seeds
+            .iter()
+            .map(|seed| signed_vrf_pair(&driver, *seed, height, round, DEFAULT_CHAIN_ID))
+            .collect();
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        for (commit, _) in &signed {
+            state.commits.insert(commit.validator_id, commit.clone());
+        }
+        for (_, reveal) in signed.iter().take(3) {
+            state.reveals.insert(reveal.validator_id, reveal.clone());
+        }
+        driver.vrf_states[0] = Some(state);
+
+        let result = driver
+            .compute_and_store_vrf_election(0)
+            .expect("quorum-backed election result should be computed");
+        let frozen = driver.vrf_reveal_evidence(height, round);
+        let live_before_late = compute_reveal_set_commitment(&frozen);
+        assert_eq!(live_before_late, result.reveal_set_commitment);
+
+        let late_reveal = signed[3].1.clone();
+        let _ = driver.insert_valid_vrf_reveal(0, late_reveal, false, None);
+        let expanded_live_evidence = reveal_evidence_from_reveals(
+            driver.vrf_states[0]
+                .as_ref()
+                .expect("slot present")
+                .reveals
+                .values()
+                .cloned(),
+        );
+        assert_ne!(
+            compute_reveal_set_commitment(&expanded_live_evidence),
+            result.reveal_set_commitment,
+            "this is the live bug shape: rebuilding from mutable reveals would mismatch"
+        );
+
+        let proposer_seed = seeds
+            .iter()
+            .copied()
+            .find(|seed| validator_id_for_seed(*seed) == result.elected_validator_id)
+            .expect("elected validator maps to one test seed");
+        let election = election_for_round(&driver, height, round);
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
+            epoch_seed: election.epoch_seed,
+            prev_qc_bytes: vec![],
+            timestamp: 1_700_000_001,
+            polc_round: None,
+            slash_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            election_result_hash: Some(result.hash()),
+            election_result: Some(result),
+            vrf_reveals: driver.vrf_reveal_evidence(height, round),
+        };
+
+        produce_block(
+            &template,
+            &driver.engine.state,
+            &driver.engine.mempool,
+            &election,
+        )
+        .expect("proposal must use frozen evidence and avoid proposer identity mismatch");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -92,7 +92,9 @@ pub fn produce_block(
             .iter()
             .find(|candidate| candidate.vrf_pubkey == template.proposer_vrf_keypair.public_key())
             .map(|candidate| candidate.validator_id)
-            .ok_or(ConsensusError::WrongProposer)?,
+            .ok_or_else(|| {
+                ConsensusError::wrong_proposer("local VRF key is not in election candidates")
+            })?,
         &template.proposer_vrf_keypair,
         &template.epoch_seed,
         election.height,
@@ -106,21 +108,29 @@ pub fn produce_block(
                 || result.round != election.round
                 || result.elected_validator_id != slot.proposer_id
             {
-                return Err(ConsensusError::WrongProposer);
+                return Err(ConsensusError::wrong_proposer(
+                    "authoritative election result does not match proposer slot",
+                ));
             }
             if reveal_set_commitment_active(election.height)
                 && result.reveal_set_commitment
                     != compute_reveal_set_commitment(&template.vrf_reveals)
             {
-                return Err(ConsensusError::WrongProposer);
+                return Err(ConsensusError::wrong_proposer(
+                    "authoritative reveal-set commitment does not match proposal evidence",
+                ));
             }
             let result_hash = result.hash();
             if election_result_hash.is_some_and(|hash| hash != result_hash) {
-                return Err(ConsensusError::WrongProposer);
+                return Err(ConsensusError::wrong_proposer(
+                    "provided election_result_hash disagrees with authoritative result",
+                ));
             }
             election_result_hash = Some(result_hash);
         } else if reveal_set_commitment_active(election.height) {
-            return Err(ConsensusError::WrongProposer);
+            return Err(ConsensusError::wrong_proposer(
+                "missing authoritative election result after reveal-set activation",
+            ));
         } else {
             let expected_normal = VrfElectionResult {
                 height: election.height,
@@ -151,13 +161,17 @@ pub fn produce_block(
             if template.election_result_hash != Some(expected_normal)
                 && template.election_result_hash != Some(expected_fallback)
             {
-                return Err(ConsensusError::WrongProposer);
+                return Err(ConsensusError::wrong_proposer(
+                    "legacy commit-reveal hash does not match proposer VRF result or fallback",
+                ));
             }
         }
     } else {
         let elected = elect_proposer(election, election.height)?;
         if elected != slot.proposer_id {
-            return Err(ConsensusError::WrongProposer);
+            return Err(ConsensusError::wrong_proposer(
+                "legacy proposer election selected a different validator",
+            ));
         }
     }
 
@@ -394,10 +408,11 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        assert_eq!(
+        assert!(matches!(
             produce_block(&template, &state, &mempool, &election),
-            Err(ConsensusError::WrongProposer)
-        );
+            Err(ConsensusError::WrongProposer { reason })
+                if reason == "local VRF key is not in election candidates"
+        ));
     }
 
     #[test]
@@ -514,10 +529,74 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        assert_eq!(
+        assert!(matches!(
             produce_block(&template, &state, &mempool, &election),
-            Err(ConsensusError::WrongProposer)
-        );
+            Err(ConsensusError::WrongProposer { reason })
+                if reason == "authoritative election result does not match proposer slot"
+        ));
+    }
+
+    #[test]
+    fn wrong_proposer_reasons_are_distinct_for_authoritative_checks() {
+        let mut state = ChainState::new_genesis();
+        state.height = REVEAL_SET_COMMITMENT_HEIGHT.saturating_sub(1);
+        let mempool = Mempool::default_config();
+        let seed = [0x5Bu8; 32];
+        let height = state.height + 1;
+        let election = make_election(&seed, height, 0, seed, 1_000_000);
+        let vrf = VrfKeypair::from_seed(&seed);
+        let validator_id = election.candidates[0].validator_id;
+        let base_result = VrfElectionResult {
+            height,
+            round: 0,
+            elected_validator_id: validator_id,
+            elected_vrf_output: VRF_FALLBACK_OUTPUT,
+            fallback_used: false,
+            reveal_set_commitment: compute_reveal_set_commitment(&[]),
+        };
+        let base_template = BlockTemplate {
+            proposer_vrf_keypair: vrf,
+            epoch_seed: election.epoch_seed,
+            prev_qc_bytes: vec![],
+            timestamp: 1_700_000_001,
+            polc_round: None,
+            slash_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            election_result_hash: None,
+            election_result: Some(base_result),
+            vrf_reveals: vec![],
+        };
+
+        let mut mismatched_evidence = base_template;
+        mismatched_evidence.vrf_reveals = vec![VrfRevealEvidence {
+            validator_id,
+            vrf_output: Bytes32::from([0xAB; 32]),
+            vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0xCD; 80]).unwrap(),
+        }];
+        assert!(matches!(
+            produce_block(&mismatched_evidence, &state, &mempool, &election),
+            Err(ConsensusError::WrongProposer { reason })
+                if reason == "authoritative reveal-set commitment does not match proposal evidence"
+        ));
+
+        let mut mismatched_hash = mismatched_evidence;
+        mismatched_hash.vrf_reveals = vec![];
+        mismatched_hash.election_result_hash = Some(Bytes32::from([0xEF; 32]));
+        assert!(matches!(
+            produce_block(&mismatched_hash, &state, &mempool, &election),
+            Err(ConsensusError::WrongProposer { reason })
+                if reason == "provided election_result_hash disagrees with authoritative result"
+        ));
+
+        let mut missing_result = mismatched_hash;
+        missing_result.election_result_hash = None;
+        missing_result.election_result = None;
+        assert!(matches!(
+            produce_block(&missing_result, &state, &mempool, &election),
+            Err(ConsensusError::WrongProposer { reason })
+                if reason == "missing authoritative election result after reveal-set activation"
+        ));
     }
 
     #[test]
