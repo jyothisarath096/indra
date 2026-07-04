@@ -38,8 +38,10 @@ pub struct NodeState<'a> {
 
 /// Network-layer context needed by peer-aware RPC methods.
 pub struct NetworkContext<'a> {
-    /// Connected validator peer addresses.
+    /// Dialable connected validator peer addresses.
     pub validator_peer_addrs: Vec<String>,
+    /// Number of currently authenticated validator peer connections.
+    pub connected_validator_peer_count: usize,
     /// Number of discovered peers not necessarily connected.
     pub discovered_peer_count: usize,
     /// Number of currently connected observer peers.
@@ -70,6 +72,7 @@ impl<'a> NodeState<'a> {
     pub fn with_network(
         engine: &'a impl RpcEngineView,
         validator_peer_addrs: Vec<String>,
+        connected_validator_peer_count: usize,
         discovered_peer_count: usize,
         observer_peer_count: usize,
     ) -> Self {
@@ -82,6 +85,7 @@ impl<'a> NodeState<'a> {
             blocks_retained: engine.blocks_retained(),
             network: Some(NetworkContext {
                 validator_peer_addrs,
+                connected_validator_peer_count,
                 discovered_peer_count,
                 observer_peer_count,
                 _lifetime: std::marker::PhantomData,
@@ -337,7 +341,7 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let peers = state
         .network
         .as_ref()
-        .map(|network| network.validator_peer_addrs.len())
+        .map(|network| network.connected_validator_peer_count)
         .unwrap_or(0);
 
     Ok(format!(
@@ -498,7 +502,7 @@ fn get_peers(state: &NodeState<'_>) -> RpcResult<String> {
         ),
         Some(network) => Ok(format!(
             r#"{{"peer_count":{},"target_peers":{},"discovered_count":{},"observer_peer_count":{}}}"#,
-            network.validator_peer_addrs.len(),
+            network.connected_validator_peer_count,
             indra_core::types::primitives::TARGET_OUTBOUND_PEERS,
             network.discovered_peer_count,
             network.observer_peer_count,
@@ -1573,6 +1577,7 @@ mod tests {
                 "203.0.113.10:30303".to_string(),
                 "198.51.100.22:30303".to_string(),
             ],
+            2,
             7,
             3,
         );
@@ -1586,5 +1591,18 @@ mod tests {
         assert!(!result.contains("198.51.100.22"));
         assert!(!result.contains("validator_peers"));
         assert!(!result.contains("connected\""));
+    }
+
+    #[test]
+    fn peers_count_uses_authenticated_connection_count_not_dialable_addresses() {
+        let engine = make_state("inbound-peers");
+        let state = NodeState::with_network(&engine, Vec::new(), 3, 7, 0);
+
+        let chain_info = get_chain_info(&state).unwrap();
+        let peers = get_peers(&state).unwrap();
+
+        assert!(chain_info.contains(r#""peers":3"#));
+        assert!(peers.contains(r#""peer_count":3"#));
+        assert!(peers.contains(r#""discovered_count":7"#));
     }
 }

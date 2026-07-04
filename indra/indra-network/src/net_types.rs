@@ -24,6 +24,12 @@ pub enum NetworkEvent {
         validator_id: Bytes32,
         /// Remote socket address.
         addr: SocketAddr,
+        /// True when this node initiated the connection by dialing `addr`.
+        ///
+        /// For inbound connections, `addr` is the accepted socket's source
+        /// endpoint and may contain an ephemeral port. Callers must not treat
+        /// that endpoint as a future dial candidate.
+        is_outbound: bool,
     },
     /// A connected peer dropped or was disconnected.
     PeerDisconnected {

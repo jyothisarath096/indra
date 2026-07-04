@@ -607,6 +607,7 @@ impl PeerManagerActor {
             .send(NetworkEvent::PeerConnected {
                 validator_id: peer_validator_id,
                 addr,
+                is_outbound: handshake.is_initiator,
             })
             .await;
     }

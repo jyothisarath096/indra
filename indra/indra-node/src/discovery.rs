@@ -1,7 +1,7 @@
 //! Peer discovery — DNS seeding, peer exchange, and peer table persistence.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io,
     net::{SocketAddr, ToSocketAddrs},
 };
@@ -113,6 +113,43 @@ pub fn load_peers(path: &str) -> Vec<SocketAddr> {
         .collect()
 }
 
+/// Sanitize persisted peers loaded from disk before they enter discovery.
+///
+/// Persisted `peers.json` predates connection-direction tracking, so a bare
+/// `ip:port` cannot prove whether it was a legitimate listening address or an
+/// accepted inbound socket source with an ephemeral port. Multiple ports for
+/// the same IP are therefore treated as an anomaly and collapsed to a single
+/// deterministic candidate, preferring the configured P2P listening port when
+/// present.
+pub fn sanitize_loaded_peers(
+    peers: impl IntoIterator<Item = SocketAddr>,
+    preferred_port: Option<u16>,
+) -> Vec<SocketAddr> {
+    let mut by_ip = BTreeMap::new();
+    for peer in peers {
+        by_ip.entry(peer.ip()).or_insert_with(Vec::new).push(peer);
+    }
+
+    let mut sanitized = Vec::new();
+    for (_ip, mut candidates) in by_ip {
+        candidates.sort_by_key(|addr| {
+            (
+                preferred_port
+                    .map(|port| addr.port() != port)
+                    .unwrap_or(false),
+                addr.port(),
+                addr.to_string(),
+            )
+        });
+        if let Some(peer) = candidates.into_iter().next() {
+            sanitized.push(peer);
+        }
+    }
+    sanitized.sort();
+    sanitized.dedup();
+    sanitized
+}
+
 /// Build a deterministic PeerList payload from candidate addresses.
 pub fn peer_list_payload(
     candidates: impl IntoIterator<Item = SocketAddr>,
@@ -197,6 +234,42 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("indra_missing_peers_{}.json", std::process::id()));
         assert!(load_peers(path.to_str().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn sanitize_loaded_peers_collapses_multiple_ports_per_ip() {
+        let peers = vec![
+            "203.0.113.10:52154".parse().unwrap(),
+            "203.0.113.10:30303".parse().unwrap(),
+            "203.0.113.10:49844".parse().unwrap(),
+            "198.51.100.22:45240".parse().unwrap(),
+            "198.51.100.22:30303".parse().unwrap(),
+        ];
+
+        let sanitized = sanitize_loaded_peers(peers, Some(30303));
+
+        assert_eq!(
+            sanitized,
+            vec![
+                "198.51.100.22:30303".parse().unwrap(),
+                "203.0.113.10:30303".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_loaded_peers_leaves_single_port_per_ip_unchanged() {
+        let peers = vec![
+            "203.0.113.10:30303".parse().unwrap(),
+            "198.51.100.22:30303".parse().unwrap(),
+            "192.0.2.44:30303".parse().unwrap(),
+        ];
+
+        let mut expected = peers;
+        expected.sort();
+        let sanitized = sanitize_loaded_peers(expected.clone(), Some(30303));
+
+        assert_eq!(sanitized, expected);
     }
 
     #[test]

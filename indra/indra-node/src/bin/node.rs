@@ -32,7 +32,7 @@ use indra_network::{
 use indra_node::{
     discovery::{
         default_dns_seed_hosts_config, load_peers, peer_list_payload, resolve_dns_seeds,
-        resolve_peer_addr, save_peers,
+        resolve_peer_addr, sanitize_loaded_peers, save_peers,
     },
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     genesis::load_genesis_seed_peers,
@@ -381,6 +381,7 @@ fn record_peer_connected_event(
     local_validator_id: indra_core::Bytes32,
     validator_id: indra_core::Bytes32,
     addr: SocketAddr,
+    is_outbound: bool,
     connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer_addrs: &Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
     addr_validators: &Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
@@ -421,31 +422,58 @@ fn record_peer_connected_event(
         .unwrap()
         .entry(addr.ip())
         .or_insert(0) += 1;
-    peer_addrs.lock().unwrap().insert(validator_id, addr);
     addr_validators.lock().unwrap().insert(addr, validator_id);
     connected_validator_ids.lock().unwrap().insert(validator_id);
-    authenticated_peer_addrs
-        .lock()
-        .unwrap()
-        .insert(addr.to_string());
-    authenticated_addr_validators
-        .lock()
-        .unwrap()
-        .insert(addr.to_string(), validator_id);
-    let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
-    insert_discovered_peer_bounded(
-        &mut discovered_peers.lock().unwrap(),
-        &authenticated,
-        bootstrap_peer_addrs,
-        genesis_peer_addrs,
-        addr.to_string(),
-    );
+
+    // Only outbound connection addresses are dial targets. Inbound accepted
+    // socket source addresses frequently contain ephemeral ports; they remain
+    // live endpoints for routing/accounting via `addr_validators`, but must
+    // never pollute discovery, PeerList gossip, or persisted peers.
+    if is_outbound {
+        peer_addrs.lock().unwrap().insert(validator_id, addr);
+        authenticated_peer_addrs
+            .lock()
+            .unwrap()
+            .insert(addr.to_string());
+        authenticated_addr_validators
+            .lock()
+            .unwrap()
+            .insert(addr.to_string(), validator_id);
+        let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+        insert_discovered_peer_bounded(
+            &mut discovered_peers.lock().unwrap(),
+            &authenticated,
+            bootstrap_peer_addrs,
+            genesis_peer_addrs,
+            addr.to_string(),
+        );
+    }
+
     retry_after.lock().unwrap().remove(&addr.ip().to_string());
     retry_after.lock().unwrap().remove(&addr.to_string());
     retry_delay.lock().unwrap().remove(&addr.ip().to_string());
     retry_delay.lock().unwrap().remove(&addr.to_string());
-    clear_dial_failure(&addr.to_string(), &mut failure_counts.lock().unwrap());
+    if is_outbound {
+        clear_dial_failure(&addr.to_string(), &mut failure_counts.lock().unwrap());
+    }
     true
+}
+
+fn peer_addresses_to_persist(
+    discovered_peers: &HashSet<String>,
+    peer_addrs: &HashMap<indra_core::Bytes32, SocketAddr>,
+    local_p2p_addr: &str,
+) -> Vec<SocketAddr> {
+    let mut peers_to_save: Vec<SocketAddr> = bounded_discovered_peer_addrs(discovered_peers)
+        .into_iter()
+        .filter(|addr| !is_configured_self_addr(addr, local_p2p_addr))
+        .collect();
+    peers_to_save.extend(peer_addrs.values().copied());
+    peers_to_save.retain(|addr| !is_configured_self_addr(addr, local_p2p_addr));
+    peers_to_save.sort();
+    peers_to_save.dedup();
+    peers_to_save.truncate(MAX_DISCOVERED_PEERS);
+    peers_to_save
 }
 
 fn choose_proposal_mode(
@@ -598,13 +626,18 @@ fn start_network_runtime(
                     async move {
                         while let Some(event) = async_event_rx.recv().await {
                             match &event {
-                                NetworkEvent::PeerConnected { validator_id, addr } => {
+                                NetworkEvent::PeerConnected {
+                                    validator_id,
+                                    addr,
+                                    is_outbound,
+                                } => {
                                     let local_id =
                                         handshake_config.read().unwrap().my_validator_id;
                                     if !record_peer_connected_event(
                                         local_id,
                                         *validator_id,
                                         *addr,
+                                        *is_outbound,
                                         &connected_addrs,
                                         &peer_addrs,
                                         &addr_validators,
@@ -732,7 +765,22 @@ fn start_network_runtime(
                     let p2p_addr_for_port = p2p_addr.clone();
                     async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let persisted = load_peers(&peers_file_path);
+                        let p2p_port = p2p_addr_for_port
+                            .rsplit(':')
+                            .next()
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .unwrap_or(30303);
+                        let raw_persisted = load_peers(&peers_file_path);
+                        let persisted =
+                            sanitize_loaded_peers(raw_persisted.iter().copied(), Some(p2p_port));
+                        if persisted.len() != raw_persisted.len() {
+                            eprintln!(
+                                "[discovery] sanitized persisted peers: {} -> {} entries",
+                                raw_persisted.len(),
+                                persisted.len()
+                            );
+                            save_peers(&peers_file_path, &persisted);
+                        }
                         {
                             let mut dp = discovered_peers.lock().unwrap();
                             let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
@@ -758,11 +806,6 @@ fn start_network_runtime(
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
-                        let p2p_port = p2p_addr_for_port
-                            .rsplit(':')
-                            .next()
-                            .and_then(|port| port.parse::<u16>().ok())
-                            .unwrap_or(30303);
                         let dns_peers = resolve_dns_seeds(&dns_seed_host, p2p_port);
                         {
                             let mut dp = discovered_peers.lock().unwrap();
@@ -912,17 +955,11 @@ fn start_network_runtime(
                                 }
                             }
                             if last_peer_save.elapsed().as_secs() >= PEER_TABLE_SAVE_INTERVAL_SECS {
-                                let mut peers_to_save: Vec<SocketAddr> =
-                                    bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap())
-                                        .into_iter()
-                                        .filter(|addr| !is_configured_self_addr(addr, &p2p_addr_for_port))
-                                        .collect();
-                                peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
-                                peers_to_save
-                                    .retain(|addr| !is_configured_self_addr(addr, &p2p_addr_for_port));
-                                peers_to_save.sort();
-                                peers_to_save.dedup();
-                                peers_to_save.truncate(MAX_DISCOVERED_PEERS);
+                                let peers_to_save = peer_addresses_to_persist(
+                                    &discovered_peers.lock().unwrap(),
+                                    &peer_addrs.lock().unwrap(),
+                                    &p2p_addr_for_port,
+                                );
                                 save_peers(&peers_file_path, &peers_to_save);
                                 last_peer_save = Instant::now();
                             }
@@ -938,17 +975,11 @@ fn start_network_runtime(
                     let local_p2p_addr = p2p_addr.clone();
                     async move {
                         if tokio::signal::ctrl_c().await.is_ok() {
-                            let mut peers_to_save: Vec<SocketAddr> =
-                                bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap())
-                                    .into_iter()
-                                    .filter(|addr| !is_configured_self_addr(addr, &local_p2p_addr))
-                                    .collect();
-                            peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
-                            peers_to_save
-                                .retain(|addr| !is_configured_self_addr(addr, &local_p2p_addr));
-                            peers_to_save.sort();
-                            peers_to_save.dedup();
-                            peers_to_save.truncate(MAX_DISCOVERED_PEERS);
+                            let peers_to_save = peer_addresses_to_persist(
+                                &discovered_peers.lock().unwrap(),
+                                &peer_addrs.lock().unwrap(),
+                                &local_p2p_addr,
+                            );
                             save_peers(&peers_file_path, &peers_to_save);
                             eprintln!(
                                 "[discovery] saved {} peers before shutdown",
@@ -1530,7 +1561,9 @@ fn main() {
             while let Ok(event) = network_events.recv() {
                 connected_validator_peers.store(gossip.connection_count(), Ordering::Relaxed);
                 match event {
-                    NetworkEvent::PeerConnected { validator_id, addr } => {
+                    NetworkEvent::PeerConnected {
+                        validator_id, addr, ..
+                    } => {
                         connected_validator_peers
                             .store(gossip.connection_count(), Ordering::Relaxed);
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
@@ -3225,6 +3258,7 @@ fn handle_rpc(
         .iter()
         .map(|addr| addr.to_string())
         .collect();
+    let connected_validator_peer_count = gossip.connection_count();
     let discovered_count = discovered_peers.lock().unwrap().len();
     let observer_count_val = observer_count.load(Ordering::Relaxed);
 
@@ -3240,6 +3274,7 @@ fn handle_rpc(
         let state = NodeState::with_network(
             &snapshot,
             validator_peer_addrs,
+            connected_validator_peer_count,
             discovered_count,
             observer_count_val,
         );
@@ -3432,6 +3467,7 @@ mod tests {
             local,
             local,
             addr,
+            true,
             &connected_addrs,
             &peer_addrs,
             &addr_validators,
@@ -3455,6 +3491,197 @@ mod tests {
         assert!(authenticated_addr_validators.lock().unwrap().is_empty());
         assert!(connected_validator_ids.lock().unwrap().is_empty());
         assert!(failure_counts.lock().unwrap().is_empty());
+    }
+
+    struct PeerConnectionTestState {
+        connected_addrs: Arc<Mutex<HashMap<IpAddr, usize>>>,
+        peer_addrs: Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
+        addr_validators: Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
+        discovered_peers: Arc<Mutex<HashSet<String>>>,
+        authenticated_peer_addrs: Arc<Mutex<HashSet<String>>>,
+        authenticated_addr_validators: Arc<Mutex<HashMap<String, indra_core::Bytes32>>>,
+        connected_validator_ids: Arc<Mutex<HashSet<indra_core::Bytes32>>>,
+        bootstrap_peer_addrs: HashSet<String>,
+        genesis_peer_addrs: HashSet<String>,
+        retry_after: Arc<Mutex<HashMap<String, Instant>>>,
+        retry_delay: Arc<Mutex<HashMap<String, Duration>>>,
+        failure_counts: Arc<Mutex<HashMap<String, u32>>>,
+    }
+
+    impl PeerConnectionTestState {
+        fn new() -> Self {
+            Self {
+                connected_addrs: Arc::new(Mutex::new(HashMap::new())),
+                peer_addrs: Arc::new(Mutex::new(HashMap::new())),
+                addr_validators: Arc::new(Mutex::new(HashMap::new())),
+                discovered_peers: Arc::new(Mutex::new(HashSet::new())),
+                authenticated_peer_addrs: Arc::new(Mutex::new(HashSet::new())),
+                authenticated_addr_validators: Arc::new(Mutex::new(HashMap::new())),
+                connected_validator_ids: Arc::new(Mutex::new(HashSet::new())),
+                bootstrap_peer_addrs: HashSet::new(),
+                genesis_peer_addrs: HashSet::new(),
+                retry_after: Arc::new(Mutex::new(HashMap::new())),
+                retry_delay: Arc::new(Mutex::new(HashMap::new())),
+                failure_counts: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn record(
+            &self,
+            local: indra_core::Bytes32,
+            validator: indra_core::Bytes32,
+            addr: SocketAddr,
+            is_outbound: bool,
+        ) -> bool {
+            record_peer_connected_event(
+                local,
+                validator,
+                addr,
+                is_outbound,
+                &self.connected_addrs,
+                &self.peer_addrs,
+                &self.addr_validators,
+                &self.discovered_peers,
+                &self.authenticated_peer_addrs,
+                &self.authenticated_addr_validators,
+                &self.connected_validator_ids,
+                &self.bootstrap_peer_addrs,
+                &self.genesis_peer_addrs,
+                &self.retry_after,
+                &self.retry_delay,
+                &self.failure_counts,
+            )
+        }
+
+        fn gossip_payload(&self) -> Vec<PeerListEntry> {
+            let addrs: Vec<_> = self.peer_addrs.lock().unwrap().values().copied().collect();
+            peer_list_payload_with_identities(
+                addrs,
+                None,
+                &HashSet::new(),
+                &self.addr_validators.lock().unwrap(),
+            )
+        }
+
+        fn persisted(&self, local_p2p_addr: &str) -> Vec<SocketAddr> {
+            peer_addresses_to_persist(
+                &self.discovered_peers.lock().unwrap(),
+                &self.peer_addrs.lock().unwrap(),
+                local_p2p_addr,
+            )
+        }
+    }
+
+    #[test]
+    fn inbound_connection_source_address_not_added_to_discovery() {
+        let local = indra_core::Bytes32::from([0x01; 32]);
+        let validator = indra_core::Bytes32::from([0x02; 32]);
+        let inbound_source: SocketAddr = "203.0.113.80:52154".parse().unwrap();
+        let state = PeerConnectionTestState::new();
+
+        assert!(state.record(local, validator, inbound_source, false));
+
+        assert!(!state
+            .discovered_peers
+            .lock()
+            .unwrap()
+            .contains(&inbound_source.to_string()));
+        assert!(!state.peer_addrs.lock().unwrap().contains_key(&validator));
+        assert!(!state
+            .authenticated_peer_addrs
+            .lock()
+            .unwrap()
+            .contains(&inbound_source.to_string()));
+        assert!(!state
+            .authenticated_addr_validators
+            .lock()
+            .unwrap()
+            .contains_key(&inbound_source.to_string()));
+    }
+
+    #[test]
+    fn inbound_connection_source_address_not_in_outgoing_peerlist() {
+        let local = indra_core::Bytes32::from([0x01; 32]);
+        let validator = indra_core::Bytes32::from([0x02; 32]);
+        let inbound_source: SocketAddr = "203.0.113.80:52154".parse().unwrap();
+        let state = PeerConnectionTestState::new();
+
+        assert!(state.record(local, validator, inbound_source, false));
+
+        let payload = state.gossip_payload();
+        assert!(payload
+            .iter()
+            .all(|entry| entry.addr != inbound_source.to_string()));
+    }
+
+    #[test]
+    fn inbound_connection_source_address_not_persisted() {
+        let local = indra_core::Bytes32::from([0x01; 32]);
+        let validator = indra_core::Bytes32::from([0x02; 32]);
+        let inbound_source: SocketAddr = "203.0.113.80:52154".parse().unwrap();
+        let state = PeerConnectionTestState::new();
+
+        assert!(state.record(local, validator, inbound_source, false));
+
+        assert!(!state.persisted("0.0.0.0:30303").contains(&inbound_source));
+    }
+
+    #[test]
+    fn outbound_connection_target_still_added_to_discovery() {
+        let local = indra_core::Bytes32::from([0x01; 32]);
+        let validator = indra_core::Bytes32::from([0x02; 32]);
+        let dial_target: SocketAddr = "203.0.113.80:30303".parse().unwrap();
+        let state = PeerConnectionTestState::new();
+
+        assert!(state.record(local, validator, dial_target, true));
+
+        assert!(state
+            .discovered_peers
+            .lock()
+            .unwrap()
+            .contains(&dial_target.to_string()));
+        assert_eq!(
+            state.peer_addrs.lock().unwrap().get(&validator).copied(),
+            Some(dial_target)
+        );
+        assert!(state.gossip_payload().iter().any(|entry| {
+            entry.addr == dial_target.to_string() && entry.validator_id == Some(validator)
+        }));
+        assert!(state.persisted("0.0.0.0:30303").contains(&dial_target));
+    }
+
+    #[test]
+    fn inbound_connection_still_tracked_as_live_endpoint() {
+        let local = indra_core::Bytes32::from([0x01; 32]);
+        let validator = indra_core::Bytes32::from([0x02; 32]);
+        let inbound_source: SocketAddr = "203.0.113.80:52154".parse().unwrap();
+        let state = PeerConnectionTestState::new();
+
+        assert!(state.record(local, validator, inbound_source, false));
+
+        assert_eq!(
+            state
+                .addr_validators
+                .lock()
+                .unwrap()
+                .get(&inbound_source)
+                .copied(),
+            Some(validator)
+        );
+        assert!(state
+            .connected_validator_ids
+            .lock()
+            .unwrap()
+            .contains(&validator));
+        assert_eq!(
+            state
+                .connected_addrs
+                .lock()
+                .unwrap()
+                .get(&inbound_source.ip())
+                .copied(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3631,7 +3858,7 @@ mod tests {
             epoch_records: HashMap::new(),
             migration_history: Vec::new(),
         };
-        let state = indra_rpc::handlers::NodeState::with_network(&snapshot, Vec::new(), 0, 0);
+        let state = indra_rpc::handlers::NodeState::with_network(&snapshot, Vec::new(), 0, 0, 0);
 
         match indra_rpc::handlers::dispatch("indra_getHeight", &[], &state) {
             indra_rpc::handlers::DispatchResult::Ready(Ok(result)) => {
@@ -3852,6 +4079,7 @@ mod tests {
             local,
             validator,
             addr,
+            true,
             &connected_addrs,
             &peer_addrs,
             &addr_validators,
