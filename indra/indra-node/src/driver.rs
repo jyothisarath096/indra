@@ -74,6 +74,15 @@ const MAX_ACCEPTED_ROUND_JUMP: u32 = 8;
 /// distinct round/hash combinations.
 const MAX_STALLED_HEIGHT_ENTRIES: usize = 256;
 
+/// Minimum interval before re-emitting the same recovery request.
+///
+/// Several driver paths are tick-driven: the node loop or VRF timeout
+/// machinery can revisit the same condition many times before a peer has
+/// had a chance to answer. Remembering recent request keys prevents those
+/// paths from turning one missing artifact into a tight request/log loop
+/// while still allowing retry after a normal round-scale delay.
+const ACTION_RETRY_DEBOUNCE_MS: u64 = 1_000;
+
 /// Current Tendermint phase of the local round state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundPhase {
@@ -338,6 +347,8 @@ pub struct ConsensusDriver {
     pending_precommit_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Proposals waiting on signed VRF reveal gossip before prevote.
     pending_reveal_blocks: HashMap<(u64, u32, Bytes32), BlockV1>,
+    /// Recent VRF reveal recovery requests keyed by exact missing set.
+    requested_vrf_reveals: HashMap<(u64, u32, Vec<Bytes32>), Instant>,
     /// Tendermint lock state for the current height.
     locked_round: Option<u32>,
     /// Full block hash this validator is locked on.
@@ -394,6 +405,7 @@ impl ConsensusDriver {
             seen_round_votes: HashMap::new(),
             pending_precommit_quorum: HashSet::new(),
             pending_reveal_blocks: HashMap::new(),
+            requested_vrf_reveals: HashMap::new(),
             locked_round: None,
             locked_value: None,
             locked_value_hash: None,
@@ -757,6 +769,7 @@ impl ConsensusDriver {
         self.buffered_votes.clear();
         self.requested_proposals.clear();
         self.pending_precommit_quorum.clear();
+        self.requested_vrf_reveals.clear();
         self.vote_collectors.clear();
         self.seen_round_votes.clear();
         self.vrf_states = [None, None];
@@ -817,6 +830,8 @@ impl ConsensusDriver {
         self.current_phase = RoundPhase::Propose;
         self.precommit_phase_started_at = None;
         let height = self.next_height();
+        self.requested_vrf_reveals
+            .retain(|(h, r, _), _| *h == height && *r >= round);
         if vrf_commit_reveal_election_active(height) {
             let next = self
                 .vrf_states
@@ -915,7 +930,26 @@ impl ConsensusDriver {
             .collect()
     }
 
-    fn request_missing_reveals_for_slot(&self, slot: usize) -> Vec<DriverAction> {
+    fn should_emit_vrf_reveal_request(
+        &mut self,
+        height: u64,
+        round: u32,
+        missing_validator_ids: &[Bytes32],
+    ) -> bool {
+        let key = (height, round, missing_validator_ids.to_vec());
+        let now = Instant::now();
+        if self
+            .requested_vrf_reveals
+            .get(&key)
+            .is_some_and(|last| last.elapsed().as_millis() < ACTION_RETRY_DEBOUNCE_MS as u128)
+        {
+            return false;
+        }
+        self.requested_vrf_reveals.insert(key, now);
+        true
+    }
+
+    fn request_missing_reveals_for_slot(&mut self, slot: usize) -> Vec<DriverAction> {
         let Some(state) = self.vrf_states.get(slot).and_then(|state| state.as_ref()) else {
             return vec![];
         };
@@ -925,20 +959,26 @@ impl ConsensusDriver {
             return vec![];
         }
 
-        let missing_validator_ids = self.missing_reveal_validator_ids(state);
+        let height = state.height;
+        let round = state.round;
+        let mut missing_validator_ids = self.missing_reveal_validator_ids(state);
+        missing_validator_ids.sort_by_key(|id| id.0);
         if missing_validator_ids.is_empty() {
+            return vec![];
+        }
+        if !self.should_emit_vrf_reveal_request(height, round, &missing_validator_ids) {
             return vec![];
         }
 
         eprintln!(
             "[vrf] local reveal set below quorum for height={} round={} — requesting {} missing reveal(s)",
-            state.height,
-            state.round,
+            height,
+            round,
             missing_validator_ids.len(),
         );
         vec![DriverAction::RequestVrfReveals {
-            height: state.height,
-            round: state.round,
+            height,
+            round,
             missing_validator_ids,
         }]
     }
@@ -2928,6 +2968,8 @@ impl ConsensusDriver {
         let Some(slot) = self.vrf_slot_index(height, round) else {
             return vec![];
         };
+        self.requested_vrf_reveals
+            .retain(|(h, r, _), _| *h != height || *r != round);
         let mut actions = Vec::new();
         for reveal in reveals {
             if reveal.height == height && reveal.round == round {
@@ -4061,6 +4103,67 @@ mod tests {
                 && *missing_validator_ids == expected_missing
         ));
         assert!(driver.vrf_election_result(height, round).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sparse_reveal_request_is_debounced_until_retry_window_or_response() {
+        let local_seed = [0xC9u8; 32];
+        let seed_b = [0xCAu8; 32];
+        let seed_c = [0xCBu8; 32];
+        let seed_d = [0xCCu8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "sparse_reveal_request_debounce");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.commits.insert(commit_a.validator_id, commit_a);
+        state.reveals.insert(reveal_a.validator_id, reveal_a);
+        driver.vrf_states[0] = Some(state);
+
+        let first = driver.advance_vrf_round(height, round);
+        assert!(matches!(
+            first.as_slice(),
+            [DriverAction::RequestVrfReveals { .. }]
+        ));
+        let second = driver.advance_vrf_round(height, round);
+        assert!(
+            second.is_empty(),
+            "identical sparse-reveal condition must not re-emit immediately"
+        );
+
+        for at in driver.requested_vrf_reveals.values_mut() {
+            *at = Instant::now() - Duration::from_millis(ACTION_RETRY_DEBOUNCE_MS + 1);
+        }
+        let retry = driver.advance_vrf_round(height, round);
+        assert!(
+            retry
+                .iter()
+                .any(|action| matches!(action, DriverAction::RequestVrfReveals { .. })),
+            "same request should be allowed again after debounce window"
+        );
+
+        let _ = driver.process(DriverEvent::VrfRevealsResponse {
+            from: "127.0.0.1:9914".parse().unwrap(),
+            height,
+            round,
+            reveals: vec![],
+        });
+        assert!(
+            driver.requested_vrf_reveals.is_empty(),
+            "response path clears in-flight reveal request debounce state"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

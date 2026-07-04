@@ -48,6 +48,7 @@ const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
+const PROPOSAL_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_DISCOVERED_PEERS: usize = 256;
 const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
@@ -405,6 +406,16 @@ fn choose_proposal_mode(
     } else {
         ProposalMode::None
     }
+}
+
+fn proposal_failure_backoff_active(
+    failed_at_slot: Option<((u64, u32), Instant)>,
+    height: u64,
+    round: u32,
+) -> bool {
+    failed_at_slot.is_some_and(|((h, r), at)| {
+        h == height && r == round && at.elapsed() < PROPOSAL_FAILURE_BACKOFF
+    })
 }
 
 fn build_handshake_config(engine: &NodeEngine) -> Option<HandshakeConfig> {
@@ -1741,6 +1752,7 @@ fn main() {
             std::thread::sleep(Duration::from_secs(3));
 
             let mut proposed_at_slot: Option<(u64, u32)> = None;
+            let mut failed_proposal_at_slot: Option<((u64, u32), Instant)> = None;
             let mut last_commit_time: Option<std::time::SystemTime> = None;
             let mut last_observed_height = 0u64;
             let mut phase_started_at = Instant::now();
@@ -1827,13 +1839,7 @@ fn main() {
                 if sync_target.is_none() {
                     match phase {
                         RoundPhase::Propose => {
-                            let (
-                                should_propose,
-                                next_height,
-                                election_result_hash,
-                                vrf_reveals,
-                                vrf_actions,
-                            ) = {
+                            let (should_propose, next_height, proposal_round, vrf_actions) = {
                                 let mut d = driver.lock().unwrap();
                                 let epoch_seed = indra_core::types::primitives::Bytes32::from(
                                     indra_crypto::sha256(&d.engine.state.tip_hash.0),
@@ -1862,8 +1868,7 @@ fn main() {
                                         d.can_propose()
                                             && d.engine.config.bootstrap_peers.is_empty(),
                                         height,
-                                        None,
-                                        Vec::new(),
+                                        round,
                                         Vec::new(),
                                     )
                                 } else {
@@ -1889,13 +1894,7 @@ fn main() {
                                     } else {
                                         d.can_propose() && d.engine.is_proposer(&election)
                                     };
-                                    (
-                                        should,
-                                        height,
-                                        election_result.map(|result| result.hash()),
-                                        d.vrf_reveal_evidence(height, round),
-                                        vrf_actions,
-                                    )
+                                    (should, height, round, vrf_actions)
                                 }
                             };
                             if !vrf_actions.is_empty() {
@@ -1913,7 +1912,7 @@ fn main() {
                             }
 
                             let already_have_proposal = proposed_at_slot
-                                == Some((next_height, round))
+                                == Some((next_height, proposal_round))
                                 || driver
                                     .lock()
                                     .unwrap()
@@ -1928,7 +1927,7 @@ fn main() {
                                 valid_reproposal.is_some(),
                                 proposed_at_slot,
                                 next_height,
-                                round,
+                                proposal_round,
                                 already_have_proposal,
                             );
 
@@ -1936,6 +1935,22 @@ fn main() {
                                 proposal_mode,
                                 ProposalMode::Fresh | ProposalMode::Reproposal
                             ) {
+                                if proposal_failure_backoff_active(
+                                    failed_proposal_at_slot,
+                                    next_height,
+                                    proposal_round,
+                                ) {
+                                    match height_rx.recv_timeout(Duration::from_millis(100)) {
+                                        Ok(()) => {
+                                            phase_started_at = Instant::now();
+                                            proposed_at_slot = None;
+                                            failed_proposal_at_slot = None;
+                                        }
+                                        Err(_) => {}
+                                    }
+                                    continue;
+                                }
+
                                 let time_since_last_commit = last_commit_time
                                     .and_then(|t| t.elapsed().ok())
                                     .unwrap_or(Duration::from_secs(MIN_BLOCK_INTERVAL_SECS));
@@ -1962,78 +1977,118 @@ fn main() {
                                     );
                                     let height = d.engine.state.height + 1;
                                     let round = d.current_round();
-                                    let candidates: Vec<
-                                        indra_consensus::proposer::ProposerCandidate,
-                                    > = d
-                                        .engine
-                                        .state
-                                        .validators
-                                        .active_validators()
-                                        .filter_map(|v| {
-                                            v.vrf_pk.map(|vrf_pk| {
-                                                indra_consensus::proposer::ProposerCandidate {
-                                                    validator_id: v.validator_id,
-                                                    vrf_pubkey: vrf_pk,
-                                                    verified_vrf_output: None,
-                                                    stake: v.stake_spark,
-                                                }
+                                    if height != next_height || round != proposal_round {
+                                        eprintln!(
+                                            "[consensus] proposal skipped: slot changed while preparing proposal (captured height={} round={}, current height={} round={})",
+                                            next_height, proposal_round, height, round,
+                                        );
+                                        None
+                                    } else {
+                                        let candidates: Vec<
+                                            indra_consensus::proposer::ProposerCandidate,
+                                        > = d
+                                            .engine
+                                            .state
+                                            .validators
+                                            .active_validators()
+                                            .filter_map(|v| {
+                                                v.vrf_pk.map(|vrf_pk| {
+                                                    indra_consensus::proposer::ProposerCandidate {
+                                                        validator_id: v.validator_id,
+                                                        vrf_pubkey: vrf_pk,
+                                                        verified_vrf_output: None,
+                                                        stake: v.stake_spark,
+                                                    }
+                                                })
                                             })
-                                        })
-                                        .collect();
-                                    let election = indra_consensus::proposer::ProposerElection {
-                                        epoch_seed,
-                                        height,
-                                        round,
-                                        candidates,
-                                    };
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    let polc_round = d.proposal_polc_round(height);
-                                    let last_qc_bytes = d.last_qc_bytes();
-                                    let proposal_result =
-                                        if matches!(proposal_mode, ProposalMode::Reproposal) {
-                                            let (valid_block, valid_round) = valid_reproposal
-                                                .expect("reproposal mode requires a valid block");
-                                            d.engine.repropose(
-                                                &valid_block,
+                                            .collect();
+                                        let election =
+                                            indra_consensus::proposer::ProposerElection {
+                                                epoch_seed,
+                                                height,
                                                 round,
-                                                Some(valid_round),
-                                                &election,
-                                                valid_block.header.timestamp,
-                                                last_qc_bytes,
-                                                election_result_hash,
-                                                vrf_reveals.clone(),
-                                            )
+                                                candidates,
+                                            };
+                                        let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
+                                        let election_result = if active {
+                                            d.vrf_election_result(height, round)
                                         } else {
-                                            d.engine.propose(
-                                                &election,
-                                                timestamp,
-                                                last_qc_bytes,
-                                                polc_round,
-                                                election_result_hash,
-                                                vrf_reveals.clone(),
-                                            )
+                                            None
                                         };
-                                    match proposal_result {
-                                        Ok(block) => {
-                                            let actions = d.process(DriverEvent::InboundBlock {
-                                                from: None,
-                                                block: block.clone(),
-                                            });
-                                            Some((block, actions))
-                                        }
-                                        Err(indra_node::error::NodeError::MissingQc { height }) => {
+                                        if active
+                                            && !election_result.is_some_and(|result| {
+                                                Some(result.elected_validator_id)
+                                                    == d.engine.validator_id()
+                                            })
+                                        {
                                             eprintln!(
-                                                "[consensus] proposal skipped at height {}: no QC for previous block",
-                                                height
+                                                "[consensus] proposal skipped at height={} round={}: no current quorum-backed local election result for this validator",
+                                                height, round,
                                             );
                                             None
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[consensus] proposal failed: {}", e);
-                                            None
+                                        } else {
+                                            let election_result_hash =
+                                                election_result.map(|result| result.hash());
+                                            let vrf_reveals = d.vrf_reveal_evidence(height, round);
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            let polc_round = d.proposal_polc_round(height);
+                                            let last_qc_bytes = d.last_qc_bytes();
+                                            let proposal_result = if matches!(
+                                                proposal_mode,
+                                                ProposalMode::Reproposal
+                                            ) {
+                                                let (valid_block, valid_round) = valid_reproposal
+                                                    .expect(
+                                                        "reproposal mode requires a valid block",
+                                                    );
+                                                d.engine.repropose(
+                                                    &valid_block,
+                                                    round,
+                                                    Some(valid_round),
+                                                    &election,
+                                                    valid_block.header.timestamp,
+                                                    last_qc_bytes,
+                                                    election_result_hash,
+                                                    vrf_reveals.clone(),
+                                                )
+                                            } else {
+                                                d.engine.propose(
+                                                    &election,
+                                                    timestamp,
+                                                    last_qc_bytes,
+                                                    polc_round,
+                                                    election_result_hash,
+                                                    vrf_reveals.clone(),
+                                                )
+                                            };
+                                            match proposal_result {
+                                                Ok(block) => {
+                                                    let actions =
+                                                        d.process(DriverEvent::InboundBlock {
+                                                            from: None,
+                                                            block: block.clone(),
+                                                        });
+                                                    Some((block, actions))
+                                                }
+                                                Err(indra_node::error::NodeError::MissingQc {
+                                                    height,
+                                                }) => {
+                                                    eprintln!(
+                                                        "[consensus] proposal skipped at height {}: no QC for previous block",
+                                                        height
+                                                    );
+                                                    None
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[consensus] proposal failed: {}", e);
+                                                    failed_proposal_at_slot =
+                                                        Some(((height, round), Instant::now()));
+                                                    None
+                                                }
+                                            }
                                         }
                                     }
                                 };
@@ -3247,6 +3302,25 @@ mod tests {
         let mode = choose_proposal_mode(true, true, None, 10, 3, true);
 
         assert_eq!(mode, ProposalMode::Reproposal);
+    }
+
+    #[test]
+    fn proposal_failure_backoff_suppresses_same_slot_retry() {
+        let failed = Some(((42, 7), Instant::now()));
+
+        assert!(proposal_failure_backoff_active(failed, 42, 7));
+        assert!(!proposal_failure_backoff_active(failed, 42, 8));
+        assert!(!proposal_failure_backoff_active(failed, 43, 7));
+    }
+
+    #[test]
+    fn proposal_failure_backoff_allows_retry_after_window() {
+        let failed = Some((
+            (42, 7),
+            Instant::now() - PROPOSAL_FAILURE_BACKOFF - Duration::from_millis(1),
+        ));
+
+        assert!(!proposal_failure_backoff_active(failed, 42, 7));
     }
 
     #[test]
