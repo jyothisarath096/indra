@@ -14,8 +14,8 @@ use std::net::SocketAddr;
 use indra_consensus::mempool::Mempool;
 use indra_consensus::{
     proposer::{
-        compute_vrf_input, elect_proposer, elect_proposer_from_reveals, ProposerCandidate,
-        ProposerElection, VRF_FALLBACK_OUTPUT,
+        compute_fallback_election_result, compute_vrf_input, elect_proposer,
+        elect_proposer_from_reveals, ProposerCandidate, ProposerElection, VRF_FALLBACK_OUTPUT,
     },
     qc::{verify_qc_strict, QcValidator},
 };
@@ -23,7 +23,7 @@ use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
 use indra_core::types::primitives::{
     bps_of, reveal_set_commitment_active, vrf_commit_reveal_election_active, Bytes32,
-    CONSENSUS_QUORUM_BPS,
+    CONSENSUS_QUORUM_BPS, MAX_VRF_EMPTY_REVEAL_ROUNDS,
 };
 use indra_core::types::vrf_election::{compute_reveal_set_commitment, VrfElectionResult};
 use indra_core::EpochRecord;
@@ -538,17 +538,6 @@ pub(crate) fn verify_reveal_set_evidence(
         revealed_outputs.insert(evidence.validator_id, evidence.vrf_output);
     }
 
-    let total_stake = state.validators.total_active_stake();
-    if total_stake == 0 || revealed_stake < bps_of(total_stake, CONSENSUS_QUORUM_BPS) {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "vrf reveal set below quorum: revealed_stake={} total_stake={} quorum_bps={}",
-                revealed_stake, total_stake, CONSENSUS_QUORUM_BPS,
-            ),
-        });
-    }
-
     let candidates: Vec<_> = state
         .validators
         .active_validators()
@@ -574,6 +563,37 @@ pub(crate) fn verify_reveal_set_evidence(
         round: block.header.proposer_round,
         candidates,
     };
+
+    let total_stake = state.validators.total_active_stake();
+    if total_stake == 0 || revealed_stake < bps_of(total_stake, CONSENSUS_QUORUM_BPS) {
+        if block.vrf_reveals.is_empty() {
+            let mut fallback =
+                compute_fallback_election_result(&election).map_err(NodeError::Consensus)?;
+            fallback.reveal_set_commitment = compute_reveal_set_commitment(&[]);
+            if header_hash == fallback.hash() {
+                let minimum_fallback_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
+                if block.header.proposer_round < minimum_fallback_round {
+                    return Err(NodeError::BlockInvalid {
+                        height: block.header.height,
+                        reason: format!(
+                            "fallback election claimed at round {} before minimum fallback round {}",
+                            block.header.proposer_round, minimum_fallback_round,
+                        ),
+                    });
+                }
+                return Ok(fallback);
+            }
+        }
+
+        return Err(NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!(
+                "vrf reveal set below quorum: revealed_stake={} total_stake={} quorum_bps={}",
+                revealed_stake, total_stake, CONSENSUS_QUORUM_BPS,
+            ),
+        });
+    }
+
     let mut result =
         elect_proposer_from_reveals(&election, &revealed_outputs).map_err(NodeError::Consensus)?;
     result.reveal_set_commitment = compute_reveal_set_commitment(&block.vrf_reveals);
@@ -901,7 +921,16 @@ mod tests {
         active_seeds: &[u8],
         reveal_seeds: &[u8],
     ) -> BlockV1 {
-        let round = 0u32;
+        make_reveal_set_block_at_round(state, height, 0, active_seeds, reveal_seeds)
+    }
+
+    fn make_reveal_set_block_at_round(
+        state: &ChainState,
+        height: u64,
+        round: u32,
+        active_seeds: &[u8],
+        reveal_seeds: &[u8],
+    ) -> BlockV1 {
         let election = build_election(state, height, round);
         let mut revealed_outputs = std::collections::BTreeMap::new();
         let mut evidence = Vec::new();
@@ -1565,6 +1594,96 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fallback_reveal_set_evidence_verifies_without_quorum() {
+        let mut state = ChainState::new_genesis();
+        for seed in [0x55, 0x56, 0x57, 0x58] {
+            install_active_validator(&mut state, seed, 10_000, true, true);
+        }
+
+        let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
+        let block = make_reveal_set_block_at_round(
+            &state,
+            u64::MAX,
+            threshold_round,
+            &[0x55, 0x56, 0x57, 0x58],
+            &[],
+        );
+        let result = verify_reveal_set_evidence(&block, &state).unwrap();
+
+        assert!(result.fallback_used);
+        assert_eq!(
+            result.reveal_set_commitment,
+            compute_reveal_set_commitment(&[]),
+            "deterministic fallback is verified from the canonical empty reveal evidence set"
+        );
+        assert_eq!(Some(result.hash()), block.header.election_result_hash);
+    }
+
+    #[test]
+    fn fallback_claim_below_round_threshold_rejected() {
+        let mut state = ChainState::new_genesis();
+        for seed in [0x59, 0x5A, 0x5B, 0x5C] {
+            install_active_validator(&mut state, seed, 10_000, true, true);
+        }
+
+        let block =
+            make_reveal_set_block_at_round(&state, u64::MAX, 0, &[0x59, 0x5A, 0x5B, 0x5C], &[]);
+        let err = verify_reveal_set_evidence(&block, &state).unwrap_err();
+
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("before minimum fallback round"),
+                    "unexpected rejection reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_claim_at_threshold_round_accepted() {
+        let mut state = ChainState::new_genesis();
+        for seed in [0x5D, 0x5E, 0x5F, 0x60] {
+            install_active_validator(&mut state, seed, 10_000, true, true);
+        }
+
+        let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
+        let block = make_reveal_set_block_at_round(
+            &state,
+            u64::MAX,
+            threshold_round,
+            &[0x5D, 0x5E, 0x5F, 0x60],
+            &[],
+        );
+        let result = verify_reveal_set_evidence(&block, &state).unwrap();
+
+        assert!(result.fallback_used);
+        assert_eq!(result.round, threshold_round);
+    }
+
+    #[test]
+    fn fallback_claim_above_threshold_round_accepted() {
+        let mut state = ChainState::new_genesis();
+        for seed in [0x65, 0x66, 0x67, 0x68] {
+            install_active_validator(&mut state, seed, 10_000, true, true);
+        }
+
+        let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
+        let block = make_reveal_set_block_at_round(
+            &state,
+            u64::MAX,
+            threshold_round.saturating_add(3),
+            &[0x65, 0x66, 0x67, 0x68],
+            &[],
+        );
+        let result = verify_reveal_set_evidence(&block, &state).unwrap();
+
+        assert!(result.fallback_used);
+        assert!(result.round > threshold_round);
     }
 
     #[test]

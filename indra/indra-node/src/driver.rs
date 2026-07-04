@@ -384,8 +384,19 @@ pub struct ConsensusDriver {
     vrf_states: [Option<VrfRoundState>; 2],
     /// Locally computed VRF outputs retained until reveal.
     local_vrf_rounds: BTreeMap<(u64, u32), LocalVrfRoundState>,
-    /// Consecutive empty-reveal rounds at the current height.
+    /// Consecutive rounds at the current height without a usable reveal set.
+    ///
+    /// Before reveal-set commitments activate, this means zero reveals. After
+    /// activation, it means zero or non-zero reveals below the 2/3 stake quorum.
+    /// Both cases must feed the same Option-D deterministic fallback counter so
+    /// liveness is bounded by a fixed round count, not validator count or gossip
+    /// timing.
     consecutive_empty_reveal_rounds: u32,
+    /// Last insufficient reveal round already counted toward fallback.
+    ///
+    /// Reveal recovery can be retried within the same round after debounce, but
+    /// the fixed fallback counter must advance at most once per round.
+    last_insufficient_reveal_round_counted: Option<(u64, u32)>,
     /// Highest block height for which this driver has already pipelined its
     /// local round-0 VRF commit.
     highest_pipelined_vrf_commit_height: u64,
@@ -423,6 +434,7 @@ impl ConsensusDriver {
             vrf_states: [None, None],
             local_vrf_rounds: BTreeMap::new(),
             consecutive_empty_reveal_rounds: 0,
+            last_insufficient_reveal_round_counted: None,
             highest_pipelined_vrf_commit_height: 0,
         };
         driver.highest_pipelined_vrf_commit_height = driver.engine.state.height;
@@ -756,6 +768,8 @@ impl ConsensusDriver {
     pub fn reset_round(&mut self) {
         self.prune_future_proposals();
         self.valid_block = None;
+        self.consecutive_empty_reveal_rounds = 0;
+        self.last_insufficient_reveal_round_counted = None;
         self.start_round(0);
         self.apply_vote_safety();
     }
@@ -775,6 +789,7 @@ impl ConsensusDriver {
         self.vrf_states = [None, None];
         self.local_vrf_rounds.clear();
         self.consecutive_empty_reveal_rounds = 0;
+        self.last_insufficient_reveal_round_counted = None;
         self.highest_pipelined_vrf_commit_height = self.engine.state.height;
         self.locked_round = None;
         self.locked_value = None;
@@ -1297,15 +1312,43 @@ impl ConsensusDriver {
         if reveal_set_commitment_active(state_height) {
             let revealed_stake = self.revealed_stake(state);
             if !self.quorum_stake_reached(revealed_stake) {
+                let counted_key = (state_height, state_round);
+                if self.last_insufficient_reveal_round_counted != Some(counted_key) {
+                    self.consecutive_empty_reveal_rounds =
+                        self.consecutive_empty_reveal_rounds.saturating_add(1);
+                    self.last_insufficient_reveal_round_counted = Some(counted_key);
+                }
                 eprintln!(
-                    "[vrf] election pending for height={} round={}: reveal set below quorum (revealed_stake={} total_stake={} quorum_bps={})",
+                    "[vrf] election pending for height={} round={}: reveal set below quorum (revealed_stake={} total_stake={} quorum_bps={} insufficient rounds {}/{})",
                     state_height,
                     state_round,
                     revealed_stake,
                     self.total_active_stake(),
                     CONSENSUS_QUORUM_BPS,
+                    self.consecutive_empty_reveal_rounds,
+                    MAX_VRF_EMPTY_REVEAL_ROUNDS,
                 );
-                return None;
+                if self.consecutive_empty_reveal_rounds < MAX_VRF_EMPTY_REVEAL_ROUNDS {
+                    return None;
+                }
+
+                let result = compute_fallback_election_result(&election);
+                let Ok(mut result) = result else {
+                    return None;
+                };
+                result.reveal_set_commitment = compute_reveal_set_commitment(&[]);
+                if let Some(state) = self.vrf_states[slot].as_mut() {
+                    state.phase = VrfRoundPhase::Fallback;
+                    state.election_result = Some(result);
+                }
+                eprintln!(
+                    "[vrf] election result computed for height={} round={}: elected={} fallback={} after insufficient reveal threshold",
+                    result.height,
+                    result.round,
+                    hex::encode(&result.elected_validator_id.0[..4]),
+                    result.fallback_used,
+                );
+                return Some(result);
             }
         }
         if revealed.is_empty() {
@@ -1359,6 +1402,7 @@ impl ConsensusDriver {
         }
         if let Some(state) = self.vrf_states[slot].as_mut() {
             self.consecutive_empty_reveal_rounds = 0;
+            self.last_insufficient_reveal_round_counted = None;
             state.phase = VrfRoundPhase::Complete;
             state.election_result = Some(result);
         }
@@ -1480,7 +1524,20 @@ impl ConsensusDriver {
     pub fn vrf_reveal_evidence(&self, height: u64, round: u32) -> Vec<VrfRevealEvidence> {
         self.vrf_slot_index(height, round)
             .and_then(|slot| self.vrf_states[slot].as_ref())
-            .map(|state| reveal_evidence_from_reveals(state.reveals.values().cloned()))
+            .map(|state| {
+                if state
+                    .election_result
+                    .is_some_and(|result| result.fallback_used)
+                {
+                    // Option-D fallback is a public deterministic election; no
+                    // reveal set produced it. Keep the committed evidence set
+                    // canonical and count-independent even if this node happened
+                    // to see a few sub-quorum reveals before fallback.
+                    Vec::new()
+                } else {
+                    reveal_evidence_from_reveals(state.reveals.values().cloned())
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -4108,6 +4165,213 @@ mod tests {
     }
 
     #[test]
+    fn sub_quorum_reveals_count_toward_fallback_threshold() {
+        let local_seed = [0xC1u8; 32];
+        let seed_b = [0xC2u8; 32];
+        let seed_c = [0xC3u8; 32];
+        let seed_d = [0xC4u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "sub_quorum_counts_to_fallback");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xC1; 32]);
+
+        let height = u64::MAX;
+        for round in 0..MAX_VRF_EMPTY_REVEAL_ROUNDS {
+            let (commit_a, reveal_a) =
+                signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+            let mut state = VrfRoundState::new(height, round);
+            state.phase = VrfRoundPhase::Reveal;
+            state.reveal_started_at =
+                Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+            state.commits.insert(commit_a.validator_id, commit_a);
+            state.reveals.insert(reveal_a.validator_id, reveal_a);
+            driver.vrf_states[0] = Some(state);
+
+            let result = driver.compute_and_store_vrf_election(0);
+            assert_eq!(
+                driver.consecutive_empty_reveal_rounds,
+                round + 1,
+                "sub-quorum non-zero reveal rounds must advance the same bounded fallback counter as zero-reveal rounds"
+            );
+            if round + 1 < MAX_VRF_EMPTY_REVEAL_ROUNDS {
+                assert!(
+                    result.is_none(),
+                    "fallback must wait until the configured insufficient-reveal threshold"
+                );
+            } else {
+                let result = result.expect("fallback should be produced at threshold");
+                assert!(result.fallback_used);
+                assert_eq!(
+                    result.reveal_set_commitment,
+                    compute_reveal_set_commitment(&[]),
+                    "deterministic fallback commits to the canonical empty reveal evidence set"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn permanent_reveal_deficit_still_guarantees_progress() {
+        let local_seed = [0xC5u8; 32];
+        let seed_b = [0xC6u8; 32];
+        let seed_c = [0xC7u8; 32];
+        let seed_d = [0xC8u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "permanent_deficit_fallback");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xC5; 32]);
+
+        let height = u64::MAX;
+        let mut fallback = None;
+        for round in 0..MAX_VRF_EMPTY_REVEAL_ROUNDS {
+            let (commit_a, reveal_a) =
+                signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+            let mut state = VrfRoundState::new(height, round);
+            state.phase = VrfRoundPhase::Reveal;
+            state.reveal_started_at =
+                Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+            state.commits.insert(commit_a.validator_id, commit_a);
+            state.reveals.insert(reveal_a.validator_id, reveal_a);
+            driver.vrf_states[0] = Some(state);
+
+            let actions = driver.advance_vrf_round(height, round);
+            if round + 1 < MAX_VRF_EMPTY_REVEAL_ROUNDS {
+                assert!(
+                    actions
+                        .iter()
+                        .any(|action| matches!(action, DriverAction::RequestVrfReveals { .. })),
+                    "reveal recovery should still be attempted while the bounded fallback counter advances"
+                );
+            }
+            fallback = driver.vrf_election_result(height, round);
+        }
+
+        let fallback = fallback.expect("permanent reveal deficit must produce bounded fallback");
+        assert!(fallback.fallback_used);
+        assert_eq!(
+            fallback.reveal_set_commitment,
+            compute_reveal_set_commitment(&[]),
+            "fallback is independent of validator count and sparse local gossip state"
+        );
+        assert!(
+            driver
+                .vrf_reveal_evidence(height, MAX_VRF_EMPTY_REVEAL_ROUNDS - 1)
+                .is_empty(),
+            "fallback block bodies must carry the canonical empty reveal evidence set"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn request_and_fallback_counter_operate_concurrently() {
+        let local_seed = [0xC9u8; 32];
+        let seed_b = [0xCAu8; 32];
+        let seed_c = [0xCBu8; 32];
+        let seed_d = [0xCCu8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "request_and_counter_concurrent");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+
+        let height = u64::MAX;
+        let round = 0;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Reveal;
+        state.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        state.commits.insert(commit_a.validator_id, commit_a);
+        state.reveals.insert(reveal_a.validator_id, reveal_a);
+        driver.vrf_states[0] = Some(state);
+
+        let actions = driver.advance_vrf_round(height, round);
+
+        assert_eq!(
+            driver.consecutive_empty_reveal_rounds, 1,
+            "sub-quorum request path must not bypass fallback accounting"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::RequestVrfReveals { .. })),
+            "reveal recovery request must still fire during fallback countdown"
+        );
+        assert!(driver.vrf_election_result(height, round).is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quorum_reveal_after_sub_quorum_resets_fallback_counter() {
+        let local_seed = [0xCDu8; 32];
+        let seed_b = [0xCEu8; 32];
+        let seed_c = [0xCFu8; 32];
+        let seed_d = [0xD0u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "sub_quorum_then_quorum_reset");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xCD; 32]);
+
+        let height = u64::MAX;
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, 0, DEFAULT_CHAIN_ID);
+        let mut sparse = VrfRoundState::new(height, 0);
+        sparse.phase = VrfRoundPhase::Reveal;
+        sparse.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        sparse.commits.insert(commit_a.validator_id, commit_a);
+        sparse.reveals.insert(reveal_a.validator_id, reveal_a);
+        driver.vrf_states[0] = Some(sparse);
+        assert!(driver.compute_and_store_vrf_election(0).is_none());
+        assert_eq!(driver.consecutive_empty_reveal_rounds, 1);
+
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, 1, DEFAULT_CHAIN_ID);
+        let (commit_b, reveal_b) = signed_vrf_pair(&driver, seed_b, height, 1, DEFAULT_CHAIN_ID);
+        let (commit_c, reveal_c) = signed_vrf_pair(&driver, seed_c, height, 1, DEFAULT_CHAIN_ID);
+        let mut quorum = VrfRoundState::new(height, 1);
+        quorum.phase = VrfRoundPhase::Reveal;
+        quorum.reveal_started_at =
+            Some(Instant::now() - Duration::from_millis(VRF_REVEAL_WINDOW_MS + 10));
+        for commit in [commit_a, commit_b, commit_c] {
+            quorum.commits.insert(commit.validator_id, commit);
+        }
+        for reveal in [reveal_a, reveal_b, reveal_c] {
+            quorum.reveals.insert(reveal.validator_id, reveal);
+        }
+        driver.vrf_states[0] = Some(quorum);
+
+        let result = driver
+            .compute_and_store_vrf_election(0)
+            .expect("quorum reveal set should complete normal election");
+        assert!(!result.fallback_used);
+        assert_eq!(
+            driver.consecutive_empty_reveal_rounds, 0,
+            "quorum-backed recovery must reset the bounded fallback counter"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sparse_reveal_request_is_debounced_until_retry_window_or_response() {
         let local_seed = [0xC9u8; 32];
         let seed_b = [0xCAu8; 32];
@@ -4299,6 +4563,42 @@ mod tests {
             proposal.is_err(),
             "post-activation proposal must not be produced without a quorum-backed election hash"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fallback_round_depth_check_ignores_desynced_local_counter() {
+        let local_seed = [0xE5u8; 32];
+        let seed_b = [0xE6u8; 32];
+        let seed_c = [0xE7u8; 32];
+        let seed_d = [0xE8u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "fallback_depth_desync");
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, seed_b, "b");
+        install_active_validator(&mut driver, seed_c, "c");
+        install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xE8; 32]);
+
+        driver.consecutive_empty_reveal_rounds = MAX_VRF_EMPTY_REVEAL_ROUNDS;
+        let premature_fallback =
+            reveal_set_block_from_reveals(&driver, &[local_seed, seed_b, seed_c, seed_d], &[]);
+        assert_eq!(premature_fallback.header.proposer_round, 0);
+
+        let err =
+            crate::sync::verify_reveal_set_evidence(&premature_fallback, &driver.engine.state)
+                .unwrap_err();
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("before minimum fallback round"),
+                    "fallback depth must be enforced from block round, not local counter: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
