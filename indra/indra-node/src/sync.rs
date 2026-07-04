@@ -881,6 +881,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
+            election_result: None,
             vrf_reveals: vec![],
         };
         produce_block(&template, state, &Mempool::default_config(), &election).unwrap()

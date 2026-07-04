@@ -221,6 +221,7 @@ fn mempool_to_block_pipeline() {
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
+        election_result: None,
         vrf_reveals: vec![],
     };
 

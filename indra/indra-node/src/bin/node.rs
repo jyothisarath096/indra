@@ -2044,7 +2044,7 @@ fn main() {
                                                     .expect(
                                                         "reproposal mode requires a valid block",
                                                     );
-                                                d.engine.repropose(
+                                                d.engine.repropose_with_election_result(
                                                     &valid_block,
                                                     round,
                                                     Some(valid_round),
@@ -2052,15 +2052,17 @@ fn main() {
                                                     valid_block.header.timestamp,
                                                     last_qc_bytes,
                                                     election_result_hash,
+                                                    election_result,
                                                     vrf_reveals.clone(),
                                                 )
                                             } else {
-                                                d.engine.propose(
+                                                d.engine.propose_with_election_result(
                                                     &election,
                                                     timestamp,
                                                     last_qc_bytes,
                                                     polc_round,
                                                     election_result_hash,
+                                                    election_result,
                                                     vrf_reveals.clone(),
                                                 )
                                             };

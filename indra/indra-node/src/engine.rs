@@ -501,6 +501,33 @@ impl NodeEngine {
         election_result_hash: Option<Bytes32>,
         vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
+        self.propose_with_election_result(
+            election,
+            timestamp,
+            prev_qc_bytes,
+            polc_round,
+            election_result_hash,
+            None,
+            vrf_reveals,
+        )
+    }
+
+    /// Propose a block using an authoritative commit-reveal election result.
+    ///
+    /// The consensus driver owns post-activation reveal-set election state.
+    /// This entry point lets the driver pass that quorum-backed result through
+    /// to block production so producer validation does not recompute a second,
+    /// potentially different proposer-election result from local-only data.
+    pub fn propose_with_election_result(
+        &mut self,
+        election: &ProposerElection,
+        timestamp: u64,
+        prev_qc_bytes: Vec<u8>,
+        polc_round: Option<u32>,
+        election_result_hash: Option<Bytes32>,
+        election_result: Option<VrfElectionResult>,
+        vrf_reveals: Vec<VrfRevealEvidence>,
+    ) -> NodeResult<BlockV1> {
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && prev_qc_bytes.is_empty() {
             eprintln!(
@@ -522,8 +549,10 @@ impl NodeEngine {
 
         self.prune_invalid_governance_ops();
 
-        let election_result_hash =
-            election_result_hash.or_else(|| self.local_election_result_hash(election));
+        let election_result_hash = election_result
+            .map(|result| result.hash())
+            .or(election_result_hash)
+            .or_else(|| self.local_election_result_hash(election));
         let template = BlockTemplate {
             proposer_vrf_keypair: vrf_kp,
             epoch_seed: election.epoch_seed,
@@ -534,6 +563,7 @@ impl NodeEngine {
             governance_ops: self.select_governance_ops(),
             staking_ops: self.select_staking_ops(),
             election_result_hash,
+            election_result,
             vrf_reveals,
         };
 
@@ -555,6 +585,36 @@ impl NodeEngine {
         timestamp: u64,
         last_qc: Vec<u8>,
         election_result_hash: Option<Bytes32>,
+        vrf_reveals: Vec<VrfRevealEvidence>,
+    ) -> NodeResult<BlockV1> {
+        self.repropose_with_election_result(
+            original_block,
+            new_round,
+            valid_round,
+            election,
+            timestamp,
+            last_qc,
+            election_result_hash,
+            None,
+            vrf_reveals,
+        )
+    }
+
+    /// Re-propose a valid block using an authoritative commit-reveal election result.
+    ///
+    /// This mirrors [`Self::propose_with_election_result`] for POLC
+    /// re-proposals, preserving the same single-authority proposer identity
+    /// rule across fresh proposals and re-proposals.
+    pub fn repropose_with_election_result(
+        &self,
+        original_block: &BlockV1,
+        new_round: u32,
+        valid_round: Option<u32>,
+        election: &ProposerElection,
+        timestamp: u64,
+        last_qc: Vec<u8>,
+        election_result_hash: Option<Bytes32>,
+        election_result: Option<VrfElectionResult>,
         vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
         let proposal_height = self.state.height + 1;
@@ -581,22 +641,37 @@ impl NodeEngine {
             election.height,
             election.round,
         );
-        let election_result_hash =
-            election_result_hash.or_else(|| self.local_election_result_hash(election));
+        let election_result_hash = election_result
+            .map(|result| result.hash())
+            .or(election_result_hash)
+            .or_else(|| self.local_election_result_hash(election));
         if vrf_commit_reveal_election_active(election.height) {
-            let expected = VrfElectionResult {
-                height: election.height,
-                round: election.round,
-                elected_validator_id: slot.proposer_id,
-                elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-                fallback_used: false,
-                reveal_set_commitment: compute_reveal_set_commitment(&vrf_reveals),
-            }
-            .hash();
-            if election_result_hash != Some(expected) {
-                return Err(NodeError::NotProposer {
-                    height: proposal_height,
-                });
+            if let Some(result) = election_result {
+                if result.height != election.height
+                    || result.round != election.round
+                    || result.elected_validator_id != slot.proposer_id
+                    || result.reveal_set_commitment != compute_reveal_set_commitment(&vrf_reveals)
+                    || election_result_hash != Some(result.hash())
+                {
+                    return Err(NodeError::NotProposer {
+                        height: proposal_height,
+                    });
+                }
+            } else {
+                let expected = VrfElectionResult {
+                    height: election.height,
+                    round: election.round,
+                    elected_validator_id: slot.proposer_id,
+                    elected_vrf_output: Bytes32::from(slot.vrf_output.0),
+                    fallback_used: false,
+                    reveal_set_commitment: compute_reveal_set_commitment(&vrf_reveals),
+                }
+                .hash();
+                if election_result_hash != Some(expected) {
+                    return Err(NodeError::NotProposer {
+                        height: proposal_height,
+                    });
+                }
             }
         } else {
             let elected =
@@ -1266,6 +1341,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
+            election_result: None,
             vrf_reveals: vec![],
         };
         produce_block(
