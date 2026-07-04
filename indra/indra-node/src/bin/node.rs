@@ -22,10 +22,12 @@ use indra_core::types::primitives::{
 };
 use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_network::{
-    message::Message, observer::NODE_TYPE_FULL, perform_handshake_initiator,
-    perform_handshake_responder, perform_observer_handshake_responder, read_frame_plain_limited,
-    spawn_peer_manager, write_frame_plain, HandshakeConfig, NetworkCommand, NetworkEvent,
-    ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle, TokenBucket,
+    message::{Message, PeerListEntry},
+    observer::NODE_TYPE_FULL,
+    perform_handshake_initiator, perform_handshake_responder, perform_observer_handshake_responder,
+    read_frame_plain_limited, spawn_peer_manager, write_frame_plain, HandshakeConfig,
+    NetworkCommand, NetworkEvent, ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle,
+    TokenBucket,
 };
 use indra_node::{
     discovery::{
@@ -192,6 +194,29 @@ fn insert_discovered_peer_bounded(
     discovered_peers.insert(peer)
 }
 
+fn insert_discovered_peer_if_not_self(
+    discovered_peers: &mut HashSet<String>,
+    authenticated_peer_addrs: &HashSet<String>,
+    bootstrap_peers: &HashSet<String>,
+    genesis_peer_addrs: &HashSet<String>,
+    local_p2p_addr: &str,
+    peer: String,
+) -> bool {
+    let Some(addr) = resolve_peer_addr(&peer) else {
+        return false;
+    };
+    if is_configured_self_addr(&addr, local_p2p_addr) {
+        return false;
+    }
+    insert_discovered_peer_bounded(
+        discovered_peers,
+        authenticated_peer_addrs,
+        bootstrap_peers,
+        genesis_peer_addrs,
+        peer,
+    )
+}
+
 fn bounded_discovered_peer_addrs(discovered_peers: &HashSet<String>) -> Vec<SocketAddr> {
     let mut peers: Vec<SocketAddr> = discovered_peers
         .iter()
@@ -287,6 +312,40 @@ fn clear_dial_failure(peer_addr: &str, failure_counts: &mut HashMap<String, u32>
 
 fn is_configured_self_addr(addr: &SocketAddr, local_p2p_addr: &str) -> bool {
     resolve_peer_addr(local_p2p_addr).is_some_and(|local| *addr == local)
+}
+
+fn configured_self_addr_set(local_p2p_addr: &str) -> HashSet<SocketAddr> {
+    resolve_peer_addr(local_p2p_addr).into_iter().collect()
+}
+
+fn discovery_accepts_peer_addr(
+    addr: &SocketAddr,
+    validator_id: Option<indra_core::Bytes32>,
+    local_validator_id: indra_core::Bytes32,
+    local_p2p_addr: &str,
+    connected_addrs: &[SocketAddr],
+) -> bool {
+    if validator_id == Some(local_validator_id) {
+        return false;
+    }
+    !is_configured_self_addr(addr, local_p2p_addr)
+        && is_address_acceptable_for_discovery(addr)
+        && !has_connected_ip_from_socket_addrs(connected_addrs, addr)
+}
+
+fn peer_list_payload_with_identities(
+    candidates: impl IntoIterator<Item = SocketAddr>,
+    own_addr: Option<SocketAddr>,
+    banned: &HashSet<SocketAddr>,
+    addr_validators: &HashMap<SocketAddr, indra_core::Bytes32>,
+) -> Vec<PeerListEntry> {
+    let mut entries = peer_list_payload(candidates, own_addr, banned);
+    for entry in &mut entries {
+        if let Some(addr) = resolve_peer_addr(&entry.addr) {
+            entry.validator_id = addr_validators.get(&addr).copied();
+        }
+    }
+    entries
 }
 
 fn is_address_acceptable_for_discovery(addr: &SocketAddr) -> bool {
@@ -678,20 +737,22 @@ fn start_network_runtime(
                             let mut dp = discovered_peers.lock().unwrap();
                             let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
                             for addr in &persisted {
-                                insert_discovered_peer_bounded(
+                                insert_discovered_peer_if_not_self(
                                     &mut dp,
                                     &authenticated,
                                     &bootstrap_peer_addrs,
                                     &genesis_peer_addrs,
+                                    &p2p_addr_for_port,
                                     addr.to_string(),
                                 );
                             }
                             for addr in &initial_discovered_peers {
-                                insert_discovered_peer_bounded(
+                                insert_discovered_peer_if_not_self(
                                     &mut dp,
                                     &authenticated,
                                     &bootstrap_peer_addrs,
                                     &genesis_peer_addrs,
+                                    &p2p_addr_for_port,
                                     addr.clone(),
                                 );
                             }
@@ -707,11 +768,12 @@ fn start_network_runtime(
                             let mut dp = discovered_peers.lock().unwrap();
                             let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
                             for addr in &dns_peers {
-                                insert_discovered_peer_bounded(
+                                insert_discovered_peer_if_not_self(
                                     &mut dp,
                                     &authenticated,
                                     &bootstrap_peer_addrs,
                                     &genesis_peer_addrs,
+                                    &p2p_addr_for_port,
                                     addr.to_string(),
                                 );
                             }
@@ -851,8 +913,13 @@ fn start_network_runtime(
                             }
                             if last_peer_save.elapsed().as_secs() >= PEER_TABLE_SAVE_INTERVAL_SECS {
                                 let mut peers_to_save: Vec<SocketAddr> =
-                                    bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap());
+                                    bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap())
+                                        .into_iter()
+                                        .filter(|addr| !is_configured_self_addr(addr, &p2p_addr_for_port))
+                                        .collect();
                                 peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
+                                peers_to_save
+                                    .retain(|addr| !is_configured_self_addr(addr, &p2p_addr_for_port));
                                 peers_to_save.sort();
                                 peers_to_save.dedup();
                                 peers_to_save.truncate(MAX_DISCOVERED_PEERS);
@@ -868,11 +935,17 @@ fn start_network_runtime(
                     let discovered_peers = Arc::clone(&discovered_peers);
                     let peer_addrs = Arc::clone(&peer_addrs);
                     let peers_file_path = peers_file_path.clone();
+                    let local_p2p_addr = p2p_addr.clone();
                     async move {
                         if tokio::signal::ctrl_c().await.is_ok() {
                             let mut peers_to_save: Vec<SocketAddr> =
-                                bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap());
+                                bounded_discovered_peer_addrs(&discovered_peers.lock().unwrap())
+                                    .into_iter()
+                                    .filter(|addr| !is_configured_self_addr(addr, &local_p2p_addr))
+                                    .collect();
                             peers_to_save.extend(peer_addrs.lock().unwrap().values().copied());
+                            peers_to_save
+                                .retain(|addr| !is_configured_self_addr(addr, &local_p2p_addr));
                             peers_to_save.sort();
                             peers_to_save.dedup();
                             peers_to_save.truncate(MAX_DISCOVERED_PEERS);
@@ -1461,10 +1534,12 @@ fn main() {
                         connected_validator_peers
                             .store(gossip.connection_count(), Ordering::Relaxed);
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
-                        let known_addrs = peer_list_payload(
+                        let self_addrs = configured_self_addr_set(&local_p2p_addr);
+                        let known_addrs = peer_list_payload_with_identities(
                             gossip.connected_addrs(),
                             Some(addr),
-                            &HashSet::new(),
+                            &self_addrs,
+                            &gossip.addr_validators.lock().unwrap(),
                         );
                         if !known_addrs.is_empty() {
                             gossip.send_to_validator(validator_id, &Message::PeerList(known_addrs));
@@ -1501,23 +1576,26 @@ fn main() {
                                 let mut new_peers = discovered_peers.lock().unwrap();
                                 let authenticated =
                                     authenticated_peer_addrs.lock().unwrap().clone();
+                                let local_validator_id =
+                                    handshake_config.read().unwrap().my_validator_id;
                                 let mut accepted = 0usize;
-                                for addr_str in addrs.iter().take(MAX_PEER_LIST_SIZE) {
-                                    let Some(addr) = resolve_peer_addr(addr_str) else {
+                                for entry in addrs.iter().take(MAX_PEER_LIST_SIZE) {
+                                    let Some(addr) = resolve_peer_addr(&entry.addr) else {
                                         continue;
                                     };
-                                    if !is_configured_self_addr(&addr, &local_p2p_addr)
-                                        && is_address_acceptable_for_discovery(&addr)
-                                        && !has_connected_ip_from_socket_addrs(
-                                            &gossip.connected_addrs(),
-                                            &addr,
-                                        )
-                                    {
-                                        if insert_discovered_peer_bounded(
+                                    if discovery_accepts_peer_addr(
+                                        &addr,
+                                        entry.validator_id,
+                                        local_validator_id,
+                                        &local_p2p_addr,
+                                        &gossip.connected_addrs(),
+                                    ) {
+                                        if insert_discovered_peer_if_not_self(
                                             &mut new_peers,
                                             &authenticated,
                                             &bootstrap_peer_addrs,
                                             &genesis_peer_addrs,
+                                            &local_p2p_addr,
                                             addr.to_string(),
                                         ) {
                                             accepted = accepted.saturating_add(1);
@@ -2311,7 +2389,13 @@ fn main() {
 
         let peer_list_ticks = (PEER_LIST_INTERVAL_SECS / STATUS_INTERVAL.as_secs()).max(1);
         if tick.is_multiple_of(peer_list_ticks) {
-            let known_addrs = peer_list_payload(gossip.connected_addrs(), None, &HashSet::new());
+            let self_addrs = configured_self_addr_set(&p2p_addr);
+            let known_addrs = peer_list_payload_with_identities(
+                gossip.connected_addrs(),
+                None,
+                &self_addrs,
+                &gossip.addr_validators.lock().unwrap(),
+            );
             if !known_addrs.is_empty() {
                 gossip.broadcast(&Message::PeerList(known_addrs));
             }
@@ -3575,6 +3659,137 @@ mod tests {
             &unknown_addr,
             &authenticated_addr_validators,
             &connected_validator_ids,
+        ));
+    }
+
+    #[test]
+    fn peerlist_self_entry_is_not_added_to_dial_queue() {
+        let local_p2p_addr = "198.51.100.10:30303";
+        let self_addr: SocketAddr = local_p2p_addr.parse().unwrap();
+        let mut discovered_peers = HashSet::new();
+        let authenticated = HashSet::new();
+        let bootstrap = HashSet::new();
+        let genesis = HashSet::new();
+
+        assert!(
+            !discovery_accepts_peer_addr(
+                &self_addr,
+                None,
+                indra_core::Bytes32::ZERO,
+                local_p2p_addr,
+                &[]
+            ),
+            "received peer-list entries matching this node's configured P2P address must be rejected before dial queue insertion"
+        );
+        assert!(!insert_discovered_peer_if_not_self(
+            &mut discovered_peers,
+            &authenticated,
+            &bootstrap,
+            &genesis,
+            local_p2p_addr,
+            self_addr.to_string(),
+        ));
+        assert!(discovered_peers.is_empty());
+    }
+
+    #[test]
+    fn outgoing_peerlist_never_advertises_own_address() {
+        let local_p2p_addr = "198.51.100.10:30303";
+        let own_addr: SocketAddr = local_p2p_addr.parse().unwrap();
+        let other_addr: SocketAddr = "198.51.100.11:30303".parse().unwrap();
+        let self_addrs = configured_self_addr_set(local_p2p_addr);
+
+        let payload = peer_list_payload([own_addr, other_addr], None, &self_addrs);
+
+        assert_eq!(
+            payload,
+            vec![PeerListEntry::address_only(other_addr.to_string())]
+        );
+        assert!(!payload
+            .iter()
+            .any(|entry| entry.addr == own_addr.to_string()));
+    }
+
+    #[test]
+    fn peerlist_non_self_entry_is_added_to_dial_queue() {
+        let local_p2p_addr = "198.51.100.10:30303";
+        let peer_addr: SocketAddr = "198.51.100.11:30303".parse().unwrap();
+        let mut discovered_peers = HashSet::new();
+        let authenticated = HashSet::new();
+        let bootstrap = HashSet::new();
+        let genesis = HashSet::new();
+
+        assert!(discovery_accepts_peer_addr(
+            &peer_addr,
+            None,
+            indra_core::Bytes32::ZERO,
+            local_p2p_addr,
+            &[]
+        ));
+        assert!(insert_discovered_peer_if_not_self(
+            &mut discovered_peers,
+            &authenticated,
+            &bootstrap,
+            &genesis,
+            local_p2p_addr,
+            peer_addr.to_string(),
+        ));
+        assert!(discovered_peers.contains(&peer_addr.to_string()));
+    }
+
+    #[test]
+    fn peerlist_self_validator_id_is_filtered_even_when_address_differs() {
+        let local_validator_id = indra_core::Bytes32::from([0x42; 32]);
+        let local_p2p_addr = "198.51.100.10:30303";
+        let nat_observed_addr: SocketAddr = "203.0.113.44:30303".parse().unwrap();
+
+        assert!(
+            !is_configured_self_addr(&nat_observed_addr, local_p2p_addr),
+            "test must model NAT/dynamic-IP drift where address fallback cannot help"
+        );
+        assert!(
+            !discovery_accepts_peer_addr(
+                &nat_observed_addr,
+                Some(local_validator_id),
+                local_validator_id,
+                local_p2p_addr,
+                &[],
+            ),
+            "identity-tagged self entries must be filtered before they enter the dial queue"
+        );
+    }
+
+    #[test]
+    fn peerlist_entries_include_validator_ids_for_authenticated_peers() {
+        let peer_addr: SocketAddr = "203.0.113.45:30303".parse().unwrap();
+        let validator_id = indra_core::Bytes32::from([0x45; 32]);
+        let addr_validators = HashMap::from([(peer_addr, validator_id)]);
+
+        let payload =
+            peer_list_payload_with_identities([peer_addr], None, &HashSet::new(), &addr_validators);
+
+        assert_eq!(
+            payload,
+            vec![PeerListEntry::with_validator(
+                peer_addr.to_string(),
+                validator_id
+            )]
+        );
+    }
+
+    #[test]
+    fn peerlist_non_self_identity_entry_is_added_to_dial_queue() {
+        let local_validator_id = indra_core::Bytes32::from([0x50; 32]);
+        let remote_validator_id = indra_core::Bytes32::from([0x51; 32]);
+        let local_p2p_addr = "198.51.100.10:30303";
+        let peer_addr: SocketAddr = "203.0.113.51:30303".parse().unwrap();
+
+        assert!(discovery_accepts_peer_addr(
+            &peer_addr,
+            Some(remote_validator_id),
+            local_validator_id,
+            local_p2p_addr,
+            &[]
         ));
     }
 

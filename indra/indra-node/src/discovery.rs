@@ -7,6 +7,7 @@ use std::{
 };
 
 use indra_core::types::primitives::{DNS_SEED_HOSTS, MAX_PEER_LIST_SIZE};
+use indra_network::PeerListEntry;
 
 /// Encode the default DNS seed list into the existing config string field.
 pub fn default_dns_seed_hosts_config() -> String {
@@ -117,14 +118,14 @@ pub fn peer_list_payload(
     candidates: impl IntoIterator<Item = SocketAddr>,
     own_addr: Option<SocketAddr>,
     banned: &HashSet<SocketAddr>,
-) -> Vec<String> {
+) -> Vec<PeerListEntry> {
     let mut seen = HashSet::new();
     let mut peers = Vec::new();
     for addr in candidates {
         if Some(addr) == own_addr || banned.contains(&addr) || !seen.insert(addr) {
             continue;
         }
-        peers.push(addr.to_string());
+        peers.push(PeerListEntry::address_only(addr.to_string()));
         if peers.len() >= MAX_PEER_LIST_SIZE {
             break;
         }
@@ -202,7 +203,10 @@ mod tests {
     fn peer_list_deduplicates() {
         let addr: SocketAddr = "127.0.0.1:30303".parse().unwrap();
         let payload = peer_list_payload([addr, addr], None, &HashSet::new());
-        assert_eq!(payload, vec!["127.0.0.1:30303"]);
+        assert_eq!(
+            payload,
+            vec![PeerListEntry::address_only("127.0.0.1:30303")]
+        );
     }
 
     #[test]
@@ -218,6 +222,9 @@ mod tests {
         let good_addr: SocketAddr = "127.0.0.2:30303".parse().unwrap();
         let banned = HashSet::from([banned_addr]);
         let payload = peer_list_payload([banned_addr, good_addr], None, &banned);
-        assert_eq!(payload, vec!["127.0.0.2:30303"]);
+        assert_eq!(
+            payload,
+            vec![PeerListEntry::address_only("127.0.0.2:30303")]
+        );
     }
 }

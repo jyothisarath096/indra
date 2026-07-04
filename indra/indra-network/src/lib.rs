@@ -66,7 +66,7 @@ pub use gossip::{GossipEngine, GossipEvent};
 pub use handshake::{
     perform_handshake_initiator, perform_handshake_responder, HandshakeConfig, HandshakeResult,
 };
-pub use message::{Message, MessageType};
+pub use message::{Message, MessageType, PeerListEntry};
 pub use net_types::{NetworkCommand, NetworkEvent};
 pub use observer::{
     perform_observer_handshake_initiator, perform_observer_handshake_responder, read_frame_plain,

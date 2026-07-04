@@ -7,7 +7,7 @@ use std::time::Duration;
 use indra_core::types::primitives::Bytes32;
 use indra_network::{
     gossip::GossipEngine,
-    message::Message,
+    message::{Message, PeerListEntry},
     peer::{PeerStatus, PeerTable, ScoreEvent, INITIAL_SCORE},
     transport::{RecvStatus, Transport},
 };
@@ -26,7 +26,7 @@ fn message_encode_decode_all_types() {
             tip_hash: Bytes32::from([0xAAu8; 32]),
             round: 0,
         },
-        Message::PeerList(vec!["127.0.0.1:30303".to_string()]),
+        Message::PeerList(vec![PeerListEntry::address_only("127.0.0.1:30303")]),
         Message::RequestQC { height: 42 },
         Message::QCResponse {
             height: 42,

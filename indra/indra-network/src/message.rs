@@ -39,6 +39,8 @@ pub const MAX_PEER_LIST_ENTRIES: usize = 256;
 /// from a malicious `BlockResponse` count prefix.
 pub const MAX_BLOCK_RESPONSE_ENTRIES: usize = 50;
 
+const PEER_LIST_IDENTITY_TRAILER_MAGIC: &[u8; 4] = b"PLV2";
+
 /// Message type discriminant bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -102,6 +104,38 @@ impl MessageType {
     }
 }
 
+/// One peer-discovery entry.
+///
+/// The address is always present for compatibility with the original
+/// address-only `PeerList` payload. `validator_id` is included when the sender
+/// has authenticated that address and lets upgraded receivers filter their own
+/// identity without relying on fragile address matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerListEntry {
+    /// Peer socket address as `host:port`.
+    pub addr: String,
+    /// Authenticated validator identity for this address, when known.
+    pub validator_id: Option<Bytes32>,
+}
+
+impl PeerListEntry {
+    /// Construct an address-only entry.
+    pub fn address_only(addr: impl Into<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            validator_id: None,
+        }
+    }
+
+    /// Construct an entry with an authenticated validator identity.
+    pub fn with_validator(addr: impl Into<String>, validator_id: Bytes32) -> Self {
+        Self {
+            addr: addr.into(),
+            validator_id: Some(validator_id),
+        }
+    }
+}
+
 /// A decoded network message.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -111,8 +145,9 @@ pub enum Message {
     Vote(VoteV1),
     /// A pending transaction for the mempool.
     Tx(TransactionV1),
-    /// A list of peer addresses (IP:port strings).
-    PeerList(Vec<String>),
+    /// A list of peer addresses, optionally annotated with authenticated
+    /// validator identities.
+    PeerList(Vec<PeerListEntry>),
     /// Liveness ping with nonce.
     Ping(u64),
     /// Liveness pong matching a ping nonce.
@@ -254,9 +289,22 @@ impl Message {
                 let mut buf = Vec::new();
                 (peers.len() as u32).encode(&mut buf);
                 for p in peers {
-                    let bytes = p.as_bytes();
+                    let bytes = p.addr.as_bytes();
                     (bytes.len() as u16).encode(&mut buf);
                     buf.extend_from_slice(bytes);
+                }
+                let identities: Vec<_> = peers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, peer)| peer.validator_id.map(|id| (idx as u32, id)))
+                    .collect();
+                if !identities.is_empty() {
+                    buf.extend_from_slice(PEER_LIST_IDENTITY_TRAILER_MAGIC);
+                    (identities.len() as u32).encode(&mut buf);
+                    for (idx, validator_id) in identities {
+                        idx.encode(&mut buf);
+                        validator_id.encode(&mut buf);
+                    }
                 }
                 buf
             }
@@ -433,8 +481,56 @@ impl Message {
                         });
                     };
                     let s = String::from_utf8_lossy(peer_bytes).to_string();
-                    peers.push(s);
+                    peers.push(PeerListEntry::address_only(s));
                     offset += len;
+                }
+                if payload.get(offset..offset + 4) == Some(PEER_LIST_IDENTITY_TRAILER_MAGIC) {
+                    offset += 4;
+                    let Some(identity_count_bytes) = payload.get(offset..offset + 4) else {
+                        return Err(NetworkError::DecodeFailed {
+                            reason: "peer list identity trailer count truncated".to_string(),
+                        });
+                    };
+                    let identity_count =
+                        u32::from_le_bytes(identity_count_bytes.try_into().map_err(|_| {
+                            NetworkError::DecodeFailed {
+                                reason: "invalid peer list identity trailer count".to_string(),
+                            }
+                        })?) as usize;
+                    if identity_count > count {
+                        return Err(NetworkError::DecodeFailed {
+                            reason: "peer list identity trailer has more identities than entries"
+                                .to_string(),
+                        });
+                    }
+                    offset += 4;
+                    for _ in 0..identity_count {
+                        let Some(index_bytes) = payload.get(offset..offset + 4) else {
+                            return Err(NetworkError::DecodeFailed {
+                                reason: "peer list identity index truncated".to_string(),
+                            });
+                        };
+                        let index = u32::from_le_bytes(index_bytes.try_into().map_err(|_| {
+                            NetworkError::DecodeFailed {
+                                reason: "invalid peer list identity index".to_string(),
+                            }
+                        })?) as usize;
+                        offset += 4;
+                        let Some(id_bytes) = payload.get(offset..offset + 32) else {
+                            return Err(NetworkError::DecodeFailed {
+                                reason: "peer list identity validator_id truncated".to_string(),
+                            });
+                        };
+                        if index >= peers.len() {
+                            return Err(NetworkError::DecodeFailed {
+                                reason: "peer list identity index out of range".to_string(),
+                            });
+                        }
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(id_bytes);
+                        peers[index].validator_id = Some(Bytes32::from(id));
+                        offset += 32;
+                    }
                 }
                 Ok(Self::PeerList(peers))
             }
@@ -943,8 +1039,8 @@ mod tests {
     #[test]
     fn peer_list_round_trip() {
         let peers = vec![
-            "192.168.1.1:30303".to_string(),
-            "10.0.0.1:30303".to_string(),
+            PeerListEntry::address_only("192.168.1.1:30303"),
+            PeerListEntry::address_only("10.0.0.1:30303"),
         ];
         let msg = Message::PeerList(peers.clone());
         let wire = msg.encode_wire().unwrap();
@@ -966,13 +1062,84 @@ mod tests {
 
     #[test]
     fn peerlist_count_at_maximum_is_accepted() {
-        let peers: Vec<String> = (0..MAX_PEER_LIST_ENTRIES)
-            .map(|idx| format!("203.0.113.{}:30303", idx % 255))
+        let peers: Vec<PeerListEntry> = (0..MAX_PEER_LIST_ENTRIES)
+            .map(|idx| PeerListEntry::address_only(format!("203.0.113.{}:30303", idx % 255)))
             .collect();
         let wire = Message::PeerList(peers.clone()).encode_wire().unwrap();
 
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         assert!(matches!(decoded, Message::PeerList(got) if got == peers));
+    }
+
+    #[test]
+    fn peer_list_identity_trailer_round_trip() {
+        let validator_id = Bytes32::from([0x42; 32]);
+        let peers = vec![
+            PeerListEntry::with_validator("203.0.113.1:30303", validator_id),
+            PeerListEntry::address_only("203.0.113.2:30303"),
+        ];
+        let wire = Message::PeerList(peers.clone()).encode_wire().unwrap();
+
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+
+        assert!(matches!(decoded, Message::PeerList(got) if got == peers));
+    }
+
+    #[test]
+    fn old_format_peer_list_still_decodes_address_only() {
+        let peers = ["203.0.113.10:30303", "203.0.113.11:30303"];
+        let mut data = vec![MessageType::PeerList as u8];
+        (peers.len() as u32).encode(&mut data);
+        for peer in peers {
+            let bytes = peer.as_bytes();
+            (bytes.len() as u16).encode(&mut data);
+            data.extend_from_slice(bytes);
+        }
+
+        let decoded = Message::decode_wire(&data).unwrap();
+
+        assert!(matches!(
+            decoded,
+            Message::PeerList(got)
+                if got == vec![
+                    PeerListEntry::address_only("203.0.113.10:30303"),
+                    PeerListEntry::address_only("203.0.113.11:30303"),
+                ]
+        ));
+    }
+
+    #[test]
+    fn new_format_peer_list_preserves_legacy_address_prefix() {
+        let validator_id = Bytes32::from([0x77; 32]);
+        let peers = vec![
+            PeerListEntry::with_validator("203.0.113.77:30303", validator_id),
+            PeerListEntry::address_only("203.0.113.78:30303"),
+        ];
+        let wire = Message::PeerList(peers).encode_wire().unwrap();
+        let payload = &wire[5..]; // skip length prefix and message type
+
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut offset = 4;
+        let mut legacy_addresses = Vec::new();
+        for _ in 0..count {
+            let len = u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            legacy_addresses
+                .push(String::from_utf8(payload[offset..offset + len].to_vec()).unwrap());
+            offset += len;
+        }
+
+        assert_eq!(
+            legacy_addresses,
+            vec![
+                "203.0.113.77:30303".to_string(),
+                "203.0.113.78:30303".to_string()
+            ]
+        );
+        assert!(
+            payload[offset..].starts_with(PEER_LIST_IDENTITY_TRAILER_MAGIC),
+            "new identity data is appended after the legacy address prefix"
+        );
     }
 
     #[test]
