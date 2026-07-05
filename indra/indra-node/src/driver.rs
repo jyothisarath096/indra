@@ -1202,6 +1202,9 @@ impl ConsensusDriver {
                 }
             }
             actions.push(DriverAction::BroadcastVrfCommit(commit));
+            actions.extend(
+                self.maybe_create_local_reveal_for_open_phase(election.height, election.round),
+            );
         }
         actions.extend(self.advance_vrf_round(election.height, election.round));
         actions
@@ -1237,6 +1240,37 @@ impl ConsensusDriver {
             }
             self.highest_pipelined_vrf_commit_height = height;
             actions.push(DriverAction::BroadcastVrfCommit(commit));
+            actions.extend(self.maybe_create_local_reveal_for_open_phase(height, round));
+        }
+        actions
+    }
+
+    fn maybe_create_local_reveal_for_open_phase(
+        &mut self,
+        height: u64,
+        round: u32,
+    ) -> Vec<DriverAction> {
+        let mut actions = Vec::new();
+        let Some(slot) = self.vrf_slot_index(height, round) else {
+            return actions;
+        };
+        let Some(local_validator_id) = self.engine.validator_id() else {
+            return actions;
+        };
+        let should_create = self
+            .vrf_states
+            .get(slot)
+            .and_then(|state| state.as_ref())
+            .is_some_and(|state| {
+                state.phase == VrfRoundPhase::Reveal
+                    && state.commits.contains_key(&local_validator_id)
+                    && !state.reveals.contains_key(&local_validator_id)
+            });
+        if !should_create {
+            return actions;
+        }
+        if let Some(reveal) = self.make_local_vrf_reveal(height, round) {
+            actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true, None));
         }
         actions
     }
@@ -1267,9 +1301,7 @@ impl ConsensusDriver {
                 state.phase = VrfRoundPhase::Reveal;
                 state.reveal_started_at = Some(Instant::now());
             }
-            if let Some(reveal) = self.make_local_vrf_reveal(height, round) {
-                actions.extend(self.insert_valid_vrf_reveal(slot, reveal, true, None));
-            }
+            actions.extend(self.maybe_create_local_reveal_for_open_phase(height, round));
         }
 
         let should_compute = self
@@ -3886,6 +3918,199 @@ mod tests {
             "replay should not route through live finalization/pipelining state"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn setup_four_validator_vrf_round(
+        local_seed: [u8; 32],
+        suffix: &str,
+        height: u64,
+        round: u32,
+    ) -> (ConsensusDriver, PathBuf, [[u8; 32]; 3], Bytes32) {
+        let remote_seeds = [[0xA2u8; 32], [0xA3u8; 32], [0xA4u8; 32]];
+        let (mut driver, dir) = local_driver(local_seed, suffix);
+        install_active_validator(&mut driver, local_seed, "local");
+        install_active_validator(&mut driver, remote_seeds[0], "b");
+        install_active_validator(&mut driver, remote_seeds[1], "c");
+        install_active_validator(&mut driver, remote_seeds[2], "d");
+        driver.refresh_registered_voters();
+        driver.vrf_states[0] = Some(VrfRoundState::new(height, round));
+        let local_id = driver.engine.validator_id().unwrap();
+        (driver, dir, remote_seeds, local_id)
+    }
+
+    fn insert_remote_vrf_commits(
+        driver: &mut ConsensusDriver,
+        height: u64,
+        round: u32,
+        remote_seeds: &[[u8; 32]],
+    ) {
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        for seed in remote_seeds {
+            let (commit, _reveal) = signed_vrf_pair(driver, *seed, height, round, DEFAULT_CHAIN_ID);
+            driver.vrf_states[slot]
+                .as_mut()
+                .unwrap()
+                .commits
+                .insert(commit.validator_id, commit);
+        }
+    }
+
+    #[test]
+    fn local_reveal_created_when_commit_arrives_after_reveal_phase_open() {
+        let local_seed = [0xA1u8; 32];
+        let height = 42;
+        let round = 1;
+        let (mut driver, dir, remote_seeds, local_id) = setup_four_validator_vrf_round(
+            local_seed,
+            "local_reveal_after_phase_open",
+            height,
+            round,
+        );
+
+        insert_remote_vrf_commits(&mut driver, height, round, &remote_seeds);
+        let early_actions = driver.advance_vrf_round(height, round);
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        assert_eq!(
+            driver.vrf_states[slot].as_ref().unwrap().phase,
+            VrfRoundPhase::Reveal
+        );
+        assert!(!driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .commits
+            .contains_key(&local_id));
+        assert!(!driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .reveals
+            .contains_key(&local_id));
+        assert!(!early_actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_))));
+
+        let election = election_for_round(&driver, height, round);
+        let actions = driver.ensure_vrf_election_for_round(&election);
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVrfCommit(commit)
+                if commit.height == height && commit.round == round && commit.validator_id == local_id
+        )));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    DriverAction::BroadcastVrfReveal(reveal)
+                        if reveal.height == height
+                            && reveal.round == round
+                            && reveal.validator_id == local_id
+                ))
+                .count(),
+            1
+        );
+        assert!(driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .reveals
+            .contains_key(&local_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_reveal_created_when_commit_arrives_before_reveal_phase_open() {
+        let local_seed = [0xA5u8; 32];
+        let height = 43;
+        let round = 1;
+        let (mut driver, dir, remote_seeds, local_id) = setup_four_validator_vrf_round(
+            local_seed,
+            "local_reveal_before_phase_open",
+            height,
+            round,
+        );
+        let election = election_for_round(&driver, height, round);
+
+        let commit_actions = driver.ensure_vrf_election_for_round(&election);
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        assert!(commit_actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVrfCommit(commit)
+                if commit.height == height && commit.round == round && commit.validator_id == local_id
+        )));
+        assert!(!commit_actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVrfReveal(_))));
+        assert_eq!(
+            driver.vrf_states[slot].as_ref().unwrap().phase,
+            VrfRoundPhase::Commit
+        );
+
+        insert_remote_vrf_commits(&mut driver, height, round, &remote_seeds[..2]);
+        let reveal_actions = driver.advance_vrf_round(height, round);
+
+        assert_eq!(
+            reveal_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    DriverAction::BroadcastVrfReveal(reveal)
+                        if reveal.height == height
+                            && reveal.round == round
+                            && reveal.validator_id == local_id
+                ))
+                .count(),
+            1
+        );
+        assert!(driver.vrf_states[slot]
+            .as_ref()
+            .unwrap()
+            .reveals
+            .contains_key(&local_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_reveal_not_duplicated_if_both_paths_could_fire() {
+        let local_seed = [0xA6u8; 32];
+        let height = 44;
+        let round = 1;
+        let (mut driver, dir, remote_seeds, local_id) =
+            setup_four_validator_vrf_round(local_seed, "local_reveal_no_duplicate", height, round);
+        let election = election_for_round(&driver, height, round);
+
+        driver.ensure_vrf_election_for_round(&election);
+        insert_remote_vrf_commits(&mut driver, height, round, &remote_seeds[..2]);
+        let first = driver.advance_vrf_round(height, round);
+        let second = driver.ensure_vrf_election_for_round(&election);
+        let third = driver.advance_vrf_round(height, round);
+
+        let local_reveal_broadcasts = first
+            .iter()
+            .chain(second.iter())
+            .chain(third.iter())
+            .filter(|action| {
+                matches!(
+                    action,
+                    DriverAction::BroadcastVrfReveal(reveal)
+                        if reveal.height == height
+                            && reveal.round == round
+                            && reveal.validator_id == local_id
+                )
+            })
+            .count();
+        assert_eq!(local_reveal_broadcasts, 1);
+        let slot = driver.vrf_slot_index(height, round).unwrap();
+        assert_eq!(
+            driver.vrf_states[slot]
+                .as_ref()
+                .unwrap()
+                .reveals
+                .keys()
+                .filter(|validator_id| **validator_id == local_id)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
