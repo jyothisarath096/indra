@@ -1,7 +1,7 @@
 //! Async peer-manager actor for the authenticated Tokio transport.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -15,16 +15,21 @@ use tokio::{
     task::JoinHandle,
 };
 
-use indra_core::ssz::sha256;
 use indra_core::types::{
-    primitives::Bytes32, slash_detector::SlashDetector, slashing::SlashEvidenceV1,
+    block::BlockV1, primitives::Bytes32, slash_detector::SlashDetector, slashing::SlashEvidenceV1,
+    vote_signing::vote_signing_bytes,
+};
+use indra_core::{codec::Encode, ssz::sha256};
+use indra_crypto::{
+    verify_hybrid, vrf_verify, ClassicalPublicKey, HybridPublicKey, PqPublicKey, VrfOutput,
+    VrfProof, PQ_PK_BYTES,
 };
 
 use crate::{
     frame::{FrameReader, FrameWriter},
     handshake::HandshakeResult,
     message::Message,
-    net_types::{NetworkCommand, NetworkEvent},
+    net_types::{NetworkCommand, NetworkEvent, RelayValidatorKey},
     peer::{PeerTable, ScoreEvent, BAN_DURATION_RATE_LIMIT},
     rate_limit::{
         GlobalRateLimiter, MessageClass, PeerRateLimiter, RateLimitReason,
@@ -36,7 +41,14 @@ const SMALL_QUEUE_CAPACITY: usize = 256;
 const LARGE_QUEUE_CAPACITY: usize = 4;
 const TIE_BREAK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CONSENSUS_DUPLICATE_FILTER_CAPACITY: usize = 512;
+const CONSENSUS_RELAY_SEEN_CAPACITY: usize = 16_384;
 const STATUS_COALESCE_WINDOW: Duration = Duration::from_millis(500);
+const RELAY_FANOUT_SCALE_FACTOR: f64 = 2.0;
+const RELAY_FANOUT_MARGIN: usize = 2;
+const MIN_CONSENSUS_RELAY_FANOUT: usize = 4;
+const MAX_CONSENSUS_RELAY_FANOUT: usize = 16;
+const BLOCK_RELAY_FANOUT_MULTIPLIER: usize = 2;
+const MAX_BLOCK_RELAY_FANOUT: usize = 24;
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -87,6 +99,12 @@ struct PeerManagerActor {
     global_limiter: GlobalRateLimiter,
     transport_slash_detector: Arc<Mutex<SlashDetector>>,
     last_tie_break_log: HashMap<Bytes32, Instant>,
+    relay_keys: HashMap<Bytes32, RelayValidatorKey>,
+    relay_chain_id: String,
+    relay_fanout: usize,
+    relay_seen: RelaySeenCache,
+    block_relay_slots: HashMap<BlockRelaySlotKey, Bytes32>,
+    relay_metrics: HashMap<RelayMessageClass, RelayMetrics>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,7 +113,7 @@ enum QueueType {
     Large,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConsensusMessageKey {
     VrfCommit {
         validator_id: Bytes32,
@@ -120,6 +138,51 @@ enum ConsensusMessageKey {
         block_hash: Bytes32,
         content_hash: Bytes32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RelayMessageClass {
+    Block,
+    Vote,
+    VrfCommit,
+    VrfReveal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RelayMessageKey {
+    Consensus(ConsensusMessageKey),
+    Block {
+        height: u64,
+        round: u32,
+        block_hash: Bytes32,
+        content_hash: Bytes32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BlockRelaySlotKey {
+    height: u64,
+    round: u32,
+    validator_id: Bytes32,
+}
+
+#[derive(Debug, Clone)]
+struct RelaySeenEntry {
+    key: RelayMessageKey,
+    forwarded_to: HashSet<Bytes32>,
+}
+
+struct RelaySeenCache {
+    seen: VecDeque<RelaySeenEntry>,
+    capacity: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RelayMetrics {
+    relayed: u64,
+    duplicate: u64,
+    dropped: u64,
+    verification_failed: u64,
 }
 
 struct ConsensusDuplicateFilter {
@@ -147,6 +210,58 @@ impl ConsensusDuplicateFilter {
         }
         self.seen.push_back(key);
         false
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+impl RelaySeenCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn mark_originated(&mut self, key: RelayMessageKey, forwarded_to: &[Bytes32]) {
+        let forwarded = forwarded_to.iter().copied().collect::<HashSet<_>>();
+        self.upsert_forwarded(key, &forwarded);
+    }
+
+    fn is_seen(&self, key: &RelayMessageKey) -> bool {
+        self.seen.iter().any(|entry| &entry.key == key)
+    }
+
+    fn forwarded_to(&self, key: &RelayMessageKey, validator_id: &Bytes32) -> bool {
+        self.seen
+            .iter()
+            .find(|entry| &entry.key == key)
+            .is_some_and(|entry| entry.forwarded_to.contains(validator_id))
+    }
+
+    fn record_forwarded(&mut self, key: RelayMessageKey, forwarded_to: &[Bytes32]) {
+        let forwarded = forwarded_to.iter().copied().collect::<HashSet<_>>();
+        self.upsert_forwarded(key, &forwarded);
+    }
+
+    fn upsert_forwarded(&mut self, key: RelayMessageKey, forwarded: &HashSet<Bytes32>) {
+        if let Some(entry) = self.seen.iter_mut().find(|entry| entry.key == key) {
+            entry.forwarded_to.extend(forwarded.iter().copied());
+            return;
+        }
+        if self.capacity == 0 {
+            return;
+        }
+        if self.seen.len() >= self.capacity {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(RelaySeenEntry {
+            key,
+            forwarded_to: forwarded.clone(),
+        });
     }
 
     #[cfg(test)]
@@ -216,6 +331,190 @@ fn consensus_message_key(msg: &Message) -> Option<ConsensusMessageKey> {
         }),
         _ => None,
     }
+}
+
+fn relay_message_class(msg: &Message) -> Option<RelayMessageClass> {
+    match msg {
+        Message::Block(_) => Some(RelayMessageClass::Block),
+        Message::Vote(_) => Some(RelayMessageClass::Vote),
+        Message::VrfCommit(_) => Some(RelayMessageClass::VrfCommit),
+        Message::VrfReveal(_) => Some(RelayMessageClass::VrfReveal),
+        _ => None,
+    }
+}
+
+fn relay_message_key(msg: &Message) -> Option<RelayMessageKey> {
+    if let Some(key) = consensus_message_key(msg) {
+        return Some(RelayMessageKey::Consensus(key));
+    }
+    let Message::Block(block) = msg else {
+        return None;
+    };
+    let wire = msg.encode_wire().ok()?;
+    Some(RelayMessageKey::Block {
+        height: block.header.height,
+        round: block.header.proposer_round,
+        block_hash: block.header.block_hash(),
+        content_hash: Bytes32::from(sha256(&wire)),
+    })
+}
+
+/// Derive relay fanout from active validator count using an epidemic broadcast
+/// rule of thumb: O(ln N) peer choices per hop gives high coverage probability
+/// after a small number of rounds in a bounded random-ish overlay. INDRA adds a
+/// scale factor and margin because validator consensus messages are
+/// latency-sensitive, then clamps the result to avoid degenerating back into
+/// full-mesh fanout at N=200.
+fn derive_consensus_relay_fanout(active_validators: usize) -> usize {
+    if active_validators == 0 {
+        return MIN_CONSENSUS_RELAY_FANOUT;
+    }
+    let derived = ((active_validators as f64).ln() * RELAY_FANOUT_SCALE_FACTOR).ceil() as usize
+        + RELAY_FANOUT_MARGIN;
+    derived.clamp(MIN_CONSENSUS_RELAY_FANOUT, MAX_CONSENSUS_RELAY_FANOUT)
+}
+
+fn relay_fanout_for_class(base_fanout: usize, class: RelayMessageClass) -> usize {
+    match class {
+        RelayMessageClass::Block => base_fanout
+            .saturating_mul(BLOCK_RELAY_FANOUT_MULTIPLIER)
+            .min(MAX_BLOCK_RELAY_FANOUT),
+        RelayMessageClass::Vote | RelayMessageClass::VrfCommit | RelayMessageClass::VrfReveal => {
+            base_fanout
+        }
+    }
+}
+
+fn relay_key_map(keys: Vec<RelayValidatorKey>) -> HashMap<Bytes32, RelayValidatorKey> {
+    keys.into_iter()
+        .map(|key| (key.validator_id, key))
+        .collect()
+}
+
+fn relay_hybrid_public_key(key: &RelayValidatorKey) -> Option<HybridPublicKey> {
+    let pq: [u8; PQ_PK_BYTES] = key.hybrid_pq_pk.as_slice().try_into().ok()?;
+    Some(HybridPublicKey {
+        classical: ClassicalPublicKey(key.hybrid_classical_pk),
+        pq: PqPublicKey(pq),
+    })
+}
+
+fn verify_relay_hybrid_signature(
+    signing_bytes: &[u8],
+    signature: &indra_core::types::crypto::HybridSignature,
+    key: &RelayValidatorKey,
+) -> bool {
+    let Some(pk) = relay_hybrid_public_key(key) else {
+        return false;
+    };
+    let Ok(sig) = signature.to_crypto_sig() else {
+        return false;
+    };
+    verify_hybrid(signing_bytes, &sig, &pk).is_ok()
+}
+
+fn relay_vrf_input(prev_hash: &Bytes32, height: u64, round: u32) -> [u8; 32] {
+    // Mirrors indra-consensus::proposer::compute_vrf_input without adding a
+    // network -> consensus crate dependency. The epoch seed for block proposals
+    // is SHA256(parent_hash), matching sync verification.
+    let epoch_seed = sha256(&prev_hash.0);
+    let mut election_input = Vec::with_capacity(8 + 4 + 8);
+    election_input.extend_from_slice(&height.to_le_bytes());
+    election_input.extend_from_slice(&round.to_le_bytes());
+    election_input.extend_from_slice(&epoch_seed[..8]);
+    let mut data = indra_crypto::hash::domains::VRF_INPUT.to_vec();
+    data.extend_from_slice(&election_input);
+    sha256(&data)
+}
+
+fn block_relay_validator_id(
+    block: &BlockV1,
+    relay_keys: &HashMap<Bytes32, RelayValidatorKey>,
+) -> Option<Bytes32> {
+    let vrf_input = relay_vrf_input(
+        &block.header.prev_hash,
+        block.header.height,
+        block.header.proposer_round,
+    );
+    let output = VrfOutput(block.header.proposer_vrf_output.0);
+    let proof = VrfProof(block.header.proposer_vrf_proof.as_slice().to_vec());
+    let mut matches = relay_keys
+        .values()
+        .filter(|key| {
+            key.vrf_pk
+                .is_some_and(|vrf_pk| vrf_verify(&vrf_pk, &vrf_input, &output, &proof).is_ok())
+        })
+        .map(|key| key.validator_id);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+fn relay_message_key_bytes(key: &RelayMessageKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 8 + 4 + 32 + 32);
+    match key {
+        RelayMessageKey::Consensus(ConsensusMessageKey::VrfCommit {
+            validator_id,
+            height,
+            round,
+            commit_hash,
+            content_hash,
+        }) => {
+            out.push(1);
+            validator_id.encode(&mut out);
+            height.encode(&mut out);
+            round.encode(&mut out);
+            commit_hash.encode(&mut out);
+            content_hash.encode(&mut out);
+        }
+        RelayMessageKey::Consensus(ConsensusMessageKey::VrfReveal {
+            validator_id,
+            height,
+            round,
+            commit_hash,
+            vrf_output,
+            content_hash,
+        }) => {
+            out.push(2);
+            validator_id.encode(&mut out);
+            height.encode(&mut out);
+            round.encode(&mut out);
+            commit_hash.encode(&mut out);
+            vrf_output.encode(&mut out);
+            content_hash.encode(&mut out);
+        }
+        RelayMessageKey::Consensus(ConsensusMessageKey::Vote {
+            validator_id,
+            height,
+            round,
+            step,
+            block_hash,
+            content_hash,
+        }) => {
+            out.push(3);
+            validator_id.encode(&mut out);
+            height.encode(&mut out);
+            round.encode(&mut out);
+            step.encode(&mut out);
+            block_hash.encode(&mut out);
+            content_hash.encode(&mut out);
+        }
+        RelayMessageKey::Block {
+            height,
+            round,
+            block_hash,
+            content_hash,
+        } => {
+            out.push(4);
+            height.encode(&mut out);
+            round.encode(&mut out);
+            block_hash.encode(&mut out);
+            content_hash.encode(&mut out);
+        }
+    }
+    out
 }
 
 fn short_validator_id(id: &Bytes32) -> String {
@@ -293,6 +592,152 @@ async fn write_message(
 }
 
 impl PeerManagerActor {
+    fn increment_relay_metric(
+        &mut self,
+        class: RelayMessageClass,
+        update: impl FnOnce(&mut RelayMetrics),
+    ) {
+        update(self.relay_metrics.entry(class).or_default());
+    }
+
+    fn relay_verification_passes(&self, msg: &Message) -> bool {
+        match msg {
+            Message::Vote(vote) => {
+                let Some(key) = self.relay_keys.get(&vote.validator_id) else {
+                    return false;
+                };
+                let signing_bytes = vote_signing_bytes(
+                    vote.height,
+                    vote.round,
+                    vote.step,
+                    &vote.block_hash,
+                    &vote.validator_id,
+                    vote.election_result_hash.as_ref(),
+                    &self.relay_chain_id,
+                );
+                verify_relay_hybrid_signature(&signing_bytes, &vote.signature, key)
+            }
+            Message::VrfCommit(commit) => {
+                let Some(key) = self.relay_keys.get(&commit.validator_id) else {
+                    return false;
+                };
+                verify_relay_hybrid_signature(&commit.signing_bytes(), &commit.signature, key)
+            }
+            Message::VrfReveal(reveal) => {
+                let Some(key) = self.relay_keys.get(&reveal.validator_id) else {
+                    return false;
+                };
+                verify_relay_hybrid_signature(&reveal.signing_bytes(), &reveal.signature, key)
+            }
+            Message::Block(block) => block_relay_validator_id(block, &self.relay_keys).is_some(),
+            _ => false,
+        }
+    }
+
+    fn block_relay_conflicts(&mut self, block: &BlockV1, key: &RelayMessageKey) -> bool {
+        let RelayMessageKey::Block { content_hash, .. } = key else {
+            return false;
+        };
+        let Some(validator_id) = block_relay_validator_id(block, &self.relay_keys) else {
+            return true;
+        };
+        let slot = BlockRelaySlotKey {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            validator_id,
+        };
+        match self.block_relay_slots.get(&slot) {
+            Some(existing_hash) if existing_hash != content_hash => true,
+            Some(_) => false,
+            None => {
+                self.block_relay_slots.insert(slot, *content_hash);
+                false
+            }
+        }
+    }
+
+    fn relay_targets(
+        &self,
+        key: &RelayMessageKey,
+        class: RelayMessageClass,
+        sender: Bytes32,
+    ) -> Vec<Bytes32> {
+        let fanout = relay_fanout_for_class(self.relay_fanout, class);
+        let mut candidates: Vec<(u64, i32, Bytes32)> = self
+            .peers_by_validator
+            .iter()
+            .filter_map(|(validator_id, peer)| {
+                if *validator_id == sender || self.relay_seen.forwarded_to(key, validator_id) {
+                    return None;
+                }
+                let score = self
+                    .peer_table
+                    .get(&peer.addr)
+                    .map(|peer| peer.score)
+                    .unwrap_or_default();
+                let mut seed = relay_message_key_bytes(key);
+                validator_id.encode(&mut seed);
+                let digest = sha256(&seed);
+                let order = u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8]));
+                Some((order, score, *validator_id))
+            })
+            .collect();
+        candidates.sort_by(|(order_a, score_a, id_a), (order_b, score_b, id_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| order_a.cmp(order_b))
+                .then_with(|| id_a.0.cmp(&id_b.0))
+        });
+        candidates
+            .into_iter()
+            .take(fanout)
+            .map(|(_, _, validator_id)| validator_id)
+            .collect()
+    }
+
+    async fn relay_if_eligible(&mut self, sender: Bytes32, msg: &Message) {
+        let Some(class) = relay_message_class(msg) else {
+            return;
+        };
+        let Some(key) = relay_message_key(msg) else {
+            self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+            return;
+        };
+        if self.relay_seen.is_seen(&key) {
+            self.increment_relay_metric(class, |metrics| metrics.duplicate += 1);
+            return;
+        }
+        if !self.relay_verification_passes(msg) {
+            self.relay_seen.record_forwarded(key, &[]);
+            self.increment_relay_metric(class, |metrics| metrics.verification_failed += 1);
+            return;
+        }
+        if let Message::Block(block) = msg {
+            if self.block_relay_conflicts(block, &key) {
+                self.relay_seen.record_forwarded(key, &[]);
+                self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+                return;
+            }
+        }
+        let targets = self.relay_targets(&key, class, sender);
+        self.relay_seen.record_forwarded(key, &targets);
+        if targets.is_empty() {
+            self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+            return;
+        }
+        for validator_id in &targets {
+            self.try_send_to_validator(
+                *validator_id,
+                OutboundMessage {
+                    msg: msg.clone(),
+                    point_to_point: false,
+                },
+            )
+            .await;
+        }
+        self.increment_relay_metric(class, |metrics| metrics.relayed += targets.len() as u64);
+    }
+
     async fn run(mut self) {
         loop {
             tokio::select! {
@@ -316,6 +761,9 @@ impl PeerManagerActor {
         match command {
             NetworkCommand::Broadcast(msg) => {
                 let validators: Vec<Bytes32> = self.peers_by_validator.keys().copied().collect();
+                if let Some(key) = relay_message_key(&msg) {
+                    self.relay_seen.mark_originated(key, &validators);
+                }
                 for validator_id in validators {
                     self.try_send_to_validator(
                         validator_id,
@@ -358,6 +806,14 @@ impl PeerManagerActor {
                     );
                     self.drop_peer(validator_id, addr).await;
                 }
+            }
+            NetworkCommand::UpdateRelayValidatorKeys {
+                chain_id,
+                validators,
+            } => {
+                self.relay_fanout = derive_consensus_relay_fanout(validators.len());
+                self.relay_keys = relay_key_map(validators);
+                self.relay_chain_id = chain_id;
             }
         }
     }
@@ -424,6 +880,7 @@ impl PeerManagerActor {
                         .adjust_score_with_duration(&addr, -1, BAN_DURATION_RATE_LIMIT);
                     return;
                 }
+                self.relay_if_eligible(validator_id, &msg).await;
                 let _ = self
                     .event_tx
                     .send(NetworkEvent::Message {
@@ -707,6 +1164,10 @@ async fn run_write_loop(
 pub struct PeerManagerConfig {
     /// Local validator identity for deterministic duplicate-connection resolution.
     pub local_validator_id: Bytes32,
+    /// Current chain id used for vote relay signature verification.
+    pub chain_id: String,
+    /// Active validator public keys used for pre-relay cryptographic checks.
+    pub relay_validator_keys: Vec<RelayValidatorKey>,
     /// Outbound event sink consumed by `indra-node`.
     pub event_tx: mpsc::Sender<NetworkEvent>,
     /// Maximum buffered commands from the node into the actor.
@@ -774,6 +1235,12 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         global_limiter: GlobalRateLimiter::new(),
         transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
         last_tie_break_log: HashMap::new(),
+        relay_chain_id: config.chain_id,
+        relay_fanout: derive_consensus_relay_fanout(config.relay_validator_keys.len()),
+        relay_keys: relay_key_map(config.relay_validator_keys),
+        relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
+        block_relay_slots: HashMap::new(),
+        relay_metrics: HashMap::new(),
     };
     tokio::spawn(actor.run());
     PeerManagerHandle {
@@ -787,11 +1254,13 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
 mod tests {
     use super::*;
     use indra_core::types::{
+        block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         crypto::HybridSignature,
-        primitives::VariableBytes,
+        primitives::{ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES},
         vote::{VoteStep, VoteV1},
-        vrf_election::VrfCommit,
+        vrf_election::{VrfCommit, VrfReveal},
     };
+    use indra_crypto::{vrf_prove, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
     use tokio::net::{TcpListener, TcpStream};
 
     async fn stream_pair() -> (TcpStream, TcpStream) {
@@ -821,6 +1290,12 @@ mod tests {
             global_limiter: GlobalRateLimiter::new(),
             transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
             last_tie_break_log: HashMap::new(),
+            relay_keys: HashMap::new(),
+            relay_chain_id: "indra-testnet-1".to_string(),
+            relay_fanout: derive_consensus_relay_fanout(0),
+            relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
+            block_relay_slots: HashMap::new(),
+            relay_metrics: HashMap::new(),
         }
     }
 
@@ -925,6 +1400,169 @@ mod tests {
         }
     }
 
+    fn core_signature(sig: indra_crypto::HybridSignature) -> HybridSignature {
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        }
+    }
+
+    fn hybrid_key(seed: u8) -> HybridKeypair {
+        HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[seed; 32]),
+            PqKeypair::from_seed(&[seed.saturating_add(1); 32]).unwrap(),
+        )
+    }
+
+    fn relay_key(validator_id: Bytes32, keypair: &HybridKeypair) -> RelayValidatorKey {
+        let public = keypair.public_key();
+        RelayValidatorKey {
+            validator_id,
+            hybrid_classical_pk: public.classical.0,
+            hybrid_pq_pk: public.pq.0.to_vec(),
+            vrf_pk: Some(VrfKeypair::from_seed(&validator_id.0).public_key()),
+        }
+    }
+
+    fn signed_vote(validator_id: Bytes32, keypair: &HybridKeypair) -> VoteV1 {
+        let block_hash = Bytes32::from([0x44; 32]);
+        let bytes = vote_signing_bytes(
+            7,
+            2,
+            VoteStep::Prevote,
+            &block_hash,
+            &validator_id,
+            None,
+            "indra-testnet-1",
+        );
+        VoteV1 {
+            height: 7,
+            round: 2,
+            step: VoteStep::Prevote,
+            block_hash,
+            validator_id,
+            election_result_hash: None,
+            signature: core_signature(keypair.sign(&bytes).unwrap()),
+        }
+    }
+
+    fn signed_commit(validator_id: Bytes32, keypair: &HybridKeypair) -> VrfCommit {
+        let mut commit = VrfCommit {
+            chain_id_hash: Bytes32::from([0x01; 32]),
+            height: 7,
+            round: 2,
+            validator_id,
+            vrf_pubkey: [0xCC; 32],
+            commit_hash: Bytes32::from([0xDD; 32]),
+            signature: dummy_signature(),
+        };
+        commit.signature = core_signature(keypair.sign(&commit.signing_bytes()).unwrap());
+        commit
+    }
+
+    fn signed_reveal(validator_id: Bytes32, keypair: &HybridKeypair) -> VrfReveal {
+        let mut reveal = VrfReveal {
+            chain_id_hash: Bytes32::from([0x01; 32]),
+            height: 7,
+            round: 2,
+            validator_id,
+            vrf_pubkey: [0xCC; 32],
+            vrf_output: Bytes32::from([0xEE; 32]),
+            vrf_proof: VariableBytes::from_slice(&[0xAB; 80]).unwrap(),
+            commit_hash: Bytes32::from([0xDD; 32]),
+            signature: dummy_signature(),
+        };
+        reveal.signature = core_signature(keypair.sign(&reveal.signing_bytes()).unwrap());
+        reveal
+    }
+
+    fn relay_test_block(
+        _validator_id: Bytes32,
+        vrf: &VrfKeypair,
+        height: u64,
+        round: u32,
+        prev_hash: Bytes32,
+        value_hash: Bytes32,
+    ) -> BlockV1 {
+        let input = relay_vrf_input(&prev_hash, height, round);
+        let (output, proof) = vrf_prove(vrf, &input);
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion(1),
+                height,
+                prev_hash,
+                timestamp: 0,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash,
+                base_fee: 0,
+                proposer_round: round,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::from(output.0),
+                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&proof.0)
+                    .unwrap(),
+                quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),
+                election_result_hash: None,
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            vrf_reveals: vec![],
+        }
+    }
+
+    fn install_relay_keys(actor: &mut PeerManagerActor, keys: Vec<RelayValidatorKey>) {
+        actor.relay_fanout = derive_consensus_relay_fanout(keys.len());
+        actor.relay_keys = relay_key_map(keys);
+        actor.relay_chain_id = "indra-testnet-1".to_string();
+    }
+
+    fn add_test_peer(
+        actor: &mut PeerManagerActor,
+        validator_id: Bytes32,
+        port: u16,
+    ) -> mpsc::Receiver<OutboundMessage> {
+        add_test_peer_receivers(actor, validator_id, port).0
+    }
+
+    fn add_test_peer_large(
+        actor: &mut PeerManagerActor,
+        validator_id: Bytes32,
+        port: u16,
+    ) -> mpsc::Receiver<OutboundMessage> {
+        add_test_peer_receivers(actor, validator_id, port).1
+    }
+
+    fn add_test_peer_receivers(
+        actor: &mut PeerManagerActor,
+        validator_id: Bytes32,
+        port: u16,
+    ) -> (
+        mpsc::Receiver<OutboundMessage>,
+        mpsc::Receiver<OutboundMessage>,
+    ) {
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (small_tx, small_rx) = mpsc::channel(16);
+        let (large_tx, large_rx) = mpsc::channel(16);
+        actor.peer_table.add(addr).unwrap();
+        actor.peer_table.set_validator_id(&addr, validator_id);
+        actor.peer_table.mark_connected(&addr);
+        actor.validator_by_addr.insert(addr, validator_id);
+        actor.peers_by_validator.insert(
+            validator_id,
+            ManagedPeer {
+                addr,
+                small_tx,
+                large_tx,
+                read_task: tokio::spawn(async {}),
+                write_task: tokio::spawn(async {}),
+            },
+        );
+        (small_rx, large_rx)
+    }
+
     #[test]
     fn consensus_duplicate_filter_is_bounded() {
         let mut filter = ConsensusDuplicateFilter::new(3);
@@ -982,6 +1620,679 @@ mod tests {
         let mut filter = ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
         assert!(!filter.is_duplicate(key));
         assert!(filter.is_duplicate(key));
+    }
+
+    #[test]
+    fn fanout_derivation_matches_expected_values_at_each_phase_boundary() {
+        assert_eq!(derive_consensus_relay_fanout(20), 8);
+        assert_eq!(derive_consensus_relay_fanout(50), 10);
+        assert_eq!(derive_consensus_relay_fanout(100), 12);
+        assert_eq!(derive_consensus_relay_fanout(200), 13);
+        assert_eq!(
+            relay_fanout_for_class(13, RelayMessageClass::Block),
+            24,
+            "block relay fanout is a bounded multiplier, not full mesh"
+        );
+    }
+
+    #[test]
+    fn relay_cache_is_bounded_and_evicts_old_entries() {
+        let mut cache = RelaySeenCache::new(2);
+        let key = |byte| {
+            RelayMessageKey::Consensus(ConsensusMessageKey::Vote {
+                validator_id: Bytes32::from([byte; 32]),
+                height: 1,
+                round: 0,
+                step: 0,
+                block_hash: Bytes32::ZERO,
+                content_hash: Bytes32::from([byte; 32]),
+            })
+        };
+        cache.record_forwarded(key(1), &[]);
+        cache.record_forwarded(key(2), &[]);
+        cache.record_forwarded(key(3), &[]);
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.is_seen(&key(1)));
+        assert!(cache.is_seen(&key(2)));
+        assert!(cache.is_seen(&key(3)));
+    }
+
+    #[tokio::test]
+    async fn relay_targets_skip_already_forwarded_peers() {
+        let key = RelayMessageKey::Consensus(ConsensusMessageKey::Vote {
+            validator_id: Bytes32::from([0x71; 32]),
+            height: 1,
+            round: 0,
+            step: 1,
+            block_hash: Bytes32::from([0x72; 32]),
+            content_hash: Bytes32::from([0x73; 32]),
+        });
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let sender = Bytes32::from([0x70; 32]);
+        let forwarded = Bytes32::from([0x74; 32]);
+        let available = Bytes32::from([0x75; 32]);
+        actor.relay_seen.record_forwarded(key, &[forwarded]);
+        actor.relay_fanout = 4;
+        let _forwarded_rx = add_test_peer(&mut actor, forwarded, 34074);
+        let _available_rx = add_test_peer(&mut actor, available, 34075);
+
+        let targets = actor.relay_targets(&key, RelayMessageClass::Vote, sender);
+        assert!(!targets.contains(&forwarded));
+        assert!(targets.contains(&available));
+    }
+
+    #[tokio::test]
+    async fn relay_targets_prefer_higher_scored_peers() {
+        let key = RelayMessageKey::Consensus(ConsensusMessageKey::Vote {
+            validator_id: Bytes32::from([0x82; 32]),
+            height: 1,
+            round: 0,
+            step: 1,
+            block_hash: Bytes32::from([0x83; 32]),
+            content_hash: Bytes32::from([0x84; 32]),
+        });
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.relay_fanout = 1;
+        let sender = Bytes32::from([0x85; 32]);
+        let high_score = Bytes32::from([0x86; 32]);
+        let low_score = Bytes32::from([0x87; 32]);
+        let _high_rx = add_test_peer(&mut actor, high_score, 34086);
+        let _low_rx = add_test_peer(&mut actor, low_score, 34087);
+        let high_addr: SocketAddr = "127.0.0.1:34086".parse().unwrap();
+        let low_addr: SocketAddr = "127.0.0.1:34087".parse().unwrap();
+        actor.peer_table.get_mut(&high_addr).unwrap().score = 150;
+        actor.peer_table.get_mut(&low_addr).unwrap().score = 50;
+
+        let targets = actor.relay_targets(&key, RelayMessageClass::Vote, sender);
+        assert_eq!(targets, vec![high_score]);
+    }
+
+    #[tokio::test]
+    async fn relay_metrics_track_relay_drop_duplicate_and_verification_failure() {
+        let sender = Bytes32::from([0x90; 32]);
+        let receiver = Bytes32::from([0x91; 32]);
+        let keypair = hybrid_key(0x90);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34091);
+        let msg = Message::Vote(signed_vote(sender, &keypair));
+
+        actor.relay_if_eligible(sender, &msg).await;
+        assert!(receiver_rx.try_recv().is_ok());
+        actor.relay_if_eligible(sender, &msg).await;
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].duplicate, 1);
+
+        let invalid_sender = Bytes32::from([0x92; 32]);
+        let invalid_keypair = hybrid_key(0x92);
+        let invalid_msg = Message::Vote(signed_vote(invalid_sender, &invalid_keypair));
+        actor.relay_if_eligible(invalid_sender, &invalid_msg).await;
+        assert_eq!(
+            actor.relay_metrics[&RelayMessageClass::Vote].verification_failed,
+            1
+        );
+
+        let no_target_sender = Bytes32::from([0x93; 32]);
+        let no_target_keypair = hybrid_key(0x93);
+        install_relay_keys(
+            &mut actor,
+            vec![relay_key(no_target_sender, &no_target_keypair)],
+        );
+        actor.peers_by_validator.clear();
+        let no_target_msg = Message::Vote(signed_vote(no_target_sender, &no_target_keypair));
+        actor
+            .relay_if_eligible(no_target_sender, &no_target_msg)
+            .await;
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn node_originated_broadcast_marks_seen_before_echo() {
+        let sender = Bytes32::from([0x80; 32]);
+        let peer = Bytes32::from([0x81; 32]);
+        let keypair = hybrid_key(0x80);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut peer_rx = add_test_peer(&mut actor, peer, 34081);
+        let msg = Message::Vote(signed_vote(sender, &keypair));
+
+        actor
+            .handle_command(NetworkCommand::Broadcast(msg.clone()))
+            .await;
+        assert!(
+            peer_rx.try_recv().is_ok(),
+            "origin broadcast should send once"
+        );
+        actor.relay_if_eligible(peer, &msg).await;
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "echoed message must not be relay-forwarded after origin broadcast marked it seen"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_recomputed_at_epoch_transition_not_per_message() {
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let keys_20 = (0..20u8)
+            .map(|i| {
+                let id = Bytes32::from([i; 32]);
+                relay_key(id, &hybrid_key(i.saturating_add(1)))
+            })
+            .collect::<Vec<_>>();
+        let keys_200 = (0..200u16)
+            .map(|i| {
+                let mut id_bytes = [0u8; 32];
+                id_bytes[..2].copy_from_slice(&i.to_le_bytes());
+                let id = Bytes32::from(id_bytes);
+                relay_key(id, &hybrid_key((i as u8).wrapping_add(1)))
+            })
+            .collect::<Vec<_>>();
+
+        actor
+            .handle_command(NetworkCommand::UpdateRelayValidatorKeys {
+                chain_id: "indra-testnet-1".to_string(),
+                validators: keys_20,
+            })
+            .await;
+        assert_eq!(actor.relay_fanout, 8);
+        let unchanged = relay_fanout_for_class(actor.relay_fanout, RelayMessageClass::Vote);
+        assert_eq!(
+            unchanged, 8,
+            "message-class lookup must not recompute epoch fanout"
+        );
+
+        actor
+            .handle_command(NetworkCommand::UpdateRelayValidatorKeys {
+                chain_id: "indra-testnet-1".to_string(),
+                validators: keys_200,
+            })
+            .await;
+        assert_eq!(actor.relay_fanout, 13);
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_vote_to_fanout_excluding_sender() {
+        let sender = Bytes32::from([0x10; 32]);
+        let receiver = Bytes32::from([0x11; 32]);
+        let keypair = hybrid_key(0x10);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.relay_fanout = 4;
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut sender_rx = add_test_peer(&mut actor, sender, 34010);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34011);
+        let msg = Message::Vote(signed_vote(sender, &keypair));
+        actor.relay_if_eligible(sender, &msg).await;
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "relay must exclude inbound sender"
+        );
+        assert!(matches!(
+            receiver_rx.try_recv().unwrap().msg,
+            Message::Vote(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_does_not_forward_duplicate_vote() {
+        let sender = Bytes32::from([0x20; 32]);
+        let receiver = Bytes32::from([0x21; 32]);
+        let keypair = hybrid_key(0x20);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34021);
+        let msg = Message::Vote(signed_vote(sender, &keypair));
+        actor.relay_if_eligible(sender, &msg).await;
+        actor.relay_if_eligible(sender, &msg).await;
+        assert!(receiver_rx.try_recv().is_ok());
+        assert!(receiver_rx.try_recv().is_err());
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].duplicate, 1);
+    }
+
+    #[tokio::test]
+    async fn pre_relay_signature_verification_rejects_invalid_signature() {
+        let sender = Bytes32::from([0x30; 32]);
+        let receiver = Bytes32::from([0x31; 32]);
+        let keypair = hybrid_key(0x30);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34031);
+        let mut vote = signed_vote(sender, &keypair);
+        vote.signature.classical_sig = VariableBytes::from_slice(&[0x42; 64]).unwrap();
+        actor.relay_if_eligible(sender, &Message::Vote(vote)).await;
+        assert!(receiver_rx.try_recv().is_err());
+        assert_eq!(
+            actor.relay_metrics[&RelayMessageClass::Vote].verification_failed,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_relay_signature_verification_rejects_unregistered_validator() {
+        let sender = Bytes32::from([0x40; 32]);
+        let receiver = Bytes32::from([0x41; 32]);
+        let keypair = hybrid_key(0x40);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34041);
+        actor
+            .relay_if_eligible(sender, &Message::Vote(signed_vote(sender, &keypair)))
+            .await;
+        assert!(receiver_rx.try_recv().is_err());
+        assert_eq!(
+            actor.relay_metrics[&RelayMessageClass::Vote].verification_failed,
+            1
+        );
+    }
+
+    #[test]
+    fn relay_verifies_vrf_commit_and_reveal_signatures() {
+        let sender = Bytes32::from([0x50; 32]);
+        let keypair = hybrid_key(0x50);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        assert!(
+            actor.relay_verification_passes(&Message::VrfCommit(signed_commit(sender, &keypair)))
+        );
+        assert!(
+            actor.relay_verification_passes(&Message::VrfReveal(signed_reveal(sender, &keypair)))
+        );
+    }
+
+    #[test]
+    fn block_relay_verifies_embedded_proposer_vrf_not_election_authority() {
+        let validator_id = Bytes32::from([0x60; 32]);
+        let vrf = VrfKeypair::from_seed(&validator_id.0);
+        let prev_hash = Bytes32::from([0x61; 32]);
+        let block = relay_test_block(validator_id, &vrf, 9, 3, prev_hash, Bytes32::ZERO);
+        let keypair = hybrid_key(0x60);
+        let mut key = relay_key(validator_id, &keypair);
+        key.vrf_pk = Some(vrf.public_key());
+        let mut keys = HashMap::new();
+        keys.insert(validator_id, key);
+        assert_eq!(block_relay_validator_id(&block, &keys), Some(validator_id));
+    }
+
+    #[tokio::test]
+    async fn block_relay_blocks_second_conflicting_block_same_slot() {
+        let validator_id = Bytes32::from([0xA0; 32]);
+        let receiver = Bytes32::from([0xA1; 32]);
+        let vrf = VrfKeypair::from_seed(&validator_id.0);
+        let prev_hash = Bytes32::from([0xA2; 32]);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let keypair = hybrid_key(0xA0);
+        let mut key = relay_key(validator_id, &keypair);
+        key.vrf_pk = Some(vrf.public_key());
+        install_relay_keys(&mut actor, vec![key]);
+        let mut receiver_rx = add_test_peer_large(&mut actor, receiver, 34101);
+
+        let block_a = Message::Block(relay_test_block(
+            validator_id,
+            &vrf,
+            11,
+            2,
+            prev_hash,
+            Bytes32::from([0x01; 32]),
+        ));
+        let block_b = Message::Block(relay_test_block(
+            validator_id,
+            &vrf,
+            11,
+            2,
+            prev_hash,
+            Bytes32::from([0x02; 32]),
+        ));
+        actor.relay_if_eligible(validator_id, &block_a).await;
+        actor.relay_if_eligible(validator_id, &block_b).await;
+
+        assert!(matches!(
+            receiver_rx.try_recv().unwrap().msg,
+            Message::Block(_)
+        ));
+        assert!(
+            receiver_rx.try_recv().is_err(),
+            "conflicting second block for same proposer slot must not relay"
+        );
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Block].relayed, 1);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Block].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn block_relay_allows_legitimate_reproposal_different_round() {
+        let validator_id = Bytes32::from([0xB0; 32]);
+        let receiver = Bytes32::from([0xB1; 32]);
+        let vrf = VrfKeypair::from_seed(&validator_id.0);
+        let prev_hash = Bytes32::from([0xB2; 32]);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let keypair = hybrid_key(0xB0);
+        let mut key = relay_key(validator_id, &keypair);
+        key.vrf_pk = Some(vrf.public_key());
+        install_relay_keys(&mut actor, vec![key]);
+        let mut receiver_rx = add_test_peer_large(&mut actor, receiver, 34111);
+
+        let block_round_2 = Message::Block(relay_test_block(
+            validator_id,
+            &vrf,
+            11,
+            2,
+            prev_hash,
+            Bytes32::from([0x03; 32]),
+        ));
+        let block_round_3 = Message::Block(relay_test_block(
+            validator_id,
+            &vrf,
+            11,
+            3,
+            prev_hash,
+            Bytes32::from([0x04; 32]),
+        ));
+        actor.relay_if_eligible(validator_id, &block_round_2).await;
+        actor.relay_if_eligible(validator_id, &block_round_3).await;
+
+        assert!(receiver_rx.try_recv().is_ok());
+        assert!(receiver_rx.try_recv().is_ok());
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Block].relayed, 2);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Block].dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn block_relay_single_non_conflicting_block_still_relays() {
+        let validator_id = Bytes32::from([0xC0; 32]);
+        let receiver = Bytes32::from([0xC1; 32]);
+        let vrf = VrfKeypair::from_seed(&validator_id.0);
+        let prev_hash = Bytes32::from([0xC2; 32]);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let keypair = hybrid_key(0xC0);
+        let mut key = relay_key(validator_id, &keypair);
+        key.vrf_pk = Some(vrf.public_key());
+        install_relay_keys(&mut actor, vec![key]);
+        let mut receiver_rx = add_test_peer_large(&mut actor, receiver, 34121);
+
+        let block = Message::Block(relay_test_block(
+            validator_id,
+            &vrf,
+            12,
+            0,
+            prev_hash,
+            Bytes32::from([0x05; 32]),
+        ));
+        actor.relay_if_eligible(validator_id, &block).await;
+
+        assert!(matches!(
+            receiver_rx.try_recv().unwrap().msg,
+            Message::Block(_)
+        ));
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Block].relayed, 1);
+    }
+
+    #[test]
+    fn relay_does_not_forward_request_or_response_messages() {
+        assert!(relay_message_class(&Message::RequestQC { height: 7 }).is_none());
+        assert!(relay_message_class(&Message::QCResponse {
+            height: 7,
+            qc_bytes: vec![]
+        })
+        .is_none());
+        assert!(relay_message_class(&Message::RequestVrfReveals {
+            height: 7,
+            round: 0,
+            validator_ids: vec![]
+        })
+        .is_none());
+        assert!(relay_message_class(&Message::VrfRevealsResponse {
+            height: 7,
+            round: 0,
+            reveals: vec![]
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn partial_mesh_propagates_to_quorum_at_n200_realistic_topology() {
+        let n = 200usize;
+        const TARGET_OUTBOUND: usize = 8;
+        const MAX_INBOUND: usize = 64;
+        let fanout = derive_consensus_relay_fanout(n);
+
+        fn rendezvous_candidates(
+            node: usize,
+            candidates: impl Iterator<Item = usize>,
+        ) -> Vec<usize> {
+            let mut ordered = candidates
+                .filter(|candidate| *candidate != node)
+                .map(|candidate| {
+                    let mut seed = Vec::with_capacity(4);
+                    seed.extend_from_slice(&(node as u16).to_le_bytes());
+                    seed.extend_from_slice(&(candidate as u16).to_le_bytes());
+                    let digest = sha256(&seed);
+                    (
+                        u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                        candidate,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ordered.sort();
+            ordered
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect()
+        }
+
+        fn connect_outbound(
+            graph: &mut [HashSet<usize>],
+            inbound_counts: &mut [usize],
+            node: usize,
+            ordered_candidates: Vec<usize>,
+            target_outbound: usize,
+            max_inbound: usize,
+        ) {
+            let mut outbound = graph[node].len();
+            for candidate in ordered_candidates {
+                if outbound >= target_outbound {
+                    break;
+                }
+                if inbound_counts[candidate] >= max_inbound || graph[node].contains(&candidate) {
+                    continue;
+                }
+                graph[node].insert(candidate);
+                graph[candidate].insert(node);
+                inbound_counts[candidate] += 1;
+                outbound += 1;
+            }
+        }
+
+        fn build_random_bounded_graph(
+            n: usize,
+            target_outbound: usize,
+            max_inbound: usize,
+        ) -> (Vec<HashSet<usize>>, Vec<usize>) {
+            let mut graph = vec![HashSet::<usize>::new(); n];
+            let mut inbound_counts = vec![0usize; n];
+            for node in 0..n {
+                connect_outbound(
+                    &mut graph,
+                    &mut inbound_counts,
+                    node,
+                    rendezvous_candidates(node, 0..n),
+                    target_outbound,
+                    max_inbound,
+                );
+            }
+            (graph, inbound_counts)
+        }
+
+        fn build_bootstrap_first_graph(
+            n: usize,
+            target_outbound: usize,
+            max_inbound: usize,
+        ) -> (Vec<HashSet<usize>>, Vec<usize>) {
+            let bootstrap = 0usize;
+            let mut graph = vec![HashSet::<usize>::new(); n];
+            let mut inbound_counts = vec![0usize; n];
+
+            // Initial deployment shape: every non-bootstrap validator tries the
+            // configured bootstrap peer first. The bootstrap is capped, then
+            // peer-list gossip lets validators fill the remaining outbound set.
+            for node in 1..n {
+                connect_outbound(
+                    &mut graph,
+                    &mut inbound_counts,
+                    node,
+                    vec![bootstrap],
+                    1,
+                    max_inbound,
+                );
+            }
+            for node in 0..n {
+                let mut candidates = Vec::new();
+                if node != bootstrap {
+                    candidates.push(bootstrap);
+                }
+                candidates.extend(rendezvous_candidates(node, 0..n));
+                connect_outbound(
+                    &mut graph,
+                    &mut inbound_counts,
+                    node,
+                    candidates,
+                    target_outbound,
+                    max_inbound,
+                );
+            }
+
+            (graph, inbound_counts)
+        }
+
+        fn reached_after_hops(graph: &[HashSet<usize>], fanout: usize, max_hops: usize) -> usize {
+            let mut reached = HashSet::new();
+            let mut frontier = VecDeque::new();
+            reached.insert(0usize);
+            frontier.push_back(0usize);
+            for _ in 0..max_hops {
+                let level = frontier.len();
+                for _ in 0..level {
+                    let node = frontier.pop_front().unwrap();
+                    let mut neighbors = graph[node].iter().copied().collect::<Vec<_>>();
+                    neighbors.sort_unstable();
+                    for peer in neighbors.into_iter().take(fanout) {
+                        if reached.insert(peer) {
+                            frontier.push_back(peer);
+                        }
+                    }
+                }
+            }
+            reached.len()
+        }
+
+        let (random_graph, random_inbound_counts) =
+            build_random_bounded_graph(n, TARGET_OUTBOUND, MAX_INBOUND);
+        let (hub_graph, hub_inbound_counts) =
+            build_bootstrap_first_graph(n, TARGET_OUTBOUND, MAX_INBOUND);
+
+        let random_base_two_hops = reached_after_hops(&random_graph, fanout, 2);
+        let random_base_three_hops = reached_after_hops(&random_graph, fanout, 3);
+        let hub_base_two_hops = reached_after_hops(&hub_graph, fanout, 2);
+        let hub_base_three_hops = reached_after_hops(&hub_graph, fanout, 3);
+        eprintln!(
+            "[relay-sim] random bounded graph: base fanout reached {random_base_two_hops}/200 in 2 hops, {random_base_three_hops}/200 in 3 hops"
+        );
+        eprintln!(
+            "[relay-sim] bootstrap-first graph: base fanout reached {hub_base_two_hops}/200 in 2 hops, {hub_base_three_hops}/200 in 3 hops"
+        );
+        assert!(
+            random_base_three_hops >= 134,
+            "random bounded graph base fanout {fanout} should reach quorum in <=3 hops, reached {random_base_three_hops}"
+        );
+        assert!(
+            hub_base_three_hops >= 134,
+            "bootstrap-first graph base fanout {fanout} should reach quorum in <=3 hops, reached {hub_base_three_hops}"
+        );
+
+        let block_fanout = relay_fanout_for_class(fanout, RelayMessageClass::Block);
+        let random_block_two_hops = reached_after_hops(&random_graph, block_fanout, 2);
+        let hub_block_two_hops = reached_after_hops(&hub_graph, block_fanout, 2);
+        eprintln!(
+            "[relay-sim] random bounded graph: block fanout reached {random_block_two_hops}/200 in 2 hops"
+        );
+        eprintln!(
+            "[relay-sim] bootstrap-first graph: block fanout reached {hub_block_two_hops}/200 in 2 hops"
+        );
+        assert!(
+            random_block_two_hops >= random_base_two_hops,
+            "block fanout multiplier must not propagate worse than base fanout on random graph"
+        );
+        assert!(
+            hub_block_two_hops >= hub_base_two_hops,
+            "block fanout multiplier must not propagate worse than base fanout on bootstrap-first graph"
+        );
+        assert!(
+            hub_block_two_hops >= 134,
+            "bootstrap-first block relay fanout {block_fanout} should reach quorum in <=2 hops, reached {hub_block_two_hops}"
+        );
+        assert!(
+            random_graph
+                .iter()
+                .chain(hub_graph.iter())
+                .all(|neighbors| neighbors.len() < n / 2),
+            "simulation must remain partial mesh, not accidentally full mesh"
+        );
+        assert!(
+            random_inbound_counts
+                .iter()
+                .chain(hub_inbound_counts.iter())
+                .all(|count| *count <= MAX_INBOUND),
+            "simulation must honor inbound cap"
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode relay verification timing; run explicitly with --ignored --nocapture"]
+    fn bench_pre_relay_verification_cost_n200() {
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let mut keys = Vec::with_capacity(200);
+        let mut messages = Vec::with_capacity(800);
+
+        for i in 0..200u16 {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[..2].copy_from_slice(&i.to_le_bytes());
+            let validator_id = Bytes32::from(id_bytes);
+            let keypair = hybrid_key((i as u8).wrapping_add(1));
+            keys.push(relay_key(validator_id, &keypair));
+            messages.push(Message::Vote(signed_vote(validator_id, &keypair)));
+            messages.push(Message::Vote(signed_vote(validator_id, &keypair)));
+            messages.push(Message::VrfCommit(signed_commit(validator_id, &keypair)));
+            messages.push(Message::VrfReveal(signed_reveal(validator_id, &keypair)));
+        }
+
+        install_relay_keys(&mut actor, keys);
+        let start = Instant::now();
+        for msg in &messages {
+            assert!(actor.relay_verification_passes(msg));
+        }
+        let elapsed = start.elapsed();
+        let per_us = elapsed.as_micros() as f64 / messages.len() as f64;
+        eprintln!(
+            "[bench] pre-relay hybrid verification: {} msgs in {}ms ({:.1}µs/msg)",
+            messages.len(),
+            elapsed.as_millis(),
+            per_us
+        );
+        assert!(
+            elapsed.as_millis() < indra_core::types::primitives::MIN_ROUND_TIME_MS as u128,
+            "800 pre-relay verifications took {}ms, exceeding MIN_ROUND_TIME_MS",
+            elapsed.as_millis()
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use indra_network::{
     perform_handshake_initiator, perform_handshake_responder, perform_observer_handshake_responder,
     read_frame_plain_limited, spawn_peer_manager, write_frame_plain, HandshakeConfig,
     NetworkCommand, NetworkEvent, ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle,
-    TokenBucket,
+    RelayValidatorKey, TokenBucket,
 };
 use indra_node::{
     discovery::{
@@ -96,6 +96,15 @@ impl NetworkBridge {
             validator_id,
             msg: msg.clone(),
         });
+    }
+
+    fn update_relay_validator_keys(&self, config: &HandshakeConfig) {
+        let _ = self
+            .handle
+            .send_blocking(NetworkCommand::UpdateRelayValidatorKeys {
+                chain_id: config.chain_id.clone(),
+                validators: config.relay_validator_keys.clone(),
+            });
     }
 
     fn disconnect_invalid_consensus_peer(&self, addr: &SocketAddr, reason: String) {
@@ -525,11 +534,26 @@ fn build_handshake_config(engine: &NodeEngine) -> Option<HandshakeConfig> {
             Some((validator.validator_id, PqPublicKey(pq_pk)))
         })
         .collect::<Vec<_>>();
+    let relay_validator_keys = engine
+        .state
+        .validators
+        .active_validators()
+        .filter_map(|validator| {
+            Some(RelayValidatorKey {
+                validator_id: validator.validator_id,
+                hybrid_classical_pk: validator.hybrid_classical_pk?,
+                hybrid_pq_pk: validator.hybrid_pq_pk.clone()?,
+                vrf_pk: validator.vrf_pk,
+            })
+        })
+        .collect::<Vec<_>>();
 
     Some(HandshakeConfig {
         my_validator_id,
         my_signing_key: pq_keypair,
+        chain_id: engine.state.chain_id.clone(),
         known_validators,
+        relay_validator_keys,
         timeout: Duration::from_secs(10),
     })
 }
@@ -538,6 +562,15 @@ fn refresh_handshake_config(engine: &NodeEngine, config: &Arc<RwLock<HandshakeCo
     if let Some(new_config) = build_handshake_config(engine) {
         *config.write().unwrap() = new_config;
     }
+}
+
+fn refresh_handshake_and_relay_config(
+    engine: &NodeEngine,
+    config: &Arc<RwLock<HandshakeConfig>>,
+    gossip: &Arc<NetworkBridge>,
+) {
+    refresh_handshake_config(engine, config);
+    gossip.update_relay_validator_keys(&config.read().unwrap());
 }
 
 fn start_network_runtime(
@@ -600,8 +633,11 @@ fn start_network_runtime(
 
             runtime.block_on(async move {
                 let (async_event_tx, mut async_event_rx) = tokio_mpsc::channel::<NetworkEvent>(1024);
+                let initial_handshake_config = handshake_config.read().unwrap().clone();
                 let peer_manager = spawn_peer_manager(PeerManagerConfig {
-                    local_validator_id: handshake_config.read().unwrap().my_validator_id,
+                    local_validator_id: initial_handshake_config.my_validator_id,
+                    chain_id: initial_handshake_config.chain_id,
+                    relay_validator_keys: initial_handshake_config.relay_validator_keys,
                     event_tx: async_event_tx,
                     command_buffer: 1024,
                 });
@@ -1720,9 +1756,10 @@ fn main() {
                                                     &metrics_state,
                                                     &last_block_timestamp,
                                                 );
-                                                refresh_handshake_config(
+                                                refresh_handshake_and_relay_config(
                                                     &d.engine,
                                                     &handshake_config,
+                                                    &gossip,
                                                 );
                                                 if let Err(err) =
                                                     d.promote_block_header_qc(&block, "sync")
@@ -1834,9 +1871,10 @@ fn main() {
                             );
                             let new_height = driver.lock().unwrap().height();
                             if new_height > previous_height {
-                                refresh_handshake_config(
+                                refresh_handshake_and_relay_config(
                                     &driver.lock().unwrap().engine,
                                     &handshake_config,
+                                    &gossip,
                                 );
                                 let _ = height_tx.send(());
                                 broadcast_status(&driver, &gossip);
@@ -2471,7 +2509,11 @@ fn process_driver_actions(
             );
             let new_height = driver.lock().unwrap().height();
             if new_height > previous_height {
-                refresh_handshake_config(&driver.lock().unwrap().engine, handshake_config);
+                refresh_handshake_and_relay_config(
+                    &driver.lock().unwrap().engine,
+                    handshake_config,
+                    gossip,
+                );
                 if !recorded_commit {
                     record_block_commit(metrics_state, last_block_timestamp);
                     recorded_commit = true;

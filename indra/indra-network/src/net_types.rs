@@ -6,6 +6,20 @@ use indra_core::types::{primitives::Bytes32, slashing::SlashEvidenceV1};
 
 use crate::message::Message;
 
+/// Read-only validator public keys used by the peer manager for relay
+/// eligibility checks.
+#[derive(Debug, Clone)]
+pub struct RelayValidatorKey {
+    /// Validator identity.
+    pub validator_id: Bytes32,
+    /// Ed25519 hybrid public key component.
+    pub hybrid_classical_pk: [u8; 32],
+    /// ML-DSA-87 hybrid public key component.
+    pub hybrid_pq_pk: Vec<u8>,
+    /// Registered proposer-election VRF public key, when available.
+    pub vrf_pk: Option<[u8; 32]>,
+}
+
 /// Events emitted by the async network layer.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
@@ -69,5 +83,12 @@ pub enum NetworkCommand {
         validator_id: Bytes32,
         /// Human-readable reason for logs.
         reason: String,
+    },
+    /// Replace the read-only validator key snapshot used for relay checks.
+    UpdateRelayValidatorKeys {
+        /// Current chain id for vote domain separation.
+        chain_id: String,
+        /// Active validator public keys.
+        validators: Vec<RelayValidatorKey>,
     },
 }

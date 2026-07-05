@@ -17,6 +17,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::{
     error::{NetworkError, NetworkResult},
     frame::{decrypt_with_aad, encrypt_with_aad},
+    net_types::RelayValidatorKey,
 };
 
 const MAGIC: &[u8; 4] = b"INDR";
@@ -37,8 +38,13 @@ pub struct HandshakeConfig {
     pub my_validator_id: Bytes32,
     /// Local ML-DSA-87 signing key for transport authentication.
     pub my_signing_key: PqKeypair,
+    /// Current chain id used by relay signature verification.
+    pub chain_id: String,
     /// Accepted validator identities and their ML-DSA-87 verifying keys.
     pub known_validators: Vec<(Bytes32, PqPublicKey)>,
+    /// Active validator public-key snapshot used by the peer manager for
+    /// pre-relay cryptographic checks.
+    pub relay_validator_keys: Vec<RelayValidatorKey>,
     /// Maximum time allowed for the full handshake.
     pub timeout: Duration,
 }
@@ -388,7 +394,9 @@ mod tests {
         HandshakeConfig {
             my_validator_id: validator_id,
             my_signing_key: signing_key,
+            chain_id: "indra-testnet-1".to_string(),
             known_validators,
+            relay_validator_keys: Vec::new(),
             timeout,
         }
     }
