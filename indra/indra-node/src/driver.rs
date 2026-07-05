@@ -1930,6 +1930,7 @@ impl ConsensusDriver {
         let hash = block.header.block_hash();
         let value_hash = block.header.value_hash;
         let election_mismatch = vrf_commit_reveal_election_active(height)
+            && !reveal_set_commitment_active(height)
             && block.header.election_result_hash
                 != self
                     .vrf_election_result(height, self.current_round)
@@ -2014,43 +2015,61 @@ impl ConsensusDriver {
             && step == VoteStep::Precommit
             && block_hash != Bytes32::ZERO
         {
-            match self
-                .vrf_election_result(height, round)
-                .map(|result| result.hash())
-            {
-                Some(hash) => {
-                    if self
-                        .pending_block(&block_hash)
-                        .is_some_and(|block| block.header.election_result_hash != Some(hash))
-                    {
+            if reveal_set_commitment_active(height) {
+                match self
+                    .pending_block(&block_hash)
+                    .and_then(|block| block.header.election_result_hash)
+                {
+                    Some(hash) => {
+                        election_result_hash = Some(hash);
+                    }
+                    None => {
                         eprintln!(
-                            "[consensus] precommit for height={} round={}: local VRF election result does not match staged block — casting nil precommit",
+                            "[consensus] precommit for height={} round={}: staged block is missing verified reveal-set election_result_hash — casting nil precommit",
                             height, round,
                         );
                         vote_block_hash = Bytes32::ZERO;
-                    } else {
-                        election_result_hash = Some(hash);
                     }
                 }
-                None => {
-                    let waited_enough = self
-                        .precommit_phase_started_at
-                        .map(|started| {
-                            started.elapsed().as_millis() >= VRF_ELECTION_SETTLE_MS as u128
-                        })
-                        .unwrap_or(false);
-                    if !waited_enough {
+            } else {
+                match self
+                    .vrf_election_result(height, round)
+                    .map(|result| result.hash())
+                {
+                    Some(hash) => {
+                        if self
+                            .pending_block(&block_hash)
+                            .is_some_and(|block| block.header.election_result_hash != Some(hash))
+                        {
+                            eprintln!(
+                                "[consensus] precommit for height={} round={}: local VRF election result does not match staged block — casting nil precommit",
+                                height, round,
+                            );
+                            vote_block_hash = Bytes32::ZERO;
+                        } else {
+                            election_result_hash = Some(hash);
+                        }
+                    }
+                    None => {
+                        let waited_enough = self
+                            .precommit_phase_started_at
+                            .map(|started| {
+                                started.elapsed().as_millis() >= VRF_ELECTION_SETTLE_MS as u128
+                            })
+                            .unwrap_or(false);
+                        if !waited_enough {
+                            eprintln!(
+                                "[consensus] precommit height={} round={}: VRF election result not yet available — delaying nil precommit for {}ms settle window",
+                                height, round, VRF_ELECTION_SETTLE_MS,
+                            );
+                            return vec![DriverAction::None];
+                        }
                         eprintln!(
-                            "[consensus] precommit height={} round={}: VRF election result not yet available — delaying nil precommit for {}ms settle window",
+                            "[consensus] precommit height={} round={}: VRF election result still unavailable after {}ms — casting nil precommit",
                             height, round, VRF_ELECTION_SETTLE_MS,
                         );
-                        return vec![DriverAction::None];
+                        vote_block_hash = Bytes32::ZERO;
                     }
-                    eprintln!(
-                        "[consensus] precommit height={} round={}: VRF election result still unavailable after {}ms — casting nil precommit",
-                        height, round, VRF_ELECTION_SETTLE_MS,
-                    );
-                    vote_block_hash = Bytes32::ZERO;
                 }
             }
         }
@@ -3160,7 +3179,8 @@ mod tests {
     use indra_core::{
         types::block::{BlockHeaderV1, BlockV1},
         types::primitives::{
-            DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES,
+            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT, DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS,
+            DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES,
         },
         Bytes32, ProtocolVersion, VariableBytes,
     };
@@ -3445,8 +3465,16 @@ mod tests {
         active_seeds: &[[u8; 32]],
         reveals: &[VrfReveal],
     ) -> BlockV1 {
-        let height = u64::MAX;
-        let round = 0u32;
+        reveal_set_block_from_reveals_at(driver, active_seeds, reveals, u64::MAX, 0)
+    }
+
+    fn reveal_set_block_from_reveals_at(
+        driver: &ConsensusDriver,
+        active_seeds: &[[u8; 32]],
+        reveals: &[VrfReveal],
+        height: u64,
+        round: u32,
+    ) -> BlockV1 {
         let election = election_for_round(driver, height, round);
         let mut revealed_outputs = std::collections::BTreeMap::new();
         let mut evidence = reveal_evidence_from_reveals(reveals.iter().cloned());
@@ -3511,6 +3539,67 @@ mod tests {
         block.header.validator_set_root = compute_validator_set_root(&projected);
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
+    }
+
+    fn attach_parent_qc(driver: &ConsensusDriver, block: &mut BlockV1, signers: &[&HybridKeypair]) {
+        let parent_qc = qc_bytes_from_signers(
+            driver,
+            signers,
+            driver.engine.state.height,
+            0,
+            driver.engine.state.tip_hash,
+            None,
+        );
+        block.header.quorum_certificate = VariableBytes::from_slice(&parent_qc).unwrap();
+        let mut projected = driver.engine.state.clone();
+        apply_block(&mut projected, block, 0).unwrap();
+        block.header.state_root = compute_state_root(&projected);
+        block.header.validator_set_root = compute_validator_set_root(&projected);
+        block.header.value_hash = block.compute_value_hash(projected.total_supply);
+    }
+
+    fn set_complete_vrf_state_with_divergent_result(
+        driver: &mut ConsensusDriver,
+        height: u64,
+        round: u32,
+        commits: Vec<VrfCommit>,
+        reveals: Vec<VrfReveal>,
+        authoritative_hash: Bytes32,
+    ) {
+        let mut state = VrfRoundState::new(height, round);
+        state.phase = VrfRoundPhase::Complete;
+        for commit in commits {
+            state.commits.insert(commit.validator_id, commit);
+        }
+        for reveal in &reveals {
+            state.reveals.insert(reveal.validator_id, reveal.clone());
+        }
+        let mut evidence = reveal_evidence_from_reveals(reveals);
+        evidence.sort_by_key(|item| item.validator_id.0);
+        let mut divergent_result = VrfElectionResult {
+            height,
+            round,
+            elected_validator_id: state
+                .reveals
+                .keys()
+                .next()
+                .copied()
+                .expect("test must provide at least one reveal"),
+            elected_vrf_output: Bytes32::from([0x7Bu8; 32]),
+            fallback_used: false,
+            reveal_set_commitment: compute_reveal_set_commitment(&evidence),
+        };
+        if divergent_result.hash() == authoritative_hash {
+            divergent_result.elected_vrf_output = Bytes32::from([0x7Cu8; 32]);
+        }
+        assert_ne!(
+            divergent_result.hash(),
+            authoritative_hash,
+            "test setup requires local election hash to differ from proposal hash"
+        );
+        state.election_result = Some(divergent_result);
+        state.election_reveal_evidence = Some(evidence);
+        driver.vrf_states[0] = Some(state);
     }
 
     fn seed_vrf_result_for_seed(
@@ -4314,6 +4403,333 @@ mod tests {
             driver.pending_block(&block_hash).is_some(),
             "recovered block should enter normal pending-block processing after reveal response"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_two_local_election_hash_split_still_finalizes_valid_proposal() {
+        let local_seed = [0x31u8; 32];
+        let seed_b = [0x32u8; 32];
+        let seed_c = [0x33u8; 32];
+        let seed_d = [0x34u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "two_two_split_votes_block");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let _d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        let height = REVEAL_SET_COMMITMENT_HEIGHT + 1;
+        let round = 0;
+        driver.engine.state.height = height - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0x31; 32]);
+        driver.sync.mark_caught_up(driver.engine.state.height);
+        driver.start_round(round);
+
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let (commit_b, reveal_b) =
+            signed_vrf_pair(&driver, seed_b, height, round, DEFAULT_CHAIN_ID);
+        let (commit_c, reveal_c) =
+            signed_vrf_pair(&driver, seed_c, height, round, DEFAULT_CHAIN_ID);
+        let mut block = reveal_set_block_from_reveals_at(
+            &driver,
+            &[local_seed, seed_b, seed_c, seed_d],
+            &[reveal_a.clone(), reveal_b.clone(), reveal_c.clone()],
+            height,
+            round,
+        );
+        attach_parent_qc(&driver, &mut block, &[&local, &b, &c]);
+        let block_hash = block.header.block_hash();
+        let proposal_election_hash = block
+            .header
+            .election_result_hash
+            .expect("reveal-set block must commit to election result");
+        set_complete_vrf_state_with_divergent_result(
+            &mut driver,
+            height,
+            round,
+            vec![commit_a, commit_b, commit_c],
+            vec![reveal_a, reveal_b, reveal_c],
+            proposal_election_hash,
+        );
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9931".parse().unwrap()),
+            block: block.clone(),
+        });
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote)
+                if vote.height == height
+                    && vote.round == round
+                    && vote.step == VoteStep::Prevote
+                    && vote.block_hash == block_hash
+        )));
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                DriverAction::BroadcastVote(vote)
+                    if vote.height == height
+                        && vote.round == round
+                        && vote.step == VoteStep::Prevote
+                        && vote.block_hash == Bytes32::ZERO
+            )),
+            "post-activation voting must not nil-prevote solely because the local reveal view hashes differently"
+        );
+
+        for (peer, signer) in [("127.0.0.1:9932", &b), ("127.0.0.1:9933", &c)] {
+            let vote = indra_consensus::vote::produce_vote(
+                height,
+                round,
+                VoteStep::Prevote,
+                block_hash,
+                validator_id_for(signer),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let actions = driver.process(DriverEvent::InboundVote {
+                from: peer.parse().unwrap(),
+                vote,
+            });
+            if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    DriverAction::BroadcastVote(vote)
+                        if vote.step == VoteStep::Precommit
+                            && vote.height == height
+                            && vote.round == round
+                )
+            }) {
+                assert!(actions.iter().any(|action| matches!(
+                    action,
+                    DriverAction::BroadcastVote(vote)
+                        if vote.step == VoteStep::Precommit
+                            && vote.block_hash == block_hash
+                            && vote.election_result_hash == Some(proposal_election_hash)
+                )));
+            }
+        }
+
+        for (peer, signer) in [("127.0.0.1:9934", &b), ("127.0.0.1:9935", &c)] {
+            let vote = indra_consensus::vote::produce_vote_with_election_result(
+                height,
+                round,
+                VoteStep::Precommit,
+                block_hash,
+                validator_id_for(signer),
+                Some(proposal_election_hash),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let _ = driver.process(DriverEvent::InboundVote {
+                from: peer.parse().unwrap(),
+                vote,
+            });
+        }
+        assert_eq!(
+            driver.height(),
+            height,
+            "valid proposer-specified reveal set should finalize even when local election hashes split 2-2"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn three_one_split_finalizes_without_minority_nil_vote() {
+        let local_seed = [0x35u8; 32];
+        let seed_b = [0x36u8; 32];
+        let seed_c = [0x37u8; 32];
+        let seed_d = [0x38u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "three_one_split_votes_block");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let _d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        let height = REVEAL_SET_COMMITMENT_HEIGHT + 1;
+        let round = 0;
+        driver.engine.state.height = height - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0x35; 32]);
+        driver.sync.mark_caught_up(driver.engine.state.height);
+        driver.start_round(round);
+
+        let (commit_a, reveal_a) =
+            signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let (commit_b, reveal_b) =
+            signed_vrf_pair(&driver, seed_b, height, round, DEFAULT_CHAIN_ID);
+        let (commit_c, reveal_c) =
+            signed_vrf_pair(&driver, seed_c, height, round, DEFAULT_CHAIN_ID);
+        let mut block = reveal_set_block_from_reveals_at(
+            &driver,
+            &[local_seed, seed_b, seed_c, seed_d],
+            &[reveal_a.clone(), reveal_b.clone(), reveal_c.clone()],
+            height,
+            round,
+        );
+        attach_parent_qc(&driver, &mut block, &[&local, &b, &c]);
+        let block_hash = block.header.block_hash();
+        let proposal_election_hash = block.header.election_result_hash.unwrap();
+        set_complete_vrf_state_with_divergent_result(
+            &mut driver,
+            height,
+            round,
+            vec![commit_a, commit_b, commit_c],
+            vec![reveal_a, reveal_b, reveal_c],
+            proposal_election_hash,
+        );
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9936".parse().unwrap()),
+            block,
+        });
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote)
+                if vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+        )));
+
+        for (peer, signer) in [("127.0.0.1:9937", &b), ("127.0.0.1:9938", &c)] {
+            let vote = indra_consensus::vote::produce_vote(
+                height,
+                round,
+                VoteStep::Prevote,
+                block_hash,
+                validator_id_for(signer),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let _ = driver.process(DriverEvent::InboundVote {
+                from: peer.parse().unwrap(),
+                vote,
+            });
+        }
+        for (peer, signer) in [("127.0.0.1:9939", &b), ("127.0.0.1:9940", &c)] {
+            let vote = indra_consensus::vote::produce_vote_with_election_result(
+                height,
+                round,
+                VoteStep::Precommit,
+                block_hash,
+                validator_id_for(signer),
+                Some(proposal_election_hash),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let _ = driver.process(DriverEvent::InboundVote {
+                from: peer.parse().unwrap(),
+                vote,
+            });
+        }
+        assert_eq!(driver.height(), height);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_reveal_set_evidence_still_rejected_before_voting() {
+        let local_seed = [0x39u8; 32];
+        let seed_b = [0x3Au8; 32];
+        let seed_c = [0x3Bu8; 32];
+        let seed_d = [0x3Cu8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "invalid_reveal_set_still_rejected");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let _d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        let height = REVEAL_SET_COMMITMENT_HEIGHT + 1;
+        let round = 0;
+        driver.engine.state.height = height - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0x39; 32]);
+        driver.sync.mark_caught_up(driver.engine.state.height);
+        driver.start_round(round);
+
+        let (_, reveal_a) = signed_vrf_pair(&driver, local_seed, height, round, DEFAULT_CHAIN_ID);
+        let (_, reveal_b) = signed_vrf_pair(&driver, seed_b, height, round, DEFAULT_CHAIN_ID);
+        let (_, reveal_c) = signed_vrf_pair(&driver, seed_c, height, round, DEFAULT_CHAIN_ID);
+        let mut block = reveal_set_block_from_reveals_at(
+            &driver,
+            &[local_seed, seed_b, seed_c, seed_d],
+            &[reveal_a.clone(), reveal_b.clone(), reveal_c.clone()],
+            height,
+            round,
+        );
+        attach_parent_qc(&driver, &mut block, &[&local, &b, &c]);
+        block.vrf_reveals.pop();
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9941".parse().unwrap()),
+            block,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "invalid reveal-set evidence must be rejected before the voting authority change can apply"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_pre_reveal_set_mismatch_behavior_unchanged() {
+        let local_seed = [0x3Du8; 32];
+        let seed_b = [0x3Eu8; 32];
+        let seed_c = [0x3Fu8; 32];
+        let seed_d = [0x40u8; 32];
+        let (mut driver, dir) = local_driver(local_seed, "legacy_mismatch_unchanged");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, seed_b, "b");
+        let c = install_active_validator(&mut driver, seed_c, "c");
+        let _d = install_active_validator(&mut driver, seed_d, "d");
+        driver.refresh_registered_voters();
+        let height = REVEAL_SET_COMMITMENT_HEIGHT - 1;
+        let round = 0;
+        driver.engine.state.height = height - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0x3D; 32]);
+        driver.sync.mark_caught_up(driver.engine.state.height);
+        driver.start_round(round);
+
+        let election = election_for_round(&driver, height, round);
+        let elected_id =
+            indra_consensus::proposer::elect_proposer(&election, election.height).unwrap();
+        let active_seeds = [local_seed, seed_b, seed_c, seed_d];
+        let proposer_seed = active_seeds
+            .iter()
+            .copied()
+            .find(|seed| {
+                let vrf = VrfKeypair::from_seed(seed);
+                election.candidates.iter().any(|candidate| {
+                    candidate.validator_id == elected_id && candidate.vrf_pubkey == vrf.public_key()
+                })
+            })
+            .expect("elected proposer should map to one active test seed");
+        let other_seed = active_seeds
+            .iter()
+            .copied()
+            .find(|seed| *seed != proposer_seed)
+            .unwrap();
+        seed_vrf_result_for_seed(&mut driver, height, round, other_seed);
+        let mut block = make_strict_block(&driver, proposer_seed, round, Vec::new());
+        attach_parent_qc(&driver, &mut block, &[&local, &b, &c]);
+        let block_hash = block.header.block_hash();
+
+        let actions = driver.process(DriverEvent::InboundBlock {
+            from: Some("127.0.0.1:9942".parse().unwrap()),
+            block,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
+            "pre-activation local election mismatch should still prevent voting"
+        );
+        assert!(driver.pending_block(&block_hash).is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
