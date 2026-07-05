@@ -15,6 +15,13 @@ use indra_core::types::{
     transaction::OutputV1,
 };
 
+/// Defensive snapshot decode ceiling for delegators under one validator.
+///
+/// This is intentionally far above expected 200-validator mainnet operating
+/// needs, but finite so corrupted snapshots cannot claim `u32::MAX`
+/// delegators and force unbounded allocation or decode work.
+pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = 100_000;
+
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidatorStatus {
@@ -668,6 +675,59 @@ mod tests {
     }
 
     #[test]
+    fn delegation_map_decode_rejects_excessive_delegator_count() {
+        let mut bytes = Vec::new();
+        1u32.encode(&mut bytes);
+        Bytes32::from([0xAA; 32]).encode(&mut bytes);
+        ((MAX_DELEGATORS_PER_VALIDATOR_DECODE + 1) as u32).encode(&mut bytes);
+
+        let err = DelegationMap::decode_exact(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::LengthExceeded {
+                field: "snapshot.delegators",
+                max: MAX_DELEGATORS_PER_VALIDATOR_DECODE,
+                actual
+            } if actual == MAX_DELEGATORS_PER_VALIDATOR_DECODE + 1
+        ));
+    }
+
+    #[test]
+    fn delegation_map_decode_accepts_realistic_delegator_count() {
+        let validator_id = Bytes32::from([0xAB; 32]);
+        let mut map = DelegationMap::new();
+        for i in 0..3u8 {
+            map.add_delegation(validator_id, Bytes32::from([i; 32]), 1_000 + i as u64, 7);
+        }
+
+        let decoded = DelegationMap::decode_exact(&map.encode_to_vec()).unwrap();
+        assert_eq!(decoded.get_delegators(&validator_id).len(), 3);
+        assert_eq!(
+            decoded.total_delegated(&validator_id),
+            1_000 + 1_001 + 1_002
+        );
+    }
+
+    #[test]
+    fn delegation_map_legacy_decode_rejects_excessive_delegator_count() {
+        let mut bytes = Vec::new();
+        1u32.encode(&mut bytes);
+        Bytes32::from([0xAC; 32]).encode(&mut bytes);
+        ((MAX_DELEGATORS_PER_VALIDATOR_DECODE + 1) as u32).encode(&mut bytes);
+        let mut reader = ByteReader::new(&bytes);
+
+        let err = DelegationMap::decode_legacy(&mut reader).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::LengthExceeded {
+                field: "snapshot.delegators",
+                max: MAX_DELEGATORS_PER_VALIDATOR_DECODE,
+                actual
+            } if actual == MAX_DELEGATORS_PER_VALIDATOR_DECODE + 1
+        ));
+    }
+
+    #[test]
     fn insert_and_retrieve() {
         let mut vs = ValidatorSet::new();
         let v = make_validator(0x01, 10_000_000_000, 0);
@@ -1005,6 +1065,13 @@ impl Encode for DelegationMap {
 impl Decode for DelegationMap {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
+        if count > MAX_VALIDATORS {
+            return Err(IndraError::LengthExceeded {
+                field: "snapshot.delegations",
+                max: MAX_VALIDATORS,
+                actual: count,
+            });
+        }
         let mut delegators = BTreeMap::new();
         for _ in 0..count {
             let validator_id = Bytes32::decode(r)?;
@@ -1013,7 +1080,11 @@ impl Decode for DelegationMap {
                     field: "snapshot.delegations",
                 });
             }
-            let entries: Vec<DelegatorEntry> = decode_list(r, usize::MAX, "snapshot.delegators")?;
+            let entries: Vec<DelegatorEntry> = decode_list(
+                r,
+                MAX_DELEGATORS_PER_VALIDATOR_DECODE,
+                "snapshot.delegators",
+            )?;
             delegators.insert(validator_id, entries);
         }
         Ok(Self { delegators })
@@ -1031,6 +1102,13 @@ impl DelegationMap {
     /// Decode a legacy unversioned delegation map.
     pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
+        if count > MAX_VALIDATORS {
+            return Err(IndraError::LengthExceeded {
+                field: "snapshot.delegations",
+                max: MAX_VALIDATORS,
+                actual: count,
+            });
+        }
         let mut delegators = BTreeMap::new();
         for _ in 0..count {
             let validator_id = Bytes32::decode(r)?;
@@ -1040,6 +1118,13 @@ impl DelegationMap {
                 });
             }
             let entry_count = u32::decode(r)? as usize;
+            if entry_count > MAX_DELEGATORS_PER_VALIDATOR_DECODE {
+                return Err(IndraError::LengthExceeded {
+                    field: "snapshot.delegators",
+                    max: MAX_DELEGATORS_PER_VALIDATOR_DECODE,
+                    actual: entry_count,
+                });
+            }
             let mut entries = Vec::with_capacity(entry_count);
             for _ in 0..entry_count {
                 entries.push(DelegatorEntry::decode_legacy(r)?);

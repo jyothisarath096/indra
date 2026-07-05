@@ -15,13 +15,19 @@
 use std::collections::HashSet;
 
 use indra_core::{
-    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+    codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::primitives::Bytes32,
 };
 use indra_crypto::sha256;
 
 use crate::smt::{MerkleProof, SparseMerkleTree};
+
+/// Defensive snapshot decode ceiling for spent nullifiers.
+///
+/// This mirrors the UTXO snapshot guard: large enough for normal operation, but
+/// finite so corrupted snapshots cannot request unbounded allocation/work.
+pub const MAX_NULLIFIERS_DECODE: usize = 1_000_000;
 
 /// The complete set of spent nullifiers.
 ///
@@ -57,9 +63,17 @@ impl Encode for NullifierSet {
 
 impl Decode for NullifierSet {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let spent: Vec<Bytes32> = decode_list(r, usize::MAX, "snapshot.nullifiers")?;
+        let count = u32::decode(r)? as usize;
+        if count > MAX_NULLIFIERS_DECODE {
+            return Err(IndraError::LengthExceeded {
+                field: "snapshot.nullifiers",
+                max: MAX_NULLIFIERS_DECODE,
+                actual: count,
+            });
+        }
         let mut set = Self::new();
-        for nullifier in spent {
+        for _ in 0..count {
+            let nullifier = Bytes32::decode(r)?;
             if !set.spent.insert(nullifier) {
                 return Err(IndraError::DuplicateEntries {
                     field: "snapshot.nullifiers",
@@ -190,6 +204,33 @@ mod tests {
         set.insert(n);
         // No remove method exists. Verify it's still there.
         assert!(set.contains(&n));
+    }
+
+    #[test]
+    fn nullifier_set_decode_rejects_excessive_entry_count() {
+        let mut bytes = Vec::new();
+        ((MAX_NULLIFIERS_DECODE + 1) as u32).encode(&mut bytes);
+
+        let err = NullifierSet::decode_exact(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::LengthExceeded {
+                field: "snapshot.nullifiers",
+                max: MAX_NULLIFIERS_DECODE,
+                actual
+            } if actual == MAX_NULLIFIERS_DECODE + 1
+        ));
+    }
+
+    #[test]
+    fn nullifier_set_decode_accepts_realistic_entry_count() {
+        let mut set = NullifierSet::new();
+        set.insert(nullifier(0x21));
+        set.insert(nullifier(0x22));
+
+        let decoded = NullifierSet::decode_exact(&set.encode_to_vec()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded.root(), set.root());
     }
 
     #[test]

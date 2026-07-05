@@ -23,6 +23,10 @@ pub const MAX_ACTIVE_GOVERNANCE_PROPOSALS: usize = 3;
 pub const MAX_ACTIVE_GOVERNANCE_PROPOSALS_PER_PROPOSER: usize = 1;
 /// Proposal cooldown per proposer.
 pub const GOVERNANCE_PROPOSAL_COOLDOWN_EPOCHS: u64 = 10;
+/// Defensive snapshot decode cap for governance collections that are not
+/// already bounded by validator count. This matches the existing governance
+/// vector/u64-map decode cap style.
+pub const MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE: usize = 10_000;
 /// Deliberation duration.
 pub const GOVERNANCE_DELIBERATION_EPOCHS: u64 = 30;
 /// Standard proposal commit duration.
@@ -809,10 +813,10 @@ fn encode_vec<T: Encode>(values: &[T], buf: &mut Vec<u8>) {
 
 fn decode_vec<T: Decode>(r: &mut ByteReader<'_>, field: &'static str) -> IndraResult<Vec<T>> {
     let count = u32::decode(r)? as usize;
-    if count > 10_000 {
+    if count > MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE {
         return Err(IndraError::LengthExceeded {
             field,
-            max: 10_000,
+            max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
             actual: count,
         });
     }
@@ -840,10 +844,10 @@ fn decode_u64_map(
     field: &'static str,
 ) -> IndraResult<BTreeMap<Bytes32, u64>> {
     let count = u32::decode(r)? as usize;
-    if count > 10_000 {
+    if count > MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE {
         return Err(IndraError::LengthExceeded {
             field,
-            max: 10_000,
+            max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
             actual: count,
         });
     }
@@ -867,6 +871,13 @@ fn encode_set_map(map: &BTreeMap<Bytes32, ()>, buf: &mut Vec<u8>) {
 
 fn decode_set_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, ()>> {
     let count = u32::decode(r)? as usize;
+    if count > MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "governance.redelegated_delegators",
+            max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+            actual: count,
+        });
+    }
     let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
@@ -893,6 +904,13 @@ fn encode_commit_map(map: &BTreeMap<Bytes32, VoteCommit>, buf: &mut Vec<u8>) {
 
 fn decode_commit_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, VoteCommit>> {
     let count = u32::decode(r)? as usize;
+    if count > MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "governance.commits",
+            max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+            actual: count,
+        });
+    }
     let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
@@ -925,6 +943,13 @@ fn encode_reveal_map(map: &BTreeMap<Bytes32, VoteReveal>, buf: &mut Vec<u8>) {
 
 fn decode_reveal_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, VoteReveal>> {
     let count = u32::decode(r)? as usize;
+    if count > MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "governance.reveals",
+            max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+            actual: count,
+        });
+    }
     let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
@@ -957,6 +982,13 @@ fn encode_proposal_map(map: &BTreeMap<Bytes32, ProposalRecord>, buf: &mut Vec<u8
 
 fn decode_proposal_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, ProposalRecord>> {
     let count = u32::decode(r)? as usize;
+    if count > MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "governance.proposals",
+            max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+            actual: count,
+        });
+    }
     let mut map = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
@@ -1045,6 +1077,69 @@ mod tests {
         };
         assert!(snapshot.quorum_met(51, 5_000));
         assert!(!snapshot.quorum_met(50, 5_000));
+    }
+
+    #[test]
+    fn governance_decode_helpers_reject_excessive_collection_counts() {
+        let excessive = (MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE + 1) as u32;
+        let bytes = excessive.encode_to_vec();
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(matches!(
+            decode_set_map(&mut reader).unwrap_err(),
+            IndraError::LengthExceeded {
+                field: "governance.redelegated_delegators",
+                max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+                ..
+            }
+        ));
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(matches!(
+            decode_commit_map(&mut reader).unwrap_err(),
+            IndraError::LengthExceeded {
+                field: "governance.commits",
+                max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+                ..
+            }
+        ));
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(matches!(
+            decode_reveal_map(&mut reader).unwrap_err(),
+            IndraError::LengthExceeded {
+                field: "governance.reveals",
+                max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+                ..
+            }
+        ));
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(matches!(
+            decode_proposal_map(&mut reader).unwrap_err(),
+            IndraError::LengthExceeded {
+                field: "governance.proposals",
+                max: MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn governance_decode_helpers_accept_realistic_empty_collections() {
+        let bytes = 0u32.encode_to_vec();
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(decode_set_map(&mut reader).unwrap().is_empty());
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(decode_commit_map(&mut reader).unwrap().is_empty());
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(decode_reveal_map(&mut reader).unwrap().is_empty());
+
+        let mut reader = ByteReader::new(&bytes);
+        assert!(decode_proposal_map(&mut reader).unwrap().is_empty());
     }
 
     #[test]

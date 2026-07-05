@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use indra_core::{
-    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+    codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
         primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS},
@@ -35,6 +35,13 @@ use crate::{
     error::{StateError, StateResult},
     smt::{MerkleProof, SparseMerkleTree},
 };
+
+/// Defensive snapshot decode ceiling for UTXO entries.
+///
+/// This is a corruption/DoS guard for in-memory snapshot loading, not a
+/// consensus policy limit. It is high enough for current operation while
+/// preventing `u32::MAX` allocation attempts from malformed snapshots.
+pub const MAX_UTXOS_DECODE: usize = 1_000_000;
 
 /// A UTXO entry in the set: the output itself plus metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,9 +155,17 @@ impl Encode for UtxoSet {
 
 impl Decode for UtxoSet {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let entries: Vec<UtxoEntry> = decode_list(r, usize::MAX, "snapshot.utxos")?;
+        let count = u32::decode(r)? as usize;
+        if count > MAX_UTXOS_DECODE {
+            return Err(IndraError::LengthExceeded {
+                field: "snapshot.utxos",
+                max: MAX_UTXOS_DECODE,
+                actual: count,
+            });
+        }
         let mut set = Self::new();
-        for entry in entries {
+        for _ in 0..count {
+            let entry = UtxoEntry::decode(r)?;
             if set.entries.contains_key(&entry.utxo_id) {
                 return Err(IndraError::DuplicateEntries {
                     field: "snapshot.utxos",
@@ -176,6 +191,13 @@ impl UtxoSet {
     /// Decode a legacy unversioned UTXO set.
     pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
+        if count > MAX_UTXOS_DECODE {
+            return Err(IndraError::LengthExceeded {
+                field: "snapshot.utxos",
+                max: MAX_UTXOS_DECODE,
+                actual: count,
+            });
+        }
         let mut set = Self::new();
         for _ in 0..count {
             let entry = UtxoEntry::decode_legacy(r)?;
@@ -384,6 +406,33 @@ mod tests {
         assert_eq!(set.len(), 2);
         set.spend(&id1);
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn utxo_set_decode_rejects_excessive_entry_count() {
+        let mut bytes = Vec::new();
+        ((MAX_UTXOS_DECODE + 1) as u32).encode(&mut bytes);
+
+        let err = UtxoSet::decode_exact(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::LengthExceeded {
+                field: "snapshot.utxos",
+                max: MAX_UTXOS_DECODE,
+                actual
+            } if actual == MAX_UTXOS_DECODE + 1
+        ));
+    }
+
+    #[test]
+    fn utxo_set_decode_accepts_realistic_entry_count() {
+        let mut set = UtxoSet::new();
+        set.insert(dummy_output(0x31), 1, 0, 0).unwrap();
+        set.insert(dummy_output(0x32), 1, 0, 1).unwrap();
+
+        let decoded = UtxoSet::decode_exact(&set.encode_to_vec()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded.root(), set.root());
     }
 
     #[test]
