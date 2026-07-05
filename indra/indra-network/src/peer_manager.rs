@@ -2058,151 +2058,554 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn partial_mesh_propagates_to_quorum_at_n200_realistic_topology() {
-        let n = 200usize;
-        const TARGET_OUTBOUND: usize = 8;
-        const MAX_INBOUND: usize = 64;
-        let fanout = derive_consensus_relay_fanout(n);
+    const SIM_VALIDATORS_N200: usize = 200;
+    const SIM_TARGET_OUTBOUND: usize = 8;
+    const SIM_MAX_INBOUND: usize = 64;
+    const SIM_QUORUM_BPS: u64 = 6_700;
+    const SIM_RELAY_PROCESSING_MS: f64 = 2.0;
 
-        fn rendezvous_candidates(
-            node: usize,
-            candidates: impl Iterator<Item = usize>,
-        ) -> Vec<usize> {
-            let mut ordered = candidates
-                .filter(|candidate| *candidate != node)
-                .map(|candidate| {
-                    let mut seed = Vec::with_capacity(4);
-                    seed.extend_from_slice(&(node as u16).to_le_bytes());
-                    seed.extend_from_slice(&(candidate as u16).to_le_bytes());
-                    let digest = sha256(&seed);
-                    (
-                        u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
-                        candidate,
-                    )
-                })
-                .collect::<Vec<_>>();
-            ordered.sort();
-            ordered
-                .into_iter()
-                .map(|(_, candidate)| candidate)
-                .collect()
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    enum SimRegion {
+        NaEast,
+        NaWest,
+        EuWest,
+        SouthAsia,
+        EastAsia,
+        SouthAmerica,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct VrfTimingScenario {
+        name: &'static str,
+        message_loss_bps: u16,
+        congested_region: Option<SimRegion>,
+        bootstrap_saturated: bool,
+        asymmetric_latency: bool,
+        high_stake_slow_region: bool,
+        congested_region_delay_ms: f64,
+        bootstrap_delay_ms: f64,
+        slow_region_delay_ms: f64,
+        slow_region_stake: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    struct VrfTimingOutcome {
+        quorum_validators: usize,
+        commit_window_hits: usize,
+        reveal_window_hits: usize,
+        min_revealed_stake: u64,
+        median_revealed_stake: u64,
+        max_revealed_stake: u64,
+        avg_compute_ms: f64,
+        max_compute_ms: f64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct SimQueueState {
+        node: usize,
+        time_ms: f64,
+    }
+
+    impl Eq for SimQueueState {}
+
+    impl Ord for SimQueueState {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            other
+                .time_ms
+                .total_cmp(&self.time_ms)
+                .then_with(|| self.node.cmp(&other.node))
         }
+    }
 
-        fn connect_outbound(
-            graph: &mut [HashSet<usize>],
-            inbound_counts: &mut [usize],
-            node: usize,
-            ordered_candidates: Vec<usize>,
-            target_outbound: usize,
-            max_inbound: usize,
-        ) {
-            let mut outbound = graph[node].len();
-            for candidate in ordered_candidates {
-                if outbound >= target_outbound {
-                    break;
+    impl PartialOrd for SimQueueState {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    fn sim_regions_n200() -> Vec<SimRegion> {
+        let mut regions = Vec::with_capacity(SIM_VALIDATORS_N200);
+        regions.extend(std::iter::repeat(SimRegion::NaEast).take(40));
+        regions.extend(std::iter::repeat(SimRegion::NaWest).take(35));
+        regions.extend(std::iter::repeat(SimRegion::EuWest).take(45));
+        regions.extend(std::iter::repeat(SimRegion::SouthAsia).take(30));
+        regions.extend(std::iter::repeat(SimRegion::EastAsia).take(30));
+        regions.extend(std::iter::repeat(SimRegion::SouthAmerica).take(20));
+        regions
+    }
+
+    fn sim_stakes_n200_with_slow_region_stake(
+        high_stake_slow_region: bool,
+        slow_region_stake: u64,
+    ) -> Vec<u64> {
+        let regions = sim_regions_n200();
+        regions
+            .into_iter()
+            .map(|region| {
+                if high_stake_slow_region && region == SimRegion::SouthAmerica {
+                    slow_region_stake
+                } else {
+                    1
                 }
-                if inbound_counts[candidate] >= max_inbound || graph[node].contains(&candidate) {
-                    continue;
-                }
-                graph[node].insert(candidate);
-                graph[candidate].insert(node);
-                inbound_counts[candidate] += 1;
-                outbound += 1;
+            })
+            .collect()
+    }
+
+    fn sim_scenario(name: &'static str) -> VrfTimingScenario {
+        VrfTimingScenario {
+            name,
+            message_loss_bps: 0,
+            congested_region: None,
+            bootstrap_saturated: false,
+            asymmetric_latency: false,
+            high_stake_slow_region: false,
+            congested_region_delay_ms: 360.0,
+            bootstrap_delay_ms: 520.0,
+            slow_region_delay_ms: 420.0,
+            slow_region_stake: 50,
+        }
+    }
+
+    fn sim_quorum_stake(stakes: &[u64]) -> u64 {
+        stakes
+            .iter()
+            .copied()
+            .sum::<u64>()
+            .saturating_mul(SIM_QUORUM_BPS)
+            .saturating_add(9_999)
+            / 10_000
+    }
+
+    fn sim_rendezvous_candidates(
+        node: usize,
+        candidates: impl Iterator<Item = usize>,
+    ) -> Vec<usize> {
+        let mut ordered = candidates
+            .filter(|candidate| *candidate != node)
+            .map(|candidate| {
+                let mut seed = Vec::with_capacity(4);
+                seed.extend_from_slice(&(node as u16).to_le_bytes());
+                seed.extend_from_slice(&(candidate as u16).to_le_bytes());
+                let digest = sha256(&seed);
+                (
+                    u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                    candidate,
+                )
+            })
+            .collect::<Vec<_>>();
+        ordered.sort();
+        ordered
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect()
+    }
+
+    fn sim_connect_outbound(
+        graph: &mut [HashSet<usize>],
+        inbound_counts: &mut [usize],
+        node: usize,
+        ordered_candidates: Vec<usize>,
+        target_outbound: usize,
+        max_inbound: usize,
+    ) {
+        let mut outbound = graph[node].len();
+        for candidate in ordered_candidates {
+            if outbound >= target_outbound {
+                break;
             }
+            if inbound_counts[candidate] >= max_inbound || graph[node].contains(&candidate) {
+                continue;
+            }
+            graph[node].insert(candidate);
+            graph[candidate].insert(node);
+            inbound_counts[candidate] += 1;
+            outbound += 1;
+        }
+    }
+
+    fn sim_build_random_bounded_graph(
+        n: usize,
+        target_outbound: usize,
+        max_inbound: usize,
+    ) -> (Vec<HashSet<usize>>, Vec<usize>) {
+        let mut graph = vec![HashSet::<usize>::new(); n];
+        let mut inbound_counts = vec![0usize; n];
+        for node in 0..n {
+            sim_connect_outbound(
+                &mut graph,
+                &mut inbound_counts,
+                node,
+                sim_rendezvous_candidates(node, 0..n),
+                target_outbound,
+                max_inbound,
+            );
+        }
+        (graph, inbound_counts)
+    }
+
+    fn sim_build_bootstrap_first_graph(
+        n: usize,
+        target_outbound: usize,
+        max_inbound: usize,
+    ) -> (Vec<HashSet<usize>>, Vec<usize>) {
+        let bootstrap = 0usize;
+        let mut graph = vec![HashSet::<usize>::new(); n];
+        let mut inbound_counts = vec![0usize; n];
+
+        // Initial deployment shape: every non-bootstrap validator tries the
+        // configured bootstrap peer first. The bootstrap is capped, then
+        // peer-list gossip lets validators fill the remaining outbound set.
+        for node in 1..n {
+            sim_connect_outbound(
+                &mut graph,
+                &mut inbound_counts,
+                node,
+                vec![bootstrap],
+                1,
+                max_inbound,
+            );
+        }
+        for node in 0..n {
+            let mut candidates = Vec::new();
+            if node != bootstrap {
+                candidates.push(bootstrap);
+            }
+            candidates.extend(sim_rendezvous_candidates(node, 0..n));
+            sim_connect_outbound(
+                &mut graph,
+                &mut inbound_counts,
+                node,
+                candidates,
+                target_outbound,
+                max_inbound,
+            );
         }
 
-        fn build_random_bounded_graph(
-            n: usize,
-            target_outbound: usize,
-            max_inbound: usize,
-        ) -> (Vec<HashSet<usize>>, Vec<usize>) {
-            let mut graph = vec![HashSet::<usize>::new(); n];
-            let mut inbound_counts = vec![0usize; n];
-            for node in 0..n {
-                connect_outbound(
-                    &mut graph,
-                    &mut inbound_counts,
-                    node,
-                    rendezvous_candidates(node, 0..n),
-                    target_outbound,
-                    max_inbound,
-                );
-            }
-            (graph, inbound_counts)
-        }
+        (graph, inbound_counts)
+    }
 
-        fn build_bootstrap_first_graph(
-            n: usize,
-            target_outbound: usize,
-            max_inbound: usize,
-        ) -> (Vec<HashSet<usize>>, Vec<usize>) {
-            let bootstrap = 0usize;
-            let mut graph = vec![HashSet::<usize>::new(); n];
-            let mut inbound_counts = vec![0usize; n];
+    fn sim_relay_targets(
+        graph: &[HashSet<usize>],
+        node: usize,
+        origin: usize,
+        fanout: usize,
+    ) -> Vec<usize> {
+        let mut neighbors = graph[node]
+            .iter()
+            .copied()
+            .map(|peer| {
+                let mut seed = Vec::with_capacity(6);
+                seed.extend_from_slice(&(origin as u16).to_le_bytes());
+                seed.extend_from_slice(&(node as u16).to_le_bytes());
+                seed.extend_from_slice(&(peer as u16).to_le_bytes());
+                let digest = sha256(&seed);
+                (
+                    u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                    peer,
+                )
+            })
+            .collect::<Vec<_>>();
+        neighbors.sort();
+        neighbors
+            .into_iter()
+            .take(fanout)
+            .map(|(_, peer)| peer)
+            .collect()
+    }
 
-            // Initial deployment shape: every non-bootstrap validator tries the
-            // configured bootstrap peer first. The bootstrap is capped, then
-            // peer-list gossip lets validators fill the remaining outbound set.
-            for node in 1..n {
-                connect_outbound(
-                    &mut graph,
-                    &mut inbound_counts,
-                    node,
-                    vec![bootstrap],
-                    1,
-                    max_inbound,
-                );
-            }
-            for node in 0..n {
-                let mut candidates = Vec::new();
-                if node != bootstrap {
-                    candidates.push(bootstrap);
-                }
-                candidates.extend(rendezvous_candidates(node, 0..n));
-                connect_outbound(
-                    &mut graph,
-                    &mut inbound_counts,
-                    node,
-                    candidates,
-                    target_outbound,
-                    max_inbound,
-                );
-            }
+    fn sim_build_relay_targets(graph: &[HashSet<usize>], fanout: usize) -> Vec<Vec<Vec<usize>>> {
+        (0..graph.len())
+            .map(|origin| {
+                (0..graph.len())
+                    .map(|node| sim_relay_targets(graph, node, origin, fanout))
+                    .collect()
+            })
+            .collect()
+    }
 
-            (graph, inbound_counts)
-        }
-
-        fn reached_after_hops(graph: &[HashSet<usize>], fanout: usize, max_hops: usize) -> usize {
-            let mut reached = HashSet::new();
-            let mut frontier = VecDeque::new();
-            reached.insert(0usize);
-            frontier.push_back(0usize);
-            for _ in 0..max_hops {
-                let level = frontier.len();
-                for _ in 0..level {
-                    let node = frontier.pop_front().unwrap();
-                    let mut neighbors = graph[node].iter().copied().collect::<Vec<_>>();
-                    neighbors.sort_unstable();
-                    for peer in neighbors.into_iter().take(fanout) {
-                        if reached.insert(peer) {
-                            frontier.push_back(peer);
-                        }
+    fn sim_reached_after_hops(relay_targets: &[Vec<Vec<usize>>], max_hops: usize) -> usize {
+        let mut reached = HashSet::new();
+        let mut frontier = VecDeque::new();
+        reached.insert(0usize);
+        frontier.push_back(0usize);
+        for _ in 0..max_hops {
+            let level = frontier.len();
+            for _ in 0..level {
+                let node = frontier.pop_front().unwrap();
+                for peer in relay_targets[0][node].iter().copied() {
+                    if reached.insert(peer) {
+                        frontier.push_back(peer);
                     }
                 }
             }
-            reached.len()
+        }
+        reached.len()
+    }
+
+    fn sim_base_latency_ms(from: SimRegion, to: SimRegion) -> f64 {
+        if from == to {
+            return 8.0;
+        }
+        match (from.min(to), from.max(to)) {
+            (SimRegion::NaEast, SimRegion::NaWest) => 35.0,
+            (SimRegion::NaEast, SimRegion::EuWest) => 45.0,
+            (SimRegion::NaEast, SimRegion::SouthAsia) => 105.0,
+            (SimRegion::NaEast, SimRegion::EastAsia) => 110.0,
+            (SimRegion::NaEast, SimRegion::SouthAmerica) => 75.0,
+            (SimRegion::NaWest, SimRegion::EuWest) => 75.0,
+            (SimRegion::NaWest, SimRegion::SouthAsia) => 115.0,
+            (SimRegion::NaWest, SimRegion::EastAsia) => 75.0,
+            (SimRegion::NaWest, SimRegion::SouthAmerica) => 80.0,
+            (SimRegion::EuWest, SimRegion::SouthAsia) => 60.0,
+            (SimRegion::EuWest, SimRegion::EastAsia) => 95.0,
+            (SimRegion::EuWest, SimRegion::SouthAmerica) => 95.0,
+            (SimRegion::SouthAsia, SimRegion::EastAsia) => 45.0,
+            (SimRegion::SouthAsia, SimRegion::SouthAmerica) => 135.0,
+            (SimRegion::EastAsia, SimRegion::SouthAmerica) => 145.0,
+            _ => 150.0,
+        }
+    }
+
+    fn sim_hash_unit(parts: &[usize]) -> f64 {
+        let mut seed = Vec::with_capacity(parts.len() * 2);
+        for part in parts {
+            seed.extend_from_slice(&(*part as u16).to_le_bytes());
+        }
+        let digest = sha256(&seed);
+        u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])) as f64 / u64::MAX as f64
+    }
+
+    fn sim_edge_delay_ms(
+        from: usize,
+        to: usize,
+        origin: usize,
+        phase: usize,
+        regions: &[SimRegion],
+        scenario: VrfTimingScenario,
+    ) -> f64 {
+        let mut latency = sim_base_latency_ms(regions[from], regions[to]);
+        latency *= 1.0 + 0.75 * sim_hash_unit(&[origin, from, to, phase, 11]);
+        latency += 10.0;
+
+        if scenario.asymmetric_latency && regions[from] > regions[to] {
+            latency = latency.mul_add(0.8, 40.0);
+        }
+        if scenario
+            .congested_region
+            .is_some_and(|region| region == regions[from] || region == regions[to])
+        {
+            latency += scenario.congested_region_delay_ms;
+        }
+        if scenario.high_stake_slow_region
+            && (regions[from] == SimRegion::SouthAmerica || regions[to] == SimRegion::SouthAmerica)
+        {
+            latency += scenario.slow_region_delay_ms;
+        }
+        if scenario.bootstrap_saturated && (from == 0 || to == 0) {
+            latency += scenario.bootstrap_delay_ms;
         }
 
-        let (random_graph, random_inbound_counts) =
-            build_random_bounded_graph(n, TARGET_OUTBOUND, MAX_INBOUND);
-        let (hub_graph, hub_inbound_counts) =
-            build_bootstrap_first_graph(n, TARGET_OUTBOUND, MAX_INBOUND);
+        latency + SIM_RELAY_PROCESSING_MS
+    }
 
-        let random_base_two_hops = reached_after_hops(&random_graph, fanout, 2);
-        let random_base_three_hops = reached_after_hops(&random_graph, fanout, 3);
-        let hub_base_two_hops = reached_after_hops(&hub_graph, fanout, 2);
-        let hub_base_three_hops = reached_after_hops(&hub_graph, fanout, 3);
+    fn sim_edge_dropped(
+        from: usize,
+        to: usize,
+        origin: usize,
+        phase: usize,
+        scenario: VrfTimingScenario,
+    ) -> bool {
+        let loss_bps = if scenario.bootstrap_saturated && (from == 0 || to == 0) {
+            scenario.message_loss_bps.max(3_000)
+        } else {
+            scenario.message_loss_bps
+        };
+        if loss_bps == 0 {
+            return false;
+        }
+        let unit = sim_hash_unit(&[origin, from, to, phase, 97]);
+        unit < f64::from(loss_bps) / 10_000.0
+    }
+
+    fn sim_propagation_arrivals(
+        graph: &[HashSet<usize>],
+        relay_targets: &[Vec<Vec<usize>>],
+        departures: &[f64],
+        regions: &[SimRegion],
+        scenario: VrfTimingScenario,
+        phase: usize,
+    ) -> Vec<Vec<f64>> {
+        let n = graph.len();
+        let mut all = Vec::with_capacity(n);
+        for origin in 0..n {
+            let mut dist = vec![f64::INFINITY; n];
+            let mut queue = std::collections::BinaryHeap::new();
+            dist[origin] = departures[origin];
+            queue.push(SimQueueState {
+                node: origin,
+                time_ms: departures[origin],
+            });
+
+            while let Some(SimQueueState { node, time_ms }) = queue.pop() {
+                if time_ms > dist[node] {
+                    continue;
+                }
+                for peer in relay_targets[origin][node].iter().copied() {
+                    if sim_edge_dropped(node, peer, origin, phase, scenario) {
+                        continue;
+                    }
+                    let candidate =
+                        time_ms + sim_edge_delay_ms(node, peer, origin, phase, regions, scenario);
+                    if candidate < dist[peer] {
+                        dist[peer] = candidate;
+                        queue.push(SimQueueState {
+                            node: peer,
+                            time_ms: candidate,
+                        });
+                    }
+                }
+            }
+            all.push(dist);
+        }
+        all
+    }
+
+    fn sim_stake_received_by_deadline(
+        arrivals: &[Vec<f64>],
+        receiver: usize,
+        deadline: f64,
+        stakes: &[u64],
+    ) -> u64 {
+        arrivals
+            .iter()
+            .enumerate()
+            .filter(|(origin, arrival)| arrival[receiver] <= deadline && stakes[*origin] > 0)
+            .map(|(origin, _)| stakes[origin])
+            .sum()
+    }
+
+    fn sim_vrf_timing_outcome(
+        graph: &[HashSet<usize>],
+        relay_targets: &[Vec<Vec<usize>>],
+        window_ms: u64,
+        scenario: VrfTimingScenario,
+    ) -> VrfTimingOutcome {
+        let regions = sim_regions_n200();
+        let stakes = sim_stakes_n200_with_slow_region_stake(
+            scenario.high_stake_slow_region,
+            scenario.slow_region_stake,
+        );
+        let quorum_stake = sim_quorum_stake(&stakes);
+        let departures = vec![0.0; graph.len()];
+        let commit_arrivals =
+            sim_propagation_arrivals(graph, relay_targets, &departures, &regions, scenario, 1);
+        let mut reveal_departures = vec![0.0; graph.len()];
+        let mut commit_window_hits = 0usize;
+        for receiver in 0..graph.len() {
+            let mut commit_times = commit_arrivals
+                .iter()
+                .enumerate()
+                .filter_map(|(origin, arrivals)| {
+                    arrivals[receiver]
+                        .is_finite()
+                        .then_some((arrivals[receiver], stakes[origin]))
+                })
+                .collect::<Vec<_>>();
+            commit_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut stake = 0u64;
+            let mut quorum_time = window_ms as f64;
+            let mut reached_before_window = false;
+            for (arrival, origin_stake) in commit_times {
+                stake = stake.saturating_add(origin_stake);
+                if stake >= quorum_stake {
+                    quorum_time = arrival.min(window_ms as f64);
+                    reached_before_window = arrival < window_ms as f64;
+                    break;
+                }
+            }
+            if !reached_before_window {
+                commit_window_hits += 1;
+            }
+            reveal_departures[receiver] = quorum_time;
+        }
+
+        let reveal_arrivals = sim_propagation_arrivals(
+            graph,
+            relay_targets,
+            &reveal_departures,
+            &regions,
+            scenario,
+            2,
+        );
+        let mut revealed_stakes = Vec::with_capacity(graph.len());
+        let mut compute_times = Vec::with_capacity(graph.len());
+        let mut reveal_window_hits = 0usize;
+        for receiver in 0..graph.len() {
+            let deadline = reveal_departures[receiver] + window_ms as f64;
+            let stake =
+                sim_stake_received_by_deadline(&reveal_arrivals, receiver, deadline, &stakes);
+            revealed_stakes.push(stake);
+
+            let mut reveal_times = reveal_arrivals
+                .iter()
+                .enumerate()
+                .filter_map(|(origin, arrivals)| {
+                    arrivals[receiver]
+                        .is_finite()
+                        .then_some((arrivals[receiver], stakes[origin]))
+                })
+                .collect::<Vec<_>>();
+            reveal_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut accumulated = 0u64;
+            let mut compute_time = deadline;
+            let mut reached_before_deadline = false;
+            for (arrival, origin_stake) in reveal_times {
+                accumulated = accumulated.saturating_add(origin_stake);
+                if accumulated >= quorum_stake {
+                    compute_time = arrival.min(deadline);
+                    reached_before_deadline = arrival < deadline;
+                    break;
+                }
+            }
+            if !reached_before_deadline {
+                reveal_window_hits += 1;
+            }
+            compute_times.push(compute_time);
+        }
+        revealed_stakes.sort_unstable();
+        compute_times.sort_by(|a, b| a.total_cmp(b));
+        let avg_compute_ms = compute_times.iter().sum::<f64>() / compute_times.len() as f64;
+        VrfTimingOutcome {
+            quorum_validators: revealed_stakes
+                .iter()
+                .filter(|stake| **stake >= quorum_stake)
+                .count(),
+            commit_window_hits,
+            reveal_window_hits,
+            min_revealed_stake: revealed_stakes[0],
+            median_revealed_stake: revealed_stakes[revealed_stakes.len() / 2],
+            max_revealed_stake: *revealed_stakes.last().unwrap(),
+            avg_compute_ms,
+            max_compute_ms: *compute_times.last().unwrap(),
+        }
+    }
+
+    #[test]
+    fn partial_mesh_propagates_to_quorum_at_n200_realistic_topology() {
+        let n = SIM_VALIDATORS_N200;
+        let fanout = derive_consensus_relay_fanout(n);
+
+        let (random_graph, random_inbound_counts) =
+            sim_build_random_bounded_graph(n, SIM_TARGET_OUTBOUND, SIM_MAX_INBOUND);
+        let (hub_graph, hub_inbound_counts) =
+            sim_build_bootstrap_first_graph(n, SIM_TARGET_OUTBOUND, SIM_MAX_INBOUND);
+        let random_relay_targets = sim_build_relay_targets(&random_graph, fanout);
+        let hub_relay_targets = sim_build_relay_targets(&hub_graph, fanout);
+
+        let random_base_two_hops = sim_reached_after_hops(&random_relay_targets, 2);
+        let random_base_three_hops = sim_reached_after_hops(&random_relay_targets, 3);
+        let hub_base_two_hops = sim_reached_after_hops(&hub_relay_targets, 2);
+        let hub_base_three_hops = sim_reached_after_hops(&hub_relay_targets, 3);
         eprintln!(
             "[relay-sim] random bounded graph: base fanout reached {random_base_two_hops}/200 in 2 hops, {random_base_three_hops}/200 in 3 hops"
         );
@@ -2219,8 +2622,10 @@ mod tests {
         );
 
         let block_fanout = relay_fanout_for_class(fanout, RelayMessageClass::Block);
-        let random_block_two_hops = reached_after_hops(&random_graph, block_fanout, 2);
-        let hub_block_two_hops = reached_after_hops(&hub_graph, block_fanout, 2);
+        let random_block_relay_targets = sim_build_relay_targets(&random_graph, block_fanout);
+        let hub_block_relay_targets = sim_build_relay_targets(&hub_graph, block_fanout);
+        let random_block_two_hops = sim_reached_after_hops(&random_block_relay_targets, 2);
+        let hub_block_two_hops = sim_reached_after_hops(&hub_block_relay_targets, 2);
         eprintln!(
             "[relay-sim] random bounded graph: block fanout reached {random_block_two_hops}/200 in 2 hops"
         );
@@ -2250,9 +2655,207 @@ mod tests {
             random_inbound_counts
                 .iter()
                 .chain(hub_inbound_counts.iter())
-                .all(|count| *count <= MAX_INBOUND),
+                .all(|count| *count <= SIM_MAX_INBOUND),
             "simulation must honor inbound cap"
         );
+    }
+
+    #[test]
+    #[ignore = "scale-validation simulation; run explicitly with --ignored --nocapture"]
+    fn vrf_timing_windows_under_n200_latency_stress() {
+        let fanout = derive_consensus_relay_fanout(SIM_VALIDATORS_N200);
+        let (hub_graph, _) = sim_build_bootstrap_first_graph(
+            SIM_VALIDATORS_N200,
+            SIM_TARGET_OUTBOUND,
+            SIM_MAX_INBOUND,
+        );
+        let relay_targets = sim_build_relay_targets(&hub_graph, fanout);
+        let windows = [500u64, 750, 1_000, 1_500];
+        let scenarios = [
+            VrfTimingScenario {
+                message_loss_bps: 100,
+                ..sim_scenario("one_percent_loss")
+            },
+            VrfTimingScenario {
+                message_loss_bps: 500,
+                ..sim_scenario("five_percent_loss")
+            },
+            VrfTimingScenario {
+                congested_region: Some(SimRegion::EastAsia),
+                message_loss_bps: 100,
+                ..sim_scenario("east_asia_queue_spike")
+            },
+            VrfTimingScenario {
+                bootstrap_saturated: true,
+                message_loss_bps: 100,
+                ..sim_scenario("bootstrap_saturation")
+            },
+            VrfTimingScenario {
+                high_stake_slow_region: true,
+                message_loss_bps: 100,
+                ..sim_scenario("slow_region_high_stake")
+            },
+            VrfTimingScenario {
+                asymmetric_latency: true,
+                message_loss_bps: 100,
+                ..sim_scenario("asymmetric_latency")
+            },
+            VrfTimingScenario {
+                message_loss_bps: 500,
+                congested_region: Some(SimRegion::EastAsia),
+                bootstrap_saturated: true,
+                asymmetric_latency: true,
+                high_stake_slow_region: true,
+                ..sim_scenario("combined_tail")
+            },
+        ];
+
+        let mut window_choice_matters = false;
+        for scenario in scenarios {
+            let mut outcomes = Vec::new();
+            for window in windows {
+                let outcome = sim_vrf_timing_outcome(&hub_graph, &relay_targets, window, scenario);
+                eprintln!(
+                    "[vrf-window-sim] scenario={} window={}ms quorum_nodes={}/200 window_hits(commit/reveal)={}/{} stake_min/med/max={}/{}/{} avg/max_compute_ms={:.1}/{:.1}",
+                    scenario.name,
+                    window,
+                    outcome.quorum_validators,
+                    outcome.commit_window_hits,
+                    outcome.reveal_window_hits,
+                    outcome.min_revealed_stake,
+                    outcome.median_revealed_stake,
+                    outcome.max_revealed_stake,
+                    outcome.avg_compute_ms,
+                    outcome.max_compute_ms,
+                );
+                outcomes.push((window, outcome));
+            }
+            let baseline = outcomes[0].1.quorum_validators;
+            let best = outcomes
+                .iter()
+                .map(|(_, outcome)| outcome.quorum_validators)
+                .max()
+                .unwrap();
+            if best > baseline {
+                window_choice_matters = true;
+            }
+            assert!(
+                outcomes
+                    .windows(2)
+                    .all(|pair| pair[1].1.quorum_validators >= pair[0].1.quorum_validators),
+                "larger VRF windows should not reduce quorum reachability in scenario {}",
+                scenario.name
+            );
+        }
+
+        assert!(
+            window_choice_matters,
+            "stress simulation must include at least one scenario where 500ms is binding"
+        );
+    }
+
+    #[test]
+    #[ignore = "scale-validation decision analysis; run explicitly with --ignored --nocapture"]
+    fn vrf_timing_windows_finalization_cost_margin_and_settle() {
+        let fanout = derive_consensus_relay_fanout(SIM_VALIDATORS_N200);
+        let (hub_graph, _) = sim_build_bootstrap_first_graph(
+            SIM_VALIDATORS_N200,
+            SIM_TARGET_OUTBOUND,
+            SIM_MAX_INBOUND,
+        );
+        let relay_targets = sim_build_relay_targets(&hub_graph, fanout);
+
+        let normal = sim_scenario("normal_p50");
+        let normal_500 = sim_vrf_timing_outcome(&hub_graph, &relay_targets, 500, normal);
+        let normal_1500 = sim_vrf_timing_outcome(&hub_graph, &relay_targets, 1_500, normal);
+        eprintln!(
+            "[vrf-window-final] normal 500ms: quorum_nodes={}/200 window_hits(commit/reveal)={}/{} avg/max_compute_ms={:.1}/{:.1}",
+            normal_500.quorum_validators,
+            normal_500.commit_window_hits,
+            normal_500.reveal_window_hits,
+            normal_500.avg_compute_ms,
+            normal_500.max_compute_ms,
+        );
+        eprintln!(
+            "[vrf-window-final] normal 1500ms: quorum_nodes={}/200 window_hits(commit/reveal)={}/{} avg/max_compute_ms={:.1}/{:.1} avg_delta_ms={:.1} max_delta_ms={:.1}",
+            normal_1500.quorum_validators,
+            normal_1500.commit_window_hits,
+            normal_1500.reveal_window_hits,
+            normal_1500.avg_compute_ms,
+            normal_1500.max_compute_ms,
+            normal_1500.avg_compute_ms - normal_500.avg_compute_ms,
+            normal_1500.max_compute_ms - normal_500.max_compute_ms,
+        );
+        assert_eq!(normal_500.commit_window_hits, 0);
+        assert_eq!(normal_500.reveal_window_hits, 0);
+        assert_eq!(normal_1500.commit_window_hits, 0);
+        assert_eq!(normal_1500.reveal_window_hits, 0);
+        assert!((normal_1500.avg_compute_ms - normal_500.avg_compute_ms).abs() < f64::EPSILON);
+
+        let mut first_break = None;
+        for extra_delay in [420.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1_000.0] {
+            let scenario = VrfTimingScenario {
+                high_stake_slow_region: true,
+                message_loss_bps: 100,
+                slow_region_delay_ms: extra_delay,
+                ..sim_scenario("slow_region_margin_sweep")
+            };
+            let outcome = sim_vrf_timing_outcome(&hub_graph, &relay_targets, 1_500, scenario);
+            eprintln!(
+                "[vrf-window-final] 1500ms slow-region delay+{:.0}ms: quorum_nodes={}/200 window_hits(commit/reveal)={}/{} stake_min/med/max={}/{}/{} avg/max_compute_ms={:.1}/{:.1}",
+                extra_delay,
+                outcome.quorum_validators,
+                outcome.commit_window_hits,
+                outcome.reveal_window_hits,
+                outcome.min_revealed_stake,
+                outcome.median_revealed_stake,
+                outcome.max_revealed_stake,
+                outcome.avg_compute_ms,
+                outcome.max_compute_ms,
+            );
+            if outcome.quorum_validators < SIM_VALIDATORS_N200 && first_break.is_none() {
+                first_break = Some(extra_delay);
+            }
+        }
+
+        for slow_stake in [50, 75, 100] {
+            let scenario = VrfTimingScenario {
+                high_stake_slow_region: true,
+                message_loss_bps: 100,
+                slow_region_stake: slow_stake,
+                ..sim_scenario("slow_region_stake_sweep")
+            };
+            let outcome = sim_vrf_timing_outcome(&hub_graph, &relay_targets, 1_500, scenario);
+            eprintln!(
+                "[vrf-window-final] 1500ms slow-region stake={}x: quorum_nodes={}/200 window_hits(commit/reveal)={}/{} stake_min/med/max={}/{}/{} avg/max_compute_ms={:.1}/{:.1}",
+                slow_stake,
+                outcome.quorum_validators,
+                outcome.commit_window_hits,
+                outcome.reveal_window_hits,
+                outcome.min_revealed_stake,
+                outcome.median_revealed_stake,
+                outcome.max_revealed_stake,
+                outcome.avg_compute_ms,
+                outcome.max_compute_ms,
+            );
+        }
+
+        let current_reveal_ms = indra_core::types::primitives::VRF_REVEAL_WINDOW_MS;
+        let current_settle_ms = indra_core::types::primitives::VRF_ELECTION_SETTLE_MS;
+        let current_margin_ms = current_settle_ms.saturating_sub(current_reveal_ms);
+        let candidate_reveal_ms = 1_500u64;
+        let recommended_settle_ms = candidate_reveal_ms.saturating_add(current_margin_ms);
+        eprintln!(
+            "[vrf-window-final] settle relation: current_reveal={}ms current_settle={}ms current_margin={}ms candidate_reveal={}ms recommended_settle={}ms first_1500_break_delay={:?}",
+            current_reveal_ms,
+            current_settle_ms,
+            current_margin_ms,
+            candidate_reveal_ms,
+            recommended_settle_ms,
+            first_break,
+        );
+        assert_eq!(current_margin_ms, 1_000);
+        assert_eq!(recommended_settle_ms, 2_500);
     }
 
     #[test]

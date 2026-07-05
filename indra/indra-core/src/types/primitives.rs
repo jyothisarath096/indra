@@ -63,10 +63,10 @@ pub const MAX_ROUND_TIME_MS: u64 = 15_000;
 pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
 
 /// Close VRF commit window after this duration or when quorum stake committed.
-pub const VRF_COMMIT_WINDOW_MS: u64 = 500;
+pub const VRF_COMMIT_WINDOW_MS: u64 = 1_500;
 
 /// Close VRF reveal window after this duration or when quorum stake revealed.
-pub const VRF_REVEAL_WINDOW_MS: u64 = 500;
+pub const VRF_REVEAL_WINDOW_MS: u64 = 1_500;
 
 /// Delay nil precommit up to this long while waiting for the local
 /// commit-reveal election result to settle.
@@ -74,7 +74,7 @@ pub const VRF_REVEAL_WINDOW_MS: u64 = 500;
 /// This is intentionally longer than `VRF_REVEAL_WINDOW_MS` so a fast prevote
 /// quorum does not force a nil precommit just before the reveal timeout
 /// computes the election result.
-pub const VRF_ELECTION_SETTLE_MS: u64 = 1_500;
+pub const VRF_ELECTION_SETTLE_MS: u64 = 2_500;
 
 /// Use public deterministic fallback only after this many consecutive
 /// zero-reveal rounds at the same height.

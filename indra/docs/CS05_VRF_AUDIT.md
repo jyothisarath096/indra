@@ -8,7 +8,7 @@ No direct consensus safety break was found. Full `block_hash()` voting remains t
 
 Fix status update:
 
-- **VRF-03 — FIXED:** non-nil precommit no longer immediately falls back to nil when the local VRF election result is missing. The driver now waits up to `VRF_ELECTION_SETTLE_MS = 1500ms`, retries during the precommit phase, and only nil-precommits after the settle window expires.
+- **VRF-03 — FIXED:** non-nil precommit no longer immediately falls back to nil when the local VRF election result is missing. The driver now waits up to `VRF_ELECTION_SETTLE_MS = 2500ms`, retries during the precommit phase, and only nil-precommits after the settle window expires.
 - **VRF-04 — FIXED / HEIGHT-GATED:** post-activation proposals carry the exact signed reveal evidence set in the block body, and voters verify the proposer-specified set instead of each validator's local reveal view. The reveal set must represent quorum stake and its Merkle commitment is folded into `election_result_hash`.
 - **VRF-05 — FIXED:** before finalizing a precommit quorum, the driver now verifies that the subgroup agreeing on `(block_hash, election_result_hash)` independently reaches consensus quorum. Mixed election-result precommits no longer feed a QC build that later fails.
 - **VRF-06 — FIXED:** zero-reveal fallback now matches the mainnet-grade policy: fallback is produced only after `MAX_VRF_EMPTY_REVEAL_ROUNDS = 3` consecutive empty reveal rounds. Earlier empty rounds produce no election result and advance normally.
@@ -44,13 +44,13 @@ Current theoretical sequence:
 1. Height `N-1` commits; `finalize_block_on_quorum` calls `start_round(0)` for height `N` during finalization cleanup (`indra-node/src/driver.rs:2045-2077`).
 2. Node loop enters `RoundPhase::Propose`.
 3. Node loop calls `ensure_vrf_election_for_round`, which broadcasts local `VrfCommit` and drives `advance_vrf_round` (`indra-node/src/bin/node.rs:1825-1866`, `indra-node/src/driver.rs:823-847`).
-4. Commit window closes when committed stake reaches quorum or `VRF_COMMIT_WINDOW_MS = 500ms` elapses (`indra-node/src/driver.rs:855-870`, `indra-core/src/types/primitives.rs:65-69`).
-5. Reveal window closes when revealed stake reaches quorum or another 500ms elapses (`indra-node/src/driver.rs:881-891`).
+4. Commit window closes when committed stake reaches quorum or `VRF_COMMIT_WINDOW_MS = 1500ms` elapses (`indra-node/src/driver.rs:855-870`, `indra-core/src/types/primitives.rs:65-69`).
+5. Reveal window closes when revealed stake reaches quorum or another 1500ms elapses (`indra-node/src/driver.rs:881-891`).
 6. Election result is computed and stored (`indra-node/src/driver.rs:914-950`).
 7. Elected proposer can propose only when `election_result` exists (`indra-node/src/bin/node.rs:1867-1885`).
 8. Normal prevote/precommit/finalization follows.
 
-VRF theoretical lower bound under prompt delivery is roughly one network/loop turn plus 0-1000ms: if 2/3 commit and reveal stake arrives quickly, both windows can close before timeout; otherwise the timeout path costs 500ms + 500ms.
+VRF theoretical lower bound under prompt delivery is roughly one network/loop turn plus 0-3000ms: if 2/3 commit and reveal stake arrives quickly, both windows can close before timeout; otherwise the timeout path costs 1500ms + 1500ms.
 
 The observed 6-12 seconds is primarily explained by `MIN_BLOCK_INTERVAL_SECS = 6`, enforced before producing a proposal (`indra-node/src/bin/node.rs:45-48`, `indra-node/src/bin/node.rs:1927-1944`). If a round misses and advances, add `PROPOSE_TIMEOUT = 8s`, `PREVOTE_TIMEOUT = 3s`, or `PRECOMMIT_TIMEOUT = 3s` depending on where it stalls (`indra-node/src/bin/node.rs:45-47`, `indra-node/src/bin/node.rs:2043-2085`).
 
@@ -58,7 +58,7 @@ The observed 6-12 seconds is primarily explained by `MIN_BLOCK_INTERVAL_SECS = 6
 
 The gate is necessary for safety, and the previously identified nil-precommit race is fixed.
 
-The local non-nil precommit path now requires a local VRF election result. If missing, it delays nil precommit for `VRF_ELECTION_SETTLE_MS = 1500ms`. During that wait, the node loop retries the precommit path, and the driver also retries immediately when an election result arrives while already in precommit phase and the local validator has not yet precommitted.
+The local non-nil precommit path now requires a local VRF election result. If missing, it delays nil precommit for `VRF_ELECTION_SETTLE_MS = 2500ms`. During that wait, the node loop retries the precommit path, and the driver also retries immediately when an election result arrives while already in precommit phase and the local validator has not yet precommitted.
 
 The fixed behavior is:
 
@@ -67,7 +67,7 @@ The fixed behavior is:
 - If the election result arrives during the settle window, the validator casts the block precommit with `Some(election_result_hash)`.
 - If the election result remains unavailable after the settle window, the validator casts a nil precommit to avoid signing a block precommit without election attestation.
 
-This adds at most 1.5 seconds to the affected edge case and avoids wasting a full round solely because precommit outran local election computation.
+This adds at most 2.5 seconds to the affected edge case and avoids wasting a full round solely because precommit outran local election computation.
 
 Status: Fixed.
 
@@ -188,7 +188,7 @@ The main consensus loop is timer-driven with blocking `recv_timeout(100ms)` wait
 The effective block cadence is dominated by:
 
 - `MIN_BLOCK_INTERVAL_SECS = 6`, checked before proposal production (`indra-node/src/bin/node.rs:45-48`, `indra-node/src/bin/node.rs:1927-1944`).
-- VRF commit/reveal windows, 500ms each if quorum does not arrive earlier (`indra-core/src/types/primitives.rs:65-69`).
+- VRF commit/reveal windows, 1500ms each if quorum does not arrive earlier (`indra-core/src/types/primitives.rs:65-69`).
 - Round timeouts: propose 8s, prevote 3s, precommit 3s (`indra-node/src/bin/node.rs:45-47`).
 
 ### 4.2 VRF message volume
