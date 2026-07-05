@@ -183,6 +183,7 @@ struct RelayMetrics {
     duplicate: u64,
     dropped: u64,
     verification_failed: u64,
+    queue_full: u64,
 }
 
 struct ConsensusDuplicateFilter {
@@ -226,11 +227,6 @@ impl RelaySeenCache {
         }
     }
 
-    fn mark_originated(&mut self, key: RelayMessageKey, forwarded_to: &[Bytes32]) {
-        let forwarded = forwarded_to.iter().copied().collect::<HashSet<_>>();
-        self.upsert_forwarded(key, &forwarded);
-    }
-
     fn is_seen(&self, key: &RelayMessageKey) -> bool {
         self.seen.iter().any(|entry| &entry.key == key)
     }
@@ -243,6 +239,9 @@ impl RelaySeenCache {
     }
 
     fn record_forwarded(&mut self, key: RelayMessageKey, forwarded_to: &[Bytes32]) {
+        if forwarded_to.is_empty() {
+            return;
+        }
         let forwarded = forwarded_to.iter().copied().collect::<HashSet<_>>();
         self.upsert_forwarded(key, &forwarded);
     }
@@ -703,39 +702,124 @@ impl PeerManagerActor {
             self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
             return;
         };
-        if self.relay_seen.is_seen(&key) {
-            self.increment_relay_metric(class, |metrics| metrics.duplicate += 1);
-            return;
-        }
-        if !self.relay_verification_passes(msg) {
-            self.relay_seen.record_forwarded(key, &[]);
-            self.increment_relay_metric(class, |metrics| metrics.verification_failed += 1);
-            return;
-        }
-        if let Message::Block(block) = msg {
-            if self.block_relay_conflicts(block, &key) {
-                self.relay_seen.record_forwarded(key, &[]);
-                self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+        let already_seen = self.relay_seen.is_seen(&key);
+        if !already_seen {
+            if !self.relay_verification_passes(msg) {
+                self.increment_relay_metric(class, |metrics| metrics.verification_failed += 1);
                 return;
+            }
+            if let Message::Block(block) = msg {
+                if self.block_relay_conflicts(block, &key) {
+                    self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+                    return;
+                }
             }
         }
         let targets = self.relay_targets(&key, class, sender);
-        self.relay_seen.record_forwarded(key, &targets);
         if targets.is_empty() {
-            self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+            if already_seen {
+                self.increment_relay_metric(class, |metrics| metrics.duplicate += 1);
+            } else {
+                self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+            }
             return;
         }
+        let mut enqueued = Vec::new();
         for validator_id in &targets {
-            self.try_send_to_validator(
-                *validator_id,
+            if self
+                .try_send_to_validator(
+                    *validator_id,
+                    OutboundMessage {
+                        msg: msg.clone(),
+                        point_to_point: false,
+                    },
+                )
+                .await
+            {
+                enqueued.push(*validator_id);
+            }
+        }
+        self.relay_seen.record_forwarded(key, &enqueued);
+        self.increment_relay_metric(class, |metrics| metrics.relayed += enqueued.len() as u64);
+    }
+
+    async fn broadcast_to_all_connected(&mut self, msg: Message) {
+        let validators: Vec<Bytes32> = self.peers_by_validator.keys().copied().collect();
+        let relay_key = relay_message_key(&msg);
+        let mut enqueued = Vec::new();
+        for validator_id in validators {
+            if self
+                .try_send_to_validator(
+                    validator_id,
+                    OutboundMessage {
+                        msg: msg.clone(),
+                        point_to_point: false,
+                    },
+                )
+                .await
+            {
+                enqueued.push(validator_id);
+            }
+        }
+        if let Some(key) = relay_key {
+            self.relay_seen.record_forwarded(key, &enqueued);
+        }
+    }
+
+    fn record_queue_full_drop(&mut self, validator_id: Bytes32, addr: SocketAddr, msg: &Message) {
+        if let Some(class) = relay_message_class(msg) {
+            self.increment_relay_metric(class, |metrics| metrics.queue_full += 1);
+            eprintln!(
+                "[relay] outbound queue full: dropped {:?} for validator {} ({})",
+                class,
+                short_validator_id(&validator_id),
+                addr,
+            );
+        }
+    }
+
+    async fn try_send_to_validator(
+        &mut self,
+        validator_id: Bytes32,
+        outbound: OutboundMessage,
+    ) -> bool {
+        let Some(peer) = self.peers_by_validator.get(&validator_id) else {
+            return false;
+        };
+        let addr = peer.addr;
+        let queue_type = message_queue(&outbound.msg);
+        let result = match queue_type {
+            QueueType::Small => peer.small_tx.try_send(outbound),
+            QueueType::Large => peer.large_tx.try_send(outbound),
+        };
+        match result {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(message)) => {
+                if message.point_to_point {
+                    self.drop_peer(validator_id, addr).await;
+                } else {
+                    self.peer_table.score_event(&addr, ScoreEvent::Timeout);
+                    self.record_queue_full_drop(validator_id, addr, &message.msg);
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.drop_peer(validator_id, addr).await;
+                false
+            }
+        }
+    }
+
+    async fn send_to_validator(&mut self, validator_id: Bytes32, msg: Message) {
+        let _ = self
+            .try_send_to_validator(
+                validator_id,
                 OutboundMessage {
-                    msg: msg.clone(),
-                    point_to_point: false,
+                    msg,
+                    point_to_point: true,
                 },
             )
             .await;
-        }
-        self.increment_relay_metric(class, |metrics| metrics.relayed += targets.len() as u64);
     }
 
     async fn run(mut self) {
@@ -760,30 +844,10 @@ impl PeerManagerActor {
     async fn handle_command(&mut self, command: NetworkCommand) {
         match command {
             NetworkCommand::Broadcast(msg) => {
-                let validators: Vec<Bytes32> = self.peers_by_validator.keys().copied().collect();
-                if let Some(key) = relay_message_key(&msg) {
-                    self.relay_seen.mark_originated(key, &validators);
-                }
-                for validator_id in validators {
-                    self.try_send_to_validator(
-                        validator_id,
-                        OutboundMessage {
-                            msg: msg.clone(),
-                            point_to_point: false,
-                        },
-                    )
-                    .await;
-                }
+                self.broadcast_to_all_connected(msg).await;
             }
             NetworkCommand::SendTo { validator_id, msg } => {
-                self.try_send_to_validator(
-                    validator_id,
-                    OutboundMessage {
-                        msg,
-                        point_to_point: true,
-                    },
-                )
-                .await;
+                self.send_to_validator(validator_id, msg).await;
             }
             NetworkCommand::Disconnect { validator_id } => {
                 if let Some(peer) = self.peers_by_validator.get(&validator_id) {
@@ -1067,30 +1131,6 @@ impl PeerManagerActor {
                 is_outbound: handshake.is_initiator,
             })
             .await;
-    }
-
-    async fn try_send_to_validator(&mut self, validator_id: Bytes32, outbound: OutboundMessage) {
-        let Some(peer) = self.peers_by_validator.get(&validator_id) else {
-            return;
-        };
-        let queue_type = message_queue(&outbound.msg);
-        let result = match queue_type {
-            QueueType::Small => peer.small_tx.try_send(outbound),
-            QueueType::Large => peer.large_tx.try_send(outbound),
-        };
-        match result {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(message)) => {
-                if message.point_to_point {
-                    self.drop_peer(validator_id, peer.addr).await;
-                } else {
-                    self.peer_table.score_event(&peer.addr, ScoreEvent::Timeout);
-                }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.drop_peer(validator_id, peer.addr).await;
-            }
-        }
     }
 
     async fn drop_peer(&mut self, validator_id: Bytes32, addr: SocketAddr) {
@@ -1563,6 +1603,36 @@ mod tests {
         (small_rx, large_rx)
     }
 
+    fn add_test_peer_receivers_with_capacity(
+        actor: &mut PeerManagerActor,
+        validator_id: Bytes32,
+        port: u16,
+        small_capacity: usize,
+        large_capacity: usize,
+    ) -> (
+        mpsc::Receiver<OutboundMessage>,
+        mpsc::Receiver<OutboundMessage>,
+    ) {
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (small_tx, small_rx) = mpsc::channel(small_capacity);
+        let (large_tx, large_rx) = mpsc::channel(large_capacity);
+        actor.peer_table.add(addr).unwrap();
+        actor.peer_table.set_validator_id(&addr, validator_id);
+        actor.peer_table.mark_connected(&addr);
+        actor.validator_by_addr.insert(addr, validator_id);
+        actor.peers_by_validator.insert(
+            validator_id,
+            ManagedPeer {
+                addr,
+                small_tx,
+                large_tx,
+                read_task: tokio::spawn(async {}),
+                write_task: tokio::spawn(async {}),
+            },
+        );
+        (small_rx, large_rx)
+    }
+
     #[test]
     fn consensus_duplicate_filter_is_bounded() {
         let mut filter = ConsensusDuplicateFilter::new(3);
@@ -1648,9 +1718,10 @@ mod tests {
                 content_hash: Bytes32::from([byte; 32]),
             })
         };
-        cache.record_forwarded(key(1), &[]);
-        cache.record_forwarded(key(2), &[]);
-        cache.record_forwarded(key(3), &[]);
+        let forwarded = Bytes32::from([0xFE; 32]);
+        cache.record_forwarded(key(1), &[forwarded]);
+        cache.record_forwarded(key(2), &[forwarded]);
+        cache.record_forwarded(key(3), &[forwarded]);
         assert_eq!(cache.len(), 2);
         assert!(!cache.is_seen(&key(1)));
         assert!(cache.is_seen(&key(2)));
@@ -1747,6 +1818,142 @@ mod tests {
             .relay_if_eligible(no_target_sender, &no_target_msg)
             .await;
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn relay_forwarded_marked_only_after_successful_enqueue() {
+        let sender = Bytes32::from([0xA0; 32]);
+        let successful_peer = Bytes32::from([0xA1; 32]);
+        let full_peer = Bytes32::from([0xA2; 32]);
+        let keypair = hybrid_key(0xA0);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let mut successful_rx = add_test_peer(&mut actor, successful_peer, 34101);
+        let (mut full_rx, _large_rx) =
+            add_test_peer_receivers_with_capacity(&mut actor, full_peer, 34102, 1, 1);
+        let msg = Message::Vote(signed_vote(sender, &keypair));
+        let key = relay_message_key(&msg).expect("vote should have relay key");
+
+        actor
+            .peers_by_validator
+            .get(&full_peer)
+            .unwrap()
+            .small_tx
+            .try_send(OutboundMessage {
+                msg: Message::Ping(123),
+                point_to_point: false,
+            })
+            .expect("test prefill should occupy the one-slot queue");
+
+        actor
+            .handle_command(NetworkCommand::Broadcast(msg.clone()))
+            .await;
+
+        assert!(successful_rx.try_recv().is_ok());
+        assert!(
+            actor.relay_seen.forwarded_to(&key, &successful_peer),
+            "successful enqueue should be marked forwarded"
+        );
+        assert!(
+            !actor.relay_seen.forwarded_to(&key, &full_peer),
+            "queue-full peer must not be marked forwarded"
+        );
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].queue_full, 1);
+        assert!(matches!(
+            full_rx
+                .try_recv()
+                .expect("prefill should remain queued")
+                .msg,
+            Message::Ping(123)
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_recovers_delivery_to_previously_failed_peer() {
+        let origin = Bytes32::from([0xB0; 32]);
+        let echoing_peer = Bytes32::from([0xB1; 32]);
+        let missed_peer = Bytes32::from([0xB2; 32]);
+        let keypair = hybrid_key(0xB0);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let mut echoing_rx = add_test_peer(&mut actor, echoing_peer, 34111);
+        let (mut missed_rx, _large_rx) =
+            add_test_peer_receivers_with_capacity(&mut actor, missed_peer, 34112, 1, 1);
+        let msg = Message::Vote(signed_vote(origin, &keypair));
+
+        actor
+            .peers_by_validator
+            .get(&missed_peer)
+            .unwrap()
+            .small_tx
+            .try_send(OutboundMessage {
+                msg: Message::Ping(456),
+                point_to_point: false,
+            })
+            .expect("test prefill should occupy the one-slot queue");
+
+        actor
+            .handle_command(NetworkCommand::Broadcast(msg.clone()))
+            .await;
+        assert!(echoing_rx.try_recv().is_ok());
+        assert!(matches!(
+            missed_rx.try_recv().expect("clear prefilled queue").msg,
+            Message::Ping(456)
+        ));
+
+        actor.relay_if_eligible(echoing_peer, &msg).await;
+
+        assert!(matches!(
+            missed_rx
+                .try_recv()
+                .expect("relay should recover the missed peer")
+                .msg,
+            Message::Vote(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_full_drop_is_counted_by_message_class() {
+        let peer = Bytes32::from([0xA3; 32]);
+        let sender = Bytes32::from([0xA4; 32]);
+        let keypair = hybrid_key(0xA4);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let (mut peer_rx, _large_rx) =
+            add_test_peer_receivers_with_capacity(&mut actor, peer, 34103, 1, 1);
+        let msg = Message::VrfReveal(signed_reveal(sender, &keypair));
+
+        actor
+            .peers_by_validator
+            .get(&peer)
+            .unwrap()
+            .small_tx
+            .try_send(OutboundMessage {
+                msg: Message::Ping(789),
+                point_to_point: false,
+            })
+            .expect("test prefill should occupy the one-slot queue");
+
+        actor
+            .handle_command(NetworkCommand::Broadcast(msg.clone()))
+            .await;
+
+        assert_eq!(
+            actor.relay_metrics[&RelayMessageClass::VrfReveal].queue_full,
+            1
+        );
+        let key = relay_message_key(&msg).expect("reveal should have relay key");
+        assert!(
+            !actor.relay_seen.forwarded_to(&key, &peer),
+            "queue-full reveal delivery must not be marked forwarded"
+        );
+        assert!(matches!(
+            peer_rx
+                .try_recv()
+                .expect("prefill should remain queued")
+                .msg,
+            Message::Ping(789)
+        ));
     }
 
     #[tokio::test]
