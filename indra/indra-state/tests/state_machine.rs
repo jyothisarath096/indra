@@ -102,6 +102,8 @@ fn install_validator(
             pending_commission_effective_epoch: None,
             min_delegation_spark: DUST_LIMIT_SPARK,
             auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
         })
         .unwrap();
     (validator_id, pubkey, keypair)
@@ -274,6 +276,8 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
                     pending_commission_effective_epoch: None,
                     min_delegation_spark: DUST_LIMIT_SPARK,
                     auto_delegate_to: None,
+                    network_addr: None,
+                    network_addr_last_updated_epoch: None,
                 })
                 .unwrap();
             validator_id

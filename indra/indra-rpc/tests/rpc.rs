@@ -234,7 +234,7 @@ fn test_all_methods_reachable_via_dispatch() {
 fn test_get_schema_info_has_required_fields() {
     let e = engine("rpc_schema_info");
     let resp = call_rpc("indra_getSchemaInfo", &[], &e);
-    assert!(resp.contains("\"schema_version\":3"));
+    assert!(resp.contains("\"schema_version\":4"));
     assert!(resp.contains("\"schema_version_genesis\":1"));
     assert!(resp.contains("\"node_version\""));
     assert!(resp.contains("\"migration_history\""));

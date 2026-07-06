@@ -51,3 +51,29 @@ and the Phase 1 timing work in
 The Phase 2 model specifically filled the gap left by arithmetic-only bandwidth
 estimates: it simulated elapsed delivery time as network latency plus actual
 byte transfer time for each store-and-forward relay hop.
+
+## Network address advertisement
+
+Mainnet validators are expected to publish a current P2P dial address in their
+on-chain validator entry once the validator-network-address protocol upgrade is
+activated.
+
+The on-chain `network_addr` field is the source of truth for dynamic validator
+discovery. DNS seeds, static bootstrap peers, peer exchange, and persisted peer
+tables remain useful distribution/cache layers, but they must not be treated as
+independent authorities for "who is active and how do I reach them."
+
+Operationally, DNS seed records should be generated from the current active
+validator set by querying `indra_getValidatorSet` and publishing active
+validators' non-null `network_addr` values. The DNS publishing script/service is
+out of scope for the protocol field itself, but the intended relationship is:
+
+1. chain state records validator identity, active status, and `network_addr`;
+2. `indra_getValidatorSet` exposes those fields;
+3. DNS seed infrastructure caches that chain-derived active-address set;
+4. PEX and persisted peer tables continue to accelerate discovery after first
+   contact.
+
+For the initial version, `network_addr` is intentionally strict IP:port syntax
+only. Hostnames are rejected so the authoritative discovery field does not
+reintroduce a live DNS dependency or hostname-hijack surface.

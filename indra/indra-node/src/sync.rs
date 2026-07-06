@@ -818,6 +818,8 @@ mod tests {
                 pending_commission_effective_epoch: None,
                 min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
                 auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
             })
             .unwrap();
 

@@ -198,6 +198,8 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             pending_commission_effective_epoch: None,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
             auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
         };
 
         let _ = state.validators.upsert(entry);

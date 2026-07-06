@@ -10,7 +10,8 @@ use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
         max_active_validators, muldiv, overflow_fix_active, Bytes32, DUST_LIMIT_SPARK,
-        MAX_VALIDATORS, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+        MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+        SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
     },
     transaction::OutputV1,
 };
@@ -122,6 +123,10 @@ pub struct ValidatorEntry {
     pub min_delegation_spark: u64,
     /// Optional target validator for epoch-scoped reward auto-delegation.
     pub auto_delegate_to: Option<Bytes32>,
+    /// Validator-advertised P2P dial address, strict IP:port syntax.
+    pub network_addr: Option<String>,
+    /// Epoch in which `network_addr` was last set or cleared.
+    pub network_addr_last_updated_epoch: Option<u64>,
 }
 
 impl Encode for ValidatorEntry {
@@ -167,6 +172,17 @@ impl Encode for ValidatorEntry {
         if let Some(target) = self.auto_delegate_to {
             target.encode(buf);
         }
+        self.network_addr.is_some().encode(buf);
+        if let Some(addr) = &self.network_addr {
+            let bytes = addr.as_bytes();
+            debug_assert!(bytes.len() <= MAX_VALIDATOR_NETWORK_ADDR_LEN);
+            (bytes.len() as u16).encode(buf);
+            buf.extend_from_slice(bytes);
+        }
+        self.network_addr_last_updated_epoch.is_some().encode(buf);
+        if let Some(epoch) = self.network_addr_last_updated_epoch {
+            epoch.encode(buf);
+        }
     }
 
     fn encoded_len(&self) -> usize {
@@ -201,6 +217,14 @@ impl Encode for ValidatorEntry {
             + 8
             + 1
             + self.auto_delegate_to.map(|_| 32).unwrap_or(0)
+            + 1
+            + self
+                .network_addr
+                .as_ref()
+                .map(|addr| 2 + addr.len())
+                .unwrap_or(0)
+            + 1
+            + self.network_addr_last_updated_epoch.map(|_| 8).unwrap_or(0)
     }
 }
 
@@ -209,7 +233,8 @@ impl Decode for ValidatorEntry {
         let marker = u8::decode(r)?;
         match marker {
             SCHEMA_VERSION_GENESIS => decode_validator_entry_v1(r, None),
-            SCHEMA_VERSION => decode_validator_entry_v3(r, None),
+            SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS => decode_validator_entry_v3(r, None),
+            SCHEMA_VERSION => decode_validator_entry_v4(r, None),
             other if r.remaining() == 0 => Err(unsupported_schema("ValidatorEntry", other)),
             first_byte => decode_validator_entry_v1(r, Some(first_byte)),
         }
@@ -243,21 +268,28 @@ fn decode_validator_entry_v1(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, false, false)
+    decode_validator_entry_fields(r, first_byte, false, false, false)
 }
 
 fn decode_validator_entry_v2(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, false)
+    decode_validator_entry_fields(r, first_byte, true, false, false)
 }
 
 fn decode_validator_entry_v3(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, true)
+    decode_validator_entry_fields(r, first_byte, true, true, false)
+}
+
+fn decode_validator_entry_v4(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<ValidatorEntry> {
+    decode_validator_entry_fields(r, first_byte, true, true, true)
 }
 
 impl ValidatorEntry {
@@ -277,6 +309,7 @@ fn decode_validator_entry_fields(
     first_byte: Option<u8>,
     has_auto_delegate_to: bool,
     has_pending_commission: bool,
+    has_network_addr: bool,
 ) -> IndraResult<ValidatorEntry> {
     let validator_id = decode_bytes32_with_first(r, first_byte)?;
     let name_len = u32::decode(r)? as usize;
@@ -340,6 +373,39 @@ fn decode_validator_entry_fields(
     } else {
         (None, None)
     };
+    let min_delegation_spark = u64::decode(r)?;
+    let auto_delegate_to = if has_auto_delegate_to && bool::decode(r)? {
+        Some(Bytes32::decode(r)?)
+    } else {
+        None
+    };
+    let (network_addr, network_addr_last_updated_epoch) = if has_network_addr {
+        let network_addr = if bool::decode(r)? {
+            let len = u16::decode(r)? as usize;
+            if len > MAX_VALIDATOR_NETWORK_ADDR_LEN {
+                return Err(IndraError::InvalidStakingOp(format!(
+                    "validator network address length {} exceeds maximum {}",
+                    len, MAX_VALIDATOR_NETWORK_ADDR_LEN
+                )));
+            }
+            let bytes = r.read_bytes(len)?;
+            Some(
+                String::from_utf8(bytes.to_vec()).map_err(|_| IndraError::InvariantViolation {
+                    message: "invalid UTF-8 validator network address in snapshot",
+                })?,
+            )
+        } else {
+            None
+        };
+        let last_updated = if bool::decode(r)? {
+            Some(u64::decode(r)?)
+        } else {
+            None
+        };
+        (network_addr, last_updated)
+    } else {
+        (None, None)
+    };
 
     Ok(ValidatorEntry {
         validator_id,
@@ -357,12 +423,10 @@ fn decode_validator_entry_fields(
         commission_bps,
         pending_commission_bps,
         pending_commission_effective_epoch,
-        min_delegation_spark: u64::decode(r)?,
-        auto_delegate_to: if has_auto_delegate_to && bool::decode(r)? {
-            Some(Bytes32::decode(r)?)
-        } else {
-            None
-        },
+        min_delegation_spark,
+        auto_delegate_to,
+        network_addr,
+        network_addr_last_updated_epoch,
     })
 }
 
@@ -606,6 +670,8 @@ mod tests {
             pending_commission_effective_epoch: None,
             min_delegation_spark: DUST_LIMIT_SPARK,
             auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
         }
     }
 
@@ -659,6 +725,34 @@ mod tests {
         let decoded = ValidatorEntry::decode_exact(&validator.encode_to_vec()).unwrap();
         assert_eq!(decoded, validator);
         assert_eq!(decoded.auto_delegate_to, Some(target));
+    }
+
+    #[test]
+    fn validator_entry_v4_round_trips_network_address() {
+        let mut validator = make_validator(0x44, 10_000, 3);
+        validator.network_addr = Some("203.0.113.44:30303".to_string());
+        validator.network_addr_last_updated_epoch = Some(7);
+
+        let decoded = ValidatorEntry::decode_exact(&validator.encode_to_vec()).unwrap();
+        assert_eq!(decoded, validator);
+        assert_eq!(decoded.network_addr.as_deref(), Some("203.0.113.44:30303"));
+        assert_eq!(decoded.network_addr_last_updated_epoch, Some(7));
+    }
+
+    #[test]
+    fn validator_entry_v3_decodes_network_address_defaults_none() {
+        let validator = make_validator(0x45, 10_000, 3);
+        let mut bytes = validator.encode_to_vec();
+        bytes[0] = SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS;
+        // v4 appends network_addr presence and last_updated presence booleans
+        // after the v3 layout. Removing them models a persisted v3 validator.
+        bytes.truncate(bytes.len() - 2);
+
+        let decoded = ValidatorEntry::decode_exact(&bytes).unwrap();
+        assert_eq!(decoded.validator_id, validator.validator_id);
+        assert_eq!(decoded.auto_delegate_to, None);
+        assert_eq!(decoded.network_addr, None);
+        assert_eq!(decoded.network_addr_last_updated_epoch, None);
     }
 
     #[test]
@@ -910,7 +1004,9 @@ impl Decode for StakeBondEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let marker = u8::decode(r)?;
         match marker {
-            SCHEMA_VERSION_GENESIS | SCHEMA_VERSION => decode_stake_bond_entry_fields(r, None),
+            SCHEMA_VERSION_GENESIS
+            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
+            | SCHEMA_VERSION => decode_stake_bond_entry_fields(r, None),
             other if r.remaining() == 0 => Err(unsupported_schema("StakeBondEntry", other)),
             first_byte => decode_stake_bond_entry_fields(r, Some(first_byte)),
         }
@@ -981,7 +1077,9 @@ impl Decode for DelegatorEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let marker = u8::decode(r)?;
         match marker {
-            SCHEMA_VERSION_GENESIS | SCHEMA_VERSION => decode_delegator_entry_fields(r, None),
+            SCHEMA_VERSION_GENESIS
+            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
+            | SCHEMA_VERSION => decode_delegator_entry_fields(r, None),
             other if r.remaining() == 0 => Err(unsupported_schema("DelegatorEntry", other)),
             first_byte => decode_delegator_entry_fields(r, Some(first_byte)),
         }

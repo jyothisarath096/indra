@@ -1144,6 +1144,8 @@ mod tests {
             pending_commission_effective_epoch: None,
             min_delegation_spark: 1,
             auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
         }
     }
 
@@ -1174,6 +1176,8 @@ mod tests {
                 pending_commission_effective_epoch: None,
                 min_delegation_spark: 1,
                 auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
             })
             .unwrap();
         (state, validator_id, keypair)

@@ -1374,16 +1374,22 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
     let mut entries = Vec::new();
     for v in state.chain.validators.active_validators() {
         let id_hex = hex::encode(v.validator_id.0);
+        let network_addr = v
+            .network_addr
+            .as_ref()
+            .map(|addr| format!(r#""{}""#, json_escape(addr)))
+            .unwrap_or_else(|| "null".to_string());
         entries.push(format!(
-            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}"}}"#,
+            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","network_addr":{}}}"#,
             id_hex,
-            v.name,
+            json_escape(&v.name),
             v.stake_spark,
             v.commission_bps,
             v.pending_rewards,
             v.registered_epoch,
             v.hybrid_classical_pk.map(hex::encode).unwrap_or_default(),
             v.hybrid_pq_pk.as_ref().map(hex::encode).unwrap_or_default(),
+            network_addr,
         ));
     }
     Ok(format!(r#"{{"validators":[{}]}}"#, entries.join(",")))
@@ -1510,6 +1516,42 @@ mod tests {
     }
 
     #[test]
+    fn rpc_exposes_network_addr_field() {
+        let mut engine = make_state("vna");
+        for (byte, addr) in [(0x31, Some("203.0.113.31:30303")), (0x32, None)] {
+            engine
+                .validators
+                .upsert(indra_state::ValidatorEntry {
+                    validator_id: indra_core::Bytes32::from([byte; 32]),
+                    name: format!("validator-{byte}"),
+                    hybrid_classical_pk: None,
+                    hybrid_pq_pk: None,
+                    vrf_pk: None,
+                    stake_spark: 1_000_000,
+                    status: indra_state::ValidatorStatus::Active,
+                    registered_epoch: 0,
+                    last_active_epoch: 0,
+                    pending_rewards: 0,
+                    rewards_last_epoch: 0,
+                    self_report_count: 0,
+                    commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+                    pending_commission_bps: None,
+                    pending_commission_effective_epoch: None,
+                    min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+                    auto_delegate_to: None,
+                    network_addr: addr.map(str::to_string),
+                    network_addr_last_updated_epoch: addr.map(|_| 1),
+                })
+                .unwrap();
+        }
+        let state = NodeState::read_only(&engine);
+        let result = get_validator_set(&state).unwrap();
+
+        assert!(result.contains(r#""network_addr":"203.0.113.31:30303""#));
+        assert!(result.contains(r#""network_addr":null"#));
+    }
+
+    #[test]
     fn get_validator_auto_delegate_returns_target_and_name() {
         let mut engine = make_state("gad");
         let validator_id = indra_core::Bytes32::from([0x11; 32]);
@@ -1534,6 +1576,8 @@ mod tests {
                 pending_commission_effective_epoch: None,
                 min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
                 auto_delegate_to: Some(target_id),
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
             })
             .unwrap();
         engine
@@ -1556,6 +1600,8 @@ mod tests {
                 pending_commission_effective_epoch: None,
                 min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
                 auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
             })
             .unwrap();
         let state = NodeState::read_only(&engine);

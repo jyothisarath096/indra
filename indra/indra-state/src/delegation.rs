@@ -7,12 +7,12 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        staking_commitment_proof_required, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
-        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
-        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        staking_commitment_proof_required, validator_network_address_active, Bytes32,
+        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
+        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
-    staking::{StakingBondProof, StakingOp, StakingOpBody},
+    staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
 };
 use rand::SeedableRng;
@@ -46,7 +46,8 @@ pub fn apply_staking_op(
     let signing_bytes = op.signing_bytes(chain_id);
     match &op.body {
         StakingOpBody::SetCommission { validator_id, .. }
-        | StakingOpBody::SetAutoDelegate { validator_id, .. } => {
+        | StakingOpBody::SetAutoDelegate { validator_id, .. }
+        | StakingOpBody::UpdateNetworkAddress { validator_id, .. } => {
             let validator = state
                 .validators
                 .get(validator_id)
@@ -149,6 +150,12 @@ pub fn apply_staking_op(
             validator_id,
             target_validator_id,
         } => apply_set_auto_delegate(state, *validator_id, *target_validator_id),
+        StakingOpBody::UpdateNetworkAddress {
+            validator_id,
+            network_addr,
+        } => {
+            apply_update_network_address(state, *validator_id, network_addr.clone(), current_height)
+        }
         StakingOpBody::SelfStake {
             bond_utxo_id,
             validator_pubkey,
@@ -353,6 +360,8 @@ fn apply_register_validator(
         pending_commission_effective_epoch: None,
         min_delegation_spark: DUST_LIMIT_SPARK,
         auto_delegate_to: None,
+        network_addr: None,
+        network_addr_last_updated_epoch: None,
     };
     state.validators.upsert(entry)?;
     state.staked_bonds.insert(
@@ -799,6 +808,43 @@ fn apply_set_auto_delegate(
     Ok(())
 }
 
+fn apply_update_network_address(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    network_addr: Option<String>,
+    current_height: u64,
+) -> StateResult<()> {
+    if !validator_network_address_active(current_height) {
+        return Err(StateError::InvalidStakingOp(
+            "validator network address updates are not active".into(),
+        ));
+    }
+    if let Some(addr) = &network_addr {
+        validate_network_addr_string(addr)
+            .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
+    }
+
+    let current_epoch = epoch_for_height(current_height);
+    let validator = state
+        .validators
+        .get_mut(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+    if !matches!(
+        validator.status,
+        ValidatorStatus::Active | ValidatorStatus::Registered
+    ) {
+        return Err(StateError::ValidatorNotActive);
+    }
+    if validator.network_addr_last_updated_epoch == Some(current_epoch) {
+        return Err(StateError::InvalidStakingOp(
+            "validator network address already updated this epoch".into(),
+        ));
+    }
+    validator.network_addr = network_addr;
+    validator.network_addr_last_updated_epoch = Some(current_epoch);
+    Ok(())
+}
+
 /// Derive a stable delegator ID from their hybrid public key.
 ///
 /// Uses SHA-256 of the encoded public key bytes, matching how
@@ -983,6 +1029,8 @@ mod tests {
             pending_commission_effective_epoch: None,
             min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
             auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
         };
         state.validators.upsert(entry).unwrap();
         (validator_id, keypair)
@@ -2023,6 +2071,195 @@ mod tests {
         );
         assert!(state.staked_bonds.contains_key(&bond_utxo_id));
         assert!(!state.utxos.contains(&bond_utxo_id));
+    }
+
+    #[test]
+    fn pre_activation_height_rejects_update_network_address_op() {
+        let mut state = ChainState::new_genesis();
+        let chain_id = state.chain_id.clone();
+        let (validator_id, keypair) = make_active_validator(&mut state, 0xA1);
+        let op = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("203.0.113.10:30303".to_string()),
+            },
+            1,
+            &keypair,
+            &chain_id,
+        );
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 0),
+            Err(StateError::InvalidStakingOp(reason))
+                if reason.contains("network address updates are not active")
+        ));
+    }
+
+    #[test]
+    fn update_network_address_requires_validator_signature() {
+        let mut state = ChainState::new_genesis();
+        let chain_id = state.chain_id.clone();
+        let (validator_id, _keypair) = make_active_validator(&mut state, 0xA2);
+        let attacker = keypair(0xA3);
+        let op = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("203.0.113.11:30303".to_string()),
+            },
+            1,
+            &attacker,
+            &chain_id,
+        );
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
+            Err(StateError::StakingOpSignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn update_network_address_rejects_invalid_syntax_at_apply() {
+        let mut state = ChainState::new_genesis();
+        let chain_id = state.chain_id.clone();
+        let (validator_id, keypair) = make_active_validator(&mut state, 0xA4);
+
+        for invalid in [
+            "validator.example.com:30303",
+            "http://203.0.113.12:30303",
+            "203.0.113.12:30303/path",
+            "203.0.113.12:30303 ",
+            "203.0.113.12:0",
+        ] {
+            let op = signed_op(
+                StakingOpBody::UpdateNetworkAddress {
+                    validator_id,
+                    network_addr: Some(invalid.to_string()),
+                },
+                1,
+                &keypair,
+                &chain_id,
+            );
+            assert!(matches!(
+                apply_staking_op(&mut state.clone(), &op, &chain_id, u64::MAX),
+                Err(StateError::InvalidStakingOp(_))
+            ));
+        }
+
+        let op = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("[2001:db8::12]:30303".to_string()),
+            },
+            1,
+            &keypair,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .network_addr
+                .as_deref(),
+            Some("[2001:db8::12]:30303")
+        );
+    }
+
+    #[test]
+    fn update_network_address_cooldown_enforced() {
+        let mut state = ChainState::new_genesis();
+        let chain_id = state.chain_id.clone();
+        let (validator_id, keypair) = make_active_validator(&mut state, 0xA5);
+        let first = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("203.0.113.13:30303".to_string()),
+            },
+            1,
+            &keypair,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &first, &chain_id, u64::MAX).unwrap();
+
+        let second = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("203.0.113.14:30303".to_string()),
+            },
+            2,
+            &keypair,
+            &chain_id,
+        );
+        assert!(matches!(
+            apply_staking_op(&mut state, &second, &chain_id, u64::MAX),
+            Err(StateError::InvalidStakingOp(reason))
+                if reason.contains("already updated this epoch")
+        ));
+    }
+
+    #[test]
+    fn update_network_address_later_epoch_succeeds_and_clearing_counts_as_update() {
+        let mut state = ChainState::new_genesis();
+        let chain_id = state.chain_id.clone();
+        let (validator_id, keypair) = make_active_validator(&mut state, 0xA6);
+        let active_epoch = epoch_for_height(u64::MAX);
+        state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .network_addr_last_updated_epoch = active_epoch.checked_sub(1);
+
+        let set = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("203.0.113.15:30303".to_string()),
+            },
+            1,
+            &keypair,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &set, &chain_id, u64::MAX).unwrap();
+
+        let clear_same_epoch = signed_op(
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: None,
+            },
+            2,
+            &keypair,
+            &chain_id,
+        );
+        assert!(matches!(
+            apply_staking_op(&mut state, &clear_same_epoch, &chain_id, u64::MAX),
+            Err(StateError::InvalidStakingOp(reason))
+                if reason.contains("already updated this epoch")
+        ));
+    }
+
+    #[test]
+    fn update_network_address_rejects_slashed_or_exited_validator() {
+        let chain_id = "indra-testnet-1".to_string();
+        for status in [ValidatorStatus::Slashed, ValidatorStatus::Exited] {
+            let mut state = ChainState::new_genesis();
+            state.chain_id = chain_id.clone();
+            let (validator_id, keypair) = make_active_validator(&mut state, 0xA7);
+            state.validators.get_mut(&validator_id).unwrap().status = status.clone();
+            let op = signed_op(
+                StakingOpBody::UpdateNetworkAddress {
+                    validator_id,
+                    network_addr: Some("203.0.113.16:30303".to_string()),
+                },
+                1,
+                &keypair,
+                &chain_id,
+            );
+
+            assert!(matches!(
+                apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
+                Err(StateError::ValidatorNotActive)
+            ));
+        }
     }
 
     #[test]

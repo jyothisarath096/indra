@@ -107,6 +107,7 @@ pub fn migrate_chain_state(mut state: ChainState, from_version: u8) -> Result<Ch
         state = match version {
             1 => migrate_v1_to_v2(state)?,
             2 => migrate_v2_to_v3(state)?,
+            3 => migrate_v3_to_v4(state)?,
             other => return Err(format!("no migration path from schema version {other}")),
         };
         version = version.saturating_add(1);
@@ -135,6 +136,12 @@ fn migrate_v1_to_v2(state: ChainState) -> Result<ChainState, String> {
 }
 
 fn migrate_v2_to_v3(state: ChainState) -> Result<ChainState, String> {
+    Ok(state)
+}
+
+fn migrate_v3_to_v4(state: ChainState) -> Result<ChainState, String> {
+    // v4 adds optional validator network-address fields. Existing v3
+    // validators decode with `None` defaults, so no data rewrite is required.
     Ok(state)
 }
 

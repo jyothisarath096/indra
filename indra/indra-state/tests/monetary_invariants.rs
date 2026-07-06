@@ -110,6 +110,8 @@ fn make_validator(pubkey: &HybridPubKey, seed: [u8; 32], stake: u64) -> Validato
         pending_commission_effective_epoch: None,
         min_delegation_spark: 1,
         auto_delegate_to: None,
+        network_addr: None,
+        network_addr_last_updated_epoch: None,
     }
 }
 

@@ -10,7 +10,7 @@ use crate::{
     error::IndraResult,
     types::{
         crypto::{HybridPubKey, HybridSignature},
-        primitives::{Bytes32, STAKING_OP_DOMAIN},
+        primitives::{Bytes32, MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN},
     },
 };
 
@@ -23,6 +23,7 @@ const TAG_SET_COMMISSION: u8 = 5;
 const TAG_SELF_STAKE: u8 = 6;
 const TAG_SELF_UNSTAKE: u8 = 7;
 const TAG_SET_AUTO_DELEGATE: u8 = 8;
+const TAG_UPDATE_NETWORK_ADDRESS: u8 = 9;
 
 /// Proof that a staking UTXO's Pedersen commitment opens to exactly
 /// `OutputV1.value_spark`.
@@ -160,6 +161,14 @@ pub enum StakingOpBody {
         /// Target validator to soft-delegate to. Bytes32::ZERO clears.
         target_validator_id: Bytes32,
     },
+
+    /// Set or clear the validator's advertised P2P dial address.
+    UpdateNetworkAddress {
+        /// This validator's identity.
+        validator_id: Bytes32,
+        /// Strict IP:port address. `None` clears the advertised address.
+        network_addr: Option<String>,
+    },
 }
 
 impl StakingOp {
@@ -201,7 +210,8 @@ impl StakingOp {
                 validator_pubkey, ..
             } => pubkey_to_id(validator_pubkey),
             StakingOpBody::SetCommission { validator_id, .. }
-            | StakingOpBody::SetAutoDelegate { validator_id, .. } => *validator_id,
+            | StakingOpBody::SetAutoDelegate { validator_id, .. }
+            | StakingOpBody::UpdateNetworkAddress { validator_id, .. } => *validator_id,
         }
     }
 
@@ -235,6 +245,11 @@ impl StakingOp {
             }
             StakingOpBody::ClaimRewards { .. } => {}
             StakingOpBody::SetAutoDelegate { .. } => {}
+            StakingOpBody::UpdateNetworkAddress { network_addr, .. } => {
+                if let Some(addr) = network_addr {
+                    validate_network_addr_string(addr)?;
+                }
+            }
         }
         Ok(())
     }
@@ -321,6 +336,14 @@ impl Encode for StakingOpBody {
                 validator_id.encode(buf);
                 target_validator_id.encode(buf);
             }
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr,
+            } => {
+                buf.push(TAG_UPDATE_NETWORK_ADDRESS);
+                validator_id.encode(buf);
+                encode_optional_network_addr(network_addr, buf);
+            }
         }
     }
 
@@ -362,6 +385,13 @@ impl Encode for StakingOpBody {
                 validator_pubkey, ..
             } => 32 + validator_pubkey.encoded_len(),
             StakingOpBody::SetAutoDelegate { .. } => 32 + 32,
+            StakingOpBody::UpdateNetworkAddress { network_addr, .. } => {
+                32 + 1
+                    + network_addr
+                        .as_ref()
+                        .map(|addr| 2 + addr.len())
+                        .unwrap_or(0)
+            }
         }
     }
 }
@@ -409,6 +439,10 @@ impl Decode for StakingOpBody {
             TAG_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
                 validator_id: Bytes32::decode(r)?,
                 target_validator_id: Bytes32::decode(r)?,
+            }),
+            TAG_UPDATE_NETWORK_ADDRESS => Ok(StakingOpBody::UpdateNetworkAddress {
+                validator_id: Bytes32::decode(r)?,
+                network_addr: decode_optional_network_addr(r)?,
             }),
             _ => Err(IndraError::InvalidStakingOp(format!(
                 "unknown staking op tag: {}",
@@ -459,6 +493,69 @@ fn decode_optional_bond_proof(r: &mut ByteReader<'_>) -> IndraResult<Option<Stak
 
 fn optional_bond_proof_encoded_len(proof: &Option<StakingBondProof>) -> usize {
     1 + proof.as_ref().map(Encode::encoded_len).unwrap_or(0)
+}
+
+fn encode_optional_network_addr(addr: &Option<String>, buf: &mut Vec<u8>) {
+    if let Some(addr) = addr {
+        1u8.encode(buf);
+        let bytes = addr.as_bytes();
+        debug_assert!(bytes.len() <= MAX_VALIDATOR_NETWORK_ADDR_LEN);
+        (bytes.len() as u16).encode(buf);
+        buf.extend_from_slice(bytes);
+    } else {
+        0u8.encode(buf);
+    }
+}
+
+fn decode_optional_network_addr(r: &mut ByteReader<'_>) -> IndraResult<Option<String>> {
+    match u8::decode(r)? {
+        0 => Ok(None),
+        1 => {
+            let len = u16::decode(r)? as usize;
+            if len > MAX_VALIDATOR_NETWORK_ADDR_LEN {
+                return Err(crate::error::IndraError::InvalidStakingOp(format!(
+                    "validator network address length {} exceeds maximum {}",
+                    len, MAX_VALIDATOR_NETWORK_ADDR_LEN
+                )));
+            }
+            let bytes = r.read_bytes(len)?;
+            let addr = String::from_utf8(bytes.to_vec()).map_err(|_| {
+                crate::error::IndraError::InvalidStakingOp(
+                    "validator network address is not valid UTF-8".into(),
+                )
+            })?;
+            validate_network_addr_string(&addr)?;
+            Ok(Some(addr))
+        }
+        byte => Err(crate::error::IndraError::InvalidBool { byte }),
+    }
+}
+
+/// Consensus structural validation for validator-advertised network addresses.
+///
+/// v4 deliberately accepts only strict `SocketAddr` IP:port syntax: no
+/// hostnames, schemes, paths, whitespace, or zero port. Reachability is a
+/// networking concern and is not checked in consensus.
+pub fn validate_network_addr_string(addr: &str) -> IndraResult<()> {
+    if addr.is_empty()
+        || addr.len() > MAX_VALIDATOR_NETWORK_ADDR_LEN
+        || addr.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(crate::error::IndraError::InvalidStakingOp(
+            "validator network address has invalid length or characters".into(),
+        ));
+    }
+    let parsed: std::net::SocketAddr = addr.parse().map_err(|_| {
+        crate::error::IndraError::InvalidStakingOp(
+            "validator network address must be strict IP:port syntax".into(),
+        )
+    })?;
+    if parsed.port() == 0 {
+        return Err(crate::error::IndraError::InvalidStakingOp(
+            "validator network address port must be non-zero".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
@@ -541,6 +638,14 @@ mod tests {
                 validator_id: Bytes32::from([0x88u8; 32]),
                 target_validator_id: Bytes32::from([0x99u8; 32]),
             }),
+            op(StakingOpBody::UpdateNetworkAddress {
+                validator_id: Bytes32::from([0xAAu8; 32]),
+                network_addr: Some("203.0.113.10:30303".to_string()),
+            }),
+            op(StakingOpBody::UpdateNetworkAddress {
+                validator_id: Bytes32::from([0xABu8; 32]),
+                network_addr: None,
+            }),
         ];
 
         for op in cases {
@@ -568,6 +673,58 @@ mod tests {
         assert!(delegate_bytes.starts_with(STAKING_OP_DOMAIN.as_bytes()));
         assert_ne!(delegate_bytes, register.signing_bytes("indra-testnet-1"));
         assert_ne!(delegate_bytes, delegate.signing_bytes("indra-other"));
+    }
+
+    #[test]
+    fn update_network_address_rejects_unbounded_length() {
+        let mut bytes = Vec::new();
+        bytes.push(TAG_UPDATE_NETWORK_ADDRESS);
+        Bytes32::from([0xAAu8; 32]).encode(&mut bytes);
+        1u8.encode(&mut bytes);
+        ((MAX_VALIDATOR_NETWORK_ADDR_LEN as u16) + 1).encode(&mut bytes);
+        bytes.extend(std::iter::repeat_n(
+            b'1',
+            MAX_VALIDATOR_NETWORK_ADDR_LEN + 1,
+        ));
+
+        assert!(StakingOpBody::decode_exact(&bytes).is_err());
+    }
+
+    #[test]
+    fn update_network_address_rejects_invalid_syntax() {
+        for invalid in [
+            "validator.example.com:30303",
+            "http://203.0.113.10:30303",
+            "203.0.113.10:30303/path",
+            "203.0.113.10:30303 ",
+            "203.0.113.10:0",
+        ] {
+            let body = StakingOpBody::UpdateNetworkAddress {
+                validator_id: Bytes32::from([0xAAu8; 32]),
+                network_addr: Some(invalid.to_string()),
+            };
+            assert!(StakingOp {
+                body,
+                nonce: 1,
+                signature: dummy_signature()
+            }
+            .validate_structure()
+            .is_err());
+        }
+
+        for valid in ["203.0.113.10:30303", "[2001:db8::1]:30303"] {
+            let body = StakingOpBody::UpdateNetworkAddress {
+                validator_id: Bytes32::from([0xAAu8; 32]),
+                network_addr: Some(valid.to_string()),
+            };
+            assert!(StakingOp {
+                body,
+                nonce: 1,
+                signature: dummy_signature()
+            }
+            .validate_structure()
+            .is_ok());
+        }
     }
 
     #[test]

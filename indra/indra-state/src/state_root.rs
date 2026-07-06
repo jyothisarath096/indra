@@ -89,6 +89,17 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
             if let Some(vrf_pk) = validator.vrf_pk {
                 value.extend_from_slice(&vrf_pk);
             }
+            value.push(u8::from(validator.network_addr.is_some()));
+            if let Some(addr) = &validator.network_addr {
+                value.extend_from_slice(&(addr.len() as u16).to_le_bytes());
+                value.extend_from_slice(addr.as_bytes());
+            }
+            value.push(u8::from(
+                validator.network_addr_last_updated_epoch.is_some(),
+            ));
+            if let Some(epoch) = validator.network_addr_last_updated_epoch {
+                value.extend_from_slice(&epoch.to_le_bytes());
+            }
             (key, sha256(&value))
         })
         .collect();
@@ -181,8 +192,11 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use indra_core::{
-        types::transaction::OutputV1, Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
+        types::{primitives::DUST_LIMIT_SPARK, transaction::OutputV1},
+        Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
+
+    use crate::validator::{ValidatorEntry, ValidatorStatus};
 
     use super::*;
 
@@ -223,6 +237,54 @@ mod tests {
     fn validator_root_empty_is_zero() {
         let state = ChainState::new_genesis();
         assert_eq!(compute_validator_set_root(&state), Bytes32::ZERO);
+    }
+
+    #[test]
+    fn validator_set_root_includes_network_address() {
+        let mut base = ChainState::new_genesis();
+        let validator = ValidatorEntry {
+            validator_id: Bytes32::from([0xA1; 32]),
+            name: "validator-a".to_string(),
+            hybrid_classical_pk: None,
+            hybrid_pq_pk: None,
+            vrf_pk: None,
+            stake_spark: 10_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+        };
+        base.validators.upsert(validator.clone()).unwrap();
+
+        let mut with_addr = base.clone();
+        {
+            let v = with_addr
+                .validators
+                .get_mut(&validator.validator_id)
+                .unwrap();
+            v.network_addr = Some("203.0.113.20:30303".to_string());
+            v.network_addr_last_updated_epoch = Some(1);
+        }
+        assert_ne!(
+            compute_validator_set_root(&base),
+            compute_validator_set_root(&with_addr)
+        );
+
+        let mut default_again = ChainState::new_genesis();
+        default_again.validators.upsert(validator).unwrap();
+        assert_eq!(
+            compute_validator_set_root(&base),
+            compute_validator_set_root(&default_again)
+        );
     }
 
     #[test]

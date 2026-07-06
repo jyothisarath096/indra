@@ -373,6 +373,13 @@ pub mod hard_forks {
     /// activation height must be selected during coordinated deployment, after
     /// all validators have upgraded.
     pub const REVEAL_SET_COMMITMENT_HEIGHT: u64 = 5400;
+    /// Validators may publish an on-chain P2P dial address.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
+    /// coordinated deployment, comfortably ahead of the live chain tip at that
+    /// time. Do not deploy with this placeholder if the feature is intended to
+    /// activate on a live network.
+    pub const VALIDATOR_NETWORK_ADDRESS_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -416,6 +423,13 @@ pub fn vrf_commit_reveal_election_active(height: u64) -> bool {
 #[inline]
 pub fn reveal_set_commitment_active(height: u64) -> bool {
     height >= hard_forks::REVEAL_SET_COMMITMENT_HEIGHT
+}
+
+/// Whether validators may update and discovery may consume on-chain network
+/// addresses.
+#[inline]
+pub fn validator_network_address_active(height: u64) -> bool {
+    height >= hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -617,10 +631,20 @@ pub fn block_protocol_version_for_height(height: u64) -> u16 {
 /// Current schema version for all persisted structs.
 ///
 /// Increment this whenever any persisted struct changes its encoding.
-pub const SCHEMA_VERSION: u8 = 3;
+pub const SCHEMA_VERSION: u8 = 4;
+
+/// Schema version used before validator network addresses were added.
+pub const SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS: u8 = 3;
 
 /// The schema version when INDRA was first deployed.
 pub const SCHEMA_VERSION_GENESIS: u8 = 1;
+
+/// Maximum length of a validator-advertised P2P network address.
+///
+/// The field is deliberately stored as a bounded string so future schema
+/// versions can choose broader address forms, but v4 consensus validation only
+/// accepts strict IP:port `SocketAddr` syntax.
+pub const MAX_VALIDATOR_NETWORK_ADDR_LEN: usize = 255;
 
 // =============================================================================
 // PRIMITIVE TYPES

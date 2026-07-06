@@ -25,7 +25,10 @@ use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS},
+        primitives::{
+            Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+            SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+        },
         transaction::OutputV1,
     },
 };
@@ -81,7 +84,9 @@ impl Decode for UtxoEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let marker = u8::decode(r)?;
         match marker {
-            SCHEMA_VERSION_GENESIS | SCHEMA_VERSION => decode_utxo_entry_fields(r, None),
+            SCHEMA_VERSION_GENESIS
+            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
+            | SCHEMA_VERSION => decode_utxo_entry_fields(r, None),
             other if r.remaining() == 0 => Err(IndraError::UnsupportedSchemaVersion {
                 struct_name: "UtxoEntry",
                 version: other,

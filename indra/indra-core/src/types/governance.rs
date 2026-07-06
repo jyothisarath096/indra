@@ -6,7 +6,9 @@ use crate::{
     ssz::sha256,
     types::{
         crypto::{HybridPubKey, HybridSignature},
-        primitives::{Bytes32, VariableBytes, SCHEMA_VERSION},
+        primitives::{
+            Bytes32, VariableBytes, SCHEMA_VERSION, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+        },
     },
 };
 
@@ -467,7 +469,9 @@ impl Encode for GovernanceOpV2 {
 impl Decode for GovernanceOpV2 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let schema_version = u8::decode(r)?;
-        if schema_version != SCHEMA_VERSION {
+        if schema_version != SCHEMA_VERSION
+            && schema_version != SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
+        {
             return Err(IndraError::UnsupportedSchemaVersion {
                 struct_name: "GovernanceOpV2",
                 version: schema_version,

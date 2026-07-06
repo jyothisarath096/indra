@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 
 use fs2::available_space;
 use indra_core::types::primitives::{
-    DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
-    DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS, MAX_PEER_LIST_SIZE,
-    MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS, PEER_TABLE_SAVE_INTERVAL_SECS,
-    TARGET_OUTBOUND_PEERS,
+    validator_network_address_active, DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES,
+    DISK_WARN_THRESHOLD_BYTES, DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS,
+    MAX_PEER_LIST_SIZE, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS,
+    PEER_TABLE_SAVE_INTERVAL_SECS, TARGET_OUTBOUND_PEERS,
 };
 use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_network::{
@@ -483,6 +483,44 @@ fn peer_addresses_to_persist(
     peers_to_save.dedup();
     peers_to_save.truncate(MAX_DISCOVERED_PEERS);
     peers_to_save
+}
+
+fn insert_on_chain_validator_network_addrs(
+    discovered_peers: &mut HashSet<String>,
+    authenticated_peer_addrs: &HashSet<String>,
+    bootstrap_peers: &HashSet<String>,
+    genesis_peer_addrs: &HashSet<String>,
+    local_p2p_addr: &str,
+    local_validator_id: indra_core::Bytes32,
+    connected_addrs: &[SocketAddr],
+    addrs: impl IntoIterator<Item = String>,
+) -> usize {
+    let mut accepted = 0usize;
+    for raw in addrs {
+        let Some(addr) = resolve_peer_addr(&raw) else {
+            continue;
+        };
+        if !discovery_accepts_peer_addr(
+            &addr,
+            None,
+            local_validator_id,
+            local_p2p_addr,
+            connected_addrs,
+        ) {
+            continue;
+        }
+        if insert_discovered_peer_if_not_self(
+            discovered_peers,
+            authenticated_peer_addrs,
+            bootstrap_peers,
+            genesis_peer_addrs,
+            local_p2p_addr,
+            raw,
+        ) {
+            accepted = accepted.saturating_add(1);
+        }
+    }
+    accepted
 }
 
 fn choose_proposal_mode(
@@ -2427,6 +2465,8 @@ fn main() {
     // ── Main thread: status printer ─────────────────────────────────────────
     let mut last_height = 0u64;
     let mut tick = 0u64;
+    let bootstrap_peer_addrs_main: HashSet<String> = bootstrap_peers.iter().cloned().collect();
+    let genesis_peer_addrs_main: HashSet<String> = genesis_seed_peers.iter().cloned().collect();
 
     loop {
         std::thread::sleep(STATUS_INTERVAL);
@@ -2456,6 +2496,39 @@ fn main() {
 
         if tick.is_multiple_of(10) {
             check_disk_space(Path::new(&data_dir));
+        }
+
+        if validator_network_address_active(height) {
+            let on_chain_addrs: Vec<String> = {
+                let d = driver.lock().unwrap();
+                d.engine
+                    .state
+                    .validators
+                    .active_validators()
+                    .filter_map(|validator| validator.network_addr.clone())
+                    .collect()
+            };
+            if !on_chain_addrs.is_empty() {
+                let local_validator_id = handshake_config.read().unwrap().my_validator_id;
+                let connected = gossip.connected_addrs();
+                let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+                let accepted = insert_on_chain_validator_network_addrs(
+                    &mut discovered_peers.lock().unwrap(),
+                    &authenticated,
+                    &bootstrap_peer_addrs_main,
+                    &genesis_peer_addrs_main,
+                    &p2p_addr,
+                    local_validator_id,
+                    &connected,
+                    on_chain_addrs,
+                );
+                if accepted > 0 {
+                    eprintln!(
+                        "[discovery] accepted {} on-chain active validator peer address(es)",
+                        accepted
+                    );
+                }
+            }
         }
 
         let peer_list_ticks = (PEER_LIST_INTERVAL_SECS / STATUS_INTERVAL.as_secs()).max(1);
@@ -4004,6 +4077,30 @@ mod tests {
             peer_addr.to_string(),
         ));
         assert!(discovered_peers.contains(&peer_addr.to_string()));
+    }
+
+    #[test]
+    fn on_chain_validator_addresses_feed_discovery_through_existing_filters() {
+        let local_p2p_addr = "198.51.100.10:30303";
+        let mut discovered_peers = HashSet::new();
+        let accepted = insert_on_chain_validator_network_addrs(
+            &mut discovered_peers,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            local_p2p_addr,
+            indra_core::Bytes32::from([0x01; 32]),
+            &[],
+            [
+                "203.0.113.60:30303".to_string(),
+                local_p2p_addr.to_string(),
+                "not-an-address".to_string(),
+            ],
+        );
+
+        assert_eq!(accepted, 1);
+        assert!(discovered_peers.contains("203.0.113.60:30303"));
+        assert!(!discovered_peers.contains(local_p2p_addr));
     }
 
     #[test]
