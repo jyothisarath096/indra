@@ -268,6 +268,16 @@ Possible options:
 Recommendation: start with option 3. It preserves current proposer behavior to
 direct peers, while preventing repeated all-peer fanout on every relay hop.
 
+Operational requirement from Phase 2 scale validation: mainnet validators need
+at least **250 Mbps sustained uplink**, with **1 Gbps preferred**. The measured
+binding case was the bootstrap node acting as proposer for a block with a
+200-signer hybrid QC and 200 reveal-set evidence entries. At 70 Mbps sustained
+uplink the modeled quorum delivery time was ~8.51s, exceeding the 8s propose
+timeout; at 75 Mbps it was ~7.95s with almost no margin; at 250 Mbps it was
+~2.50s. See
+[`MAINNET_VALIDATOR_REQUIREMENTS.md`](MAINNET_VALIDATOR_REQUIREMENTS.md) for the
+operator-facing requirement.
+
 ### 4. Bounding relay depth
 
 Use seen-cache-only bounding, not an on-wire TTL, for the first design.
