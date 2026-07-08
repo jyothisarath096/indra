@@ -666,8 +666,8 @@ that violates a monotonic constraint is rejected at submission.
 
 ```
 Proposal deposit:           1,000 INDRA
-Deposit return:             If ≥10% of Snapshot 1 stake supports
-Deposit burned:             If <10% support OR non-reveal penalty
+Deposit return:             If proposal passes, or if failed proposal has ≥10% support
+Deposit burned:             If failed proposal has <10% support, or proposer cancels
 Max active proposals:       3 globally
 Per-proposer limit:         1 active proposal at any time
 Cooldown:                   1 new proposal per proposer per 10 epochs

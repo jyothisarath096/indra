@@ -155,11 +155,30 @@ fn apply_propose(
     if deposit.output.value_spark < required_deposit {
         return invalid("deposit UTXO value below required proposal deposit");
     }
-    let _ = state.utxos.spend(deposit_utxo_id);
-
     let proposal_id = compute_proposal_id(op.signer_id, action, current_epoch, chain_id);
     if state.governance.proposals.contains_key(&proposal_id) {
         return invalid("proposal already exists");
+    }
+    let change_spark = deposit.output.value_spark.saturating_sub(required_deposit);
+    let change_output = if change_spark > 0 {
+        Some(governance_change_output(
+            proposer_pubkey,
+            change_spark,
+            proposal_id,
+        )?)
+    } else {
+        None
+    };
+
+    let _ = state.utxos.spend(deposit_utxo_id);
+    if let Some(change_output) = change_output {
+        let output_index = state.utxos.len() as u32;
+        state
+            .utxos
+            .insert(change_output, state.height, u32::MAX - 3, output_index)
+            .map_err(|_| StateError::InvariantViolation {
+                message: "UTXO ID collision in governance deposit change output",
+            })?;
     }
 
     let commit_duration = match action.tier() {
@@ -620,6 +639,46 @@ fn governance_refund_output(
     })
 }
 
+fn governance_change_output(
+    owner: &HybridPubKey,
+    amount_spark: u64,
+    proposal_id: Bytes32,
+) -> StateResult<OutputV1> {
+    let blinding = sha256(
+        &[
+            b"governance-deposit-change-blinding".as_slice(),
+            proposal_id.0.as_slice(),
+        ]
+        .concat(),
+    );
+    let commitment = commit(amount_spark, &blinding);
+    let mut rng = StdRng::from_seed(sha256(
+        &[
+            b"governance-deposit-change-proof".as_slice(),
+            proposal_id.0.as_slice(),
+        ]
+        .concat(),
+    ));
+    let proof = prove_range(amount_spark, &blinding, &mut rng).map_err(|_| {
+        StateError::InvalidGovernanceOp {
+            reason: "failed to generate governance change range proof".into(),
+        }
+    })?;
+    Ok(OutputV1 {
+        value_spark: amount_spark,
+        commitment: indra_core::types::crypto::CommitmentV1 {
+            compressed_point: Bytes32::from(commitment.0),
+        },
+        owner_pubkey: owner.clone(),
+        range_proof: indra_core::VariableBytes::from_slice(&proof).map_err(|_| {
+            StateError::InvalidGovernanceOp {
+                reason: "governance change range proof too large".into(),
+            }
+        })?,
+        lock_height: 0,
+    })
+}
+
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
     Bytes32::from(sha256(&pubkey.classical_pk.0))
 }
@@ -846,6 +905,101 @@ mod tests {
         assert_eq!(state.governance.proposals.len(), 1);
         let proposal = state.governance.proposals.values().next().unwrap();
         assert_eq!(proposal.proposer_pubkey, proposer_pubkey);
+    }
+
+    #[test]
+    fn proposal_submission_with_overfunded_utxo_returns_change() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair) = keypair(0x35);
+        let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
+        let deposit = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 1_500), 0, 0, 0)
+            .unwrap();
+        let initial_utxo_count = state.utxos.len();
+        let op = propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey.clone(),
+            deposit,
+            1,
+        );
+
+        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+
+        assert!(state.utxos.get(&deposit).is_none());
+        assert_eq!(
+            state.utxos.len(),
+            initial_utxo_count,
+            "spending one deposit UTXO and creating one change UTXO should be net-neutral"
+        );
+        assert!(state.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 500
+        }));
+        let proposal = state.governance.proposals.values().next().unwrap();
+        assert_eq!(
+            proposal.deposit_spark, 1_000,
+            "only required deposit should be locked/at risk"
+        );
+    }
+
+    #[test]
+    fn proposal_submission_with_exact_utxo_creates_no_change() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair) = keypair(0x36);
+        let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
+        let deposit = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 1_000), 0, 0, 0)
+            .unwrap();
+        let initial_utxo_count = state.utxos.len();
+        let op = propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey.clone(),
+            deposit,
+            1,
+        );
+
+        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+
+        assert!(state.utxos.get(&deposit).is_none());
+        assert_eq!(
+            state.utxos.len(),
+            initial_utxo_count.saturating_sub(1),
+            "exact deposit spend should not create a zero-value change UTXO"
+        );
+        assert!(!state.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 0
+        }));
+    }
+
+    #[test]
+    fn proposal_submission_rejects_underfunded_utxo_without_spending_it() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair) = keypair(0x37);
+        let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
+        let deposit = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 999), 0, 0, 0)
+            .unwrap();
+        let op = propose_op(proposer_id, &proposer_keypair, proposer_pubkey, deposit, 1);
+
+        let result = apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID);
+
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidGovernanceOp { reason })
+                if reason.contains("below required proposal deposit")
+        ));
+        assert!(
+            state.utxos.get(&deposit).is_some(),
+            "underfunded deposit UTXO must remain unspent"
+        );
+        assert!(state.governance.proposals.is_empty());
     }
 
     #[test]

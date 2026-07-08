@@ -310,11 +310,6 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
     let mut should_queue = None;
     if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
         proposal.snapshot2 = Some(snapshot2);
-        for validator_id in proposal.commits.keys() {
-            if !proposal.reveals.contains_key(validator_id) {
-                proposal.deposit_burned = true;
-            }
-        }
         let (yes, no, abstain) = tally_votes(proposal);
         proposal.yes_stake = yes;
         proposal.no_stake = no;
@@ -910,11 +905,13 @@ mod tests {
     use super::*;
     use crate::{
         compute_state_root,
+        governance::{VoteCommit, VoteReveal},
         validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
     };
     use indra_core::{
         types::{
             crypto::HybridPubKey,
+            governance::GovernableAction,
             primitives::{
                 Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
                 DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
@@ -962,6 +959,13 @@ mod tests {
             },
             range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
             lock_height: 0,
+        }
+    }
+
+    fn governance_test_pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
         }
     }
 
@@ -1065,6 +1069,91 @@ mod tests {
             "Epoch reward wrong: got {} expected 89190000000",
             raw
         );
+    }
+
+    #[test]
+    fn governance_deposit_refund_depends_on_support_not_unrelated_non_reveal() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let proposal_id = Bytes32::from([0x42; 32]);
+        let yes_validator = Bytes32::from([0xA1; 32]);
+        let missing_reveal_validator = Bytes32::from([0xB1; 32]);
+        let proposer_pubkey = governance_test_pubkey(0x42);
+        let action = GovernableAction::SetMinDelegationSpark {
+            value: DUST_LIMIT_SPARK,
+        };
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert(yes_validator, 10);
+        weights.insert(missing_reveal_validator, 90);
+        let snapshot1 = GovernanceSnapshot {
+            weights,
+            total_stake: 100,
+        };
+        let mut proposal = ProposalRecord {
+            proposal_id,
+            proposer_id: Bytes32::from([0x42; 32]),
+            proposer_pubkey: proposer_pubkey.clone(),
+            tier: action.tier(),
+            action,
+            title: "refund".into(),
+            description: "non-reveal should not burn proposer deposit".into(),
+            deposit_spark: 1_000,
+            deposit_burned: false,
+            proposed_epoch: 0,
+            commit_start_epoch: 0,
+            reveal_start_epoch: 0,
+            tally_epoch: 0,
+            exec_delay_epochs: 0,
+            executable_after_epoch: 0,
+            phase: ProposalPhase::Reveal,
+            snapshot1: Some(snapshot1),
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: Vec::new(),
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: None,
+        };
+        proposal.commits.insert(
+            yes_validator,
+            VoteCommit {
+                validator_id: yes_validator,
+                commit_hash: Bytes32::from([0xC1; 32]),
+                committed_epoch: 0,
+            },
+        );
+        proposal.commits.insert(
+            missing_reveal_validator,
+            VoteCommit {
+                validator_id: missing_reveal_validator,
+                commit_hash: Bytes32::from([0xC2; 32]),
+                committed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            yes_validator,
+            VoteReveal {
+                validator_id: yes_validator,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+
+        apply_governance_phase_transitions(&mut state, 0, 0).unwrap();
+
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(proposal.phase, ProposalPhase::Failed);
+        assert_eq!(proposal.passed, Some(false));
+        assert_eq!(proposal.yes_stake, 10);
+        assert_eq!(proposal.abstain_stake, 90);
+        assert!(!proposal.deposit_burned);
+        assert_eq!(proposal.deposit_spark, 0);
+        assert!(state.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
+        }));
     }
 
     #[test]
