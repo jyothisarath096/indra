@@ -19,6 +19,8 @@ pub const ERR_NOT_FOUND: i32 = -32000;
 pub const ERR_TX_REJECTED: i32 = -32001;
 /// Node is not synced.
 pub const ERR_NOT_SYNCED: i32 = -32002;
+/// Request is not permitted on this RPC listener.
+pub const ERR_FORBIDDEN: i32 = -32003;
 
 /// An RPC-level error.
 #[derive(Debug, Error, Clone)]
@@ -46,6 +48,10 @@ pub enum RpcError {
     /// A submitted transaction was rejected.
     #[error("transaction rejected: {0}")]
     TxRejected(String),
+
+    /// The requested method is not allowed in this RPC listener mode.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl RpcError {
@@ -58,6 +64,7 @@ impl RpcError {
             Self::Internal(_) => ERR_INTERNAL_ERROR,
             Self::NotFound(_) => ERR_NOT_FOUND,
             Self::TxRejected(_) => ERR_TX_REJECTED,
+            Self::Forbidden(_) => ERR_FORBIDDEN,
         }
     }
 
@@ -69,7 +76,8 @@ impl RpcError {
             | Self::InvalidParams(message)
             | Self::Internal(message)
             | Self::NotFound(message)
-            | Self::TxRejected(message) => message,
+            | Self::TxRejected(message)
+            | Self::Forbidden(message) => message,
         }
     }
 }

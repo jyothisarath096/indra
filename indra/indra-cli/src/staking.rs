@@ -10,6 +10,7 @@ use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 pub use crate::tx_builder::{
     build_claim_rewards_op, build_delegate_op, build_register_validator_op,
     build_set_auto_delegate_op, build_set_commission_op, build_undelegate_op,
+    build_update_network_address_op,
 };
 use crate::{
     error::{CliError, CliResult},

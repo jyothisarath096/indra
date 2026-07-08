@@ -508,9 +508,20 @@ fn apply_auto_delegations(
             .get_delegator_mut(target_id, delegator_id)
             .map(|entry| (entry.staked_spark, entry.pending_rewards, true))
             .unwrap_or((0, 0, false));
-        state
-            .delegations
-            .add_delegation(*target_id, *delegator_id, *amount_spark, current_epoch);
+        if let Err(reason) = state.delegations.add_delegation(
+            *target_id,
+            *delegator_id,
+            *amount_spark,
+            current_epoch,
+        ) {
+            eprintln!(
+                "[epoch] auto-delegation skipped: validator {} -> {} ({})",
+                hex::encode(&delegator_id.0[..4]),
+                hex::encode(&target_id.0[..4]),
+                reason,
+            );
+            continue;
+        }
         snapshots.push(AutoDelegationSnapshot {
             delegator_id: *delegator_id,
             target_id: *target_id,
@@ -1068,7 +1079,8 @@ mod tests {
         state.validators.upsert(validator_b).unwrap();
         state
             .delegations
-            .add_delegation(id_b, delegator_id, 1_000_000, 0);
+            .add_delegation(id_b, delegator_id, 1_000_000, 0)
+            .unwrap();
 
         distribute_block_rewards(&mut state, 2_000, 1, 0);
 
@@ -1126,7 +1138,8 @@ mod tests {
         let delegator_id = Bytes32::from([0xD2; 32]);
         state
             .delegations
-            .add_delegation(validator_id, delegator_id, 1_000, 0);
+            .add_delegation(validator_id, delegator_id, 1_000, 0)
+            .unwrap();
 
         distribute_block_rewards(&mut state, 1_000, 1, 0);
 
@@ -1476,7 +1489,8 @@ mod tests {
         let inactive_id = Bytes32::from([0x15; 32]);
         state
             .delegations
-            .add_delegation(target_id, inactive_id, 123_456, 0);
+            .add_delegation(target_id, inactive_id, 123_456, 0)
+            .unwrap();
 
         apply_epoch_transition(&mut state, 1, 0).unwrap();
 

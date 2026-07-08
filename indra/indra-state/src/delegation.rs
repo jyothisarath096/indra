@@ -21,7 +21,7 @@ use crate::{
     chain::ChainState,
     epoch::epoch_for_height,
     error::{StateError, StateResult},
-    validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
+    validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR},
 };
 
 /// Apply a single staking operation to chain state.
@@ -440,6 +440,16 @@ fn apply_delegate(
     }
 
     let current_epoch = epoch_for_height(current_height);
+    let delegators = state.delegations.get_delegators(validator_id);
+    let existing_delegator = delegators
+        .iter()
+        .any(|entry| entry.delegator_id == delegator_id);
+    if !existing_delegator && delegators.len() >= MAX_DELEGATORS_PER_VALIDATOR {
+        return Err(StateError::InvalidStakingOp(format!(
+            "validator delegator count at maximum ({MAX_DELEGATORS_PER_VALIDATOR})"
+        )));
+    }
+
     let original_output = utxo_entry.output;
     let _ = state.utxos.spend(&bond_utxo_id);
 
@@ -458,7 +468,8 @@ fn apply_delegate(
 
     state
         .delegations
-        .add_delegation(*validator_id, delegator_id, amount_spark, current_epoch);
+        .add_delegation(*validator_id, delegator_id, amount_spark, current_epoch)
+        .map_err(|reason| StateError::InvalidStakingOp(reason.into()))?;
 
     Ok(())
 }
@@ -1945,7 +1956,8 @@ mod tests {
         let delegator_id = pubkey_to_id(&delegator_pubkey);
         state
             .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0);
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
         state
             .delegations
             .get_delegator_mut(&validator_id, &delegator_id)
@@ -1976,7 +1988,8 @@ mod tests {
         let delegator_id = pubkey_to_id(&delegator_pubkey);
         state
             .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0);
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
         state
             .delegations
             .get_delegator_mut(&validator_id, &delegator_id)
@@ -2012,7 +2025,8 @@ mod tests {
         let delegator_id = pubkey_to_id(&delegator_pubkey);
         state
             .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0);
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
         state
             .delegations
             .get_delegator_mut(&validator_id, &delegator_id)

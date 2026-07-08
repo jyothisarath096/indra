@@ -16,12 +16,18 @@ use indra_core::types::{
     transaction::OutputV1,
 };
 
-/// Defensive snapshot decode ceiling for delegators under one validator.
+/// Consensus ceiling for active delegator entries under one validator.
 ///
 /// This is intentionally far above expected 200-validator mainnet operating
-/// needs, but finite so corrupted snapshots cannot claim `u32::MAX`
-/// delegators and force unbounded allocation or decode work.
-pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = 100_000;
+/// needs, but finite so live state cannot grow beyond what snapshots can later
+/// decode on restart or sync.
+pub const MAX_DELEGATORS_PER_VALIDATOR: usize = 100_000;
+
+/// Defensive snapshot decode ceiling for delegators under one validator.
+///
+/// This intentionally matches the live write cap so state that can be accepted
+/// during normal operation can always be decoded later from persisted snapshots.
+pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDATOR;
 
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,7 +797,8 @@ mod tests {
         let validator_id = Bytes32::from([0xAB; 32]);
         let mut map = DelegationMap::new();
         for i in 0..3u8 {
-            map.add_delegation(validator_id, Bytes32::from([i; 32]), 1_000 + i as u64, 7);
+            map.add_delegation(validator_id, Bytes32::from([i; 32]), 1_000 + i as u64, 7)
+                .unwrap();
         }
 
         let decoded = DelegationMap::decode_exact(&map.encode_to_vec()).unwrap();
@@ -924,7 +931,9 @@ mod tests {
         let mut low_self = make_validator(0xFE, 1, 0);
         low_self.status = ValidatorStatus::Registered;
         vs.upsert(low_self).unwrap();
-        delegations.add_delegation(low_self_id, Bytes32::from([0xAA; 32]), 1_000_000_000, 0);
+        delegations
+            .add_delegation(low_self_id, Bytes32::from([0xAA; 32]), 1_000_000_000, 0)
+            .unwrap();
 
         vs.select_active_set(&delegations, 0);
 
@@ -1316,11 +1325,14 @@ impl DelegationMap {
         delegator_id: Bytes32,
         amount_spark: u64,
         current_epoch: u64,
-    ) {
+    ) -> Result<(), &'static str> {
         let entries = self.delegators.entry(validator_id).or_default();
         if let Some(existing) = entries.iter_mut().find(|d| d.delegator_id == delegator_id) {
             existing.staked_spark = existing.staked_spark.saturating_add(amount_spark);
         } else {
+            if entries.len() >= MAX_DELEGATORS_PER_VALIDATOR {
+                return Err("validator delegator count at maximum");
+            }
             entries.push(DelegatorEntry {
                 delegator_id,
                 staked_spark: amount_spark,
@@ -1329,6 +1341,7 @@ impl DelegationMap {
                 unbonding_end_epoch: None,
             });
         }
+        Ok(())
     }
 
     /// Begin unbonding a delegation. Returns error string if not found or already unbonding.
@@ -1439,6 +1452,97 @@ impl DelegationMap {
 mod delegation_map_tests {
     use super::*;
 
+    fn test_id(domain: u8, index: usize) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = domain;
+        bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+        Bytes32::from(bytes)
+    }
+
+    fn delegator_entry(index: usize) -> DelegatorEntry {
+        DelegatorEntry {
+            delegator_id: test_id(0xD0, index),
+            staked_spark: 1_000,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            unbonding_end_epoch: None,
+        }
+    }
+
+    fn map_with_delegator_count(validator_id: Bytes32, count: usize) -> DelegationMap {
+        let mut delegators = BTreeMap::new();
+        let entries = (0..count).map(delegator_entry).collect();
+        delegators.insert(validator_id, entries);
+        DelegationMap { delegators }
+    }
+
+    #[test]
+    fn delegation_add_rejects_past_cap() {
+        let validator_id = test_id(0xA0, 1);
+        let mut map = map_with_delegator_count(validator_id, MAX_DELEGATORS_PER_VALIDATOR);
+
+        let result = map.add_delegation(
+            validator_id,
+            test_id(0xD1, MAX_DELEGATORS_PER_VALIDATOR),
+            1_000,
+            0,
+        );
+
+        assert_eq!(result, Err("validator delegator count at maximum"));
+        assert_eq!(
+            map.get_delegators(&validator_id).len(),
+            MAX_DELEGATORS_PER_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn delegation_add_allows_up_to_cap() {
+        let validator_id = test_id(0xA0, 2);
+        let mut map = map_with_delegator_count(validator_id, MAX_DELEGATORS_PER_VALIDATOR - 1);
+
+        map.add_delegation(
+            validator_id,
+            test_id(0xD1, MAX_DELEGATORS_PER_VALIDATOR - 1),
+            1_000,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            map.get_delegators(&validator_id).len(),
+            MAX_DELEGATORS_PER_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn delegation_add_allows_existing_delegator_at_cap() {
+        let validator_id = test_id(0xA0, 3);
+        let existing_id = test_id(0xD0, 0);
+        let mut map = map_with_delegator_count(validator_id, MAX_DELEGATORS_PER_VALIDATOR);
+
+        map.add_delegation(validator_id, existing_id, 500, 0)
+            .unwrap();
+
+        let existing = map
+            .get_delegators(&validator_id)
+            .iter()
+            .find(|entry| entry.delegator_id == existing_id)
+            .unwrap();
+        assert_eq!(existing.staked_spark, 1_500);
+        assert_eq!(
+            map.get_delegators(&validator_id).len(),
+            MAX_DELEGATORS_PER_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn live_delegation_cap_matches_decode_cap() {
+        assert_eq!(
+            MAX_DELEGATORS_PER_VALIDATOR,
+            MAX_DELEGATORS_PER_VALIDATOR_DECODE
+        );
+    }
+
     #[test]
     fn test_all_delegators_iterates_all_entries() {
         let mut map = DelegationMap::new();
@@ -1449,7 +1553,8 @@ mod delegation_map_tests {
                     Bytes32::from([validator * 10 + delegator; 32]),
                     1_000,
                     0,
-                );
+                )
+                .unwrap();
             }
         }
 

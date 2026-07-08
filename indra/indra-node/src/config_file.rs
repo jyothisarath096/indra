@@ -59,6 +59,12 @@ pub struct NodeConfigFile {
     pub rpc_admin_token: Option<String>,
     /// `[rpc].cors_origins`.
     pub rpc_cors_origins: Vec<String>,
+    /// `[rpc_public].addr`.
+    pub rpc_public_addr: Option<String>,
+    /// `[rpc_public].enabled`.
+    pub rpc_public_enabled: Option<bool>,
+    /// `[rpc_public].cors_origins`.
+    pub rpc_public_cors_origins: Vec<String>,
     /// `[metrics].addr`.
     pub metrics_addr: Option<String>,
     /// `[metrics].enabled`.
@@ -93,6 +99,9 @@ impl NodeConfigFile {
             rpc_enabled: get_bool(&table, "rpc", "enabled"),
             rpc_admin_token: get_str(&table, "rpc", "admin_token"),
             rpc_cors_origins: get_str_array(&table, "rpc", "cors_origins"),
+            rpc_public_addr: get_str(&table, "rpc_public", "addr"),
+            rpc_public_enabled: get_bool(&table, "rpc_public", "enabled"),
+            rpc_public_cors_origins: get_str_array(&table, "rpc_public", "cors_origins"),
             metrics_addr: get_str(&table, "metrics", "addr"),
             metrics_enabled: get_bool(&table, "metrics", "enabled"),
             prune_keep_blocks: get_u64(&table, "storage", "prune_keep_blocks"),
@@ -144,6 +153,20 @@ impl NodeConfigFile {
             if origin.trim().is_empty() || origin == "*" {
                 errors.push(
                     "rpc.cors_origins entries must be explicit non-wildcard origins".to_string(),
+                );
+            }
+        }
+        if let Some(addr) = self.rpc_public_addr.as_deref() {
+            if !addr.is_empty() && !is_valid_addr(addr) {
+                errors
+                    .push("rpc_public.addr must be valid host:port, empty, or omitted".to_string());
+            }
+        }
+        for origin in &self.rpc_public_cors_origins {
+            if origin.trim().is_empty() || origin == "*" {
+                errors.push(
+                    "rpc_public.cors_origins entries must be explicit non-wildcard origins"
+                        .to_string(),
                 );
             }
         }
@@ -395,6 +418,11 @@ enabled = true
 admin_token = "local-admin"
 cors_origins = ["http://localhost:3000"]
 
+[rpc_public]
+addr = "127.0.0.1:8547"
+enabled = true
+cors_origins = ["https://explorer.indraprotocol.com"]
+
 [metrics]
 addr = "0.0.0.0:9615"
 enabled = true
@@ -413,6 +441,12 @@ mempool_capacity = 5000
         assert_eq!(
             cfg.rpc_cors_origins,
             vec!["http://localhost:3000".to_string()]
+        );
+        assert_eq!(cfg.rpc_public_addr.as_deref(), Some("127.0.0.1:8547"));
+        assert_eq!(cfg.rpc_public_enabled, Some(true));
+        assert_eq!(
+            cfg.rpc_public_cors_origins,
+            vec!["https://explorer.indraprotocol.com".to_string()]
         );
         assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9615"));
         assert_eq!(cfg.mempool_capacity, Some(5000));
@@ -457,6 +491,14 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
         cfg.p2p_addr = Some("127.0.0.1:0".to_string());
         let err = cfg.validate().err().unwrap_or_else(|| vec![]);
         assert!(err.iter().any(|e| e.contains("port")));
+    }
+
+    #[test]
+    fn test_validate_invalid_rpc_public_addr() {
+        let mut cfg = minimal();
+        cfg.rpc_public_addr = Some("bad-public-rpc".to_string());
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("rpc_public.addr")));
     }
 
     #[test]

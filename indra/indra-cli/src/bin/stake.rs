@@ -35,6 +35,7 @@ fn run(args: Vec<String>) -> CliResult<()> {
         "claim-rewards" => run_claim_rewards(&args),
         "set-commission" => run_set_commission(&args),
         "auto-delegate" => run_auto_delegate(&args),
+        "update-network-address" => run_update_network_address(&args),
         "nonce" => run_nonce(&args),
         "help" | "--help" | "-h" => {
             print_help();
@@ -265,7 +266,7 @@ fn run_set_commission(args: &[String]) -> CliResult<()> {
     let keys = load_keys(args)?;
     let keypair = reconstruct_keypair(&keys)?;
     let commission_bps = parse_commission(args)?;
-    let validator_id = staking_signer_id(&keys)?;
+    let validator_id = validator_id_from_keys(&keys);
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &validator_id)?;
@@ -341,6 +342,58 @@ fn run_auto_delegate(args: &[String]) -> CliResult<()> {
             (
                 "Note",
                 "Auto-delegation affects reward routing at epoch boundaries".to_string(),
+            ),
+        ],
+        None,
+    )
+}
+
+fn run_update_network_address(args: &[String]) -> CliResult<()> {
+    if has_help(args) {
+        print_update_network_address_help();
+        return Ok(());
+    }
+    let clear = args.iter().any(|arg| arg == "--clear");
+    let address = get(args, "--address");
+    if clear && address.is_some() {
+        return Err(CliError::Parse(
+            "--clear cannot be combined with --address".to_string(),
+        ));
+    }
+    if !clear && address.is_none() {
+        return Err(CliError::MissingArgument(
+            "missing required flag: --address <ip:port> or --clear".to_string(),
+        ));
+    }
+
+    let keys = load_keys(args)?;
+    let keypair = reconstruct_keypair(&keys)?;
+    let validator_id = validator_id_from_keys(&keys);
+    let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
+    let chain_id = fetch_chain_id(&node_url)?;
+    let nonce = fetch_next_nonce(&node_url, &validator_id)?;
+    let network_addr = if clear { None } else { address };
+    let built = indra_cli::tx_builder::build_update_network_address_op(
+        validator_id,
+        network_addr.clone(),
+        &keypair,
+        nonce,
+        &chain_id,
+    )?;
+    let action = network_addr.unwrap_or_else(|| "<clear>".to_string());
+    finish_op(
+        args,
+        "update-network-address",
+        &built,
+        &validator_id,
+        nonce,
+        &node_url,
+        &[
+            ("Validator", hex::encode(validator_id.0)),
+            ("Address", action),
+            (
+                "Note",
+                "One network-address update is allowed per validator per epoch".to_string(),
             ),
         ],
         None,
@@ -536,6 +589,10 @@ fn staking_signer_id(keys: &KeysFile) -> CliResult<Bytes32> {
     Ok(Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec())))
 }
 
+fn validator_id_from_keys(keys: &KeysFile) -> Bytes32 {
+    Bytes32::from(keys.public.validator_id)
+}
+
 fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
     Ok(HybridPubKey {
         classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
@@ -546,7 +603,7 @@ fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
 
 fn print_help() {
     println!(
-        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register         Register a new validator\n  self-stake       Bond one of your UTXOs as self-stake\n  self-unstake     Begin unbonding a self-stake bond\n  delegate         Delegate a UTXO to a validator\n  undelegate       Begin undelegating from a validator\n  claim-rewards    Claim pending staking rewards\n  set-commission   Update validator commission rate\n  auto-delegate    Set or clear validator auto-delegation\n  nonce            Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
+        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
     );
 }
 
@@ -583,6 +640,11 @@ fn print_auto_delegate_help() {
     println!("       indra-stake auto-delegate --validator <validator_hex> --clear [--keys keys.json] [--node url] [--dry-run]");
 }
 
+fn print_update_network_address_help() {
+    println!("Usage: indra-stake update-network-address --address <ip:port> [--keys keys.json] [--node url] [--dry-run]");
+    println!("       indra-stake update-network-address --clear [--keys keys.json] [--node url] [--dry-run]");
+}
+
 fn print_nonce_help() {
     println!("Usage: indra-stake nonce [--keys keys.json] [--node url]");
 }
@@ -590,6 +652,7 @@ fn print_nonce_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_cli::generate_keypairs;
 
     #[test]
     fn parse_bytes32_accepts_32_byte_hex() {
@@ -636,5 +699,44 @@ mod tests {
             "--clear".to_string(),
         ];
         assert!(run_auto_delegate(&args).is_err());
+    }
+
+    #[test]
+    fn update_network_address_clear_rejects_address() {
+        let args = vec![
+            "indra-stake".to_string(),
+            "update-network-address".to_string(),
+            "--address".to_string(),
+            "203.0.113.20:30303".to_string(),
+            "--clear".to_string(),
+        ];
+        assert!(run_update_network_address(&args).is_err());
+    }
+
+    #[test]
+    fn update_network_address_requires_address_or_clear() {
+        let args = vec![
+            "indra-stake".to_string(),
+            "update-network-address".to_string(),
+        ];
+        assert!(run_update_network_address(&args).is_err());
+    }
+
+    #[test]
+    fn validator_owned_address_update_uses_keys_json_validator_id() {
+        let keys =
+            generate_keypairs("validator".to_string(), [0xA1; 32], [0xA2; 32], [0xA3; 32]).unwrap();
+        let canonical = Bytes32::from(keys.public.validator_id);
+        let old_hybrid_encoding_hash = staking_signer_id(&keys).unwrap();
+
+        assert_eq!(validator_id_from_keys(&keys), canonical);
+        assert_eq!(
+            canonical,
+            Bytes32::from(indra_crypto::sha256(&keys.public.hybrid_classical_pk))
+        );
+        assert_ne!(
+            canonical, old_hybrid_encoding_hash,
+            "the old CLI derivation hashed the encoded hybrid pubkey and does not match live validator_id"
+        );
     }
 }

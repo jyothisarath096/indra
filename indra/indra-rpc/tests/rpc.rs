@@ -2,8 +2,11 @@
 
 use indra_rpc::types::parse_request;
 use indra_rpc::{
-    handlers::{dispatch, DispatchResult, NodeState},
-    server::call_rpc,
+    handlers::{
+        check_rpc_method_allowed, dispatch, dispatch_with_mode, DispatchResult, NodeState,
+        RpcMethodAccess, RpcMode, RPC_METHODS,
+    },
+    server::{call_rpc, call_rpc_with_mode},
 };
 use indra_state::ChainState;
 
@@ -61,7 +64,11 @@ fn rpc_get_block_beyond_tip() {
 fn rpc_invalid_method() {
     let e = engine("rpc_inv");
     let resp = call_rpc("indra_doesNotExist", &[], &e);
-    assert!(resp.contains("-32601"));
+    assert!(resp.contains("-32003"));
+    assert!(resp.contains("read-only listener"));
+
+    let full_resp = call_rpc_with_mode("indra_doesNotExist", &[], &e, RpcMode::Full);
+    assert!(full_resp.contains("-32601"));
 }
 
 #[test]
@@ -221,11 +228,159 @@ fn test_all_methods_reachable_via_dispatch() {
     ];
 
     for (method, params) in methods {
+        assert!(
+            RPC_METHODS.iter().any(|(name, _)| *name == method),
+            "{method} must be explicitly classified for public read-only gating"
+        );
         match dispatch(method, &params, &state) {
             DispatchResult::Ready(Err(indra_rpc::RpcError::MethodNotFound(_))) => {
                 panic!("{method} was not reachable through dispatch")
             }
             _ => {}
+        }
+    }
+}
+
+#[test]
+fn readonly_listener_rejects_unclassified_method() {
+    let method = "indra_futureWriteMethodForgotClassification";
+    assert!(
+        !RPC_METHODS.iter().any(|(name, _)| *name == method),
+        "test method must remain unclassified to prove read-only mode fails closed"
+    );
+
+    let err = check_rpc_method_allowed(method, RpcMode::ReadOnly).unwrap_err();
+    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
+    assert!(err.message().contains("read-only listener"));
+}
+
+#[test]
+fn readonly_listener_allows_classified_read_methods_at_policy_gate() {
+    for (method, access) in RPC_METHODS {
+        if *access == RpcMethodAccess::ReadOnly {
+            assert!(
+                check_rpc_method_allowed(method, RpcMode::ReadOnly).is_ok(),
+                "classified read-only method {method} should pass the read-only policy gate"
+            );
+        }
+    }
+}
+
+#[test]
+fn readonly_listener_rejects_classified_write_methods_at_policy_gate() {
+    for (method, access) in RPC_METHODS {
+        if *access == RpcMethodAccess::Write {
+            let err = check_rpc_method_allowed(method, RpcMode::ReadOnly).unwrap_err();
+            assert!(
+                matches!(err, indra_rpc::RpcError::Forbidden(_)),
+                "classified write method {method} should be forbidden on read-only listener"
+            );
+        }
+    }
+}
+
+#[test]
+fn full_listener_policy_gate_allows_classified_and_unclassified_methods() {
+    for (method, _) in RPC_METHODS {
+        assert!(
+            check_rpc_method_allowed(method, RpcMode::Full).is_ok(),
+            "full listener should allow classified method {method}"
+        );
+    }
+    assert!(check_rpc_method_allowed("indra_unclassifiedFutureMethod", RpcMode::Full).is_ok());
+}
+
+#[test]
+fn read_only_listener_allows_every_classified_read_method() {
+    let e = engine("rpc_read_only_methods");
+    let state = NodeState::read_only(&e);
+    let hex32 = format!(r#""{}""#, "11".repeat(32));
+
+    let params_for = |method: &str| -> Vec<String> {
+        match method {
+            "indra_getBlock" => vec!["0".to_string()],
+            "indra_getBalance"
+            | "indra_getUtxos"
+            | "indra_getUtxoProof"
+            | "indra_getStakingNonce"
+            | "indra_getDelegations"
+            | "indra_getDelegatorPositions"
+            | "indra_getDelegatorRewards"
+            | "indra_getValidatorDelegators"
+            | "indra_getStakeBonds"
+            | "indra_getProposal"
+            | "indra_getProposalVotes"
+            | "indra_getGovernanceNonce"
+            | "indra_getValidatorRewards"
+            | "indra_getValidator"
+            | "indra_getValidatorSelfStake"
+            | "indra_getValidatorAutoDelegate" => vec![hex32.clone()],
+            "indra_getEpochRecord" => vec!["0".to_string()],
+            _ => Vec::new(),
+        }
+    };
+
+    for (method, access) in RPC_METHODS {
+        if *access != RpcMethodAccess::ReadOnly {
+            continue;
+        }
+        match dispatch_with_mode(method, &params_for(method), &state, RpcMode::ReadOnly) {
+            DispatchResult::Ready(Err(indra_rpc::RpcError::Forbidden(error))) => {
+                panic!("read-only method {method} was blocked: {error}")
+            }
+            DispatchResult::SubmitStakingOp(_)
+            | DispatchResult::SubmitGovernanceOp(_)
+            | DispatchResult::SubmitTransaction(_) => {
+                panic!("read-only method {method} produced a submission action")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn read_only_listener_rejects_every_write_method_before_decoding() {
+    let e = engine("rpc_read_only_rejects_writes");
+    let invalid_payload = vec![r#""not valid hex""#.to_string()];
+
+    for (method, access) in RPC_METHODS {
+        if *access != RpcMethodAccess::Write {
+            continue;
+        }
+        let resp = call_rpc_with_mode(method, &invalid_payload, &e, RpcMode::ReadOnly);
+        assert!(resp.contains("\"error\""), "{method} should be rejected");
+        assert!(
+            resp.contains("not available on read-only listener"),
+            "{method} was not rejected at the read-only dispatch gate: {resp}"
+        );
+        assert!(
+            !resp.contains("decode failed") && !resp.contains("invalid hex"),
+            "{method} reached write decoding instead of being blocked first: {resp}"
+        );
+    }
+}
+
+#[test]
+fn full_listener_write_methods_are_not_read_only_blocked() {
+    let e = engine("rpc_full_writes");
+    let syntactically_valid_payload = vec![r#""00""#.to_string()];
+
+    for method in [
+        "indra_submitStakingOp",
+        "indra_submitGovernanceOp",
+        "indra_sendTransaction",
+    ] {
+        let state = NodeState::read_only(&e);
+        match dispatch_with_mode(method, &syntactically_valid_payload, &state, RpcMode::Full) {
+            DispatchResult::Ready(Err(indra_rpc::RpcError::Forbidden(error))) => {
+                panic!("full listener incorrectly blocked {method}: {error}")
+            }
+            DispatchResult::SubmitStakingOp(_)
+            | DispatchResult::SubmitGovernanceOp(_)
+            | DispatchResult::SubmitTransaction(_) => {}
+            DispatchResult::Ready(other) => {
+                panic!("full listener did not dispatch {method} to submission path: {other:?}")
+            }
         }
     }
 }

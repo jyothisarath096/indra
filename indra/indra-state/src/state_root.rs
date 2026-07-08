@@ -11,7 +11,9 @@
 
 use indra_core::{
     codec::Encode,
-    types::primitives::{Bytes32, VariableBytes, MAX_CHAIN_ID_BYTES},
+    types::primitives::{
+        validator_network_address_active, Bytes32, VariableBytes, MAX_CHAIN_ID_BYTES,
+    },
 };
 use indra_crypto::sha256;
 
@@ -46,6 +48,18 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
 
 /// Compute the validator/delegation commitment.
 pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
+    compute_validator_set_root_at_height(state, state.height)
+}
+
+/// Compute the validator/delegation commitment using the consensus root rule
+/// active at `height`.
+///
+/// Validator network-address fields are consensus-visible only at/after
+/// `VALIDATOR_NETWORK_ADDRESS_HEIGHT`. Historical pre-activation state roots
+/// must reproduce the exact pre-v4 validator preimage; emitting `false`
+/// presence bits for the new fields would still change old committed roots.
+pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> Bytes32 {
+    let include_network_addr = validator_network_address_active(height);
     let mut leaves: Vec<(Vec<u8>, [u8; 32])> = state
         .validators
         .all_validators()
@@ -89,16 +103,18 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
             if let Some(vrf_pk) = validator.vrf_pk {
                 value.extend_from_slice(&vrf_pk);
             }
-            value.push(u8::from(validator.network_addr.is_some()));
-            if let Some(addr) = &validator.network_addr {
-                value.extend_from_slice(&(addr.len() as u16).to_le_bytes());
-                value.extend_from_slice(addr.as_bytes());
-            }
-            value.push(u8::from(
-                validator.network_addr_last_updated_epoch.is_some(),
-            ));
-            if let Some(epoch) = validator.network_addr_last_updated_epoch {
-                value.extend_from_slice(&epoch.to_le_bytes());
+            if include_network_addr {
+                value.push(u8::from(validator.network_addr.is_some()));
+                if let Some(addr) = &validator.network_addr {
+                    value.extend_from_slice(&(addr.len() as u16).to_le_bytes());
+                    value.extend_from_slice(addr.as_bytes());
+                }
+                value.push(u8::from(
+                    validator.network_addr_last_updated_epoch.is_some(),
+                ));
+                if let Some(epoch) = validator.network_addr_last_updated_epoch {
+                    value.extend_from_slice(&epoch.to_le_bytes());
+                }
             }
             (key, sha256(&value))
         })
@@ -192,9 +208,13 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use indra_core::{
-        types::{primitives::DUST_LIMIT_SPARK, transaction::OutputV1},
+        types::{
+            primitives::{hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT, DUST_LIMIT_SPARK},
+            transaction::OutputV1,
+        },
         Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
+    use indra_crypto::sha256;
 
     use crate::validator::{ValidatorEntry, ValidatorStatus};
 
@@ -213,6 +233,80 @@ mod tests {
             range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap_or_else(|_| unreachable!()),
             lock_height: 0,
         }
+    }
+
+    fn validator_fixture() -> ValidatorEntry {
+        ValidatorEntry {
+            validator_id: Bytes32::from([0xA1; 32]),
+            name: "validator-a".to_string(),
+            hybrid_classical_pk: Some([0xA2; 32]),
+            hybrid_pq_pk: Some(vec![0xA3; 80]),
+            vrf_pk: Some([0xA4; 32]),
+            stake_spark: 10_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+        }
+    }
+
+    fn pre_v4_validator_root_single_validator(validator: &ValidatorEntry) -> Bytes32 {
+        let mut key = Vec::with_capacity(33);
+        key.push(0x01);
+        key.extend_from_slice(&validator.validator_id.0);
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&validator.validator_id.0);
+        value.extend_from_slice(&validator.stake_spark.to_le_bytes());
+        value.extend_from_slice(&validator.pending_rewards.to_le_bytes());
+        value.extend_from_slice(&validator.registered_epoch.to_le_bytes());
+        value.extend_from_slice(&validator.last_active_epoch.to_le_bytes());
+        value.extend_from_slice(&validator.rewards_last_epoch.to_le_bytes());
+        value.extend_from_slice(&validator.self_report_count.to_le_bytes());
+        value.extend_from_slice(&validator.commission_bps.to_le_bytes());
+        value.extend_from_slice(&validator.min_delegation_spark.to_le_bytes());
+        value.push(u8::from(validator.auto_delegate_to.is_some()));
+        if let Some(target_id) = validator.auto_delegate_to {
+            value.extend_from_slice(&target_id.0);
+        }
+        match validator.status {
+            ValidatorStatus::Registered => value.push(0),
+            ValidatorStatus::Active => value.push(1),
+            ValidatorStatus::Unbonding {
+                unbonding_end_epoch,
+            } => {
+                value.push(2);
+                value.extend_from_slice(&unbonding_end_epoch.to_le_bytes());
+            }
+            ValidatorStatus::Slashed => value.push(3),
+            ValidatorStatus::Exited => value.push(4),
+        }
+        if let Some(pk) = validator.hybrid_classical_pk {
+            value.extend_from_slice(&pk);
+        }
+        if let Some(pk) = &validator.hybrid_pq_pk {
+            value.extend_from_slice(pk);
+        }
+        if let Some(vrf_pk) = validator.vrf_pk {
+            value.extend_from_slice(&vrf_pk);
+        }
+
+        let key_hash = sha256(&key);
+        let value_hash = sha256(&value);
+        let mut leaf = Vec::with_capacity(65);
+        leaf.push(0u8);
+        leaf.extend_from_slice(&key_hash);
+        leaf.extend_from_slice(&value_hash);
+        Bytes32::from(sha256(&leaf))
     }
 
     #[test]
@@ -242,27 +336,8 @@ mod tests {
     #[test]
     fn validator_set_root_includes_network_address() {
         let mut base = ChainState::new_genesis();
-        let validator = ValidatorEntry {
-            validator_id: Bytes32::from([0xA1; 32]),
-            name: "validator-a".to_string(),
-            hybrid_classical_pk: None,
-            hybrid_pq_pk: None,
-            vrf_pk: None,
-            stake_spark: 10_000,
-            status: ValidatorStatus::Active,
-            registered_epoch: 0,
-            last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
-            self_report_count: 0,
-            commission_bps: 1_000,
-            pending_commission_bps: None,
-            pending_commission_effective_epoch: None,
-            min_delegation_spark: DUST_LIMIT_SPARK,
-            auto_delegate_to: None,
-            network_addr: None,
-            network_addr_last_updated_epoch: None,
-        };
+        base.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT;
+        let validator = validator_fixture();
         base.validators.upsert(validator.clone()).unwrap();
 
         let mut with_addr = base.clone();
@@ -280,10 +355,60 @@ mod tests {
         );
 
         let mut default_again = ChainState::new_genesis();
+        default_again.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT;
         default_again.validators.upsert(validator).unwrap();
         assert_eq!(
             compute_validator_set_root(&base),
             compute_validator_set_root(&default_again)
+        );
+    }
+
+    #[test]
+    fn height_gated_root_matches_original_pre_activation_computation() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT.saturating_sub(1);
+        let mut validator = validator_fixture();
+        validator.network_addr = Some("203.0.113.20:30303".to_string());
+        validator.network_addr_last_updated_epoch = Some(7);
+        let old_preimage_root = pre_v4_validator_root_single_validator(&validator);
+        state.validators.upsert(validator).unwrap();
+
+        assert_eq!(compute_validator_set_root(&state), old_preimage_root);
+    }
+
+    #[test]
+    fn height_gated_root_uses_new_encoding_at_and_after_activation() {
+        let mut before = ChainState::new_genesis();
+        before.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT.saturating_sub(1);
+        let mut base_validator = validator_fixture();
+        base_validator.network_addr = Some("203.0.113.20:30303".to_string());
+        base_validator.network_addr_last_updated_epoch = Some(7);
+        before.validators.upsert(base_validator.clone()).unwrap();
+
+        let mut at_activation_without_addr = ChainState::new_genesis();
+        at_activation_without_addr.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT;
+        let mut without_addr = base_validator.clone();
+        without_addr.network_addr = None;
+        without_addr.network_addr_last_updated_epoch = None;
+        at_activation_without_addr
+            .validators
+            .upsert(without_addr)
+            .unwrap();
+
+        let mut at_activation_with_addr = ChainState::new_genesis();
+        at_activation_with_addr.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT;
+        at_activation_with_addr
+            .validators
+            .upsert(base_validator.clone())
+            .unwrap();
+
+        assert_eq!(
+            compute_validator_set_root(&before),
+            pre_v4_validator_root_single_validator(&base_validator)
+        );
+        assert_ne!(
+            compute_validator_set_root(&at_activation_without_addr),
+            compute_validator_set_root(&at_activation_with_addr)
         );
     }
 

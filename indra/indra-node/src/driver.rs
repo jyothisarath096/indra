@@ -3192,7 +3192,12 @@ mod tests {
         apply_block, compute_state_root, compute_validator_set_root, ChainState, ValidatorEntry,
         ValidatorStatus,
     };
-    use std::{path::PathBuf, time::Duration};
+    use std::{
+        cmp::Ordering,
+        collections::BinaryHeap,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -3787,6 +3792,1141 @@ mod tests {
             .validator_id;
         let elected = indra_consensus::proposer::elect_proposer(election, election.height).ok()?;
         (elected == validator_id).then_some(elected)
+    }
+
+    fn real_driver_sim_n() -> usize {
+        std::env::var("INDRA_REAL_DRIVER_SIM_N")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value >= 4)
+            .unwrap_or(200)
+    }
+
+    fn real_driver_sim_quorum(validators: usize) -> usize {
+        validators.saturating_mul(2) / 3 + 1
+    }
+
+    fn real_driver_sim_full_static_topology() -> bool {
+        std::env::var("INDRA_REAL_DRIVER_SIM_TOPOLOGY")
+            .ok()
+            .is_some_and(|value| value == "full-static")
+    }
+
+    const REAL_DRIVER_SIM_TARGET_OUTBOUND: usize =
+        indra_core::types::primitives::TARGET_OUTBOUND_PEERS;
+    const REAL_DRIVER_SIM_MAX_INBOUND: usize = indra_core::types::primitives::MAX_INBOUND_PEERS;
+    const REAL_DRIVER_SIM_MIN_RELAY_FANOUT: usize = 4;
+    const REAL_DRIVER_SIM_MAX_RELAY_FANOUT: usize = 16;
+    const REAL_DRIVER_SIM_BLOCK_FANOUT_MULTIPLIER: usize = 2;
+    const REAL_DRIVER_SIM_MAX_BLOCK_FANOUT: usize = 24;
+    const REAL_DRIVER_SIM_TICK_MS: u64 = 500;
+    const REAL_DRIVER_SIM_DELIVERY_BASE_MS: u64 = 20;
+    const REAL_DRIVER_SIM_MAX_MS: u64 = 180_000;
+    const REAL_DRIVER_SIM_PROPOSE_TIMEOUT_MS: u64 = 8_000;
+    const REAL_DRIVER_SIM_PREVOTE_TIMEOUT_MS: u64 = 3_000;
+    const REAL_DRIVER_SIM_PRECOMMIT_TIMEOUT_MS: u64 = 3_000;
+
+    #[derive(Clone)]
+    enum RealSimMessage {
+        Block(BlockV1),
+        Vote(VoteV1),
+        VrfCommit(VrfCommit),
+        VrfReveal(VrfReveal),
+        QcRequest {
+            height: u64,
+        },
+        QcResponse {
+            height: u64,
+            qc_bytes: Vec<u8>,
+        },
+        VrfRevealsRequest {
+            height: u64,
+            round: u32,
+            missing_validator_ids: Vec<Bytes32>,
+        },
+        VrfRevealsResponse {
+            height: u64,
+            round: u32,
+            reveals: Vec<VrfReveal>,
+        },
+    }
+
+    enum RealSimEventKind {
+        Tick {
+            node: usize,
+        },
+        Deliver {
+            from: usize,
+            to: usize,
+            msg: RealSimMessage,
+        },
+        RestartStart {
+            node: usize,
+        },
+    }
+
+    struct RealSimEvent {
+        at_ms: u64,
+        seq: u64,
+        kind: RealSimEventKind,
+    }
+
+    impl PartialEq for RealSimEvent {
+        fn eq(&self, other: &Self) -> bool {
+            self.at_ms == other.at_ms && self.seq == other.seq
+        }
+    }
+
+    impl Eq for RealSimEvent {}
+
+    impl PartialOrd for RealSimEvent {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for RealSimEvent {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other
+                .at_ms
+                .cmp(&self.at_ms)
+                .then_with(|| other.seq.cmp(&self.seq))
+        }
+    }
+
+    struct RealSimNode {
+        addr: SocketAddr,
+        config: NodeConfig,
+        driver: Option<ConsensusDriver>,
+        online: bool,
+        stopped_once: bool,
+        proposed_slots: HashSet<(u64, u32)>,
+        phase_key: Option<(u64, u32, RoundPhase)>,
+        phase_started_ms: u64,
+        vrf_commit_started_ms: HashMap<(u64, u32), u64>,
+        vrf_reveal_started_ms: HashMap<(u64, u32), u64>,
+    }
+
+    struct RealDriverRestartOutcome {
+        name: &'static str,
+        validators: usize,
+        quorum: usize,
+        restarted: usize,
+        initial_online: usize,
+        first_quorum_online_round: Option<u32>,
+        finalized_round: Option<u32>,
+        via_fallback: bool,
+        finalized_nodes: usize,
+        late_local_commit_cases: usize,
+        duration_ms: u64,
+        wall_ms: u128,
+    }
+
+    struct RealDriverSimHarness {
+        root: PathBuf,
+        validators: usize,
+        quorum: usize,
+        nodes: Vec<RealSimNode>,
+        graph: Vec<HashSet<usize>>,
+        initial_qc_bytes: Vec<u8>,
+        queue: BinaryHeap<RealSimEvent>,
+        seq: u64,
+        now_ms: u64,
+        start_height: u64,
+        late_local_commit_cases: usize,
+        last_observed_round: u32,
+        first_quorum_online_round: Option<u32>,
+        via_fallback: bool,
+    }
+
+    fn real_sim_seed(index: usize) -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+        seed[8] = 0xA5;
+        seed
+    }
+
+    fn real_sim_genesis(validators: usize) -> (String, Vec<HybridKeypair>) {
+        let mut genesis = String::new();
+        let mut signers = Vec::with_capacity(validators);
+        for i in 0..validators {
+            let seed = real_sim_seed(i);
+            let classical = ClassicalKeypair::from_seed(&seed);
+            let pq = PqKeypair::from_seed(&seed).unwrap();
+            let vrf = VrfKeypair::from_seed(&seed);
+            let validator_id = indra_crypto::sha256(&classical.public_key().0);
+            genesis.push_str(&format!(
+                "[[validators]]\nname = \"v{i}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+                hex::encode(validator_id),
+                hex::encode(classical.public_key().0),
+                hex::encode(pq.public_key().0),
+                hex::encode(vrf.public_key()),
+            ));
+            signers.push(HybridKeypair::new(classical, pq));
+        }
+        (genesis, signers)
+    }
+
+    impl RealDriverSimHarness {
+        fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    Self::copy_dir_all(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        fn new(suffix: &str) -> Self {
+            let validators = real_driver_sim_n();
+            let quorum = real_driver_sim_quorum(validators);
+            let root = temp_dir(&format!("{suffix}_n{validators}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let genesis_path = root.join("genesis.toml");
+            let (genesis, signers) = real_sim_genesis(validators);
+            std::fs::write(&genesis_path, genesis).unwrap();
+
+            let mut nodes = Vec::with_capacity(validators);
+            let start_height = REVEAL_SET_COMMITMENT_HEIGHT.max(1);
+            let tip_hash = Bytes32::from(indra_crypto::sha256(b"real-driver-sim-tip"));
+
+            let template_dir = root.join("template_node");
+            let template_seed = real_sim_seed(0);
+            let template_pq = PqKeypair::from_seed(&template_seed).unwrap();
+            let mut template_config = NodeConfig::local_test(template_dir.clone());
+            template_config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+            template_config.validator_seed = Some(template_seed);
+            template_config.vrf_seed = Some(template_seed);
+            template_config.pq_pk = Some(template_pq.public_key().0.to_vec());
+            template_config.pq_sk = Some(template_pq.secret_key_bytes());
+            template_config.p2p_addr = "127.0.0.1:30000".to_string();
+
+            let engine = NodeEngine::init(template_config).unwrap();
+            let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+            let mut template_driver = ConsensusDriver::new(engine, vote_safety);
+            template_driver.engine.state.height = start_height;
+            template_driver.engine.state.tip_hash = tip_hash;
+            template_driver
+                .engine
+                .state_store
+                .save(&template_driver.engine.state)
+                .unwrap();
+            template_driver.refresh_registered_voters();
+            let quorum_signers: Vec<_> = signers.iter().take(quorum).collect();
+            let qc = qc_bytes_from_signers(
+                &template_driver,
+                &quorum_signers,
+                start_height,
+                0,
+                tip_hash,
+                None,
+            );
+            drop(template_driver);
+
+            for i in 0..validators {
+                let seed = real_sim_seed(i);
+                let pq = PqKeypair::from_seed(&seed).unwrap();
+                let node_dir = root.join(format!("node_{i}"));
+                Self::copy_dir_all(&template_dir, &node_dir);
+                let mut config = NodeConfig::local_test(node_dir);
+                // The template imported genesis once. Real restarted nodes
+                // must load their persisted snapshot, not re-run genesis.
+                config.genesis_path = None;
+                config.validator_seed = Some(seed);
+                config.vrf_seed = Some(seed);
+                config.pq_pk = Some(pq.public_key().0.to_vec());
+                config.pq_sk = Some(pq.secret_key_bytes());
+                config.p2p_addr = format!("127.0.0.1:{}", 30_000 + i);
+                if real_driver_sim_full_static_topology() {
+                    config.bootstrap_peers = (0..validators)
+                        .filter(|peer| *peer != i)
+                        .map(|peer| format!("127.0.0.1:{}", 30_000 + peer))
+                        .collect();
+                } else {
+                    config.bootstrap_peers = vec![format!("127.0.0.1:{}", 30_000)];
+                    if i == 0 {
+                        config.bootstrap_peers.clear();
+                    }
+                }
+
+                let mut driver = Self::restart_driver_from_config(config.clone(), &qc);
+                driver.sync.mark_caught_up(driver.height());
+                driver.refresh_registered_voters();
+                driver.start_round(0);
+                nodes.push(RealSimNode {
+                    addr: format!("127.0.0.1:{}", 30_000 + i).parse().unwrap(),
+                    config,
+                    driver: Some(driver),
+                    online: true,
+                    stopped_once: false,
+                    proposed_slots: HashSet::new(),
+                    phase_key: None,
+                    phase_started_ms: 0,
+                    vrf_commit_started_ms: HashMap::new(),
+                    vrf_reveal_started_ms: HashMap::new(),
+                });
+            }
+
+            let graph = if real_driver_sim_full_static_topology() {
+                Self::build_full_static_graph(validators)
+            } else {
+                Self::build_bootstrap_first_graph(
+                    validators,
+                    REAL_DRIVER_SIM_TARGET_OUTBOUND,
+                    REAL_DRIVER_SIM_MAX_INBOUND,
+                )
+            };
+
+            Self {
+                root,
+                validators,
+                quorum,
+                nodes,
+                graph,
+                initial_qc_bytes: qc,
+                queue: BinaryHeap::new(),
+                seq: 0,
+                now_ms: 0,
+                start_height,
+                late_local_commit_cases: 0,
+                last_observed_round: 0,
+                first_quorum_online_round: None,
+                via_fallback: false,
+            }
+        }
+
+        fn restart_driver_from_config(
+            config: NodeConfig,
+            initial_qc_bytes: &[u8],
+        ) -> ConsensusDriver {
+            let engine = NodeEngine::init(config).unwrap();
+            let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+            let mut driver = ConsensusDriver::new(engine, vote_safety);
+            driver.last_qc_bytes = initial_qc_bytes.to_vec();
+            driver.sync.mark_caught_up(driver.height());
+            driver.refresh_registered_voters();
+            driver.start_round(0);
+            driver
+        }
+
+        fn schedule(&mut self, at_ms: u64, kind: RealSimEventKind) {
+            let event = RealSimEvent {
+                at_ms,
+                seq: self.seq,
+                kind,
+            };
+            self.seq = self.seq.saturating_add(1);
+            self.queue.push(event);
+        }
+
+        fn online_count(&self) -> usize {
+            self.nodes.iter().filter(|node| node.online).count()
+        }
+
+        fn finalized_count(&self) -> usize {
+            self.nodes
+                .iter()
+                .filter_map(|node| node.driver.as_ref())
+                .filter(|driver| driver.height() > self.start_height)
+                .count()
+        }
+
+        fn current_round_max(&self) -> u32 {
+            self.nodes
+                .iter()
+                .filter_map(|node| node.driver.as_ref())
+                .map(|driver| driver.current_round())
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn observe_fallback_results(&mut self) {
+            let proposal_height = self.start_height.saturating_add(1);
+            for driver in self.nodes.iter().filter_map(|node| node.driver.as_ref()) {
+                for state in driver.vrf_states.iter().filter_map(|state| state.as_ref()) {
+                    if state.height == proposal_height
+                        && state
+                            .election_result
+                            .is_some_and(|result| result.fallback_used)
+                    {
+                        self.via_fallback = true;
+                    }
+                }
+            }
+        }
+
+        fn start_ticks(&mut self) {
+            for node in 0..self.nodes.len() {
+                if self.nodes[node].online {
+                    self.schedule(0, RealSimEventKind::Tick { node });
+                }
+            }
+        }
+
+        fn restart_set(&self, restarted: usize) -> Vec<usize> {
+            let mut ordered = (0..self.nodes.len())
+                .map(|node| {
+                    let digest = indra_crypto::sha256(&(node as u64).to_le_bytes());
+                    (u64::from_le_bytes(digest[..8].try_into().unwrap()), node)
+                })
+                .collect::<Vec<_>>();
+            ordered.sort();
+            ordered
+                .into_iter()
+                .take(restarted)
+                .map(|(_, node)| node)
+                .collect()
+        }
+
+        fn schedule_correlated_restart(&mut self, restarted: usize, spread_ms: u64) {
+            let mut nodes = self.restart_set(restarted);
+            nodes.sort();
+            for (idx, node) in nodes.into_iter().enumerate() {
+                if self.nodes[node].online {
+                    self.nodes[node].driver = None;
+                    self.nodes[node].online = false;
+                    self.nodes[node].stopped_once = true;
+                    self.nodes[node].phase_key = None;
+                    self.nodes[node].phase_started_ms = 0;
+                    self.nodes[node].vrf_commit_started_ms.clear();
+                    self.nodes[node].vrf_reveal_started_ms.clear();
+                }
+                let offset = if restarted <= 1 {
+                    0
+                } else {
+                    (idx as u64).saturating_mul(spread_ms) / (restarted as u64 - 1)
+                };
+                self.schedule(5_000 + offset, RealSimEventKind::RestartStart { node });
+            }
+        }
+
+        fn relay_fanout_for_message(&self, msg: &RealSimMessage) -> usize {
+            let base = (((self.validators as f64).ln() * 2.0).ceil() as usize + 2).clamp(
+                REAL_DRIVER_SIM_MIN_RELAY_FANOUT,
+                REAL_DRIVER_SIM_MAX_RELAY_FANOUT,
+            );
+            match msg {
+                RealSimMessage::Block(_) => base
+                    .saturating_mul(REAL_DRIVER_SIM_BLOCK_FANOUT_MULTIPLIER)
+                    .min(REAL_DRIVER_SIM_MAX_BLOCK_FANOUT),
+                RealSimMessage::Vote(_)
+                | RealSimMessage::VrfCommit(_)
+                | RealSimMessage::VrfReveal(_)
+                | RealSimMessage::QcRequest { .. }
+                | RealSimMessage::VrfRevealsRequest { .. } => base,
+                RealSimMessage::QcResponse { .. } | RealSimMessage::VrfRevealsResponse { .. } => 1,
+            }
+        }
+
+        fn rendezvous_candidates(
+            node: usize,
+            candidates: impl Iterator<Item = usize>,
+        ) -> Vec<usize> {
+            let mut ordered = candidates
+                .filter(|candidate| *candidate != node)
+                .map(|candidate| {
+                    let mut seed = Vec::with_capacity(4);
+                    seed.extend_from_slice(&(node as u16).to_le_bytes());
+                    seed.extend_from_slice(&(candidate as u16).to_le_bytes());
+                    let digest = indra_crypto::sha256(&seed);
+                    (
+                        u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                        candidate,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ordered.sort();
+            ordered
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect()
+        }
+
+        fn connect_outbound(
+            graph: &mut [HashSet<usize>],
+            inbound_counts: &mut [usize],
+            node: usize,
+            ordered_candidates: Vec<usize>,
+            target_outbound: usize,
+            max_inbound: usize,
+        ) {
+            let mut outbound = graph[node].len();
+            for candidate in ordered_candidates {
+                if outbound >= target_outbound {
+                    break;
+                }
+                if inbound_counts[candidate] >= max_inbound || graph[node].contains(&candidate) {
+                    continue;
+                }
+                graph[node].insert(candidate);
+                graph[candidate].insert(node);
+                inbound_counts[candidate] += 1;
+                outbound += 1;
+            }
+        }
+
+        fn build_bootstrap_first_graph(
+            n: usize,
+            target_outbound: usize,
+            max_inbound: usize,
+        ) -> Vec<HashSet<usize>> {
+            let bootstrap = 0usize;
+            let mut graph = vec![HashSet::<usize>::new(); n];
+            let mut inbound_counts = vec![0usize; n];
+
+            for node in 1..n {
+                Self::connect_outbound(
+                    &mut graph,
+                    &mut inbound_counts,
+                    node,
+                    vec![bootstrap],
+                    1,
+                    max_inbound,
+                );
+            }
+            for node in 0..n {
+                let mut candidates = Vec::new();
+                if node != bootstrap {
+                    candidates.push(bootstrap);
+                }
+                candidates.extend(Self::rendezvous_candidates(node, 0..n));
+                Self::connect_outbound(
+                    &mut graph,
+                    &mut inbound_counts,
+                    node,
+                    candidates,
+                    target_outbound,
+                    max_inbound,
+                );
+            }
+
+            graph
+        }
+
+        fn build_full_static_graph(n: usize) -> Vec<HashSet<usize>> {
+            (0..n)
+                .map(|node| (0..n).filter(|peer| *peer != node).collect())
+                .collect()
+        }
+
+        fn relay_targets(&self, node: usize, origin: usize, fanout: usize) -> Vec<usize> {
+            let mut neighbors = self.graph[node]
+                .iter()
+                .copied()
+                .filter(|peer| self.nodes[*peer].online)
+                .map(|peer| {
+                    let mut seed = Vec::with_capacity(6);
+                    seed.extend_from_slice(&(origin as u16).to_le_bytes());
+                    seed.extend_from_slice(&(node as u16).to_le_bytes());
+                    seed.extend_from_slice(&(peer as u16).to_le_bytes());
+                    let digest = indra_crypto::sha256(&seed);
+                    (
+                        u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                        peer,
+                    )
+                })
+                .collect::<Vec<_>>();
+            neighbors.sort();
+            neighbors
+                .into_iter()
+                .take(fanout)
+                .map(|(_, peer)| peer)
+                .collect()
+        }
+
+        fn missing_local_commit_in_open_reveal_phase(
+            driver: &ConsensusDriver,
+            height: u64,
+            round: u32,
+        ) -> bool {
+            let Some(local_id) = driver.engine.validator_id() else {
+                return false;
+            };
+            let Some(slot) = driver.vrf_slot_index(height, round) else {
+                return false;
+            };
+            let Some(state) = driver.vrf_states[slot].as_ref() else {
+                return false;
+            };
+            state.phase == VrfRoundPhase::Reveal && !state.commits.contains_key(&local_id)
+        }
+
+        fn local_commit_and_reveal_present(
+            driver: &ConsensusDriver,
+            height: u64,
+            round: u32,
+        ) -> bool {
+            let Some(local_id) = driver.engine.validator_id() else {
+                return false;
+            };
+            let Some(slot) = driver.vrf_slot_index(height, round) else {
+                return false;
+            };
+            let Some(state) = driver.vrf_states[slot].as_ref() else {
+                return false;
+            };
+            state.commits.contains_key(&local_id) && state.reveals.contains_key(&local_id)
+        }
+
+        fn sync_driver_timers(&mut self, node: usize) {
+            let now = Instant::now();
+            let now_ms = self.now_ms;
+            let node_state = &mut self.nodes[node];
+            let Some(driver) = node_state.driver.as_mut() else {
+                return;
+            };
+
+            for state in driver
+                .vrf_states
+                .iter_mut()
+                .filter_map(|state| state.as_mut())
+            {
+                let key = (state.height, state.round);
+                let commit_started_ms = *node_state
+                    .vrf_commit_started_ms
+                    .entry(key)
+                    .or_insert(now_ms);
+                state.commit_started_at =
+                    now - Duration::from_millis(now_ms.saturating_sub(commit_started_ms));
+
+                if state.reveal_started_at.is_some() {
+                    let reveal_started_ms = *node_state
+                        .vrf_reveal_started_ms
+                        .entry(key)
+                        .or_insert(now_ms);
+                    state.reveal_started_at =
+                        Some(now - Duration::from_millis(now_ms.saturating_sub(reveal_started_ms)));
+                }
+            }
+
+            if driver.current_phase == RoundPhase::Precommit {
+                let phase_started_ms = node_state.phase_started_ms;
+                driver.precommit_phase_started_at =
+                    Some(now - Duration::from_millis(now_ms.saturating_sub(phase_started_ms)));
+            }
+        }
+
+        fn sync_phase_clock(&mut self, node: usize) -> Option<(u64, u32, RoundPhase, u64)> {
+            let driver = self.nodes[node].driver.as_ref()?;
+            let key = (
+                driver.next_height(),
+                driver.current_round(),
+                driver.current_phase(),
+            );
+            if self.nodes[node].phase_key != Some(key) {
+                self.nodes[node].phase_key = Some(key);
+                self.nodes[node].phase_started_ms = self.now_ms;
+            }
+            Some((
+                key.0,
+                key.1,
+                key.2,
+                self.now_ms
+                    .saturating_sub(self.nodes[node].phase_started_ms),
+            ))
+        }
+
+        fn tick_node(&mut self, node: usize) {
+            if !self.nodes[node].online {
+                return;
+            }
+            self.sync_phase_clock(node);
+            self.sync_driver_timers(node);
+            let (height, round, late_commit_before, actions) = {
+                let Some(driver) = self.nodes[node].driver.as_mut() else {
+                    return;
+                };
+                let height = driver.next_height();
+                let round = driver.current_round();
+                let late_commit_before =
+                    Self::missing_local_commit_in_open_reveal_phase(driver, height, round);
+                let election = driver.active_vrf_candidates(height, round);
+                let actions = driver.ensure_vrf_election_for_round(&election);
+                (height, round, late_commit_before, actions)
+            };
+            self.last_observed_round = self.last_observed_round.max(round);
+            if late_commit_before
+                && self.nodes[node].driver.as_ref().is_some_and(|driver| {
+                    Self::local_commit_and_reveal_present(driver, height, round)
+                })
+            {
+                self.late_local_commit_cases = self.late_local_commit_cases.saturating_add(1);
+            }
+            self.handle_actions(node, actions);
+            self.sync_phase_clock(node);
+            self.sync_driver_timers(node);
+            self.try_propose(node);
+
+            self.sync_phase_clock(node);
+            self.sync_driver_timers(node);
+            let Some(driver) = self.nodes[node].driver.as_mut() else {
+                return;
+            };
+            let actions = driver.retry_precommit_if_waiting();
+            self.handle_actions(node, actions);
+
+            if self.nodes[node]
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.current_phase() == RoundPhase::Propose)
+            {
+                if self
+                    .sync_phase_clock(node)
+                    .is_some_and(|(_, _, _, elapsed)| elapsed >= REAL_DRIVER_SIM_PROPOSE_TIMEOUT_MS)
+                {
+                    let actions = self.nodes[node]
+                        .driver
+                        .as_mut()
+                        .unwrap()
+                        .on_propose_timeout();
+                    self.nodes[node].phase_key = None;
+                    self.handle_actions(node, actions);
+                }
+            }
+            if self.nodes[node]
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.current_phase() == RoundPhase::Prevote)
+            {
+                if self
+                    .sync_phase_clock(node)
+                    .is_some_and(|(_, _, _, elapsed)| elapsed >= REAL_DRIVER_SIM_PREVOTE_TIMEOUT_MS)
+                {
+                    let actions = self.nodes[node]
+                        .driver
+                        .as_mut()
+                        .unwrap()
+                        .on_prevote_timeout();
+                    self.nodes[node].phase_key = None;
+                    self.handle_actions(node, actions);
+                }
+            }
+            if self.nodes[node]
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.current_phase() == RoundPhase::Precommit)
+            {
+                if self
+                    .sync_phase_clock(node)
+                    .is_some_and(|(_, _, _, elapsed)| {
+                        elapsed >= REAL_DRIVER_SIM_PRECOMMIT_TIMEOUT_MS
+                    })
+                {
+                    self.nodes[node]
+                        .driver
+                        .as_mut()
+                        .unwrap()
+                        .on_precommit_timeout();
+                    self.nodes[node].phase_key = None;
+                }
+            }
+
+            if self.nodes[node].online
+                && self
+                    .nodes
+                    .get(node)
+                    .and_then(|node| node.driver.as_ref())
+                    .is_some_and(|driver| driver.height() == self.start_height)
+            {
+                self.schedule(
+                    self.now_ms + REAL_DRIVER_SIM_TICK_MS,
+                    RealSimEventKind::Tick { node },
+                );
+            }
+        }
+
+        fn try_propose(&mut self, node: usize) {
+            if !self.nodes[node].online {
+                return;
+            }
+            let (height, round, already_accepted, is_elected) = {
+                let Some(driver) = self.nodes[node].driver.as_ref() else {
+                    return;
+                };
+                if driver.current_phase() != RoundPhase::Propose {
+                    return;
+                }
+                let height = driver.next_height();
+                let round = driver.current_round();
+                let election_result = driver.vrf_election_result(height, round);
+                let is_elected = election_result.is_some_and(|result| {
+                    Some(result.elected_validator_id) == driver.engine.validator_id()
+                });
+                (
+                    height,
+                    round,
+                    driver.has_accepted_proposal_for_height(height),
+                    is_elected,
+                )
+            };
+            if self.nodes[node].proposed_slots.contains(&(height, round)) || already_accepted {
+                return;
+            }
+            if !is_elected {
+                return;
+            }
+            let actions = {
+                let Some(driver) = self.nodes[node].driver.as_mut() else {
+                    return;
+                };
+                let election_result = driver.vrf_election_result(height, round);
+                let election = driver.active_vrf_candidates(height, round);
+                let election_result_hash = election_result.map(|result| result.hash());
+                let vrf_reveals = driver.vrf_reveal_evidence(height, round);
+                let timestamp = 2_000_000_000 + height + round as u64;
+                let last_qc_bytes = driver.last_qc_bytes();
+                let polc_round = driver.proposal_polc_round(height);
+                let block = driver
+                    .engine
+                    .propose_with_election_result(
+                        &election,
+                        timestamp,
+                        last_qc_bytes,
+                        polc_round,
+                        election_result_hash,
+                        election_result,
+                        vrf_reveals,
+                    )
+                    .unwrap();
+                driver.process(DriverEvent::InboundBlock { from: None, block })
+            };
+            self.nodes[node].proposed_slots.insert((height, round));
+            self.handle_actions(node, actions);
+        }
+
+        fn delivery_delay_ms(&self, from: usize, to: usize) -> u64 {
+            REAL_DRIVER_SIM_DELIVERY_BASE_MS
+                + ((from as u64 * 17 + to as u64 * 31 + self.now_ms / 10) % 80)
+        }
+
+        fn broadcast(&mut self, from: usize, msg: RealSimMessage) {
+            let fanout = self.relay_fanout_for_message(&msg);
+            let mut seen = HashSet::from([from]);
+            let mut frontier = vec![(from, self.now_ms)];
+            while let Some((relay_node, send_at)) = frontier.pop() {
+                if !self.nodes[relay_node].online {
+                    continue;
+                }
+                for to in self.relay_targets(relay_node, from, fanout) {
+                    if !seen.insert(to) {
+                        continue;
+                    }
+                    let arrival = send_at + self.delivery_delay_ms(relay_node, to);
+                    self.schedule(
+                        arrival,
+                        RealSimEventKind::Deliver {
+                            from: relay_node,
+                            to,
+                            msg: msg.clone(),
+                        },
+                    );
+                    frontier.push((to, arrival));
+                }
+            }
+        }
+
+        fn send_to(&mut self, from: usize, to_addr: SocketAddr, msg: RealSimMessage) {
+            let Some(to) = self.nodes.iter().position(|node| node.addr == to_addr) else {
+                return;
+            };
+            if !self.nodes[to].online {
+                return;
+            }
+            self.schedule(
+                self.now_ms + self.delivery_delay_ms(from, to),
+                RealSimEventKind::Deliver { from, to, msg },
+            );
+        }
+
+        fn handle_actions(&mut self, origin: usize, actions: Vec<DriverAction>) {
+            for action in actions {
+                match action {
+                    DriverAction::BroadcastBlock(block) => {
+                        self.broadcast(origin, RealSimMessage::Block(block));
+                    }
+                    DriverAction::BroadcastVote(vote) => {
+                        self.broadcast(origin, RealSimMessage::Vote(vote));
+                    }
+                    DriverAction::BroadcastVrfCommit(commit) => {
+                        self.broadcast(origin, RealSimMessage::VrfCommit(commit));
+                    }
+                    DriverAction::BroadcastVrfReveal(reveal) => {
+                        self.broadcast(origin, RealSimMessage::VrfReveal(reveal));
+                    }
+                    DriverAction::RequestQC { height } => {
+                        self.broadcast(origin, RealSimMessage::QcRequest { height });
+                    }
+                    DriverAction::SendQCResponse {
+                        to,
+                        height,
+                        qc_bytes,
+                    } => {
+                        self.send_to(origin, to, RealSimMessage::QcResponse { height, qc_bytes });
+                    }
+                    DriverAction::RequestVrfReveals {
+                        height,
+                        round,
+                        missing_validator_ids,
+                    } => {
+                        self.broadcast(
+                            origin,
+                            RealSimMessage::VrfRevealsRequest {
+                                height,
+                                round,
+                                missing_validator_ids,
+                            },
+                        );
+                    }
+                    DriverAction::SendVrfRevealsResponse {
+                        to,
+                        height,
+                        round,
+                        reveals,
+                    } => {
+                        self.send_to(
+                            origin,
+                            to,
+                            RealSimMessage::VrfRevealsResponse {
+                                height,
+                                round,
+                                reveals,
+                            },
+                        );
+                    }
+                    DriverAction::ActivateBufferedProposal(block) => {
+                        if let Some(driver) = self.nodes[origin].driver.as_mut() {
+                            let actions =
+                                driver.process(DriverEvent::InboundBlock { from: None, block });
+                            self.handle_actions(origin, actions);
+                        }
+                    }
+                    DriverAction::None
+                    | DriverAction::BroadcastTx(_)
+                    | DriverAction::RequestBlocks { .. }
+                    | DriverAction::RequestProposal { .. }
+                    | DriverAction::SlashDetected(_)
+                    | DriverAction::DisconnectInvalidConsensusPeer { .. } => {}
+                }
+            }
+        }
+
+        fn deliver(&mut self, from: usize, to: usize, msg: RealSimMessage) {
+            if !self.nodes[to].online {
+                return;
+            }
+            let from_addr = self.nodes[from].addr;
+            self.sync_phase_clock(to);
+            self.sync_driver_timers(to);
+            let Some(driver) = self.nodes[to].driver.as_mut() else {
+                return;
+            };
+            let actions = match msg {
+                RealSimMessage::Block(block) => driver.process(DriverEvent::InboundBlock {
+                    from: Some(from_addr),
+                    block,
+                }),
+                RealSimMessage::Vote(vote) => driver.process(DriverEvent::InboundVote {
+                    from: from_addr,
+                    vote,
+                }),
+                RealSimMessage::VrfCommit(commit) => {
+                    driver.process(DriverEvent::InboundVrfCommit {
+                        from: from_addr,
+                        commit,
+                    })
+                }
+                RealSimMessage::VrfReveal(reveal) => {
+                    driver.process(DriverEvent::InboundVrfReveal {
+                        from: from_addr,
+                        reveal,
+                    })
+                }
+                RealSimMessage::QcRequest { height } => driver.process(DriverEvent::QcRequest {
+                    from: from_addr,
+                    height,
+                }),
+                RealSimMessage::QcResponse { height, qc_bytes } => {
+                    driver.process(DriverEvent::QcResponse {
+                        from: from_addr,
+                        height,
+                        qc_bytes,
+                    })
+                }
+                RealSimMessage::VrfRevealsRequest {
+                    height,
+                    round,
+                    missing_validator_ids,
+                } => driver.process(DriverEvent::VrfRevealsRequest {
+                    from: from_addr,
+                    height,
+                    round,
+                    missing_validator_ids,
+                }),
+                RealSimMessage::VrfRevealsResponse {
+                    height,
+                    round,
+                    reveals,
+                } => driver.process(DriverEvent::VrfRevealsResponse {
+                    from: from_addr,
+                    height,
+                    round,
+                    reveals,
+                }),
+            };
+            self.handle_actions(to, actions);
+        }
+
+        fn run(
+            &mut self,
+            name: &'static str,
+            restarted: usize,
+            restart_spread_ms: u64,
+        ) -> RealDriverRestartOutcome {
+            let wall_start = Instant::now();
+            if restarted > 0 {
+                self.schedule_correlated_restart(restarted, restart_spread_ms);
+            }
+            self.start_ticks();
+            let initial_online = self.validators.saturating_sub(restarted);
+            let mut processed_events = 0usize;
+            while let Some(event) = self.queue.pop() {
+                processed_events = processed_events.saturating_add(1);
+                if processed_events % 50_000 == 0 {
+                    eprintln!(
+                        "[real-driver-restart-sim:progress] scenario={} events={} now_ms={} queue={} online={} finalized={} round_max={}",
+                        name,
+                        processed_events,
+                        self.now_ms,
+                        self.queue.len(),
+                        self.online_count(),
+                        self.finalized_count(),
+                        self.current_round_max(),
+                    );
+                }
+                if event.at_ms > REAL_DRIVER_SIM_MAX_MS {
+                    break;
+                }
+                self.now_ms = event.at_ms;
+                if self.online_count() >= self.quorum && self.first_quorum_online_round.is_none() {
+                    self.first_quorum_online_round = Some(self.current_round_max());
+                }
+                match event.kind {
+                    RealSimEventKind::Tick { node } => self.tick_node(node),
+                    RealSimEventKind::Deliver { from, to, msg } => self.deliver(from, to, msg),
+                    RealSimEventKind::RestartStart { node } => {
+                        if !self.nodes[node].online {
+                            let driver = Self::restart_driver_from_config(
+                                self.nodes[node].config.clone(),
+                                &self.initial_qc_bytes,
+                            );
+                            self.nodes[node].driver = Some(driver);
+                            self.nodes[node].online = true;
+                            self.nodes[node].phase_key = None;
+                            self.nodes[node].phase_started_ms = self.now_ms;
+                            self.nodes[node].vrf_commit_started_ms.clear();
+                            self.nodes[node].vrf_reveal_started_ms.clear();
+                            self.schedule(self.now_ms, RealSimEventKind::Tick { node });
+                        }
+                    }
+                }
+                self.observe_fallback_results();
+                if self.finalized_count() >= self.quorum {
+                    break;
+                }
+            }
+            let finalized = self.finalized_count() >= self.quorum;
+            RealDriverRestartOutcome {
+                name,
+                validators: self.validators,
+                quorum: self.quorum,
+                restarted,
+                initial_online,
+                first_quorum_online_round: self.first_quorum_online_round,
+                finalized_round: finalized.then(|| self.current_round_max()),
+                via_fallback: self.via_fallback,
+                finalized_nodes: self.finalized_count(),
+                late_local_commit_cases: self.late_local_commit_cases,
+                duration_ms: self.now_ms,
+                wall_ms: wall_start.elapsed().as_millis(),
+            }
+        }
+    }
+
+    impl Drop for RealDriverSimHarness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    #[ignore = "scale-validation real-driver N=200 correlated restart harness; run explicitly with --ignored --nocapture"]
+    fn real_driver_correlated_restart_n200_harness() {
+        let scenarios = [
+            ("baseline", 0usize, 0u64),
+            ("restart_25pct", real_driver_sim_n() / 4, 15_000u64),
+            ("restart_50pct", real_driver_sim_n() / 2, 15_000u64),
+            ("restart_75pct", real_driver_sim_n() * 3 / 4, 15_000u64),
+            (
+                "restart_75pct_spread_15s",
+                real_driver_sim_n() * 3 / 4,
+                15_000u64,
+            ),
+            (
+                "restart_75pct_spread_30s",
+                real_driver_sim_n() * 3 / 4,
+                30_000u64,
+            ),
+            (
+                "restart_75pct_spread_60s",
+                real_driver_sim_n() * 3 / 4,
+                60_000u64,
+            ),
+            (
+                "restart_75pct_spread_120s",
+                real_driver_sim_n() * 3 / 4,
+                120_000u64,
+            ),
+            (
+                "restart_75pct_spread_180s",
+                real_driver_sim_n() * 3 / 4,
+                180_000u64,
+            ),
+        ];
+        for (name, restarted, spread_ms) in scenarios {
+            if std::env::var("INDRA_REAL_DRIVER_SIM_SCENARIO")
+                .ok()
+                .is_some_and(|selected| selected != name)
+            {
+                continue;
+            }
+            eprintln!("[real-driver-restart-sim:start] scenario={name}");
+            let mut harness = RealDriverSimHarness::new(name);
+            let outcome = harness.run(name, restarted, spread_ms);
+            eprintln!(
+                "[real-driver-restart-sim] scenario={} n={} quorum={} restarted={} initial_online={} first_quorum_online_round={:?} finalized_round={:?} via_fallback={} finalized_nodes={} duration_ms={} wall_ms={} late_local_commit_cases={}",
+                outcome.name,
+                outcome.validators,
+                outcome.quorum,
+                outcome.restarted,
+                outcome.initial_online,
+                outcome.first_quorum_online_round,
+                outcome.finalized_round,
+                outcome.via_fallback,
+                outcome.finalized_nodes,
+                outcome.duration_ms,
+                outcome.wall_ms,
+                outcome.late_local_commit_cases,
+            );
+            assert!(
+                outcome.finalized_nodes >= outcome.quorum,
+                "scenario {name} should finalize on at least quorum validators"
+            );
+        }
     }
 
     #[test]

@@ -401,6 +401,28 @@ pub fn build_set_auto_delegate_op(
     )
 }
 
+/// Build and sign a validator network-address update staking op.
+pub fn build_update_network_address_op(
+    validator_id: Bytes32,
+    network_addr: Option<String>,
+    keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    let body = StakingOpBody::UpdateNetworkAddress {
+        validator_id,
+        network_addr,
+    };
+    StakingOp {
+        body: body.clone(),
+        nonce,
+        signature: dummy_signature()?,
+    }
+    .validate_structure()
+    .map_err(|e| CliError::Transaction(e.to_string()))?;
+    build_signed_staking_op(body, keypair, nonce, chain_id)
+}
+
 /// Build and sign a validator self-unstake operation.
 pub fn build_self_unstake_op(
     bond_utxo_id: Bytes32,
@@ -796,6 +818,60 @@ mod tests {
     }
 
     #[test]
+    fn build_update_network_address_op_serialises_and_decodes() {
+        let keypair = test_keypair(0x7A);
+        let validator_id = Bytes32::from([0x1B; 32]);
+        let built = build_update_network_address_op(
+            validator_id,
+            Some("203.0.113.20:30303".to_string()),
+            &keypair,
+            16,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        let op = decode_built(&built);
+        assert_eq!(op.nonce, 16);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id: v,
+                network_addr: Some(addr),
+            } if v == validator_id && addr == "203.0.113.20:30303"
+        ));
+    }
+
+    #[test]
+    fn build_clear_network_address_op_uses_none() {
+        let keypair = test_keypair(0x7B);
+        let validator_id = Bytes32::from([0x1C; 32]);
+        let built =
+            build_update_network_address_op(validator_id, None, &keypair, 17, DEFAULT_CHAIN_ID)
+                .unwrap();
+        let op = decode_built(&built);
+        assert!(matches!(
+            op.body,
+            StakingOpBody::UpdateNetworkAddress {
+                validator_id: v,
+                network_addr: None,
+            } if v == validator_id
+        ));
+    }
+
+    #[test]
+    fn build_update_network_address_rejects_invalid_syntax() {
+        let keypair = test_keypair(0x7C);
+        let validator_id = Bytes32::from([0x1D; 32]);
+        assert!(build_update_network_address_op(
+            validator_id,
+            Some("validator.example.com:30303".to_string()),
+            &keypair,
+            18,
+            DEFAULT_CHAIN_ID,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn all_ops_have_correct_nonce() {
         let keypair = test_keypair(0x76);
         let validator_id = Bytes32::from([0x07; 32]);
@@ -836,6 +912,14 @@ mod tests {
             build_set_auto_delegate_op(
                 validator_id,
                 Bytes32::from([0x19; 32]),
+                &keypair,
+                42,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
+            build_update_network_address_op(
+                validator_id,
+                Some("203.0.113.20:30303".to_string()),
                 &keypair,
                 42,
                 DEFAULT_CHAIN_ID,
@@ -889,6 +973,14 @@ mod tests {
                 Bytes32::from([0x1A; 32]),
                 &keypair,
                 8,
+                DEFAULT_CHAIN_ID,
+            )
+            .unwrap(),
+            build_update_network_address_op(
+                validator_id,
+                Some("203.0.113.21:30303".to_string()),
+                &keypair,
+                9,
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),

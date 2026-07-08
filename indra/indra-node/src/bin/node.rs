@@ -1392,6 +1392,10 @@ fn main() {
     if let Some(v) = get_arg("--rpc-addr") {
         cfg_file.rpc_addr = Some(v);
     }
+    if let Some(v) = get_arg("--rpc-public-addr") {
+        cfg_file.rpc_public_addr = Some(v);
+        cfg_file.rpc_public_enabled = Some(true);
+    }
     if args.iter().any(|a| a == "--no-observer-port") {
         cfg_file.observer_addr = Some(String::new());
     }
@@ -2395,71 +2399,45 @@ fn main() {
     // Inline HTTP/JSON-RPC handler — avoids circular dependency with indra-rpc.
     // Reads chain state directly from the driver under a brief lock.
     if rpc_should_start(cfg_file.rpc_enabled) {
-        let driver_rpc = Arc::clone(&driver);
-        let gossip_rpc = Arc::clone(&gossip);
-        let discovered_peers_rpc = Arc::clone(&discovered_peers);
-        let observer_count_rpc = Arc::clone(&observer_count);
         let rpc_addr = get_arg("--rpc-addr")
             .or_else(|| cfg_file.rpc_addr.clone())
             .unwrap_or_else(|| "127.0.0.1:8545".to_string());
         if let Some(warning) = rpc_non_loopback_warning(&rpc_addr) {
             eprintln!("{}", warning);
         }
-        let rpc_cors_origins = Arc::new(cfg_file.rpc_cors_origins.clone());
-        let rpc_conn_count = Arc::new(AtomicU64::new(0));
-        let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
-        let utxo_scan_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
-        eprintln!("[rpc] listening on {}", rpc_addr);
-
-        std::thread::spawn(move || {
-            let listener = match std::net::TcpListener::bind(&rpc_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[rpc] bind failed: {}", e);
-                    return;
-                }
-            };
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        if !reserve_rpc_connection(&rpc_conn_count) {
-                            eprintln!(
-                                "[rpc] connection limit reached ({}), dropping new connection",
-                                MAX_RPC_CONNECTIONS
-                            );
-                            drop(stream);
-                            continue;
-                        }
-                        let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-                        let driver_rpc = Arc::clone(&driver_rpc);
-                        let gossip_rpc = Arc::clone(&gossip_rpc);
-                        let discovered_peers_rpc = Arc::clone(&discovered_peers_rpc);
-                        let observer_count_rpc = Arc::clone(&observer_count_rpc);
-                        let rpc_conn_count = Arc::clone(&rpc_conn_count);
-                        let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
-                        let utxo_scan_limiter = Arc::clone(&utxo_scan_limiter);
-                        let rpc_cors_origins = Arc::clone(&rpc_cors_origins);
-                        std::thread::spawn(move || {
-                            handle_rpc(
-                                stream,
-                                &driver_rpc,
-                                &gossip_rpc,
-                                &discovered_peers_rpc,
-                                &observer_count_rpc,
-                                peer_ip,
-                                &rpc_rate_limiter,
-                                &utxo_scan_limiter,
-                                &rpc_cors_origins,
-                            );
-                            release_rpc_connection(&rpc_conn_count);
-                        });
-                    }
-                    Err(e) => eprintln!("[rpc] accept error: {}", e),
-                }
-            }
-        });
+        spawn_rpc_listener(
+            "rpc",
+            rpc_addr,
+            indra_rpc::handlers::RpcMode::Full,
+            Arc::clone(&driver),
+            Arc::clone(&gossip),
+            Arc::clone(&discovered_peers),
+            Arc::clone(&observer_count),
+            cfg_file.rpc_cors_origins.clone(),
+        );
     } else {
         eprintln!("[rpc] RPC server disabled by config");
+    }
+
+    if rpc_public_should_start(cfg_file.rpc_public_enabled) {
+        let rpc_public_addr = cfg_file
+            .rpc_public_addr
+            .clone()
+            .filter(|addr| !addr.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1:8547".to_string());
+        if let Some(warning) = rpc_non_loopback_warning(&rpc_public_addr) {
+            eprintln!("[rpc-public] {}", warning);
+        }
+        spawn_rpc_listener(
+            "rpc-public",
+            rpc_public_addr,
+            indra_rpc::handlers::RpcMode::ReadOnly,
+            Arc::clone(&driver),
+            Arc::clone(&gossip),
+            Arc::clone(&discovered_peers),
+            Arc::clone(&observer_count),
+            cfg_file.rpc_public_cors_origins.clone(),
+        );
     }
 
     // ── Main thread: status printer ─────────────────────────────────────────
@@ -2861,6 +2839,7 @@ fn print_help() {
     println!("  --observer-addr <host:port>");
     println!("  --no-observer-port");
     println!("  --rpc-addr <host:port>");
+    println!("  --rpc-public-addr <host:port>  Enable read-only public RPC listener");
     println!("  --metrics-addr <addr>");
     println!("  --no-metrics");
     println!("  --bootstrap-peers <addr,addr,...>");
@@ -2923,6 +2902,13 @@ enabled = true
 # Empty admin token disables privileged RPC topology details.
 admin_token = ""
 # Empty allowlist means browsers receive no cross-origin access by default.
+cors_origins = []
+
+[rpc_public]
+# Optional read-only listener for public reverse proxies. Writes are rejected
+# at the RPC dispatch layer before any submission path is reachable.
+addr    = "127.0.0.1:8547"
+enabled = false
 cors_origins = []
 
 [metrics]
@@ -3105,6 +3091,76 @@ fn rpc_should_start(enabled: Option<bool>) -> bool {
     enabled.unwrap_or(true)
 }
 
+fn rpc_public_should_start(enabled: Option<bool>) -> bool {
+    enabled.unwrap_or(false)
+}
+
+fn spawn_rpc_listener(
+    label: &'static str,
+    rpc_addr: String,
+    mode: indra_rpc::handlers::RpcMode,
+    driver: Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    gossip: Arc<NetworkBridge>,
+    discovered_peers: Arc<Mutex<HashSet<String>>>,
+    observer_count: Arc<AtomicUsize>,
+    cors_origins: Vec<String>,
+) {
+    let rpc_cors_origins = Arc::new(cors_origins);
+    let rpc_conn_count = Arc::new(AtomicU64::new(0));
+    let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
+    let utxo_scan_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
+    eprintln!("[{}] listening on {} ({:?})", label, rpc_addr, mode);
+
+    std::thread::spawn(move || {
+        let listener = match std::net::TcpListener::bind(&rpc_addr) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[{}] bind failed: {}", label, e);
+                return;
+            }
+        };
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    if !reserve_rpc_connection(&rpc_conn_count) {
+                        eprintln!(
+                            "[{}] connection limit reached ({}), dropping new connection",
+                            label, MAX_RPC_CONNECTIONS
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+                    let driver_rpc = Arc::clone(&driver);
+                    let gossip_rpc = Arc::clone(&gossip);
+                    let discovered_peers_rpc = Arc::clone(&discovered_peers);
+                    let observer_count_rpc = Arc::clone(&observer_count);
+                    let rpc_conn_count = Arc::clone(&rpc_conn_count);
+                    let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
+                    let utxo_scan_limiter = Arc::clone(&utxo_scan_limiter);
+                    let rpc_cors_origins = Arc::clone(&rpc_cors_origins);
+                    std::thread::spawn(move || {
+                        handle_rpc(
+                            stream,
+                            &driver_rpc,
+                            &gossip_rpc,
+                            &discovered_peers_rpc,
+                            &observer_count_rpc,
+                            peer_ip,
+                            &rpc_rate_limiter,
+                            &utxo_scan_limiter,
+                            &rpc_cors_origins,
+                            mode,
+                        );
+                        release_rpc_connection(&rpc_conn_count);
+                    });
+                }
+                Err(e) => eprintln!("[{}] accept error: {}", label, e),
+            }
+        }
+    });
+}
+
 struct RpcSnapshot {
     chain: indra_state::ChainState,
     mempool_size: usize,
@@ -3233,8 +3289,11 @@ fn handle_rpc(
     rate_limiter: &indra_rpc::server::RpcRateLimiter,
     utxo_scan_limiter: &indra_rpc::server::RpcWindowRateLimiter,
     cors_origins: &[String],
+    rpc_mode: indra_rpc::handlers::RpcMode,
 ) {
-    use indra_rpc::handlers::{dispatch, DispatchResult, NodeState};
+    use indra_rpc::handlers::{
+        check_rpc_method_allowed, dispatch_with_mode, DispatchResult, NodeState,
+    };
     use indra_rpc::types::{parse_request, RpcResponse};
     use std::io::{BufRead, BufReader, Read};
 
@@ -3356,6 +3415,13 @@ fn handle_rpc(
         }
     };
 
+    if let Err(error) = check_rpc_method_allowed(&req.method, rpc_mode) {
+        let body =
+            RpcResponse::err(req.id.clone(), error.code(), error.message().to_string()).to_json();
+        send_http(&stream, &cors, &body);
+        return;
+    }
+
     if indra_rpc::server::is_utxo_scan_method(&req.method) {
         if let Some(ip) = peer_ip {
             if !utxo_scan_limiter.allow(ip, indra_rpc::server::UTXO_SCAN_RATE_PER_MIN) {
@@ -3393,7 +3459,7 @@ fn handle_rpc(
             discovered_count,
             observer_count_val,
         );
-        match dispatch(&req.method, &req.params, &state) {
+        match dispatch_with_mode(&req.method, &req.params, &state, rpc_mode) {
             DispatchResult::Ready(Ok(result)) => RpcResponse::ok(req.id.clone(), result).to_json(),
             DispatchResult::Ready(Err(error)) => {
                 RpcResponse::err(req.id.clone(), error.code(), error.message().to_string())
@@ -3949,6 +4015,13 @@ mod tests {
         assert!(!rpc_should_start(Some(false)));
         assert!(rpc_should_start(Some(true)));
         assert!(rpc_should_start(None));
+    }
+
+    #[test]
+    fn rpc_public_server_is_opt_in() {
+        assert!(!rpc_public_should_start(None));
+        assert!(!rpc_public_should_start(Some(false)));
+        assert!(rpc_public_should_start(Some(true)));
     }
 
     #[test]

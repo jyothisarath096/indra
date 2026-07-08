@@ -18,6 +18,7 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS};
@@ -191,6 +192,58 @@ impl StateStore {
             [SNAPSHOT_VERSION_V1_SUMMARY, ..] => Ok(Some(SCHEMA_VERSION_GENESIS)),
             _ => Ok(None),
         }
+    }
+
+    /// Create a best-effort rollback point before durable schema migration.
+    ///
+    /// The migration path may subsequently rewrite snapshots using the current
+    /// schema. Keeping a timestamped copy of the current state-store files makes
+    /// rollback possible if migration or post-migration integrity checks fail.
+    pub fn backup_for_schema_migration(
+        &self,
+        from_version: u8,
+        to_version: u8,
+    ) -> StorageResult<Option<PathBuf>> {
+        let Some(snapshot_path) = self.find_latest_snapshot()? else {
+            return Ok(None);
+        };
+        let Some(height) = snapshot_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                name.trim_start_matches("state_")
+                    .trim_end_matches(".snap")
+                    .parse::<u64>()
+                    .ok()
+            })
+        else {
+            return Ok(None);
+        };
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backup_dir = self.dir.join(format!(
+            "migration_backup_v{from_version}_to_v{to_version}_h{height}_{timestamp}_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&backup_dir)?;
+
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            fs::copy(entry.path(), backup_dir.join(file_name))?;
+        }
+
+        eprintln!(
+            "[migration] backed up state store before schema migration v{from_version}->v{to_version}: {}",
+            backup_dir.display()
+        );
+        Ok(Some(backup_dir))
     }
 
     /// Height of the newest snapshot, if any.
@@ -543,10 +596,15 @@ mod tests {
     use super::*;
     use indra_core::{
         types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-        types::primitives::MAX_VRF_PROOF_BYTES,
+        types::primitives::{
+            hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES,
+        },
         Bytes32, ProtocolVersion, VariableBytes,
     };
-    use indra_state::{apply_block, compute_state_root, compute_validator_set_root};
+    use indra_state::{
+        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
+        ValidatorStatus,
+    };
     use std::io::Write;
 
     fn temp_dir(suffix: &str) -> PathBuf {
@@ -568,6 +626,46 @@ mod tests {
             .unwrap();
         file.write_all(payload).unwrap();
         file.flush().unwrap();
+    }
+
+    fn test_validator() -> ValidatorEntry {
+        ValidatorEntry {
+            validator_id: Bytes32::from([0x41; 32]),
+            name: "validator-one".to_string(),
+            hybrid_classical_pk: Some([0x42; 32]),
+            hybrid_pq_pk: Some(vec![0x43; 80]),
+            vrf_pk: Some([0x44; 32]),
+            stake_spark: 1_000_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 7,
+            last_active_epoch: 7,
+            pending_rewards: 12,
+            rewards_last_epoch: 6,
+            self_report_count: 1,
+            commission_bps: 900,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+        }
+    }
+
+    fn write_snapshot_meta(dir: &Path, state: &ChainState, snapshot_bytes: &[u8]) {
+        let meta = SnapshotMeta {
+            height: state.height,
+            block_hash: state.tip_hash,
+            state_root: compute_state_root(state),
+            validator_set_root: compute_validator_set_root(state),
+            chain_id: state.chain_id.clone(),
+            checksum: crc32(snapshot_bytes),
+        };
+        std::fs::write(
+            dir.join(format!("state_{}.snap.meta", state.height)),
+            meta.encode(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -599,6 +697,57 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded, state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_sidecar_verification_succeeds_for_real_pre_activation_snapshot() {
+        let dir = temp_dir("pre_activation_migrated_sidecar");
+        let store = StateStore::open(&dir).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT.saturating_sub(1);
+        state.tip_hash = Bytes32::from([0x99; 32]);
+        state.validators.upsert(test_validator()).unwrap();
+
+        store.save(&state).unwrap();
+
+        let snapshot_path = dir.join(format!("state_{}.snap", state.height));
+        let mut snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        // Outer snapshot payload byte 0 is the snapshot format; byte 1 is the
+        // stored ChainState schema version. Mark it as v3 so startup exercises
+        // the migrate-then-verify path against a historical sidecar root.
+        snapshot_bytes[13] =
+            indra_core::types::primitives::SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS;
+        std::fs::write(&snapshot_path, &snapshot_bytes).unwrap();
+        write_snapshot_meta(&dir, &state, &snapshot_bytes);
+
+        assert_eq!(
+            store.schema_version().unwrap(),
+            Some(indra_core::types::primitives::SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS)
+        );
+        let loaded = store.load_latest().unwrap().unwrap();
+        assert_eq!(loaded.height, state.height);
+        assert_eq!(compute_state_root(&loaded), compute_state_root(&state));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_for_schema_migration_copies_state_store_files() {
+        let dir = temp_dir("migration_backup");
+        let store = StateStore::open(&dir).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.height = 12;
+        state.validators.upsert(test_validator()).unwrap();
+        store.save(&state).unwrap();
+
+        let backup_dir = store
+            .backup_for_schema_migration(3, SCHEMA_VERSION)
+            .unwrap()
+            .expect("snapshot exists");
+        assert!(backup_dir.join("state_12.snap").exists());
+        assert!(backup_dir.join("state_12.snap.meta").exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -749,12 +898,15 @@ mod tests {
                 network_addr_last_updated_epoch: None,
             })
             .unwrap();
-        state.delegations.add_delegation(
-            Bytes32::from([0x41; 32]),
-            Bytes32::from([0x51; 32]),
-            25_000,
-            7,
-        );
+        state
+            .delegations
+            .add_delegation(
+                Bytes32::from([0x41; 32]),
+                Bytes32::from([0x51; 32]),
+                25_000,
+                7,
+            )
+            .unwrap();
         state
             .delegations
             .begin_undelegate(

@@ -2333,7 +2333,8 @@ mod tests {
         let (owner, _) = make_test_keypair([0x92; 32]);
         state
             .delegations
-            .add_delegation(validator_id, delegator_id, 200_000, 0);
+            .add_delegation(validator_id, delegator_id, 200_000, 0)
+            .unwrap();
         state.staked_bonds.insert(
             bond_id,
             StakeBondEntry {

@@ -2530,6 +2530,57 @@ mod tests {
             .collect()
     }
 
+    fn sim_relay_targets_masked(
+        graph: &[HashSet<usize>],
+        node: usize,
+        origin: usize,
+        fanout: usize,
+        online: &[bool],
+    ) -> Vec<usize> {
+        let mut neighbors = graph[node]
+            .iter()
+            .copied()
+            .filter(|peer| online[*peer])
+            .map(|peer| {
+                let mut seed = Vec::with_capacity(6);
+                seed.extend_from_slice(&(origin as u16).to_le_bytes());
+                seed.extend_from_slice(&(node as u16).to_le_bytes());
+                seed.extend_from_slice(&(peer as u16).to_le_bytes());
+                let digest = sha256(&seed);
+                (
+                    u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                    peer,
+                )
+            })
+            .collect::<Vec<_>>();
+        neighbors.sort();
+        neighbors
+            .into_iter()
+            .take(fanout)
+            .map(|(_, peer)| peer)
+            .collect()
+    }
+
+    fn sim_build_relay_targets_masked(
+        graph: &[HashSet<usize>],
+        fanout: usize,
+        online: &[bool],
+    ) -> Vec<Vec<Vec<usize>>> {
+        (0..graph.len())
+            .map(|origin| {
+                (0..graph.len())
+                    .map(|node| {
+                        if online[node] {
+                            sim_relay_targets_masked(graph, node, origin, fanout, online)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn sim_reached_after_hops(relay_targets: &[Vec<Vec<usize>>], max_hops: usize) -> usize {
         let mut reached = HashSet::new();
         let mut frontier = VecDeque::new();
@@ -2635,14 +2686,14 @@ mod tests {
     }
 
     fn sim_propagation_arrivals(
-        graph: &[HashSet<usize>],
+        _graph: &[HashSet<usize>],
         relay_targets: &[Vec<Vec<usize>>],
         departures: &[f64],
         regions: &[SimRegion],
         scenario: VrfTimingScenario,
         phase: usize,
     ) -> Vec<Vec<f64>> {
-        let n = graph.len();
+        let n = relay_targets.len();
         let mut all = Vec::with_capacity(n);
         for origin in 0..n {
             let mut dist = vec![f64::INFINITY; n];
@@ -2794,6 +2845,376 @@ mod tests {
             max_revealed_stake: *revealed_stakes.last().unwrap(),
             avg_compute_ms,
             max_compute_ms: *compute_times.last().unwrap(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RestartSimOutcome {
+        restarted: usize,
+        initial_online: usize,
+        first_quorum_online_round: Option<u32>,
+        finalized_round: Option<u32>,
+        finalized_via_fallback: bool,
+        max_late_local_commit_cases_in_round: usize,
+        min_block_reach_two_hops_after_quorum: usize,
+        min_block_reach_three_hops_after_quorum: usize,
+        min_block_reach_four_hops_after_quorum: usize,
+        min_online_degree_after_quorum: usize,
+        quorum_online_time_ms: Option<f64>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RestartRoundOutcome {
+        online: usize,
+        quorum_backed_election_nodes: usize,
+        late_local_commit_cases: usize,
+        block_reach_two_hops: usize,
+        block_reach_three_hops: usize,
+        block_reach_four_hops: usize,
+        min_online_degree: usize,
+    }
+
+    fn sim_restart_set(n: usize, restarted: usize) -> HashSet<usize> {
+        let mut ordered = (0..n)
+            .map(|node| {
+                let digest = sha256(&[(node & 0xFF) as u8, ((node >> 8) & 0xFF) as u8, 0xC0, 0xDE]);
+                (
+                    u64::from_le_bytes(digest[..8].try_into().unwrap_or([0xFF; 8])),
+                    node,
+                )
+            })
+            .collect::<Vec<_>>();
+        ordered.sort();
+        ordered
+            .into_iter()
+            .take(restarted)
+            .map(|(_, node)| node)
+            .collect()
+    }
+
+    fn sim_restart_ready_times(n: usize, restarted: usize, restart_window_ms: f64) -> Vec<f64> {
+        let restarted_set = sim_restart_set(n, restarted);
+        let mut restarted_order = restarted_set.iter().copied().collect::<Vec<_>>();
+        restarted_order.sort_by(|a, b| {
+            sim_hash_unit(&[*a, 0xAA55])
+                .total_cmp(&sim_hash_unit(&[*b, 0xAA55]))
+                .then_with(|| a.cmp(b))
+        });
+        let mut ready = vec![0.0; n];
+        for (idx, node) in restarted_order.into_iter().enumerate() {
+            // Startup in the live node waits 500ms before loading discovery
+            // sources, then dials with a 2s minimum backoff on failures. This
+            // model adds a conservative 5s process/bootstrap base and spreads
+            // the correlated restart cohort across the configured short window.
+            let position = if restarted <= 1 {
+                0.0
+            } else {
+                idx as f64 / (restarted - 1) as f64
+            };
+            ready[node] = 5_000.0 + position * restart_window_ms;
+        }
+        ready
+    }
+
+    fn sim_online_mask(ready_times: &[f64], at_ms: f64) -> Vec<bool> {
+        ready_times.iter().map(|ready| *ready <= at_ms).collect()
+    }
+
+    fn sim_online_count(online: &[bool]) -> usize {
+        online.iter().filter(|online| **online).count()
+    }
+
+    fn sim_online_quorum(online: &[bool]) -> bool {
+        sim_online_count(online) >= sim_quorum_stake(&vec![1; online.len()]) as usize
+    }
+
+    fn sim_min_online_degree(graph: &[HashSet<usize>], online: &[bool]) -> usize {
+        graph
+            .iter()
+            .enumerate()
+            .filter(|(node, _)| online[*node])
+            .map(|(_, neighbors)| neighbors.iter().filter(|peer| online[**peer]).count())
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn sim_reached_after_hops_masked(
+        relay_targets: &[Vec<Vec<usize>>],
+        origin: usize,
+        online: &[bool],
+        max_hops: usize,
+    ) -> usize {
+        if !online[origin] {
+            return 0;
+        }
+        let mut reached = HashSet::new();
+        let mut frontier = VecDeque::new();
+        reached.insert(origin);
+        frontier.push_back(origin);
+        for _ in 0..max_hops {
+            let level = frontier.len();
+            for _ in 0..level {
+                let node = frontier.pop_front().unwrap();
+                for peer in relay_targets[origin][node].iter().copied() {
+                    if online[peer] && reached.insert(peer) {
+                        frontier.push_back(peer);
+                    }
+                }
+            }
+        }
+        reached.len()
+    }
+
+    fn sim_propagation_arrivals_masked(
+        _graph: &[HashSet<usize>],
+        relay_targets: &[Vec<Vec<usize>>],
+        departures: &[f64],
+        online: &[bool],
+        regions: &[SimRegion],
+        scenario: VrfTimingScenario,
+        phase: usize,
+    ) -> Vec<Vec<f64>> {
+        let n = relay_targets.len();
+        let mut all = Vec::with_capacity(n);
+        for origin in 0..n {
+            let mut dist = vec![f64::INFINITY; n];
+            if !online[origin] || !departures[origin].is_finite() {
+                all.push(dist);
+                continue;
+            }
+            let mut queue = std::collections::BinaryHeap::new();
+            dist[origin] = departures[origin];
+            queue.push(SimQueueState {
+                node: origin,
+                time_ms: departures[origin],
+            });
+
+            while let Some(SimQueueState { node, time_ms }) = queue.pop() {
+                if time_ms > dist[node] {
+                    continue;
+                }
+                for peer in relay_targets[origin][node].iter().copied() {
+                    if !online[peer] || sim_edge_dropped(node, peer, origin, phase, scenario) {
+                        continue;
+                    }
+                    let candidate =
+                        time_ms + sim_edge_delay_ms(node, peer, origin, phase, regions, scenario);
+                    if candidate < dist[peer] {
+                        dist[peer] = candidate;
+                        queue.push(SimQueueState {
+                            node: peer,
+                            time_ms: candidate,
+                        });
+                    }
+                }
+            }
+            all.push(dist);
+        }
+        all
+    }
+
+    fn sim_restart_round_outcome(
+        graph: &[HashSet<usize>],
+        relay_targets: &[Vec<Vec<usize>>],
+        block_relay_targets: &[Vec<Vec<usize>>],
+        ready_times: &[f64],
+        round_start_ms: f64,
+        scenario: VrfTimingScenario,
+    ) -> RestartRoundOutcome {
+        let regions = sim_regions_n200();
+        let stakes = vec![1u64; graph.len()];
+        let quorum_stake = sim_quorum_stake(&stakes);
+        let online = sim_online_mask(ready_times, round_start_ms);
+        let online_count = sim_online_count(&online);
+        let mut commit_departures = vec![f64::INFINITY; graph.len()];
+        for node in 0..graph.len() {
+            if online[node] {
+                // Simulate scheduler/load jitter after restart. Remote commit
+                // quorum may open reveal phase before a node's own local commit
+                // is inserted; the fixed driver path must still create that
+                // node's reveal when the local commit arrives.
+                let local_jitter_ms = 25.0 + 900.0 * sim_hash_unit(&[node, 0x5151]);
+                commit_departures[node] = round_start_ms + local_jitter_ms;
+            }
+        }
+        let commit_arrivals = sim_propagation_arrivals_masked(
+            graph,
+            relay_targets,
+            &commit_departures,
+            &online,
+            &regions,
+            scenario,
+            11,
+        );
+        let mut reveal_departures = vec![f64::INFINITY; graph.len()];
+        let mut late_local_commit_cases = 0usize;
+        for receiver in 0..graph.len() {
+            if !online[receiver] {
+                continue;
+            }
+            let mut commit_times = commit_arrivals
+                .iter()
+                .enumerate()
+                .filter_map(|(origin, arrivals)| {
+                    arrivals[receiver]
+                        .is_finite()
+                        .then_some((arrivals[receiver], stakes[origin]))
+                })
+                .collect::<Vec<_>>();
+            commit_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut stake = 0u64;
+            let mut reveal_open_time =
+                round_start_ms + indra_core::types::primitives::VRF_COMMIT_WINDOW_MS as f64;
+            for (arrival, origin_stake) in commit_times {
+                stake = stake.saturating_add(origin_stake);
+                if stake >= quorum_stake {
+                    reveal_open_time = arrival.min(reveal_open_time);
+                    break;
+                }
+            }
+            if commit_departures[receiver] > reveal_open_time {
+                late_local_commit_cases += 1;
+            }
+            reveal_departures[receiver] = commit_departures[receiver].max(reveal_open_time);
+        }
+
+        let reveal_arrivals = sim_propagation_arrivals_masked(
+            graph,
+            relay_targets,
+            &reveal_departures,
+            &online,
+            &regions,
+            scenario,
+            12,
+        );
+        let mut quorum_backed_election_nodes = 0usize;
+        for receiver in 0..graph.len() {
+            if !online[receiver] {
+                continue;
+            }
+            let deadline = reveal_departures[receiver]
+                + indra_core::types::primitives::VRF_REVEAL_WINDOW_MS as f64;
+            let revealed_stake =
+                sim_stake_received_by_deadline(&reveal_arrivals, receiver, deadline, &stakes);
+            if revealed_stake >= quorum_stake {
+                quorum_backed_election_nodes += 1;
+            }
+        }
+
+        let block_reach_two_hops = (0..graph.len())
+            .filter(|origin| online[*origin])
+            .map(|origin| sim_reached_after_hops_masked(block_relay_targets, origin, &online, 2))
+            .min()
+            .unwrap_or(0);
+        let block_reach_three_hops = (0..graph.len())
+            .filter(|origin| online[*origin])
+            .map(|origin| sim_reached_after_hops_masked(block_relay_targets, origin, &online, 3))
+            .min()
+            .unwrap_or(0);
+        let block_reach_four_hops = (0..graph.len())
+            .filter(|origin| online[*origin])
+            .map(|origin| sim_reached_after_hops_masked(block_relay_targets, origin, &online, 4))
+            .min()
+            .unwrap_or(0);
+
+        RestartRoundOutcome {
+            online: online_count,
+            quorum_backed_election_nodes,
+            late_local_commit_cases,
+            block_reach_two_hops,
+            block_reach_three_hops,
+            block_reach_four_hops,
+            min_online_degree: sim_min_online_degree(graph, &online),
+        }
+    }
+
+    fn sim_correlated_restart_outcome(
+        restarted: usize,
+        restart_window_ms: f64,
+    ) -> RestartSimOutcome {
+        let n = SIM_VALIDATORS_N200;
+        let fanout = derive_consensus_relay_fanout(n);
+        let block_fanout = relay_fanout_for_class(fanout, RelayMessageClass::Block);
+        let (graph, _) = sim_build_bootstrap_first_graph(n, SIM_TARGET_OUTBOUND, SIM_MAX_INBOUND);
+        let ready_times = sim_restart_ready_times(n, restarted, restart_window_ms);
+        let initial_online = ready_times.iter().filter(|ready| **ready <= 0.0).count();
+        let scenario = VrfTimingScenario {
+            bootstrap_saturated: true,
+            message_loss_bps: 100,
+            ..sim_scenario("correlated_restart")
+        };
+        let failed_round_ms = indra_core::types::primitives::VRF_COMMIT_WINDOW_MS as f64
+            + indra_core::types::primitives::VRF_REVEAL_WINDOW_MS as f64
+            + 8_000.0;
+        let mut insufficient_rounds = 0u32;
+        let mut first_quorum_online_round = None;
+        let mut quorum_online_time_ms = None;
+        let mut max_late_local_commit_cases_in_round = 0usize;
+        let mut min_block_reach_two_hops_after_quorum = usize::MAX;
+        let mut min_block_reach_three_hops_after_quorum = usize::MAX;
+        let mut min_block_reach_four_hops_after_quorum = usize::MAX;
+        let mut min_online_degree_after_quorum = usize::MAX;
+        let mut finalized_round = None;
+        let mut finalized_via_fallback = false;
+
+        for round in 0..64u32 {
+            let round_start_ms = f64::from(round) * failed_round_ms;
+            let online = sim_online_mask(&ready_times, round_start_ms);
+            if sim_online_quorum(&online) && first_quorum_online_round.is_none() {
+                first_quorum_online_round = Some(round);
+                quorum_online_time_ms = Some(round_start_ms);
+            }
+
+            let outcome = sim_restart_round_outcome(
+                &graph,
+                &sim_build_relay_targets_masked(&graph, fanout, &online),
+                &sim_build_relay_targets_masked(&graph, block_fanout, &online),
+                &ready_times,
+                round_start_ms,
+                scenario,
+            );
+            max_late_local_commit_cases_in_round =
+                max_late_local_commit_cases_in_round.max(outcome.late_local_commit_cases);
+            if sim_online_quorum(&online) {
+                min_block_reach_two_hops_after_quorum =
+                    min_block_reach_two_hops_after_quorum.min(outcome.block_reach_two_hops);
+                min_block_reach_three_hops_after_quorum =
+                    min_block_reach_three_hops_after_quorum.min(outcome.block_reach_three_hops);
+                min_block_reach_four_hops_after_quorum =
+                    min_block_reach_four_hops_after_quorum.min(outcome.block_reach_four_hops);
+                min_online_degree_after_quorum =
+                    min_online_degree_after_quorum.min(outcome.min_online_degree);
+            }
+
+            if outcome.quorum_backed_election_nodes >= sim_quorum_stake(&vec![1; n]) as usize
+                && outcome.online >= sim_quorum_stake(&vec![1; n]) as usize
+            {
+                finalized_round = Some(round);
+                break;
+            }
+
+            insufficient_rounds = insufficient_rounds.saturating_add(1);
+            if insufficient_rounds >= indra_core::types::primitives::MAX_VRF_EMPTY_REVEAL_ROUNDS
+                && outcome.online >= sim_quorum_stake(&vec![1; n]) as usize
+            {
+                finalized_round = Some(round);
+                finalized_via_fallback = true;
+                break;
+            }
+        }
+
+        RestartSimOutcome {
+            restarted,
+            initial_online,
+            first_quorum_online_round,
+            finalized_round,
+            finalized_via_fallback,
+            max_late_local_commit_cases_in_round,
+            min_block_reach_two_hops_after_quorum: min_block_reach_two_hops_after_quorum.min(n),
+            min_block_reach_three_hops_after_quorum: min_block_reach_three_hops_after_quorum.min(n),
+            min_block_reach_four_hops_after_quorum: min_block_reach_four_hops_after_quorum.min(n),
+            min_online_degree_after_quorum: min_online_degree_after_quorum.min(n),
+            quorum_online_time_ms,
         }
     }
 
@@ -3063,6 +3484,72 @@ mod tests {
         );
         assert_eq!(current_margin_ms, 1_000);
         assert_eq!(recommended_settle_ms, 2_500);
+    }
+
+    #[test]
+    #[ignore = "scale-validation correlated restart simulation; run explicitly with --ignored --nocapture"]
+    fn correlated_multi_validator_restart_recovers_bounded_at_n200() {
+        let severities = [(50usize, "25%"), (100usize, "50%"), (150usize, "75%")];
+        let mut outcomes = Vec::new();
+        for (restarted, label) in severities {
+            let outcome = sim_correlated_restart_outcome(restarted, 15_000.0);
+            eprintln!(
+                "[restart-sim] severity={} restarted={}/200 initial_online={} quorum_online_round={:?} quorum_online_time_ms={:?} finalized_round={:?} finalized_via_fallback={} late_local_commit_cases_max={} min_block_reach_after_quorum(2/3/4hops)={}/{}/{} min_online_degree_after_quorum={}",
+                label,
+                outcome.restarted,
+                outcome.initial_online,
+                outcome.first_quorum_online_round,
+                outcome.quorum_online_time_ms,
+                outcome.finalized_round,
+                outcome.finalized_via_fallback,
+                outcome.max_late_local_commit_cases_in_round,
+                outcome.min_block_reach_two_hops_after_quorum,
+                outcome.min_block_reach_three_hops_after_quorum,
+                outcome.min_block_reach_four_hops_after_quorum,
+                outcome.min_online_degree_after_quorum,
+            );
+
+            let quorum_round = outcome
+                .first_quorum_online_round
+                .expect("restart cohort should eventually reconnect enough stake");
+            let finalized_round = outcome
+                .finalized_round
+                .expect("network should recover after enough stake reconnects");
+            assert!(
+                finalized_round.saturating_sub(quorum_round)
+                    <= indra_core::types::primitives::MAX_VRF_EMPTY_REVEAL_ROUNDS,
+                "severity {label} should finalize within bounded fallback rounds after online quorum returns"
+            );
+            assert!(
+                outcome.min_block_reach_four_hops_after_quorum >= 134,
+                "severity {label} should preserve block relay quorum reach within four hops after reconnect"
+            );
+            outcomes.push((label, outcome));
+        }
+
+        let mut first_extended_unavailability = None;
+        for restart_window_ms in [15_000.0, 30_000.0, 60_000.0, 120_000.0, 180_000.0] {
+            let outcome = sim_correlated_restart_outcome(150, restart_window_ms);
+            eprintln!(
+                "[restart-sim:sweep] severity=75% restart_window_ms={:.0} quorum_online_round={:?} quorum_online_time_ms={:?} finalized_round={:?} finalized_via_fallback={}",
+                restart_window_ms,
+                outcome.first_quorum_online_round,
+                outcome.quorum_online_time_ms,
+                outcome.finalized_round,
+                outcome.finalized_via_fallback,
+            );
+            if outcome.first_quorum_online_round.is_some_and(|round| {
+                round > indra_core::types::primitives::MAX_VRF_EMPTY_REVEAL_ROUNDS
+            }) && first_extended_unavailability.is_none()
+            {
+                first_extended_unavailability = Some(restart_window_ms);
+            }
+        }
+        eprintln!(
+            "[restart-sim] first 75% restart window where unavailable stake, not VRF/relay, dominates beyond fallback threshold: {:?}",
+            first_extended_unavailability
+        );
+        assert_eq!(outcomes.len(), 3);
     }
 
     #[test]

@@ -115,6 +115,12 @@ impl NodeEngine {
                     node_version: indra_core::types::primitives::SCHEMA_VERSION,
                 });
             }
+            if snapshot_version < indra_core::types::primitives::SCHEMA_VERSION {
+                state_store.backup_for_schema_migration(
+                    snapshot_version,
+                    indra_core::types::primitives::SCHEMA_VERSION,
+                )?;
+            }
         }
         let mut genesis_base = ChainState::new_genesis();
         if let Some(ref genesis_path) = config.genesis_path {

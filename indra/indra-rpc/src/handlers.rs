@@ -214,9 +214,102 @@ pub enum DispatchResult {
     SubmitTransaction(Vec<u8>),
 }
 
+/// RPC listener capability mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcMode {
+    /// Full local listener: read methods and submission methods are available.
+    Full,
+    /// Public listener: only explicit read-only methods are available.
+    ReadOnly,
+}
+
+/// Access class for an RPC method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcMethodAccess {
+    /// The method only reads local node/chain state and is safe for public exposure.
+    ReadOnly,
+    /// The method submits data to a local mempool or otherwise requests mutation.
+    Write,
+}
+
+/// All RPC methods currently dispatched by this crate, with their access class.
+///
+/// This is an explicit allowlist for read-only public listeners. New methods must
+/// be classified here before they can be dispatched.
+pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
+    ("indra_getHeight", RpcMethodAccess::ReadOnly),
+    ("indra_getTip", RpcMethodAccess::ReadOnly),
+    ("indra_getChainInfo", RpcMethodAccess::ReadOnly),
+    ("indra_getMempoolSize", RpcMethodAccess::ReadOnly),
+    ("indra_getBlock", RpcMethodAccess::ReadOnly),
+    ("indra_getBalance", RpcMethodAccess::ReadOnly),
+    ("indra_getUtxos", RpcMethodAccess::ReadOnly),
+    ("indra_getUtxoProof", RpcMethodAccess::ReadOnly),
+    ("indra_getPeers", RpcMethodAccess::ReadOnly),
+    ("indra_getStakingNonce", RpcMethodAccess::ReadOnly),
+    ("indra_getDelegations", RpcMethodAccess::ReadOnly),
+    ("indra_getDelegatorPositions", RpcMethodAccess::ReadOnly),
+    ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
+    ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
+    ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
+    ("indra_getEpochInfo", RpcMethodAccess::ReadOnly),
+    ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
+    ("indra_getEpochHistory", RpcMethodAccess::ReadOnly),
+    ("indra_getLatestEpoch", RpcMethodAccess::ReadOnly),
+    ("indra_getSchemaInfo", RpcMethodAccess::ReadOnly),
+    ("indra_getProposals", RpcMethodAccess::ReadOnly),
+    ("indra_getProposal", RpcMethodAccess::ReadOnly),
+    ("indra_getProposalVotes", RpcMethodAccess::ReadOnly),
+    ("indra_getGovernanceParams", RpcMethodAccess::ReadOnly),
+    ("indra_getGovernanceNonce", RpcMethodAccess::ReadOnly),
+    ("indra_getValidatorRewards", RpcMethodAccess::ReadOnly),
+    ("indra_getValidator", RpcMethodAccess::ReadOnly),
+    ("indra_getValidatorSelfStake", RpcMethodAccess::ReadOnly),
+    ("indra_getValidatorAutoDelegate", RpcMethodAccess::ReadOnly),
+    ("indra_getValidatorSet", RpcMethodAccess::ReadOnly),
+    ("indra_submitStakingOp", RpcMethodAccess::Write),
+    ("indra_submitGovernanceOp", RpcMethodAccess::Write),
+    ("indra_sendTransaction", RpcMethodAccess::Write),
+];
+
+/// Return the configured access class for a known RPC method.
+pub fn rpc_method_access(method: &str) -> Option<RpcMethodAccess> {
+    RPC_METHODS
+        .iter()
+        .find_map(|(candidate, access)| (*candidate == method).then_some(*access))
+}
+
+/// Return true if a method is explicitly allowlisted for read-only listeners.
+pub fn rpc_method_is_read_only(method: &str) -> bool {
+    rpc_method_access(method) == Some(RpcMethodAccess::ReadOnly)
+}
+
+/// Check whether a method is allowed on a listener with the given mode.
+pub fn check_rpc_method_allowed(method: &str, mode: RpcMode) -> RpcResult<()> {
+    if mode == RpcMode::ReadOnly && rpc_method_access(method) != Some(RpcMethodAccess::ReadOnly) {
+        return Err(RpcError::Forbidden(format!(
+            "RPC method {method} is not available on read-only listener"
+        )));
+    }
+    Ok(())
+}
+
 /// Dispatch a method call to the appropriate handler.
 pub fn dispatch(method: &str, params: &[String], state: &NodeState<'_>) -> DispatchResult {
+    dispatch_with_mode(method, params, state, RpcMode::Full)
+}
+
+/// Dispatch a method call with listener-mode enforcement.
+pub fn dispatch_with_mode(
+    method: &str,
+    params: &[String],
+    state: &NodeState<'_>,
+    mode: RpcMode,
+) -> DispatchResult {
     use DispatchResult::Ready;
+    if let Err(error) = check_rpc_method_allowed(method, mode) {
+        return Ready(Err(error));
+    }
     match method {
         "indra_getHeight" => Ready(get_height(state)),
         "indra_getTip" => Ready(get_tip(state)),

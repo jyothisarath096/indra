@@ -32,7 +32,10 @@ use std::time::{Duration, Instant};
 
 use crate::{
     error::{ERR_INTERNAL_ERROR, ERR_PARSE_ERROR},
-    handlers::{dispatch, DispatchResult, NodeState, RpcEngineMut, RpcEngineView},
+    handlers::{
+        check_rpc_method_allowed, dispatch_with_mode, DispatchResult, NodeState, RpcEngineMut,
+        RpcEngineView, RpcMode,
+    },
     types::{parse_request, JsonId, RpcResponse},
 };
 
@@ -358,6 +361,7 @@ where
             &req.params,
             id,
             &mut *guard,
+            RpcMode::Full,
         ))
     }
 }
@@ -472,8 +476,12 @@ fn read_and_process_ref<E: RpcEngineView>(
         }
     };
 
+    if let Err(error) = check_rpc_method_allowed(&req.method, RpcMode::ReadOnly) {
+        return Ok(RpcResponse::err(req.id, error.code(), error.message().to_string()).to_json());
+    }
+
     let state = NodeState::read_only(engine);
-    let resp = match dispatch(&req.method, &req.params, &state) {
+    let resp = match dispatch_with_mode(&req.method, &req.params, &state, RpcMode::ReadOnly) {
         DispatchResult::Ready(Ok(json)) => RpcResponse::ok(req.id, json),
         DispatchResult::Ready(Err(e)) => {
             RpcResponse::err(req.id, e.code(), e.message().to_string())
@@ -492,8 +500,18 @@ fn read_and_process_ref<E: RpcEngineView>(
 
 /// Make a direct in-process RPC call (for testing without HTTP).
 pub fn call_rpc<E: RpcEngineView>(method: &str, params: &[String], engine: &E) -> String {
+    call_rpc_with_mode(method, params, engine, RpcMode::ReadOnly)
+}
+
+/// Make a direct in-process RPC call with an explicit listener mode.
+pub fn call_rpc_with_mode<E: RpcEngineView>(
+    method: &str,
+    params: &[String],
+    engine: &E,
+    mode: RpcMode,
+) -> String {
     let state = NodeState::read_only(engine);
-    match dispatch(method, params, &state) {
+    match dispatch_with_mode(method, params, &state, mode) {
         DispatchResult::Ready(Ok(result)) => RpcResponse::ok(JsonId::Number(1), result).to_json(),
         DispatchResult::Ready(Err(e)) => {
             RpcResponse::err(JsonId::Number(1), e.code(), e.message().to_string()).to_json()
@@ -514,9 +532,10 @@ fn dispatch_to_response<E: RpcEngineMut>(
     params: &[String],
     id: JsonId,
     engine: &mut E,
+    mode: RpcMode,
 ) -> String {
     let state = NodeState::read_only(engine);
-    let resp = match dispatch(method, params, &state) {
+    let resp = match dispatch_with_mode(method, params, &state, mode) {
         DispatchResult::Ready(Ok(json)) => RpcResponse::ok(id, json),
         DispatchResult::Ready(Err(e)) => RpcResponse::err(id, e.code(), e.message().to_string()),
         DispatchResult::SubmitStakingOp(op_bytes) => {
@@ -581,7 +600,12 @@ mod tests {
         let engine = ChainState::new_genesis();
         let resp = call_rpc("indra_fake", &[], &engine);
         assert!(resp.contains("\"error\""));
-        assert!(resp.contains("-32601"));
+        assert!(resp.contains("-32003"));
+        assert!(resp.contains("read-only listener"));
+
+        let full_resp = call_rpc_with_mode("indra_fake", &[], &engine, RpcMode::Full);
+        assert!(full_resp.contains("\"error\""));
+        assert!(full_resp.contains("-32601"));
     }
 
     #[test]

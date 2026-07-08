@@ -379,7 +379,7 @@ pub mod hard_forks {
     /// coordinated deployment, comfortably ahead of the live chain tip at that
     /// time. Do not deploy with this placeholder if the feature is intended to
     /// activate on a live network.
-    pub const VALIDATOR_NETWORK_ADDRESS_HEIGHT: u64 = u64::MAX;
+    pub const VALIDATOR_NETWORK_ADDRESS_HEIGHT: u64 = 19900;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
