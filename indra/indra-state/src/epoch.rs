@@ -249,6 +249,12 @@ pub fn apply_governance_phase_transitions(
     current_epoch: u64,
     height: u64,
 ) -> StateResult<()> {
+    // Governance ops in the boundary block are intentionally processed before
+    // this epoch-transition pass runs (see `apply_block`). Therefore every
+    // phase boundary is inclusive for the phase being closed: an action
+    // included in the exact block that reaches `commit_start_epoch`,
+    // `reveal_start_epoch`, or `tally_epoch` is still evaluated under the old
+    // phase, and the transition takes effect immediately afterward.
     let proposal_ids: Vec<Bytes32> = state.governance.proposals.keys().copied().collect();
     for proposal_id in proposal_ids {
         let phase = match state.governance.proposals.get(&proposal_id) {

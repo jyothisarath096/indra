@@ -574,7 +574,8 @@ Phase 2  COMMIT         20 epochs  (~10 hours)
 
 Phase 3  REVEAL         10 epochs  (~5 hours)
   All who committed MUST reveal (vote_byte, nonce).
-  Votes become public. Non-reveal = deposit burned + abstain.
+  Votes become public. Non-reveal = abstain.
+  Validator non-reveal does not directly affect the proposer's deposit.
   Delegators who disagree may governance-redelegate their
   vote weight to a different validator.
   SNAPSHOT 2 taken at end of Phase 3.
@@ -582,7 +583,10 @@ Phase 3  REVEAL         10 epochs  (~5 hours)
 Phase 4  TALLY          1 epoch    (automatic)
   Final count: Snapshot 1 votes × Snapshot 2 stake weights.
   Non-committed validators count as abstain in denominator.
-  Non-revealed validators count as abstain, deposit burned.
+  Non-revealed validators count as abstain.
+  Deposit is returned if the proposal passes, or if it fails with
+  >=10% support; it is burned only if the proposal fails below that
+  support threshold or the proposer cancels during deliberation.
 
 Phase 5  EXEC DELAY     100 epochs (~50 hours, governable)
   If passed: parameter change queued.
@@ -591,6 +595,12 @@ Phase 5  EXEC DELAY     100 epochs (~50 hours, governable)
 
 **Total governance cycle:** ~160 epochs (~80 hours) from proposal to
 execution under default parameters.
+
+Governance phase boundaries are inclusive for the phase being closed.
+Operations included in the exact block that reaches a transition epoch
+are processed under the old phase first, then the epoch transition takes
+effect. For example, a reveal included in the block that reaches the
+tally epoch is still accepted before the proposal moves to tally.
 
 ### 6.3 Two-snapshot mechanism
 
@@ -985,7 +995,7 @@ security property. This is the strongest achievable hybrid guarantee.
 ```
 Block 300 (epoch 1 boundary) — Proposal submitted:
   Action: SetSlashLivenessBps { value: 8 }  (Tier 2: Critical)
-  Deposit: 1,000 INDRA burned from proposer UTXO
+  Deposit: 1,000 INDRA escrowed from proposer UTXO
   Phase 1 start: epoch 1
   Phase 2 start: epoch 31 (Snapshot 1 taken)
   Phase 3 start: epoch 61 (reveals begin)
