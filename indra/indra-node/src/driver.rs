@@ -3865,6 +3865,77 @@ mod tests {
         },
     }
 
+    fn real_sim_message_class(msg: &RealSimMessage) -> &'static str {
+        match msg {
+            RealSimMessage::Block(_) => "Block",
+            RealSimMessage::Vote(_) => "Vote",
+            RealSimMessage::VrfCommit(_) => "VrfCommit",
+            RealSimMessage::VrfReveal(_) => "VrfReveal",
+            RealSimMessage::QcRequest { .. } => "QcRequest",
+            RealSimMessage::QcResponse { .. } => "QcResponse",
+            RealSimMessage::VrfRevealsRequest { .. } => "VrfRevealsRequest",
+            RealSimMessage::VrfRevealsResponse { .. } => "VrfRevealsResponse",
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct RealSimRelayKey {
+        class: u8,
+        digest: Bytes32,
+    }
+
+    fn real_sim_relay_key(msg: &RealSimMessage) -> Option<RealSimRelayKey> {
+        let (class, mut bytes) = match msg {
+            RealSimMessage::Block(block) => {
+                let mut bytes = Vec::with_capacity(block.encoded_len());
+                block.encode(&mut bytes);
+                (0u8, bytes)
+            }
+            RealSimMessage::Vote(vote) => {
+                let mut bytes = Vec::with_capacity(vote.encoded_len());
+                vote.encode(&mut bytes);
+                (1u8, bytes)
+            }
+            RealSimMessage::VrfCommit(commit) => {
+                let mut bytes = Vec::with_capacity(commit.encoded_len());
+                commit.encode(&mut bytes);
+                (2u8, bytes)
+            }
+            RealSimMessage::VrfReveal(reveal) => {
+                let mut bytes = Vec::with_capacity(reveal.encoded_len());
+                reveal.encode(&mut bytes);
+                (3u8, bytes)
+            }
+            // Point-to-point recovery traffic is not relay-deduped in
+            // production's consensus relay path, so keep it outside the
+            // simulated relay cache too.
+            RealSimMessage::QcRequest { .. }
+            | RealSimMessage::QcResponse { .. }
+            | RealSimMessage::VrfRevealsRequest { .. }
+            | RealSimMessage::VrfRevealsResponse { .. } => return None,
+        };
+        bytes.insert(0, class);
+        Some(RealSimRelayKey {
+            class,
+            digest: Bytes32::from(indra_crypto::sha256(&bytes)),
+        })
+    }
+
+    #[derive(Default)]
+    struct RealDriverSimEventStats {
+        processed_ticks: usize,
+        processed_deliveries: usize,
+        processed_restarts: usize,
+        scheduled_deliveries: usize,
+        broadcast_calls_from_tick: usize,
+        broadcast_calls_from_deliver: usize,
+        broadcast_calls_from_activate: usize,
+        suppressed_rebroadcasts: usize,
+        scheduled_by_class: HashMap<&'static str, usize>,
+        processed_by_class: HashMap<&'static str, usize>,
+        broadcast_by_class: HashMap<&'static str, usize>,
+    }
+
     struct RealSimEvent {
         at_ms: u64,
         seq: u64,
@@ -3928,6 +3999,8 @@ mod tests {
         quorum: usize,
         nodes: Vec<RealSimNode>,
         graph: Vec<HashSet<usize>>,
+        relay_seen: Vec<HashSet<RealSimRelayKey>>,
+        relay_forwarded: Vec<HashMap<RealSimRelayKey, HashSet<usize>>>,
         initial_qc_bytes: Vec<u8>,
         queue: BinaryHeap<RealSimEvent>,
         seq: u64,
@@ -3937,6 +4010,7 @@ mod tests {
         last_observed_round: u32,
         first_quorum_online_round: Option<u32>,
         via_fallback: bool,
+        event_stats: RealDriverSimEventStats,
     }
 
     fn real_sim_seed(index: usize) -> [u8; 32] {
@@ -4088,6 +4162,8 @@ mod tests {
                 quorum,
                 nodes,
                 graph,
+                relay_seen: vec![HashSet::new(); validators],
+                relay_forwarded: vec![HashMap::new(); validators],
                 initial_qc_bytes: qc,
                 queue: BinaryHeap::new(),
                 seq: 0,
@@ -4097,6 +4173,7 @@ mod tests {
                 last_observed_round: 0,
                 first_quorum_online_round: None,
                 via_fallback: false,
+                event_stats: RealDriverSimEventStats::default(),
             }
         }
 
@@ -4115,6 +4192,15 @@ mod tests {
         }
 
         fn schedule(&mut self, at_ms: u64, kind: RealSimEventKind) {
+            if let RealSimEventKind::Deliver { msg, .. } = &kind {
+                self.event_stats.scheduled_deliveries =
+                    self.event_stats.scheduled_deliveries.saturating_add(1);
+                *self
+                    .event_stats
+                    .scheduled_by_class
+                    .entry(real_sim_message_class(msg))
+                    .or_default() += 1;
+            }
             let event = RealSimEvent {
                 at_ms,
                 seq: self.seq,
@@ -4314,11 +4400,24 @@ mod tests {
                 .collect()
         }
 
-        fn relay_targets(&self, node: usize, origin: usize, fanout: usize) -> Vec<usize> {
+        fn relay_targets(
+            &self,
+            node: usize,
+            origin: usize,
+            fanout: usize,
+            key: Option<&RealSimRelayKey>,
+        ) -> Vec<usize> {
             let mut neighbors = self.graph[node]
                 .iter()
                 .copied()
-                .filter(|peer| self.nodes[*peer].online)
+                .filter(|peer| {
+                    self.nodes[*peer].online
+                        && key.is_none_or(|key| {
+                            !self.relay_forwarded[node]
+                                .get(key)
+                                .is_some_and(|forwarded| forwarded.contains(peer))
+                        })
+                })
                 .map(|peer| {
                     let mut seed = Vec::with_capacity(6);
                     seed.extend_from_slice(&(origin as u16).to_le_bytes());
@@ -4457,7 +4556,7 @@ mod tests {
             {
                 self.late_local_commit_cases = self.late_local_commit_cases.saturating_add(1);
             }
-            self.handle_actions(node, actions);
+            self.handle_actions(node, actions, "tick");
             self.sync_phase_clock(node);
             self.sync_driver_timers(node);
             self.try_propose(node);
@@ -4468,7 +4567,7 @@ mod tests {
                 return;
             };
             let actions = driver.retry_precommit_if_waiting();
-            self.handle_actions(node, actions);
+            self.handle_actions(node, actions, "tick");
 
             if self.nodes[node]
                 .driver
@@ -4485,7 +4584,7 @@ mod tests {
                         .unwrap()
                         .on_propose_timeout();
                     self.nodes[node].phase_key = None;
-                    self.handle_actions(node, actions);
+                    self.handle_actions(node, actions, "tick");
                 }
             }
             if self.nodes[node]
@@ -4503,7 +4602,7 @@ mod tests {
                         .unwrap()
                         .on_prevote_timeout();
                     self.nodes[node].phase_key = None;
-                    self.handle_actions(node, actions);
+                    self.handle_actions(node, actions, "tick");
                 }
             }
             if self.nodes[node]
@@ -4596,7 +4695,7 @@ mod tests {
                 driver.process(DriverEvent::InboundBlock { from: None, block })
             };
             self.nodes[node].proposed_slots.insert((height, round));
-            self.handle_actions(node, actions);
+            self.handle_actions(node, actions, "tick");
         }
 
         fn delivery_delay_ms(&self, from: usize, to: usize) -> u64 {
@@ -4604,7 +4703,43 @@ mod tests {
                 + ((from as u64 * 17 + to as u64 * 31 + self.now_ms / 10) % 80)
         }
 
-        fn broadcast(&mut self, from: usize, msg: RealSimMessage) {
+        fn broadcast(&mut self, from: usize, msg: RealSimMessage, source: &'static str) {
+            let relay_key = real_sim_relay_key(&msg);
+            if relay_key
+                .as_ref()
+                .is_some_and(|key| self.relay_seen[from].contains(key))
+            {
+                self.event_stats.suppressed_rebroadcasts =
+                    self.event_stats.suppressed_rebroadcasts.saturating_add(1);
+                return;
+            }
+            if let Some(key) = relay_key.as_ref() {
+                self.relay_seen[from].insert(key.clone());
+            }
+            match source {
+                "tick" => {
+                    self.event_stats.broadcast_calls_from_tick =
+                        self.event_stats.broadcast_calls_from_tick.saturating_add(1)
+                }
+                "deliver" => {
+                    self.event_stats.broadcast_calls_from_deliver = self
+                        .event_stats
+                        .broadcast_calls_from_deliver
+                        .saturating_add(1)
+                }
+                "activate" => {
+                    self.event_stats.broadcast_calls_from_activate = self
+                        .event_stats
+                        .broadcast_calls_from_activate
+                        .saturating_add(1)
+                }
+                _ => {}
+            }
+            *self
+                .event_stats
+                .broadcast_by_class
+                .entry(real_sim_message_class(&msg))
+                .or_default() += 1;
             let fanout = self.relay_fanout_for_message(&msg);
             let mut seen = HashSet::from([from]);
             let mut frontier = vec![(from, self.now_ms)];
@@ -4612,7 +4747,10 @@ mod tests {
                 if !self.nodes[relay_node].online {
                     continue;
                 }
-                for to in self.relay_targets(relay_node, from, fanout) {
+                if let Some(key) = relay_key.as_ref() {
+                    self.relay_seen[relay_node].insert(key.clone());
+                }
+                for to in self.relay_targets(relay_node, from, fanout, relay_key.as_ref()) {
                     if !seen.insert(to) {
                         continue;
                     }
@@ -4625,6 +4763,12 @@ mod tests {
                             msg: msg.clone(),
                         },
                     );
+                    if let Some(key) = relay_key.as_ref() {
+                        self.relay_forwarded[relay_node]
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(to);
+                    }
                     frontier.push((to, arrival));
                 }
             }
@@ -4643,23 +4787,28 @@ mod tests {
             );
         }
 
-        fn handle_actions(&mut self, origin: usize, actions: Vec<DriverAction>) {
+        fn handle_actions(
+            &mut self,
+            origin: usize,
+            actions: Vec<DriverAction>,
+            source: &'static str,
+        ) {
             for action in actions {
                 match action {
                     DriverAction::BroadcastBlock(block) => {
-                        self.broadcast(origin, RealSimMessage::Block(block));
+                        self.broadcast(origin, RealSimMessage::Block(block), source);
                     }
                     DriverAction::BroadcastVote(vote) => {
-                        self.broadcast(origin, RealSimMessage::Vote(vote));
+                        self.broadcast(origin, RealSimMessage::Vote(vote), source);
                     }
                     DriverAction::BroadcastVrfCommit(commit) => {
-                        self.broadcast(origin, RealSimMessage::VrfCommit(commit));
+                        self.broadcast(origin, RealSimMessage::VrfCommit(commit), source);
                     }
                     DriverAction::BroadcastVrfReveal(reveal) => {
-                        self.broadcast(origin, RealSimMessage::VrfReveal(reveal));
+                        self.broadcast(origin, RealSimMessage::VrfReveal(reveal), source);
                     }
                     DriverAction::RequestQC { height } => {
-                        self.broadcast(origin, RealSimMessage::QcRequest { height });
+                        self.broadcast(origin, RealSimMessage::QcRequest { height }, source);
                     }
                     DriverAction::SendQCResponse {
                         to,
@@ -4680,6 +4829,7 @@ mod tests {
                                 round,
                                 missing_validator_ids,
                             },
+                            source,
                         );
                     }
                     DriverAction::SendVrfRevealsResponse {
@@ -4702,7 +4852,7 @@ mod tests {
                         if let Some(driver) = self.nodes[origin].driver.as_mut() {
                             let actions =
                                 driver.process(DriverEvent::InboundBlock { from: None, block });
-                            self.handle_actions(origin, actions);
+                            self.handle_actions(origin, actions, "activate");
                         }
                     }
                     DriverAction::None
@@ -4718,6 +4868,9 @@ mod tests {
         fn deliver(&mut self, from: usize, to: usize, msg: RealSimMessage) {
             if !self.nodes[to].online {
                 return;
+            }
+            if let Some(key) = real_sim_relay_key(&msg) {
+                self.relay_seen[to].insert(key);
             }
             let from_addr = self.nodes[from].addr;
             self.sync_phase_clock(to);
@@ -4778,7 +4931,7 @@ mod tests {
                     reveals,
                 }),
             };
-            self.handle_actions(to, actions);
+            self.handle_actions(to, actions, "deliver");
         }
 
         fn run(
@@ -4796,6 +4949,25 @@ mod tests {
             let mut processed_events = 0usize;
             while let Some(event) = self.queue.pop() {
                 processed_events = processed_events.saturating_add(1);
+                match &event.kind {
+                    RealSimEventKind::Tick { .. } => {
+                        self.event_stats.processed_ticks =
+                            self.event_stats.processed_ticks.saturating_add(1)
+                    }
+                    RealSimEventKind::Deliver { msg, .. } => {
+                        self.event_stats.processed_deliveries =
+                            self.event_stats.processed_deliveries.saturating_add(1);
+                        *self
+                            .event_stats
+                            .processed_by_class
+                            .entry(real_sim_message_class(msg))
+                            .or_default() += 1;
+                    }
+                    RealSimEventKind::RestartStart { .. } => {
+                        self.event_stats.processed_restarts =
+                            self.event_stats.processed_restarts.saturating_add(1)
+                    }
+                }
                 if processed_events % 50_000 == 0 {
                     eprintln!(
                         "[real-driver-restart-sim:progress] scenario={} events={} now_ms={} queue={} online={} finalized={} round_max={}",
@@ -4807,6 +4979,9 @@ mod tests {
                         self.finalized_count(),
                         self.current_round_max(),
                     );
+                    if std::env::var("INDRA_REAL_DRIVER_SIM_EVENT_STATS").is_ok() {
+                        self.log_event_stats(name);
+                    }
                 }
                 if event.at_ms > REAL_DRIVER_SIM_MAX_MS {
                     break;
@@ -4840,6 +5015,9 @@ mod tests {
                 }
             }
             let finalized = self.finalized_count() >= self.quorum;
+            if std::env::var("INDRA_REAL_DRIVER_SIM_EVENT_STATS").is_ok() {
+                self.log_event_stats(name);
+            }
             RealDriverRestartOutcome {
                 name,
                 validators: self.validators,
@@ -4854,6 +5032,25 @@ mod tests {
                 duration_ms: self.now_ms,
                 wall_ms: wall_start.elapsed().as_millis(),
             }
+        }
+
+        fn log_event_stats(&self, name: &str) {
+            eprintln!(
+                "[real-driver-restart-sim:event-stats] scenario={} ticks={} deliveries={} restarts={} scheduled_deliveries={} broadcasts(tick/deliver/activate)={}/{}/{} suppressed_rebroadcasts={} queue={} scheduled_by_class={:?} processed_by_class={:?} broadcast_by_class={:?}",
+                name,
+                self.event_stats.processed_ticks,
+                self.event_stats.processed_deliveries,
+                self.event_stats.processed_restarts,
+                self.event_stats.scheduled_deliveries,
+                self.event_stats.broadcast_calls_from_tick,
+                self.event_stats.broadcast_calls_from_deliver,
+                self.event_stats.broadcast_calls_from_activate,
+                self.event_stats.suppressed_rebroadcasts,
+                self.queue.len(),
+                self.event_stats.scheduled_by_class,
+                self.event_stats.processed_by_class,
+                self.event_stats.broadcast_by_class,
+            );
         }
     }
 
