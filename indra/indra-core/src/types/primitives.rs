@@ -203,9 +203,16 @@ pub const DEFAULT_CHAIN_ID: &str = "indra-testnet-1";
 pub const SPARK_PER_INDRA: u64 = 100_000_000;
 
 /// Genesis supply in Spark. All 1 billion INDRA are pre-minted at genesis.
+///
+/// Constitutional monetary invariant: governance MUST NOT be able to change
+/// this value, the hard cap, era durations, or era reward constants. Any
+/// monetary-policy change requires an explicit protocol upgrade/hard fork, not
+/// a `GovernableAction`.
 pub const GENESIS_SUPPLY_SPARK: u64 = GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA;
 
 /// Hard cap in Spark. Total supply can only decrease via fee burn.
+///
+/// Constitutional monetary invariant: this is not governable at runtime.
 pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
 
 /// Minimum UTXO value in Spark. Outputs below this are rejected.
@@ -230,31 +237,49 @@ pub const MAX_DELEGATION_SPARK: u64 = MINIMUM_VALIDATOR_BOND_SPARK;
 pub const MINIMUM_ACTIVE_SELF_STAKE_SPARK: u64 = MINIMUM_VALIDATOR_BOND_SPARK;
 
 /// Blocks per year assuming a 6 second target block time.
+///
+/// Monetary schedule invariant: governance MUST NOT change reward-era timing.
 pub const BLOCKS_PER_YEAR: u64 = 5_256_000;
 
 /// Blocks per era for Eras 1 and 2 (4 years each).
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_1_2_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 4;
 
 /// Blocks per era for Era 3+ (8 years each).
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_3_PLUS_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 8;
 
 /// Era 1 block reward in Spark.
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_1_BLOCK_REWARD_SPARK: u64 = 1_189_200_000;
 
 /// Era 2 block reward in Spark.
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_2_BLOCK_REWARD_SPARK: u64 = ERA_1_BLOCK_REWARD_SPARK / 2;
 
 /// Era 3 block reward in Spark.
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_3_BLOCK_REWARD_SPARK: u64 = ERA_2_BLOCK_REWARD_SPARK / 2;
 
 /// Era 4 block reward in Spark.
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_4_BLOCK_REWARD_SPARK: u64 = ERA_3_BLOCK_REWARD_SPARK / 2;
 
 /// Era 5 block reward in Spark.
+///
+/// Monetary schedule invariant: not governable at runtime.
 pub const ERA_5_BLOCK_REWARD_SPARK: u64 = ERA_4_BLOCK_REWARD_SPARK / 2;
 
 /// All 1,000,000,000 INDRA are earned through block rewards.
 /// No pre-allocation to any person or entity.
+///
+/// Monetary schedule invariant: governance cannot alter this reward pool.
 pub const VALIDATOR_REWARDS_POOL_SPARK: u64 = 1_000_000_000 * SPARK_PER_INDRA;
 
 /// Fraction of transaction fees burned (basis points).

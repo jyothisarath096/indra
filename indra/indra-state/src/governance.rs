@@ -1017,6 +1017,100 @@ fn proposal_map_len(map: &BTreeMap<Bytes32, ProposalRecord>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epoch::block_reward_at_height;
+    use indra_core::types::primitives::{
+        BLOCKS_PER_YEAR, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+        ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+        ERA_4_BLOCK_REWARD_SPARK, ERA_5_BLOCK_REWARD_SPARK, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
+        VALIDATOR_REWARDS_POOL_SPARK,
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MonetaryPolicySnapshot {
+        genesis_supply_spark: u64,
+        hard_cap_spark: u64,
+        validator_rewards_pool_spark: u64,
+        blocks_per_year: u64,
+        era_1_2_duration_blocks: u64,
+        era_3_plus_duration_blocks: u64,
+        era_rewards_spark: [u64; 5],
+        reward_schedule_samples: Vec<(u64, u64)>,
+    }
+
+    fn monetary_policy_snapshot() -> MonetaryPolicySnapshot {
+        let era_3_start = ERA_1_2_DURATION_BLOCKS.saturating_mul(2);
+        MonetaryPolicySnapshot {
+            genesis_supply_spark: GENESIS_SUPPLY_SPARK,
+            hard_cap_spark: HARD_CAP_SPARK,
+            validator_rewards_pool_spark: VALIDATOR_REWARDS_POOL_SPARK,
+            blocks_per_year: BLOCKS_PER_YEAR,
+            era_1_2_duration_blocks: ERA_1_2_DURATION_BLOCKS,
+            era_3_plus_duration_blocks: ERA_3_PLUS_DURATION_BLOCKS,
+            era_rewards_spark: [
+                ERA_1_BLOCK_REWARD_SPARK,
+                ERA_2_BLOCK_REWARD_SPARK,
+                ERA_3_BLOCK_REWARD_SPARK,
+                ERA_4_BLOCK_REWARD_SPARK,
+                ERA_5_BLOCK_REWARD_SPARK,
+            ],
+            reward_schedule_samples: vec![
+                (0, block_reward_at_height(0)),
+                (
+                    ERA_1_2_DURATION_BLOCKS.saturating_sub(1),
+                    block_reward_at_height(ERA_1_2_DURATION_BLOCKS.saturating_sub(1)),
+                ),
+                (
+                    ERA_1_2_DURATION_BLOCKS,
+                    block_reward_at_height(ERA_1_2_DURATION_BLOCKS),
+                ),
+                (era_3_start, block_reward_at_height(era_3_start)),
+                (
+                    era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS),
+                    block_reward_at_height(era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS)),
+                ),
+                (
+                    era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS.saturating_mul(2)),
+                    block_reward_at_height(
+                        era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS.saturating_mul(2)),
+                    ),
+                ),
+            ],
+        }
+    }
+
+    fn current_governable_action_samples() -> Vec<GovernableAction> {
+        vec![
+            GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK.saturating_mul(2),
+            },
+            GovernableAction::SetProposalDepositSpark {
+                value: 2_000 * SPARK_PER_INDRA,
+            },
+            GovernableAction::SetSlashLivenessBps { value: 25 },
+            GovernableAction::SetSlashDoublePrecommitBps { value: 600 },
+            GovernableAction::SetSlashSurroundVoteBps { value: 1_200 },
+            GovernableAction::SetMaxCommissionBps { value: 1_500 },
+            GovernableAction::SetGovernanceDelayEpochs { value: 200 },
+            GovernableAction::SetGovernanceQuorumBps { value: 6_000 },
+            GovernableAction::SetGovernanceCriticalQuorumBps { value: 7_500 },
+        ]
+    }
+
+    fn is_constitutional_monetary_policy_action(action: &GovernableAction) -> bool {
+        match action {
+            GovernableAction::SetSlashLivenessThresholdEpochs { .. }
+            | GovernableAction::SetMinDelegationSpark { .. }
+            | GovernableAction::SetProposalDepositSpark { .. }
+            | GovernableAction::SetSlashLivenessBps { .. }
+            | GovernableAction::SetSlashDoublePrecommitBps { .. }
+            | GovernableAction::SetSlashSurroundVoteBps { .. }
+            | GovernableAction::SetMaxCommissionBps { .. }
+            | GovernableAction::SetGovernanceDelayEpochs { .. }
+            | GovernableAction::SetGovernanceQuorumBps { .. }
+            | GovernableAction::SetGovernanceCriticalQuorumBps { .. } => false,
+        }
+    }
 
     #[test]
     fn governable_params_default_values_match_constants() {
@@ -1067,6 +1161,36 @@ mod tests {
         let mut params = GovernableParams::default_mainnet();
         params.apply_action(&GovernableAction::SetSlashLivenessBps { value: 25 });
         assert_eq!(params.slash_liveness_bps, 25);
+    }
+
+    #[test]
+    fn governance_actions_are_constitutionally_non_monetary() {
+        let before = monetary_policy_snapshot();
+        let mut params = GovernableParams::default_mainnet();
+        let actions = current_governable_action_samples();
+
+        // There are exactly ten governable actions today. This count and the
+        // exhaustive `is_constitutional_monetary_policy_action` match above are
+        // intentional: adding a new `GovernableAction` must force a deliberate
+        // monetary-policy classification instead of silently expanding the
+        // governance surface.
+        assert_eq!(actions.len(), 10);
+
+        for action in actions {
+            assert!(
+                !is_constitutional_monetary_policy_action(&action),
+                "runtime governance must not expose monetary-policy actions: {action:?}"
+            );
+            params
+                .validate_action(&action)
+                .expect("sample action should be valid under current governance bounds");
+            params.apply_action(&action);
+            assert_eq!(
+                monetary_policy_snapshot(),
+                before,
+                "governance action changed immutable monetary policy snapshot: {action:?}"
+            );
+        }
     }
 
     #[test]
