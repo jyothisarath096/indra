@@ -520,11 +520,12 @@ pub const TARGET_UTILISATION_DENOMINATOR: u64 = 100;
 
 // ── Governance ────────────────────────────────────────────────────────────────
 
-/// Deprecated legacy governance quorum constant.
+/// Deprecated legacy governance YES-stake threshold constant.
 ///
 /// Current governance uses `GovernableParams::governance_quorum_bps` and
-/// `governance_critical_quorum_bps` instead.
-#[deprecated(note = "superseded by GovernableParams governance quorum fields")]
+/// `governance_critical_quorum_bps` as YES-stake thresholds over total
+/// proposal snapshot stake instead.
+#[deprecated(note = "superseded by GovernableParams governance YES-stake threshold fields")]
 pub const QUORUM_THRESHOLD_BPS: u32 = 3_300;
 /// Consensus quorum threshold — strictly more than 2/3 of stake must agree
 /// for a block to be finalised.
@@ -533,8 +534,8 @@ pub const CONSENSUS_QUORUM_BPS: u32 = 6_667;
 /// Deprecated legacy governance pass threshold.
 ///
 /// Current governance requires yes stake to exceed the per-proposal total-stake
-/// quorum in `GovernableParams`.
-#[deprecated(note = "superseded by GovernableParams governance quorum fields")]
+/// threshold in `GovernableParams`.
+#[deprecated(note = "superseded by GovernableParams governance YES-stake threshold fields")]
 pub const PASS_THRESHOLD_BPS: u32 = 6_600; // reduced from 8000 — 80% impossible at 500+ validators
 
 /// Minimum validator commission rate in basis points (500 = 5%).

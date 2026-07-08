@@ -325,6 +325,9 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
                 message: "snapshot2 missing after tally",
             }
         })?;
+        // Governance "quorum" fields are intentionally YES-stake thresholds
+        // over total proposal snapshot stake, not participation thresholds.
+        // See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
         let quorum_bps = match proposal.tier {
             indra_core::types::governance::ProposalTier::Standard => {
                 state.governance.params.governance_quorum_bps

@@ -57,9 +57,13 @@ pub struct GovernableParams {
     pub max_commission_bps: u32,
     /// Governance delay.
     pub governance_delay_epochs: u64,
-    /// Standard quorum bps.
+    /// Standard proposal YES-stake threshold in basis points of total
+    /// governance snapshot stake. This is not a participation quorum; see
+    /// docs/GOVERNANCE_THRESHOLD_DESIGN.md.
     pub governance_quorum_bps: u32,
-    /// Critical quorum bps.
+    /// Critical proposal YES-stake threshold in basis points of total
+    /// governance snapshot stake. This is not a participation quorum; see
+    /// docs/GOVERNANCE_THRESHOLD_DESIGN.md.
     pub governance_critical_quorum_bps: u32,
 }
 
@@ -330,12 +334,15 @@ pub struct GovernanceSnapshot {
 }
 
 impl GovernanceSnapshot {
-    /// Return whether yes stake meets quorum.
+    /// Return whether YES stake clears the configured total-snapshot-stake
+    /// threshold. Despite the historical name, this is not a participation
+    /// quorum; see docs/GOVERNANCE_THRESHOLD_DESIGN.md.
     pub fn quorum_met(&self, yes_stake: u64, quorum_bps: u32) -> bool {
         self.quorum_met_at_height(yes_stake, quorum_bps, u64::MAX)
     }
 
-    /// Return whether yes stake meets quorum under the arithmetic active at `height`.
+    /// Return whether YES stake clears the configured total-snapshot-stake
+    /// threshold under the arithmetic active at `height`.
     pub fn quorum_met_at_height(&self, yes_stake: u64, quorum_bps: u32, height: u64) -> bool {
         if self.total_stake == 0 {
             return false;

@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Phase 5 found two high-priority governance vulnerabilities and three medium/low hardening gaps. GV-01, GV-02, GV-04, GV-08, and GV-09 are now fixed. Governance proposal deposits must be owned by the proposer before the UTXO can be spent, closing the direct funds-at-risk path. Queued governance actions are revalidated immediately before both manual and automatic execution, preserving monotonic safety rules such as "governance quorum can only increase." Client vote encoding now matches state semantics (`0 = no`, `1 = yes`, abstain by not revealing), governance mempool admission validates ops against scratch state before acceptance, and `min_delegation_spark` has a hard upper bound.
+Phase 5 found two high-priority governance vulnerabilities and three medium/low hardening gaps. GV-01, GV-02, GV-04, GV-08, and GV-09 are now fixed. Governance proposal deposits must be owned by the proposer before the UTXO can be spent, closing the direct funds-at-risk path. Queued governance actions are revalidated immediately before both manual and automatic execution, preserving monotonic safety rules such as "governance YES-stake thresholds can only increase." Client vote encoding now matches state semantics (`0 = no`, `1 = yes`, abstain by not revealing), governance mempool admission validates ops against scratch state before acceptance, and `min_delegation_spark` has a hard upper bound.
 
 Regression tests were added for all fixed Phase 5 findings. Remaining lower-priority governance cleanup is historical proposal pruning/archival.
 
@@ -14,9 +14,9 @@ Regression tests were added for all fixed Phase 5 findings. Remaining lower-prio
 | GV-02 | Authorization | CLI/FFI vote encoding now matches state reveal semantics | MEDIUM | FIXED |
 | GV-03 | Authorization | Double voting is prevented by one commit/reveal per validator per proposal | SAFE | VERIFIED |
 | GV-04 | Lifecycle | Governance mempool admission validates ops before acceptance; historical proposal pruning remains cleanup | MEDIUM | FIXED |
-| GV-05 | Quorum | Quorum base is snapshot total governance stake, not live mutable stake | SAFE | VERIFIED |
-| GV-06 | Quorum | Approval requires yes stake to exceed the configured total-stake threshold; minority pass not possible under defaults | SAFE | VERIFIED |
-| GV-07 | Quorum | Thresholds are stake-weighted, not validator-count-weighted | SAFE | VERIFIED |
+| GV-05 | Threshold denominator | YES-threshold denominator is snapshot total governance stake, not live mutable stake | SAFE | VERIFIED |
+| GV-06 | YES threshold | Approval requires yes stake to exceed the configured total-stake threshold; minority pass not possible under defaults | SAFE | VERIFIED |
+| GV-07 | YES threshold | Thresholds are stake-weighted, not validator-count-weighted | SAFE | VERIFIED |
 | GV-08 | Parameters | `min_delegation_spark` now has a maximum and stale governance constants are deprecated | LOW | FIXED |
 | GV-09 | Parameters | Queued governance-of-governance actions are now revalidated at execution time | HIGH | FIXED |
 | GV-10 | Parameters | Phase 4 security constants are mostly hard-coded and not governable | SAFE | VERIFIED |
@@ -153,7 +153,7 @@ Regression tests:
 - `governance_mempool_rejects_op_for_nonexistent_proposal`
 - `governance_mempool_accepts_valid_op`
 
-### GV-05 — Quorum Calculation Base
+### GV-05 — YES-Threshold Denominator
 
 Severity: SAFE
 
@@ -167,7 +167,7 @@ Code evidence:
 
 Analysis:
 
-Governance voting weight is based on a snapshot, avoiding mid-vote stake mutation changing the quorum base. Delegated stake is intentionally included for governance, with a reveal-phase redelegation overlay available to delegators. This is a governance-policy choice rather than a consensus-safety issue.
+Governance voting weight is based on a snapshot, avoiding mid-vote stake mutation changing the YES-threshold denominator. Delegated stake is intentionally included for governance, with a reveal-phase redelegation overlay available to delegators. This is a governance-policy choice rather than a consensus-safety issue.
 
 ### GV-06 — Approval Threshold and Minority-Pass Risk
 
@@ -177,7 +177,7 @@ Status: VERIFIED
 
 Code evidence:
 
-- Default standard quorum is 5000 bps and default critical quorum is 6700 bps: `GovernableParams::default_mainnet` at `indra-state/src/governance.rs:62`.
+- Default standard YES-stake threshold is 5000 bps and default critical YES-stake threshold is 6700 bps: `GovernableParams::default_mainnet` at `indra-state/src/governance.rs:62`.
 - A proposal passes only when `yes_stake > bps_of(total_stake, quorum_bps)`: `GovernanceSnapshot::quorum_met_at_height` at `indra-state/src/governance.rs:330`.
 - No votes and non-reveals are not counted as yes; they effectively block passage unless yes stake exceeds the threshold.
 
@@ -265,12 +265,12 @@ Code evidence:
 
 Attack scenario:
 
-1. Current standard governance quorum is 5000 bps.
-2. Proposal A raises standard quorum to 6000 bps. It is valid at proposal time and passes.
-3. Proposal B raises standard quorum to 7000 bps. It is also valid and executes first.
-4. Proposal A executes later and sets quorum to 6000 bps.
-5. Before the fix, the monotonic rule "governance_quorum_bps can only increase" was bypassed because A was not revalidated against the current 7000 bps value.
-6. After the fix, proposal A fails execution-time revalidation and quorum remains 7000 bps.
+1. Current standard governance YES-stake threshold is 5000 bps.
+2. Proposal A raises the standard threshold to 6000 bps. It is valid at proposal time and passes.
+3. Proposal B raises the standard threshold to 7000 bps. It is also valid and executes first.
+4. Proposal A executes later and sets the threshold to 6000 bps.
+5. Before the fix, the monotonic rule "`governance_quorum_bps` can only increase" was bypassed because A was not revalidated against the current 7000 bps value.
+6. After the fix, proposal A fails execution-time revalidation and the threshold remains 7000 bps.
 
 The same pattern can affect:
 
@@ -414,7 +414,7 @@ Governance cannot directly undo the high-severity Phase 4 fixes:
 - ST-13 slash evidence window and unbonding period are hard-coded constants, not governable.
 - ST-05 minimum active self-stake is hard-coded through `MINIMUM_ACTIVE_SELF_STAKE_SPARK`.
 
-Governance can tune `min_delegation_spark`, slashing basis points, commission ceilings, governance delays, and governance quorums within the explicit bounds above. Those are economically sensitive but bounded.
+Governance can tune `min_delegation_spark`, slashing basis points, commission ceilings, governance delays, and governance YES-stake thresholds within the explicit bounds above. Those are economically sensitive but bounded.
 
 ## Proof-of-Concept / Regression Tests
 
@@ -445,12 +445,12 @@ Target finding: GV-09.
 ```rust
 #[test]
 fn queued_governance_action_is_revalidated_before_execution() {
-    // Queue two passed governance quorum proposals:
+    // Queue two passed governance YES-stake threshold proposals:
     // A: SetGovernanceQuorumBps { value: 6000 }
     // B: SetGovernanceQuorumBps { value: 7000 }
     // Execute B first.
-    // Previous vulnerable behavior: executing A later lowers quorum to 6000.
-    // Fixed behavior: A fails execution-time validation and quorum remains 7000.
+    // Previous vulnerable behavior: executing A later lowers the threshold to 6000.
+    // Fixed behavior: A fails execution-time validation and the threshold remains 7000.
 }
 ```
 

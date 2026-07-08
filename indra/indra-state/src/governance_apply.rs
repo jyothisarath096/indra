@@ -412,7 +412,8 @@ fn apply_execute(
 ///
 /// Actions are validated when proposed, but governance parameters can change
 /// before execution. Rechecking here preserves monotonic safety constraints
-/// such as "quorum can only increase" even when multiple proposals are queued.
+/// such as "governance YES-stake thresholds can only increase" even when
+/// multiple proposals are queued.
 pub(crate) fn revalidate_queued_governance_action_or_fail(
     state: &mut ChainState,
     proposal_id: Bytes32,

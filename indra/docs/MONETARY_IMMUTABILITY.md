@@ -33,7 +33,7 @@ participation parameters:
   evidence;
 - maximum validator commission;
 - governance execution delay;
-- standard and critical governance quorum thresholds.
+- standard and critical governance YES-stake thresholds.
 
 Some of these are economic in the broad operational sense: they affect
 participation costs, slashing penalties, or validator/delegator reward

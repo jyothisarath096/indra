@@ -615,8 +615,12 @@ a different validator during Phase 3.
 
 **Vote count:** `yes_stake / snapshot1_total_stake > quorum_bps / 10000`
 
-Snapshot 1 total stake is the denominator for all quorum calculations,
-including abstains. Abstentions cannot be manufactured by non-participation.
+Despite the historical field name, `quorum_bps` is a YES-stake threshold
+over total Snapshot 1 stake, not a participation quorum. Snapshot 1 total
+stake is the denominator, including abstains and non-participation. A
+proposal passes only if YES stake alone exceeds the configured threshold;
+YES beating NO among participants is not sufficient. See
+`docs/GOVERNANCE_THRESHOLD_DESIGN.md`.
 
 ### 6.4 Governance redelegation
 
@@ -637,19 +641,19 @@ impractical.
 
 ### 6.5 Proposal tiers
 
-**Tier 1 — Standard** (50% of Snapshot 1 stake required):
+**Tier 1 — Standard** (YES stake must exceed 50% of Snapshot 1 stake):
 - `slash_liveness_threshold_epochs` — consecutive epochs before liveness penalty
 - `min_delegation_spark` — global delegation dust floor
 - `proposal_deposit_spark` — governance proposal deposit amount
 
-**Tier 2 — Critical** (67% of Snapshot 1 stake required):
+**Tier 2 — Critical** (YES stake must exceed 67% of Snapshot 1 stake):
 - `slash_liveness_bps` — liveness penalty rate (floor: 1 BPS)
 - `slash_double_precommit_bps` — double-precommit slash rate
 - `slash_surround_vote_bps` — surround-vote slash rate
 - `max_commission_bps` — maximum validator commission (monotonic decrease only)
 - `governance_delay_epochs` — execution delay (monotonic increase only)
-- `governance_quorum_bps` — standard quorum threshold (monotonic increase only)
-- `governance_critical_quorum_bps` — critical quorum threshold (monotonic increase only)
+- `governance_quorum_bps` — standard YES-stake threshold over total snapshot stake (monotonic increase only)
+- `governance_critical_quorum_bps` — critical YES-stake threshold over total snapshot stake (monotonic increase only)
 
 ### 6.6 Permanently immutable parameters
 
@@ -666,7 +670,7 @@ any governance action regardless of support level:
 
 - `max_commission_bps` — can only **decrease** (protects existing delegators)
 - `governance_delay_epochs` — can only **increase** (protects community reaction time)
-- `governance_quorum_bps` — can only **increase** (harder to pass = safer)
+- `governance_quorum_bps` — can only **increase** (higher YES-stake threshold = safer)
 - `governance_critical_quorum_bps` — can only **increase**
 
 These constraints are enforced at proposal validation time. A proposal
@@ -686,8 +690,8 @@ Cooldown:                   1 new proposal per proposer per 10 epochs
 ### 6.9 Default governance parameters
 
 ```
-Standard quorum:            50.00% of Snapshot 1 stake
-Critical quorum:            67.00% of Snapshot 1 stake
+Standard YES threshold:     >50.00% of Snapshot 1 stake
+Critical YES threshold:     >67.00% of Snapshot 1 stake
 Execution delay:            100 epochs (~50 hours)
 Proposal deposit:           1,000 INDRA
 Max commission:             20% (may only decrease via governance)
@@ -944,8 +948,8 @@ Commission:
   Range:                     0–max_commission_bps
 
 Governance (default):
-  Standard quorum:           50% (5,000 BPS)
-  Critical quorum:           67% (6,700 BPS)
+  Standard YES threshold:    >50% of Snapshot 1 stake (5,000 BPS)
+  Critical YES threshold:    >67% of Snapshot 1 stake (6,700 BPS)
   Execution delay:           100 epochs (~50 hours)
   Proposal deposit:          1,000 INDRA
   Active proposals max:      3 globally
@@ -1019,7 +1023,7 @@ Epoch 71 — Tally:
     + bonkai 50k (lost redeleg) + kushal 100k = 400k total
   YES: buddhi 100k + siddhi 150k = 250k
   NO:  bonkai 50k + kushal 100k = 150k
-  YES% = 250k/400k = 62.5% < 67% (critical quorum)
+  YES% = 250k/400k = 62.5% < 67% critical YES threshold
   → Proposal FAILS. Deposit returned (>10% support).
 
 Alternative: if YES = 270k (>67%), proposal passes → executes at epoch 171.

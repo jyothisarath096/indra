@@ -127,14 +127,20 @@ pub enum GovernableAction {
         /// New governance delay in epochs.
         value: u64,
     },
-    /// Set standard governance quorum.
+    /// Set standard governance YES-stake threshold.
+    ///
+    /// This threshold is applied to total proposal snapshot stake, not
+    /// participating stake. See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
     SetGovernanceQuorumBps {
-        /// New standard quorum in basis points.
+        /// New standard YES-stake threshold in basis points.
         value: u32,
     },
-    /// Set critical governance quorum.
+    /// Set critical governance YES-stake threshold.
+    ///
+    /// This threshold is applied to total proposal snapshot stake, not
+    /// participating stake. See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
     SetGovernanceCriticalQuorumBps {
-        /// New critical quorum in basis points.
+        /// New critical YES-stake threshold in basis points.
         value: u32,
     },
 }
