@@ -1,5 +1,7 @@
 //! `indra-governance` — build and submit governance operations.
 
+use std::path::{Path, PathBuf};
+
 use indra_cli::{
     fetch_chain_id, reconstruct_keypair, staking::http_post, CliError, CliResult, KeysFile,
 };
@@ -8,12 +10,14 @@ use indra_core::{
     types::{
         crypto::{HybridPubKey, HybridSignature},
         governance::{
-            governance_signing_domain, GovernableAction, GovernanceOpV2, GovernancePayload,
+            governance_signing_domain, governance_vote_commit_hash, GovernableAction,
+            GovernanceOpV2, GovernancePayload,
         },
         primitives::{Bytes32, VariableBytes},
     },
 };
 use indra_crypto::{sha256, HybridKeypair};
+use rand::RngCore;
 
 fn main() {
     if let Err(error) = run() {
@@ -30,7 +34,8 @@ fn run() -> CliResult<()> {
     }
 
     let command = args[0].as_str();
-    let keys = KeysFile::load(&flag_value(&args, "--keys").unwrap_or_else(|| "keys.json".into()))?;
+    let keys_path = flag_value(&args, "--keys").unwrap_or_else(|| "keys.json".into());
+    let keys = KeysFile::load(&keys_path)?;
     let keypair = reconstruct_keypair(&keys)?;
     let signer_id = signer_id_from_keys(&keys);
     let node_url = flag_value(&args, "--node").unwrap_or_else(|| "http://127.0.0.1:8545".into());
@@ -51,17 +56,20 @@ fn run() -> CliResult<()> {
         "commit" => {
             let proposal_id = parse_hex32_required(&args, "--proposal-id")?;
             let vote = parse_vote(&required_flag(&args, "--vote")?)?;
-            let vote_nonce = parse_hex32_required(&args, "--vote-nonce")?;
+            let vote_nonce = vote_nonce_for_commit(&args, &keys_path, proposal_id, signer_id)?;
             GovernancePayload::Commit {
                 proposal_id,
-                commit_hash: compute_vote_commit_hash(vote, vote_nonce),
+                commit_hash: governance_vote_commit_hash(proposal_id, signer_id, vote, vote_nonce),
             }
         }
-        "reveal" => GovernancePayload::Reveal {
-            proposal_id: parse_hex32_required(&args, "--proposal-id")?,
-            vote: parse_vote(&required_flag(&args, "--vote")?)?,
-            nonce: parse_hex32_required(&args, "--vote-nonce")?,
-        },
+        "reveal" => {
+            let proposal_id = parse_hex32_required(&args, "--proposal-id")?;
+            GovernancePayload::Reveal {
+                proposal_id,
+                vote: parse_vote(&required_flag(&args, "--vote")?)?,
+                nonce: vote_nonce_for_reveal(&args, &keys_path, proposal_id, signer_id)?,
+            }
+        }
         "redelegate" => GovernancePayload::Redelegate {
             proposal_id: parse_hex32_required(&args, "--proposal-id")?,
             from_validator: parse_hex32_required(&args, "--from-validator")?,
@@ -167,13 +175,6 @@ fn parse_governable_action(args: &[String]) -> CliResult<GovernableAction> {
     }
 }
 
-fn compute_vote_commit_hash(vote: u8, nonce: Bytes32) -> Bytes32 {
-    let mut bytes = Vec::with_capacity(33);
-    vote.encode(&mut bytes);
-    nonce.encode(&mut bytes);
-    Bytes32::from(sha256(&bytes))
-}
-
 fn fetch_governance_nonce(node_url: &str, signer_id: Bytes32) -> CliResult<u64> {
     let body = format!(
         r#"{{"jsonrpc":"2.0","method":"indra_getGovernanceNonce","params":["{}"],"id":1}}"#,
@@ -210,6 +211,133 @@ fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey
         pq_pk: VariableBytes::from_slice(&public.pq.0)
             .map_err(|_| CliError::Transaction("pq pubkey too large".into()))?,
     })
+}
+
+fn vote_nonce_for_commit(
+    args: &[String],
+    keys_path: &str,
+    proposal_id: Bytes32,
+    signer_id: Bytes32,
+) -> CliResult<Bytes32> {
+    let store_path = vote_nonce_store_path(args, keys_path);
+    if let Some(raw) = flag_value(args, "--vote-nonce") {
+        let nonce = parse_hex32(&raw)?;
+        save_vote_nonce(&store_path, proposal_id, signer_id, nonce)?;
+        return Ok(nonce);
+    }
+    if let Some(existing) = load_vote_nonce(&store_path, proposal_id, signer_id)? {
+        return Ok(existing);
+    }
+    let nonce = generate_vote_nonce();
+    save_vote_nonce(&store_path, proposal_id, signer_id, nonce)?;
+    println!(
+        "generated_vote_nonce: {} (saved to {})",
+        hex::encode(nonce.0),
+        store_path.display()
+    );
+    Ok(nonce)
+}
+
+fn vote_nonce_for_reveal(
+    args: &[String],
+    keys_path: &str,
+    proposal_id: Bytes32,
+    signer_id: Bytes32,
+) -> CliResult<Bytes32> {
+    if let Some(raw) = flag_value(args, "--vote-nonce") {
+        return parse_hex32(&raw);
+    }
+    let store_path = vote_nonce_store_path(args, keys_path);
+    load_vote_nonce(&store_path, proposal_id, signer_id)?.ok_or_else(|| {
+        CliError::MissingArgument(format!(
+            "--vote-nonce (no saved nonce for proposal {} / validator {} in {})",
+            hex::encode(proposal_id.0),
+            hex::encode(signer_id.0),
+            store_path.display()
+        ))
+    })
+}
+
+fn generate_vote_nonce() -> Bytes32 {
+    let mut bytes = [0u8; 32];
+    let mut rng = rand::rngs::OsRng;
+    rng.fill_bytes(&mut bytes);
+    Bytes32::from(bytes)
+}
+
+fn vote_nonce_store_path(args: &[String], keys_path: &str) -> PathBuf {
+    flag_value(args, "--vote-nonce-store")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_vote_nonce_store_path(keys_path))
+}
+
+fn default_vote_nonce_store_path(keys_path: &str) -> PathBuf {
+    let keys_path = Path::new(keys_path);
+    keys_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("governance_vote_nonces.txt")
+}
+
+fn load_vote_nonce(
+    path: &Path,
+    proposal_id: Bytes32,
+    signer_id: Bytes32,
+) -> CliResult<Option<Bytes32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
+    let proposal_hex = hex::encode(proposal_id.0);
+    let signer_hex = hex::encode(signer_id.0);
+    for line in contents.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 3 && parts[0] == proposal_hex && parts[1] == signer_hex {
+            return parse_hex32(parts[2]).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn save_vote_nonce(
+    path: &Path,
+    proposal_id: Bytes32,
+    signer_id: Bytes32,
+    nonce: Bytes32,
+) -> CliResult<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Io(format!("{}: {}", parent.display(), e)))?;
+    }
+    let proposal_hex = hex::encode(proposal_id.0);
+    let signer_hex = hex::encode(signer_id.0);
+    let nonce_hex = hex::encode(nonce.0);
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    if path.exists() {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
+        for line in contents.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 3 && parts[0] == proposal_hex && parts[1] == signer_hex {
+                lines.push(format!("{proposal_hex} {signer_hex} {nonce_hex}"));
+                replaced = true;
+            } else if !line.trim().is_empty() {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    if !replaced {
+        lines.push(format!("{proposal_hex} {signer_hex} {nonce_hex}"));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(path, out).map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))
 }
 
 fn parse_vote(raw: &str) -> CliResult<u8> {
@@ -309,13 +437,15 @@ Commands:\n\
 Common flags:\n\
   --keys <path>    Path to keys.json (default: keys.json)\n\
   --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n\
-  --nonce <n>      Governance nonce override\n\
-  --dry-run        Build and sign but do not submit\n\n\
+	  --nonce <n>      Governance nonce override\n\
+	  --vote-nonce-store <path>  Local vote nonce store (default: beside keys.json)\n\
+	  --dry-run        Build and sign but do not submit\n\n\
 Propose flags:\n\
   --action <name> --value <n> --deposit-utxo <hex> --title <text> --description <text>\n\n\
 Vote flags:\n\
-  --proposal-id <hex> --vote yes|no --vote-nonce <32-byte-hex>\n\
-  Abstain by not submitting a reveal op."
+  --proposal-id <hex> --vote yes|no [--vote-nonce <32-byte-hex>]\n\
+  Commit auto-generates and saves --vote-nonce by default; reveal reloads it.\n\
+	  Abstain by not submitting a reveal op."
     );
 }
 
@@ -341,5 +471,47 @@ mod tests {
     fn abstain_behavior_is_explicitly_documented() {
         let err = parse_vote("abstain").unwrap_err().to_string();
         assert!(err.contains("not submitting a reveal op"));
+    }
+
+    #[test]
+    fn cli_auto_generates_distinct_nonces_across_proposals() {
+        let path = std::env::temp_dir().join(format!(
+            "indra-governance-nonces-{}-{}.txt",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let keys_path = std::env::temp_dir()
+            .join("keys.json")
+            .to_string_lossy()
+            .to_string();
+        let args = vec![
+            "commit".to_string(),
+            "--vote-nonce-store".to_string(),
+            path_str,
+        ];
+        let signer_id = Bytes32::from([0xA1; 32]);
+        let proposal_a = Bytes32::from([0xB1; 32]);
+        let proposal_b = Bytes32::from([0xB2; 32]);
+
+        let nonce_a = vote_nonce_for_commit(&args, &keys_path, proposal_a, signer_id).unwrap();
+        let nonce_b = vote_nonce_for_commit(&args, &keys_path, proposal_b, signer_id).unwrap();
+
+        assert_ne!(
+            nonce_a, nonce_b,
+            "auto-generated vote nonces should be distinct across proposals"
+        );
+        assert_eq!(
+            vote_nonce_for_reveal(&args, &keys_path, proposal_a, signer_id).unwrap(),
+            nonce_a,
+            "reveal path should load the saved nonce without an operator-supplied override"
+        );
+        assert_eq!(
+            vote_nonce_for_reveal(&args, &keys_path, proposal_b, signer_id).unwrap(),
+            nonce_b,
+            "reveal path should load the saved nonce for the matching proposal"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

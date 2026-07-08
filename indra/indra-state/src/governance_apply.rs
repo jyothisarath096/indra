@@ -1,15 +1,13 @@
 //! Governance operation application.
 
-use indra_core::{
-    codec::Encode,
-    types::{
-        crypto::HybridPubKey,
-        governance::{
-            compute_proposal_id, governance_signing_domain, GovernanceOpV2, GovernancePayload,
-        },
-        primitives::Bytes32,
-        transaction::OutputV1,
+use indra_core::types::{
+    crypto::HybridPubKey,
+    governance::{
+        compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
+        GovernanceOpV2, GovernancePayload,
     },
+    primitives::Bytes32,
+    transaction::OutputV1,
 };
 use indra_crypto::{commit, prove_range, sha256, verify_hybrid};
 use rand::{rngs::StdRng, SeedableRng};
@@ -313,10 +311,7 @@ fn apply_reveal(
     if proposal.reveals.contains_key(&op.signer_id) {
         return invalid("duplicate reveal");
     }
-    let mut bytes = Vec::with_capacity(33);
-    vote.encode(&mut bytes);
-    nonce.encode(&mut bytes);
-    let expected = Bytes32::from(sha256(&bytes));
+    let expected = governance_vote_commit_hash(*proposal_id, op.signer_id, vote, *nonce);
     if expected != commit.commit_hash {
         return invalid("reveal does not match commit hash");
     }
@@ -696,6 +691,7 @@ fn _assert_params_send(_: &GovernableParams, _: &GovernanceState) {}
 mod tests {
     use super::*;
     use indra_core::{
+        codec::Encode,
         types::{
             crypto::{CommitmentV1, HybridSignature},
             governance::{GovernableAction, GovernanceActionType},
@@ -1229,5 +1225,51 @@ mod tests {
             result,
             Err(StateError::InvalidGovernanceOp { reason }) if reason.contains("vote must be 0 or 1")
         ));
+    }
+
+    #[test]
+    fn reveal_verification_uses_domain_separated_hash() {
+        let mut state = ChainState::new_genesis();
+        let proposal_id = Bytes32::from([0xAB; 32]);
+        let validator_id = Bytes32::from([0xCD; 32]);
+        let nonce = Bytes32::from([0xEF; 32]);
+        let vote = 1u8;
+        let (proposer_pubkey, _) = keypair(0xAB);
+        let mut proposal = proposal_record(
+            proposal_id,
+            proposer_pubkey,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            ProposalPhase::Reveal,
+        );
+        proposal.commits.insert(
+            validator_id,
+            VoteCommit {
+                validator_id,
+                commit_hash: governance_vote_commit_hash(proposal_id, validator_id, vote, nonce),
+                committed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+        let op = GovernanceOpV2 {
+            action_type: GovernanceActionType::RevealVote,
+            signer_id: validator_id,
+            nonce: 1,
+            payload: GovernancePayload::Reveal {
+                proposal_id,
+                vote,
+                nonce,
+            },
+            signature: dummy_sig(),
+        };
+
+        apply_reveal(&mut state, &op, 0, &proposal_id, vote, &nonce).unwrap();
+
+        assert!(state.governance.proposals[&proposal_id]
+            .reveals
+            .get(&validator_id)
+            .map(|reveal| reveal.vote)
+            .unwrap_or(false));
     }
 }

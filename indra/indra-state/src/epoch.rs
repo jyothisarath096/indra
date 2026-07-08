@@ -434,10 +434,36 @@ pub fn compute_snapshot2(proposal: &ProposalRecord) -> GovernanceSnapshot {
         if !proposal.reveals.contains_key(&redelegation.to_validator) {
             continue;
         }
-        if let Some(from_weight) = weights.get_mut(&redelegation.from_validator) {
-            *from_weight = from_weight.saturating_sub(redelegation.amount_spark);
+        if !weights.contains_key(&redelegation.from_validator) {
+            eprintln!(
+                "[governance] skipping malformed redelegation: from_validator {} absent from snapshot1",
+                hex::encode(&redelegation.from_validator.0[..4])
+            );
+            continue;
         }
-        let to_weight = weights.entry(redelegation.to_validator).or_insert(0);
+        if !weights.contains_key(&redelegation.to_validator) {
+            eprintln!(
+                "[governance] skipping malformed redelegation: to_validator {} absent from snapshot1",
+                hex::encode(&redelegation.to_validator.0[..4])
+            );
+            continue;
+        }
+        let from_weight = weights
+            .get_mut(&redelegation.from_validator)
+            .expect("from_validator presence checked above");
+        if *from_weight < redelegation.amount_spark {
+            eprintln!(
+                "[governance] skipping malformed redelegation: amount {} exceeds snapshot weight {} for validator {}",
+                redelegation.amount_spark,
+                *from_weight,
+                hex::encode(&redelegation.from_validator.0[..4])
+            );
+            continue;
+        }
+        *from_weight = from_weight.saturating_sub(redelegation.amount_spark);
+        let to_weight = weights
+            .get_mut(&redelegation.to_validator)
+            .expect("to_validator presence checked above");
         *to_weight = to_weight.saturating_add(redelegation.amount_spark);
     }
     GovernanceSnapshot {
@@ -905,7 +931,7 @@ mod tests {
     use super::*;
     use crate::{
         compute_state_root,
-        governance::{VoteCommit, VoteReveal},
+        governance::{GovernanceRedelegation, VoteCommit, VoteReveal},
         validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
     };
     use indra_core::{
@@ -1154,6 +1180,151 @@ mod tests {
         assert!(state.utxos.all_entries().any(|entry| {
             entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
         }));
+    }
+
+    #[test]
+    fn snapshot2_never_creates_weight_for_non_snapshot1_validator() {
+        let proposal_id = Bytes32::from([0x51; 32]);
+        let from_validator = Bytes32::from([0xA1; 32]);
+        let non_snapshot_validator = Bytes32::from([0xB1; 32]);
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert(from_validator, 100);
+        let mut proposal = ProposalRecord {
+            proposal_id,
+            proposer_id: Bytes32::from([0x01; 32]),
+            proposer_pubkey: governance_test_pubkey(0x51),
+            tier: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            }
+            .tier(),
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            title: "snapshot2".into(),
+            description: "defensive target bound".into(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch: 0,
+            commit_start_epoch: 0,
+            reveal_start_epoch: 0,
+            tally_epoch: 0,
+            exec_delay_epochs: 0,
+            executable_after_epoch: 0,
+            phase: ProposalPhase::Reveal,
+            snapshot1: Some(GovernanceSnapshot {
+                weights,
+                total_stake: 100,
+            }),
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: vec![GovernanceRedelegation {
+                delegator_id: Bytes32::from([0xD1; 32]),
+                from_validator,
+                to_validator: non_snapshot_validator,
+                amount_spark: 40,
+            }],
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: None,
+        };
+        proposal.reveals.insert(
+            from_validator,
+            VoteReveal {
+                validator_id: from_validator,
+                vote: false,
+                revealed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            non_snapshot_validator,
+            VoteReveal {
+                validator_id: non_snapshot_validator,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+
+        let snapshot2 = compute_snapshot2(&proposal);
+
+        assert_eq!(snapshot2.weights.get(&from_validator), Some(&100));
+        assert!(!snapshot2.weights.contains_key(&non_snapshot_validator));
+        assert_eq!(snapshot2.total_stake, 100);
+    }
+
+    #[test]
+    fn snapshot2_redelegation_moves_weight_when_both_validators_are_in_snapshot1() {
+        let proposal_id = Bytes32::from([0x52; 32]);
+        let from_validator = Bytes32::from([0xA2; 32]);
+        let to_validator = Bytes32::from([0xB2; 32]);
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert(from_validator, 100);
+        weights.insert(to_validator, 50);
+        let mut proposal = ProposalRecord {
+            proposal_id,
+            proposer_id: Bytes32::from([0x02; 32]),
+            proposer_pubkey: governance_test_pubkey(0x52),
+            tier: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            }
+            .tier(),
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            title: "snapshot2".into(),
+            description: "normal redelegation".into(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch: 0,
+            commit_start_epoch: 0,
+            reveal_start_epoch: 0,
+            tally_epoch: 0,
+            exec_delay_epochs: 0,
+            executable_after_epoch: 0,
+            phase: ProposalPhase::Reveal,
+            snapshot1: Some(GovernanceSnapshot {
+                weights,
+                total_stake: 150,
+            }),
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: vec![GovernanceRedelegation {
+                delegator_id: Bytes32::from([0xD2; 32]),
+                from_validator,
+                to_validator,
+                amount_spark: 40,
+            }],
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: None,
+        };
+        proposal.reveals.insert(
+            from_validator,
+            VoteReveal {
+                validator_id: from_validator,
+                vote: false,
+                revealed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            to_validator,
+            VoteReveal {
+                validator_id: to_validator,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+
+        let snapshot2 = compute_snapshot2(&proposal);
+
+        assert_eq!(snapshot2.weights.get(&from_validator), Some(&60));
+        assert_eq!(snapshot2.weights.get(&to_validator), Some(&90));
+        assert_eq!(snapshot2.total_stake, 150);
     }
 
     #[test]

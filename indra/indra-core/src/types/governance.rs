@@ -266,7 +266,9 @@ pub enum GovernancePayload {
     Commit {
         /// Proposal id.
         proposal_id: Bytes32,
-        /// SHA-256(vote_byte || nonce_32_bytes).
+        /// Domain-separated hidden-vote commitment.
+        ///
+        /// See [`governance_vote_commit_hash`] for the exact preimage.
         commit_hash: Bytes32,
     },
     /// Vote reveal.
@@ -529,6 +531,29 @@ pub fn governance_signing_domain(
     buf
 }
 
+/// Compute a domain-separated hidden-vote commitment.
+///
+/// Preimage:
+/// `INDRA-gov-commit-v1:` || `proposal_id` || `validator_id` || `vote` || `nonce`
+///
+/// The proposal and validator binding are intentionally inside the commitment
+/// hash itself, not only in the surrounding signed governance operation, so a
+/// reused `(vote, nonce)` pair cannot produce the same commitment across
+/// proposals or validators.
+pub fn governance_vote_commit_hash(
+    proposal_id: Bytes32,
+    validator_id: Bytes32,
+    vote: u8,
+    nonce: Bytes32,
+) -> Bytes32 {
+    let mut buf = b"INDRA-gov-commit-v1:".to_vec();
+    proposal_id.encode(&mut buf);
+    validator_id.encode(&mut buf);
+    vote.encode(&mut buf);
+    nonce.encode(&mut buf);
+    Bytes32::from(sha256(&buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +590,29 @@ mod tests {
         assert_eq!(
             op,
             GovernanceOpV2::decode_exact(&op.encode_to_vec()).unwrap()
+        );
+    }
+
+    #[test]
+    fn commit_hash_includes_proposal_and_validator_binding() {
+        let vote = 1;
+        let nonce = Bytes32::from([0xAA; 32]);
+        let proposal_a = Bytes32::from([0x11; 32]);
+        let proposal_b = Bytes32::from([0x22; 32]);
+        let validator_a = Bytes32::from([0x33; 32]);
+        let validator_b = Bytes32::from([0x44; 32]);
+
+        let base = governance_vote_commit_hash(proposal_a, validator_a, vote, nonce);
+
+        assert_ne!(
+            base,
+            governance_vote_commit_hash(proposal_b, validator_a, vote, nonce),
+            "same vote/nonce must not collide across proposals"
+        );
+        assert_ne!(
+            base,
+            governance_vote_commit_hash(proposal_a, validator_b, vote, nonce),
+            "same vote/nonce must not collide across validators"
         );
     }
 }
