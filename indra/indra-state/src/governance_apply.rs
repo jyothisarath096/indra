@@ -128,6 +128,14 @@ fn apply_propose(
     {
         return invalid("proposer already has an active proposal");
     }
+    if state
+        .governance
+        .has_active_proposal_for_action_target(action)
+    {
+        return invalid(
+            "a proposal targeting this parameter is already active - wait for it to resolve before submitting a new one",
+        );
+    }
     if let Some(last) = state.governance.last_proposal_epoch.get(&op.signer_id) {
         if current_epoch < last.saturating_add(GOVERNANCE_PROPOSAL_COOLDOWN_EPOCHS) {
             return invalid("proposer cooldown not elapsed");
@@ -790,10 +798,28 @@ mod tests {
         deposit_utxo_id: Bytes32,
         nonce: u64,
     ) -> GovernanceOpV2 {
-        let payload = GovernancePayload::Propose {
-            action: GovernableAction::SetMinDelegationSpark {
+        propose_op_with_action(
+            signer_id,
+            keypair,
+            proposer_pubkey,
+            deposit_utxo_id,
+            nonce,
+            GovernableAction::SetMinDelegationSpark {
                 value: DUST_LIMIT_SPARK,
             },
+        )
+    }
+
+    fn propose_op_with_action(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposer_pubkey: HybridPubKey,
+        deposit_utxo_id: Bytes32,
+        nonce: u64,
+        action: GovernableAction,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Propose {
+            action,
             deposit_utxo_id,
             proposer_pubkey,
             title: VariableBytes::from_slice(b"test").unwrap(),
@@ -808,6 +834,26 @@ mod tests {
         };
         sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
         op
+    }
+
+    fn install_proposer_with_deposit(
+        state: &mut ChainState,
+        seed: u8,
+        deposit_value: u64,
+        output_index: u32,
+    ) -> (HybridPubKey, HybridKeypair, Bytes32, Bytes32) {
+        let (pubkey, keypair) = keypair(seed);
+        let proposer_id = install_governance_validator(state, &pubkey);
+        let deposit = state
+            .utxos
+            .insert(
+                deposit_output(pubkey.clone(), deposit_value),
+                0,
+                0,
+                output_index,
+            )
+            .unwrap();
+        (pubkey, keypair, proposer_id, deposit)
     }
 
     fn proposal_record(
@@ -997,6 +1043,131 @@ mod tests {
             "underfunded deposit UTXO must remain unspent"
         );
         assert!(state.governance.proposals.is_empty());
+    }
+
+    #[test]
+    fn proposal_submission_rejects_conflicting_active_parameter_target() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (first_pubkey, first_keypair, first_id, first_deposit) =
+            install_proposer_with_deposit(&mut state, 0x38, 1_000, 0);
+        let (second_pubkey, second_keypair, second_id, second_deposit) =
+            install_proposer_with_deposit(&mut state, 0x39, 1_000, 1);
+
+        let first = propose_op_with_action(
+            first_id,
+            &first_keypair,
+            first_pubkey,
+            first_deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+        );
+        apply_governance_op(&mut state, &first, 0, DEFAULT_CHAIN_ID).unwrap();
+
+        let second = propose_op_with_action(
+            second_id,
+            &second_keypair,
+            second_pubkey,
+            second_deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK + 1,
+            },
+        );
+        let result = apply_governance_op(&mut state, &second, 0, DEFAULT_CHAIN_ID);
+
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidGovernanceOp { reason })
+                if reason.contains("targeting this parameter is already active")
+        ));
+        assert_eq!(state.governance.proposals.len(), 1);
+    }
+
+    #[test]
+    fn proposal_submission_allows_same_parameter_after_prior_resolves() {
+        for terminal_phase in [
+            ProposalPhase::Failed,
+            ProposalPhase::Cancelled,
+            ProposalPhase::Executed,
+        ] {
+            let mut state = ChainState::new_genesis();
+            state.governance.params.proposal_deposit_spark = 1_000;
+            let (first_pubkey, first_keypair, first_id, first_deposit) =
+                install_proposer_with_deposit(&mut state, 0x3a, 1_000, 0);
+            let (second_pubkey, second_keypair, second_id, second_deposit) =
+                install_proposer_with_deposit(&mut state, 0x3b, 1_000, 1);
+
+            let first = propose_op_with_action(
+                first_id,
+                &first_keypair,
+                first_pubkey,
+                first_deposit,
+                1,
+                GovernableAction::SetMinDelegationSpark {
+                    value: DUST_LIMIT_SPARK,
+                },
+            );
+            apply_governance_op(&mut state, &first, 0, DEFAULT_CHAIN_ID).unwrap();
+            let first_proposal_id = *state.governance.proposals.keys().next().unwrap();
+            state
+                .governance
+                .proposals
+                .get_mut(&first_proposal_id)
+                .unwrap()
+                .phase = terminal_phase;
+
+            let second = propose_op_with_action(
+                second_id,
+                &second_keypair,
+                second_pubkey,
+                second_deposit,
+                1,
+                GovernableAction::SetMinDelegationSpark {
+                    value: DUST_LIMIT_SPARK + 1,
+                },
+            );
+
+            apply_governance_op(&mut state, &second, 0, DEFAULT_CHAIN_ID)
+                .unwrap_or_else(|err| panic!("terminal phase {terminal_phase:?} blocked: {err}"));
+            assert_eq!(state.governance.proposals.len(), 2);
+        }
+    }
+
+    #[test]
+    fn proposal_submission_allows_different_parameters_concurrently() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (first_pubkey, first_keypair, first_id, first_deposit) =
+            install_proposer_with_deposit(&mut state, 0x3c, 1_000, 0);
+        let (second_pubkey, second_keypair, second_id, second_deposit) =
+            install_proposer_with_deposit(&mut state, 0x3d, 1_000, 1);
+
+        let first = propose_op_with_action(
+            first_id,
+            &first_keypair,
+            first_pubkey,
+            first_deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+        );
+        apply_governance_op(&mut state, &first, 0, DEFAULT_CHAIN_ID).unwrap();
+
+        let second = propose_op_with_action(
+            second_id,
+            &second_keypair,
+            second_pubkey,
+            second_deposit,
+            1,
+            GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
+        );
+        apply_governance_op(&mut state, &second, 0, DEFAULT_CHAIN_ID).unwrap();
+
+        assert_eq!(state.governance.proposals.len(), 2);
     }
 
     #[test]

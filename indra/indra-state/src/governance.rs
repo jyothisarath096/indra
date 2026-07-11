@@ -727,6 +727,15 @@ impl GovernanceState {
             .filter(|p| &p.proposer_id == proposer && is_active_phase(p.phase))
             .count()
     }
+
+    /// Whether any non-terminal proposal already targets the same governable
+    /// parameter, ignoring the proposed value.
+    pub fn has_active_proposal_for_action_target(&self, action: &GovernableAction) -> bool {
+        let target = std::mem::discriminant(action);
+        self.proposals.values().any(|proposal| {
+            is_active_phase(proposal.phase) && std::mem::discriminant(&proposal.action) == target
+        })
+    }
 }
 
 impl Default for GovernanceState {
