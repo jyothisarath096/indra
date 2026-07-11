@@ -622,12 +622,15 @@ mod tests {
         let keys = keys();
         let chain = CString::new("indra-testnet-1").unwrap();
         let bond_utxo_id = [0x08u8; 32];
+        let bond_blinding_factor = [0x0au8; 32];
         let vrf_pk = [0x09u8; 32];
         let mut out = out();
         let result = unsafe {
             indra_build_register_validator(
                 10_001,
                 bond_utxo_id.as_ptr(),
+                1_000_000,
+                bond_blinding_factor.as_ptr(),
                 keys.classical_seed.as_ptr(),
                 keys.pq_pk.as_ptr(),
                 keys.pq_sk.as_ptr(),
