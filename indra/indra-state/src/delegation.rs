@@ -856,15 +856,15 @@ fn apply_update_network_address(
     Ok(())
 }
 
-/// Derive a stable delegator ID from their hybrid public key.
+/// Derive a stable staking identity from a hybrid public key.
 ///
-/// Uses SHA-256 of the encoded public key bytes, matching how
-/// validator_id is derived from validator public keys.
+/// This must match `keys.json`'s canonical `validator_id`/account ID:
+/// SHA-256 of the classical public key bytes. Do not hash the encoded
+/// hybrid-pubkey object here; that produces a different identity from
+/// live genesis validators and makes validator-owned reward claims
+/// unreachable for real keys.
 fn pubkey_to_id(pubkey: &indra_core::types::crypto::HybridPubKey) -> Bytes32 {
-    use indra_core::codec::Encode;
-    let bytes = pubkey.encode_to_vec();
-    // Simple SHA-256 via standard library — matches validator_id derivation
-    let hash = indra_crypto::sha256(&bytes);
+    let hash = indra_crypto::sha256(&pubkey.classical_pk.0);
     Bytes32::from(hash)
 }
 
@@ -2496,7 +2496,7 @@ mod tests {
                 vrf_pk: [0x49; 32],
                 bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA6)),
             },
-            1,
+            2,
             &second_keypair,
             &state.chain_id,
         );
@@ -2504,8 +2504,7 @@ mod tests {
         apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
         assert!(matches!(
             apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::DuplicateValidatorKey { reason })
-                if reason.contains("hybrid_classical_pk")
+            Err(StateError::ValidatorAlreadyRegistered)
         ));
     }
 

@@ -73,7 +73,7 @@ fn signed_staking_op(
 }
 
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+    Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
 }
 
 fn install_validator(

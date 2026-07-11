@@ -559,7 +559,7 @@ pub fn validate_network_addr_string(addr: &str) -> IndraResult<()> {
 }
 
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+    Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
 }
 
 #[cfg(test)]

@@ -201,7 +201,7 @@ fn submit_governance_op(node_url: &str, op_hex: &str) -> CliResult<String> {
 }
 
 fn signer_id_from_keys(keys: &KeysFile) -> Bytes32 {
-    Bytes32::from(sha256(&keys.public.hybrid_classical_pk))
+    Bytes32::from(keys.public.validator_id)
 }
 
 fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey> {

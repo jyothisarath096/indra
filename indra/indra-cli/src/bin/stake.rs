@@ -5,12 +5,15 @@ use indra_cli::{
     CliError, CliResult, KeysFile, Wallet, WalletEntry,
 };
 use indra_core::{
-    codec::Encode,
     types::{
-        crypto::HybridPubKey,
-        primitives::{Bytes32, VariableBytes},
+        primitives::Bytes32,
         staking::StakingBondProof,
     },
+};
+#[cfg(test)]
+use indra_core::{
+    codec::{Decode, Encode},
+    types::{crypto::HybridPubKey, primitives::VariableBytes},
 };
 
 const DEFAULT_NODE: &str = "http://127.0.0.1:8545";
@@ -585,14 +588,14 @@ fn required(args: &[String], flag: &str) -> CliResult<String> {
 }
 
 fn staking_signer_id(keys: &KeysFile) -> CliResult<Bytes32> {
-    let pubkey = hybrid_pubkey_from_keys(keys)?;
-    Ok(Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec())))
+    Ok(validator_id_from_keys(keys))
 }
 
 fn validator_id_from_keys(keys: &KeysFile) -> Bytes32 {
     Bytes32::from(keys.public.validator_id)
 }
 
+#[cfg(test)]
 fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
     Ok(HybridPubKey {
         classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
@@ -727,9 +730,13 @@ mod tests {
         let keys =
             generate_keypairs("validator".to_string(), [0xA1; 32], [0xA2; 32], [0xA3; 32]).unwrap();
         let canonical = Bytes32::from(keys.public.validator_id);
-        let old_hybrid_encoding_hash = staking_signer_id(&keys).unwrap();
+        let old_hybrid_encoding_hash = {
+            let pubkey = hybrid_pubkey_from_keys(&keys).unwrap();
+            Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+        };
 
         assert_eq!(validator_id_from_keys(&keys), canonical);
+        assert_eq!(staking_signer_id(&keys).unwrap(), canonical);
         assert_eq!(
             canonical,
             Bytes32::from(indra_crypto::sha256(&keys.public.hybrid_classical_pk))
@@ -738,5 +745,25 @@ mod tests {
             canonical, old_hybrid_encoding_hash,
             "the old CLI derivation hashed the encoded hybrid pubkey and does not match live validator_id"
         );
+    }
+
+    #[test]
+    fn claim_rewards_uses_keys_json_validator_id_for_signer() {
+        let keys =
+            generate_keypairs("validator".to_string(), [0xB1; 32], [0xB2; 32], [0xB3; 32]).unwrap();
+        let keypair = reconstruct_keypair(&keys).unwrap();
+        let canonical = validator_id_from_keys(&keys);
+        let built = indra_cli::tx_builder::build_claim_rewards_op(
+            canonical,
+            &keypair,
+            1,
+            "indra-testnet-1",
+        )
+        .unwrap();
+        let op_bytes = hex::decode(&built.op_hex).unwrap();
+        let op = indra_core::types::staking::StakingOp::decode_exact(&op_bytes).unwrap();
+
+        assert_eq!(staking_signer_id(&keys).unwrap(), canonical);
+        assert_eq!(op.signer_id(), canonical);
     }
 }

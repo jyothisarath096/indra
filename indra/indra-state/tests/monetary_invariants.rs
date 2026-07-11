@@ -41,7 +41,7 @@ fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
 }
 
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+    Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
 }
 
 fn dummy_sig() -> HybridSignature {
