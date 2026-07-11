@@ -1369,11 +1369,9 @@ fn proposal_phase_str(phase: indra_state::governance::ProposalPhase) -> &'static
         indra_state::governance::ProposalPhase::Deliberation => "Deliberation",
         indra_state::governance::ProposalPhase::Commit => "Commit",
         indra_state::governance::ProposalPhase::Reveal => "Reveal",
-        indra_state::governance::ProposalPhase::Tally => "Tally",
         indra_state::governance::ProposalPhase::ExecDelay => "ExecDelay",
         indra_state::governance::ProposalPhase::Executed => "Executed",
         indra_state::governance::ProposalPhase::Failed => "Failed",
-        indra_state::governance::ProposalPhase::Expired => "Expired",
         indra_state::governance::ProposalPhase::Cancelled => "Cancelled",
     }
 }

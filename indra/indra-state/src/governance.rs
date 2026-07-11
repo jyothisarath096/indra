@@ -274,6 +274,11 @@ impl Decode for GovernableParams {
 }
 
 /// Phase of an active proposal.
+///
+/// Dead `Tally` and `Expired` variants were removed after governance audit 10:
+/// no live governance activity had occurred, no code wrote either value, and
+/// `Tally` was an active-but-unhandled landmine. Numeric tags for remaining
+/// phases are intentionally preserved so existing valid encodings do not shift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ProposalPhase {
@@ -283,16 +288,12 @@ pub enum ProposalPhase {
     Commit = 1,
     /// Reveal.
     Reveal = 2,
-    /// Tally.
-    Tally = 3,
     /// Execution delay.
     ExecDelay = 4,
     /// Executed.
     Executed = 5,
     /// Failed.
     Failed = 6,
-    /// Expired.
-    Expired = 7,
     /// Cancelled.
     Cancelled = 8,
 }
@@ -313,11 +314,9 @@ impl Decode for ProposalPhase {
             0 => Ok(Self::Deliberation),
             1 => Ok(Self::Commit),
             2 => Ok(Self::Reveal),
-            3 => Ok(Self::Tally),
             4 => Ok(Self::ExecDelay),
             5 => Ok(Self::Executed),
             6 => Ok(Self::Failed),
-            7 => Ok(Self::Expired),
             8 => Ok(Self::Cancelled),
             b => Err(IndraError::InvalidBool { byte: b }),
         }
@@ -782,7 +781,6 @@ fn is_active_phase(phase: ProposalPhase) -> bool {
         ProposalPhase::Deliberation
             | ProposalPhase::Commit
             | ProposalPhase::Reveal
-            | ProposalPhase::Tally
             | ProposalPhase::ExecDelay
     )
 }
@@ -1217,6 +1215,18 @@ mod tests {
         };
         assert!(snapshot.quorum_met(51, 5_000));
         assert!(!snapshot.quorum_met(50, 5_000));
+    }
+
+    #[test]
+    fn proposal_phase_removed_dead_tags_reject() {
+        for dead_tag in [3u8, 7u8] {
+            let bytes = dead_tag.encode_to_vec();
+            let mut reader = ByteReader::new(&bytes);
+            assert!(matches!(
+                ProposalPhase::decode(&mut reader),
+                Err(IndraError::InvalidBool { byte }) if byte == dead_tag
+            ));
+        }
     }
 
     #[test]
