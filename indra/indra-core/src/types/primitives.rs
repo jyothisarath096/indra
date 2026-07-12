@@ -20,8 +20,20 @@ pub const BLOCK_TIME_TARGET_SECS: u64 = 6;
 /// Blocks per epoch.
 pub const EPOCH_DURATION_BLOCKS: u64 = 300;
 
-/// Maximum active validators.
+/// Maximum registered validators retained in consensus state.
+///
+/// Active-set size is phase-dependent and capped separately by
+/// `max_active_validators`. This ceiling bounds the full validator registry
+/// (Active + Registered + other persisted lifecycle entries) so a one-time
+/// registration cost cannot create unbounded state every node must sync.
 pub const MAX_VALIDATORS: usize = 1_500;
+
+/// Maximum delegation-return events retained in consensus state.
+///
+/// This is a fixed rolling log for operator visibility after forced validator
+/// eviction. It intentionally does not scale with the theoretical
+/// validators × delegators product.
+pub const MAX_DELEGATION_RETURN_EVENTS: usize = 100_000;
 
 /// Epochs a validator's stake is locked after initiating exit.
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 1008; // 21 days at 2 epochs/hour (48 epochs/day × 21 days = 1008)
@@ -405,6 +417,16 @@ pub mod hard_forks {
     /// time. Do not deploy with this placeholder if the feature is intended to
     /// activate on a live network.
     pub const VALIDATOR_NETWORK_ADDRESS_HEIGHT: u64 = 19900;
+
+    /// Registered-validator cap replacement rule.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
+    /// coordinated deployment, comfortably ahead of the live chain tip at that
+    /// time. Before this height, a full validator registry rejects new
+    /// registrations exactly as before. At/after this height, a higher
+    /// total-stake registration may synchronously evict the lowest total-stake
+    /// registered validator to preserve the hard cap without first-come bias.
+    pub const REGISTERED_VALIDATOR_CAP_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -455,6 +477,12 @@ pub fn reveal_set_commitment_active(height: u64) -> bool {
 #[inline]
 pub fn validator_network_address_active(height: u64) -> bool {
     height >= hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT
+}
+
+/// Whether full-registry synchronous replacement is active.
+#[inline]
+pub fn registered_validator_cap_active(height: u64) -> bool {
+    height >= hard_forks::REGISTERED_VALIDATOR_CAP_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

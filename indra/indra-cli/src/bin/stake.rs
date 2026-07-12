@@ -4,12 +4,7 @@ use indra_cli::{
     fetch_chain_id, fetch_staking_nonce, reconstruct_keypair, submit_staking_op, BuiltStakingOp,
     CliError, CliResult, KeysFile, Wallet, WalletEntry,
 };
-use indra_core::{
-    types::{
-        primitives::Bytes32,
-        staking::StakingBondProof,
-    },
-};
+use indra_core::types::{primitives::Bytes32, staking::StakingBondProof};
 #[cfg(test)]
 use indra_core::{
     codec::{Decode, Encode},

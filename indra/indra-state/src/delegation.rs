@@ -7,10 +7,11 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        staking_commitment_proof_required, validator_network_address_active, Bytes32,
-        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
-        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        registered_validator_cap_active, staking_commitment_proof_required,
+        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
+        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -21,7 +22,10 @@ use crate::{
     chain::ChainState,
     epoch::epoch_for_height,
     error::{StateError, StateResult},
-    validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR},
+    validator::{
+        DelegationReturnEvent, DelegationReturnReason, StakeBondEntry, ValidatorEntry,
+        ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR,
+    },
 };
 
 /// Apply a single staking operation to chain state.
@@ -275,12 +279,6 @@ fn apply_register_validator(
     if state.validators.get(&validator_id).is_some() {
         return Err(StateError::ValidatorAlreadyRegistered);
     }
-    if state.validators.len() >= MAX_VALIDATORS {
-        return Err(StateError::InvariantViolation {
-            message: "validator set at maximum capacity",
-        });
-    }
-
     let new_classical_pk = validator_pubkey.classical_pk.0;
     let new_pq_pk = validator_pubkey.pq_pk.as_slice();
     for existing in state.validators.all_validators() {
@@ -334,6 +332,25 @@ fn apply_register_validator(
     }
 
     let current_epoch = epoch_for_height(state.height);
+    if state.validators.len() >= MAX_VALIDATORS {
+        if !registered_validator_cap_active(current_height) {
+            return Err(StateError::InvariantViolation {
+                message: "validator set at maximum capacity",
+            });
+        }
+        let (lowest_id, lowest_total) =
+            lowest_ranked_registry_validator(state).ok_or(StateError::InvariantViolation {
+                message: "validator set full but no evictable validator found",
+            })?;
+        if amount_spark <= lowest_total {
+            return Err(StateError::InvalidStakingOp(format!(
+                "validator registry at capacity; new total stake {} does not exceed lowest registered total stake {}",
+                amount_spark, lowest_total
+            )));
+        }
+        evict_validator_for_registry_replacement(state, lowest_id, current_epoch, current_height)?;
+    }
+
     let original_output = utxo_entry.output;
     let spent = state.utxos.spend(&bond_utxo_id);
     if spent.is_none() {
@@ -376,6 +393,191 @@ fn apply_register_validator(
             original_output,
         },
     );
+    Ok(())
+}
+
+fn lowest_ranked_registry_validator(state: &ChainState) -> Option<(Bytes32, u64)> {
+    state
+        .validators
+        .all_validators()
+        .filter(|validator| {
+            matches!(
+                validator.status,
+                ValidatorStatus::Active | ValidatorStatus::Registered
+            )
+        })
+        .map(|validator| {
+            let total = validator
+                .stake_spark
+                .saturating_add(state.delegations.total_delegated(&validator.validator_id));
+            (validator.validator_id, total)
+        })
+        .min_by(|(id_a, total_a), (id_b, total_b)| {
+            total_a.cmp(total_b).then_with(|| id_b.0.cmp(&id_a.0))
+        })
+}
+
+fn evict_validator_for_registry_replacement(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    current_epoch: u64,
+    current_height: u64,
+) -> StateResult<()> {
+    let validator = state
+        .validators
+        .get(&validator_id)
+        .cloned()
+        .ok_or(StateError::ValidatorNotFound)?;
+    let delegators = state.delegations.take_delegators(&validator_id);
+
+    if validator.pending_rewards > 0 {
+        payout_or_burn_pending_reward(
+            state,
+            &validator_id,
+            &validator_id,
+            validator.pending_rewards,
+            validator_public_key(&validator)?,
+            current_height,
+        )?;
+    }
+    for entry in &delegators {
+        if entry.pending_rewards > 0 {
+            if let Some(bond) = state
+                .staked_bonds
+                .values()
+                .find(|bond| {
+                    bond.validator_id == validator_id && bond.delegator_id == entry.delegator_id
+                })
+                .cloned()
+            {
+                payout_or_burn_pending_reward(
+                    state,
+                    &validator_id,
+                    &entry.delegator_id,
+                    entry.pending_rewards,
+                    bond.original_output.owner_pubkey,
+                    current_height,
+                )?;
+            } else if entry.pending_rewards < DUST_LIMIT_SPARK {
+                eprintln!(
+                    "[staking] burned dust pending reward {} for delegator {} during validator eviction; no bond pubkey found",
+                    entry.pending_rewards,
+                    hex::encode(&entry.delegator_id.0[..4])
+                );
+            } else {
+                return Err(StateError::InvariantViolation {
+                    message: "delegator reward could not be paid during validator eviction",
+                });
+            }
+        }
+    }
+
+    let mut bond_ids: Vec<Bytes32> = state
+        .staked_bonds
+        .values()
+        .filter(|bond| bond.validator_id == validator_id)
+        .map(|bond| bond.utxo_id)
+        .collect();
+    bond_ids.sort_by_key(|id| id.0);
+    for bond_id in bond_ids {
+        if let Some(bond) = state.staked_bonds.remove(&bond_id) {
+            let output = crate::epoch::released_bond_output(&bond, current_height)?;
+            let output_index =
+                u32::try_from(state.utxos.len()).unwrap_or(u32::MAX.saturating_sub(1));
+            let refund_utxo_id = state
+                .utxos
+                .insert(output, current_height, STAKING_TX_IDX, output_index)
+                .map_err(|_| StateError::InvariantViolation {
+                    message: "UTXO ID collision in validator eviction bond refund",
+                })?;
+            state.push_delegation_return_event(DelegationReturnEvent {
+                delegator_id: bond.delegator_id,
+                validator_id,
+                bond_utxo_id: bond.utxo_id,
+                amount_spark: bond.amount_spark,
+                reason: DelegationReturnReason::ValidatorEvicted,
+                returned_epoch: current_epoch,
+                returned_height: current_height,
+                refund_utxo_id,
+            });
+        }
+    }
+
+    state.validators.remove(&validator_id);
+    eprintln!(
+        "[staking] evicted validator {} from full registry and returned {} delegation entries",
+        hex::encode(&validator_id.0[..4]),
+        delegators.len()
+    );
+    Ok(())
+}
+
+fn validator_public_key(validator: &ValidatorEntry) -> StateResult<HybridPubKey> {
+    let classical_pk = validator
+        .hybrid_classical_pk
+        .ok_or(StateError::InvariantViolation {
+            message: "validator missing classical key during eviction reward payout",
+        })?;
+    let pq_bytes = validator
+        .hybrid_pq_pk
+        .as_deref()
+        .ok_or(StateError::InvariantViolation {
+            message: "validator missing PQ key during eviction reward payout",
+        })?;
+    Ok(HybridPubKey {
+        classical_pk: Bytes32::from(classical_pk),
+        pq_pk: VariableBytes::from_slice(pq_bytes).map_err(|_| StateError::InvariantViolation {
+            message: "validator PQ key too large during eviction reward payout",
+        })?,
+    })
+}
+
+fn payout_or_burn_pending_reward(
+    state: &mut ChainState,
+    validator_id: &Bytes32,
+    delegator_id: &Bytes32,
+    amount: u64,
+    owner_pubkey: HybridPubKey,
+    current_height: u64,
+) -> StateResult<()> {
+    if amount < DUST_LIMIT_SPARK {
+        eprintln!(
+            "[staking] burned dust pending reward {} for delegator {} during validator eviction",
+            amount,
+            hex::encode(&delegator_id.0[..4])
+        );
+        return Ok(());
+    }
+    let mut blinding_input = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
+    blinding_input.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
+    blinding_input.extend_from_slice(&validator_id.0);
+    blinding_input.extend_from_slice(&delegator_id.0);
+    blinding_input.extend_from_slice(&current_height.to_le_bytes());
+    let blinding = indra_crypto::sha256(&blinding_input);
+    let commitment = indra_crypto::commit(amount, &blinding);
+    let mut rng = rand::rngs::StdRng::from_seed(blinding);
+    let proof = indra_crypto::prove_range(amount, &blinding, &mut rng).map_err(|_| {
+        StateError::InvalidStakingOp(
+            "failed to generate range proof for eviction reward UTXO".into(),
+        )
+    })?;
+    let output = OutputV1 {
+        value_spark: amount,
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::from(commitment.0),
+        },
+        owner_pubkey,
+        range_proof: VariableBytes::from_slice(&proof)
+            .map_err(|_| StateError::InvalidStakingOp("range proof too large".into()))?,
+        lock_height: 0,
+    };
+    let output_index = u32::try_from(state.utxos.len()).unwrap_or(u32::MAX.saturating_sub(1));
+    state
+        .utxos
+        .insert(output, current_height, STAKING_TX_IDX, output_index)
+        .map_err(|_| StateError::InvariantViolation {
+            message: "UTXO ID collision in validator eviction reward payout",
+        })?;
     Ok(())
 }
 
@@ -2689,5 +2891,312 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::ValidatorNotActive)
         ));
+    }
+
+    fn raw_pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+        }
+    }
+
+    fn raw_output(value_spark: u64, owner_pubkey: HybridPubKey, byte: u8) -> OutputV1 {
+        OutputV1 {
+            value_spark,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from([byte; 32]),
+            },
+            owner_pubkey,
+            range_proof: VariableBytes::from_slice(&[byte]).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn raw_id(domain: u8, index: usize) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = domain;
+        bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+        Bytes32::from(bytes)
+    }
+
+    fn insert_registry_entry_for_cap_test(
+        state: &mut ChainState,
+        index: usize,
+        stake: u64,
+    ) -> Bytes32 {
+        let validator_id = raw_id(0x44, index);
+        let pk_byte = (index % 200) as u8;
+        let pubkey = raw_pubkey(pk_byte);
+        let bond_utxo_id = raw_id(0x55, index);
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: format!("cap-{index}"),
+                hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
+                vrf_pk: Some(raw_id(0x66, index).0),
+                stake_spark: stake,
+                status: ValidatorStatus::Registered,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: 1_000,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
+            })
+            .unwrap();
+        state.staked_bonds.insert(
+            bond_utxo_id,
+            StakeBondEntry {
+                utxo_id: bond_utxo_id,
+                validator_id,
+                delegator_id: validator_id,
+                amount_spark: stake,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: raw_output(stake, pubkey, (index % 200) as u8),
+            },
+        );
+        validator_id
+    }
+
+    fn fill_registry_to_cap(state: &mut ChainState, lowest_stake: u64) -> Bytes32 {
+        let lowest_id = insert_registry_entry_for_cap_test(state, 0, lowest_stake);
+        for index in 1..MAX_VALIDATORS {
+            insert_registry_entry_for_cap_test(
+                state,
+                index,
+                lowest_stake
+                    .saturating_add(DUST_LIMIT_SPARK.saturating_mul(10))
+                    .saturating_add(index as u64),
+            );
+        }
+        lowest_id
+    }
+
+    fn registration_op_with_bond(
+        state: &mut ChainState,
+        seed: u8,
+        amount: u64,
+        nonce: u64,
+    ) -> (StakingOp, Bytes32) {
+        let keypair = keypair(seed);
+        let pubkey = pubkey_from_keypair(&keypair);
+        let bond_utxo_id = insert_delegator_utxo(state, pubkey.clone(), amount, seed);
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey: pubkey,
+                vrf_pk: [seed; 32],
+                bond_proof: Some(bond_proof(amount, seed)),
+            },
+            nonce,
+            &keypair,
+            &state.chain_id,
+        );
+        (op, bond_utxo_id)
+    }
+
+    #[test]
+    fn registration_at_cap_pre_activation_rejects_unchanged() {
+        let mut state = ChainState::new_genesis();
+        fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
+        let (op, bond_utxo_id) = registration_op_with_bond(
+            &mut state,
+            0xF1,
+            MINIMUM_VALIDATOR_BOND_SPARK.saturating_mul(10),
+            1,
+        );
+        let chain_id = state.chain_id.clone();
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvariantViolation { message })
+                if message == "validator set at maximum capacity"
+        ));
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert_eq!(state.validators.len(), MAX_VALIDATORS);
+    }
+
+    #[test]
+    fn registration_at_cap_post_activation_rejects_if_not_higher_total_stake() {
+        let mut state = ChainState::new_genesis();
+        fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
+        let (op, bond_utxo_id) =
+            registration_op_with_bond(&mut state, 0xF2, MINIMUM_VALIDATOR_BOND_SPARK, 1);
+        let chain_id = state.chain_id.clone();
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
+            Err(StateError::InvalidStakingOp(reason))
+                if reason.contains("validator registry at capacity")
+        ));
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert_eq!(state.validators.len(), MAX_VALIDATORS);
+    }
+
+    #[test]
+    fn registration_at_cap_post_activation_evicts_lowest_and_refunds_all_bonds() {
+        let mut state = ChainState::new_genesis();
+        let lowest_id = fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
+        let delegator = raw_id(0x77, 1);
+        let delegator_bond = raw_id(0x78, 1);
+        let delegator_pubkey = raw_pubkey(0x7A);
+        state
+            .delegations
+            .add_delegation(lowest_id, delegator, DUST_LIMIT_SPARK, 0)
+            .unwrap();
+        state.staked_bonds.insert(
+            delegator_bond,
+            StakeBondEntry {
+                utxo_id: delegator_bond,
+                validator_id: lowest_id,
+                delegator_id: delegator,
+                amount_spark: DUST_LIMIT_SPARK,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: test_output(DUST_LIMIT_SPARK, delegator_pubkey, 0x7A),
+            },
+        );
+        let (op, new_bond) = registration_op_with_bond(
+            &mut state,
+            0xF3,
+            MINIMUM_VALIDATOR_BOND_SPARK
+                .saturating_add(DUST_LIMIT_SPARK)
+                .saturating_add(1),
+            1,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
+
+        assert_eq!(state.validators.len(), MAX_VALIDATORS);
+        assert!(state.validators.get(&lowest_id).is_none());
+        assert!(state.staked_bonds.contains_key(&new_bond));
+        assert!(!state.staked_bonds.contains_key(&delegator_bond));
+        assert!(state.delegations.get_delegators(&lowest_id).is_empty());
+        assert_eq!(state.delegation_return_events.len(), 2);
+        assert!(state
+            .delegation_return_events
+            .iter()
+            .any(|event| event.delegator_id == lowest_id
+                && event.reason == DelegationReturnReason::ValidatorEvicted));
+        assert!(state
+            .delegation_return_events
+            .iter()
+            .any(|event| event.delegator_id == delegator
+                && event.reason == DelegationReturnReason::ValidatorEvicted));
+    }
+
+    #[test]
+    fn validator_eviction_pays_claimable_rewards_and_burns_dust_rewards() {
+        let mut state = ChainState::new_genesis();
+        let lowest_id = fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
+        state
+            .validators
+            .get_mut(&lowest_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK;
+        let delegator = raw_id(0x79, 1);
+        let delegator_bond = raw_id(0x7B, 1);
+        state
+            .delegations
+            .add_delegation(lowest_id, delegator, DUST_LIMIT_SPARK, 0)
+            .unwrap();
+        state
+            .delegations
+            .get_delegator_mut(&lowest_id, &delegator)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK - 1;
+        state.staked_bonds.insert(
+            delegator_bond,
+            StakeBondEntry {
+                utxo_id: delegator_bond,
+                validator_id: lowest_id,
+                delegator_id: delegator,
+                amount_spark: DUST_LIMIT_SPARK,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: test_output(DUST_LIMIT_SPARK, raw_pubkey(0x7C), 0x7C),
+            },
+        );
+        let utxos_before = state.utxos.len();
+        let (op, _) = registration_op_with_bond(
+            &mut state,
+            0xF4,
+            MINIMUM_VALIDATOR_BOND_SPARK
+                .saturating_add(DUST_LIMIT_SPARK)
+                .saturating_add(1),
+            1,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
+
+        assert!(state.validators.get(&lowest_id).is_none());
+        assert!(state.utxos.len() >= utxos_before.saturating_add(2));
+        assert!(state
+            .delegation_return_events
+            .iter()
+            .any(|event| event.delegator_id == delegator));
+    }
+
+    #[test]
+    fn delegation_return_event_log_prunes_oldest_entries() {
+        let mut state = ChainState::new_genesis();
+        for i in 0..=indra_core::types::primitives::MAX_DELEGATION_RETURN_EVENTS {
+            state.push_delegation_return_event(DelegationReturnEvent {
+                delegator_id: raw_id(0xA0, i),
+                validator_id: raw_id(0xA1, i),
+                bond_utxo_id: raw_id(0xA2, i),
+                amount_spark: 1,
+                reason: DelegationReturnReason::ValidatorEvicted,
+                returned_epoch: i as u64,
+                returned_height: i as u64,
+                refund_utxo_id: raw_id(0xA3, i),
+            });
+        }
+        assert_eq!(
+            state.delegation_return_events.len(),
+            indra_core::types::primitives::MAX_DELEGATION_RETURN_EVENTS
+        );
+        assert_eq!(
+            state
+                .delegation_return_events
+                .first()
+                .map(|event| event.returned_epoch),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn validator_owned_ops_do_not_force_remove_specific_delegators() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xC1);
+        let delegator_keypair = keypair(0xC2);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, DUST_LIMIT_SPARK, 0)
+            .unwrap();
+        let chain_id = state.chain_id.clone();
+        let op = set_auto_delegate_op(&state, validator_id, Bytes32::ZERO, &validator_keypair, 1);
+
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert!(state
+            .delegations
+            .get_delegators(&validator_id)
+            .iter()
+            .any(|entry| entry.delegator_id == delegator_id));
     }
 }

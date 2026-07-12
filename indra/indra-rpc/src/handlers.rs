@@ -249,6 +249,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getStakingNonce", RpcMethodAccess::ReadOnly),
     ("indra_getDelegations", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorPositions", RpcMethodAccess::ReadOnly),
+    ("indra_getDelegationReturnEvents", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
     ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
@@ -323,6 +324,7 @@ pub fn dispatch_with_mode(
         "indra_getStakingNonce" => Ready(get_staking_nonce(params, state)),
         "indra_getDelegations" => Ready(get_delegations(params, state)),
         "indra_getDelegatorPositions" => Ready(get_delegator_positions(params, state)),
+        "indra_getDelegationReturnEvents" => Ready(get_delegation_return_events(params, state)),
         "indra_getDelegatorRewards" => Ready(get_delegator_rewards(params, state)),
         "indra_getValidatorDelegators" => Ready(get_validator_delegators(params, state)),
         "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
@@ -914,6 +916,62 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
         total_rewards,
         active_positions,
         unbonding_positions,
+    ))
+}
+
+/// `indra_getDelegationReturnEvents` — returns automatic principal-return events for a delegator.
+///
+/// Params: `["<delegator_id_hex>", "<since_epoch optional>", "<limit optional>"]`
+fn get_delegation_return_events(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let delegator_hex = first_param(params, "delegator_id")?;
+    let delegator_id = parse_hex32_value(&delegator_hex, "delegator_id")?;
+    let since_epoch = if params.len() > 1 {
+        Some(parse_u64_param(params, 1, "since_epoch")?)
+    } else {
+        None
+    };
+    let limit = if params.len() > 2 {
+        parse_u64_param(params, 2, "limit")?.min(1_000) as usize
+    } else {
+        100usize
+    };
+
+    let mut events = Vec::new();
+    for event in state
+        .chain
+        .delegation_return_events
+        .iter()
+        .filter(|event| event.delegator_id == delegator_id)
+        .filter(|event| {
+            since_epoch
+                .map(|epoch| event.returned_epoch >= epoch)
+                .unwrap_or(true)
+        })
+        .rev()
+        .take(limit)
+    {
+        let reason = match event.reason {
+            indra_state::validator::DelegationReturnReason::ValidatorEvicted => "ValidatorEvicted",
+        };
+        events.push(format!(
+            r#"{{"delegator_id":"{}","validator_id":"{}","bond_utxo_id":"{}","amount_spark":{},"reason":"{}","returned_epoch":{},"returned_height":{},"refund_utxo_id":"{}"}}"#,
+            hex::encode(event.delegator_id.0),
+            hex::encode(event.validator_id.0),
+            hex::encode(event.bond_utxo_id.0),
+            event.amount_spark,
+            reason,
+            event.returned_epoch,
+            event.returned_height,
+            hex::encode(event.refund_utxo_id.0),
+        ));
+    }
+    events.reverse();
+
+    Ok(format!(
+        r#"{{"delegator_id":"{}","events":[{}],"count":{}}}"#,
+        delegator_hex,
+        events.join(","),
+        events.len(),
     ))
 }
 
@@ -1640,6 +1698,44 @@ mod tests {
 
         assert!(result.contains(r#""network_addr":"203.0.113.31:30303""#));
         assert!(result.contains(r#""network_addr":null"#));
+    }
+
+    #[test]
+    fn rpc_exposes_delegation_return_events_for_delegator() {
+        let mut engine = make_state("dre");
+        let delegator_id = indra_core::Bytes32::from([0x41; 32]);
+        let validator_id = indra_core::Bytes32::from([0x42; 32]);
+        engine.push_delegation_return_event(indra_state::DelegationReturnEvent {
+            delegator_id,
+            validator_id,
+            bond_utxo_id: indra_core::Bytes32::from([0x43; 32]),
+            amount_spark: 123,
+            reason: indra_state::DelegationReturnReason::ValidatorEvicted,
+            returned_epoch: 7,
+            returned_height: 2_100,
+            refund_utxo_id: indra_core::Bytes32::from([0x44; 32]),
+        });
+        engine.push_delegation_return_event(indra_state::DelegationReturnEvent {
+            delegator_id: indra_core::Bytes32::from([0x45; 32]),
+            validator_id,
+            bond_utxo_id: indra_core::Bytes32::from([0x46; 32]),
+            amount_spark: 456,
+            reason: indra_state::DelegationReturnReason::ValidatorEvicted,
+            returned_epoch: 8,
+            returned_height: 2_400,
+            refund_utxo_id: indra_core::Bytes32::from([0x47; 32]),
+        });
+        let state = NodeState::read_only(&engine);
+        let result = get_delegation_return_events(
+            &[hex::encode(delegator_id.0), "0".into(), "10".into()],
+            &state,
+        )
+        .unwrap();
+
+        assert!(result.contains(r#""reason":"ValidatorEvicted""#));
+        assert!(result.contains(r#""amount_spark":123"#));
+        assert!(result.contains(r#""count":1"#));
+        assert!(!result.contains(r#""amount_spark":456"#));
     }
 
     #[test]

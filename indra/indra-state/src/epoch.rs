@@ -845,7 +845,7 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
     Ok(())
 }
 
-fn released_bond_output(
+pub(crate) fn released_bond_output(
     bond: &crate::validator::StakeBondEntry,
     release_height: u64,
 ) -> StateResult<indra_core::types::transaction::OutputV1> {

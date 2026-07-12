@@ -10,14 +10,18 @@ use std::collections::{BTreeMap, HashSet};
 
 use indra_core::types::primitives::{
     Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
-    MAX_CHAIN_ID_BYTES,
+    MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
 };
 
 use crate::{
     governance::GovernanceState,
     nullifier::NullifierSet,
     utxo::UtxoSet,
-    validator::{DelegationMap, StakeBondEntry, ValidatorSet},
+    validator::{
+        decode_delegation_return_events, delegation_return_events_encoded_len,
+        encode_delegation_return_events, DelegationMap, DelegationReturnEvent, StakeBondEntry,
+        ValidatorSet,
+    },
 };
 
 /// The complete chain state at a given block height.
@@ -83,6 +87,12 @@ pub struct ChainState {
     /// On-chain governance state.
     pub governance: GovernanceState,
 
+    /// Bounded rolling log of automatic delegation principal returns.
+    ///
+    /// This is consensus-visible after the registered-validator-cap activation
+    /// so delegators can discover forced returns caused by validator eviction.
+    pub delegation_return_events: Vec<DelegationReturnEvent>,
+
     /// Transient fee burns accumulated for the current epoch summary.
     /// Not encoded and not included in consensus state roots.
     pub epoch_fees_burned: u64,
@@ -129,6 +139,7 @@ impl Encode for ChainState {
         encode_nonce_map(&self.staking_nonces, buf);
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
+        encode_delegation_return_events(&self.delegation_return_events, buf);
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
     }
@@ -152,6 +163,7 @@ impl Encode for ChainState {
             + nonce_map_encoded_len(&self.staking_nonces)
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
+            + delegation_return_events_encoded_len(&self.delegation_return_events)
     }
 }
 
@@ -176,6 +188,11 @@ impl Decode for ChainState {
             staking_nonces: decode_nonce_map(r)?,
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
             governance: GovernanceState::decode(r)?,
+            delegation_return_events: if r.remaining() > 0 {
+                decode_delegation_return_events(r)?
+            } else {
+                Vec::new()
+            },
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -205,6 +222,7 @@ impl ChainState {
             staking_nonces: BTreeMap::new(),
             applied_slash_hashes: HashSet::new(),
             governance: GovernanceState::new(),
+            delegation_return_events: Vec::new(),
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -236,6 +254,7 @@ impl ChainState {
                 HashSet::new()
             },
             governance: GovernanceState::new(),
+            delegation_return_events: Vec::new(),
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -263,6 +282,7 @@ impl ChainState {
             staking_nonces: decode_nonce_map(r)?,
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
             governance: GovernanceState::new(),
+            delegation_return_events: Vec::new(),
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -277,6 +297,19 @@ impl ChainState {
     /// True if the chain has had at least one block applied.
     pub fn has_blocks(&self) -> bool {
         self.height > 0
+    }
+
+    /// Append a delegation-return event and prune the oldest entries if the
+    /// fixed global retention bound is exceeded.
+    pub fn push_delegation_return_event(&mut self, event: DelegationReturnEvent) {
+        self.delegation_return_events.push(event);
+        let excess = self
+            .delegation_return_events
+            .len()
+            .saturating_sub(MAX_DELEGATION_RETURN_EVENTS);
+        if excess > 0 {
+            self.delegation_return_events.drain(0..excess);
+        }
     }
 }
 

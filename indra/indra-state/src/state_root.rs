@@ -12,7 +12,8 @@
 use indra_core::{
     codec::Encode,
     types::primitives::{
-        validator_network_address_active, Bytes32, VariableBytes, MAX_CHAIN_ID_BYTES,
+        registered_validator_cap_active, validator_network_address_active, Bytes32, VariableBytes,
+        MAX_CHAIN_ID_BYTES,
     },
 };
 use indra_crypto::sha256;
@@ -166,6 +167,20 @@ pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> 
         leaves.push((key, sha256(&hash.0)));
     }
 
+    if registered_validator_cap_active(height) {
+        for event in &state.delegation_return_events {
+            let mut key = Vec::with_capacity(1 + 32 + 32 + 8);
+            key.push(0x06);
+            key.extend_from_slice(&event.delegator_id.0);
+            key.extend_from_slice(&event.bond_utxo_id.0);
+            key.extend_from_slice(&event.returned_height.to_le_bytes());
+
+            let mut value = Vec::new();
+            event.encode(&mut value);
+            leaves.push((key, sha256(&value)));
+        }
+    }
+
     if leaves.is_empty() {
         return Bytes32::ZERO;
     }
@@ -209,14 +224,19 @@ pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> 
 mod tests {
     use indra_core::{
         types::{
-            primitives::{hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT, DUST_LIMIT_SPARK},
+            primitives::{
+                hard_forks::{REGISTERED_VALIDATOR_CAP_HEIGHT, VALIDATOR_NETWORK_ADDRESS_HEIGHT},
+                DUST_LIMIT_SPARK,
+            },
             transaction::OutputV1,
         },
         Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
     use indra_crypto::sha256;
 
-    use crate::validator::{ValidatorEntry, ValidatorStatus};
+    use crate::validator::{
+        DelegationReturnEvent, DelegationReturnReason, ValidatorEntry, ValidatorStatus,
+    };
 
     use super::*;
 
@@ -409,6 +429,36 @@ mod tests {
         assert_ne!(
             compute_validator_set_root(&at_activation_without_addr),
             compute_validator_set_root(&at_activation_with_addr)
+        );
+    }
+
+    #[test]
+    fn validator_set_root_includes_delegation_return_events_only_after_cap_activation() {
+        let mut before = ChainState::new_genesis();
+        before.height = REGISTERED_VALIDATOR_CAP_HEIGHT.saturating_sub(1);
+        let mut before_with_event = before.clone();
+        before_with_event.push_delegation_return_event(DelegationReturnEvent {
+            delegator_id: Bytes32::from([0x51; 32]),
+            validator_id: Bytes32::from([0x52; 32]),
+            bond_utxo_id: Bytes32::from([0x53; 32]),
+            amount_spark: 10,
+            reason: DelegationReturnReason::ValidatorEvicted,
+            returned_epoch: 1,
+            returned_height: before_with_event.height,
+            refund_utxo_id: Bytes32::from([0x54; 32]),
+        });
+        assert_eq!(
+            compute_validator_set_root(&before),
+            compute_validator_set_root(&before_with_event)
+        );
+
+        let mut at_activation = before_with_event;
+        at_activation.height = REGISTERED_VALIDATOR_CAP_HEIGHT;
+        let mut at_activation_empty = ChainState::new_genesis();
+        at_activation_empty.height = REGISTERED_VALIDATOR_CAP_HEIGHT;
+        assert_ne!(
+            compute_validator_set_root(&at_activation_empty),
+            compute_validator_set_root(&at_activation)
         );
     }
 

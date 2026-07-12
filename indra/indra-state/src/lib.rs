@@ -61,5 +61,5 @@ pub use nullifier::NullifierSet;
 pub use smt::{MerkleProof, SparseMerkleTree, SMT_DEPTH};
 pub use state_root::{compute_state_root, compute_validator_set_root};
 pub use utxo::{UtxoEntry, UtxoSet};
-pub use validator::DelegatorEntry;
+pub use validator::{DelegationReturnEvent, DelegationReturnReason, DelegatorEntry};
 pub use validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};

@@ -10,8 +10,8 @@ use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
         max_active_validators, muldiv, overflow_fix_active, Bytes32, DUST_LIMIT_SPARK,
-        MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
-        SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+        MAX_DELEGATION_RETURN_EVENTS, MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN,
+        SCHEMA_VERSION, SCHEMA_VERSION_GENESIS, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
     },
     transaction::OutputV1,
 };
@@ -28,6 +28,122 @@ pub const MAX_DELEGATORS_PER_VALIDATOR: usize = 100_000;
 /// This intentionally matches the live write cap so state that can be accepted
 /// during normal operation can always be decoded later from persisted snapshots.
 pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDATOR;
+
+/// Why a stake bond was returned outside the normal claim/undelegation flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationReturnReason {
+    /// Validator was evicted from the bounded registry by a higher-stake
+    /// registration; all associated bonds were returned immediately.
+    ValidatorEvicted,
+}
+
+impl Encode for DelegationReturnReason {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::ValidatorEvicted => 1u8.encode(buf),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        1
+    }
+}
+
+impl Decode for DelegationReturnReason {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        match u8::decode(r)? {
+            1 => Ok(Self::ValidatorEvicted),
+            _ => Err(IndraError::InvariantViolation {
+                message: "invalid delegation return reason",
+            }),
+        }
+    }
+}
+
+/// Consensus-visible event recording an automatic delegation principal return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationReturnEvent {
+    /// Delegator whose stake bond was returned.
+    pub delegator_id: Bytes32,
+    /// Validator from which the stake bond was returned.
+    pub validator_id: Bytes32,
+    /// Original bonded UTXO ID.
+    pub bond_utxo_id: Bytes32,
+    /// Principal amount returned in Spark.
+    pub amount_spark: u64,
+    /// Why this return happened.
+    pub reason: DelegationReturnReason,
+    /// Epoch in which the return was applied.
+    pub returned_epoch: u64,
+    /// Height at which the return was applied.
+    pub returned_height: u64,
+    /// Newly created refund UTXO ID.
+    pub refund_utxo_id: Bytes32,
+}
+
+impl Encode for DelegationReturnEvent {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        SCHEMA_VERSION.encode(buf);
+        self.delegator_id.encode(buf);
+        self.validator_id.encode(buf);
+        self.bond_utxo_id.encode(buf);
+        self.amount_spark.encode(buf);
+        self.reason.encode(buf);
+        self.returned_epoch.encode(buf);
+        self.returned_height.encode(buf);
+        self.refund_utxo_id.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        1 + 32 + 32 + 32 + 8 + self.reason.encoded_len() + 8 + 8 + 32
+    }
+}
+
+impl Decode for DelegationReturnEvent {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let marker = u8::decode(r)?;
+        match marker {
+            SCHEMA_VERSION_GENESIS
+            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
+            | SCHEMA_VERSION => Ok(Self {
+                delegator_id: Bytes32::decode(r)?,
+                validator_id: Bytes32::decode(r)?,
+                bond_utxo_id: Bytes32::decode(r)?,
+                amount_spark: u64::decode(r)?,
+                reason: DelegationReturnReason::decode(r)?,
+                returned_epoch: u64::decode(r)?,
+                returned_height: u64::decode(r)?,
+                refund_utxo_id: Bytes32::decode(r)?,
+            }),
+            _ => Err(IndraError::UnsupportedSchemaVersion {
+                struct_name: "DelegationReturnEvent",
+                version: marker,
+                max_supported: SCHEMA_VERSION,
+            }),
+        }
+    }
+}
+
+/// Encode the bounded global delegation-return event log.
+pub fn encode_delegation_return_events(events: &[DelegationReturnEvent], buf: &mut Vec<u8>) {
+    encode_list(events, buf);
+}
+
+/// Decode the bounded global delegation-return event log.
+pub fn decode_delegation_return_events(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<Vec<DelegationReturnEvent>> {
+    decode_list(
+        r,
+        MAX_DELEGATION_RETURN_EVENTS,
+        "snapshot.delegation_return_events",
+    )
+}
+
+/// Encoded length of the bounded global delegation-return event log.
+pub fn delegation_return_events_encoded_len(events: &[DelegationReturnEvent]) -> usize {
+    list_encoded_len(events)
+}
 
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,7 +644,7 @@ impl ValidatorSet {
         Ok(set)
     }
 
-    /// Number of registered validators (active + unbonding).
+    /// Number of validator registry entries across all lifecycle statuses.
     pub fn len(&self) -> usize {
         self.validators.len()
     }
@@ -594,6 +710,11 @@ impl ValidatorSet {
         Ok(())
     }
 
+    /// Remove a validator entry from the registry.
+    pub fn remove(&mut self, id: &Bytes32) -> Option<ValidatorEntry> {
+        self.validators.remove(id)
+    }
+
     /// Iterate over all active validators.
     pub fn active_validators(&self) -> impl Iterator<Item = &ValidatorEntry> {
         self.validators.values().filter(|v| v.is_active())
@@ -622,7 +743,10 @@ impl ValidatorSet {
     /// `validator.stake_spark` only, so active-set selection must use the same
     /// self-stake model. Delegated stake affects delegator reward splitting,
     /// but it does not increase validator selection weight in the current
-    /// protocol.
+    /// protocol. This is deliberately distinct from registered-registry
+    /// replacement, which uses total stake (self + delegated) only as a
+    /// housekeeping rule for deciding which persisted validator entry gets a
+    /// scarce registry slot when the registry is full.
     pub fn select_active_set(&mut self, _delegations: &DelegationMap, total_staked_spark: u64) {
         let max_active = max_active_validators(total_staked_spark);
         let mut candidates: Vec<(Bytes32, u64)> = self
@@ -1306,6 +1430,12 @@ impl DelegationMap {
                     .map(|d| d.pending_rewards)
             })
             .unwrap_or(0)
+    }
+
+    /// Remove all delegation entries for a validator, returning them for
+    /// immediate principal/reward settlement.
+    pub fn take_delegators(&mut self, validator_id: &Bytes32) -> Vec<DelegatorEntry> {
+        self.delegators.remove(validator_id).unwrap_or_default()
     }
 
     /// Remove a specific virtual delegation entry without unbonding.
