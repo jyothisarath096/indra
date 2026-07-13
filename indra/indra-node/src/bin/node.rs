@@ -1470,6 +1470,9 @@ fn main() {
     if let Some(v) = get_arg("--keys") {
         cfg_file.keys_path = Some(v);
     }
+    if let Some(v) = get_arg("--keys-password-file") {
+        cfg_file.keys_password_file = Some(v);
+    }
     if let Some(v) = get_arg("--p2p-addr") {
         cfg_file.p2p_addr = Some(v);
     }
@@ -1595,7 +1598,7 @@ fn main() {
     check_disk_space(Path::new(&data_dir));
 
     // Load keys
-    let keys_data = load_keys_data(&keys_path);
+    let keys_data = load_keys_data(&keys_path, cfg_file.keys_password_file.as_deref());
 
     let bootstrap_peers: Vec<String> = if cfg_file.bootstrap_peers.is_empty() {
         eprintln!("Bootstrap: (none; DNS/persisted/genesis discovery enabled)");
@@ -3031,6 +3034,8 @@ genesis  = "{}"
 
 [keys]
 path = "{}"
+# Required when path points to an encrypted keystore. File must be mode 0600.
+# password_file = "{}/keys.pass"
 
 [network]
 p2p_addr        = "0.0.0.0:30303"
@@ -3067,6 +3072,7 @@ mempool_capacity  = 5000
         toml_escape(&data_dir),
         toml_escape(&genesis_file),
         toml_escape(&keys_file),
+        toml_escape(&data_dir),
         OBSERVER_PORT,
         bootstrap_toml,
         DNS_SEED_HOSTS.join(","),
@@ -3154,44 +3160,27 @@ fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn load_keys_data(keys_path: &str) -> KeysData {
-    let keys_str = std::fs::read_to_string(keys_path)
-        .unwrap_or_else(|e| panic!("Cannot read {}: {}", keys_path, e));
-    KeysData {
-        hybrid_seed: extract_hex32(&keys_str, "hybrid_seed"),
-        bls_seed: extract_hex32(&keys_str, "bls_seed"),
-        vrf_seed: extract_hex32(&keys_str, "vrf_seed"),
-        pq_sk: extract_hex_field(&keys_str, "pq_sk"),
-        pq_pk: extract_hex_field(&keys_str, "hybrid_pq_pk"),
-    }
-}
-
-fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
-    let key = format!("\"{}\":", field);
-    let pos = match json.find(&key) {
-        Some(p) => p,
-        None => return vec![],
+fn load_keys_data(keys_path: &str, password_file: Option<&str>) -> KeysData {
+    let password_source = match password_file {
+        Some(path) => indra_keystore::PasswordSource::File {
+            path: Path::new(path),
+            reject_permissive: true,
+        },
+        None => indra_keystore::PasswordSource::None,
     };
-    let after = &json[pos + key.len()..];
-    let start = after.find('"').unwrap_or(0) + 1;
-    let end = after[start..].find('"').unwrap_or(0) + start;
-    hex::decode(&after[start..end]).unwrap_or_default()
-}
-
-fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
-    let key = format!("\"{}\":", field);
-    let pos = json
-        .find(&key)
-        .unwrap_or_else(|| panic!("Field '{}' not found in keys.json", field));
-    let after = &json[pos + key.len()..];
-    let start = after.find('"').unwrap() + 1;
-    let end = after[start..].find('"').unwrap() + start;
-    let hex_str = &after[start..end];
-    let bytes =
-        hex::decode(hex_str).unwrap_or_else(|_| panic!("Invalid hex for field '{}'", field));
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes[..32]);
-    arr
+    let keys = indra_keystore::load_keys(keys_path, password_source).unwrap_or_else(|e| {
+        panic!(
+            "Cannot load {}: {}. Encrypted validator keys require [keys].password_file or --keys-password-file for unattended startup.",
+            keys_path, e
+        )
+    });
+    KeysData {
+        hybrid_seed: keys.hybrid_seed,
+        bls_seed: keys.bls_seed,
+        vrf_seed: keys.vrf_seed,
+        pq_sk: keys.pq_sk,
+        pq_pk: keys.public.hybrid_pq_pk,
+    }
 }
 
 fn reserve_rpc_connection(count: &AtomicU64) -> bool {
@@ -3851,6 +3840,81 @@ mod tests {
         ));
 
         assert!(!proposal_failure_backoff_active(failed, 42, 7));
+    }
+
+    #[test]
+    fn node_startup_loads_encrypted_keys_from_password_file() {
+        let dir =
+            std::env::temp_dir().join(format!("indra-node-keystore-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys_path = dir.join("keys.json");
+        let password_path = dir.join("keys.pass");
+        let keys =
+            indra_keystore::generate_keypairs("validator".to_string(), [1; 32], [2; 32], [3; 32])
+                .unwrap();
+        let encrypted = indra_keystore::encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
+        indra_keystore::write_keys_secure(password_path.to_str().unwrap(), "pw\n").unwrap();
+
+        let loaded = load_keys_data(
+            keys_path.to_str().unwrap(),
+            Some(password_path.to_str().unwrap()),
+        );
+        assert_eq!(loaded.hybrid_seed, keys.hybrid_seed);
+        assert_eq!(loaded.bls_seed, keys.bls_seed);
+        assert_eq!(loaded.vrf_seed, keys.vrf_seed);
+        assert_eq!(loaded.pq_sk, keys.pq_sk);
+        assert_eq!(loaded.pq_pk, keys.public.hybrid_pq_pk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_startup_rejects_encrypted_keys_without_password_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "indra-node-keystore-no-password-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys_path = dir.join("keys.json");
+        let keys =
+            indra_keystore::generate_keypairs("validator".to_string(), [1; 32], [2; 32], [3; 32])
+                .unwrap();
+        let encrypted = indra_keystore::encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
+
+        let result = std::panic::catch_unwind(|| load_keys_data(keys_path.to_str().unwrap(), None));
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_startup_rejects_permissive_password_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "indra-node-keystore-permissions-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys_path = dir.join("keys.json");
+        let password_path = dir.join("keys.pass");
+        let keys =
+            indra_keystore::generate_keypairs("validator".to_string(), [1; 32], [2; 32], [3; 32])
+                .unwrap();
+        let encrypted = indra_keystore::encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
+        std::fs::write(&password_path, "pw\n").unwrap();
+        std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            load_keys_data(
+                keys_path.to_str().unwrap(),
+                Some(password_path.to_str().unwrap()),
+            )
+        });
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

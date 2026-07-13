@@ -497,7 +497,7 @@ fn fetch_next_nonce(node_url: &str, signer_id: &Bytes32) -> CliResult<u64> {
 
 fn load_keys(args: &[String]) -> CliResult<KeysFile> {
     let path = get(args, "--keys").unwrap_or_else(|| DEFAULT_KEYS.to_string());
-    KeysFile::load(&path)
+    indra_cli::load_keys_for_cli(&path, args)
 }
 
 fn staking_bond_proof_from_wallet(
@@ -601,7 +601,7 @@ fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
 
 fn print_help() {
     println!(
-        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
+        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
     );
 }
 

@@ -13,6 +13,7 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
 indra-node      = { path = "../indra-node" }
 indra-rpc       = { path = "../indra-rpc" }
+indra-keystore  = { path = "../indra-keystore" }
 thiserror.workspace = true
 hex.workspace = true
 bip39.workspace = true

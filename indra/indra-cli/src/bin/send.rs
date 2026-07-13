@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   indra-send --keys keys.json --wallet wallet.json \
+//!              [--keys-password-file keys.pass] \
 //!              --to <validator_address_or_pubkey> \
 //!              --amount <INDRA> \
 //!              --fee <INDRA> \
@@ -60,24 +61,23 @@ fn main() {
     println!("Node:    {}", node_url);
     println!("──────────────────────────────────────");
 
-    // Load keys
-    let keys_str = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
-        eprintln!("Error reading keys: {}", e);
+    // Load keys through the shared keystore loader so encrypted and legacy
+    // plaintext key files behave consistently across every CLI tool.
+    let keys = indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
+        eprintln!("Error loading keys: {}", e);
         std::process::exit(1);
     });
-    let hybrid_seed = extract_hex32(&keys_str, "hybrid_seed");
-    let pq_sk_bytes = extract_hex_field(&keys_str, "pq_sk");
-    let pq_pk_bytes = extract_hex_field(&keys_str, "hybrid_pq_pk");
+    let hybrid_seed = keys.hybrid_seed;
+    let pq_sk_bytes = keys.pq_sk.clone();
+    let pq_pk_bytes = keys.public.hybrid_pq_pk.clone();
 
     // Derive sender pubkey from seed
     use indra_core::types::{
         crypto::HybridPubKey,
         primitives::{Bytes32, VariableBytes},
     };
-    use indra_crypto::hybrid::ClassicalKeypair;
-    let classical = ClassicalKeypair::from_seed(&hybrid_seed);
     let sender_pubkey = HybridPubKey {
-        classical_pk: Bytes32::from(classical.public_key().0),
+        classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
         pq_pk: VariableBytes::from_slice(&pq_pk_bytes)
             .unwrap_or_else(|_| VariableBytes::from_slice(&[0u8; 2592]).unwrap()),
     };
@@ -253,35 +253,4 @@ fn extract_json_field(json: &str, field: &str) -> Option<String> {
     let after = &json[pos + key.len()..];
     let end = after.find('"')?;
     Some(after[..end].to_string())
-}
-
-fn extract_hex_field(json: &str, field: &str) -> Vec<u8> {
-    let key = format!("\"{}\":", field);
-    let pos = match json.find(&key) {
-        Some(p) => p,
-        None => return vec![0u8; 2592],
-    };
-    let after = &json[pos + key.len()..];
-    let start = after.find('"').unwrap_or(0) + 1;
-    let end = after[start..].find('"').unwrap_or(0) + start;
-    hex::decode(&after[start..end]).unwrap_or_else(|_| vec![0u8; 2592])
-}
-
-fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
-    let key = format!("\"{}\":", field);
-    let pos = json.find(&key).unwrap_or_else(|| {
-        eprintln!("Field '{}' not found in keys.json", field);
-        std::process::exit(1);
-    });
-    let after = &json[pos + key.len()..];
-    let start = after.find('"').unwrap() + 1;
-    let end = after[start..].find('"').unwrap() + start;
-    let hex_str = &after[start..end];
-    let bytes = hex::decode(hex_str).unwrap_or_else(|_| {
-        eprintln!("Invalid hex for '{}'", field);
-        std::process::exit(1);
-    });
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes[..32]);
-    arr
 }

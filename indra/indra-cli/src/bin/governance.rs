@@ -39,7 +39,7 @@ fn run() -> CliResult<()> {
 
     let command = args[0].as_str();
     let keys_path = flag_value(&args, "--keys").unwrap_or_else(|| "keys.json".into());
-    let keys = KeysFile::load(&keys_path)?;
+    let keys = indra_cli::load_keys_for_cli(&keys_path, &args)?;
     let keypair = reconstruct_keypair(&keys)?;
     let signer_id = signer_id_from_keys(&keys);
     let node_url = flag_value(&args, "--node").unwrap_or_else(|| "http://127.0.0.1:8545".into());
@@ -519,6 +519,7 @@ Commands:\n\
   cancel       Cancel your proposal during deliberation\n\n\
 Common flags:\n\
   --keys <path>    Path to keys.json (default: keys.json)\n\
+  --keys-password-file <path>  Password file for encrypted keys.json\n\
   --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n\
 	  --nonce <n>      Governance nonce override\n\
 	  --vote-nonce-store <path>  Local vote nonce store (default: beside keys.json)\n\

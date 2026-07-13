@@ -9,6 +9,7 @@
 //! derived deterministically from the validator seed.
 //!
 //! indra-wallet-scan --keys keys.json --wallet wallet.json \
+//!                   [--keys-password-file keys.pass] \
 //!                   --node http://127.0.0.1:8545
 
 const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
@@ -35,7 +36,7 @@ fn main() {
     println!("─────────────────────────────────────────");
 
     // Load keys
-    let keys = indra_cli::KeysFile::load(&keys_path).unwrap_or_else(|e| {
+    let keys = indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
         eprintln!("Error loading keys: {}", e);
         std::process::exit(1);
     });

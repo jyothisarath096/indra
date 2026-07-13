@@ -10,8 +10,8 @@
 //! - Legacy BLS12-381 keypair metadata (retained for backward compatibility)
 //! - VRF keypair (for proposer election)
 //!
-//! Output: a `keys.json` file with hex-encoded public and private keys.
-//! The private keys are stored as seeds (32 bytes each).
+//! Output: an encrypted `keys.json` by default, with legacy plaintext available
+//! only through an explicit unsafe opt-out for test/dev use.
 //!
 //! ### `genesis`
 //! Build a `genesis.toml` from a list of validator public keys and stake amounts.
@@ -48,9 +48,11 @@ pub mod wallet;
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
 pub use keygen::{
+    decrypt_encrypted_keys, encrypt_plaintext_keys, encrypt_plaintext_keys_replace,
     generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs,
-    has_secret_value_in_argv, recover_from_mnemonic, warn_if_key_file_permissive,
-    write_keys_file_secure, KeysFile, ValidatorKeys,
+    has_secret_value_in_argv, inspect_public_metadata, load_keys_for_cli,
+    password_source_from_args, recover_from_mnemonic, warn_if_key_file_permissive,
+    write_keys_file_secure, KeysFile, PasswordSource, ValidatorKeys,
 };
 pub use legacy_scan_auth::{
     build_legacy_scan_auth_proof, fetch_legacy_scan_challenge, json_string, rpc_call_raw_params,

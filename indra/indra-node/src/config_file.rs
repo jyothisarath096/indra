@@ -43,6 +43,8 @@ pub struct NodeConfigFile {
     pub genesis: Option<String>,
     /// `[keys].path`.
     pub keys_path: Option<String>,
+    /// `[keys].password_file`.
+    pub keys_password_file: Option<String>,
     /// `[network].p2p_addr`.
     pub p2p_addr: Option<String>,
     /// `[network].observer_addr`.
@@ -96,6 +98,7 @@ impl NodeConfigFile {
             data_dir: get_str(&table, "node", "data_dir"),
             genesis: get_str(&table, "node", "genesis"),
             keys_path: get_str(&table, "keys", "path"),
+            keys_password_file: get_str(&table, "keys", "password_file"),
             p2p_addr: get_str(&table, "network", "p2p_addr"),
             observer_addr: get_str(&table, "network", "observer_addr"),
             bootstrap_peers: get_str_array(&table, "network", "bootstrap_peers"),
@@ -401,12 +404,17 @@ genesis = "/tmp/indra/genesis.toml"
 
 [keys]
 path = "/tmp/indra/keys.json"
+password_file = "/tmp/indra/keys.pass"
 "#,
         );
         let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
         assert_eq!(cfg.mode.as_deref(), Some("validator"));
         assert_eq!(cfg.data_dir.as_deref(), Some("/tmp/indra"));
         assert_eq!(cfg.keys_path.as_deref(), Some("/tmp/indra/keys.json"));
+        assert_eq!(
+            cfg.keys_password_file.as_deref(),
+            Some("/tmp/indra/keys.pass")
+        );
     }
 
     #[test]
@@ -422,6 +430,7 @@ genesis = "/root/.indra/data/genesis.toml"
 
 [keys]
 path = "/root/.indra/data/keys.json"
+password_file = "/root/.indra/secrets/keys.pass"
 
 [network]
 p2p_addr = "0.0.0.0:30303"

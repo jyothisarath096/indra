@@ -15,6 +15,7 @@ indra-consensus = { path = "../indra-consensus" }
 indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
 indra-rpc       = { path = "../indra-rpc" }
+indra-keystore  = { path = "../indra-keystore" }
 indra-bulletproofs = { path = "../indra-bulletproofs" }
 rand.workspace = true
 thiserror.workspace = true

@@ -26,15 +26,15 @@ fn main() {
 
 fn usage_and_exit() -> ! {
     eprintln!("Usage:");
-    eprintln!("  indra-tx address --keys <keys.json>");
-    eprintln!("  indra-tx balance --keys <keys.json> [--address <hex>] --rpc <url>");
-    eprintln!("  indra-tx send --keys <keys.json> --to <address-hex> --amount <spark> --rpc <url>");
+    eprintln!("  indra-tx address --keys <keys.json> [--keys-password-file <path>]");
+    eprintln!("  indra-tx balance --keys <keys.json> [--keys-password-file <path>] [--address <hex>] --rpc <url>");
+    eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] --to <address-hex> --amount <spark> --rpc <url>");
     std::process::exit(1);
 }
 
 fn cmd_address(args: &[String]) {
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
-    let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
+    let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
@@ -51,7 +51,7 @@ fn cmd_balance(args: &[String]) {
         std::process::exit(1);
     });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
+    let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
@@ -97,7 +97,7 @@ fn cmd_send(args: &[String]) {
     let chain_id = get_arg(args, "--chain-id")
         .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
 
-    let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
+    let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });

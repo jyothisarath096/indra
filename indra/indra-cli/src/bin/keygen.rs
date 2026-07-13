@@ -1,5 +1,25 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
+        print_help();
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("encrypt") {
+        cmd_encrypt(&args[2..]);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("decrypt") {
+        cmd_decrypt(&args[2..]);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("inspect") {
+        cmd_inspect(&args[2..]);
+        return;
+    }
+
     let output = args
         .iter()
         .position(|a| a == "--output")
@@ -17,6 +37,18 @@ fn main() {
     let passphrase_mode = args.iter().any(|a| a == "--passphrase");
     if recover_mode && passphrase_mode {
         eprintln!("Error: choose either --recover or --passphrase, not both");
+        std::process::exit(1);
+    }
+    let plaintext_unsafe = args.iter().any(|a| a == "--plaintext-unsafe");
+    let password_source = keygen_password_source(&args);
+    if !plaintext_unsafe
+        && matches!(password_source, indra_cli::PasswordSource::Prompt)
+        && !stdin_is_tty()
+    {
+        eprintln!(
+            "Error: encrypted key generation in noninteractive mode requires --keys-password-file/--password-file, \
+             or explicitly opt out with --plaintext-unsafe for test/dev use."
+        );
         std::process::exit(1);
     }
     let name_arg = args
@@ -69,7 +101,22 @@ fn main() {
         }
     };
 
-    let json = keys.to_json();
+    let json = if plaintext_unsafe {
+        eprintln!(
+            "WARNING: writing plaintext keys.json because --plaintext-unsafe was supplied. \
+             Do not use plaintext key files for mainnet validators."
+        );
+        keys.to_json()
+    } else {
+        let password = password_source.resolve(true).unwrap_or_else(|e| {
+            eprintln!("Failed to read keystore password: {}", e);
+            std::process::exit(1);
+        });
+        indra_cli::encrypt_plaintext_keys(&keys, password.as_bytes()).unwrap_or_else(|e| {
+            eprintln!("Failed to encrypt keys: {}", e);
+            std::process::exit(1);
+        })
+    };
     if let Err(err) = indra_cli::write_keys_file_secure(output, &json) {
         eprintln!("Failed to write {}: {}", output, err);
         std::process::exit(1);
@@ -106,6 +153,158 @@ fn main() {
         hex::encode(keys.public.hybrid_classical_pk)
     );
     println!("  Keys written to:  {}", output);
+    if !plaintext_unsafe {
+        println!("  Storage:          encrypted at rest");
+        println!("  For unattended validator startup, store the password in a separate 0600 password file and set [keys].password_file.");
+    }
+}
+
+fn cmd_encrypt(args: &[String]) {
+    let keys_path = get(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
+    let replace = args.iter().any(|a| a == "--replace");
+    let out = get(args, "--out");
+    if replace && out.is_some() {
+        eprintln!("Error: choose either --replace or --out, not both");
+        std::process::exit(1);
+    }
+    if !replace && out.is_none() {
+        eprintln!("Error: encrypt requires --out <path> or --replace");
+        std::process::exit(1);
+    }
+    let keys = indra_cli::KeysFile::load(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load plaintext keys: {}", e);
+        std::process::exit(1);
+    });
+    let password = keygen_password_source_slice(args)
+        .resolve(true)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read keystore password: {}", e);
+            std::process::exit(1);
+        });
+    if replace {
+        let backup = indra_cli::encrypt_plaintext_keys_replace(
+            std::path::Path::new(&keys_path),
+            &keys,
+            password.as_bytes(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to encrypt/replace keys: {}", e);
+            std::process::exit(1);
+        });
+        println!("Encrypted keys written to: {}", keys_path);
+        println!("Plaintext backup retained at: {}", backup.display());
+        println!("Verify the encrypted key works, then securely remove the plaintext backup.");
+    } else {
+        let encrypted = indra_cli::encrypt_plaintext_keys(&keys, password.as_bytes())
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to encrypt keys: {}", e);
+                std::process::exit(1);
+            });
+        let out = out.unwrap();
+        indra_cli::write_keys_file_secure(&out, &encrypted).unwrap_or_else(|e| {
+            eprintln!("Failed to write {}: {}", out, e);
+            std::process::exit(1);
+        });
+        println!("Encrypted keys written to: {}", out);
+    }
+}
+
+fn cmd_decrypt(args: &[String]) {
+    let keys_path = get(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
+    let out = get(args, "--out").unwrap_or_else(|| {
+        eprintln!("Error: decrypt requires --out <path>; refusing to print private keys to stdout");
+        std::process::exit(1);
+    });
+    let json = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", keys_path, e);
+        std::process::exit(1);
+    });
+    let password = keygen_password_source_slice(args)
+        .resolve(false)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read keystore password: {}", e);
+            std::process::exit(1);
+        });
+    let keys = indra_cli::decrypt_encrypted_keys(&json, password.as_bytes()).unwrap_or_else(|e| {
+        eprintln!("Failed to decrypt keys: {}", e);
+        std::process::exit(1);
+    });
+    indra_cli::write_keys_file_secure(&out, &keys.to_json()).unwrap_or_else(|e| {
+        eprintln!("Failed to write {}: {}", out, e);
+        std::process::exit(1);
+    });
+    println!("Plaintext keys written to: {}", out);
+    println!(
+        "WARNING: this file contains private key material. Use only for emergency/debug workflows."
+    );
+}
+
+fn cmd_inspect(args: &[String]) {
+    let keys_path = get(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
+    let json = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", keys_path, e);
+        std::process::exit(1);
+    });
+    let (name, public) = indra_cli::inspect_public_metadata(&json).unwrap_or_else(|e| {
+        eprintln!("Failed to inspect keys: {}", e);
+        std::process::exit(1);
+    });
+    println!("Validator Name: {}", name);
+    println!("Validator ID:   {}", hex::encode(public.validator_id));
+    println!(
+        "Classical PK:   {}",
+        hex::encode(public.hybrid_classical_pk)
+    );
+    println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
+    println!("BLS PK:         {}", hex::encode(public.bls_pk));
+    println!("VRF PK:         {}", hex::encode(public.vrf_pk));
+}
+
+fn get(args: &[String], flag: &str) -> Option<String> {
+    get_ref(args, flag).map(ToString::to_string)
+}
+
+fn get_ref<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+fn keygen_password_source(args: &[String]) -> indra_cli::PasswordSource<'_> {
+    keygen_password_source_slice(args)
+}
+
+fn keygen_password_source_slice(args: &[String]) -> indra_cli::PasswordSource<'_> {
+    let path = get_ref(args, "--keys-password-file").or_else(|| get_ref(args, "--password-file"));
+    if let Some(path) = path {
+        indra_cli::PasswordSource::File {
+            path: std::path::Path::new(path),
+            reject_permissive: false,
+        }
+    } else if let Some(var) = get_ref(args, "--keys-password-env") {
+        indra_cli::PasswordSource::Env(var)
+    } else {
+        indra_cli::PasswordSource::Prompt
+    }
+}
+
+fn print_help() {
+    println!(
+        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json"
+    );
+}
+
+fn stdin_is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: isatty only observes the stdin fd.
+        unsafe { libc::isatty(0) == 1 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn read_secret_from_stdin(prompt: &str) -> String {

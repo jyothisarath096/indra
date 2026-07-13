@@ -45,7 +45,17 @@ pub enum CliError {
     /// Transaction build failed.
     #[error("transaction error: {0}")]
     Transaction(String),
+
+    /// Keystore operation failed.
+    #[error("keystore error: {0}")]
+    Keystore(String),
 }
 
 /// Convenience alias.
 pub type CliResult<T> = Result<T, CliError>;
+
+impl From<indra_keystore::KeystoreError> for CliError {
+    fn from(value: indra_keystore::KeystoreError) -> Self {
+        Self::Keystore(value.to_string())
+    }
+}
