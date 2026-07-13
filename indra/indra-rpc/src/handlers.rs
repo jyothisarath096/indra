@@ -4,6 +4,7 @@
 //! the node state, and returns a JSON string result or an RpcError.
 
 use indra_core::{
+    types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{SCHEMA_VERSION, SCHEMA_VERSION_GENESIS},
     types::{
         epoch_record::EpochRecord, governance::GovernanceOpV2, staking::StakingOp,
@@ -242,8 +243,12 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getChainInfo", RpcMethodAccess::ReadOnly),
     ("indra_getMempoolSize", RpcMethodAccess::ReadOnly),
     ("indra_getBlock", RpcMethodAccess::ReadOnly),
-    ("indra_getBalance", RpcMethodAccess::ReadOnly),
-    ("indra_getUtxos", RpcMethodAccess::ReadOnly),
+    ("indra_getLegacyScanChallenge", RpcMethodAccess::ReadOnly),
+    (
+        "indra_getLegacyBalanceAuthorized",
+        RpcMethodAccess::ReadOnly,
+    ),
+    ("indra_getLegacyUtxosAuthorized", RpcMethodAccess::ReadOnly),
     ("indra_getUtxoProof", RpcMethodAccess::ReadOnly),
     ("indra_getPeers", RpcMethodAccess::ReadOnly),
     ("indra_getStakingNonce", RpcMethodAccess::ReadOnly),
@@ -317,8 +322,9 @@ pub fn dispatch_with_mode(
         "indra_getChainInfo" => Ready(get_chain_info(state)),
         "indra_getMempoolSize" => Ready(get_mempool_size(state)),
         "indra_getBlock" => Ready(get_block(params, state)),
-        "indra_getBalance" => Ready(get_balance(params, state)),
-        "indra_getUtxos" => Ready(get_utxos(params, state)),
+        "indra_getLegacyScanChallenge" => Ready(get_legacy_scan_challenge(params, state)),
+        "indra_getLegacyBalanceAuthorized" => Ready(get_legacy_balance_authorized(params, state)),
+        "indra_getLegacyUtxosAuthorized" => Ready(get_legacy_utxos_authorized(params, state)),
         "indra_getUtxoProof" => Ready(get_utxo_proof(params, state)),
         "indra_getPeers" => Ready(get_peers(state)),
         "indra_getStakingNonce" => Ready(get_staking_nonce(params, state)),
@@ -524,10 +530,161 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     ))
 }
 
-/// `indra_getBalance` — returns total UTXO balance for an address.
-fn get_balance(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+/// Domain separator for the temporary legacy UTXO-scan ownership proof.
+///
+/// This is not an OutputV2 view key. It proves possession of the legacy
+/// address spend key before an address-indexed RPC scan is served.
+pub const LEGACY_SCAN_AUTH_DOMAIN: &[u8] = b"INDRA-legacy-utxo-scan-auth-v1:";
+
+fn legacy_scan_challenge_bytes(address: [u8; 32], state: &NodeState<'_>) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(LEGACY_SCAN_AUTH_DOMAIN.len() + b"challenge:".len() + 32);
+    preimage.extend_from_slice(LEGACY_SCAN_AUTH_DOMAIN);
+    preimage.extend_from_slice(b"challenge:");
+    preimage.extend_from_slice(state.chain.chain_id.as_bytes());
+    preimage.extend_from_slice(&address);
+    indra_crypto::sha256(&preimage)
+}
+
+fn legacy_scan_signing_message(address: [u8; 32], challenge: [u8; 32]) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(LEGACY_SCAN_AUTH_DOMAIN.len() + 32 + 32);
+    preimage.extend_from_slice(LEGACY_SCAN_AUTH_DOMAIN);
+    preimage.extend_from_slice(b"proof:");
+    preimage.extend_from_slice(&address);
+    preimage.extend_from_slice(&challenge);
+    indra_crypto::sha256(&preimage)
+}
+
+/// Build the message hash that a legacy scan proof must sign.
+pub fn legacy_scan_auth_message(address: [u8; 32], challenge: [u8; 32]) -> [u8; 32] {
+    legacy_scan_signing_message(address, challenge)
+}
+
+fn parse_hex_field<const N: usize>(json: &str, field: &str) -> RpcResult<[u8; N]> {
+    let raw = extract_json_string_field(json, field)
+        .ok_or_else(|| RpcError::InvalidParams(format!("missing auth field {field}")))?;
+    let bytes = hex::decode(raw)
+        .map_err(|_| RpcError::InvalidParams(format!("invalid hex in auth field {field}")))?;
+    if bytes.len() != N {
+        return Err(RpcError::InvalidParams(format!(
+            "auth field {field} must be {N} bytes"
+        )));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn parse_hex_vec_field(json: &str, field: &str) -> RpcResult<Vec<u8>> {
+    let raw = extract_json_string_field(json, field)
+        .ok_or_else(|| RpcError::InvalidParams(format!("missing auth field {field}")))?;
+    hex::decode(raw)
+        .map_err(|_| RpcError::InvalidParams(format!("invalid hex in auth field {field}")))
+}
+
+fn parse_u8_field(json: &str, field: &str) -> RpcResult<u8> {
+    let key = format!("\"{}\":", field);
+    let pos = json
+        .find(&key)
+        .ok_or_else(|| RpcError::InvalidParams(format!("missing auth field {field}")))?;
+    let after = json[pos + key.len()..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<u8>()
+        .map_err(|_| RpcError::InvalidParams(format!("invalid auth field {field}")))
+}
+
+fn extract_json_string_field<'a>(json: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{}\":", field);
+    let pos = json.find(&key)?;
+    let after = json[pos + key.len()..].trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(&after[..end])
+}
+
+fn verify_legacy_scan_auth(
+    address: [u8; 32],
+    auth_json: &str,
+    state: &NodeState<'_>,
+) -> RpcResult<()> {
+    let version = parse_u8_field(auth_json, "version")?;
+    if version != 1 {
+        return Err(RpcError::Forbidden(format!(
+            "unsupported legacy scan auth version {version}"
+        )));
+    }
+
+    let challenge = parse_hex_field::<32>(auth_json, "challenge")?;
+    let expected_challenge = legacy_scan_challenge_bytes(address, state);
+    if challenge != expected_challenge {
+        return Err(RpcError::Forbidden(
+            "legacy scan authorization challenge was not issued for this address and chain".into(),
+        ));
+    }
+
+    let classical_pk = parse_hex_field::<32>(auth_json, "hybrid_classical_pk")?;
+    if indra_crypto::sha256(&classical_pk) != address {
+        return Err(RpcError::Forbidden(
+            "legacy scan authorization public key does not match requested address".into(),
+        ));
+    }
+
+    let pq_pk = parse_hex_vec_field(auth_json, "hybrid_pq_pk")?;
+    let classical_sig = parse_hex_vec_field(auth_json, "classical_sig")?;
+    let pq_sig = parse_hex_vec_field(auth_json, "pq_sig")?;
+
+    let pk = HybridPubKey {
+        classical_pk: Bytes32::from(classical_pk),
+        pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&pq_pk)
+            .map_err(|_| RpcError::InvalidParams("hybrid_pq_pk too large".into()))?,
+    };
+    let sig = HybridSignature {
+        classical_sig: indra_core::types::primitives::VariableBytes::from_slice(&classical_sig)
+            .map_err(|_| RpcError::InvalidParams("classical_sig too large".into()))?,
+        pq_sig: indra_core::types::primitives::VariableBytes::from_slice(&pq_sig)
+            .map_err(|_| RpcError::InvalidParams("pq_sig too large".into()))?,
+    };
+    let crypto_pk = pk
+        .to_crypto_pubkey()
+        .map_err(|reason| RpcError::InvalidParams(format!("invalid auth public key: {reason}")))?;
+    let crypto_sig = sig
+        .to_crypto_sig()
+        .map_err(|reason| RpcError::InvalidParams(format!("invalid auth signature: {reason}")))?;
+    let msg = legacy_scan_signing_message(address, challenge);
+    indra_crypto::verify_hybrid(&msg, &crypto_sig, &crypto_pk)
+        .map_err(|_| RpcError::Forbidden("legacy scan authorization signature invalid".into()))
+}
+
+fn authorized_address(params: &[String], state: &NodeState<'_>) -> RpcResult<(String, [u8; 32])> {
+    if params.len() < 2 {
+        return Err(RpcError::InvalidParams(
+            "expected address and scan_auth_proof parameters".into(),
+        ));
+    }
+    let address_hex = unquote(&params[0]).to_string();
+    let auth = unquote(&params[1]);
+    let address = parse_address_hex(&address_hex)?;
+    verify_legacy_scan_auth(address, auth, state)?;
+    Ok((address_hex, address))
+}
+
+/// `indra_getLegacyScanChallenge` — returns a node-provided challenge for a
+/// temporary legacy UTXO-scan ownership proof.
+fn get_legacy_scan_challenge(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let address_hex = first_param(params, "address")?;
     let address = parse_address_hex(&address_hex)?;
+    let challenge = legacy_scan_challenge_bytes(address, state);
+    Ok(format!(
+        r#"{{"address":"{}","challenge":"{}","auth_format_version":1,"note":"sign INDRA legacy UTXO-scan authorization; this is not an OutputV2 view key"}}"#,
+        address_hex,
+        hex::encode(challenge)
+    ))
+}
+
+/// `indra_getLegacyBalanceAuthorized` — returns total legacy UTXO balance after
+/// the address owner proves possession of the legacy spend key.
+fn get_legacy_balance_authorized(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let (address_hex, address) = authorized_address(params, state)?;
     let mut balance = 0u64;
     for entry in state.chain.utxos.all_entries() {
         let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
@@ -537,14 +694,14 @@ fn get_balance(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     }
     Ok(format!(
         r#"{{"address":"{}","balance":{},"privacy_note":"{}"}}"#,
-        address_hex, balance, UTXO_PRIVACY_NOTE
+        address_hex, balance, LEGACY_SCAN_PRIVACY_NOTE
     ))
 }
 
-/// `indra_getUtxos` — returns UTXOs for an address.
-fn get_utxos(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let address_hex = first_param(params, "address")?;
-    let address = parse_address_hex(&address_hex)?;
+/// `indra_getLegacyUtxosAuthorized` — returns legacy UTXOs after the address
+/// owner proves possession of the legacy spend key.
+fn get_legacy_utxos_authorized(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let (address_hex, address) = authorized_address(params, state)?;
     let utxos: Vec<String> = state
         .chain
         .utxos
@@ -568,12 +725,12 @@ fn get_utxos(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
         r#"{{"address":"{}","utxos":[{}],"privacy_note":"{}"}}"#,
         address_hex,
         utxos.join(","),
-        UTXO_PRIVACY_NOTE
+        LEGACY_SCAN_PRIVACY_NOTE
     ))
 }
 
-const UTXO_PRIVACY_NOTE: &str =
-    "queries are public; UTXO amounts reflect public value_spark metadata, not committed values";
+const LEGACY_SCAN_PRIVACY_NOTE: &str =
+    "authorized legacy RPC scan only; raw OutputV1 chain data still exposes owner and value metadata to full-node observers";
 
 fn parse_address_hex(address_hex: &str) -> RpcResult<[u8; 32]> {
     if address_hex.len() != 64 {

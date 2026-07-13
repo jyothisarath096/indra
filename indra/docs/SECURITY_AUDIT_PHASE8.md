@@ -8,7 +8,7 @@
 | API-02 | RPC input | Transaction submission uses validated mempool admission | SAFE | VERIFIED |
 | API-03 | RPC input | Governance op admission uses full validation | SAFE | VERIFIED |
 | API-04 | Info leak | No RPC endpoint exposes private keys or raw secret material | SAFE | VERIFIED |
-| API-05 | Info leak | Public UTXO/address queries are public by testnet design and now rate-limited/documented | MEDIUM | FIXED |
+| API-05 | Info leak | Public UTXO/address scans superseded by authorized legacy scan RPC | MEDIUM | FIXED |
 | API-06 | Info leak | Public peer endpoint exposes validator peer topology/IPs | HIGH | FIXED |
 | API-07 | Resource | No RPC rate limiting or connection concurrency limit | HIGH | FIXED |
 | API-08 | Resource | Oversized bodies, non-POST methods, and batch requests rejected | MEDIUM | FIXED |
@@ -33,13 +33,13 @@ Severity: CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE
 The RPC layer performs some important validation, but it was not uniform across endpoints. Hex transaction/governance/staking payloads were decoded before reaching application logic, and transaction/governance admissions already routed through validated paths. The remaining gaps were:
 
 - The hand-written JSON-RPC parser in `indra-rpc/src/types.rs` accepts missing or non-`2.0` `jsonrpc` values and does not implement a strict JSON parser.
-- Invalid address lengths for `indra_getBalance` and `indra_getUtxos` returned zero/empty results instead of a clean invalid-parameter error.
+- Invalid address lengths for the legacy address-scan methods returned zero/empty results instead of a clean invalid-parameter error.
 - Staking operations admitted through RPC called `NodeEngine::add_staking_op`, which only ran `validate_structure()` plus duplicate nonce checks before adding the op to the staking mempool.
 - The inline node RPC handler accepted any non-OPTIONS HTTP method with a body; it did not require POST.
 
 **Attack scenario:** An attacker sends large volumes of structurally valid but state-invalid staking operations. They can enter the staking mempool and be selected into candidate blocks, wasting proposer/block-validation work before final rejection.
 
-**Fix implemented:** `NodeEngine::add_staking_op` now validates staking operations against a scratch clone of current state via `apply_staking_op` before mempool insertion. `indra_getBalance` and `indra_getUtxos` now reject malformed address parameters with JSON-RPC invalid-params errors. The live node and generic RPC handlers enforce POST/OPTIONS semantics. Regression coverage: `staking_mempool_rejects_structurally_invalid_staking_op_at_admission`, `rpc_get_balance_returns_error_for_invalid_address`, and `rpc_rejects_non_post_method`.
+**Fix implemented:** `NodeEngine::add_staking_op` now validates staking operations against a scratch clone of current state via `apply_staking_op` before mempool insertion. The legacy address-scan challenge path now rejects malformed address parameters with JSON-RPC invalid-params errors. The live node and generic RPC handlers enforce POST/OPTIONS semantics. Regression coverage: `staking_mempool_rejects_structurally_invalid_staking_op_at_admission`, `rpc_legacy_scan_challenge_returns_error_for_invalid_address`, and `rpc_rejects_non_post_method`.
 
 **Residual note:** The minimal hand-written JSON parser remains intentionally small; it is now bounded and stricter at the transport/method layer, but a production RPC stack should eventually use a full HTTP/JSON implementation.
 
@@ -74,18 +74,18 @@ No RPC endpoint inspected returns validator private keys, VRF secret keys, BLS s
 
 ### API-05 — UTXO and transaction privacy
 
-**Status:** FIXED  
+**Status:** FIXED; superseded by later legacy-scan authorization hardening  
 **Severity:** MEDIUM
 
-The RPC layer exposes address-indexed UTXO data without proving that the caller owns the address. `indra_getBalance` scans all UTXOs and returns the public total for any 32-byte address hash supplied by the caller (`indra-rpc/src/handlers.rs:429`). `indra_getUtxos` returns UTXO IDs, public amounts, creation height, transaction index, output index, and lock height for any supplied address (`indra-rpc/src/handlers.rs:447`). `indra_getUtxoProof` also allows arbitrary UTXO membership probing by ID.
+The original finding was that the RPC layer exposed address-indexed UTXO data without proving that the caller owns the address. The old `indra_getBalance`/`indra_getUtxos` methods scanned all UTXOs for any 32-byte address hash supplied by the caller. `indra_getUtxoProof` also allows generic UTXO membership probing by ID.
 
 This does not expose blinding factors or private keys, but it weakens wallet privacy and makes balance/UTXO surveillance easy for any known address.
 
-**Attack scenario:** An external caller who learns a validator/user address can repeatedly query `indra_getUtxos` to track balances, UTXO churn, lock heights, and output lineage without authentication or ownership proof.
+**Attack scenario:** An external caller who learns a validator/user address can repeatedly query address-indexed scan endpoints to track balances, UTXO churn, lock heights, and output lineage without authentication or ownership proof.
 
-**Fix implemented:** For testnet, INDRA explicitly treats address-indexed UTXO scans as public chain-data RPC rather than wallet-owner RPC. Responses now include a privacy caveat explaining that queries are public and amounts reflect `value_spark` metadata, not hidden committed values. The live node adds a separate per-IP UTXO-scan limiter (`UTXO_SCAN_RATE_PER_MIN = 10`) on top of the global RPC limiter. Regression coverage: `utxo_query_privacy_caveat_is_documented_in_response` and `utxo_query_is_rate_limited_independently`.
+**Current fix implemented:** The old unauthenticated public scan methods have been removed from dispatch/read-only classification and replaced by `indra_getLegacyScanChallenge`, `indra_getLegacyUtxosAuthorized`, and `indra_getLegacyBalanceAuthorized`. The authorized methods require a signed ownership challenge from the address's hybrid spend key before returning address-specific UTXO/balance data. The live node keeps a separate per-IP UTXO-scan limiter (`UTXO_SCAN_RATE_PER_MIN = 10`) on the authorized scan endpoints. Regression coverage: `legacy_utxo_and_balance_scans_require_valid_ownership_auth`, `old_public_utxo_scan_methods_are_removed_from_public_rpc`, and `utxo_query_is_rate_limited_independently`.
 
-**Mainnet TODO:** If INDRA wants wallet privacy stronger than public-chain observability, add a separate local wallet API using view keys or signed ownership challenges. That is a protocol/API design change and was intentionally not added in this hardening pass.
+**Residual limitation:** This is RPC-layer hardening only. OutputV1 still exposes owner/value metadata to anyone reading raw chain data or running a full node. Full node-level transaction privacy remains deferred to OutputV2 pending external post-quantum cryptography review.
 
 ### API-06 — Validator identity and topology exposure
 
@@ -111,7 +111,7 @@ No per-IP, per-method, global, or expensive-endpoint rate limiter was found in t
 
 Expensive read endpoints include UTXO scans, delegation/staking queries, governance queries, and peer topology queries. Mutating endpoints also decode and validate user-provided payloads.
 
-**Attack scenario:** A single client opens many concurrent RPC connections and repeatedly calls `indra_getUtxos` or mutation endpoints with large-but-under-limit bodies. This consumes threads, memory, validation CPU, and the consensus driver mutex.
+**Attack scenario:** A single client opens many concurrent RPC connections and repeatedly calls authorized legacy UTXO scans or mutation endpoints with large-but-under-limit bodies. This consumes threads, memory, validation CPU, and the consensus driver mutex.
 
 **Fix implemented:** The live node RPC listener now enforces `MAX_RPC_CONNECTIONS = 64` with atomic connection accounting and drops excess connections before spawning handlers. A shared per-IP RPC token bucket (`RPC_RATE_LIMIT_PER_SEC = 20`, `RPC_RATE_BURST = 40`) rejects excess requests with HTTP 429. Regression coverage: `rpc_connection_limit_is_enforced` and `rpc_per_ip_rate_limit_returns_429`.
 
@@ -272,7 +272,7 @@ The original Phase 8 audit was audit-only, but follow-up fix tasks added regress
 
 3. **API-09 consensus-lock contention**
    - Populate state with many UTXOs.
-   - Repeatedly call `indra_getUtxos` while measuring time to acquire the consensus driver lock for a local consensus action.
+   - Repeatedly call `indra_getLegacyUtxosAuthorized` while measuring time to acquire the consensus driver lock for a local consensus action.
    - Fix expectation: read-only RPC does not hold the consensus driver lock across full-state scans.
 
 4. **API-13 CLI argv leakage**
@@ -286,8 +286,8 @@ The original Phase 8 audit was audit-only, but follow-up fix tasks added regress
    - Non-POST methods, oversized bodies, and batch requests are rejected explicitly.
 
 6. **API-05 UTXO scan privacy/rate limit**
-   - `indra_getUtxos` responses include a privacy caveat.
-   - UTXO scan endpoints are independently per-IP rate-limited.
+   - Legacy address-indexed UTXO/balance scans require valid ownership authorization.
+   - Authorized UTXO scan endpoints are independently per-IP rate-limited.
 
 7. **API-10/API-11 FFI hardening**
    - Bounded C strings reject non-NUL-terminated buffers within `MAX_CSTR_LEN`.

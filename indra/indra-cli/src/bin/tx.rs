@@ -27,7 +27,7 @@ fn main() {
 fn usage_and_exit() -> ! {
     eprintln!("Usage:");
     eprintln!("  indra-tx address --keys <keys.json>");
-    eprintln!("  indra-tx balance --address <hex> --rpc <url>");
+    eprintln!("  indra-tx balance --keys <keys.json> [--address <hex>] --rpc <url>");
     eprintln!("  indra-tx send --keys <keys.json> --to <address-hex> --amount <spark> --rpc <url>");
     std::process::exit(1);
 }
@@ -43,9 +43,38 @@ fn cmd_address(args: &[String]) {
 }
 
 fn cmd_balance(args: &[String]) {
-    let address = required_arg(args, "--address");
+    let keys_path = get_arg(args, "--keys").unwrap_or_else(|| {
+        eprintln!(
+            "Error: legacy balance scans now require ownership authorization. \
+             Re-run with --keys <keys.json> for the address owner."
+        );
+        std::process::exit(1);
+    });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let raw = rpc_call(&rpc, "indra_getBalance", &[address.clone()]);
+    let keys = KeysFile::load(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Error loading {}: {}", keys_path, e);
+        std::process::exit(1);
+    });
+    let derived_address = hex::encode(sha256(&keys.public.hybrid_classical_pk));
+    let address = get_arg(args, "--address").unwrap_or_else(|| derived_address.clone());
+    if address != derived_address {
+        eprintln!(
+            "Error: keys.json does not own requested address {}. \
+             Legacy UTXO/balance scans require the owner's keys.",
+            address
+        );
+        std::process::exit(1);
+    }
+    let proof = build_auth_or_exit(&rpc, &keys, &address);
+    let raw = indra_cli::rpc_call_raw_params(
+        &rpc,
+        "indra_getLegacyBalanceAuthorized",
+        &[indra_cli::json_string(&address), proof],
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error querying authorized legacy balance: {}", e);
+        std::process::exit(1);
+    });
     let balance = extract_number(&raw, "balance").unwrap_or(0);
     println!(
         "Address: {}\nBalance: {} Spark ({:.8} INDRA)",
@@ -78,7 +107,16 @@ fn cmd_send(args: &[String]) {
     let pq_pk = keys.public.hybrid_pq_pk.clone();
     let sender_address = hex::encode(sha256(&classical_pk));
 
-    let utxos_raw = rpc_call(&rpc, "indra_getUtxos", &[sender_address.clone()]);
+    let proof = build_auth_or_exit(&rpc, &keys, &sender_address);
+    let utxos_raw = indra_cli::rpc_call_raw_params(
+        &rpc,
+        "indra_getLegacyUtxosAuthorized",
+        &[indra_cli::json_string(&sender_address), proof],
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error querying authorized legacy UTXOs: {}", e);
+        std::process::exit(1);
+    });
     let wallet = wallet_from_utxos_json(&utxos_raw);
 
     let recipient_pubkey = resolve_recipient_pubkey(&rpc, &recipient_address);
@@ -117,6 +155,17 @@ fn cmd_send(args: &[String]) {
         std::process::exit(1);
     }
     println!("{}", built.tx_id);
+}
+
+fn build_auth_or_exit(rpc: &str, keys: &KeysFile, address: &str) -> String {
+    indra_cli::build_legacy_scan_auth_proof(rpc, keys, address).unwrap_or_else(|e| {
+        eprintln!(
+            "Error building legacy scan authorization: {}. \
+             Address-indexed UTXO scans are no longer public; use the owner's keys.json.",
+            e
+        );
+        std::process::exit(1);
+    })
 }
 
 fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {

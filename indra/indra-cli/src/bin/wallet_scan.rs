@@ -1,6 +1,6 @@
 //! Wallet scan — discover UTXOs owned by this keypair from the chain.
 //!
-//! Calls indra_getUtxos RPC to find UTXOs, then the user provides
+//! Calls the authorized legacy UTXO-scan RPC to find UTXOs, then the user provides
 //! the blinding factors to reconstruct spendable wallet entries.
 //!
 //! ## Usage
@@ -35,16 +35,14 @@ fn main() {
     println!("─────────────────────────────────────────");
 
     // Load keys
-    let keys_str = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
-        eprintln!("Error reading keys: {}", e);
+    let keys = indra_cli::KeysFile::load(&keys_path).unwrap_or_else(|e| {
+        eprintln!("Error loading keys: {}", e);
         std::process::exit(1);
     });
-    let hybrid_seed = extract_hex32(&keys_str, "hybrid_seed");
+    let hybrid_seed = keys.hybrid_seed;
 
     // Derive classical pubkey
-    use indra_crypto::hybrid::ClassicalKeypair;
-    let classical = ClassicalKeypair::from_seed(&hybrid_seed);
-    let classical_pk = classical.public_key().0;
+    let classical_pk = keys.public.hybrid_classical_pk;
     let address_hex = hex::encode(indra_crypto::sha256(&classical_pk));
     let pubkey_hex = hex::encode(classical_pk);
 
@@ -114,7 +112,7 @@ fn main() {
 
     // Query node for UTXOs
     println!("\nQuerying node for UTXOs...");
-    match query_utxos(&node_url, &address_hex) {
+    match query_utxos(&node_url, &keys, &address_hex) {
         Ok(response) => {
             println!("Node response: {}", response);
             let discovered = parse_utxos_json(&response);
@@ -181,13 +179,20 @@ fn main() {
     );
 }
 
-/// Query the node for UTXOs owned by a pubkey.
-fn query_utxos(node_url: &str, pubkey_hex: &str) -> Result<String, String> {
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","method":"indra_getUtxos","params":["{}"],"id":1}}"#,
-        pubkey_hex
-    );
-    indra_cli::staking::http_post(node_url, &body).map_err(|e| e.to_string())
+/// Query the node for UTXOs owned by this keypair's legacy address.
+fn query_utxos(
+    node_url: &str,
+    keys: &indra_cli::KeysFile,
+    address_hex: &str,
+) -> Result<String, String> {
+    let proof = indra_cli::build_legacy_scan_auth_proof(node_url, keys, address_hex)
+        .map_err(|e| e.to_string())?;
+    indra_cli::rpc_call_raw_params(
+        node_url,
+        "indra_getLegacyUtxosAuthorized",
+        &[indra_cli::json_string(address_hex), proof],
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Derive the genesis blinding factor for this validator's initial stake UTXO.
@@ -266,25 +271,4 @@ fn extract_json_num(json: &str, key: &str) -> Option<u64> {
     let after = json[pos + needle.len()..].trim_start();
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
-}
-
-fn extract_hex32(json: &str, field: &str) -> [u8; 32] {
-    let key = format!("\"{}\":", field);
-    let pos = match json.find(&key) {
-        Some(p) => p,
-        None => {
-            eprintln!("Field '{}' not found in keys.json", field);
-            std::process::exit(1);
-        }
-    };
-    let after = &json[pos + key.len()..];
-    let start = after.find('"').unwrap_or(0) + 1;
-    let end = after[start..].find('"').unwrap_or(0) + start;
-    let bytes = hex::decode(&after[start..end]).unwrap_or_else(|_| {
-        eprintln!("Invalid hex for '{}'", field);
-        std::process::exit(1);
-    });
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes[..32]);
-    arr
 }

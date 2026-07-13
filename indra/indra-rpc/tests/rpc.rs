@@ -7,6 +7,7 @@ use indra_core::types::{
     governance::{GovernableAction, ProposalTier},
     primitives::{Bytes32, VariableBytes},
 };
+use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_rpc::types::parse_request;
 use indra_rpc::{
     handlers::{
@@ -22,6 +23,48 @@ use indra_state::ChainState;
 
 fn engine(_suffix: &str) -> ChainState {
     ChainState::new_genesis()
+}
+
+fn legacy_scan_auth_fixture(state: &ChainState) -> (String, String) {
+    let classical = ClassicalKeypair::from_seed(&[0xA5; 32]);
+    let pq = PqKeypair::from_seed(&[0x5A; 32]).unwrap();
+    let keypair = HybridKeypair::new(classical, pq);
+    let public = keypair.public_key();
+    let address = indra_crypto::sha256(&public.classical.0);
+    let address_hex = hex::encode(address);
+    let challenge_resp = call_rpc(
+        "indra_getLegacyScanChallenge",
+        &[format!(r#""{}""#, address_hex)],
+        state,
+    );
+    let challenge_hex = extract_string_field(&challenge_resp, "challenge").unwrap();
+    let challenge = decode_hex32(&challenge_hex);
+    let msg = indra_rpc::handlers::legacy_scan_auth_message(address, challenge);
+    let sig = keypair.sign(&msg).unwrap();
+    let proof = format!(
+        r#"{{"version":1,"challenge":"{}","hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","classical_sig":"{}","pq_sig":"{}","reserved_output_v2":null}}"#,
+        challenge_hex,
+        hex::encode(public.classical.0),
+        hex::encode(public.pq.0),
+        hex::encode(sig.classical.0),
+        hex::encode(sig.pq.0)
+    );
+    (address_hex, proof)
+}
+
+fn extract_string_field(json: &str, field: &str) -> Option<String> {
+    let key = format!("\"{}\":\"", field);
+    let pos = json.find(&key)?;
+    let after = &json[pos + key.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn decode_hex32(hex_value: &str) -> [u8; 32] {
+    let bytes = hex::decode(hex_value).unwrap();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
 }
 
 #[test]
@@ -98,6 +141,72 @@ fn get_staking_nonce_returns_zero_for_unknown() {
     let resp = call_rpc("indra_getStakingNonce", &[format!(r#""{}""#, signer)], &e);
     assert!(resp.contains("\"nonce\":0"));
     assert!(resp.contains("\"next_nonce\":1"));
+}
+
+#[test]
+fn legacy_utxo_and_balance_scans_require_valid_ownership_auth() {
+    let e = engine("rpc_legacy_scan_auth");
+    let address = "11".repeat(32);
+
+    let missing_auth = call_rpc(
+        "indra_getLegacyUtxosAuthorized",
+        &[format!(r#""{}""#, address)],
+        &e,
+    );
+    assert!(missing_auth.contains("\"error\""));
+    assert!(missing_auth.contains("scan_auth_proof"));
+
+    let invalid_auth = call_rpc(
+        "indra_getLegacyBalanceAuthorized",
+        &[format!(r#""{}""#, address), "{}".to_string()],
+        &e,
+    );
+    assert!(invalid_auth.contains("\"error\""));
+
+    let (owned_address, proof) = legacy_scan_auth_fixture(&e);
+    let utxos = call_rpc(
+        "indra_getLegacyUtxosAuthorized",
+        &[format!(r#""{}""#, owned_address), proof.clone()],
+        &e,
+    );
+    assert!(utxos.contains("\"utxos\""), "{utxos}");
+    assert!(utxos.contains("authorized legacy RPC scan"));
+
+    let balance = call_rpc(
+        "indra_getLegacyBalanceAuthorized",
+        &[format!(r#""{}""#, owned_address), proof],
+        &e,
+    );
+    assert!(balance.contains("\"balance\""), "{balance}");
+}
+
+#[test]
+fn old_public_utxo_scan_methods_are_removed_from_public_rpc() {
+    assert!(!RPC_METHODS
+        .iter()
+        .any(|(name, _)| *name == "indra_getUtxos"));
+    assert!(!RPC_METHODS
+        .iter()
+        .any(|(name, _)| *name == "indra_getBalance"));
+
+    let e = engine("rpc_old_utxo_methods_removed");
+    let resp = call_rpc_with_mode(
+        "indra_getUtxos",
+        &[format!(r#""{}""#, "11".repeat(32))],
+        &e,
+        RpcMode::ReadOnly,
+    );
+    assert!(resp.contains("\"error\""));
+    assert!(resp.contains("read-only listener"));
+
+    let full_resp = call_rpc_with_mode(
+        "indra_getUtxos",
+        &[format!(r#""{}""#, "11".repeat(32))],
+        &e,
+        RpcMode::Full,
+    );
+    assert!(full_resp.contains("\"error\""));
+    assert!(full_resp.contains("-32601"));
 }
 
 #[test]
@@ -280,8 +389,15 @@ fn test_all_methods_reachable_via_dispatch() {
         ("indra_getChainInfo", vec![]),
         ("indra_getMempoolSize", vec![]),
         ("indra_getBlock", vec!["0".to_string()]),
-        ("indra_getBalance", vec![hex32.clone()]),
-        ("indra_getUtxos", vec![hex32.clone()]),
+        ("indra_getLegacyScanChallenge", vec![hex32.clone()]),
+        (
+            "indra_getLegacyBalanceAuthorized",
+            vec![hex32.clone(), "{}".to_string()],
+        ),
+        (
+            "indra_getLegacyUtxosAuthorized",
+            vec![hex32.clone(), "{}".to_string()],
+        ),
         ("indra_getUtxoProof", vec![hex32.clone()]),
         ("indra_getPeers", vec![]),
         ("indra_getStakingNonce", vec![hex32.clone()]),
@@ -382,8 +498,7 @@ fn read_only_listener_allows_every_classified_read_method() {
     let params_for = |method: &str| -> Vec<String> {
         match method {
             "indra_getBlock" => vec!["0".to_string()],
-            "indra_getBalance"
-            | "indra_getUtxos"
+            "indra_getLegacyScanChallenge"
             | "indra_getUtxoProof"
             | "indra_getStakingNonce"
             | "indra_getDelegations"
@@ -398,6 +513,9 @@ fn read_only_listener_allows_every_classified_read_method() {
             | "indra_getValidator"
             | "indra_getValidatorSelfStake"
             | "indra_getValidatorAutoDelegate" => vec![hex32.clone()],
+            "indra_getLegacyBalanceAuthorized" | "indra_getLegacyUtxosAuthorized" => {
+                vec![hex32.clone(), "{}".to_string()]
+            }
             "indra_getEpochRecord" => vec!["0".to_string()],
             _ => Vec::new(),
         }

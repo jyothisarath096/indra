@@ -281,8 +281,9 @@ All endpoints accept JSON-RPC 2.0 POST to `http://node:8545`.
 **Wallet**
 | Method | Description |
 |--------|-------------|
-| `indra_getBalance` | UTXO balance for an address |
-| `indra_getUtxos` | UTXOs for an address |
+| `indra_getLegacyScanChallenge` | Ownership challenge for authorized legacy scans |
+| `indra_getLegacyBalanceAuthorized` | Authorized legacy UTXO balance scan |
+| `indra_getLegacyUtxosAuthorized` | Authorized legacy UTXO scan |
 | `indra_sendTransaction` | Submit a signed transaction |
 | `indra_submitStakingOp` | Submit a staking operation |
 | `indra_getStakingNonce` | Replay-protection nonce for staking |

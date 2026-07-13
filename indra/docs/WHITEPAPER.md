@@ -435,11 +435,26 @@ addresses.
 - Transaction timing is public
 - The fact that a specific UTXO was spent is public
 
-### 4.3 Compliance support
+### 4.3 Current privacy boundary and future view-key work
 
-INDRA supports optional view keys for selective disclosure to auditors,
-regulators, or exchanges. Public (non-confidential) transactions omit
-Bulletproof range proofs and reveal amounts in plaintext.
+INDRA currently uses Pedersen commitments and Bulletproof range proofs
+for transaction amount confidentiality, but the current OutputV1 format
+still exposes recipient public keys and value metadata to anyone reading
+raw chain data directly. This is the same owner-level transparency model
+as Bitcoin, not a full transaction-privacy model.
+
+Remote RPC-based legacy address scanning requires authorization: a caller
+must prove ownership of the address before using the legacy UTXO/balance
+scan methods. This closes casual remote surveillance through public RPC
+endpoints, but it does not hide OutputV1 owner/value metadata from a full
+node or anyone with raw block data.
+
+Full owner-level transaction privacy against node-level observers
+requires a future protocol upgrade using stealth destinations, encrypted
+recipient notes, and real view keys. That upgrade must use a reviewed,
+genuinely post-quantum-appropriate construction before INDRA makes any
+full view-key or stealth-address privacy claim. It is planned, but not
+implemented.
 
 ---
 
@@ -821,8 +836,9 @@ Schema
 Submission
   indra_sendTransaction      Submit a transaction
   indra_submitStakingOp      Submit a staking operation
-  indra_getBalance           UTXO balance for an address
-  indra_getUtxos             UTXOs for an address
+  indra_getLegacyScanChallenge        Ownership challenge for legacy scans
+  indra_getLegacyBalanceAuthorized    Authorized legacy UTXO balance scan
+  indra_getLegacyUtxosAuthorized      Authorized legacy UTXO scan
   indra_getStakingNonce      Replay-protection nonce for staking ops
   indra_getPeers             Connected validator and observer peers
 ```

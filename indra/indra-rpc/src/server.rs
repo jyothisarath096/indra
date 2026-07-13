@@ -172,7 +172,10 @@ pub fn rpc_rate_limited_response() -> String {
 
 /// Return true when an RPC method triggers a full public UTXO scan.
 pub fn is_utxo_scan_method(method: &str) -> bool {
-    matches!(method, "indra_getBalance" | "indra_getUtxos")
+    matches!(
+        method,
+        "indra_getLegacyBalanceAuthorized" | "indra_getLegacyUtxosAuthorized"
+    )
 }
 
 /// Return true when the request body is a JSON-RPC batch request.
@@ -625,21 +628,24 @@ mod tests {
     }
 
     #[test]
-    fn rpc_get_balance_returns_error_for_invalid_address() {
+    fn rpc_legacy_scan_challenge_returns_error_for_invalid_address() {
         let engine = ChainState::new_genesis();
-        let resp = call_rpc("indra_getBalance", &["not-hex".to_string()], &engine);
+        let resp = call_rpc(
+            "indra_getLegacyScanChallenge",
+            &["not-hex".to_string()],
+            &engine,
+        );
         assert!(resp.contains("\"error\""));
         assert!(resp.contains("invalid address"));
         assert!(!resp.contains("\"balance\":0"));
     }
 
     #[test]
-    fn utxo_query_privacy_caveat_is_documented_in_response() {
-        let engine = ChainState::new_genesis();
-        let address = hex::encode([0u8; 32]);
-        let resp = call_rpc("indra_getUtxos", &[address], &engine);
-        assert!(resp.contains("privacy_note"));
-        assert!(resp.contains("queries are public"));
+    fn old_public_utxo_scan_methods_are_not_rate_limited_as_scan_methods() {
+        assert!(!is_utxo_scan_method("indra_getUtxos"));
+        assert!(!is_utxo_scan_method("indra_getBalance"));
+        assert!(is_utxo_scan_method("indra_getLegacyUtxosAuthorized"));
+        assert!(is_utxo_scan_method("indra_getLegacyBalanceAuthorized"));
     }
 
     #[test]

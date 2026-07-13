@@ -39,6 +39,7 @@
 pub mod error;
 pub mod genesis_cmd;
 pub mod keygen;
+pub mod legacy_scan_auth;
 pub mod query;
 pub mod staking;
 pub mod tx_builder;
@@ -50,6 +51,10 @@ pub use keygen::{
     generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs,
     has_secret_value_in_argv, recover_from_mnemonic, warn_if_key_file_permissive,
     write_keys_file_secure, KeysFile, ValidatorKeys,
+};
+pub use legacy_scan_auth::{
+    build_legacy_scan_auth_proof, fetch_legacy_scan_challenge, json_string, rpc_call_raw_params,
+    ScanAuthFileV1,
 };
 pub use query::{rpc_call, QueryResult};
 pub use staking::{
