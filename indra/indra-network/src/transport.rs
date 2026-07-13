@@ -145,7 +145,11 @@ impl Connection {
         self.read_pos = payload_end;
         self.compact_read_buf();
 
-        let msg = Message::decode_wire(&payload)?;
+        let msg = match Message::decode_wire(&payload) {
+            Ok(msg) => msg,
+            Err(NetworkError::UnknownMessageType { .. }) => return Ok(RecvStatus::NoData),
+            Err(error) => return Err(error),
+        };
         Ok(RecvStatus::Message(msg))
     }
 
@@ -356,6 +360,45 @@ mod tests {
         let (first_msg, second_msg) = handle.join().unwrap();
         assert!(matches!(first_msg, Message::Ping(1)));
         assert!(matches!(second_msg, Message::Pong(2)));
+    }
+
+    #[test]
+    fn recv_skips_unknown_message_type_without_disconnect() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (stream, _) = server.accept().unwrap();
+            let mut conn = Connection::from_stream(stream).unwrap();
+
+            let first = loop {
+                match conn.recv().unwrap() {
+                    RecvStatus::NoData => break RecvStatus::NoData,
+                    RecvStatus::Message(_) => panic!("unknown message should be skipped"),
+                    RecvStatus::Disconnected => panic!("connection closed unexpectedly"),
+                }
+            };
+            assert!(matches!(first, RecvStatus::NoData));
+
+            loop {
+                match conn.recv().unwrap() {
+                    RecvStatus::Message(msg) => break msg,
+                    RecvStatus::NoData => thread::sleep(Duration::from_millis(1)),
+                    RecvStatus::Disconnected => panic!("connection closed unexpectedly"),
+                }
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(&1u32.to_le_bytes()).unwrap();
+        client.write_all(&[0xFE]).unwrap();
+        client
+            .write_all(&Message::Ping(99).encode_wire().unwrap())
+            .unwrap();
+        client.flush().unwrap();
+
+        let msg = handle.join().unwrap();
+        assert!(matches!(msg, Message::Ping(99)));
     }
 
     #[test]

@@ -1361,6 +1361,7 @@ fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<Str
                 Some(_) => "NO",
                 None => "ABSTAIN",
             };
+            let committed = proposal.commits.contains_key(validator_id);
             let name = state
                 .chain
                 .validators
@@ -1368,11 +1369,12 @@ fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<Str
                 .map(|validator| validator.name.as_str())
                 .unwrap_or("unknown");
             format!(
-                "{{\"validator_id\":\"{}\",\"name\":\"{}\",\"vote\":\"{}\",\"snapshot2_weight\":{},\"revealed\":{}}}",
+                "{{\"validator_id\":\"{}\",\"name\":\"{}\",\"vote\":\"{}\",\"snapshot2_weight\":{},\"committed\":{},\"revealed\":{}}}",
                 hex::encode(validator_id.0),
                 json_escape(name),
                 vote,
                 weight,
+                committed,
                 proposal.reveals.contains_key(validator_id)
             )
         })

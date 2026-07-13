@@ -1,5 +1,12 @@
 //! Integration tests for the RPC layer.
 
+use std::collections::BTreeMap;
+
+use indra_core::types::{
+    crypto::HybridPubKey,
+    governance::{GovernableAction, ProposalTier},
+    primitives::{Bytes32, VariableBytes},
+};
 use indra_rpc::types::parse_request;
 use indra_rpc::{
     handlers::{
@@ -7,6 +14,9 @@ use indra_rpc::{
         RpcMethodAccess, RpcMode, RPC_METHODS,
     },
     server::{call_rpc, call_rpc_with_mode},
+};
+use indra_state::governance::{
+    GovernanceSnapshot, ProposalPhase, ProposalRecord, VoteCommit, VoteReveal,
 };
 use indra_state::ChainState;
 
@@ -136,6 +146,79 @@ fn get_delegations_returns_empty_for_unknown_validator() {
     let validator = "22".repeat(32);
     let resp = call_rpc("indra_getDelegations", &[format!(r#""{}""#, validator)], &e);
     assert!(resp.contains("\"delegators\":[]"));
+}
+
+#[test]
+fn get_proposal_votes_reports_committed_and_revealed_flags() {
+    let mut e = engine("rpc_proposal_votes_flags");
+    let proposal_id = Bytes32::from([0xE1; 32]);
+    let validator_id = Bytes32::from([0xA1; 32]);
+    let mut weights = BTreeMap::new();
+    weights.insert(validator_id, 100);
+    let snapshot = GovernanceSnapshot {
+        weights,
+        total_stake: 100,
+    };
+    let mut commits = BTreeMap::new();
+    commits.insert(
+        validator_id,
+        VoteCommit {
+            validator_id,
+            commit_hash: Bytes32::from([0xC1; 32]),
+            committed_epoch: 1,
+        },
+    );
+    let mut reveals = BTreeMap::new();
+    reveals.insert(
+        validator_id,
+        VoteReveal {
+            validator_id,
+            vote: true,
+            revealed_epoch: 2,
+        },
+    );
+    e.governance.proposals.insert(
+        proposal_id,
+        ProposalRecord {
+            proposal_id,
+            proposer_id: validator_id,
+            proposer_pubkey: HybridPubKey {
+                classical_pk: Bytes32::from([0xB1; 32]),
+                pq_pk: VariableBytes::from_slice(&[0xB2; 32]).unwrap(),
+            },
+            tier: ProposalTier::Standard,
+            action: GovernableAction::SetMinDelegationSpark { value: 1 },
+            title: "test".to_string(),
+            description: "test".to_string(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch: 0,
+            commit_start_epoch: 1,
+            reveal_start_epoch: 2,
+            tally_epoch: 3,
+            exec_delay_epochs: 0,
+            executable_after_epoch: 0,
+            phase: ProposalPhase::Reveal,
+            snapshot1: Some(snapshot),
+            commits,
+            reveals,
+            redelegations: Vec::new(),
+            redelegated_delegators: BTreeMap::new(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: None,
+        },
+    );
+
+    let resp = call_rpc(
+        "indra_getProposalVotes",
+        &[format!(r#""{}""#, hex::encode(proposal_id.0))],
+        &e,
+    );
+    assert!(resp.contains("\"committed\":true"));
+    assert!(resp.contains("\"revealed\":true"));
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! Networking runs on a Tokio runtime with authenticated encrypted transport.
 //! Consensus and state transition logic remain synchronous on dedicated threads.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -14,12 +14,14 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use fs2::available_space;
+use indra_core::codec::Encode;
 use indra_core::types::primitives::{
     validator_network_address_active, DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES,
     DISK_WARN_THRESHOLD_BYTES, DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS,
     MAX_PEER_LIST_SIZE, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS,
     PEER_TABLE_SAVE_INTERVAL_SECS, TARGET_OUTBOUND_PEERS,
 };
+use indra_crypto::sha256;
 use indra_crypto::{PqKeypair, PqPublicKey};
 use indra_network::{
     message::{Message, PeerListEntry},
@@ -30,6 +32,7 @@ use indra_network::{
     RelayValidatorKey, TokenBucket,
 };
 use indra_node::{
+    config::{default_governance_mempool_capacity, DEFAULT_STAKING_MEMPOOL_CAPACITY},
     discovery::{
         default_dns_seed_hosts_config, load_peers, peer_list_payload, resolve_dns_seeds,
         resolve_peer_addr, sanitize_loaded_peers, save_peers,
@@ -52,6 +55,7 @@ const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const PROPOSAL_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_DISCOVERED_PEERS: usize = 256;
+const OP_RELAY_SEEN_CAPACITY: usize = 16_384;
 const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
 const MAX_INBOUND_PER_IP: u8 = 3;
@@ -89,6 +93,13 @@ impl NetworkBridge {
         let _ = self
             .handle
             .send_blocking(NetworkCommand::Broadcast(msg.clone()));
+    }
+
+    fn broadcast_except(&self, except: indra_core::Bytes32, msg: &Message) {
+        let _ = self.handle.send_blocking(NetworkCommand::BroadcastExcept {
+            except,
+            msg: msg.clone(),
+        });
     }
 
     fn send_to_validator(&self, validator_id: indra_core::Bytes32, msg: &Message) {
@@ -129,6 +140,82 @@ impl NetworkBridge {
     fn validator_for_addr(&self, addr: &SocketAddr) -> Option<indra_core::Bytes32> {
         self.addr_validators.lock().unwrap().get(addr).copied()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OpRelayKey {
+    Staking(indra_core::Bytes32),
+    Governance(indra_core::Bytes32),
+}
+
+struct OpRelaySeenCache {
+    seen: VecDeque<OpRelayKey>,
+    capacity: usize,
+}
+
+impl OpRelaySeenCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn observe(&mut self, key: OpRelayKey) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        if self.capacity > 0 {
+            if self.seen.len() >= self.capacity {
+                self.seen.pop_front();
+            }
+            self.seen.push_back(key);
+        }
+        true
+    }
+}
+
+fn op_relay_key(msg: &Message) -> Option<OpRelayKey> {
+    match msg {
+        Message::StakingOp(op) => Some(OpRelayKey::Staking(indra_core::Bytes32::from(sha256(
+            &op.encode_to_vec(),
+        )))),
+        Message::GovernanceOp(op) => Some(OpRelayKey::Governance(indra_core::Bytes32::from(
+            sha256(&op.encode_to_vec()),
+        ))),
+        _ => None,
+    }
+}
+
+fn broadcast_locally_accepted_op(
+    gossip: &NetworkBridge,
+    op_relay_seen: &Mutex<OpRelaySeenCache>,
+    msg: Message,
+) {
+    if let Some(key) = op_relay_key(&msg) {
+        if let Ok(mut seen) = op_relay_seen.lock() {
+            let _ = seen.observe(key);
+        }
+    }
+    gossip.broadcast(&msg);
+}
+
+fn rebroadcast_inbound_accepted_op(
+    gossip: &NetworkBridge,
+    op_relay_seen: &Mutex<OpRelaySeenCache>,
+    origin: indra_core::Bytes32,
+    msg: Message,
+) {
+    if let Some(key) = op_relay_key(&msg) {
+        if let Ok(mut seen) = op_relay_seen.lock() {
+            if !seen.observe(key) {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    gossip.broadcast_except(origin, &msg);
 }
 
 fn has_connected_ip(
@@ -1245,7 +1332,11 @@ async fn handle_observer_connection(
                         eprintln!("[observer] consensus message from {}, closing", addr);
                         break;
                     }
-                    Message::Block(_) | Message::BlockResponse { .. } | Message::Tx(_) => {}
+                    Message::Block(_)
+                    | Message::BlockResponse { .. }
+                    | Message::Tx(_)
+                    | Message::StakingOp(_)
+                    | Message::GovernanceOp(_) => {}
                 }
             }
             block = block_rx.recv() => {
@@ -1553,6 +1644,12 @@ fn main() {
         peers_file: peers_file.clone(),
         snapshot_interval: cfg_file.snapshot_interval.unwrap_or(300),
         mempool_capacity: cfg_file.mempool_capacity.unwrap_or(5_000),
+        staking_mempool_capacity: cfg_file
+            .staking_mempool_capacity
+            .unwrap_or(DEFAULT_STAKING_MEMPOOL_CAPACITY),
+        governance_mempool_capacity: cfg_file
+            .governance_mempool_capacity
+            .unwrap_or_else(default_governance_mempool_capacity),
         prune_keep_blocks: if archive { None } else { Some(prune_keep) },
         observer_addr: observer_addr.clone(),
         metrics_addr: metrics_addr.clone(),
@@ -1592,6 +1689,7 @@ fn main() {
     let connected_validator_peers = Arc::new(AtomicUsize::new(0));
     let metrics_state = Arc::new(MetricsState::new());
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
+    let op_relay_seen = Arc::new(Mutex::new(OpRelaySeenCache::new(OP_RELAY_SEEN_CAPACITY)));
     let (gossip, discovered_peers, authenticated_peer_addrs, network_events) =
         start_network_runtime(
             p2p_addr.clone(),
@@ -1634,6 +1732,7 @@ fn main() {
         let connected_validator_peers = Arc::clone(&connected_validator_peers);
         let metrics_state = Arc::clone(&metrics_state);
         let last_block_timestamp = Arc::clone(&last_block_timestamp);
+        let op_relay_seen = Arc::clone(&op_relay_seen);
 
         std::thread::spawn(move || {
             while let Ok(event) = network_events.recv() {
@@ -1683,6 +1782,48 @@ fn main() {
                         msg,
                     } => {
                         match &msg {
+                            Message::StakingOp(op) => {
+                                let accepted = driver
+                                    .lock()
+                                    .map_err(|_| "consensus driver lock poisoned".to_string())
+                                    .and_then(|mut guard| {
+                                        guard
+                                            .engine
+                                            .add_staking_op(op.clone())
+                                            .map_err(|e| e.to_string())
+                                    })
+                                    .is_ok();
+                                if accepted {
+                                    rebroadcast_inbound_accepted_op(
+                                        &gossip,
+                                        &op_relay_seen,
+                                        validator_id,
+                                        msg.clone(),
+                                    );
+                                }
+                                continue;
+                            }
+                            Message::GovernanceOp(op) => {
+                                let accepted = driver
+                                    .lock()
+                                    .map_err(|_| "consensus driver lock poisoned".to_string())
+                                    .and_then(|mut guard| {
+                                        guard
+                                            .engine
+                                            .add_governance_op(op.clone())
+                                            .map_err(|e| e.to_string())
+                                    })
+                                    .is_ok();
+                                if accepted {
+                                    rebroadcast_inbound_accepted_op(
+                                        &gossip,
+                                        &op_relay_seen,
+                                        validator_id,
+                                        msg.clone(),
+                                    );
+                                }
+                                continue;
+                            }
                             Message::PeerList(addrs) => {
                                 let mut new_peers = discovered_peers.lock().unwrap();
                                 let authenticated =
@@ -2412,6 +2553,7 @@ fn main() {
             Arc::clone(&driver),
             Arc::clone(&gossip),
             Arc::clone(&discovered_peers),
+            Arc::clone(&op_relay_seen),
             Arc::clone(&observer_count),
             cfg_file.rpc_cors_origins.clone(),
         );
@@ -2435,6 +2577,7 @@ fn main() {
             Arc::clone(&driver),
             Arc::clone(&gossip),
             Arc::clone(&discovered_peers),
+            Arc::clone(&op_relay_seen),
             Arc::clone(&observer_count),
             cfg_file.rpc_public_cors_origins.clone(),
         );
@@ -3102,6 +3245,7 @@ fn spawn_rpc_listener(
     driver: Arc<Mutex<indra_node::driver::ConsensusDriver>>,
     gossip: Arc<NetworkBridge>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
+    op_relay_seen: Arc<Mutex<OpRelaySeenCache>>,
     observer_count: Arc<AtomicUsize>,
     cors_origins: Vec<String>,
 ) {
@@ -3134,6 +3278,7 @@ fn spawn_rpc_listener(
                     let driver_rpc = Arc::clone(&driver);
                     let gossip_rpc = Arc::clone(&gossip);
                     let discovered_peers_rpc = Arc::clone(&discovered_peers);
+                    let op_relay_seen_rpc = Arc::clone(&op_relay_seen);
                     let observer_count_rpc = Arc::clone(&observer_count);
                     let rpc_conn_count = Arc::clone(&rpc_conn_count);
                     let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
@@ -3145,6 +3290,7 @@ fn spawn_rpc_listener(
                             &driver_rpc,
                             &gossip_rpc,
                             &discovered_peers_rpc,
+                            &op_relay_seen_rpc,
                             &observer_count_rpc,
                             peer_ip,
                             &rpc_rate_limiter,
@@ -3284,6 +3430,7 @@ fn handle_rpc(
     driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
     gossip: &Arc<NetworkBridge>,
     discovered_peers: &Arc<Mutex<HashSet<String>>>,
+    op_relay_seen: &Arc<Mutex<OpRelaySeenCache>>,
     observer_count: &Arc<AtomicUsize>,
     peer_ip: Option<IpAddr>,
     rate_limiter: &indra_rpc::server::RpcRateLimiter,
@@ -3473,11 +3620,22 @@ fn handle_rpc(
                         .lock()
                         .map_err(|_| "consensus driver lock poisoned".to_string())
                         .and_then(|mut guard| {
-                            guard.engine.add_staking_op(op).map_err(|e| e.to_string())
+                            guard
+                                .engine
+                                .add_staking_op(op.clone())
+                                .map_err(|e| e.to_string())
                         }) {
                         Ok(()) => {
-                            RpcResponse::ok(req.id.clone(), r#"{"status":"accepted"}"#.to_string())
-                                .to_json()
+                            broadcast_locally_accepted_op(
+                                gossip,
+                                op_relay_seen,
+                                Message::StakingOp(op),
+                            );
+                            RpcResponse::ok(
+                                req.id.clone(),
+                                r#"{"status":"accepted","detail":"accepted into local mempool and relayed; not yet confirmed on-chain"}"#.to_string(),
+                            )
+                            .to_json()
                         }
                         Err(error) => {
                             RpcResponse::err(req.id.clone(), -32000, format!("rejected: {error}"))
@@ -3502,12 +3660,20 @@ fn handle_rpc(
                         .and_then(|mut guard| {
                             guard
                                 .engine
-                                .add_governance_op(op)
+                                .add_governance_op(op.clone())
                                 .map_err(|e| e.to_string())
                         }) {
                         Ok(()) => {
-                            RpcResponse::ok(req.id.clone(), r#"{"status":"accepted"}"#.to_string())
-                                .to_json()
+                            broadcast_locally_accepted_op(
+                                gossip,
+                                op_relay_seen,
+                                Message::GovernanceOp(op),
+                            );
+                            RpcResponse::ok(
+                                req.id.clone(),
+                                r#"{"status":"accepted","detail":"accepted into local mempool and relayed; not yet confirmed on-chain"}"#.to_string(),
+                            )
+                            .to_json()
                         }
                         Err(error) => {
                             RpcResponse::err(req.id.clone(), -32000, format!("rejected: {error}"))
@@ -3588,6 +3754,41 @@ fn send_http(stream: &std::net::TcpStream, cors: &str, body: &str) {
 mod tests {
     use super::*;
 
+    fn dummy_hybrid_sig() -> indra_core::types::crypto::HybridSignature {
+        indra_core::types::crypto::HybridSignature {
+            classical_sig: indra_core::types::primitives::VariableBytes::from_slice(&[0x11; 64])
+                .unwrap(),
+            pq_sig: indra_core::types::primitives::VariableBytes::from_slice(&[0x22; 64]).unwrap(),
+        }
+    }
+
+    fn dummy_staking_op(nonce: u64) -> indra_core::types::staking::StakingOp {
+        indra_core::types::staking::StakingOp {
+            body: indra_core::types::staking::StakingOpBody::ClaimRewards {
+                validator_id: indra_core::Bytes32::from([0x31; 32]),
+                delegator_pubkey: indra_core::types::crypto::HybridPubKey {
+                    classical_pk: indra_core::Bytes32::from([0x32; 32]),
+                    pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0x33; 32])
+                        .unwrap(),
+                },
+            },
+            nonce,
+            signature: dummy_hybrid_sig(),
+        }
+    }
+
+    fn dummy_governance_op(nonce: u64) -> indra_core::types::governance::GovernanceOpV2 {
+        indra_core::types::governance::GovernanceOpV2 {
+            action_type: indra_core::types::governance::GovernanceActionType::CancelProposal,
+            signer_id: indra_core::Bytes32::from([0x41; 32]),
+            nonce,
+            payload: indra_core::types::governance::GovernancePayload::Cancel {
+                proposal_id: indra_core::Bytes32::from([0x42; 32]),
+            },
+            signature: dummy_hybrid_sig(),
+        }
+    }
+
     #[test]
     fn status_broadcast_on_first_peer_connection() {
         let tip_hash = indra_core::Bytes32::from([0x55u8; 32]);
@@ -3597,6 +3798,33 @@ mod tests {
             matches!(first, Message::Status { height: 42, tip_hash: got, .. } if got == tip_hash)
         );
         assert!(matches!(second, Message::Ping(_)));
+    }
+
+    #[test]
+    fn op_relay_seen_cache_deduplicates_staking_and_governance_ops() {
+        let staking = Message::StakingOp(dummy_staking_op(7));
+        let governance = Message::GovernanceOp(dummy_governance_op(9));
+        let staking_key = op_relay_key(&staking).unwrap();
+        let governance_key = op_relay_key(&governance).unwrap();
+        let mut cache = OpRelaySeenCache::new(16);
+
+        assert!(cache.observe(staking_key));
+        assert!(!cache.observe(staking_key));
+        assert!(cache.observe(governance_key));
+        assert!(!cache.observe(governance_key));
+    }
+
+    #[test]
+    fn op_relay_seen_cache_eviction_allows_old_key_again_after_capacity() {
+        let first = op_relay_key(&Message::StakingOp(dummy_staking_op(1))).unwrap();
+        let second = op_relay_key(&Message::StakingOp(dummy_staking_op(2))).unwrap();
+        let third = op_relay_key(&Message::StakingOp(dummy_staking_op(3))).unwrap();
+        let mut cache = OpRelaySeenCache::new(2);
+
+        assert!(cache.observe(first));
+        assert!(cache.observe(second));
+        assert!(cache.observe(third));
+        assert!(cache.observe(first));
     }
 
     #[test]

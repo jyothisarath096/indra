@@ -12,7 +12,9 @@ use indra_core::{
     codec::{ByteReader, Decode, Encode},
     types::{
         block::BlockV1,
+        governance::GovernanceOpV2,
         primitives::Bytes32,
+        staking::StakingOp,
         transaction::TransactionV1,
         vote::VoteV1,
         vrf_election::{VrfCommit, VrfReveal},
@@ -77,6 +79,10 @@ pub enum MessageType {
     RequestVrfReveals = 0x0F,
     /// Respond with signed VRF reveals.
     VrfRevealsResponse = 0x10,
+    /// A pending staking operation.
+    StakingOp = 0x11,
+    /// A pending governance operation.
+    GovernanceOp = 0x12,
 }
 
 impl MessageType {
@@ -99,7 +105,9 @@ impl MessageType {
             0x0E => Ok(Self::VrfReveal),
             0x0F => Ok(Self::RequestVrfReveals),
             0x10 => Ok(Self::VrfRevealsResponse),
-            other => Err(NetworkError::UnexpectedMessage { got: other }),
+            0x11 => Ok(Self::StakingOp),
+            0x12 => Ok(Self::GovernanceOp),
+            other => Err(NetworkError::UnknownMessageType { got: other }),
         }
     }
 }
@@ -145,6 +153,10 @@ pub enum Message {
     Vote(VoteV1),
     /// A pending transaction for the mempool.
     Tx(TransactionV1),
+    /// A pending staking operation for the staking mempool.
+    StakingOp(StakingOp),
+    /// A pending governance operation for the governance mempool.
+    GovernanceOp(GovernanceOpV2),
     /// A list of peer addresses, optionally annotated with authenticated
     /// validator identities.
     PeerList(Vec<PeerListEntry>),
@@ -229,6 +241,8 @@ impl Message {
             Self::Block(_) => MessageType::Block,
             Self::Vote(_) => MessageType::Vote,
             Self::Tx(_) => MessageType::Tx,
+            Self::StakingOp(_) => MessageType::StakingOp,
+            Self::GovernanceOp(_) => MessageType::GovernanceOp,
             Self::PeerList(_) => MessageType::PeerList,
             Self::Ping(_) => MessageType::Ping,
             Self::Pong(_) => MessageType::Pong,
@@ -285,6 +299,8 @@ impl Message {
             Self::Block(b) => b.encode_to_vec(),
             Self::Vote(v) => v.encode_to_vec(),
             Self::Tx(tx) => tx.encode_to_vec(),
+            Self::StakingOp(op) => op.encode_to_vec(),
+            Self::GovernanceOp(op) => op.encode_to_vec(),
             Self::PeerList(peers) => {
                 let mut buf = Vec::new();
                 (peers.len() as u32).encode(&mut buf);
@@ -441,6 +457,21 @@ impl Message {
                     reason: e.to_string(),
                 })?;
                 Ok(Self::Tx(tx))
+            }
+            MessageType::StakingOp => {
+                let mut r = ByteReader::new(payload);
+                let op = StakingOp::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
+                    reason: e.to_string(),
+                })?;
+                Ok(Self::StakingOp(op))
+            }
+            MessageType::GovernanceOp => {
+                let mut r = ByteReader::new(payload);
+                let op =
+                    GovernanceOpV2::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
+                Ok(Self::GovernanceOp(op))
             }
             MessageType::PeerList => {
                 let count_bytes: [u8; 4] = payload
@@ -857,10 +888,12 @@ mod tests {
     use indra_core::types::{
         block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         crypto::HybridSignature,
+        governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
             MAX_VRF_PROOF_BYTES,
         },
+        staking::{StakingOp, StakingOpBody},
         vrf_election::VrfReveal,
     };
 
@@ -913,12 +946,64 @@ mod tests {
         }
     }
 
+    fn test_staking_op() -> StakingOp {
+        StakingOp {
+            body: StakingOpBody::ClaimRewards {
+                validator_id: Bytes32::from([0x31; 32]),
+                delegator_pubkey: indra_core::types::crypto::HybridPubKey {
+                    classical_pk: Bytes32::from([0x32; 32]),
+                    pq_pk: VariableBytes::from_slice(&[0x33; 32]).unwrap(),
+                },
+            },
+            nonce: 7,
+            signature: dummy_sig(),
+        }
+    }
+
+    fn test_governance_op() -> GovernanceOpV2 {
+        GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id: Bytes32::from([0x41; 32]),
+            nonce: 9,
+            payload: GovernancePayload::Commit {
+                proposal_id: Bytes32::from([0x42; 32]),
+                commit_hash: Bytes32::from([0x43; 32]),
+            },
+            signature: dummy_sig(),
+        }
+    }
+
     #[test]
     fn ping_round_trip() {
         let msg = Message::Ping(0xDEADBEEF_CAFEBABE);
         let wire = msg.encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap(); // skip length prefix
         assert!(matches!(decoded, Message::Ping(0xDEADBEEF_CAFEBABE)));
+    }
+
+    #[test]
+    fn staking_op_round_trip() {
+        let op = test_staking_op();
+        let wire = Message::StakingOp(op.clone()).encode_wire().unwrap();
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+        assert!(matches!(decoded, Message::StakingOp(got) if got == op));
+    }
+
+    #[test]
+    fn governance_op_round_trip() {
+        let op = test_governance_op();
+        let wire = Message::GovernanceOp(op.clone()).encode_wire().unwrap();
+        let decoded = Message::decode_wire(&wire[4..]).unwrap();
+        assert!(matches!(decoded, Message::GovernanceOp(got) if got == op));
+    }
+
+    #[test]
+    fn unknown_message_type_is_skippable_for_rolling_upgrade() {
+        let err = Message::decode_wire(&[0xFE]).unwrap_err();
+        assert!(matches!(
+            err,
+            NetworkError::UnknownMessageType { got: 0xFE }
+        ));
     }
 
     #[test]
@@ -1216,11 +1301,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_type_errors() {
+    fn unknown_type_is_reported_as_skippable() {
         let data = vec![0xFF, 0x00, 0x00];
         assert!(matches!(
             Message::decode_wire(&data),
-            Err(NetworkError::UnexpectedMessage { got: 0xFF })
+            Err(NetworkError::UnknownMessageType { got: 0xFF })
         ));
     }
 

@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use toml::Value;
 
-use crate::config::NodeConfig;
+use crate::config::{
+    default_governance_mempool_capacity, NodeConfig, DEFAULT_STAKING_MEMPOOL_CAPACITY,
+};
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DNS_SEED_HOSTS, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT,
 };
@@ -75,6 +77,10 @@ pub struct NodeConfigFile {
     pub snapshot_interval: Option<u64>,
     /// `[storage].mempool_capacity`.
     pub mempool_capacity: Option<usize>,
+    /// `[storage].staking_mempool_capacity`.
+    pub staking_mempool_capacity: Option<usize>,
+    /// `[storage].governance_mempool_capacity`.
+    pub governance_mempool_capacity: Option<usize>,
 }
 
 impl NodeConfigFile {
@@ -107,6 +113,12 @@ impl NodeConfigFile {
             prune_keep_blocks: get_u64(&table, "storage", "prune_keep_blocks"),
             snapshot_interval: get_u64(&table, "storage", "snapshot_interval"),
             mempool_capacity: get_usize(&table, "storage", "mempool_capacity"),
+            staking_mempool_capacity: get_usize(&table, "storage", "staking_mempool_capacity"),
+            governance_mempool_capacity: get_usize(
+                &table,
+                "storage",
+                "governance_mempool_capacity",
+            ),
         })
     }
 
@@ -269,6 +281,12 @@ impl NodeConfigFile {
             peers_file,
             snapshot_interval: self.snapshot_interval.unwrap_or(300),
             mempool_capacity: self.mempool_capacity.unwrap_or(5_000),
+            staking_mempool_capacity: self
+                .staking_mempool_capacity
+                .unwrap_or(DEFAULT_STAKING_MEMPOOL_CAPACITY),
+            governance_mempool_capacity: self
+                .governance_mempool_capacity
+                .unwrap_or_else(default_governance_mempool_capacity),
             prune_keep_blocks,
             observer_addr,
             metrics_addr,
@@ -431,6 +449,8 @@ enabled = true
 prune_keep_blocks = 50000
 snapshot_interval = 300
 mempool_capacity = 5000
+staking_mempool_capacity = 5001
+governance_mempool_capacity = 2400
 "#,
         );
         let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
@@ -450,6 +470,8 @@ mempool_capacity = 5000
         );
         assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9615"));
         assert_eq!(cfg.mempool_capacity, Some(5000));
+        assert_eq!(cfg.staking_mempool_capacity, Some(5001));
+        assert_eq!(cfg.governance_mempool_capacity, Some(2400));
     }
 
     #[test]

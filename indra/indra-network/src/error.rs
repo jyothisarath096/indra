@@ -42,6 +42,17 @@ pub enum NetworkError {
         got: u8,
     },
 
+    /// The peer sent a message type from a newer protocol version.
+    ///
+    /// Unknown future messages are skipped rather than treated as invalid so a
+    /// rolling upgrade can briefly mix old and new validators without causing
+    /// disconnects or bans.
+    #[error("unknown message type {got:#04x}")]
+    UnknownMessageType {
+        /// The received type byte.
+        got: u8,
+    },
+
     /// Peer was banned.
     #[error("peer {addr} is banned")]
     PeerBanned {

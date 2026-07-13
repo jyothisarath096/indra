@@ -1,6 +1,10 @@
 //! `indra-governance` — build and submit governance operations.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
+};
 
 use indra_cli::{
     fetch_chain_id, reconstruct_keypair, staking::http_post, CliError, CliResult, KeysFile,
@@ -104,6 +108,10 @@ fn run() -> CliResult<()> {
 
     let response = submit_governance_op(&node_url, &op_hex)?;
     println!("{response}");
+    println!("status_detail: accepted into local mempool and relayed; not yet confirmed on-chain");
+    if has_flag(&args, "--wait") {
+        wait_for_governance_confirmation(&node_url, &op, signer_id)?;
+    }
     Ok(())
 }
 
@@ -198,6 +206,68 @@ fn submit_governance_op(node_url: &str, op_hex: &str) -> CliResult<String> {
         return Err(CliError::Rpc(message));
     }
     Ok(response)
+}
+
+fn wait_for_governance_confirmation(
+    node_url: &str,
+    op: &GovernanceOpV2,
+    signer_id: Bytes32,
+) -> CliResult<()> {
+    let timeout = Duration::from_secs(120);
+    let start = Instant::now();
+    match &op.payload {
+        GovernancePayload::Commit { proposal_id, .. } => {
+            while start.elapsed() < timeout {
+                let votes = fetch_proposal_votes(node_url, *proposal_id)?;
+                if validator_bool_field(&votes, signer_id, "committed") == Some(true) {
+                    println!("confirmed_on_chain: committed");
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+            Err(CliError::Rpc(
+                "timed out waiting for commit to appear on-chain".into(),
+            ))
+        }
+        GovernancePayload::Reveal { proposal_id, .. } => {
+            while start.elapsed() < timeout {
+                let votes = fetch_proposal_votes(node_url, *proposal_id)?;
+                if validator_bool_field(&votes, signer_id, "revealed") == Some(true) {
+                    println!("confirmed_on_chain: revealed");
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+            Err(CliError::Rpc(
+                "timed out waiting for reveal to appear on-chain".into(),
+            ))
+        }
+        _ => {
+            println!("confirmed_on_chain: --wait is currently implemented for commit/reveal only");
+            Ok(())
+        }
+    }
+}
+
+fn fetch_proposal_votes(node_url: &str, proposal_id: Bytes32) -> CliResult<String> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","method":"indra_getProposalVotes","params":["{}"],"id":1}}"#,
+        hex::encode(proposal_id.0)
+    );
+    let response = http_post(node_url, &body)?;
+    if let Some(message) = rpc_error_message(&response) {
+        return Err(CliError::Rpc(message));
+    }
+    Ok(response)
+}
+
+fn validator_bool_field(json: &str, validator_id: Bytes32, field: &str) -> Option<bool> {
+    let needle = format!(r#""validator_id":"{}""#, hex::encode(validator_id.0));
+    let start = json.find(&needle)?;
+    let rest = &json[start..];
+    let object_end = rest.find('}').unwrap_or(rest.len());
+    let object = &rest[..object_end];
+    parse_bool_json_field(object, field)
 }
 
 fn signer_id_from_keys(keys: &KeysFile) -> Bytes32 {
@@ -423,6 +493,19 @@ fn parse_string_json_field(json: &str, field: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
+fn parse_bool_json_field(json: &str, field: &str) -> Option<bool> {
+    let key = format!("\"{}\":", field);
+    let pos = json.find(&key)?;
+    let after = json[pos + key.len()..].trim_start();
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn print_help() {
     println!(
         "INDRA Governance CLI\n\
@@ -439,6 +522,7 @@ Common flags:\n\
   --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n\
 	  --nonce <n>      Governance nonce override\n\
 	  --vote-nonce-store <path>  Local vote nonce store (default: beside keys.json)\n\
+	  --wait           For commit/reveal, poll until visible on-chain\n\
 	  --dry-run        Build and sign but do not submit\n\n\
 Propose flags:\n\
   --action <name> --value <n> --deposit-utxo <hex> --title <text> --description <text>\n\n\
@@ -513,5 +597,20 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn validator_bool_field_reads_commit_and_reveal_confirmation() {
+        let signer = Bytes32::from([0xAB; 32]);
+        let other = Bytes32::from([0xCD; 32]);
+        let json = format!(
+            r#"{{"votes":[{{"validator_id":"{}","committed":false,"revealed":false}},{{"validator_id":"{}","committed":true,"revealed":true}}]}}"#,
+            hex::encode(other.0),
+            hex::encode(signer.0)
+        );
+
+        assert_eq!(validator_bool_field(&json, signer, "committed"), Some(true));
+        assert_eq!(validator_bool_field(&json, signer, "revealed"), Some(true));
+        assert_eq!(validator_bool_field(&json, other, "committed"), Some(false));
     }
 }

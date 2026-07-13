@@ -87,6 +87,10 @@ pub enum MessageClass {
     BlockRequest,
     /// Transactions.
     Tx,
+    /// Staking operations.
+    StakingOp,
+    /// Governance operations.
+    GovernanceOp,
     /// Ping and pong keepalives.
     PingPong,
     /// Block sync responses.
@@ -110,6 +114,8 @@ impl MessageClass {
             | Message::RequestQC { .. }
             | Message::RequestVrfReveals { .. } => Self::BlockRequest,
             Message::Tx(_) => Self::Tx,
+            Message::StakingOp(_) => Self::StakingOp,
+            Message::GovernanceOp(_) => Self::GovernanceOp,
             Message::Ping(_) | Message::Pong(_) => Self::PingPong,
             Message::BlockResponse { .. } => Self::BlockResponse,
             Message::QCResponse { .. } | Message::VrfRevealsResponse { .. } => Self::QCResponse,
@@ -151,6 +157,8 @@ impl MessageClass {
                 | Message::BlockResponse { .. }
                 | Message::VrfRevealsResponse { .. }
                 | Message::Tx(_)
+                | Message::StakingOp(_)
+                | Message::GovernanceOp(_)
         )
     }
 
@@ -253,6 +261,8 @@ impl PeerRateLimiter {
         count_buckets.insert(MessageClass::PeerList, TokenBucket::new(2, 4));
         count_buckets.insert(MessageClass::BlockRequest, TokenBucket::new(5, 10));
         count_buckets.insert(MessageClass::Tx, TokenBucket::new(50, 200));
+        count_buckets.insert(MessageClass::StakingOp, TokenBucket::new(10, 50));
+        count_buckets.insert(MessageClass::GovernanceOp, TokenBucket::new(5, 20));
         count_buckets.insert(MessageClass::PingPong, TokenBucket::new(2, 4));
         // Sync catch-up can legitimately receive several BlockResponse
         // messages back-to-back after pipelined RequestBlocks. Keep the
@@ -337,7 +347,9 @@ mod tests {
     use crate::message::Message;
     use indra_core::types::{
         crypto::HybridSignature,
+        governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
         primitives::{Bytes32, VariableBytes},
+        staking::{StakingOp, StakingOpBody},
         vote::{VoteStep, VoteV1},
         vrf_election::{VrfCommit, VrfReveal},
     };
@@ -383,6 +395,33 @@ mod tests {
             vrf_output: Bytes32::from([0x04; 32]),
             vrf_proof: VariableBytes::from_slice(&[0x05; 80]).unwrap(),
             commit_hash: Bytes32::from([0x06; 32]),
+            signature: dummy_signature(),
+        })
+    }
+
+    fn dummy_staking_op() -> Message {
+        Message::StakingOp(StakingOp {
+            body: StakingOpBody::ClaimRewards {
+                validator_id: Bytes32::from([0x21; 32]),
+                delegator_pubkey: indra_core::types::crypto::HybridPubKey {
+                    classical_pk: Bytes32::from([0x22; 32]),
+                    pq_pk: VariableBytes::from_slice(&[0x23; 32]).unwrap(),
+                },
+            },
+            nonce: 1,
+            signature: dummy_signature(),
+        })
+    }
+
+    fn dummy_governance_op() -> Message {
+        Message::GovernanceOp(GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id: Bytes32::from([0x31; 32]),
+            nonce: 1,
+            payload: GovernancePayload::Commit {
+                proposal_id: Bytes32::from([0x32; 32]),
+                commit_hash: Bytes32::from([0x33; 32]),
+            },
             signature: dummy_signature(),
         })
     }
@@ -446,6 +485,36 @@ mod tests {
                 bucket.last_refill = Instant::now() - Duration::from_secs(3);
             }
         }
+    }
+
+    #[test]
+    fn staking_and_governance_ops_have_tight_rate_limits() {
+        let mut limiter = PeerRateLimiter::new();
+        let staking = dummy_staking_op();
+        let governance = dummy_governance_op();
+
+        for _ in 0..50 {
+            assert_eq!(limiter.check(&staking, 512), None);
+        }
+        assert!(matches!(
+            limiter.check(&staking, 512),
+            Some(RateLimitViolation {
+                class: MessageClass::StakingOp,
+                ..
+            })
+        ));
+
+        let mut limiter = PeerRateLimiter::new();
+        for _ in 0..20 {
+            assert_eq!(limiter.check(&governance, 512), None);
+        }
+        assert!(matches!(
+            limiter.check(&governance, 512),
+            Some(RateLimitViolation {
+                class: MessageClass::GovernanceOp,
+                ..
+            })
+        ));
     }
 
     #[test]

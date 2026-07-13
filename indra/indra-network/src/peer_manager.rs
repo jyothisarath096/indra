@@ -26,6 +26,7 @@ use indra_crypto::{
 };
 
 use crate::{
+    error::NetworkError,
     frame::{FrameReader, FrameWriter},
     handshake::HandshakeResult,
     message::Message,
@@ -745,6 +746,20 @@ impl PeerManagerActor {
 
     async fn broadcast_to_all_connected(&mut self, msg: Message) {
         let validators: Vec<Bytes32> = self.peers_by_validator.keys().copied().collect();
+        self.broadcast_to_validators(msg, validators).await;
+    }
+
+    async fn broadcast_to_all_connected_except(&mut self, except: Bytes32, msg: Message) {
+        let validators: Vec<Bytes32> = self
+            .peers_by_validator
+            .keys()
+            .filter(|validator_id| **validator_id != except)
+            .copied()
+            .collect();
+        self.broadcast_to_validators(msg, validators).await;
+    }
+
+    async fn broadcast_to_validators(&mut self, msg: Message, validators: Vec<Bytes32>) {
         let relay_key = relay_message_key(&msg);
         let mut enqueued = Vec::new();
         for validator_id in validators {
@@ -845,6 +860,9 @@ impl PeerManagerActor {
         match command {
             NetworkCommand::Broadcast(msg) => {
                 self.broadcast_to_all_connected(msg).await;
+            }
+            NetworkCommand::BroadcastExcept { except, msg } => {
+                self.broadcast_to_all_connected_except(except, msg).await;
             }
             NetworkCommand::SendTo { validator_id, msg } => {
                 self.send_to_validator(validator_id, msg).await;
@@ -1036,6 +1054,7 @@ impl PeerManagerActor {
                 };
                 let msg = match Message::decode_wire(payload) {
                     Ok(msg) => msg,
+                    Err(NetworkError::UnknownMessageType { .. }) => continue,
                     Err(_) => break,
                 };
                 if let Message::Vote(vote) = &msg {

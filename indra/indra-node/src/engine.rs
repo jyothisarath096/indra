@@ -276,6 +276,12 @@ impl NodeEngine {
                 "duplicate staking op nonce".into(),
             ));
         }
+        if self.staking_mempool.len() >= self.config.staking_mempool_capacity {
+            return Err(NodeError::InvalidStakingOp(format!(
+                "staking mempool full: {} ops",
+                self.config.staking_mempool_capacity
+            )));
+        }
         self.staking_mempool.push(op);
         Ok(())
     }
@@ -295,6 +301,12 @@ impl NodeEngine {
             return Err(NodeError::InvalidGovernanceOp(
                 "duplicate governance op nonce".into(),
             ));
+        }
+        if self.governance_mempool.len() >= self.config.governance_mempool_capacity {
+            return Err(NodeError::InvalidGovernanceOp(format!(
+                "governance mempool full: {} ops",
+                self.config.governance_mempool_capacity
+            )));
         }
         self.governance_mempool.push(op);
         Ok(())
@@ -2007,6 +2019,22 @@ mod tests {
     }
 
     #[test]
+    fn staking_mempool_capacity_is_enforced_at_admission() {
+        let dir = temp_dir("staking_mempool_capacity");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.staking_mempool_capacity = 0;
+        let mut engine = NodeEngine::init(config).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x74; 32], "stake-cap");
+        let op = valid_set_commission_staking_op(&engine, &keypair, 1, 1_100);
+
+        let err = engine.add_staking_op(op).unwrap_err().to_string();
+        assert!(err.contains("staking mempool full"));
+        assert!(engine.staking_mempool.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn governance_mempool_rejects_invalid_signature() {
         let dir = temp_dir("governance_bad_sig");
         let config = NodeConfig::local_test(dir.clone());
@@ -2063,6 +2091,22 @@ mod tests {
         engine.add_governance_op(op.clone()).unwrap();
 
         assert_eq!(engine.governance_mempool, vec![op]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_capacity_is_enforced_at_admission() {
+        let dir = temp_dir("governance_mempool_capacity");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.governance_mempool_capacity = 0;
+        let mut engine = NodeEngine::init(config).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x54; 32], "gov-cap");
+        let op = valid_governance_propose_op(&mut engine, &keypair, 1);
+
+        let err = engine.add_governance_op(op).unwrap_err().to_string();
+        assert!(err.contains("governance mempool full"));
+        assert!(engine.governance_mempool.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

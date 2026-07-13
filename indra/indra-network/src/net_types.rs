@@ -61,6 +61,14 @@ pub enum NetworkEvent {
 pub enum NetworkCommand {
     /// Broadcast a message to all connected peers.
     Broadcast(Message),
+    /// Broadcast a message to all connected peers except one authenticated
+    /// validator.
+    BroadcastExcept {
+        /// Validator identity to skip.
+        except: Bytes32,
+        /// Message to send.
+        msg: Message,
+    },
     /// Send a message to one authenticated validator.
     SendTo {
         /// Destination peer validator identity.

@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use indra_core::types::primitives::MAX_ACTIVE_VALIDATORS;
+use indra_state::governance::MAX_ACTIVE_GOVERNANCE_PROPOSALS;
 use indra_storage::PruneConfig;
 
 /// All configuration for a running INDRA node.
@@ -58,6 +60,12 @@ pub struct NodeConfig {
     /// Maximum mempool size (number of transactions).
     pub mempool_capacity: usize,
 
+    /// Maximum staking operations held in the local staking-op mempool.
+    pub staking_mempool_capacity: usize,
+
+    /// Maximum governance operations held in the local governance-op mempool.
+    pub governance_mempool_capacity: usize,
+
     /// Number of recent blocks to keep in pruned mode.
     ///
     /// `None` means archive mode.
@@ -72,6 +80,21 @@ pub struct NodeConfig {
     ///
     /// `None` disables metrics entirely.
     pub metrics_addr: Option<String>,
+}
+
+/// Default staking-op mempool capacity.
+pub const DEFAULT_STAKING_MEMPOOL_CAPACITY: usize = 5_000;
+
+/// Default governance-op mempool capacity.
+///
+/// The expected governance burst is bounded by active validators and active
+/// proposals: commits, reveals, and redelegations for each active validator,
+/// plus headroom for propose/execute/cancel operations.
+pub fn default_governance_mempool_capacity() -> usize {
+    MAX_ACTIVE_VALIDATORS
+        .saturating_mul(MAX_ACTIVE_GOVERNANCE_PROPOSALS)
+        .saturating_mul(4)
+        .max(256)
 }
 
 impl NodeConfig {
@@ -92,6 +115,8 @@ impl NodeConfig {
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
+            staking_mempool_capacity: DEFAULT_STAKING_MEMPOOL_CAPACITY,
+            governance_mempool_capacity: default_governance_mempool_capacity(),
             prune_keep_blocks: None,
             observer_addr: None,
             metrics_addr: None,
@@ -115,6 +140,8 @@ impl NodeConfig {
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
+            staking_mempool_capacity: DEFAULT_STAKING_MEMPOOL_CAPACITY,
+            governance_mempool_capacity: default_governance_mempool_capacity(),
             prune_keep_blocks: None,
             observer_addr: Some(format!(
                 "0.0.0.0:{}",
@@ -141,6 +168,8 @@ impl NodeConfig {
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
+            staking_mempool_capacity: DEFAULT_STAKING_MEMPOOL_CAPACITY,
+            governance_mempool_capacity: default_governance_mempool_capacity(),
             prune_keep_blocks: None,
             observer_addr: Some(format!(
                 "0.0.0.0:{}",
