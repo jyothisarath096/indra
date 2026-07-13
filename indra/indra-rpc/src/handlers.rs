@@ -35,12 +35,18 @@ pub struct NodeState<'a> {
     pub blocks_retained: usize,
     /// Optional network context for validator-node-only peer methods.
     pub network: Option<NetworkContext<'a>>,
+    /// RPC listener mode serving this request.
+    pub rpc_mode: RpcMode,
+    /// Whether this listener has a configured non-empty admin token.
+    pub admin_token_configured: bool,
 }
 
 /// Network-layer context needed by peer-aware RPC methods.
 pub struct NetworkContext<'a> {
     /// Dialable connected validator peer addresses.
     pub validator_peer_addrs: Vec<String>,
+    /// Full connected validator peer topology for admin-only diagnostics.
+    pub validator_peer_topology: Vec<PeerTopologyEntry>,
     /// Number of currently authenticated validator peer connections.
     pub connected_validator_peer_count: usize,
     /// Number of discovered peers not necessarily connected.
@@ -49,6 +55,15 @@ pub struct NetworkContext<'a> {
     pub observer_peer_count: usize,
     /// Marker tying this context to the borrowed node state lifetime.
     pub _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+/// Admin-visible connected validator peer entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerTopologyEntry {
+    /// Authenticated validator ID, when known to the live node.
+    pub validator_id: Option<String>,
+    /// Connected peer socket address.
+    pub address: String,
 }
 
 /// Read-only schema migration audit record for RPC output.
@@ -77,6 +92,41 @@ impl<'a> NodeState<'a> {
         discovered_peer_count: usize,
         observer_peer_count: usize,
     ) -> Self {
+        Self::with_network_policy(
+            engine,
+            validator_peer_addrs,
+            Vec::new(),
+            connected_validator_peer_count,
+            discovered_peer_count,
+            observer_peer_count,
+            RpcMode::Full,
+            false,
+        )
+    }
+
+    /// Construct a state object with network context and explicit RPC policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_network_policy(
+        engine: &'a impl RpcEngineView,
+        validator_peer_addrs: Vec<String>,
+        validator_peer_topology: Vec<PeerTopologyEntry>,
+        connected_validator_peer_count: usize,
+        discovered_peer_count: usize,
+        observer_peer_count: usize,
+        rpc_mode: RpcMode,
+        admin_token_configured: bool,
+    ) -> Self {
+        let topology = if validator_peer_topology.is_empty() {
+            validator_peer_addrs
+                .iter()
+                .map(|address| PeerTopologyEntry {
+                    validator_id: None,
+                    address: address.clone(),
+                })
+                .collect()
+        } else {
+            validator_peer_topology
+        };
         Self {
             engine,
             chain: engine.chain_state(),
@@ -86,11 +136,14 @@ impl<'a> NodeState<'a> {
             blocks_retained: engine.blocks_retained(),
             network: Some(NetworkContext {
                 validator_peer_addrs,
+                validator_peer_topology: topology,
                 connected_validator_peer_count,
                 discovered_peer_count,
                 observer_peer_count,
                 _lifetime: std::marker::PhantomData,
             }),
+            rpc_mode,
+            admin_token_configured,
         }
     }
 
@@ -104,6 +157,8 @@ impl<'a> NodeState<'a> {
             lowest_block: engine.lowest_block(),
             blocks_retained: engine.blocks_retained(),
             network: None,
+            rpc_mode: RpcMode::ReadOnly,
+            admin_token_configured: false,
         }
     }
 
@@ -123,6 +178,8 @@ impl<'a> NodeState<'a> {
             lowest_block,
             blocks_retained,
             network: None,
+            rpc_mode: RpcMode::Full,
+            admin_token_configured: false,
         }
     }
 }
@@ -231,6 +288,9 @@ pub enum RpcMethodAccess {
     ReadOnly,
     /// The method submits data to a local mempool or otherwise requests mutation.
     Write,
+    /// The method exposes privileged local-node diagnostics and requires an
+    /// explicit admin token on the full local listener.
+    Admin,
 }
 
 /// All RPC methods currently dispatched by this crate, with their access class.
@@ -273,6 +333,8 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getValidatorSelfStake", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorAutoDelegate", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorSet", RpcMethodAccess::ReadOnly),
+    ("indra_getPeerTopology", RpcMethodAccess::Admin),
+    ("indra_getRpcPolicy", RpcMethodAccess::ReadOnly),
     ("indra_submitStakingOp", RpcMethodAccess::Write),
     ("indra_submitGovernanceOp", RpcMethodAccess::Write),
     ("indra_sendTransaction", RpcMethodAccess::Write),
@@ -292,10 +354,47 @@ pub fn rpc_method_is_read_only(method: &str) -> bool {
 
 /// Check whether a method is allowed on a listener with the given mode.
 pub fn check_rpc_method_allowed(method: &str, mode: RpcMode) -> RpcResult<()> {
-    if mode == RpcMode::ReadOnly && rpc_method_access(method) != Some(RpcMethodAccess::ReadOnly) {
-        return Err(RpcError::Forbidden(format!(
-            "RPC method {method} is not available on read-only listener"
-        )));
+    check_rpc_method_allowed_with_admin(method, mode, false, false)
+}
+
+/// Check whether a method is allowed on a listener with token-aware admin policy.
+pub fn check_rpc_method_allowed_with_admin(
+    method: &str,
+    mode: RpcMode,
+    admin_token_configured: bool,
+    admin_token_valid: bool,
+) -> RpcResult<()> {
+    match rpc_method_access(method) {
+        Some(RpcMethodAccess::Admin) => {
+            if mode != RpcMode::Full {
+                return Err(RpcError::Forbidden(format!(
+                    "RPC admin method {method} is not available on read-only listener"
+                )));
+            }
+            if !admin_token_configured {
+                return Err(RpcError::Forbidden(
+                    "RPC admin methods are disabled because rpc.admin_token is not configured"
+                        .to_string(),
+                ));
+            }
+            if !admin_token_valid {
+                return Err(RpcError::Forbidden(
+                    "RPC admin method requires a valid X-Admin-Token header".to_string(),
+                ));
+            }
+        }
+        Some(RpcMethodAccess::Write) if mode == RpcMode::ReadOnly => {
+            return Err(RpcError::Forbidden(format!(
+                "RPC method {method} is not available on read-only listener"
+            )));
+        }
+        Some(RpcMethodAccess::ReadOnly | RpcMethodAccess::Write) => {}
+        None if mode == RpcMode::ReadOnly => {
+            return Err(RpcError::Forbidden(format!(
+                "RPC method {method} is not available on read-only listener"
+            )));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -312,8 +411,22 @@ pub fn dispatch_with_mode(
     state: &NodeState<'_>,
     mode: RpcMode,
 ) -> DispatchResult {
+    dispatch_with_admin(method, params, state, mode, false, false)
+}
+
+/// Dispatch a method call with listener-mode and admin-token enforcement.
+pub fn dispatch_with_admin(
+    method: &str,
+    params: &[String],
+    state: &NodeState<'_>,
+    mode: RpcMode,
+    admin_token_configured: bool,
+    admin_token_valid: bool,
+) -> DispatchResult {
     use DispatchResult::Ready;
-    if let Err(error) = check_rpc_method_allowed(method, mode) {
+    if let Err(error) =
+        check_rpc_method_allowed_with_admin(method, mode, admin_token_configured, admin_token_valid)
+    {
         return Ready(Err(error));
     }
     match method {
@@ -351,6 +464,8 @@ pub fn dispatch_with_mode(
         "indra_getValidatorSelfStake" => Ready(get_validator_self_stake(params, state)),
         "indra_getValidatorAutoDelegate" => Ready(get_validator_auto_delegate(params, state)),
         "indra_getValidatorSet" => Ready(get_validator_set(state)),
+        "indra_getPeerTopology" => Ready(get_peer_topology(state)),
+        "indra_getRpcPolicy" => Ready(get_rpc_policy(state)),
         "indra_sendTransaction" => send_transaction(params),
         _ => Ready(Err(RpcError::MethodNotFound(method.to_string()))),
     }
@@ -760,6 +875,51 @@ fn get_peers(state: &NodeState<'_>) -> RpcResult<String> {
             network.observer_peer_count,
         )),
     }
+}
+
+/// `indra_getPeerTopology` — admin-only full connected validator peer details.
+fn get_peer_topology(state: &NodeState<'_>) -> RpcResult<String> {
+    let Some(network) = &state.network else {
+        return Ok(
+            r#"{"validator_peers":[],"peer_count":0,"discovered_count":0,"observer_peer_count":0}"#
+                .to_string(),
+        );
+    };
+    let peers = network
+        .validator_peer_topology
+        .iter()
+        .map(|peer| match &peer.validator_id {
+            Some(validator_id) => format!(
+                r#"{{"validator_id":"{}","address":"{}"}}"#,
+                json_escape(validator_id),
+                json_escape(&peer.address)
+            ),
+            None => format!(
+                r#"{{"validator_id":null,"address":"{}"}}"#,
+                json_escape(&peer.address)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        r#"{{"validator_peers":[{}],"peer_count":{},"discovered_count":{},"observer_peer_count":{}}}"#,
+        peers,
+        network.connected_validator_peer_count,
+        network.discovered_peer_count,
+        network.observer_peer_count,
+    ))
+}
+
+/// `indra_getRpcPolicy` — reports listener policy without revealing tokens.
+fn get_rpc_policy(state: &NodeState<'_>) -> RpcResult<String> {
+    let mode = match state.rpc_mode {
+        RpcMode::Full => "full",
+        RpcMode::ReadOnly => "read_only",
+    };
+    Ok(format!(
+        r#"{{"listener_mode":"{}","admin_token_configured":{},"admin_token_value_exposed":false}}"#,
+        mode, state.admin_token_configured
+    ))
 }
 
 /// `indra_getStakingNonce` — returns current staking nonce for a signer.

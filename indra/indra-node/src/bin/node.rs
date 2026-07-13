@@ -137,6 +137,27 @@ impl NetworkBridge {
         self.peer_addrs.lock().unwrap().values().copied().collect()
     }
 
+    fn peer_topology(&self) -> Vec<indra_rpc::handlers::PeerTopologyEntry> {
+        let mut peers: Vec<_> = self
+            .peer_addrs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(
+                |(validator_id, addr)| indra_rpc::handlers::PeerTopologyEntry {
+                    validator_id: Some(hex::encode(validator_id.0)),
+                    address: addr.to_string(),
+                },
+            )
+            .collect();
+        peers.sort_by(|a, b| {
+            a.validator_id
+                .cmp(&b.validator_id)
+                .then(a.address.cmp(&b.address))
+        });
+        peers
+    }
+
     fn validator_for_addr(&self, addr: &SocketAddr) -> Option<indra_core::Bytes32> {
         self.addr_validators.lock().unwrap().get(addr).copied()
     }
@@ -2559,6 +2580,10 @@ fn main() {
             Arc::clone(&op_relay_seen),
             Arc::clone(&observer_count),
             cfg_file.rpc_cors_origins.clone(),
+            cfg_file
+                .rpc_admin_token
+                .clone()
+                .filter(|token| !token.trim().is_empty()),
         );
     } else {
         eprintln!("[rpc] RPC server disabled by config");
@@ -2583,6 +2608,7 @@ fn main() {
             Arc::clone(&op_relay_seen),
             Arc::clone(&observer_count),
             cfg_file.rpc_public_cors_origins.clone(),
+            None,
         );
     }
 
@@ -3237,8 +3263,10 @@ fn spawn_rpc_listener(
     op_relay_seen: Arc<Mutex<OpRelaySeenCache>>,
     observer_count: Arc<AtomicUsize>,
     cors_origins: Vec<String>,
+    admin_token: Option<String>,
 ) {
     let rpc_cors_origins = Arc::new(cors_origins);
+    let admin_token = Arc::new(admin_token);
     let rpc_conn_count = Arc::new(AtomicU64::new(0));
     let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
     let utxo_scan_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
@@ -3273,6 +3301,7 @@ fn spawn_rpc_listener(
                     let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
                     let utxo_scan_limiter = Arc::clone(&utxo_scan_limiter);
                     let rpc_cors_origins = Arc::clone(&rpc_cors_origins);
+                    let admin_token = Arc::clone(&admin_token);
                     std::thread::spawn(move || {
                         handle_rpc(
                             stream,
@@ -3286,6 +3315,7 @@ fn spawn_rpc_listener(
                             &utxo_scan_limiter,
                             &rpc_cors_origins,
                             mode,
+                            admin_token.as_ref().as_deref(),
                         );
                         release_rpc_connection(&rpc_conn_count);
                     });
@@ -3426,9 +3456,10 @@ fn handle_rpc(
     utxo_scan_limiter: &indra_rpc::server::RpcWindowRateLimiter,
     cors_origins: &[String],
     rpc_mode: indra_rpc::handlers::RpcMode,
+    configured_admin_token: Option<&str>,
 ) {
     use indra_rpc::handlers::{
-        check_rpc_method_allowed, dispatch_with_mode, DispatchResult, NodeState,
+        check_rpc_method_allowed_with_admin, dispatch_with_admin, DispatchResult, NodeState,
     };
     use indra_rpc::types::{parse_request, RpcResponse};
     use std::io::{BufRead, BufReader, Read};
@@ -3454,6 +3485,7 @@ fn handle_rpc(
     let mut content_length = 0usize;
     let mut method = String::new();
     let mut origin: Option<String> = None;
+    let mut presented_admin_token: Option<String> = None;
     let mut line = String::new();
     let mut first_line = true;
 
@@ -3482,6 +3514,9 @@ fn handle_rpc(
         }
         if trimmed.to_lowercase().starts_with("origin:") {
             origin = Some(trimmed["origin:".len()..].trim().to_string());
+        }
+        if trimmed.to_lowercase().starts_with("x-admin-token:") {
+            presented_admin_token = Some(trimmed["x-admin-token:".len()..].trim().to_string());
         }
     }
 
@@ -3551,7 +3586,15 @@ fn handle_rpc(
         }
     };
 
-    if let Err(error) = check_rpc_method_allowed(&req.method, rpc_mode) {
+    let (admin_token_configured, admin_token_valid) =
+        rpc_admin_token_status(configured_admin_token, presented_admin_token.as_deref());
+
+    if let Err(error) = check_rpc_method_allowed_with_admin(
+        &req.method,
+        rpc_mode,
+        admin_token_configured,
+        admin_token_valid,
+    ) {
         let body =
             RpcResponse::err(req.id.clone(), error.code(), error.message().to_string()).to_json();
         send_http(&stream, &cors, &body);
@@ -3575,6 +3618,7 @@ fn handle_rpc(
         .iter()
         .map(|addr| addr.to_string())
         .collect();
+    let validator_peer_topology = gossip.peer_topology();
     let connected_validator_peer_count = gossip.connection_count();
     let discovered_count = discovered_peers.lock().unwrap().len();
     let observer_count_val = observer_count.load(Ordering::Relaxed);
@@ -3588,14 +3632,24 @@ fn handle_rpc(
                 return;
             }
         };
-        let state = NodeState::with_network(
+        let state = NodeState::with_network_policy(
             &snapshot,
             validator_peer_addrs,
+            validator_peer_topology,
             connected_validator_peer_count,
             discovered_count,
             observer_count_val,
+            rpc_mode,
+            admin_token_configured,
         );
-        match dispatch_with_mode(&req.method, &req.params, &state, rpc_mode) {
+        match dispatch_with_admin(
+            &req.method,
+            &req.params,
+            &state,
+            rpc_mode,
+            admin_token_configured,
+            admin_token_valid,
+        ) {
             DispatchResult::Ready(Ok(result)) => RpcResponse::ok(req.id.clone(), result).to_json(),
             DispatchResult::Ready(Err(error)) => {
                 RpcResponse::err(req.id.clone(), error.code(), error.message().to_string())
@@ -3726,6 +3780,17 @@ fn handle_rpc(
     };
 
     send_http(&stream, &cors, &response_body);
+}
+
+fn rpc_admin_token_status(
+    configured_admin_token: Option<&str>,
+    presented_admin_token: Option<&str>,
+) -> (bool, bool) {
+    let configured = configured_admin_token.is_some();
+    let valid = configured_admin_token
+        .zip(presented_admin_token)
+        .is_some_and(|(expected, presented)| expected == presented);
+    (configured, valid)
 }
 
 fn send_http(stream: &std::net::TcpStream, cors: &str, body: &str) {
@@ -4322,6 +4387,21 @@ mod tests {
         assert!(warning.contains("non-loopback"));
         assert!(warning.contains("127.0.0.1"));
         assert!(rpc_non_loopback_warning("127.0.0.1:8545").is_none());
+    }
+
+    #[test]
+    fn rpc_admin_token_status_matches_header_policy() {
+        assert_eq!(rpc_admin_token_status(None, None), (false, false));
+        assert_eq!(rpc_admin_token_status(None, Some("secret")), (false, false));
+        assert_eq!(rpc_admin_token_status(Some("secret"), None), (true, false));
+        assert_eq!(
+            rpc_admin_token_status(Some("secret"), Some("wrong")),
+            (true, false)
+        );
+        assert_eq!(
+            rpc_admin_token_status(Some("secret"), Some("secret")),
+            (true, true)
+        );
     }
 
     #[test]

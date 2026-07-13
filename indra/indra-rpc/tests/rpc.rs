@@ -11,7 +11,8 @@ use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_rpc::types::parse_request;
 use indra_rpc::{
     handlers::{
-        check_rpc_method_allowed, dispatch, dispatch_with_mode, DispatchResult, NodeState,
+        check_rpc_method_allowed, check_rpc_method_allowed_with_admin, dispatch,
+        dispatch_with_admin, dispatch_with_mode, DispatchResult, NodeState, PeerTopologyEntry,
         RpcMethodAccess, RpcMode, RPC_METHODS,
     },
     server::{call_rpc, call_rpc_with_mode},
@@ -421,6 +422,7 @@ fn test_all_methods_reachable_via_dispatch() {
         ("indra_getValidatorSelfStake", vec![hex32.clone()]),
         ("indra_getValidatorAutoDelegate", vec![hex32.clone()]),
         ("indra_getValidatorSet", vec![]),
+        ("indra_getRpcPolicy", vec![]),
         ("indra_submitStakingOp", vec![r#""00""#.to_string()]),
         ("indra_submitGovernanceOp", vec![r#""00""#.to_string()]),
         ("indra_sendTransaction", vec![r#""00""#.to_string()]),
@@ -437,6 +439,57 @@ fn test_all_methods_reachable_via_dispatch() {
             }
             _ => {}
         }
+    }
+}
+
+#[test]
+fn admin_method_reachable_only_with_valid_admin_policy() {
+    let e = engine("rpc_admin_reachable");
+    let state = NodeState::with_network_policy(
+        &e,
+        vec!["203.0.113.10:30303".to_string()],
+        vec![PeerTopologyEntry {
+            validator_id: Some("aa".repeat(32)),
+            address: "203.0.113.10:30303".to_string(),
+        }],
+        1,
+        2,
+        3,
+        RpcMode::Full,
+        true,
+    );
+
+    match dispatch_with_admin(
+        "indra_getPeerTopology",
+        &[],
+        &state,
+        RpcMode::Full,
+        true,
+        true,
+    ) {
+        DispatchResult::Ready(Ok(result)) => {
+            assert!(result.contains("validator_peers"));
+            assert!(result.contains("203.0.113.10:30303"));
+            assert!(result.contains(&"aa".repeat(32)));
+        }
+        _ => panic!("admin topology should be reachable with valid token"),
+    }
+}
+
+#[test]
+fn rpc_policy_reports_mode_and_token_presence_without_token_value() {
+    let e = engine("rpc_policy");
+    let state =
+        NodeState::with_network_policy(&e, Vec::new(), Vec::new(), 0, 0, 0, RpcMode::Full, true);
+
+    match dispatch_with_mode("indra_getRpcPolicy", &[], &state, RpcMode::Full) {
+        DispatchResult::Ready(Ok(result)) => {
+            assert!(result.contains(r#""listener_mode":"full""#));
+            assert!(result.contains(r#""admin_token_configured":true"#));
+            assert!(result.contains(r#""admin_token_value_exposed":false"#));
+            assert!(!result.contains("secret"));
+        }
+        _ => panic!("rpc policy should be reachable as a read-only method"),
     }
 }
 
@@ -479,8 +532,58 @@ fn readonly_listener_rejects_classified_write_methods_at_policy_gate() {
 }
 
 #[test]
+fn admin_endpoint_rejected_when_no_token_is_provided() {
+    let err =
+        check_rpc_method_allowed_with_admin("indra_getPeerTopology", RpcMode::Full, true, false)
+            .unwrap_err();
+    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
+    assert!(err.message().contains("X-Admin-Token"));
+}
+
+#[test]
+fn admin_endpoint_rejected_when_token_is_wrong() {
+    let err =
+        check_rpc_method_allowed_with_admin("indra_getPeerTopology", RpcMode::Full, true, false)
+            .unwrap_err();
+    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
+    assert!(err.message().contains("valid X-Admin-Token"));
+}
+
+#[test]
+fn admin_endpoint_accepted_with_correct_token_on_full_listener() {
+    assert!(check_rpc_method_allowed_with_admin(
+        "indra_getPeerTopology",
+        RpcMode::Full,
+        true,
+        true
+    )
+    .is_ok());
+}
+
+#[test]
+fn admin_endpoint_rejected_on_readonly_listener_even_with_valid_token() {
+    let err =
+        check_rpc_method_allowed_with_admin("indra_getPeerTopology", RpcMode::ReadOnly, true, true)
+            .unwrap_err();
+    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
+    assert!(err.message().contains("read-only listener"));
+}
+
+#[test]
+fn empty_or_unset_admin_token_disables_admin_endpoints_fail_closed() {
+    let err =
+        check_rpc_method_allowed_with_admin("indra_getPeerTopology", RpcMode::Full, false, true)
+            .unwrap_err();
+    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
+    assert!(err.message().contains("not configured"));
+}
+
+#[test]
 fn full_listener_policy_gate_allows_classified_and_unclassified_methods() {
-    for (method, _) in RPC_METHODS {
+    for (method, access) in RPC_METHODS {
+        if *access == RpcMethodAccess::Admin {
+            continue;
+        }
         assert!(
             check_rpc_method_allowed(method, RpcMode::Full).is_ok(),
             "full listener should allow classified method {method}"

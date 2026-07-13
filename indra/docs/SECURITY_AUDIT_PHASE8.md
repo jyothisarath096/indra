@@ -223,7 +223,9 @@ Mutation endpoints still require signed transactions/governance/staking ops, so 
 
 **Fix implemented:** The live node now honors `rpc.enabled` and `rpc.addr` from config, prints a loud warning when RPC binds to a non-loopback address, and parses `rpc.admin_token` / `rpc.cors_origins` config fields for explicit operator control. Public topology details were already removed under API-06; no full-topology admin endpoint is exposed when no token is configured. Regression coverage: `rpc_server_does_not_start_when_disabled_in_config`, `rpc_warns_on_non_loopback_binding`, and config parsing coverage for `rpc.admin_token` / `rpc.cors_origins`.
 
-**Residual note:** Mutation endpoints remain public RPC methods protected by signed payload validation rather than an RPC token. If operators want a stricter admin/mutation split, that should be added as an explicit compatibility-affecting RPC policy change.
+**Admin policy follow-up implemented:** `rpc.admin_token` is now wired to explicit admin-only RPC methods through the `X-Admin-Token` header. The first admin-gated endpoint is `indra_getPeerTopology`, which restores full peer topology visibility only for local/operator diagnostics; the public `indra_getPeers` endpoint remains aggregate-only. `indra_getRpcPolicy` reports listener mode and whether an admin token is configured without ever returning the token value. Empty or unset `rpc.admin_token` disables admin endpoints fail-closed.
+
+**Design note:** Mutation endpoints remain available on the full local listener and remain protected by signed transaction/staking/governance payload validation, not by the admin token. This is intentional: payload signatures are the decentralized authority model for submissions, and admin RPC authentication must not become a centralized gate for ordinary network participation.
 
 ### API-15 — CLI command injection
 
@@ -316,5 +318,5 @@ All Phase 8 findings are now either FIXED or VERIFIED. Remaining mainnet design 
 
 1. **Wallet privacy redesign.** Decide whether address-indexed UTXO/balance queries should require view keys or signed ownership challenges instead of being public chain-data RPC.
 2. **Opaque FFI key handles.** Replace raw private-key return structs with opaque handles for production wallet integrations.
-3. **Full RPC stack hardening.** Replace the hand-written HTTP/JSON parser with a mature bounded HTTP implementation and an explicit public/admin RPC policy.
+3. **Full RPC stack hardening.** The explicit public/admin RPC policy has been implemented for admin-only diagnostics. Replacing the hand-written HTTP/JSON transport with a mature bounded HTTP implementation remains deliberately deferred architectural debt, not an active security gap under the current hardened transport envelope (body size limits, connection limits, per-IP rate limiting, batch rejection, method enforcement, and fail-closed read-only dispatch).
 4. **Encrypted key storage.** `keys.json` remains plaintext with mode `0600`; encrypted validator key storage remains a future operator UX/security improvement.
