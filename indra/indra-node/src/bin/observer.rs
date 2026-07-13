@@ -604,6 +604,8 @@ p2p_addr        = "0.0.0.0:0"
 observer_addr   = ""
 bootstrap_peers = {}
 dns_seed_host   = "seeds.indraprotocol.com"
+# off = ordinary DNS, warn = log DNSSEC problems but use answers, require = secure answers only.
+dns_seed_validation = "warn"
 peers_file      = "{}/peers.json"
 
 [rpc]

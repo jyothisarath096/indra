@@ -9,6 +9,8 @@ use indra_core::types::primitives::MAX_ACTIVE_VALIDATORS;
 use indra_state::governance::MAX_ACTIVE_GOVERNANCE_PROPOSALS;
 use indra_storage::PruneConfig;
 
+use crate::discovery::DnsSeedValidationMode;
+
 /// All configuration for a running INDRA node.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -50,6 +52,9 @@ pub struct NodeConfig {
 
     /// DNS seed hostname for peer discovery.
     pub dns_seed_host: String,
+
+    /// DNSSEC validation policy for DNS seed hostname responses.
+    pub dns_seed_validation: DnsSeedValidationMode,
 
     /// Path to peer table persistence file.
     pub peers_file: String,
@@ -112,6 +117,7 @@ impl NodeConfig {
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
+            dns_seed_validation: DnsSeedValidationMode::DEFAULT,
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
@@ -137,6 +143,7 @@ impl NodeConfig {
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
+            dns_seed_validation: DnsSeedValidationMode::DEFAULT,
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
@@ -165,6 +172,7 @@ impl NodeConfig {
             p2p_addr,
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
+            dns_seed_validation: DnsSeedValidationMode::DEFAULT,
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,

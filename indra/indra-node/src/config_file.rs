@@ -11,6 +11,7 @@ use toml::Value;
 use crate::config::{
     default_governance_mempool_capacity, NodeConfig, DEFAULT_STAKING_MEMPOOL_CAPACITY,
 };
+use crate::discovery::DnsSeedValidationMode;
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DNS_SEED_HOSTS, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT,
 };
@@ -53,6 +54,8 @@ pub struct NodeConfigFile {
     pub bootstrap_peers: Vec<String>,
     /// `[network].dns_seed_host`.
     pub dns_seed_host: Option<String>,
+    /// `[network].dns_seed_validation`.
+    pub dns_seed_validation: Option<String>,
     /// `[network].peers_file`.
     pub peers_file: Option<String>,
     /// `[rpc].addr`.
@@ -103,6 +106,7 @@ impl NodeConfigFile {
             observer_addr: get_str(&table, "network", "observer_addr"),
             bootstrap_peers: get_str_array(&table, "network", "bootstrap_peers"),
             dns_seed_host: get_str(&table, "network", "dns_seed_host"),
+            dns_seed_validation: get_str(&table, "network", "dns_seed_validation"),
             peers_file: get_str(&table, "network", "peers_file"),
             rpc_addr: get_str(&table, "rpc", "addr"),
             rpc_enabled: get_bool(&table, "rpc", "enabled"),
@@ -152,6 +156,11 @@ impl NodeConfigFile {
                 errors.push(
                     "network.observer_addr must be valid host:port, empty, or omitted".to_string(),
                 );
+            }
+        }
+        if let Some(mode) = self.dns_seed_validation.as_deref() {
+            if let Err(err) = mode.parse::<DnsSeedValidationMode>() {
+                errors.push(err);
             }
         }
         if let Some(addr) = self.metrics_addr.as_deref() {
@@ -281,6 +290,12 @@ impl NodeConfigFile {
                 .dns_seed_host
                 .clone()
                 .unwrap_or_else(|| DNS_SEED_HOSTS.join(",")),
+            dns_seed_validation: self
+                .dns_seed_validation
+                .as_deref()
+                .map(str::parse::<DnsSeedValidationMode>)
+                .transpose()?
+                .unwrap_or_default(),
             peers_file,
             snapshot_interval: self.snapshot_interval.unwrap_or(300),
             mempool_capacity: self.mempool_capacity.unwrap_or(5_000),
@@ -437,6 +452,7 @@ p2p_addr = "0.0.0.0:30303"
 observer_addr = "0.0.0.0:30304"
 bootstrap_peers = ["1.1.1.1:30303", "2.2.2.2:30303"]
 dns_seed_host = "seeds.indraprotocol.com"
+dns_seed_validation = "require"
 peers_file = "/root/.indra/data/peers.json"
 
 [rpc]
@@ -465,6 +481,7 @@ governance_mempool_capacity = 2400
         let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
         assert_eq!(cfg.p2p_addr.as_deref(), Some("0.0.0.0:30303"));
         assert_eq!(cfg.bootstrap_peers.len(), 2);
+        assert_eq!(cfg.dns_seed_validation.as_deref(), Some("require"));
         assert_eq!(cfg.rpc_enabled, Some(true));
         assert_eq!(cfg.rpc_admin_token.as_deref(), Some("local-admin"));
         assert_eq!(
@@ -497,6 +514,26 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
             cfg.bootstrap_peers,
             vec!["a.example:30303".to_string(), "b.example:30303".to_string()]
         );
+    }
+
+    #[test]
+    fn dns_seed_validation_defaults_to_warn_when_unset() {
+        let cfg = minimal();
+        let node = cfg.to_node_config(None).unwrap_err();
+        assert!(node.contains("validator mode requires keys.json data"));
+
+        let mut observer = cfg;
+        observer.mode = Some("observer".to_string());
+        let node = observer.to_node_config(None).unwrap();
+        assert_eq!(node.dns_seed_validation, DnsSeedValidationMode::Warn);
+    }
+
+    #[test]
+    fn test_validate_invalid_dns_seed_validation_mode() {
+        let mut cfg = minimal();
+        cfg.dns_seed_validation = Some("maybe".to_string());
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("dns_seed_validation")));
     }
 
     #[test]

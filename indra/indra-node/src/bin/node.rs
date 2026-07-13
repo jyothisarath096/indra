@@ -34,8 +34,9 @@ use indra_network::{
 use indra_node::{
     config::{default_governance_mempool_capacity, DEFAULT_STAKING_MEMPOOL_CAPACITY},
     discovery::{
-        default_dns_seed_hosts_config, load_peers, peer_list_payload, resolve_dns_seeds,
-        resolve_peer_addr, sanitize_loaded_peers, save_peers,
+        default_dns_seed_hosts_config, load_peers, peer_list_payload,
+        resolve_dns_seeds_with_validation, resolve_peer_addr, sanitize_loaded_peers, save_peers,
+        DnsSeedValidationMode,
     },
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     genesis::load_genesis_seed_peers,
@@ -725,6 +726,7 @@ fn start_network_runtime(
     initial_discovered_peers: Vec<String>,
     peers_file_path: String,
     dns_seed_host: String,
+    dns_seed_validation: DnsSeedValidationMode,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
 ) -> (
     Arc<NetworkBridge>,
@@ -988,7 +990,11 @@ fn start_network_runtime(
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
-                        let dns_peers = resolve_dns_seeds(&dns_seed_host, p2p_port);
+                        let dns_peers = resolve_dns_seeds_with_validation(
+                            &dns_seed_host,
+                            p2p_port,
+                            dns_seed_validation,
+                        );
                         {
                             let mut dp = discovered_peers.lock().unwrap();
                             let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
@@ -1587,6 +1593,16 @@ fn main() {
         .dns_seed_host
         .clone()
         .unwrap_or_else(default_dns_seed_hosts_config);
+    let dns_seed_validation = cfg_file
+        .dns_seed_validation
+        .as_deref()
+        .map(str::parse::<DnsSeedValidationMode>)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap_or_default();
     let prune_keep_cfg = cfg_file
         .prune_keep_blocks
         .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS);
@@ -1665,6 +1681,7 @@ fn main() {
         p2p_addr: p2p_addr.clone(),
         bootstrap_peers: bootstrap_peers.clone(),
         dns_seed_host: dns_seed_host.clone(),
+        dns_seed_validation,
         peers_file: peers_file.clone(),
         snapshot_interval: cfg_file.snapshot_interval.unwrap_or(300),
         mempool_capacity: cfg_file.mempool_capacity.unwrap_or(5_000),
@@ -1721,6 +1738,7 @@ fn main() {
             genesis_seed_peers.clone(),
             peers_file.clone(),
             dns_seed_host.clone(),
+            dns_seed_validation,
             Arc::clone(&handshake_config),
         );
     if let Some(addr) = observer_addr {
@@ -3068,6 +3086,8 @@ p2p_addr        = "0.0.0.0:30303"
 observer_addr   = "0.0.0.0:{}"
 bootstrap_peers = {}
 dns_seed_host   = "{}"
+# off = ordinary DNS, warn = log DNSSEC problems but use answers, require = secure answers only.
+dns_seed_validation = "warn"
 peers_file      = "{}/peers.json"
 
 [rpc]
