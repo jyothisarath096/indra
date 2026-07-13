@@ -28,6 +28,8 @@ pub enum IndraError {
     UnknownAction = -11,
     /// Invalid governance vote value.
     InvalidVote = -12,
+    /// Unknown, destroyed, or otherwise invalid opaque key handle.
+    InvalidHandle = -13,
     /// Internal error.
     Internal = -99,
 }
@@ -76,6 +78,7 @@ pub const fn error_string(error_code: i32) -> &'static [u8] {
         -10 => b"invalid json\0",
         -11 => b"unknown governance action\0",
         -12 => b"invalid vote\0",
+        -13 => b"invalid key handle\0",
         _ => b"internal error\0",
     }
 }

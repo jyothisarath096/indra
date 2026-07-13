@@ -12,13 +12,15 @@ use indra_cli::tx_builder::{
 };
 use indra_core::types::primitives::Bytes32;
 use indra_core::types::staking::StakingBondProof;
-use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::hybrid::HybridKeypair;
+#[cfg(feature = "legacy_raw_keys")]
+use indra_crypto::hybrid::{ClassicalKeypair, PqKeypair};
 
-use crate::{
-    bounded_cstr, errors::IndraError, CLASSICAL_SK_BYTES, INDRA_OP_HEX_MAX_BYTES, PQ_PK_BYTES,
-    PQ_SK_BYTES,
-};
+use crate::{bounded_cstr, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES};
+#[cfg(feature = "legacy_raw_keys")]
+use crate::{CLASSICAL_SK_BYTES, PQ_PK_BYTES, PQ_SK_BYTES};
 
+#[cfg(feature = "legacy_raw_keys")]
 fn reconstruct_keypair(
     classical_seed: &[u8; CLASSICAL_SK_BYTES],
     pq_pk: &[u8; PQ_PK_BYTES],
@@ -35,7 +37,7 @@ pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
     out
 }
 
-unsafe fn read_staking_bond_proof(
+pub(crate) unsafe fn read_staking_bond_proof(
     bond_value_spark: u64,
     bond_blinding_factor: *const u8,
 ) -> StakingBondProof {
@@ -48,6 +50,7 @@ unsafe fn read_staking_bond_proof(
     proof
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 pub(crate) unsafe fn read_keypair(
     classical_seed: *const u8,
     pq_pk: *const u8,
@@ -90,6 +93,7 @@ pub(crate) unsafe fn write_hex_to_buf(
     Ok(())
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 fn key_ptrs_are_null(
     classical_seed: *const u8,
     pq_pk: *const u8,
@@ -104,6 +108,7 @@ fn key_ptrs_are_null(
         || out_hex.is_null()
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 unsafe fn build_with_keypair<F>(args: StakingCommonArgs, build: F) -> i32
 where
     F: FnOnce(&HybridKeypair, u64, &str) -> Result<String, IndraError> + UnwindSafe,
@@ -130,11 +135,42 @@ where
     }
 }
 
+unsafe fn build_with_handle<F>(args: StakingHandleArgs, build: F) -> i32
+where
+    F: FnOnce(&HybridKeypair, &[u8; 32], u64, &str) -> Result<String, IndraError> + UnwindSafe,
+{
+    if args.chain_id.is_null() || args.out_hex.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    match catch_unwind(|| {
+        let signing = handles::signing_material(args.handle)?;
+        let keypair = signing.keypair()?;
+        let chain = read_chain_id(args.chain_id)?;
+        let hex = build(&keypair, &signing.public.validator_id, args.nonce, &chain)?;
+        write_hex_to_buf(&hex, args.out_hex, args.out_len)
+    }) {
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
 #[derive(Clone, Copy)]
+#[cfg(feature = "legacy_raw_keys")]
 struct StakingCommonArgs {
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StakingHandleArgs {
+    handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
@@ -149,6 +185,7 @@ struct StakingCommonArgs {
 /// `pq_pk`, `pq_sk`, and `vrf_pk` must reference 32, 2592, 32, and 32
 /// readable bytes respectively. `chain_id` must be a valid null-terminated
 /// UTF-8 string. `out_hex` must point to a writable buffer of length `out_len`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_register_validator(
     commission_bps: u32,
@@ -191,6 +228,45 @@ pub unsafe extern "C" fn indra_build_register_validator(
     )
 }
 
+/// Build and sign a RegisterValidator staking operation using an opaque handle.
+/// The VRF public key is derived from the handle's stored public metadata.
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_register_validator_with_handle(
+    commission_bps: u32,
+    bond_utxo_id: *const u8,
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    if commission_bps > 10_000 {
+        return IndraError::InvalidParam.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, _validator_id, nonce, chain| {
+            let bond = Bytes32::from(read_bytes32(bond_utxo_id));
+            let proof = read_staking_bond_proof(bond_value_spark, bond_blinding_factor);
+            let vrf = handles::public_info(handle)?.vrf_pk;
+            build_register_validator_op(commission_bps, bond, proof, keypair, vrf, nonce, chain)
+                .map(|built| built.op_hex)
+                .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign a SelfStake staking operation.
 ///
 /// # Safety
@@ -198,6 +274,7 @@ pub unsafe extern "C" fn indra_build_register_validator(
 /// All pointer arguments must be valid and non-null. `bond_utxo_id` must
 /// reference 32 readable bytes. Key and output pointers follow
 /// `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_stake(
     bond_utxo_id: *const u8,
@@ -238,6 +315,42 @@ pub unsafe extern "C" fn indra_build_self_stake(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_self_stake_with_handle(
+    bond_utxo_id: *const u8,
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, _validator_id, nonce, chain| {
+            build_self_stake_op(
+                Bytes32::from(read_bytes32(bond_utxo_id)),
+                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
+                keypair,
+                nonce,
+                chain,
+            )
+            .map(|built| built.op_hex)
+            .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign a SelfUnstake staking operation.
 ///
 /// # Safety
@@ -245,6 +358,7 @@ pub unsafe extern "C" fn indra_build_self_stake(
 /// All pointer arguments must be valid and non-null. `bond_utxo_id` must
 /// reference 32 readable bytes. Key and output pointers follow
 /// `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_unstake(
     bond_utxo_id: *const u8,
@@ -282,6 +396,39 @@ pub unsafe extern "C" fn indra_build_self_unstake(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_self_unstake_with_handle(
+    bond_utxo_id: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if bond_utxo_id.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, _validator_id, nonce, chain| {
+            build_self_unstake_op(
+                Bytes32::from(read_bytes32(bond_utxo_id)),
+                keypair,
+                nonce,
+                chain,
+            )
+            .map(|built| built.op_hex)
+            .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign a Delegate staking operation.
 ///
 /// # Safety
@@ -289,6 +436,7 @@ pub unsafe extern "C" fn indra_build_self_unstake(
 /// All pointer arguments must be valid and non-null. `validator_id` and
 /// `bond_utxo_id` must each reference 32 readable bytes. Key and output
 /// pointers follow `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_delegate(
     validator_id: *const u8,
@@ -331,6 +479,44 @@ pub unsafe extern "C" fn indra_build_delegate(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_delegate_with_handle(
+    validator_id: *const u8,
+    bond_utxo_id: *const u8,
+    bond_value_spark: u64,
+    bond_blinding_factor: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if validator_id.is_null() || bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, _signer_id, nonce, chain| {
+            build_delegate_op(
+                Bytes32::from(read_bytes32(validator_id)),
+                Bytes32::from(read_bytes32(bond_utxo_id)),
+                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
+                keypair,
+                nonce,
+                chain,
+            )
+            .map(|built| built.op_hex)
+            .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign an Undelegate staking operation.
 ///
 /// # Safety
@@ -338,6 +524,7 @@ pub unsafe extern "C" fn indra_build_delegate(
 /// All pointer arguments must be valid and non-null. `validator_id` and
 /// `bond_utxo_id` must each reference 32 readable bytes. Key and output
 /// pointers follow `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_undelegate(
     validator_id: *const u8,
@@ -377,6 +564,41 @@ pub unsafe extern "C" fn indra_build_undelegate(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_undelegate_with_handle(
+    validator_id: *const u8,
+    bond_utxo_id: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if validator_id.is_null() || bond_utxo_id.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, _signer_id, nonce, chain| {
+            build_undelegate_op(
+                Bytes32::from(read_bytes32(validator_id)),
+                Bytes32::from(read_bytes32(bond_utxo_id)),
+                keypair,
+                nonce,
+                chain,
+            )
+            .map(|built| built.op_hex)
+            .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign a ClaimRewards staking operation.
 ///
 /// # Safety
@@ -384,6 +606,7 @@ pub unsafe extern "C" fn indra_build_undelegate(
 /// All pointer arguments must be valid and non-null. `validator_id` must
 /// reference 32 readable bytes. Key and output pointers follow
 /// `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_claim_rewards(
     validator_id: *const u8,
@@ -421,6 +644,30 @@ pub unsafe extern "C" fn indra_build_claim_rewards(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_claim_rewards_with_handle(
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, validator_id, nonce, chain| {
+            build_claim_rewards_op(Bytes32::from(*validator_id), keypair, nonce, chain)
+                .map(|built| built.op_hex)
+                .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign a SetCommission staking operation.
 ///
 /// # Safety
@@ -428,6 +675,7 @@ pub unsafe extern "C" fn indra_build_claim_rewards(
 /// All pointer arguments must be valid and non-null. `validator_id` must
 /// reference 32 readable bytes. Key and output pointers follow
 /// `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_set_commission(
     validator_id: *const u8,
@@ -470,6 +718,40 @@ pub unsafe extern "C" fn indra_build_set_commission(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_set_commission_with_handle(
+    new_commission_bps: u32,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if new_commission_bps > 10_000 {
+        return IndraError::InvalidParam.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, validator_id, nonce, chain| {
+            build_set_commission_op(
+                Bytes32::from(*validator_id),
+                new_commission_bps,
+                keypair,
+                nonce,
+                chain,
+            )
+            .map(|built| built.op_hex)
+            .map_err(IndraError::from)
+        },
+    )
+}
+
 /// Build and sign a SetAutoDelegate staking operation.
 ///
 /// # Safety
@@ -477,6 +759,7 @@ pub unsafe extern "C" fn indra_build_set_commission(
 /// All pointer arguments must be valid and non-null. `validator_id` and
 /// `target_validator_id` must each reference 32 readable bytes. Key and output
 /// pointers follow `indra_build_register_validator`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_set_auto_delegate(
     validator_id: *const u8,
@@ -516,7 +799,41 @@ pub unsafe extern "C" fn indra_build_set_auto_delegate(
     )
 }
 
-#[cfg(test)]
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
+    target_validator_id: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if target_validator_id.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, validator_id, nonce, chain| {
+            build_set_auto_delegate_op(
+                Bytes32::from(*validator_id),
+                Bytes32::from(read_bytes32(target_validator_id)),
+                keypair,
+                nonce,
+                chain,
+            )
+            .map(|built| built.op_hex)
+            .map_err(IndraError::from)
+        },
+    )
+}
+
+#[cfg(all(test, feature = "legacy_raw_keys"))]
 mod tests {
     use super::*;
     use crate::{indra_keygen, IndraKeyPair};

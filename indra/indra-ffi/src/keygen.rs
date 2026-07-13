@@ -1,22 +1,33 @@
-use indra_cli::{generate_keypairs, recover_from_mnemonic};
+use indra_cli::{generate_keypairs, recover_from_mnemonic, KeysFile};
 use indra_crypto::{derive_all_seeds, generate_mnemonic, validate_mnemonic};
 
+#[cfg(not(feature = "legacy_raw_keys"))]
+use crate::errors::IndraError;
+#[cfg(feature = "legacy_raw_keys")]
 use crate::{errors::IndraError, IndraKeyPair};
 
+#[cfg(feature = "legacy_raw_keys")]
 const PQ_PK_BYTES: usize = 2592;
+#[cfg(feature = "legacy_raw_keys")]
 const PQ_SK_BYTES: usize = 32;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
-pub fn generate(mut seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
+pub fn generate_keys(mut seed: [u8; 32]) -> Result<KeysFile, IndraError> {
     let derived = derive_all_seeds(&seed);
     seed.fill(0);
-    let keys = generate_keypairs(
+    generate_keypairs(
         String::new(),
         derived.hybrid_seed,
         derived.bls_seed,
         derived.vrf_seed,
     )
-    .map_err(|_| IndraError::KeygenFailed)?;
+    .map_err(|_| IndraError::KeygenFailed)
+}
+
+/// Generate an INDRA keypair bundle from one wallet seed.
+#[cfg(feature = "legacy_raw_keys")]
+pub fn generate(seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
+    let keys = generate_keys(seed)?;
     keys_to_ffi(&keys)
 }
 
@@ -26,9 +37,14 @@ pub fn new_mnemonic() -> String {
 }
 
 /// Generate an INDRA keypair bundle from a BIP-39 mnemonic phrase.
+pub fn generate_keys_from_mnemonic(phrase: &str) -> Result<KeysFile, IndraError> {
+    recover_from_mnemonic(phrase, String::new()).map_err(|_| IndraError::InvalidParam)
+}
+
+/// Generate an INDRA keypair bundle from a BIP-39 mnemonic phrase.
+#[cfg(feature = "legacy_raw_keys")]
 pub fn generate_from_mnemonic(phrase: &str) -> Result<IndraKeyPair, IndraError> {
-    let keys =
-        recover_from_mnemonic(phrase, String::new()).map_err(|_| IndraError::InvalidParam)?;
+    let keys = generate_keys_from_mnemonic(phrase)?;
     keys_to_ffi(&keys)
 }
 
@@ -37,6 +53,7 @@ pub fn is_valid_mnemonic(phrase: &str) -> bool {
     validate_mnemonic(phrase)
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 fn keys_to_ffi(keys: &indra_cli::KeysFile) -> Result<IndraKeyPair, IndraError> {
     if keys.public.hybrid_pq_pk.len() != PQ_PK_BYTES || keys.pq_sk.len() != PQ_SK_BYTES {
         return Err(IndraError::KeygenFailed);

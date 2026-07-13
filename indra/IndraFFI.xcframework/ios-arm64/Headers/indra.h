@@ -18,24 +18,34 @@ extern "C" {
 #define INDRA_ERR_RANGE_PROOF    -7
 #define INDRA_ERR_BALANCE        -8
 #define INDRA_ERR_INVALID_PARAM  -9
+#define INDRA_ERR_INVALID_JSON  -10
+#define INDRA_ERR_UNKNOWN_ACTION -11
+#define INDRA_ERR_INVALID_VOTE  -12
+#define INDRA_ERR_INVALID_HANDLE -13
 #define INDRA_ERR_INTERNAL      -99
 
+#define INDRA_OP_HEX_MAX_BYTES 32768
 #define INDRA_CLASSICAL_PK_BYTES  32
 #define INDRA_CLASSICAL_SK_BYTES  32
 #define INDRA_PQ_PK_BYTES       2592
 #define INDRA_PQ_SK_BYTES         32
 #define INDRA_VALIDATOR_ID_BYTES  32
+#define INDRA_UTXO_ID_BYTES       32
+#define INDRA_VRF_PK_BYTES        32
+#define INDRA_PROPOSAL_ID_BYTES   32
 #define INDRA_BYTES32_LEN         32
 #define INDRA_TX_ID_BYTES         32
 #define INDRA_MNEMONIC_MAX_BYTES 300
+
+typedef uint64_t IndraKeyHandle;
+#define INDRA_KEY_HANDLE_INVALID ((IndraKeyHandle)0)
 
 typedef struct {
     uint8_t validator_id[INDRA_VALIDATOR_ID_BYTES];
     uint8_t classical_pk[INDRA_CLASSICAL_PK_BYTES];
     uint8_t pq_pk[INDRA_PQ_PK_BYTES];
-    uint8_t classical_seed[INDRA_CLASSICAL_SK_BYTES];
-    uint8_t pq_sk[INDRA_PQ_SK_BYTES];
-} IndraKeyPair;
+    uint8_t vrf_pk[INDRA_VRF_PK_BYTES];
+} IndraPublicKeyInfo;
 
 typedef struct {
     uint8_t  utxo_id[INDRA_BYTES32_LEN];
@@ -53,10 +63,8 @@ typedef struct {
     uint64_t       fee_spark;
     const IndraUtxoEntry* utxos;
     size_t         utxo_count;
-    const uint8_t* sender_classical_seed;
-    const uint8_t* sender_pq_sk;
-    const uint8_t* sender_pq_pk;
-} IndraTxParams;
+    IndraKeyHandle sender_handle;
+} IndraTxParamsV2;
 
 typedef struct {
     uint8_t  tx_id[INDRA_TX_ID_BYTES];
@@ -68,9 +76,10 @@ typedef struct {
     size_t   spent_count;
 } IndraTxResult;
 
-int32_t indra_keygen(
+int32_t indra_keygen_handle(
     const uint8_t* seed,
-    IndraKeyPair* out
+    IndraKeyHandle* out_handle,
+    IndraPublicKeyInfo* out_public
 );
 
 int32_t indra_generate_mnemonic(
@@ -78,10 +87,21 @@ int32_t indra_generate_mnemonic(
     size_t out_len
 );
 
-int32_t indra_keygen_from_mnemonic(
+int32_t indra_keygen_from_mnemonic_handle(
     const char* phrase,
-    IndraKeyPair* out
+    IndraKeyHandle* out_handle,
+    IndraPublicKeyInfo* out_public
 );
+
+int32_t indra_key_handle_public(
+    IndraKeyHandle handle,
+    IndraPublicKeyInfo* out_public
+);
+
+int32_t indra_destroy_key_handle(IndraKeyHandle handle);
+int32_t indra_destroy_all_key_handles(void);
+
+void indra_zeroize_tx_result(IndraTxResult* result);
 
 int32_t indra_validate_mnemonic(const char* phrase);
 
@@ -90,8 +110,8 @@ int32_t indra_validator_id(
     uint8_t* out_id
 );
 
-int32_t indra_build_tx(
-    const IndraTxParams* params,
+int32_t indra_build_tx_with_handle(
+    const IndraTxParamsV2* params,
     IndraTxResult* out
 );
 
@@ -112,6 +132,368 @@ int32_t indra_verify_range_proof(
     const uint8_t* proof_bytes,
     size_t proof_len
 );
+
+int32_t indra_build_register_validator_with_handle(
+    uint32_t commission_bps,
+    const uint8_t* bond_utxo_id,
+    uint64_t bond_value_spark,
+    const uint8_t* bond_blinding_factor,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_self_stake_with_handle(
+    const uint8_t* bond_utxo_id,
+    uint64_t bond_value_spark,
+    const uint8_t* bond_blinding_factor,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_self_unstake_with_handle(
+    const uint8_t* bond_utxo_id,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_delegate_with_handle(
+    const uint8_t* validator_id,
+    const uint8_t* bond_utxo_id,
+    uint64_t bond_value_spark,
+    const uint8_t* bond_blinding_factor,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_undelegate_with_handle(
+    const uint8_t* validator_id,
+    const uint8_t* bond_utxo_id,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_claim_rewards_with_handle(
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_set_commission_with_handle(
+    uint32_t new_commission_bps,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_set_auto_delegate_with_handle(
+    const uint8_t* target_validator_id,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_propose_with_handle(
+    const char* title,
+    const char* description,
+    const char* action_json,
+    const uint8_t* deposit_utxo_id,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_commit_with_handle(
+    const uint8_t* proposal_id,
+    uint8_t vote,
+    const uint8_t* reveal_nonce,
+    uint8_t* out_commitment,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_reveal_with_handle(
+    const uint8_t* proposal_id,
+    uint8_t vote,
+    const uint8_t* reveal_nonce,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_redelegate_with_handle(
+    const uint8_t* proposal_id,
+    const uint8_t* from_validator_id,
+    const uint8_t* to_validator_id,
+    uint64_t amount_spark,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_execute_with_handle(
+    const uint8_t* proposal_id,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_cancel_with_handle(
+    const uint8_t* proposal_id,
+    IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_compute_vote_commitment(
+    uint8_t vote,
+    const uint8_t* reveal_nonce,
+    uint8_t* out_commitment
+);
+
+/*
+ * Transitional migration surface only. These raw-key declarations correspond
+ * to Rust symbols compiled with Cargo feature `legacy_raw_keys`; production
+ * wallet builds must not enable that feature and should not define this macro.
+ */
+#ifdef INDRA_ENABLE_LEGACY_RAW_KEYS
+typedef struct {
+    uint8_t validator_id[INDRA_VALIDATOR_ID_BYTES];
+    uint8_t classical_pk[INDRA_CLASSICAL_PK_BYTES];
+    uint8_t pq_pk[INDRA_PQ_PK_BYTES];
+    uint8_t classical_seed[INDRA_CLASSICAL_SK_BYTES];
+    uint8_t pq_sk[INDRA_PQ_SK_BYTES];
+    uint8_t bls_seed[INDRA_BYTES32_LEN];
+    uint8_t vrf_seed[INDRA_BYTES32_LEN];
+} IndraKeyPair;
+
+typedef struct {
+    const uint8_t* recipient_classical_pk;
+    uint64_t       amount_spark;
+    uint64_t       fee_spark;
+    const IndraUtxoEntry* utxos;
+    size_t         utxo_count;
+    const uint8_t* sender_classical_seed;
+    const uint8_t* sender_pq_sk;
+    const uint8_t* sender_pq_pk;
+} IndraTxParams;
+
+int32_t indra_keygen(const uint8_t* seed, IndraKeyPair* out);
+int32_t indra_keygen_from_mnemonic(const char* phrase, IndraKeyPair* out);
+void indra_zeroize_keypair(IndraKeyPair* keypair);
+
+int32_t indra_build_tx(const IndraTxParams* params, IndraTxResult* out);
+
+int32_t indra_build_register_validator(
+    uint32_t commission_bps,
+    const uint8_t* bond_utxo_id,
+    uint64_t bond_value_spark,
+    const uint8_t* bond_blinding_factor,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    const uint8_t* vrf_pk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_self_stake(
+    const uint8_t* bond_utxo_id,
+    uint64_t bond_value_spark,
+    const uint8_t* bond_blinding_factor,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_self_unstake(
+    const uint8_t* bond_utxo_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_delegate(
+    const uint8_t* validator_id,
+    const uint8_t* bond_utxo_id,
+    uint64_t bond_value_spark,
+    const uint8_t* bond_blinding_factor,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_undelegate(
+    const uint8_t* validator_id,
+    const uint8_t* bond_utxo_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_claim_rewards(
+    const uint8_t* validator_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_set_commission(
+    const uint8_t* validator_id,
+    uint32_t new_commission_bps,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_set_auto_delegate(
+    const uint8_t* validator_id,
+    const uint8_t* target_validator_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_propose(
+    const char* title,
+    const char* description,
+    const char* action_json,
+    const uint8_t* deposit_utxo_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_commit(
+    const uint8_t* proposal_id,
+    uint8_t vote,
+    const uint8_t* reveal_nonce,
+    uint8_t* out_commitment,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_reveal(
+    const uint8_t* proposal_id,
+    uint8_t vote,
+    const uint8_t* reveal_nonce,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_redelegate(
+    const uint8_t* proposal_id,
+    const uint8_t* from_validator_id,
+    const uint8_t* to_validator_id,
+    uint64_t amount_spark,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_execute(
+    const uint8_t* proposal_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_governance_cancel(
+    const uint8_t* proposal_id,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_pk,
+    const uint8_t* pq_sk,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+#endif
 
 void indra_free_bytes(uint8_t* ptr, size_t len);
 void indra_free_usize(size_t* ptr, size_t len);

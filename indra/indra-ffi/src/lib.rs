@@ -8,8 +8,9 @@
 //!   translated to `INDRA_ERR_INTERNAL`.
 //! - Memory allocated by Rust (`tx_bytes`, `spent_indices`) must be freed by
 //!   the caller using `indra_free_bytes()` / `indra_free_usize()`.
-//! - This library is not synchronised at the FFI layer. Swift callers should
-//!   serialise access if they share mutable wallet state.
+//! - Opaque key handles are process-local. The consuming app must persist
+//!   recovery material in platform secure storage, recreate handles on unlock,
+//!   and destroy handles on wallet lock/logout.
 
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
@@ -22,12 +23,14 @@ use indra_crypto::sha256;
 
 pub mod errors;
 pub mod governance;
+pub mod handles;
 pub mod keygen;
 pub mod staking;
 pub mod tx;
 pub mod wallet;
 
 use errors::{error_string, IndraError};
+pub use handles::{IndraKeyHandle, INDRA_KEY_HANDLE_INVALID};
 
 pub const CLASSICAL_PK_BYTES: usize = 32;
 pub const CLASSICAL_SK_BYTES: usize = 32;
@@ -71,7 +74,310 @@ pub(crate) unsafe fn bounded_cstr(ptr: *const c_char) -> Result<String, IndraErr
         .map_err(|_| IndraError::InvalidParam)
 }
 
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use indra_core::{
+        codec::Decode,
+        types::{
+            governance::{GovernanceOpV2, GovernancePayload},
+            staking::{StakingOp, StakingOpBody},
+        },
+    };
+    use std::{
+        ffi::{CStr, CString},
+        fs,
+        path::Path,
+        sync::{Mutex, OnceLock},
+        thread,
+    };
+
+    const OK: i32 = IndraError::Ok as i32;
+    const INVALID_HANDLE: i32 = IndraError::InvalidHandle as i32;
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn handle_from_seed(seed: [u8; 32]) -> (IndraKeyHandle, IndraPublicKeyInfo) {
+        let mut handle = INDRA_KEY_HANDLE_INVALID;
+        let mut public = IndraPublicKeyInfo::zeroed();
+        let code = unsafe { indra_keygen_handle(seed.as_ptr(), &mut handle, &mut public) };
+        assert_eq!(code, OK);
+        assert_ne!(handle, INDRA_KEY_HANDLE_INVALID);
+        (handle, public)
+    }
+
+    fn out() -> Vec<c_char> {
+        vec![0; INDRA_OP_HEX_MAX_BYTES]
+    }
+
+    unsafe fn decode_staking(out: &[c_char]) -> StakingOp {
+        let hex = CStr::from_ptr(out.as_ptr()).to_str().unwrap();
+        StakingOp::decode_exact(&hex::decode(hex).unwrap()).unwrap()
+    }
+
+    unsafe fn decode_governance(out: &[c_char]) -> GovernanceOpV2 {
+        let hex = CStr::from_ptr(out.as_ptr()).to_str().unwrap();
+        GovernanceOpV2::decode_exact(&hex::decode(hex).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn keygen_handle_returns_public_metadata_without_private_fields() {
+        let _guard = test_lock();
+        let (_handle, public) = handle_from_seed([0x42; 32]);
+        assert_ne!(public.validator_id, [0u8; 32]);
+        assert_ne!(public.classical_pk, [0u8; 32]);
+        assert_ne!(public.pq_pk, [0u8; PQ_PK_BYTES]);
+        assert_ne!(public.vrf_pk, [0u8; 32]);
+        assert_eq!(
+            std::mem::size_of::<IndraPublicKeyInfo>(),
+            INDRA_VALIDATOR_ID_BYTES + CLASSICAL_PK_BYTES + PQ_PK_BYTES + INDRA_VRF_PK_BYTES
+        );
+    }
+
+    #[test]
+    fn key_handle_public_matches_legacy_keygen_public_fields() {
+        let _guard = test_lock();
+        let seed = [0x24; 32];
+        let (handle, public) = handle_from_seed(seed);
+        let direct = keygen::generate_keys(seed).unwrap();
+        assert_eq!(public.validator_id, direct.public.validator_id);
+        assert_eq!(public.classical_pk, direct.public.hybrid_classical_pk);
+        assert_eq!(
+            public.pq_pk.as_slice(),
+            direct.public.hybrid_pq_pk.as_slice()
+        );
+        assert_eq!(public.vrf_pk, direct.public.vrf_pk);
+
+        let mut fetched = IndraPublicKeyInfo::zeroed();
+        let code = unsafe { indra_key_handle_public(handle, &mut fetched) };
+        assert_eq!(code, OK);
+        assert_eq!(fetched.validator_id, public.validator_id);
+        assert_eq!(fetched.classical_pk, public.classical_pk);
+        assert_eq!(fetched.pq_pk, public.pq_pk);
+        assert_eq!(fetched.vrf_pk, public.vrf_pk);
+    }
+
+    #[test]
+    fn destroy_key_handle_zeroizes_and_invalidates_entry() {
+        let _guard = test_lock();
+        let (handle, _public) = handle_from_seed([0x11; 32]);
+        assert_eq!(indra_destroy_key_handle(handle), OK);
+        let mut fetched = IndraPublicKeyInfo::zeroed();
+        let code = unsafe { indra_key_handle_public(handle, &mut fetched) };
+        assert_eq!(code, INVALID_HANDLE);
+    }
+
+    #[test]
+    fn build_tx_with_handle_matches_legacy_builder_output_shape() {
+        let _guard = test_lock();
+        let (handle, public) = handle_from_seed([0x33; 32]);
+        let utxo = IndraUtxoEntry {
+            utxo_id: [0xAA; 32],
+            value_spark: 10_000_000,
+            blinding: [0x01; 32],
+            created_height: 0,
+            tx_index: 0,
+            out_index: 0,
+            spent: 0,
+        };
+        let params = IndraTxParamsV2 {
+            recipient_classical_pk: public.classical_pk.as_ptr(),
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: &utxo,
+            utxo_count: 1,
+            sender_handle: handle,
+        };
+        let mut result = IndraTxResult::zeroed();
+        let code = unsafe { indra_build_tx_with_handle(&params, &mut result) };
+        assert_eq!(code, OK);
+        assert!(!result.tx_bytes.is_null());
+        assert!(result.tx_bytes_len > 0);
+        assert_ne!(result.tx_id, [0u8; 32]);
+        unsafe {
+            indra_free_bytes(result.tx_bytes, result.tx_bytes_len);
+            indra_free_usize(result.spent_indices, result.spent_count);
+        }
+    }
+
+    #[test]
+    fn staking_builders_with_handle_sign_with_canonical_validator_identity() {
+        let _guard = test_lock();
+        let (handle, public) = handle_from_seed([0x44; 32]);
+        let chain = CString::new("indra-testnet-1").unwrap();
+        let mut out = out();
+        let code = unsafe {
+            crate::staking::indra_build_claim_rewards_with_handle(
+                handle,
+                7,
+                chain.as_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(code, OK);
+        let op = unsafe { decode_staking(&out) };
+        assert_eq!(op.nonce, 7);
+        match op.body {
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey,
+            } => {
+                assert_eq!(validator_id.0, public.validator_id);
+                assert_eq!(delegator_pubkey.classical_pk.0, public.classical_pk);
+            }
+            other => panic!("unexpected staking op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn governance_builders_with_handle_sign_with_canonical_identity() {
+        let _guard = test_lock();
+        let (handle, public) = handle_from_seed([0x55; 32]);
+        let chain = CString::new("indra-testnet-1").unwrap();
+        let proposal_id = [0x99; 32];
+        let mut out = out();
+        let code = unsafe {
+            crate::governance::indra_build_governance_cancel_with_handle(
+                proposal_id.as_ptr(),
+                handle,
+                9,
+                chain.as_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(code, OK);
+        let op = unsafe { decode_governance(&out) };
+        assert_eq!(op.signer_id.0, public.validator_id);
+        assert_eq!(op.nonce, 9);
+        assert!(matches!(op.payload, GovernancePayload::Cancel { .. }));
+    }
+
+    #[test]
+    fn invalid_handle_rejected_for_all_handle_builders() {
+        let _guard = test_lock();
+        let chain = CString::new("indra-testnet-1").unwrap();
+        let mut out_hex = out();
+        let mut result = IndraTxResult::zeroed();
+        let recipient = [0x01; 32];
+        let tx_params = IndraTxParamsV2 {
+            recipient_classical_pk: recipient.as_ptr(),
+            amount_spark: 1,
+            fee_spark: 1,
+            utxos: std::ptr::null(),
+            utxo_count: 0,
+            sender_handle: INDRA_KEY_HANDLE_INVALID,
+        };
+        assert_eq!(
+            unsafe { indra_build_tx_with_handle(&tx_params, &mut result) },
+            INVALID_HANDLE
+        );
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_claim_rewards_with_handle(
+                    INDRA_KEY_HANDLE_INVALID,
+                    1,
+                    chain.as_ptr(),
+                    out_hex.as_mut_ptr(),
+                    out_hex.len(),
+                )
+            },
+            INVALID_HANDLE
+        );
+        let proposal_id = [0x02; 32];
+        assert_eq!(
+            unsafe {
+                crate::governance::indra_build_governance_cancel_with_handle(
+                    proposal_id.as_ptr(),
+                    INDRA_KEY_HANDLE_INVALID,
+                    1,
+                    chain.as_ptr(),
+                    out_hex.as_mut_ptr(),
+                    out_hex.len(),
+                )
+            },
+            INVALID_HANDLE
+        );
+    }
+
+    #[test]
+    fn destroy_all_key_handles_invalidates_existing_handles() {
+        let _guard = test_lock();
+        let (h1, _p1) = handle_from_seed([0x61; 32]);
+        let (h2, _p2) = handle_from_seed([0x62; 32]);
+        assert_eq!(indra_destroy_all_key_handles(), OK);
+        let mut fetched = IndraPublicKeyInfo::zeroed();
+        assert_eq!(
+            unsafe { indra_key_handle_public(h1, &mut fetched) },
+            INVALID_HANDLE
+        );
+        assert_eq!(
+            unsafe { indra_key_handle_public(h2, &mut fetched) },
+            INVALID_HANDLE
+        );
+    }
+
+    #[test]
+    fn concurrent_handle_builds_do_not_cross_use_or_panic() {
+        let _guard = test_lock();
+        let mut workers = Vec::new();
+        for i in 0..8u8 {
+            workers.push(thread::spawn(move || {
+                let (handle, public) = handle_from_seed([i + 1; 32]);
+                let chain = CString::new("indra-testnet-1").unwrap();
+                let mut out = out();
+                let code = unsafe {
+                    crate::staking::indra_build_claim_rewards_with_handle(
+                        handle,
+                        u64::from(i) + 1,
+                        chain.as_ptr(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                };
+                assert_eq!(code, OK);
+                let op = unsafe { decode_staking(&out) };
+                match op.body {
+                    StakingOpBody::ClaimRewards { validator_id, .. } => {
+                        assert_eq!(validator_id.0, public.validator_id);
+                    }
+                    other => panic!("unexpected staking op: {other:?}"),
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn header_abi_sync_check_covers_source_and_xcframework_headers() {
+        let _guard = test_lock();
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = manifest.join("include/indra.h");
+        let xc_root = manifest.parent().unwrap().join("IndraFFI.xcframework");
+        let source_header = fs::read_to_string(&source).unwrap();
+        for header in [
+            xc_root.join("ios-arm64/Headers/indra.h"),
+            xc_root.join("ios-arm64_x86_64-simulator/Headers/indra.h"),
+        ] {
+            let bundled = fs::read_to_string(&header).unwrap();
+            assert_eq!(
+                bundled,
+                source_header,
+                "stale FFI header: {}",
+                header.display()
+            );
+        }
+    }
+}
+
 /// FFI keypair bundle returned to Swift.
+#[cfg(feature = "legacy_raw_keys")]
 #[repr(C)]
 pub struct IndraKeyPair {
     pub validator_id: [u8; BYTES32_LEN],
@@ -83,6 +389,7 @@ pub struct IndraKeyPair {
     pub vrf_seed: [u8; BYTES32_LEN],
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 impl IndraKeyPair {
     /// Zero-initialised value for tests and error paths.
     pub const fn zeroed() -> Self {
@@ -94,6 +401,28 @@ impl IndraKeyPair {
             pq_sk: [0u8; PQ_SK_BYTES],
             bls_seed: [0u8; BYTES32_LEN],
             vrf_seed: [0u8; BYTES32_LEN],
+        }
+    }
+}
+
+/// Public metadata for an opaque key handle. Contains no private key material.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IndraPublicKeyInfo {
+    pub validator_id: [u8; BYTES32_LEN],
+    pub classical_pk: [u8; CLASSICAL_PK_BYTES],
+    pub pq_pk: [u8; PQ_PK_BYTES],
+    pub vrf_pk: [u8; INDRA_VRF_PK_BYTES],
+}
+
+impl IndraPublicKeyInfo {
+    /// Zero-initialised value for tests and error paths.
+    pub const fn zeroed() -> Self {
+        Self {
+            validator_id: [0u8; BYTES32_LEN],
+            classical_pk: [0u8; CLASSICAL_PK_BYTES],
+            pq_pk: [0u8; PQ_PK_BYTES],
+            vrf_pk: [0u8; INDRA_VRF_PK_BYTES],
         }
     }
 }
@@ -112,6 +441,7 @@ pub struct IndraUtxoEntry {
 }
 
 /// FFI transaction builder input parameters.
+#[cfg(feature = "legacy_raw_keys")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IndraTxParams {
@@ -123,6 +453,18 @@ pub struct IndraTxParams {
     pub sender_classical_seed: *const u8,
     pub sender_pq_sk: *const u8,
     pub sender_pq_pk: *const u8,
+}
+
+/// FFI transaction builder input parameters for opaque key handles.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IndraTxParamsV2 {
+    pub recipient_classical_pk: *const u8,
+    pub amount_spark: u64,
+    pub fee_spark: u64,
+    pub utxos: *const IndraUtxoEntry,
+    pub utxo_count: usize,
+    pub sender_handle: IndraKeyHandle,
 }
 
 /// FFI transaction builder output.
@@ -157,6 +499,7 @@ impl IndraTxResult {
 /// # Safety
 ///
 /// `keypair` must be null or point to valid writable `IndraKeyPair` storage.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_zeroize_keypair(keypair: *mut IndraKeyPair) {
     if keypair.is_null() {
@@ -185,6 +528,7 @@ pub unsafe extern "C" fn indra_zeroize_tx_result(result: *mut IndraTxResult) {
 ///
 /// `seed` must point to at least 32 readable bytes and `out` must point to a
 /// valid writable `IndraKeyPair`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -> i32 {
     if seed.is_null() || out.is_null() {
@@ -202,6 +546,45 @@ pub unsafe extern "C" fn indra_keygen(seed: *const u8, out: *mut IndraKeyPair) -
     }) {
         Ok(Ok(keypair)) => {
             *out = keypair;
+            IndraError::Ok.code()
+        }
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Generate a new INDRA key handle from one 32-byte wallet seed.
+///
+/// Handles are process-local. The consuming app should recreate handles from
+/// platform secure storage on unlock and destroy them on lock/logout.
+///
+/// # Safety
+///
+/// `seed` must point to at least 32 readable bytes. `out_handle` and
+/// `out_public` must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn indra_keygen_handle(
+    seed: *const u8,
+    out_handle: *mut IndraKeyHandle,
+    out_public: *mut IndraPublicKeyInfo,
+) -> i32 {
+    if seed.is_null() || out_handle.is_null() || out_public.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    *out_handle = INDRA_KEY_HANDLE_INVALID;
+    *out_public = IndraPublicKeyInfo::zeroed();
+
+    match catch_unwind(|| {
+        let mut seed_bytes = [0u8; CLASSICAL_SK_BYTES];
+        seed_bytes.copy_from_slice(std::slice::from_raw_parts(seed, CLASSICAL_SK_BYTES));
+        let result = keygen::generate_keys(seed_bytes);
+        seed_bytes.fill(0);
+        result.and_then(|keys| handles::store_keys(&keys))
+    }) {
+        Ok(Ok((handle, public))) => {
+            *out_handle = handle;
+            *out_public = public;
             IndraError::Ok.code()
         }
         Ok(Err(err)) => err.code(),
@@ -246,6 +629,7 @@ pub unsafe extern "C" fn indra_generate_mnemonic(out_phrase: *mut c_char, out_le
 ///
 /// `phrase` must point to a valid null-terminated UTF-8 C string and `out`
 /// must point to writable `IndraKeyPair` storage.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_keygen_from_mnemonic(
     phrase: *const c_char,
@@ -265,6 +649,83 @@ pub unsafe extern "C" fn indra_keygen_from_mnemonic(
             *out = keypair;
             IndraError::Ok.code()
         }
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Recover an INDRA key handle from a BIP-39 mnemonic phrase.
+///
+/// # Safety
+///
+/// `phrase` must point to a valid null-terminated UTF-8 C string.
+/// `out_handle` and `out_public` must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn indra_keygen_from_mnemonic_handle(
+    phrase: *const c_char,
+    out_handle: *mut IndraKeyHandle,
+    out_public: *mut IndraPublicKeyInfo,
+) -> i32 {
+    if phrase.is_null() || out_handle.is_null() || out_public.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    *out_handle = INDRA_KEY_HANDLE_INVALID;
+    *out_public = IndraPublicKeyInfo::zeroed();
+
+    match catch_unwind(|| {
+        let phrase_str = bounded_cstr(phrase)?;
+        keygen::generate_keys_from_mnemonic(&phrase_str).and_then(|keys| handles::store_keys(&keys))
+    }) {
+        Ok(Ok((handle, public))) => {
+            *out_handle = handle;
+            *out_public = public;
+            IndraError::Ok.code()
+        }
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Copy public metadata for an opaque key handle.
+///
+/// # Safety
+///
+/// `out_public` must point to writable `IndraPublicKeyInfo` storage.
+#[no_mangle]
+pub unsafe extern "C" fn indra_key_handle_public(
+    handle: IndraKeyHandle,
+    out_public: *mut IndraPublicKeyInfo,
+) -> i32 {
+    if out_public.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    *out_public = IndraPublicKeyInfo::zeroed();
+    match catch_unwind(|| handles::public_info(handle)) {
+        Ok(Ok(public)) => {
+            *out_public = public;
+            IndraError::Ok.code()
+        }
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Destroy one opaque key handle and zeroize its in-process key material.
+#[no_mangle]
+pub extern "C" fn indra_destroy_key_handle(handle: IndraKeyHandle) -> i32 {
+    match catch_unwind(|| handles::destroy(handle)) {
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Destroy all opaque key handles and zeroize their in-process key material.
+#[no_mangle]
+pub extern "C" fn indra_destroy_all_key_handles() -> i32 {
+    match catch_unwind(handles::destroy_all) {
+        Ok(Ok(())) => IndraError::Ok.code(),
         Ok(Err(err)) => err.code(),
         Err(_) => IndraError::Internal.code(),
     }
@@ -324,6 +785,7 @@ pub unsafe extern "C" fn indra_validator_id(classical_pk: *const u8, out_id: *mu
 /// `params` and `out` must be valid non-null pointers. Any pointer fields inside
 /// `params` must reference readable memory for the documented lengths, and
 /// `out` must point to writable storage for `IndraTxResult`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_tx(
     params: *const IndraTxParams,
@@ -386,6 +848,97 @@ pub unsafe extern "C" fn indra_build_tx(
             }
         };
         sender_classical_seed.fill(0);
+
+        let tx_id = built.tx_id;
+        let change_spark = built.change_spark;
+        let change_blinding = built.change_blinding;
+
+        let tx_bytes_len = built.tx_bytes.len();
+        let tx_bytes_ptr = Box::into_raw(built.tx_bytes) as *mut u8;
+        let spent_count = built.spent_indices.len();
+        let spent_ptr = Box::into_raw(built.spent_indices) as *mut usize;
+
+        *out = IndraTxResult {
+            tx_id,
+            tx_bytes: tx_bytes_ptr,
+            tx_bytes_len,
+            change_spark,
+            change_blinding,
+            spent_indices: spent_ptr,
+            spent_count,
+        };
+
+        Ok::<(), IndraError>(())
+    }) {
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Build and sign a transaction for the wallet using an opaque key handle.
+///
+/// # Safety
+///
+/// `params` and `out` must be valid non-null pointers. Any pointer fields inside
+/// `params` must reference readable memory for the documented lengths, and
+/// `out` must point to writable storage for `IndraTxResult`.
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_tx_with_handle(
+    params: *const IndraTxParamsV2,
+    out: *mut IndraTxResult,
+) -> i32 {
+    if params.is_null() || out.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    *out = IndraTxResult::zeroed();
+
+    match catch_unwind(|| {
+        let params_ref = &*params;
+        if params_ref.utxo_count > MAX_UTXO_COUNT {
+            return Err(IndraError::InvalidParam);
+        }
+        if params_ref.recipient_classical_pk.is_null()
+            || (params_ref.utxo_count > 0 && params_ref.utxos.is_null())
+        {
+            return Err(IndraError::NullPointer);
+        }
+
+        let mut recipient_classical_pk = [0u8; CLASSICAL_PK_BYTES];
+        recipient_classical_pk.copy_from_slice(std::slice::from_raw_parts(
+            params_ref.recipient_classical_pk,
+            CLASSICAL_PK_BYTES,
+        ));
+
+        let utxos = if params_ref.utxo_count == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(params_ref.utxos, params_ref.utxo_count)
+        };
+
+        let signing = handles::signing_material(params_ref.sender_handle)?;
+        let mut sender_classical_seed = signing.classical_seed();
+        let mut sender_pq_sk = signing.pq_sk();
+        let wallet_context =
+            wallet::build_wallet_context(sender_classical_seed, &signing.public.pq_pk, utxos)?;
+        let built = match tx::build(
+            recipient_classical_pk,
+            params_ref.amount_spark,
+            params_ref.fee_spark,
+            sender_classical_seed,
+            &sender_pq_sk,
+            wallet_context,
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                sender_classical_seed.fill(0);
+                sender_pq_sk.fill(0);
+                return Err(error);
+            }
+        };
+        sender_classical_seed.fill(0);
+        sender_pq_sk.fill(0);
 
         let tx_id = built.tx_id;
         let change_spark = built.change_spark;
@@ -551,7 +1104,7 @@ pub extern "C" fn indra_error_string(error_code: i32) -> *const c_char {
     error_string(error_code).as_ptr().cast::<c_char>()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy_raw_keys"))]
 mod tests {
     use super::*;
 

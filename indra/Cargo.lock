@@ -573,6 +573,7 @@ dependencies = [
  "indra-state",
  "rand 0.8.6",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

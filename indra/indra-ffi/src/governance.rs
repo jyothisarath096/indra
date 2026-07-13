@@ -18,10 +18,14 @@ use indra_core::{
 use indra_crypto::{hybrid::HybridKeypair, sha256};
 use serde_json::Value;
 
+#[cfg(feature = "legacy_raw_keys")]
+use crate::staking::read_keypair;
 use crate::{
     bounded_cstr,
     errors::IndraError,
-    staking::{read_bytes32, read_chain_id, read_keypair, write_hex_to_buf},
+    handles,
+    staking::{read_bytes32, read_chain_id, write_hex_to_buf},
+    IndraKeyHandle,
 };
 
 fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> Result<HybridPubKey, IndraError> {
@@ -32,6 +36,7 @@ fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> Result<HybridPubKey, I
     })
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 fn signer_id_from_keypair(keypair: &HybridKeypair) -> Bytes32 {
     Bytes32::from(sha256(&keypair.public_key().classical.0))
 }
@@ -135,6 +140,7 @@ fn compute_vote_commit_hash(wire_vote: u8, reveal_nonce: Bytes32) -> Bytes32 {
     Bytes32::from(sha256(&bytes))
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 fn shared_null(
     classical_seed: *const u8,
     pq_pk: *const u8,
@@ -149,6 +155,7 @@ fn shared_null(
         || out_hex.is_null()
 }
 
+#[cfg(feature = "legacy_raw_keys")]
 unsafe fn build_with_payload<F>(args: GovernanceCommonArgs, make_payload: F) -> i32
 where
     F: FnOnce(&HybridKeypair) -> Result<GovernancePayload, IndraError> + UnwindSafe,
@@ -177,11 +184,44 @@ where
     }
 }
 
+unsafe fn build_with_payload_handle<F>(args: GovernanceHandleArgs, make_payload: F) -> i32
+where
+    F: FnOnce(&HybridKeypair) -> Result<GovernancePayload, IndraError> + UnwindSafe,
+{
+    if args.chain_id.is_null() || args.out_hex.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    match catch_unwind(|| {
+        let signing = handles::signing_material(args.handle)?;
+        let keypair = signing.keypair()?;
+        let chain = read_chain_id(args.chain_id)?;
+        let payload = make_payload(&keypair)?;
+        let signer_id = Bytes32::from(signing.public.validator_id);
+        let hex = build_governance_op(signer_id, args.nonce, payload, &keypair, &chain)?;
+        write_hex_to_buf(&hex, args.out_hex, args.out_len)
+    }) {
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
 #[derive(Clone, Copy)]
+#[cfg(feature = "legacy_raw_keys")]
 struct GovernanceCommonArgs {
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GovernanceHandleArgs {
+    handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
@@ -196,6 +236,7 @@ struct GovernanceCommonArgs {
 /// `action_json`, and `chain_id` must be valid null-terminated UTF-8 strings.
 /// `deposit_utxo_id` must reference 32 readable bytes. Key and output pointers
 /// must reference the documented readable/writable lengths.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_propose(
     title: *const c_char,
@@ -222,6 +263,49 @@ pub unsafe extern "C" fn indra_build_governance_propose(
             classical_seed,
             pq_pk,
             pq_sk,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair| {
+            let title_str = bounded_cstr(title)?;
+            let description_str = bounded_cstr(description)?;
+            Ok(GovernancePayload::Propose {
+                action: parse_action_json(action_json)?,
+                deposit_utxo_id: Bytes32::from(read_bytes32(deposit_utxo_id)),
+                proposer_pubkey: hybrid_pubkey_from_keypair(keypair)?,
+                title: VariableBytes::from_slice(title_str.as_bytes())
+                    .map_err(|_| IndraError::InvalidParam)?,
+                description: VariableBytes::from_slice(description_str.as_bytes())
+                    .map_err(|_| IndraError::InvalidParam)?,
+            })
+        },
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
+    title: *const c_char,
+    description: *const c_char,
+    action_json: *const c_char,
+    deposit_utxo_id: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if title.is_null()
+        || description.is_null()
+        || action_json.is_null()
+        || deposit_utxo_id.is_null()
+    {
+        return IndraError::NullPointer.code();
+    }
+    build_with_payload_handle(
+        GovernanceHandleArgs {
+            handle,
             nonce,
             chain_id,
             out_hex,
@@ -277,6 +361,7 @@ pub unsafe extern "C" fn indra_compute_vote_commitment(
 /// Pointer arguments must be valid and non-null. `proposal_id`,
 /// `reveal_nonce`, and `out_commitment` must reference 32 bytes. Key and
 /// output pointers follow `indra_build_governance_propose`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_commit(
     proposal_id: *const u8,
@@ -317,6 +402,42 @@ pub unsafe extern "C" fn indra_build_governance_commit(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
+    proposal_id: *const u8,
+    vote: u8,
+    reveal_nonce: *const u8,
+    out_commitment: *mut u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if proposal_id.is_null() || reveal_nonce.is_null() || out_commitment.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_payload_handle(
+        GovernanceHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |_| {
+            let vote = wire_vote(vote)?;
+            let commitment =
+                compute_vote_commit_hash(vote, Bytes32::from(read_bytes32(reveal_nonce)));
+            std::slice::from_raw_parts_mut(out_commitment, 32).copy_from_slice(&commitment.0);
+            Ok(GovernancePayload::Commit {
+                proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+                commit_hash: commitment,
+            })
+        },
+    )
+}
+
 /// Build and sign a governance RevealVote operation.
 ///
 /// # Safety
@@ -324,6 +445,7 @@ pub unsafe extern "C" fn indra_build_governance_commit(
 /// Pointer arguments must be valid and non-null. `proposal_id` and
 /// `reveal_nonce` must each reference 32 readable bytes. Key and output
 /// pointers follow `indra_build_governance_propose`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_reveal(
     proposal_id: *const u8,
@@ -360,6 +482,38 @@ pub unsafe extern "C" fn indra_build_governance_reveal(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
+    proposal_id: *const u8,
+    vote: u8,
+    reveal_nonce: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if proposal_id.is_null() || reveal_nonce.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_payload_handle(
+        GovernanceHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |_| {
+            Ok(GovernancePayload::Reveal {
+                proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+                vote: wire_vote(vote)?,
+                nonce: Bytes32::from(read_bytes32(reveal_nonce)),
+            })
+        },
+    )
+}
+
 /// Build and sign a GovernanceRedelegate operation.
 ///
 /// # Safety
@@ -367,6 +521,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal(
 /// Pointer arguments must be valid and non-null. The ID pointers must each
 /// reference 32 readable bytes. Key and output pointers follow
 /// `indra_build_governance_propose`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_redelegate(
     proposal_id: *const u8,
@@ -405,6 +560,40 @@ pub unsafe extern "C" fn indra_build_governance_redelegate(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
+    proposal_id: *const u8,
+    from_validator_id: *const u8,
+    to_validator_id: *const u8,
+    amount_spark: u64,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if proposal_id.is_null() || from_validator_id.is_null() || to_validator_id.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_payload_handle(
+        GovernanceHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |_| {
+            Ok(GovernancePayload::Redelegate {
+                proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+                from_validator: Bytes32::from(read_bytes32(from_validator_id)),
+                to_validator: Bytes32::from(read_bytes32(to_validator_id)),
+                amount_spark,
+            })
+        },
+    )
+}
+
 /// Build and sign a governance Execute operation.
 ///
 /// # Safety
@@ -412,6 +601,7 @@ pub unsafe extern "C" fn indra_build_governance_redelegate(
 /// Pointer arguments must be valid and non-null. `proposal_id` must reference
 /// 32 readable bytes. Key and output pointers follow
 /// `indra_build_governance_propose`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_execute(
     proposal_id: *const u8,
@@ -444,6 +634,34 @@ pub unsafe extern "C" fn indra_build_governance_execute(
     )
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
+    proposal_id: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if proposal_id.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_payload_handle(
+        GovernanceHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |_| {
+            Ok(GovernancePayload::Execute {
+                proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+            })
+        },
+    )
+}
+
 /// Build and sign a governance Cancel operation.
 ///
 /// # Safety
@@ -451,6 +669,7 @@ pub unsafe extern "C" fn indra_build_governance_execute(
 /// Pointer arguments must be valid and non-null. `proposal_id` must reference
 /// 32 readable bytes. Key and output pointers follow
 /// `indra_build_governance_propose`.
+#[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_cancel(
     proposal_id: *const u8,
@@ -483,7 +702,35 @@ pub unsafe extern "C" fn indra_build_governance_cancel(
     )
 }
 
-#[cfg(test)]
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
+    proposal_id: *const u8,
+    handle: IndraKeyHandle,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if proposal_id.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_payload_handle(
+        GovernanceHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |_| {
+            Ok(GovernancePayload::Cancel {
+                proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+            })
+        },
+    )
+}
+
+#[cfg(all(test, feature = "legacy_raw_keys"))]
 mod tests {
     use super::*;
     use crate::{indra_keygen, IndraKeyPair, INDRA_OP_HEX_MAX_BYTES};
