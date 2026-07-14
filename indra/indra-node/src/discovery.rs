@@ -2,7 +2,9 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::{SocketAddr, ToSocketAddrs},
     str::FromStr,
 };
@@ -175,6 +177,64 @@ where
     resolved
 }
 
+async fn resolve_dns_seed_hosts_with_status_async<F, Fut>(
+    hosts: &[String],
+    port: u16,
+    mode: DnsSeedValidationMode,
+    mut resolver: F,
+) -> Vec<SocketAddr>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = io::Result<DnsSeedLookup>>,
+{
+    let mut addrs = HashSet::new();
+    for host in hosts {
+        let addr_str = format!("{host}:{port}");
+        match resolver(addr_str).await {
+            Ok(lookup) => {
+                let status = lookup.status;
+                if status != DnsSeedValidationStatus::Secure && mode == DnsSeedValidationMode::Warn
+                {
+                    eprintln!(
+                        "[discovery] DNS seed {} returned {} DNSSEC status in warn mode — using addresses for now; enable zone signing before switching network.dns_seed_validation=require",
+                        host,
+                        dnssec_status_label(status)
+                    );
+                }
+                if status != DnsSeedValidationStatus::Secure
+                    && mode == DnsSeedValidationMode::Require
+                {
+                    eprintln!(
+                        "[discovery] DNS seed {} rejected: DNSSEC status {} is not secure",
+                        host,
+                        dnssec_status_label(status)
+                    );
+                    continue;
+                }
+                if !lookup.addrs.is_empty() {
+                    eprintln!(
+                        "[discovery] DNS seed {} resolved to {} addresses (dnssec={})",
+                        host,
+                        lookup.addrs.len(),
+                        dnssec_status_label(status)
+                    );
+                }
+                addrs.extend(lookup.addrs);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[discovery] DNS seed {} resolution failed: {} — using bootstrap peers only",
+                    host, e
+                );
+            }
+        }
+    }
+
+    let mut resolved: Vec<SocketAddr> = addrs.into_iter().collect();
+    resolved.sort();
+    resolved
+}
+
 fn dnssec_status_label(status: DnsSeedValidationStatus) -> &'static str {
     match status {
         DnsSeedValidationStatus::Unchecked => "unchecked",
@@ -196,12 +256,12 @@ fn dnssec_status_label(status: DnsSeedValidationStatus) -> &'static str {
 /// DNSSEC validation is controlled by `network.dns_seed_validation`. A poisoned
 /// unchecked DNS response can cause dial churn, but cannot eclipse consensus
 /// because the validator transport rejects unknown validator identities.
-pub fn resolve_dns_seeds(hosts: &str, port: u16) -> Vec<SocketAddr> {
-    resolve_dns_seeds_with_validation(hosts, port, DnsSeedValidationMode::DEFAULT)
+pub async fn resolve_dns_seeds(hosts: &str, port: u16) -> Vec<SocketAddr> {
+    resolve_dns_seeds_with_validation(hosts, port, DnsSeedValidationMode::DEFAULT).await
 }
 
 /// Resolve DNS seed hostnames with the configured DNSSEC validation mode.
-pub fn resolve_dns_seeds_with_validation(
+pub async fn resolve_dns_seeds_with_validation(
     hosts: &str,
     port: u16,
     mode: DnsSeedValidationMode,
@@ -214,24 +274,18 @@ pub fn resolve_dns_seeds_with_validation(
                 .map(|iter| iter.collect::<Vec<SocketAddr>>())
         }),
         DnsSeedValidationMode::Warn | DnsSeedValidationMode::Require => {
-            resolve_dns_seed_hosts_with_status(&hosts, port, mode, resolve_seed_with_hickory_dnssec)
+            resolve_dns_seed_hosts_with_status_async(&hosts, port, mode, |addr_str| async move {
+                let (host, port) = split_host_port(&addr_str)?;
+                resolve_seed_with_hickory_dnssec_async(&host, port).await
+            })
+            .await
         }
     }
 }
 
 /// Resolve the default DNS seed hostnames.
-pub fn resolve_default_dns_seeds(port: u16) -> Vec<SocketAddr> {
-    resolve_dns_seeds(&default_dns_seed_hosts_config(), port)
-}
-
-fn resolve_seed_with_hickory_dnssec(addr_str: &str) -> io::Result<DnsSeedLookup> {
-    let (host, port) = split_host_port(addr_str)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tokio runtime: {e}")))?;
-    runtime.block_on(resolve_seed_with_hickory_dnssec_async(&host, port))
+pub async fn resolve_default_dns_seeds(port: u16) -> Vec<SocketAddr> {
+    resolve_dns_seeds(&default_dns_seed_hosts_config(), port).await
 }
 
 async fn resolve_seed_with_hickory_dnssec_async(
@@ -577,6 +631,33 @@ mod tests {
             );
             assert!(resolved.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn dnssec_seed_resolution_is_safe_inside_existing_tokio_runtime() {
+        let resolved =
+            resolve_dns_seeds_with_validation("127.0.0.1", 30303, DnsSeedValidationMode::Warn)
+                .await;
+
+        assert_eq!(resolved, vec!["127.0.0.1:30303".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn async_dnssec_policy_gate_rejects_unsigned_in_require_mode() {
+        let resolved = resolve_dns_seed_hosts_with_status_async(
+            &["seed.example".to_string()],
+            30303,
+            DnsSeedValidationMode::Require,
+            |_| async {
+                Ok(DnsSeedLookup {
+                    addrs: vec!["203.0.113.10:30303".parse().unwrap()],
+                    status: DnsSeedValidationStatus::Unsigned,
+                })
+            },
+        )
+        .await;
+
+        assert!(resolved.is_empty());
     }
 
     #[test]

@@ -994,7 +994,8 @@ fn start_network_runtime(
                             &dns_seed_host,
                             p2p_port,
                             dns_seed_validation,
-                        );
+                        )
+                        .await;
                         {
                             let mut dp = discovered_peers.lock().unwrap();
                             let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
