@@ -332,6 +332,75 @@ fn get_proposal_votes_reports_committed_and_revealed_flags() {
 }
 
 #[test]
+fn rpc_governance_queries_reflect_retained_state_after_pruning() {
+    let mut e = engine("rpc_proposal_pruned");
+    let retained_id = Bytes32::from([0xE2; 32]);
+    let pruned_id = Bytes32::from([0xE3; 32]);
+    for proposal_id in [retained_id, pruned_id] {
+        e.governance.proposals.insert(
+            proposal_id,
+            ProposalRecord {
+                proposal_id,
+                proposer_id: Bytes32::from([0xA2; 32]),
+                proposer_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from([0xB3; 32]),
+                    pq_pk: VariableBytes::from_slice(&[0xB4; 32]).unwrap(),
+                },
+                tier: ProposalTier::Standard,
+                action: GovernableAction::SetMinDelegationSpark { value: 1 },
+                title: "retained-state".to_string(),
+                description: "ordinary RPC exposes active plus retained recent proposals"
+                    .to_string(),
+                deposit_spark: 0,
+                deposit_burned: false,
+                proposed_epoch: 0,
+                commit_start_epoch: 1,
+                reveal_start_epoch: 2,
+                tally_epoch: 3,
+                exec_delay_epochs: 0,
+                executable_after_epoch: 0,
+                phase: ProposalPhase::Failed,
+                snapshot1: None,
+                commits: BTreeMap::new(),
+                reveals: BTreeMap::new(),
+                redelegations: Vec::new(),
+                redelegated_delegators: BTreeMap::new(),
+                snapshot2: None,
+                yes_stake: 0,
+                no_stake: 0,
+                abstain_stake: 0,
+                passed: Some(false),
+            },
+        );
+    }
+    e.governance.proposals.remove(&pruned_id);
+
+    let retained = call_rpc(
+        "indra_getProposal",
+        &[format!(r#""{}""#, hex::encode(retained_id.0))],
+        &e,
+    );
+    assert!(retained.contains("\"proposal_id\""));
+    assert!(retained.contains(&hex::encode(retained_id.0)));
+
+    let pruned = call_rpc(
+        "indra_getProposal",
+        &[format!(r#""{}""#, hex::encode(pruned_id.0))],
+        &e,
+    );
+    assert!(pruned.contains("\"error\""));
+    assert!(pruned.contains("proposal not found"));
+
+    let pruned_votes = call_rpc(
+        "indra_getProposalVotes",
+        &[format!(r#""{}""#, hex::encode(pruned_id.0))],
+        &e,
+    );
+    assert!(pruned_votes.contains("\"error\""));
+    assert!(pruned_votes.contains("proposal not found"));
+}
+
+#[test]
 fn test_get_delegator_positions_unknown_returns_empty() {
     let e = engine("rpc_positions_unknown");
     let delegator = "33".repeat(32);

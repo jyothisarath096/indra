@@ -824,11 +824,15 @@ Epoch history
 
 Governance
   indra_getGovernanceParams  Current governable parameters
-  indra_getProposals         All active and recent proposals
-  indra_getProposal          Full proposal detail
-  indra_getProposalVotes     Per-validator vote breakdown
+  indra_getProposals         Active and consensus-retained recent proposals
+  indra_getProposal          Full detail for a retained proposal
+  indra_getProposalVotes     Per-validator vote breakdown for a retained proposal
   indra_getGovernanceNonce   Governance replay-protection nonce
   indra_submitGovernanceOp   Submit a governance operation
+
+Completed governance proposals older than the consensus retention window may
+be pruned from ordinary node state; deep historical governance lookup is an
+archive-node or indexer responsibility, matching block-pruning behavior.
 
 Schema
   indra_getSchemaInfo        Schema version and migration history

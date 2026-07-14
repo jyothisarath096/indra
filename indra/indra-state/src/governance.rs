@@ -27,6 +27,12 @@ pub const GOVERNANCE_PROPOSAL_COOLDOWN_EPOCHS: u64 = 10;
 /// already bounded by validator count. This matches the existing governance
 /// vector/u64-map decode cap style.
 pub const MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE: usize = 10_000;
+/// Maximum terminal governance proposal records retained in consensus state
+/// after `GOVERNANCE_PROPOSAL_PRUNING_HEIGHT`.
+///
+/// Active proposals are always retained. Deep historical governance history is
+/// an archive-node/indexer responsibility, matching block-pruning precedent.
+pub const MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS: usize = 1_024;
 /// Deliberation duration.
 pub const GOVERNANCE_DELIBERATION_EPOCHS: u64 = 30;
 /// Standard proposal commit duration.
@@ -735,6 +741,50 @@ impl GovernanceState {
             is_active_phase(proposal.phase) && std::mem::discriminant(&proposal.action) == target
         })
     }
+
+    /// Prune old terminal proposals while preserving all consensus-active
+    /// proposal state.
+    ///
+    /// This is a consensus-state pruning rule, not local archival. It must only
+    /// be called at/after the scheduled pruning activation height. Terminal
+    /// proposals are ordered deterministically by `(proposed_epoch,
+    /// proposal_id)`, and only the newest `retain_terminal` are kept. Any
+    /// proposal referenced by an unexecuted queued execution is retained even if
+    /// its phase is terminal, because that queued execution remains
+    /// consensus-active.
+    pub fn prune_terminal_proposals(&mut self, retain_terminal: usize) -> Vec<Bytes32> {
+        let unexecuted_queued: BTreeMap<Bytes32, ()> = self
+            .queued_executions
+            .iter()
+            .filter(|exec| !exec.executed)
+            .map(|exec| (exec.proposal_id, ()))
+            .collect();
+        let mut terminal: Vec<(u64, Bytes32)> = self
+            .proposals
+            .values()
+            .filter(|proposal| {
+                !is_active_phase(proposal.phase)
+                    && !unexecuted_queued.contains_key(&proposal.proposal_id)
+            })
+            .map(|proposal| (proposal.proposed_epoch, proposal.proposal_id))
+            .collect();
+        if terminal.len() <= retain_terminal {
+            return Vec::new();
+        }
+        terminal.sort_by_key(|(proposed_epoch, proposal_id)| (*proposed_epoch, proposal_id.0));
+        let prune_count = terminal.len().saturating_sub(retain_terminal);
+        let pruned: Vec<Bytes32> = terminal
+            .into_iter()
+            .take(prune_count)
+            .map(|(_, proposal_id)| proposal_id)
+            .collect();
+        for proposal_id in &pruned {
+            self.proposals.remove(proposal_id);
+        }
+        self.queued_executions
+            .retain(|exec| !pruned.contains(&exec.proposal_id) || !exec.executed);
+        pruned
+    }
 }
 
 impl Default for GovernanceState {
@@ -1033,7 +1083,7 @@ mod tests {
     use super::*;
     use crate::epoch::block_reward_at_height;
     use indra_core::types::primitives::{
-        BLOCKS_PER_YEAR, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+        VariableBytes, BLOCKS_PER_YEAR, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
         ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
         ERA_4_BLOCK_REWARD_SPARK, ERA_5_BLOCK_REWARD_SPARK, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
         VALIDATOR_REWARDS_POOL_SPARK,
@@ -1109,6 +1159,58 @@ mod tests {
             GovernableAction::SetGovernanceQuorumBps { value: 6_000 },
             GovernableAction::SetGovernanceCriticalQuorumBps { value: 7_500 },
         ]
+    }
+
+    fn test_proposal_id(index: u64) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        Bytes32::from(bytes)
+    }
+
+    fn test_pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+        }
+    }
+
+    fn test_proposal(index: u64, phase: ProposalPhase, proposed_epoch: u64) -> ProposalRecord {
+        let proposal_id = test_proposal_id(index);
+        ProposalRecord {
+            proposal_id,
+            proposer_id: Bytes32::from([0xA0; 32]),
+            proposer_pubkey: test_pubkey(0xA1),
+            tier: ProposalTier::Standard,
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            title: format!("proposal-{index}"),
+            description: "test proposal".to_string(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch,
+            commit_start_epoch: proposed_epoch.saturating_add(30),
+            reveal_start_epoch: proposed_epoch.saturating_add(50),
+            tally_epoch: proposed_epoch.saturating_add(60),
+            exec_delay_epochs: 0,
+            executable_after_epoch: proposed_epoch.saturating_add(60),
+            phase,
+            snapshot1: None,
+            commits: BTreeMap::new(),
+            reveals: BTreeMap::new(),
+            redelegations: Vec::new(),
+            redelegated_delegators: BTreeMap::new(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: match phase {
+                ProposalPhase::Failed => Some(false),
+                ProposalPhase::Executed => Some(true),
+                ProposalPhase::Cancelled => None,
+                _ => None,
+            },
+        }
     }
 
     fn is_constitutional_monetary_policy_action(action: &GovernableAction) -> bool {
@@ -1331,5 +1433,116 @@ mod tests {
             },
         );
         assert_eq!(state.active_proposal_count(), 1);
+    }
+
+    #[test]
+    fn terminal_proposal_pruning_keeps_all_active_proposals() {
+        let mut state = GovernanceState::new();
+        let active_id = test_proposal_id(10_000);
+        state.proposals.insert(
+            active_id,
+            test_proposal(10_000, ProposalPhase::Deliberation, 0),
+        );
+        for index in 0..5 {
+            let proposal = test_proposal(index, ProposalPhase::Failed, index);
+            state.proposals.insert(proposal.proposal_id, proposal);
+        }
+
+        let pruned = state.prune_terminal_proposals(1);
+
+        assert!(state.proposals.contains_key(&active_id));
+        assert_eq!(state.active_proposal_count(), 1);
+        assert_eq!(pruned.len(), 4);
+        let terminal_count = state
+            .proposals
+            .values()
+            .filter(|proposal| !is_active_phase(proposal.phase))
+            .count();
+        assert_eq!(terminal_count, 1);
+    }
+
+    #[test]
+    fn terminal_proposal_pruning_retains_exactly_newest_1024() {
+        let mut state = GovernanceState::new();
+        let total = MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS + 6;
+        for index in 0..total {
+            let proposal = test_proposal(index as u64, ProposalPhase::Failed, index as u64);
+            state.proposals.insert(proposal.proposal_id, proposal);
+        }
+
+        let pruned = state.prune_terminal_proposals(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS);
+
+        assert_eq!(pruned.len(), 6);
+        assert_eq!(
+            state.proposals.len(),
+            MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS
+        );
+        for index in 0..6 {
+            assert!(!state.proposals.contains_key(&test_proposal_id(index)));
+        }
+        for index in 6..total {
+            assert!(state
+                .proposals
+                .contains_key(&test_proposal_id(index as u64)));
+        }
+    }
+
+    #[test]
+    fn terminal_proposal_pruning_order_is_deterministic_by_epoch_then_id() {
+        let mut state = GovernanceState::new();
+        for index in 0..5 {
+            let proposal = test_proposal(index, ProposalPhase::Executed, 7);
+            state.proposals.insert(proposal.proposal_id, proposal);
+        }
+
+        let pruned = state.prune_terminal_proposals(4);
+
+        assert_eq!(pruned, vec![test_proposal_id(0)]);
+        for index in 1..5 {
+            assert!(state.proposals.contains_key(&test_proposal_id(index)));
+        }
+    }
+
+    #[test]
+    fn terminal_proposal_pruning_removes_matching_executed_queued_executions() {
+        let mut state = GovernanceState::new();
+        let proposal = test_proposal(1, ProposalPhase::Executed, 0);
+        let proposal_id = proposal.proposal_id;
+        let action = proposal.action.clone();
+        state.proposals.insert(proposal_id, proposal);
+        state.queued_executions.push(QueuedExecution {
+            proposal_id,
+            action,
+            executable_epoch: 0,
+            executed: true,
+        });
+
+        let pruned = state.prune_terminal_proposals(0);
+
+        assert_eq!(pruned, vec![proposal_id]);
+        assert!(!state.proposals.contains_key(&proposal_id));
+        assert!(state.queued_executions.is_empty());
+    }
+
+    #[test]
+    fn terminal_proposal_pruning_never_removes_unexecuted_queued_executions() {
+        let mut state = GovernanceState::new();
+        let proposal = test_proposal(1, ProposalPhase::Executed, 0);
+        let proposal_id = proposal.proposal_id;
+        let action = proposal.action.clone();
+        state.proposals.insert(proposal_id, proposal);
+        state.queued_executions.push(QueuedExecution {
+            proposal_id,
+            action,
+            executable_epoch: 0,
+            executed: false,
+        });
+
+        let pruned = state.prune_terminal_proposals(0);
+
+        assert!(pruned.is_empty());
+        assert!(state.proposals.contains_key(&proposal_id));
+        assert_eq!(state.queued_executions.len(), 1);
+        assert!(!state.queued_executions[0].executed);
     }
 }

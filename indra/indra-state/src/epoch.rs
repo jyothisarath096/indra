@@ -20,11 +20,11 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, muldiv, overflow_fix_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
-            EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-            ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-            HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN,
-            STAKING_TX_IDX,
+            bps_of, governance_proposal_pruning_active, muldiv, overflow_fix_active, Bytes32,
+            VariableBytes, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
+            ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
+            ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS,
+            SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -36,7 +36,7 @@ use crate::{
     error::StateResult,
     governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
-        GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS,
+        GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS, MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS,
     },
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
     validator::ValidatorStatus,
@@ -84,6 +84,7 @@ pub fn apply_epoch_transition_at_height(
         state.fee_reward_pool,
     );
     apply_governance_phase_transitions(state, current_epoch, height)?;
+    prune_governance_history_if_active(state, height);
     let active_before: HashSet<Bytes32> = state
         .validators
         .active_validators()
@@ -301,6 +302,23 @@ pub fn apply_governance_phase_transitions(
         }
     }
     Ok(())
+}
+
+fn prune_governance_history_if_active(state: &mut ChainState, height: u64) {
+    if !governance_proposal_pruning_active(height) {
+        return;
+    }
+    let pruned = state
+        .governance
+        .prune_terminal_proposals(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS);
+    if !pruned.is_empty() {
+        eprintln!(
+            "[governance] pruned {} terminal proposal records at height={} (retaining newest {})",
+            pruned.len(),
+            height,
+            MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS
+        );
+    }
 }
 
 fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> StateResult<()> {
@@ -940,7 +958,7 @@ mod tests {
     use super::*;
     use crate::{
         compute_state_root,
-        governance::{GovernanceRedelegation, VoteCommit, VoteReveal},
+        governance::{GovernanceRedelegation, ProposalRecord, VoteCommit, VoteReveal},
         validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
     };
     use indra_core::{
@@ -948,10 +966,11 @@ mod tests {
             crypto::HybridPubKey,
             governance::GovernableAction,
             primitives::{
-                Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
-                DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-                ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-                SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
+                hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT, Bytes32, VariableBytes,
+                COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+                ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
+                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, SLASH_LIVENESS_BPS,
+                SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
         },
@@ -1004,6 +1023,57 @@ mod tests {
         }
     }
 
+    fn governance_pruning_test_id(index: u64) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        Bytes32::from(bytes)
+    }
+
+    fn governance_pruning_test_proposal(
+        index: u64,
+        phase: ProposalPhase,
+        proposed_epoch: u64,
+    ) -> ProposalRecord {
+        let proposal_id = governance_pruning_test_id(index);
+        ProposalRecord {
+            proposal_id,
+            proposer_id: Bytes32::from([0x71; 32]),
+            proposer_pubkey: governance_test_pubkey(0x72),
+            tier: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            }
+            .tier(),
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            title: format!("proposal-{index}"),
+            description: "terminal proposal pruning test".to_string(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch,
+            commit_start_epoch: proposed_epoch.saturating_add(30),
+            reveal_start_epoch: proposed_epoch.saturating_add(50),
+            tally_epoch: proposed_epoch.saturating_add(60),
+            exec_delay_epochs: 0,
+            executable_after_epoch: proposed_epoch.saturating_add(60),
+            phase,
+            snapshot1: None,
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: Vec::new(),
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: match phase {
+                ProposalPhase::Failed => Some(false),
+                ProposalPhase::Executed => Some(true),
+                _ => None,
+            },
+        }
+    }
+
     #[test]
     fn epoch_boundary_detection() {
         assert!(!is_epoch_boundary(0));
@@ -1020,6 +1090,93 @@ mod tests {
         assert_eq!(epoch_for_height(299), 0);
         assert_eq!(epoch_for_height(300), 1);
         assert_eq!(epoch_for_height(600), 2);
+    }
+
+    #[test]
+    fn governance_pruning_pre_activation_state_root_unchanged() {
+        let mut state = ChainState::new_genesis();
+        state.height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT.saturating_sub(1);
+        for index in 0..5 {
+            let proposal = governance_pruning_test_proposal(index, ProposalPhase::Failed, index);
+            state
+                .governance
+                .proposals
+                .insert(proposal.proposal_id, proposal);
+        }
+        let before = compute_state_root(&state);
+        let height = state.height;
+
+        prune_governance_history_if_active(&mut state, height);
+
+        assert_eq!(state.governance.proposals.len(), 5);
+        assert_eq!(compute_state_root(&state), before);
+    }
+
+    #[test]
+    fn governance_pruning_changes_state_root_at_activation_when_records_removed() {
+        let mut state = ChainState::new_genesis();
+        state.height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT;
+        for index in 0..(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS + 1) {
+            let proposal =
+                governance_pruning_test_proposal(index as u64, ProposalPhase::Failed, index as u64);
+            state
+                .governance
+                .proposals
+                .insert(proposal.proposal_id, proposal);
+        }
+        let before = compute_state_root(&state);
+        let height = state.height;
+
+        prune_governance_history_if_active(&mut state, height);
+
+        assert_eq!(
+            state.governance.proposals.len(),
+            MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS
+        );
+        assert!(!state
+            .governance
+            .proposals
+            .contains_key(&governance_pruning_test_id(0)));
+        assert_ne!(compute_state_root(&state), before);
+    }
+
+    #[test]
+    fn governance_pruning_replay_across_activation_is_deterministic() {
+        let mut continuous = ChainState::new_genesis();
+        continuous.height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT;
+        for index in 0..(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS + 3) {
+            let proposal =
+                governance_pruning_test_proposal(index as u64, ProposalPhase::Failed, index as u64);
+            continuous
+                .governance
+                .proposals
+                .insert(proposal.proposal_id, proposal);
+        }
+        let mut replayed = continuous.clone();
+
+        apply_epoch_transition_at_height(
+            &mut continuous,
+            epoch_for_height(GOVERNANCE_PROPOSAL_PRUNING_HEIGHT),
+            111,
+            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT,
+        )
+        .unwrap();
+        apply_epoch_transition_at_height(
+            &mut replayed,
+            epoch_for_height(GOVERNANCE_PROPOSAL_PRUNING_HEIGHT),
+            999,
+            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            continuous.governance.proposals.keys().collect::<Vec<_>>(),
+            replayed.governance.proposals.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            compute_state_root(&continuous),
+            compute_state_root(&replayed)
+        );
     }
 
     #[test]

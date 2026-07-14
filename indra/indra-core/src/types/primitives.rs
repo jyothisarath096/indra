@@ -427,6 +427,16 @@ pub mod hard_forks {
     /// total-stake registration may synchronously evict the lowest total-stake
     /// registered validator to preserve the hard cap without first-come bias.
     pub const REGISTERED_VALIDATOR_CAP_HEIGHT: u64 = u64::MAX;
+
+    /// Governance terminal-proposal pruning.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
+    /// coordinated deployment, comfortably ahead of the live chain tip at that
+    /// time. At/after this height, consensus state retains all active
+    /// governance proposals and only the most recent terminal proposal records.
+    /// Deep historical governance transparency is delegated to archive
+    /// nodes/indexers, matching block-pruning precedent.
+    pub const GOVERNANCE_PROPOSAL_PRUNING_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -483,6 +493,12 @@ pub fn validator_network_address_active(height: u64) -> bool {
 #[inline]
 pub fn registered_validator_cap_active(height: u64) -> bool {
     height >= hard_forks::REGISTERED_VALIDATOR_CAP_HEIGHT
+}
+
+/// Whether terminal governance proposal pruning is active.
+#[inline]
+pub fn governance_proposal_pruning_active(height: u64) -> bool {
+    height >= hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -980,5 +996,17 @@ mod tests {
         assert!(overflow_fix_active(1));
         assert!(overflow_fix_active(25_932));
         assert!(overflow_fix_active(u64::MAX));
+    }
+
+    #[test]
+    fn governance_proposal_pruning_activates_only_at_configured_height() {
+        use hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT;
+
+        assert!(!governance_proposal_pruning_active(
+            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT.saturating_sub(1)
+        ));
+        assert!(governance_proposal_pruning_active(
+            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
+        ));
     }
 }

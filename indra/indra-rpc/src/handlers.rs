@@ -1623,6 +1623,10 @@ fn get_governance_params(state: &NodeState<'_>) -> RpcResult<String> {
 }
 
 fn get_proposals(_params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    // Returns active proposals plus the consensus-retained recent terminal
+    // history. Older terminal proposals may be pruned from ChainState after
+    // `GOVERNANCE_PROPOSAL_PRUNING_HEIGHT`; deep history is an archive
+    // node/indexer concern, matching block-pruning precedent.
     let mut proposals: Vec<_> = state.chain.governance.proposals.values().collect();
     proposals.sort_by_key(|proposal| proposal.proposed_epoch);
     let summaries = proposals
@@ -1640,6 +1644,10 @@ fn get_proposals(_params: &[String], state: &NodeState<'_>) -> RpcResult<String>
 
 fn get_proposal(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let proposal_id = parse_hex32_value(&first_param(params, "proposal_id")?, "proposal_id")?;
+    // A missing proposal may either never have existed or may be an old
+    // terminal proposal pruned by the consensus retention rule. Current RPC
+    // intentionally exposes the retained state view only; archive/indexer
+    // tooling is responsible for deep historical lookup.
     let proposal = state
         .chain
         .governance
@@ -1651,6 +1659,8 @@ fn get_proposal(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 
 fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let proposal_id = parse_hex32_value(&first_param(params, "proposal_id")?, "proposal_id")?;
+    // Same retained-state semantics as `indra_getProposal`: votes for pruned
+    // historical proposals are no longer available from ordinary node state.
     let proposal = state
         .chain
         .governance
