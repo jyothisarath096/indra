@@ -51,14 +51,38 @@ pub const RPC_RATE_LIMIT_PER_SEC: u64 = 20;
 /// Maximum burst of RPC requests accepted from one IP address.
 pub const RPC_RATE_BURST: u64 = 40;
 
+/// Public read-only RPC requests per second accepted from one IP address.
+pub const RPC_PUBLIC_RATE_LIMIT_PER_SEC: u64 = 5;
+
+/// Public read-only RPC burst accepted from one IP address.
+pub const RPC_PUBLIC_RATE_BURST: u64 = 20;
+
+/// Public read-only RPC listener-wide requests per second.
+pub const RPC_PUBLIC_GLOBAL_RATE_LIMIT_PER_SEC: u64 = 100;
+
+/// Public read-only RPC listener-wide burst.
+pub const RPC_PUBLIC_GLOBAL_RATE_BURST: u64 = 200;
+
 /// Maximum RPC request body size.
 pub const MAX_RPC_BODY_BYTES: usize = 1_048_576;
+
+/// Maximum public read-only RPC request body size.
+pub const RPC_PUBLIC_MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// Per-request timeout for blocking stdlib RPC handlers.
 pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-request timeout for public read-only RPC handlers.
+pub const RPC_PUBLIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum public UTXO/balance scans per minute from one IP.
 pub const UTXO_SCAN_RATE_PER_MIN: u64 = 10;
+
+/// Maximum expensive public read-only calls per minute from one IP.
+pub const RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN: u64 = 30;
+
+/// Maximum expensive public read-only calls per minute across a listener.
+pub const RPC_PUBLIC_EXPENSIVE_GLOBAL_RATE_PER_MIN: u64 = 300;
 
 /// Shared per-IP fixed-window limiter for expensive UTXO scan endpoints.
 #[derive(Debug, Default)]
@@ -81,6 +105,43 @@ impl RpcWindowRateLimiter {
             Err(_) => return false,
         };
         let entry = windows.entry(ip).or_insert((Instant::now(), 0));
+        if entry.0.elapsed() >= Duration::from_secs(60) {
+            *entry = (Instant::now(), 0);
+        }
+        if entry.1 >= limit_per_min {
+            return false;
+        }
+        entry.1 = entry.1.saturating_add(1);
+        true
+    }
+}
+
+/// Shared fixed-window limiter across the whole listener.
+#[derive(Debug)]
+pub struct RpcGlobalWindowRateLimiter {
+    window: Mutex<(Instant, u64)>,
+}
+
+impl Default for RpcGlobalWindowRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RpcGlobalWindowRateLimiter {
+    /// Create an empty global fixed-window limiter.
+    pub fn new() -> Self {
+        Self {
+            window: Mutex::new((Instant::now(), 0)),
+        }
+    }
+
+    /// Return true if the listener is still within the per-minute budget.
+    pub fn allow(&self, limit_per_min: u64) -> bool {
+        let mut entry = match self.window.lock() {
+            Ok(entry) => entry,
+            Err(_) => return false,
+        };
         if entry.0.elapsed() >= Duration::from_secs(60) {
             *entry = (Instant::now(), 0);
         }
@@ -149,14 +210,42 @@ impl RpcRateLimiter {
 
     /// Return true if a request from `ip` is within the rate limit.
     pub fn allow(&self, ip: IpAddr) -> bool {
+        self.allow_with_limits(ip, RPC_RATE_LIMIT_PER_SEC, RPC_RATE_BURST)
+    }
+
+    /// Return true if a request from `ip` is within the supplied rate limit.
+    pub fn allow_with_limits(&self, ip: IpAddr, refill_per_sec: u64, burst: u64) -> bool {
         let mut buckets = match self.buckets.lock() {
             Ok(buckets) => buckets,
             Err(_) => return false,
         };
         buckets
             .entry(ip)
-            .or_insert_with(|| RpcTokenBucket::new(RPC_RATE_LIMIT_PER_SEC, RPC_RATE_BURST))
+            .or_insert_with(|| RpcTokenBucket::new(refill_per_sec, burst))
             .allow()
+    }
+}
+
+/// Shared listener-wide token bucket for aggregate public RPC admission.
+#[derive(Debug)]
+pub struct RpcGlobalRateLimiter {
+    bucket: Mutex<RpcTokenBucket>,
+}
+
+impl RpcGlobalRateLimiter {
+    /// Create a global limiter with the supplied refill rate and burst.
+    pub fn new(refill_per_sec: u64, burst: u64) -> Self {
+        Self {
+            bucket: Mutex::new(RpcTokenBucket::new(refill_per_sec, burst)),
+        }
+    }
+
+    /// Return true if the listener-wide request budget has capacity.
+    pub fn allow(&self) -> bool {
+        match self.bucket.lock() {
+            Ok(mut bucket) => bucket.allow(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -176,6 +265,30 @@ pub fn is_utxo_scan_method(method: &str) -> bool {
         method,
         "indra_getLegacyBalanceAuthorized" | "indra_getLegacyUtxosAuthorized"
     )
+}
+
+/// Public read-only method cost class used for pre-dispatch throttling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcMethodCost {
+    /// Cheap metadata or point lookup.
+    Cheap,
+    /// Potentially scans sizeable state or reads historical ranges.
+    Expensive,
+}
+
+/// Classify public read-only methods by expected resource cost.
+pub fn rpc_method_cost(method: &str) -> RpcMethodCost {
+    match method {
+        "indra_getLegacyBalanceAuthorized"
+        | "indra_getLegacyUtxosAuthorized"
+        | "indra_getDelegatorPositions"
+        | "indra_getDelegatorRewards"
+        | "indra_getValidatorDelegators"
+        | "indra_getStakeBonds"
+        | "indra_getEpochHistory"
+        | "indra_getUtxoProof" => RpcMethodCost::Expensive,
+        _ => RpcMethodCost::Cheap,
+    }
 }
 
 /// Return true when the request body is a JSON-RPC batch request.
@@ -660,6 +773,50 @@ mod tests {
         let response = rpc_rate_limited_response();
         assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
         assert!(response.contains("RPC rate limit exceeded"));
+    }
+
+    #[test]
+    fn rpc_public_global_rate_limit_catches_many_ip_aggregate() {
+        let per_ip = RpcRateLimiter::new();
+        let global = RpcGlobalRateLimiter::new(1, 3);
+
+        for idx in 1..=3u8 {
+            let ip = IpAddr::from([203, 0, 113, idx]);
+            assert!(per_ip.allow_with_limits(
+                ip,
+                RPC_PUBLIC_RATE_LIMIT_PER_SEC,
+                RPC_PUBLIC_RATE_BURST
+            ));
+            assert!(global.allow());
+        }
+
+        let fourth_ip = IpAddr::from([203, 0, 113, 99]);
+        assert!(per_ip.allow_with_limits(
+            fourth_ip,
+            RPC_PUBLIC_RATE_LIMIT_PER_SEC,
+            RPC_PUBLIC_RATE_BURST
+        ));
+        assert!(
+            !global.allow(),
+            "listener-wide public limit must reject distributed traffic even when each IP is below its own bucket"
+        );
+    }
+
+    #[test]
+    fn rpc_public_expensive_method_classification_is_explicit() {
+        assert_eq!(
+            rpc_method_cost("indra_getDelegatorPositions"),
+            RpcMethodCost::Expensive
+        );
+        assert_eq!(
+            rpc_method_cost("indra_getLegacyUtxosAuthorized"),
+            RpcMethodCost::Expensive
+        );
+        assert_eq!(
+            rpc_method_cost("indra_getEpochHistory"),
+            RpcMethodCost::Expensive
+        );
+        assert_eq!(rpc_method_cost("indra_getHeight"), RpcMethodCost::Cheap);
     }
 
     #[test]

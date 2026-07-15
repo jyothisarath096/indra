@@ -322,7 +322,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
     ("indra_getEpochHistory", RpcMethodAccess::ReadOnly),
     ("indra_getLatestEpoch", RpcMethodAccess::ReadOnly),
-    ("indra_getSchemaInfo", RpcMethodAccess::ReadOnly),
+    ("indra_getSchemaInfo", RpcMethodAccess::Admin),
     ("indra_getProposals", RpcMethodAccess::ReadOnly),
     ("indra_getProposal", RpcMethodAccess::ReadOnly),
     ("indra_getProposalVotes", RpcMethodAccess::ReadOnly),

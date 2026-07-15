@@ -802,9 +802,29 @@ fn full_listener_write_methods_are_not_read_only_blocked() {
 #[test]
 fn test_get_schema_info_has_required_fields() {
     let e = engine("rpc_schema_info");
-    let resp = call_rpc("indra_getSchemaInfo", &[], &e);
-    assert!(resp.contains("\"schema_version\":4"));
-    assert!(resp.contains("\"schema_version_genesis\":1"));
-    assert!(resp.contains("\"node_version\""));
-    assert!(resp.contains("\"migration_history\""));
+    let state =
+        NodeState::with_network_policy(&e, Vec::new(), Vec::new(), 0, 0, 0, RpcMode::Full, true);
+    match dispatch_with_admin(
+        "indra_getSchemaInfo",
+        &[],
+        &state,
+        RpcMode::Full,
+        true,
+        true,
+    ) {
+        DispatchResult::Ready(Ok(resp)) => {
+            assert!(resp.contains("\"schema_version\":4"));
+            assert!(resp.contains("\"schema_version_genesis\":1"));
+            assert!(resp.contains("\"node_version\""));
+            assert!(resp.contains("\"migration_history\""));
+        }
+        _ => panic!("schema info should be admin-readable on the full listener"),
+    }
+}
+
+#[test]
+fn schema_info_is_not_public_read_only() {
+    let err = check_rpc_method_allowed("indra_getSchemaInfo", RpcMode::ReadOnly).unwrap_err();
+    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
+    assert!(err.message().contains("admin method") || err.message().contains("read-only listener"));
 }

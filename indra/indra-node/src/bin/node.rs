@@ -63,6 +63,65 @@ const MAX_INBOUND_PER_IP: u8 = 3;
 const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
 const MAX_RPC_CONNECTIONS: u64 = indra_rpc::server::MAX_RPC_CONNECTIONS;
 
+#[derive(Debug, Clone)]
+struct RpcListenerPolicy {
+    per_ip_rate_per_sec: u64,
+    per_ip_burst: u64,
+    global_rate_per_sec: Option<u64>,
+    global_burst: Option<u64>,
+    max_body_bytes: usize,
+    request_timeout: Duration,
+}
+
+impl RpcListenerPolicy {
+    fn full() -> Self {
+        Self {
+            per_ip_rate_per_sec: indra_rpc::server::RPC_RATE_LIMIT_PER_SEC,
+            per_ip_burst: indra_rpc::server::RPC_RATE_BURST,
+            global_rate_per_sec: None,
+            global_burst: None,
+            max_body_bytes: indra_rpc::server::MAX_RPC_BODY_BYTES,
+            request_timeout: indra_rpc::server::RPC_REQUEST_TIMEOUT,
+        }
+    }
+
+    fn public_from_config(cfg: &NodeConfigFile) -> Self {
+        Self {
+            per_ip_rate_per_sec: cfg
+                .rpc_public_per_ip_rate_per_sec
+                .unwrap_or(indra_rpc::server::RPC_PUBLIC_RATE_LIMIT_PER_SEC),
+            per_ip_burst: cfg
+                .rpc_public_per_ip_burst
+                .unwrap_or(indra_rpc::server::RPC_PUBLIC_RATE_BURST),
+            global_rate_per_sec: Some(
+                cfg.rpc_public_global_rate_per_sec
+                    .unwrap_or(indra_rpc::server::RPC_PUBLIC_GLOBAL_RATE_LIMIT_PER_SEC),
+            ),
+            global_burst: Some(
+                cfg.rpc_public_global_burst
+                    .unwrap_or(indra_rpc::server::RPC_PUBLIC_GLOBAL_RATE_BURST),
+            ),
+            max_body_bytes: cfg
+                .rpc_public_max_body_bytes
+                .unwrap_or(indra_rpc::server::RPC_PUBLIC_MAX_BODY_BYTES),
+            request_timeout: Duration::from_millis(
+                cfg.rpc_public_timeout_ms
+                    .unwrap_or(indra_rpc::server::RPC_PUBLIC_REQUEST_TIMEOUT.as_millis() as u64),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RpcRejectionCounters {
+    per_ip_rate_limited: AtomicU64,
+    global_rate_limited: AtomicU64,
+    expensive_method_limited: AtomicU64,
+    auth_failures: AtomicU64,
+    oversized_bodies: AtomicU64,
+    timeouts_or_incomplete_reads: AtomicU64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalMode {
     None,
@@ -2593,6 +2652,7 @@ fn main() {
             "rpc",
             rpc_addr,
             indra_rpc::handlers::RpcMode::Full,
+            RpcListenerPolicy::full(),
             Arc::clone(&driver),
             Arc::clone(&gossip),
             Arc::clone(&discovered_peers),
@@ -2614,13 +2674,14 @@ fn main() {
             .clone()
             .filter(|addr| !addr.trim().is_empty())
             .unwrap_or_else(|| "127.0.0.1:8547".to_string());
-        if let Some(warning) = rpc_non_loopback_warning(&rpc_public_addr) {
+        if let Some(warning) = rpc_public_non_loopback_warning(&rpc_public_addr) {
             eprintln!("[rpc-public] {}", warning);
         }
         spawn_rpc_listener(
             "rpc-public",
             rpc_public_addr,
             indra_rpc::handlers::RpcMode::ReadOnly,
+            RpcListenerPolicy::public_from_config(&cfg_file),
             Arc::clone(&driver),
             Arc::clone(&gossip),
             Arc::clone(&discovered_peers),
@@ -3260,7 +3321,19 @@ fn rpc_non_loopback_warning(addr: &str) -> Option<String> {
         None
     } else {
         Some(format!(
-            "WARNING: RPC server binding to non-loopback address {}. Ensure firewall rules protect this port. Consider binding to 127.0.0.1 for validator nodes.",
+            "WARNING: full RPC listener binding to non-loopback address {}. This listener can accept signed submissions and admin methods; do not expose it directly to the public internet. Bind to 127.0.0.1 or a private interface and protect it with firewall rules.",
+            parsed
+        ))
+    }
+}
+
+fn rpc_public_non_loopback_warning(addr: &str) -> Option<String> {
+    let parsed = addr.parse::<SocketAddr>().ok()?;
+    if parsed.ip().is_loopback() {
+        None
+    } else {
+        Some(format!(
+            "WARNING: rpc_public listener binding to non-loopback address {}. This read-only listener is designed for public consumers only with public-endpoint hardening; mainnet operators should still place it behind a reverse proxy/CDN/WAF with TLS, additional rate limits, logging, and monitoring.",
             parsed
         ))
     }
@@ -3278,6 +3351,7 @@ fn spawn_rpc_listener(
     label: &'static str,
     rpc_addr: String,
     mode: indra_rpc::handlers::RpcMode,
+    policy: RpcListenerPolicy,
     driver: Arc<Mutex<indra_node::driver::ConsensusDriver>>,
     gossip: Arc<NetworkBridge>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
@@ -3288,9 +3362,17 @@ fn spawn_rpc_listener(
 ) {
     let rpc_cors_origins = Arc::new(cors_origins);
     let admin_token = Arc::new(admin_token);
+    let policy = Arc::new(policy);
     let rpc_conn_count = Arc::new(AtomicU64::new(0));
     let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
+    let rpc_global_rate_limiter = policy
+        .global_rate_per_sec
+        .zip(policy.global_burst)
+        .map(|(rate, burst)| Arc::new(indra_rpc::server::RpcGlobalRateLimiter::new(rate, burst)));
     let utxo_scan_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
+    let expensive_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
+    let expensive_global_limiter = Arc::new(indra_rpc::server::RpcGlobalWindowRateLimiter::new());
+    let rejection_counters = Arc::new(RpcRejectionCounters::default());
     eprintln!("[{}] listening on {} ({:?})", label, rpc_addr, mode);
 
     std::thread::spawn(move || {
@@ -3320,9 +3402,14 @@ fn spawn_rpc_listener(
                     let observer_count_rpc = Arc::clone(&observer_count);
                     let rpc_conn_count = Arc::clone(&rpc_conn_count);
                     let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
+                    let rpc_global_rate_limiter = rpc_global_rate_limiter.clone();
                     let utxo_scan_limiter = Arc::clone(&utxo_scan_limiter);
+                    let expensive_limiter = Arc::clone(&expensive_limiter);
+                    let expensive_global_limiter = Arc::clone(&expensive_global_limiter);
+                    let rejection_counters = Arc::clone(&rejection_counters);
                     let rpc_cors_origins = Arc::clone(&rpc_cors_origins);
                     let admin_token = Arc::clone(&admin_token);
+                    let policy = Arc::clone(&policy);
                     std::thread::spawn(move || {
                         handle_rpc(
                             stream,
@@ -3333,9 +3420,14 @@ fn spawn_rpc_listener(
                             &observer_count_rpc,
                             peer_ip,
                             &rpc_rate_limiter,
+                            rpc_global_rate_limiter.as_deref(),
                             &utxo_scan_limiter,
+                            &expensive_limiter,
+                            &expensive_global_limiter,
+                            &rejection_counters,
                             &rpc_cors_origins,
                             mode,
+                            &policy,
                             admin_token.as_ref().as_deref(),
                         );
                         release_rpc_connection(&rpc_conn_count);
@@ -3460,6 +3552,115 @@ fn snapshot_rpc_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_public_light_method(
+    method: &str,
+    driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    connected_validator_peer_count: usize,
+    discovered_count: usize,
+    observer_count_val: usize,
+    rpc_mode: indra_rpc::handlers::RpcMode,
+    admin_token_configured: bool,
+    rejection_counters: &RpcRejectionCounters,
+) -> Option<indra_rpc::RpcResult<String>> {
+    if rpc_mode != indra_rpc::handlers::RpcMode::ReadOnly {
+        return None;
+    }
+    if !public_light_method_avoids_full_snapshot(method) {
+        return None;
+    }
+    match method {
+        "indra_getHeight" => Some(
+            driver
+                .lock()
+                .map_err(|_| indra_rpc::RpcError::Internal("consensus driver lock poisoned".into()))
+                .map(|guard| format!(r#"{{"height":{}}}"#, guard.engine.state.height)),
+        ),
+        "indra_getTip" => Some(
+            driver
+                .lock()
+                .map_err(|_| indra_rpc::RpcError::Internal("consensus driver lock poisoned".into()))
+                .map(|guard| {
+                    format!(
+                        r#"{{"height":{},"tip_hash":"{}"}}"#,
+                        guard.engine.state.height,
+                        hex::encode(guard.engine.state.tip_hash.0)
+                    )
+                }),
+        ),
+        "indra_getMempoolSize" => Some(
+            driver
+                .lock()
+                .map_err(|_| indra_rpc::RpcError::Internal("consensus driver lock poisoned".into()))
+                .map(|guard| format!(r#"{{"size":{}}}"#, guard.engine.mempool.len())),
+        ),
+        "indra_getPeers" => Some(Ok(format!(
+            r#"{{"peer_count":{},"target_peers":{},"discovered_count":{},"observer_peer_count":{}}}"#,
+            connected_validator_peer_count,
+            indra_core::types::primitives::TARGET_OUTBOUND_PEERS,
+            discovered_count,
+            observer_count_val,
+        ))),
+        "indra_getRpcPolicy" => Some(Ok(public_rpc_policy_json(
+            admin_token_configured,
+            rejection_counters,
+        ))),
+        _ => None,
+    }
+}
+
+fn public_rpc_policy_json(
+    admin_token_configured: bool,
+    rejection_counters: &RpcRejectionCounters,
+) -> String {
+    format!(
+        r#"{{"listener_mode":"read_only","admin_token_configured":{},"admin_token_value_exposed":false,"public_rejections":{{"per_ip_rate_limited":{},"global_rate_limited":{},"expensive_method_limited":{},"auth_failures":{},"oversized_bodies":{},"timeouts_or_incomplete_reads":{}}}}}"#,
+        admin_token_configured,
+        rejection_counters
+            .per_ip_rate_limited
+            .load(Ordering::Relaxed),
+        rejection_counters
+            .global_rate_limited
+            .load(Ordering::Relaxed),
+        rejection_counters
+            .expensive_method_limited
+            .load(Ordering::Relaxed),
+        rejection_counters.auth_failures.load(Ordering::Relaxed),
+        rejection_counters.oversized_bodies.load(Ordering::Relaxed),
+        rejection_counters
+            .timeouts_or_incomplete_reads
+            .load(Ordering::Relaxed),
+    )
+}
+
+fn public_light_method_avoids_full_snapshot(method: &str) -> bool {
+    matches!(
+        method,
+        "indra_getHeight"
+            | "indra_getTip"
+            | "indra_getMempoolSize"
+            | "indra_getPeers"
+            | "indra_getRpcPolicy"
+    )
+}
+
+fn public_expensive_method_allowed(
+    method: &str,
+    peer_ip: Option<IpAddr>,
+    expensive_limiter: &indra_rpc::server::RpcWindowRateLimiter,
+    expensive_global_limiter: &indra_rpc::server::RpcGlobalWindowRateLimiter,
+) -> bool {
+    if indra_rpc::server::rpc_method_cost(method) != indra_rpc::server::RpcMethodCost::Expensive {
+        return true;
+    }
+    let per_ip_allowed = peer_ip
+        .map(|ip| expensive_limiter.allow(ip, indra_rpc::server::RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN))
+        .unwrap_or(true);
+    let global_allowed =
+        expensive_global_limiter.allow(indra_rpc::server::RPC_PUBLIC_EXPENSIVE_GLOBAL_RATE_PER_MIN);
+    per_ip_allowed && global_allowed
+}
+
 /// Inline JSON-RPC handler for the node binary.
 ///
 /// Reads one HTTP request, dispatches to the appropriate chain query,
@@ -3474,9 +3675,14 @@ fn handle_rpc(
     observer_count: &Arc<AtomicUsize>,
     peer_ip: Option<IpAddr>,
     rate_limiter: &indra_rpc::server::RpcRateLimiter,
+    global_rate_limiter: Option<&indra_rpc::server::RpcGlobalRateLimiter>,
     utxo_scan_limiter: &indra_rpc::server::RpcWindowRateLimiter,
+    expensive_limiter: &indra_rpc::server::RpcWindowRateLimiter,
+    expensive_global_limiter: &indra_rpc::server::RpcGlobalWindowRateLimiter,
+    rejection_counters: &RpcRejectionCounters,
     cors_origins: &[String],
     rpc_mode: indra_rpc::handlers::RpcMode,
+    policy: &RpcListenerPolicy,
     configured_admin_token: Option<&str>,
 ) {
     use indra_rpc::handlers::{
@@ -3485,11 +3691,28 @@ fn handle_rpc(
     use indra_rpc::types::{parse_request, RpcResponse};
     use std::io::{BufRead, BufReader, Read};
 
-    let _ = stream.set_read_timeout(Some(indra_rpc::server::RPC_REQUEST_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(indra_rpc::server::RPC_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(policy.request_timeout));
+    let _ = stream.set_write_timeout(Some(policy.request_timeout));
 
     if let Some(ip) = peer_ip {
-        if !rate_limiter.allow(ip) {
+        if !rate_limiter.allow_with_limits(ip, policy.per_ip_rate_per_sec, policy.per_ip_burst) {
+            rejection_counters
+                .per_ip_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("[rpc] per-IP rate limit rejected request from {ip}");
+            let response = indra_rpc::server::rpc_rate_limited_response();
+            let _ = stream
+                .try_clone()
+                .map(|mut writer| writer.write_all(response.as_bytes()));
+            return;
+        }
+    }
+    if let Some(global_limiter) = global_rate_limiter {
+        if !global_limiter.allow() {
+            rejection_counters
+                .global_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("[rpc] global rate limit rejected request");
             let response = indra_rpc::server::rpc_rate_limited_response();
             let _ = stream
                 .try_clone()
@@ -3513,6 +3736,10 @@ fn handle_rpc(
     loop {
         line.clear();
         if reader.read_line(&mut line).is_err() {
+            rejection_counters
+                .timeouts_or_incomplete_reads
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("[rpc] incomplete or timed-out header read");
             return;
         }
         let trimmed = line.trim();
@@ -3573,7 +3800,14 @@ fn handle_rpc(
         return;
     }
 
-    if content_length > indra_rpc::server::MAX_RPC_BODY_BYTES {
+    if content_length > policy.max_body_bytes {
+        rejection_counters
+            .oversized_bodies
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[rpc] oversized request body rejected: {} bytes > {} bytes",
+            content_length, policy.max_body_bytes
+        );
         let response = indra_rpc::server::http_json_error(
             "413 Payload Too Large",
             -32600,
@@ -3588,6 +3822,10 @@ fn handle_rpc(
 
     let mut body_bytes = vec![0u8; content_length];
     if reader.read_exact(&mut body_bytes).is_err() {
+        rejection_counters
+            .timeouts_or_incomplete_reads
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!("[rpc] incomplete or timed-out body read");
         return;
     }
     let body_str = String::from_utf8_lossy(&body_bytes);
@@ -3616,10 +3854,41 @@ fn handle_rpc(
         admin_token_configured,
         admin_token_valid,
     ) {
+        if matches!(&error, indra_rpc::RpcError::Forbidden(_)) {
+            rejection_counters
+                .auth_failures
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("[rpc] authorization/policy rejection for {}", req.method);
+        }
         let body =
             RpcResponse::err(req.id.clone(), error.code(), error.message().to_string()).to_json();
         send_http(&stream, &cors, &body);
         return;
+    }
+
+    if rpc_mode == indra_rpc::handlers::RpcMode::ReadOnly
+        && indra_rpc::server::rpc_method_cost(&req.method)
+            == indra_rpc::server::RpcMethodCost::Expensive
+    {
+        if !public_expensive_method_allowed(
+            &req.method,
+            peer_ip,
+            expensive_limiter,
+            expensive_global_limiter,
+        ) {
+            rejection_counters
+                .expensive_method_limited
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[rpc-public] expensive-method rate limit rejected {}",
+                req.method
+            );
+            let response = indra_rpc::server::rpc_rate_limited_response();
+            let _ = stream
+                .try_clone()
+                .map(|mut writer| writer.write_all(response.as_bytes()));
+            return;
+        }
     }
 
     if indra_rpc::server::is_utxo_scan_method(&req.method) {
@@ -3643,6 +3912,31 @@ fn handle_rpc(
     let connected_validator_peer_count = gossip.connection_count();
     let discovered_count = discovered_peers.lock().unwrap().len();
     let observer_count_val = observer_count.load(Ordering::Relaxed);
+
+    if let Some(result) = dispatch_public_light_method(
+        &req.method,
+        driver,
+        connected_validator_peer_count,
+        discovered_count,
+        observer_count_val,
+        rpc_mode,
+        admin_token_configured,
+        rejection_counters,
+    ) {
+        match result {
+            Ok(result) => {
+                let body = RpcResponse::ok(req.id.clone(), result).to_json();
+                send_http(&stream, &cors, &body);
+            }
+            Err(error) => {
+                let body =
+                    RpcResponse::err(req.id.clone(), error.code(), error.message().to_string())
+                        .to_json();
+                send_http(&stream, &cors, &body);
+            }
+        }
+        return;
+    }
 
     let response_body = {
         let snapshot = match snapshot_rpc_state(driver) {
@@ -4405,9 +4699,111 @@ mod tests {
     #[test]
     fn rpc_warns_on_non_loopback_binding() {
         let warning = rpc_non_loopback_warning("0.0.0.0:8545").unwrap();
-        assert!(warning.contains("non-loopback"));
-        assert!(warning.contains("127.0.0.1"));
+        assert!(warning.contains("full RPC listener"));
+        assert!(warning.contains("do not expose"));
         assert!(rpc_non_loopback_warning("127.0.0.1:8545").is_none());
+
+        let public_warning = rpc_public_non_loopback_warning("0.0.0.0:8547").unwrap();
+        assert!(public_warning.contains("rpc_public listener"));
+        assert!(public_warning.contains("reverse proxy"));
+        assert!(public_warning.contains("CDN"));
+        assert!(rpc_public_non_loopback_warning("127.0.0.1:8547").is_none());
+    }
+
+    #[test]
+    fn rpc_public_policy_uses_stricter_limits_than_full_rpc() {
+        let cfg = NodeConfigFile::default();
+        let public = RpcListenerPolicy::public_from_config(&cfg);
+        let full = RpcListenerPolicy::full();
+        assert_eq!(
+            public.per_ip_rate_per_sec,
+            indra_rpc::server::RPC_PUBLIC_RATE_LIMIT_PER_SEC
+        );
+        assert_eq!(
+            public.per_ip_burst,
+            indra_rpc::server::RPC_PUBLIC_RATE_BURST
+        );
+        assert_eq!(
+            public.global_rate_per_sec,
+            Some(indra_rpc::server::RPC_PUBLIC_GLOBAL_RATE_LIMIT_PER_SEC)
+        );
+        assert!(public.max_body_bytes < full.max_body_bytes);
+        assert!(public.request_timeout < full.request_timeout);
+    }
+
+    #[test]
+    fn rpc_public_policy_honors_configured_limits() {
+        let cfg = NodeConfigFile {
+            rpc_public_per_ip_rate_per_sec: Some(7),
+            rpc_public_per_ip_burst: Some(17),
+            rpc_public_global_rate_per_sec: Some(70),
+            rpc_public_global_burst: Some(170),
+            rpc_public_max_body_bytes: Some(8192),
+            rpc_public_timeout_ms: Some(2500),
+            ..NodeConfigFile::default()
+        };
+        let public = RpcListenerPolicy::public_from_config(&cfg);
+        assert_eq!(public.per_ip_rate_per_sec, 7);
+        assert_eq!(public.per_ip_burst, 17);
+        assert_eq!(public.global_rate_per_sec, Some(70));
+        assert_eq!(public.global_burst, Some(170));
+        assert_eq!(public.max_body_bytes, 8192);
+        assert_eq!(public.request_timeout, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn public_light_methods_avoid_full_snapshot_path() {
+        assert!(public_light_method_avoids_full_snapshot("indra_getHeight"));
+        assert!(public_light_method_avoids_full_snapshot("indra_getTip"));
+        assert!(public_light_method_avoids_full_snapshot(
+            "indra_getMempoolSize"
+        ));
+        assert!(!public_light_method_avoids_full_snapshot(
+            "indra_getChainInfo"
+        ));
+        assert!(!public_light_method_avoids_full_snapshot(
+            "indra_getDelegatorPositions"
+        ));
+    }
+
+    #[test]
+    fn public_rpc_policy_exposes_rejection_counters_without_token_values() {
+        let counters = RpcRejectionCounters::default();
+        counters.global_rate_limited.store(7, Ordering::Relaxed);
+        let result = public_rpc_policy_json(false, &counters);
+        assert!(result.contains(r#""listener_mode":"read_only""#));
+        assert!(result.contains(r#""global_rate_limited":7"#));
+        assert!(!result.contains("secret"));
+    }
+
+    #[test]
+    fn expensive_public_method_gate_rejects_before_snapshot_work() {
+        let ip = IpAddr::from([198, 51, 100, 7]);
+        let per_ip = indra_rpc::server::RpcWindowRateLimiter::new();
+        let global = indra_rpc::server::RpcGlobalWindowRateLimiter::new();
+        for _ in 0..indra_rpc::server::RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN {
+            assert!(public_expensive_method_allowed(
+                "indra_getDelegatorPositions",
+                Some(ip),
+                &per_ip,
+                &global
+            ));
+        }
+        assert!(
+            !public_expensive_method_allowed(
+                "indra_getDelegatorPositions",
+                Some(ip),
+                &per_ip,
+                &global
+            ),
+            "the public expensive-method gate should reject before dispatch/snapshot"
+        );
+        assert!(public_expensive_method_allowed(
+            "indra_getHeight",
+            Some(ip),
+            &per_ip,
+            &global
+        ));
     }
 
     #[test]

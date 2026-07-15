@@ -58,5 +58,8 @@ pub use handlers::{
     check_rpc_method_allowed, dispatch, dispatch_with_mode, DispatchResult, NetworkContext,
     NodeState, RpcMethodAccess, RpcMode,
 };
-pub use server::{RpcRateLimiter, RpcServer, MAX_RPC_CONNECTIONS, RPC_REQUEST_TIMEOUT};
+pub use server::{
+    RpcGlobalRateLimiter, RpcGlobalWindowRateLimiter, RpcRateLimiter, RpcServer,
+    MAX_RPC_CONNECTIONS, RPC_PUBLIC_REQUEST_TIMEOUT, RPC_REQUEST_TIMEOUT,
+};
 pub use types::{RpcErrorBody, RpcRequest, RpcResponse};

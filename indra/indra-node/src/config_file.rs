@@ -72,6 +72,18 @@ pub struct NodeConfigFile {
     pub rpc_public_enabled: Option<bool>,
     /// `[rpc_public].cors_origins`.
     pub rpc_public_cors_origins: Vec<String>,
+    /// `[rpc_public].per_ip_rate_per_sec`.
+    pub rpc_public_per_ip_rate_per_sec: Option<u64>,
+    /// `[rpc_public].per_ip_burst`.
+    pub rpc_public_per_ip_burst: Option<u64>,
+    /// `[rpc_public].global_rate_per_sec`.
+    pub rpc_public_global_rate_per_sec: Option<u64>,
+    /// `[rpc_public].global_burst`.
+    pub rpc_public_global_burst: Option<u64>,
+    /// `[rpc_public].max_body_bytes`.
+    pub rpc_public_max_body_bytes: Option<usize>,
+    /// `[rpc_public].timeout_ms`.
+    pub rpc_public_timeout_ms: Option<u64>,
     /// `[metrics].addr`.
     pub metrics_addr: Option<String>,
     /// `[metrics].enabled`.
@@ -115,6 +127,12 @@ impl NodeConfigFile {
             rpc_public_addr: get_str(&table, "rpc_public", "addr"),
             rpc_public_enabled: get_bool(&table, "rpc_public", "enabled"),
             rpc_public_cors_origins: get_str_array(&table, "rpc_public", "cors_origins"),
+            rpc_public_per_ip_rate_per_sec: get_u64(&table, "rpc_public", "per_ip_rate_per_sec"),
+            rpc_public_per_ip_burst: get_u64(&table, "rpc_public", "per_ip_burst"),
+            rpc_public_global_rate_per_sec: get_u64(&table, "rpc_public", "global_rate_per_sec"),
+            rpc_public_global_burst: get_u64(&table, "rpc_public", "global_burst"),
+            rpc_public_max_body_bytes: get_usize(&table, "rpc_public", "max_body_bytes"),
+            rpc_public_timeout_ms: get_u64(&table, "rpc_public", "timeout_ms"),
             metrics_addr: get_str(&table, "metrics", "addr"),
             metrics_enabled: get_bool(&table, "metrics", "enabled"),
             prune_keep_blocks: get_u64(&table, "storage", "prune_keep_blocks"),
@@ -193,6 +211,26 @@ impl NodeConfigFile {
                         .to_string(),
                 );
             }
+        }
+        for (name, value) in [
+            (
+                "rpc_public.per_ip_rate_per_sec",
+                self.rpc_public_per_ip_rate_per_sec,
+            ),
+            ("rpc_public.per_ip_burst", self.rpc_public_per_ip_burst),
+            (
+                "rpc_public.global_rate_per_sec",
+                self.rpc_public_global_rate_per_sec,
+            ),
+            ("rpc_public.global_burst", self.rpc_public_global_burst),
+            ("rpc_public.timeout_ms", self.rpc_public_timeout_ms),
+        ] {
+            if value == Some(0) {
+                errors.push(format!("{name} must be greater than 0"));
+            }
+        }
+        if self.rpc_public_max_body_bytes == Some(0) {
+            errors.push("rpc_public.max_body_bytes must be greater than 0".to_string());
         }
         if let Some(keep) = self.prune_keep_blocks {
             if keep > 0 && keep < MIN_PRUNE_KEEP_BLOCKS {
@@ -465,6 +503,12 @@ cors_origins = ["http://localhost:3000"]
 addr = "127.0.0.1:8547"
 enabled = true
 cors_origins = ["https://explorer.indraprotocol.com"]
+per_ip_rate_per_sec = 5
+per_ip_burst = 20
+global_rate_per_sec = 100
+global_burst = 200
+max_body_bytes = 65536
+timeout_ms = 10000
 
 [metrics]
 addr = "0.0.0.0:9615"
@@ -494,6 +538,12 @@ governance_mempool_capacity = 2400
             cfg.rpc_public_cors_origins,
             vec!["https://explorer.indraprotocol.com".to_string()]
         );
+        assert_eq!(cfg.rpc_public_per_ip_rate_per_sec, Some(5));
+        assert_eq!(cfg.rpc_public_per_ip_burst, Some(20));
+        assert_eq!(cfg.rpc_public_global_rate_per_sec, Some(100));
+        assert_eq!(cfg.rpc_public_global_burst, Some(200));
+        assert_eq!(cfg.rpc_public_max_body_bytes, Some(65536));
+        assert_eq!(cfg.rpc_public_timeout_ms, Some(10000));
         assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9615"));
         assert_eq!(cfg.mempool_capacity, Some(5000));
         assert_eq!(cfg.staking_mempool_capacity, Some(5001));
