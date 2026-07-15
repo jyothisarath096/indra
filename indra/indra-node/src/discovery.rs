@@ -13,6 +13,15 @@ use hickory_resolver::{config::ResolveHosts, proto::rr::RecordType, Resolver};
 use indra_core::types::primitives::{DNS_SEED_HOSTS, MAX_PEER_LIST_SIZE};
 use indra_network::PeerListEntry;
 
+/// DNS seeds currently publish IPv4 validator addresses only.
+///
+/// Querying AAAA unconditionally adds no discovery value for today's network and
+/// can surface resolver/provider-specific DNSSEC negative-response errors for a
+/// record type we do not consume. Add `RecordType::AAAA` here only when seed
+/// records and validator operations explicitly support IPv6 bootstrap
+/// addresses.
+const DNS_SEED_RECORD_TYPES: &[RecordType] = &[RecordType::A];
+
 /// DNSSEC policy for DNS seed hostname resolution.
 ///
 /// DNS seeds are only one discovery layer, so even `Require` rejects only the
@@ -328,7 +337,7 @@ async fn resolve_seed_with_hickory_dnssec_async(
         format!("{host}.")
     };
 
-    for record_type in [RecordType::A, RecordType::AAAA] {
+    for &record_type in DNS_SEED_RECORD_TYPES {
         match resolver.lookup(query_host.as_str(), record_type).await {
             Ok(lookup) => {
                 let ips: Vec<_> = lookup
@@ -640,6 +649,15 @@ mod tests {
                 .await;
 
         assert_eq!(resolved, vec!["127.0.0.1:30303".parse().unwrap()]);
+    }
+
+    #[test]
+    fn dnssec_seed_resolution_is_ipv4_only_until_ipv6_seeds_are_supported() {
+        assert_eq!(
+            DNS_SEED_RECORD_TYPES,
+            &[RecordType::A],
+            "do not query AAAA for IPv4-only seed records; absent AAAA records in signed zones can produce DNSSEC negative-response errors that add no usable peers"
+        );
     }
 
     #[tokio::test]
