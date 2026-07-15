@@ -26,7 +26,7 @@ use indra_core::{
     error::{IndraError, IndraResult},
     types::{
         primitives::{
-            Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+            compressed_auth_tree_active, Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
             SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
         },
         transaction::OutputV1,
@@ -36,7 +36,7 @@ use indra_crypto::sha256;
 
 use crate::{
     error::{StateError, StateResult},
-    smt::{MerkleProof, SparseMerkleTree},
+    smt::{AuthTreeProof, CompressedAuthTree, MerkleProof, SparseMerkleTree},
 };
 
 /// Defensive snapshot decode ceiling for UTXO entries.
@@ -134,11 +134,14 @@ fn decode_utxo_entry_fields(
 pub struct UtxoSet {
     entries: HashMap<Bytes32, UtxoEntry>,
     smt: SparseMerkleTree,
+    compressed: CompressedAuthTree,
 }
 
 impl PartialEq for UtxoSet {
     fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries && self.smt.root() == other.smt.root()
+        self.entries == other.entries
+            && self.smt.root() == other.smt.root()
+            && self.compressed.root() == other.compressed.root()
     }
 }
 
@@ -180,6 +183,7 @@ impl Decode for UtxoSet {
             set.smt.insert(entry.utxo_id.0, leaf_value);
             set.entries.insert(entry.utxo_id, entry);
         }
+        set.rebuild_compressed_cache();
         Ok(set)
     }
 }
@@ -190,6 +194,7 @@ impl UtxoSet {
         Self {
             entries: HashMap::new(),
             smt: SparseMerkleTree::new(),
+            compressed: CompressedAuthTree::new(),
         }
     }
 
@@ -215,6 +220,7 @@ impl UtxoSet {
             set.smt.insert(entry.utxo_id.0, leaf_value);
             set.entries.insert(entry.utxo_id, entry);
         }
+        set.rebuild_compressed_cache();
         Ok(set)
     }
 
@@ -279,6 +285,7 @@ impl UtxoSet {
             .map(Self::leaf_value)
             .unwrap_or([0u8; 32]);
         self.smt.insert(id.0, smt_value);
+        self.compressed.insert(id.0, smt_value);
         Ok(id)
     }
 
@@ -294,6 +301,7 @@ impl UtxoSet {
         let removed = self.entries.remove(id);
         if removed.is_some() {
             self.smt.delete(id.0);
+            self.compressed.delete(id.0);
         }
         removed
     }
@@ -314,14 +322,41 @@ impl UtxoSet {
         self.smt.root()
     }
 
+    /// Consensus root for all unspent outputs under the root rule active at `height`.
+    pub fn root_at_height(&self, height: u64) -> [u8; 32] {
+        if compressed_auth_tree_active(height) {
+            self.compressed.root()
+        } else {
+            self.smt.root()
+        }
+    }
+
     /// Inclusion or exclusion proof for a specific UTXO ID.
     pub fn prove(&self, id: &Bytes32) -> MerkleProof {
         self.smt.prove(id.0)
     }
 
+    /// Versioned proof under the proof rule active at `height`.
+    pub fn prove_at_height(&self, id: &Bytes32, height: u64) -> AuthTreeProof {
+        if compressed_auth_tree_active(height) {
+            AuthTreeProof::V2Compressed(self.compressed.prove(id.0))
+        } else {
+            AuthTreeProof::V1LegacySparse(self.smt.prove(id.0))
+        }
+    }
+
     /// Deterministic 32-byte value committed at a UTXO leaf.
     pub fn value_hash(&self, id: &Bytes32) -> Option<[u8; 32]> {
         self.entries.get(id).map(Self::leaf_value)
+    }
+
+    fn rebuild_compressed_cache(&mut self) {
+        self.compressed = CompressedAuthTree::from_pairs(
+            self.entries
+                .values()
+                .map(|entry| (entry.utxo_id.0, Self::leaf_value(entry))),
+        )
+        .expect("UTXO IDs are unique in UtxoSet");
     }
 
     fn leaf_value(entry: &UtxoEntry) -> [u8; 32] {
@@ -453,5 +488,28 @@ mod tests {
         let missing = set.prove(&id);
         assert_eq!(missing.value, None);
         assert!(SparseMerkleTree::verify_proof(set.root(), id.0, &missing));
+    }
+
+    #[test]
+    fn compressed_auth_tree_roots_and_proofs_switch_only_at_activation_height() {
+        let mut set = UtxoSet::new();
+        let id = set.insert(dummy_output(0x12), 2, 1, 0).unwrap();
+
+        assert_eq!(set.root_at_height(u64::MAX - 1), set.root());
+        assert!(matches!(
+            set.prove_at_height(&id, u64::MAX - 1),
+            AuthTreeProof::V1LegacySparse(_)
+        ));
+
+        let compressed_root = set.root_at_height(u64::MAX);
+        assert_ne!(compressed_root, set.root());
+        let AuthTreeProof::V2Compressed(proof) = set.prove_at_height(&id, u64::MAX) else {
+            panic!("expected compressed proof at activation");
+        };
+        assert!(CompressedAuthTree::verify_proof(
+            compressed_root,
+            id.0,
+            &proof
+        ));
     }
 }

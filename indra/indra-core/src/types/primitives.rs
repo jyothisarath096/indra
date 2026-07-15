@@ -506,6 +506,23 @@ pub mod hard_forks {
     /// rule should be active from mainnet's first block). It will NOT
     /// automatically differ between testnet and mainnet.
     pub const STATE_COMMITMENT_V2_HEIGHT: u64 = u64::MAX;
+
+    /// Compressed authenticated tree for UTXO/nullifier roots and versioned proofs.
+    ///
+    /// At/after this height, UTXO/nullifier roots switch from the legacy
+    /// fixed-depth SMT to the compressed authenticated tree. This is separate
+    /// from `STATE_COMMITMENT_V2_HEIGHT` because UTXO/nullifier roots are
+    /// already-live consensus commitments with a different readiness/rollback
+    /// profile from the still-unscheduled validator/delegation/staking
+    /// commitment.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
+    /// with no per-chain-ID differentiation. It is intentionally unscheduled
+    /// until a coordinated deployment height is chosen. Before building mainnet
+    /// genesis, this MUST be deliberately reset (almost certainly to 0 if the
+    /// rule should be active from mainnet's first block). It will NOT
+    /// automatically differ between testnet and mainnet.
+    pub const COMPRESSED_AUTH_TREE_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -575,6 +592,12 @@ pub fn governance_proposal_pruning_active(height: u64) -> bool {
 #[inline]
 pub fn state_commitment_v2_active(height: u64) -> bool {
     height >= hard_forks::STATE_COMMITMENT_V2_HEIGHT
+}
+
+/// Whether UTXO/nullifier roots and proofs use the compressed authenticated tree.
+#[inline]
+pub fn compressed_auth_tree_active(height: u64) -> bool {
+    height >= hard_forks::COMPRESSED_AUTH_TREE_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ use indra_core::{
 use indra_crypto::sha256;
 
 use crate::{
-    smt::SparseMerkleTree,
+    smt::CompressedAuthTree,
     validator::{DelegationReturnEvent, DelegatorEntry, StakeBondEntry, ValidatorEntry},
     ChainState,
 };
@@ -39,36 +39,51 @@ const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateCommitmentV2 {
-    tree: SparseMerkleTree,
+    tree: CompressedAuthTree,
 }
 
 impl StateCommitmentV2 {
     /// Build a V2 commitment deterministically from canonical chain state.
     pub fn from_state(state: &ChainState, height: u64) -> Self {
-        let mut commitment = Self::default();
+        let mut leaves = Vec::new();
         for validator in state.validators.all_validators() {
-            commitment.put_validator(validator, height);
+            leaves.push((
+                validator_key(&validator.validator_id),
+                validator_value_hash(validator, height),
+            ));
         }
         for (validator_id, delegators) in state.delegations.all_delegators() {
             for delegator in delegators {
-                commitment.put_delegator(validator_id, delegator);
+                leaves.push((
+                    delegator_key(validator_id, &delegator.delegator_id),
+                    delegator_value_hash(delegator),
+                ));
             }
         }
         for (signer_id, nonce) in &state.staking_nonces {
-            commitment.put_staking_nonce(signer_id, *nonce);
+            leaves.push((
+                staking_nonce_key(signer_id),
+                staking_nonce_value_hash(signer_id, *nonce),
+            ));
         }
         for (utxo_id, bond) in &state.staked_bonds {
-            commitment.put_staked_bond(utxo_id, bond);
+            leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
         }
         for hash in &state.applied_slash_hashes {
-            commitment.put_slash_hash(hash);
+            leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
         }
         if registered_validator_cap_active(height) {
             for event in &state.delegation_return_events {
-                commitment.put_delegation_return_event(event);
+                leaves.push((
+                    delegation_return_event_key(event),
+                    delegation_return_event_value_hash(event),
+                ));
             }
         }
-        commitment
+        Self {
+            tree: CompressedAuthTree::from_pairs(leaves)
+                .expect("StateCommitmentV2 keys are domain-separated and unique"),
+        }
     }
 
     /// Current commitment root.

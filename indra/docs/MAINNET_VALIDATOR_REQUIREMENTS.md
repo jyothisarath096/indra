@@ -105,6 +105,7 @@ Current hardcoded hard-fork/activation-height constants that must be reviewed:
 - `REGISTERED_VALIDATOR_CAP_HEIGHT`
 - `GOVERNANCE_PROPOSAL_PRUNING_HEIGHT`
 - `STATE_COMMITMENT_V2_HEIGHT`
+- `COMPRESSED_AUTH_TREE_HEIGHT`
 
 This checklist is intentionally broader than currently-live testnet features.
 Any future constant following the same hardcoded height-gate pattern must be

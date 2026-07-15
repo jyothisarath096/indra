@@ -19,7 +19,7 @@
 //! **Do not** add iteration-order-dependent logic to `recompute()` without
 //! updating the determinism tests and this documentation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use indra_core::types::primitives::Bytes32;
 use indra_crypto::sha256;
@@ -38,6 +38,111 @@ pub struct MerkleProof {
     pub siblings: Vec<[u8; 32]>,
 }
 
+/// Versioned authenticated-tree proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthTreeProof {
+    /// Legacy fixed-depth sparse Merkle proof.
+    V1LegacySparse(MerkleProof),
+    /// Compressed authenticated tree proof.
+    V2Compressed(CompressedProof),
+}
+
+/// Compressed authenticated tree proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedProof {
+    /// The queried key.
+    pub key: [u8; 32],
+    /// The proven value for inclusion proofs, or `None` for non-membership.
+    pub value: Option<[u8; 32]>,
+    /// Terminal proof case at the queried subtree.
+    pub terminal: ProofTerminal,
+    /// Branch reconstruction steps from the terminal subtree upward to root.
+    pub steps: Vec<CompressedProofStep>,
+}
+
+/// Terminal case for a compressed authenticated proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofTerminal {
+    /// The queried key is present.
+    Included,
+    /// The queried key's next child is absent from an otherwise matching branch.
+    MissingChild,
+    /// The queried path terminates at a different leaf.
+    DivergentLeaf {
+        /// Existing leaf key proving non-membership of the queried key.
+        existing_key: [u8; 32],
+        /// Existing leaf value hash.
+        existing_value_hash: [u8; 32],
+    },
+    /// The queried key diverges before a compressed branch's prefix.
+    PrefixMismatch {
+        /// The branch prefix, as nibbles.
+        branch_prefix: Vec<u8>,
+        /// All committed children of the mismatched branch.
+        children: Vec<CompressedProofChild>,
+    },
+}
+
+/// One compressed branch reconstruction step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedProofStep {
+    /// Branch prefix, as nibbles.
+    pub branch_prefix: Vec<u8>,
+    /// Nibble followed by the queried key at this branch.
+    pub target_nibble: u8,
+    /// Bitmap of non-empty children committed by this branch.
+    pub child_bitmap: u16,
+    /// Sibling children required to reconstruct this branch, sorted by nibble.
+    pub siblings: Vec<CompressedProofChild>,
+}
+
+/// A revealed compressed-branch child hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressedProofChild {
+    /// Child nibble, 0..=15.
+    pub nibble: u8,
+    /// Child node kind.
+    pub kind: CompressedChildKind,
+    /// Child hash.
+    pub hash: [u8; 32],
+}
+
+/// Hash-domain child kind committed in compressed branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressedChildKind {
+    /// Leaf child.
+    Leaf,
+    /// Branch child.
+    Branch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthTreeNode {
+    Empty,
+    Leaf {
+        key: [u8; 32],
+        value_hash: [u8; 32],
+        hash: [u8; 32],
+    },
+    Branch {
+        prefix: Vec<u8>,
+        children: BTreeMap<u8, Box<AuthTreeNode>>,
+        hash: [u8; 32],
+    },
+}
+
+/// Compressed authenticated tree over a 256-bit key space.
+///
+/// This is a current-state, Jellyfish-style compressed sparse tree. It stores
+/// full keys at leaves, compressed nibble prefixes at branches, and never
+/// materializes empty subtrees or single-child branch chains. Internal node
+/// hashes are domain-separated from the legacy SMT so roots cannot be confused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedAuthTree {
+    leaves: HashMap<[u8; 32], [u8; 32]>,
+    root: AuthTreeNode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NodeLoc {
     depth: u16,
@@ -50,6 +155,189 @@ pub struct SparseMerkleTree {
     leaves: HashMap<[u8; 32], [u8; 32]>,
     nodes: HashMap<NodeLoc, [u8; 32]>,
     root: [u8; 32],
+}
+
+impl Default for CompressedAuthTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompressedAuthTree {
+    /// Create an empty compressed authenticated tree.
+    pub fn new() -> Self {
+        Self {
+            leaves: HashMap::new(),
+            root: AuthTreeNode::Empty,
+        }
+    }
+
+    /// Build a compressed tree from a complete leaf set in one deterministic pass.
+    pub fn from_pairs<I>(pairs: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = ([u8; 32], [u8; 32])>,
+    {
+        let mut sorted: Vec<_> = pairs.into_iter().collect();
+        sorted.sort_by_key(|(key, _)| *key);
+        for window in sorted.windows(2) {
+            if window[0].0 == window[1].0 {
+                return Err("duplicate compressed authenticated tree key".to_string());
+            }
+        }
+        let leaves = sorted.iter().copied().collect::<HashMap<_, _>>();
+        let root = build_compressed_subtree(&sorted, 0);
+        Ok(Self { leaves, root })
+    }
+
+    /// Number of real leaves in the tree.
+    pub fn len(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// True if the tree has no leaves.
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+
+    /// Number of materialized compressed nodes, including leaves.
+    pub fn materialized_node_count(&self) -> usize {
+        compressed_node_count(&self.root)
+    }
+
+    /// Insert or replace a leaf.
+    pub fn insert(&mut self, key: [u8; 32], value_hash: [u8; 32]) {
+        self.leaves.insert(key, value_hash);
+        let root = std::mem::replace(&mut self.root, AuthTreeNode::Empty);
+        self.root = compressed_insert(root, key, value_hash);
+    }
+
+    /// Delete a leaf if it exists.
+    pub fn delete(&mut self, key: [u8; 32]) {
+        self.leaves.remove(&key);
+        let root = std::mem::replace(&mut self.root, AuthTreeNode::Empty);
+        self.root = compressed_delete(root, key);
+    }
+
+    /// Current compressed root hash.
+    pub fn root(&self) -> [u8; 32] {
+        self.root.hash()
+    }
+
+    /// Build an inclusion or non-membership proof for a key.
+    pub fn prove(&self, key: [u8; 32]) -> CompressedProof {
+        let mut proof = compressed_prove(&self.root, key);
+        proof.key = key;
+        proof
+    }
+
+    /// Verify a compressed proof against a root.
+    pub fn verify_proof(root: [u8; 32], key: [u8; 32], proof: &CompressedProof) -> bool {
+        if proof.key != key {
+            return false;
+        }
+        let key_nibbles = key_to_nibbles(&key);
+        let (mut acc, mut child_kind, mut child_present) = match &proof.terminal {
+            ProofTerminal::Included => {
+                let Some(value_hash) = proof.value else {
+                    return false;
+                };
+                (
+                    hash_compressed_leaf(&key, &value_hash),
+                    CompressedChildKind::Leaf,
+                    true,
+                )
+            }
+            ProofTerminal::MissingChild => {
+                if proof.value.is_some() {
+                    return false;
+                }
+                (compressed_empty_hash(), CompressedChildKind::Leaf, false)
+            }
+            ProofTerminal::DivergentLeaf {
+                existing_key,
+                existing_value_hash,
+            } => {
+                if proof.value.is_some() || existing_key == &key {
+                    return false;
+                }
+                (
+                    hash_compressed_leaf(existing_key, existing_value_hash),
+                    CompressedChildKind::Leaf,
+                    true,
+                )
+            }
+            ProofTerminal::PrefixMismatch {
+                branch_prefix,
+                children,
+            } => {
+                if proof.value.is_some()
+                    || starts_with_nibbles(&key_nibbles, branch_prefix)
+                    || children.is_empty()
+                {
+                    return false;
+                }
+                let Ok(hash) = hash_branch_from_children(branch_prefix, children) else {
+                    return false;
+                };
+                (hash, CompressedChildKind::Branch, true)
+            }
+        };
+
+        for step in &proof.steps {
+            if !valid_nibble_path(&step.branch_prefix)
+                || step.target_nibble > 0x0F
+                || !starts_with_nibbles(&key_nibbles, &step.branch_prefix)
+                || step.branch_prefix.len() >= key_nibbles.len()
+                || key_nibbles[step.branch_prefix.len()] != step.target_nibble
+            {
+                return false;
+            }
+            let mut children = step.siblings.clone();
+            if child_present {
+                children.push(CompressedProofChild {
+                    nibble: step.target_nibble,
+                    kind: child_kind,
+                    hash: acc,
+                });
+            }
+            children.sort_by_key(|child| child.nibble);
+            let bitmap = child_bitmap(&children);
+            if bitmap != Some(step.child_bitmap) {
+                return false;
+            }
+            if child_present {
+                if (step.child_bitmap & (1u16 << step.target_nibble)) == 0 {
+                    return false;
+                }
+            } else if (step.child_bitmap & (1u16 << step.target_nibble)) != 0 {
+                return false;
+            }
+            let Ok(hash) = hash_branch_from_children(&step.branch_prefix, &children) else {
+                return false;
+            };
+            acc = hash;
+            child_kind = CompressedChildKind::Branch;
+            child_present = true;
+        }
+
+        acc == root
+    }
+}
+
+impl AuthTreeNode {
+    fn hash(&self) -> [u8; 32] {
+        match self {
+            AuthTreeNode::Empty => compressed_empty_hash(),
+            AuthTreeNode::Leaf { hash, .. } | AuthTreeNode::Branch { hash, .. } => *hash,
+        }
+    }
+
+    fn kind(&self) -> CompressedChildKind {
+        match self {
+            AuthTreeNode::Leaf { .. } => CompressedChildKind::Leaf,
+            AuthTreeNode::Branch { .. } | AuthTreeNode::Empty => CompressedChildKind::Branch,
+        }
+    }
 }
 
 impl SparseMerkleTree {
@@ -263,6 +551,399 @@ impl SparseMerkleTree {
     }
 }
 
+fn build_compressed_subtree(pairs: &[([u8; 32], [u8; 32])], start_nibble: usize) -> AuthTreeNode {
+    match pairs.len() {
+        0 => AuthTreeNode::Empty,
+        1 => {
+            let (key, value_hash) = pairs[0];
+            AuthTreeNode::Leaf {
+                key,
+                value_hash,
+                hash: hash_compressed_leaf(&key, &value_hash),
+            }
+        }
+        _ => {
+            let prefix = longest_common_prefix_for_pairs(pairs, start_nibble);
+            let mut children = BTreeMap::new();
+            let mut index = 0usize;
+            while index < pairs.len() {
+                let nibbles = key_to_nibbles(&pairs[index].0);
+                let child_nibble = nibbles.get(prefix.len()).copied().unwrap_or(0);
+                let mut end = index + 1;
+                while end < pairs.len() {
+                    let other = key_to_nibbles(&pairs[end].0);
+                    if other.get(prefix.len()).copied().unwrap_or(0) != child_nibble {
+                        break;
+                    }
+                    end += 1;
+                }
+                let child = build_compressed_subtree(&pairs[index..end], prefix.len() + 1);
+                children.insert(child_nibble, Box::new(child));
+                index = end;
+            }
+            make_branch(prefix, children)
+        }
+    }
+}
+
+fn compressed_insert(node: AuthTreeNode, key: [u8; 32], value_hash: [u8; 32]) -> AuthTreeNode {
+    match node {
+        AuthTreeNode::Empty => AuthTreeNode::Leaf {
+            key,
+            value_hash,
+            hash: hash_compressed_leaf(&key, &value_hash),
+        },
+        AuthTreeNode::Leaf {
+            key: existing_key,
+            value_hash: existing_value,
+            ..
+        } => {
+            if existing_key == key {
+                AuthTreeNode::Leaf {
+                    key,
+                    value_hash,
+                    hash: hash_compressed_leaf(&key, &value_hash),
+                }
+            } else {
+                let existing_nibbles = key_to_nibbles(&existing_key);
+                let key_nibbles = key_to_nibbles(&key);
+                let prefix_len = common_nibble_prefix_len(&existing_nibbles, &key_nibbles, 0);
+                let prefix = key_nibbles[..prefix_len].to_vec();
+                let mut children = BTreeMap::new();
+                children.insert(
+                    existing_nibbles[prefix_len],
+                    Box::new(AuthTreeNode::Leaf {
+                        key: existing_key,
+                        value_hash: existing_value,
+                        hash: hash_compressed_leaf(&existing_key, &existing_value),
+                    }),
+                );
+                children.insert(
+                    key_nibbles[prefix_len],
+                    Box::new(AuthTreeNode::Leaf {
+                        key,
+                        value_hash,
+                        hash: hash_compressed_leaf(&key, &value_hash),
+                    }),
+                );
+                make_branch(prefix, children)
+            }
+        }
+        AuthTreeNode::Branch {
+            prefix,
+            mut children,
+            ..
+        } => {
+            let key_nibbles = key_to_nibbles(&key);
+            let shared = common_nibble_prefix_len(&prefix, &key_nibbles, 0);
+            if shared < prefix.len() {
+                let old_nibble = prefix[shared];
+                let new_nibble = key_nibbles[shared];
+                let mut split_children = BTreeMap::new();
+                split_children.insert(old_nibble, Box::new(make_branch(prefix, children)));
+                split_children.insert(
+                    new_nibble,
+                    Box::new(AuthTreeNode::Leaf {
+                        key,
+                        value_hash,
+                        hash: hash_compressed_leaf(&key, &value_hash),
+                    }),
+                );
+                return make_branch(key_nibbles[..shared].to_vec(), split_children);
+            }
+
+            let Some(child_nibble) = key_nibbles.get(prefix.len()).copied() else {
+                return make_branch(prefix, children);
+            };
+            let child = children
+                .remove(&child_nibble)
+                .map(|boxed| *boxed)
+                .unwrap_or(AuthTreeNode::Empty);
+            children.insert(
+                child_nibble,
+                Box::new(compressed_insert(child, key, value_hash)),
+            );
+            make_branch(prefix, children)
+        }
+    }
+}
+
+fn compressed_delete(node: AuthTreeNode, key: [u8; 32]) -> AuthTreeNode {
+    match node {
+        AuthTreeNode::Empty => AuthTreeNode::Empty,
+        AuthTreeNode::Leaf {
+            key: existing_key, ..
+        } => {
+            if existing_key == key {
+                AuthTreeNode::Empty
+            } else {
+                node
+            }
+        }
+        AuthTreeNode::Branch {
+            prefix,
+            mut children,
+            ..
+        } => {
+            let key_nibbles = key_to_nibbles(&key);
+            if !starts_with_nibbles(&key_nibbles, &prefix) || prefix.len() >= key_nibbles.len() {
+                return make_branch(prefix, children);
+            }
+            let child_nibble = key_nibbles[prefix.len()];
+            if let Some(child) = children.remove(&child_nibble) {
+                match compressed_delete(*child, key) {
+                    AuthTreeNode::Empty => {}
+                    updated => {
+                        children.insert(child_nibble, Box::new(updated));
+                    }
+                }
+            }
+            collapse_or_branch(prefix, children)
+        }
+    }
+}
+
+fn collapse_or_branch(
+    prefix: Vec<u8>,
+    mut children: BTreeMap<u8, Box<AuthTreeNode>>,
+) -> AuthTreeNode {
+    match children.len() {
+        0 => AuthTreeNode::Empty,
+        1 => *children.pop_first().expect("len checked").1,
+        _ => make_branch(prefix, children),
+    }
+}
+
+fn make_branch(prefix: Vec<u8>, children: BTreeMap<u8, Box<AuthTreeNode>>) -> AuthTreeNode {
+    let mut proof_children = Vec::with_capacity(children.len());
+    for (nibble, child) in &children {
+        if matches!(**child, AuthTreeNode::Empty) {
+            continue;
+        }
+        proof_children.push(CompressedProofChild {
+            nibble: *nibble,
+            kind: child.kind(),
+            hash: child.hash(),
+        });
+    }
+    if proof_children.is_empty() {
+        return AuthTreeNode::Empty;
+    }
+    let hash = hash_branch_from_children(&prefix, &proof_children)
+        .unwrap_or_else(|_| compressed_empty_hash());
+    AuthTreeNode::Branch {
+        prefix,
+        children,
+        hash,
+    }
+}
+
+fn compressed_prove(node: &AuthTreeNode, key: [u8; 32]) -> CompressedProof {
+    let key_nibbles = key_to_nibbles(&key);
+    match node {
+        AuthTreeNode::Empty => CompressedProof {
+            key,
+            value: None,
+            terminal: ProofTerminal::MissingChild,
+            steps: Vec::new(),
+        },
+        AuthTreeNode::Leaf {
+            key: existing_key,
+            value_hash,
+            ..
+        } => {
+            if existing_key == &key {
+                CompressedProof {
+                    key,
+                    value: Some(*value_hash),
+                    terminal: ProofTerminal::Included,
+                    steps: Vec::new(),
+                }
+            } else {
+                CompressedProof {
+                    key,
+                    value: None,
+                    terminal: ProofTerminal::DivergentLeaf {
+                        existing_key: *existing_key,
+                        existing_value_hash: *value_hash,
+                    },
+                    steps: Vec::new(),
+                }
+            }
+        }
+        AuthTreeNode::Branch {
+            prefix, children, ..
+        } => {
+            if !starts_with_nibbles(&key_nibbles, prefix) || prefix.len() >= key_nibbles.len() {
+                return CompressedProof {
+                    key,
+                    value: None,
+                    terminal: ProofTerminal::PrefixMismatch {
+                        branch_prefix: prefix.clone(),
+                        children: proof_children_from_map(children, None),
+                    },
+                    steps: Vec::new(),
+                };
+            }
+            let target = key_nibbles[prefix.len()];
+            let step = CompressedProofStep {
+                branch_prefix: prefix.clone(),
+                target_nibble: target,
+                child_bitmap: child_bitmap(&proof_children_from_map(children, None)).unwrap_or(0),
+                siblings: proof_children_from_map(children, Some(target)),
+            };
+            if let Some(child) = children.get(&target) {
+                let mut proof = compressed_prove(child, key);
+                proof.steps.push(step);
+                proof
+            } else {
+                CompressedProof {
+                    key,
+                    value: None,
+                    terminal: ProofTerminal::MissingChild,
+                    steps: vec![step],
+                }
+            }
+        }
+    }
+}
+
+fn proof_children_from_map(
+    children: &BTreeMap<u8, Box<AuthTreeNode>>,
+    exclude: Option<u8>,
+) -> Vec<CompressedProofChild> {
+    children
+        .iter()
+        .filter(|(nibble, child)| {
+            Some(**nibble) != exclude && !matches!(***child, AuthTreeNode::Empty)
+        })
+        .map(|(nibble, child)| CompressedProofChild {
+            nibble: *nibble,
+            kind: child.kind(),
+            hash: child.hash(),
+        })
+        .collect()
+}
+
+fn compressed_node_count(node: &AuthTreeNode) -> usize {
+    match node {
+        AuthTreeNode::Empty => 0,
+        AuthTreeNode::Leaf { .. } => 1,
+        AuthTreeNode::Branch { children, .. } => {
+            1 + children
+                .values()
+                .map(|child| compressed_node_count(child))
+                .sum::<usize>()
+        }
+    }
+}
+
+fn longest_common_prefix_for_pairs(pairs: &[([u8; 32], [u8; 32])], start_nibble: usize) -> Vec<u8> {
+    let first = key_to_nibbles(&pairs[0].0);
+    let mut len = start_nibble;
+    while len < first.len() {
+        let nibble = first[len];
+        if pairs
+            .iter()
+            .skip(1)
+            .all(|(key, _)| key_to_nibbles(key).get(len).copied() == Some(nibble))
+        {
+            len += 1;
+        } else {
+            break;
+        }
+    }
+    first[..len].to_vec()
+}
+
+fn common_nibble_prefix_len(a: &[u8], b: &[u8], start: usize) -> usize {
+    let mut index = start;
+    while index < a.len() && index < b.len() && a[index] == b[index] {
+        index += 1;
+    }
+    index
+}
+
+fn starts_with_nibbles(key: &[u8], prefix: &[u8]) -> bool {
+    key.len() >= prefix.len() && key[..prefix.len()] == *prefix
+}
+
+fn valid_nibble_path(path: &[u8]) -> bool {
+    path.iter().all(|nibble| *nibble <= 0x0F) && path.len() <= 64
+}
+
+fn key_to_nibbles(key: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    for byte in key {
+        out.push(byte >> 4);
+        out.push(byte & 0x0F);
+    }
+    out
+}
+
+fn pack_nibbles(nibbles: &[u8]) -> Option<Vec<u8>> {
+    if !valid_nibble_path(nibbles) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(nibbles.len().div_ceil(2));
+    for chunk in nibbles.chunks(2) {
+        let high = chunk[0] << 4;
+        let low = chunk.get(1).copied().unwrap_or(0);
+        out.push(high | low);
+    }
+    Some(out)
+}
+
+fn child_bitmap(children: &[CompressedProofChild]) -> Option<u16> {
+    let mut bitmap = 0u16;
+    let mut previous = None;
+    for child in children {
+        if child.nibble > 0x0F || previous.is_some_and(|prev| child.nibble <= prev) {
+            return None;
+        }
+        bitmap |= 1u16 << child.nibble;
+        previous = Some(child.nibble);
+    }
+    Some(bitmap)
+}
+
+fn compressed_empty_hash() -> [u8; 32] {
+    sha256(b"INDRA-auth-tree-v2-empty")
+}
+
+fn hash_compressed_leaf(key: &[u8; 32], value_hash: &[u8; 32]) -> [u8; 32] {
+    let mut data = Vec::with_capacity("INDRA-auth-tree-v2-leaf".len() + 64);
+    data.extend_from_slice(b"INDRA-auth-tree-v2-leaf");
+    data.extend_from_slice(key);
+    data.extend_from_slice(value_hash);
+    sha256(&data)
+}
+
+fn hash_branch_from_children(
+    prefix: &[u8],
+    children: &[CompressedProofChild],
+) -> Result<[u8; 32], String> {
+    if !valid_nibble_path(prefix) || children.is_empty() {
+        return Err("invalid compressed branch".to_string());
+    }
+    let bitmap = child_bitmap(children).ok_or_else(|| "invalid compressed children".to_string())?;
+    let packed_prefix = pack_nibbles(prefix).ok_or_else(|| "invalid branch prefix".to_string())?;
+    let mut data = Vec::with_capacity(32 + 1 + packed_prefix.len() + 2 + children.len() * 34);
+    data.extend_from_slice(b"INDRA-auth-tree-v2-branch");
+    data.push(u8::try_from(prefix.len()).map_err(|_| "branch prefix too long".to_string())?);
+    data.extend_from_slice(&packed_prefix);
+    data.extend_from_slice(&bitmap.to_le_bytes());
+    for child in children {
+        data.push(child.nibble);
+        data.push(match child.kind {
+            CompressedChildKind::Leaf => 0,
+            CompressedChildKind::Branch => 1,
+        });
+        data.extend_from_slice(&child.hash);
+    }
+    Ok(sha256(&data))
+}
+
 fn set_or_remove_node(
     nodes: &mut HashMap<NodeLoc, [u8; 32]>,
     loc: NodeLoc,
@@ -365,6 +1046,12 @@ mod tests {
 
     fn value(byte: u8) -> [u8; 32] {
         sha256(&[byte; 8])
+    }
+
+    fn ckey(first: u8, second: u8) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0] = (first << 4) | second;
+        out
     }
 
     #[test]
@@ -525,5 +1212,145 @@ mod tests {
         let absent = key(0xFE);
         let proof = smt.prove(absent);
         assert!(SparseMerkleTree::verify_proof(smt.root(), absent, &proof));
+    }
+
+    #[test]
+    fn compressed_tree_known_small_vector_root() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let v1 = value(0xA1);
+        let v2 = value(0xA2);
+        let tree = CompressedAuthTree::from_pairs([(k1, v1), (k2, v2)]).unwrap();
+
+        let children = vec![
+            CompressedProofChild {
+                nibble: 0,
+                kind: CompressedChildKind::Leaf,
+                hash: hash_compressed_leaf(&k1, &v1),
+            },
+            CompressedProofChild {
+                nibble: 1,
+                kind: CompressedChildKind::Leaf,
+                hash: hash_compressed_leaf(&k2, &v2),
+            },
+        ];
+        let expected = hash_branch_from_children(&[0x1], &children).unwrap();
+        assert_eq!(tree.root(), expected);
+        assert_eq!(tree.materialized_node_count(), 3);
+    }
+
+    #[test]
+    fn compressed_batch_construction_matches_incremental_construction() {
+        let pairs: Vec<_> = (0u8..96)
+            .map(|i| {
+                let mut k = sha256(&[i; 4]);
+                k[0] ^= i.rotate_left(1);
+                (k, value(i.wrapping_mul(11)))
+            })
+            .collect();
+        let batch = CompressedAuthTree::from_pairs(pairs.clone()).unwrap();
+        let mut incremental = CompressedAuthTree::new();
+        for (k, v) in pairs.iter().rev() {
+            incremental.insert(*k, *v);
+        }
+        assert_eq!(batch.root(), incremental.root());
+        assert!(
+            batch.materialized_node_count() <= batch.len().saturating_mul(2),
+            "compressed tree should stay close to real leaf count"
+        );
+    }
+
+    #[test]
+    fn compressed_insert_update_delete_matches_batch_reference() {
+        let mut live = CompressedAuthTree::new();
+        let mut reference = HashMap::new();
+        for i in 0u8..64 {
+            let k = sha256(&[i, i.wrapping_mul(7)]);
+            let v = value(i);
+            live.insert(k, v);
+            reference.insert(k, v);
+            let rebuilt =
+                CompressedAuthTree::from_pairs(reference.iter().map(|(k, v)| (*k, *v))).unwrap();
+            assert_eq!(live.root(), rebuilt.root());
+        }
+        for i in (0u8..64).step_by(5) {
+            let k = sha256(&[i, i.wrapping_mul(7)]);
+            live.delete(k);
+            reference.remove(&k);
+            let rebuilt =
+                CompressedAuthTree::from_pairs(reference.iter().map(|(k, v)| (*k, *v))).unwrap();
+            assert_eq!(live.root(), rebuilt.root());
+        }
+    }
+
+    #[test]
+    fn compressed_inclusion_proof_verifies() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let tree = CompressedAuthTree::from_pairs([(k1, value(1)), (k2, value(2))]).unwrap();
+        let proof = tree.prove(k1);
+        assert!(matches!(proof.terminal, ProofTerminal::Included));
+        assert!(CompressedAuthTree::verify_proof(tree.root(), k1, &proof));
+    }
+
+    #[test]
+    fn compressed_non_membership_missing_child_verifies() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let missing = ckey(0x1, 0x2);
+        let tree = CompressedAuthTree::from_pairs([(k1, value(1)), (k2, value(2))]).unwrap();
+        let proof = tree.prove(missing);
+        assert!(matches!(proof.terminal, ProofTerminal::MissingChild));
+        assert!(CompressedAuthTree::verify_proof(
+            tree.root(),
+            missing,
+            &proof
+        ));
+    }
+
+    #[test]
+    fn compressed_non_membership_divergent_leaf_verifies() {
+        let present = ckey(0x4, 0x4);
+        let missing = ckey(0x4, 0x5);
+        let tree = CompressedAuthTree::from_pairs([(present, value(1))]).unwrap();
+        let proof = tree.prove(missing);
+        assert!(matches!(
+            proof.terminal,
+            ProofTerminal::DivergentLeaf { .. }
+        ));
+        assert!(CompressedAuthTree::verify_proof(
+            tree.root(),
+            missing,
+            &proof
+        ));
+    }
+
+    #[test]
+    fn compressed_non_membership_prefix_mismatch_verifies() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let missing = ckey(0x2, 0x0);
+        let tree = CompressedAuthTree::from_pairs([(k1, value(1)), (k2, value(2))]).unwrap();
+        let proof = tree.prove(missing);
+        assert!(matches!(
+            proof.terminal,
+            ProofTerminal::PrefixMismatch { .. }
+        ));
+        assert!(CompressedAuthTree::verify_proof(
+            tree.root(),
+            missing,
+            &proof
+        ));
+    }
+
+    #[test]
+    fn compressed_proof_tampering_fails() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let tree = CompressedAuthTree::from_pairs([(k1, value(1)), (k2, value(2))]).unwrap();
+        let mut proof = tree.prove(k1);
+        assert!(CompressedAuthTree::verify_proof(tree.root(), k1, &proof));
+        proof.steps[0].siblings[0].hash[0] ^= 0x80;
+        assert!(!CompressedAuthTree::verify_proof(tree.root(), k1, &proof));
     }
 }

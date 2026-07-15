@@ -22,8 +22,8 @@ use crate::ChainState;
 
 /// Compute the full state root for the given chain state.
 pub fn compute_state_root(state: &ChainState) -> Bytes32 {
-    let utxo_root = state.utxos.root();
-    let nullifier_root = state.nullifiers.root();
+    let utxo_root = state.utxos.root_at_height(state.height);
+    let nullifier_root = state.nullifiers.root_at_height(state.height);
     let validator_root = compute_validator_set_root(state);
 
     let chain_id = VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
@@ -233,12 +233,15 @@ pub(crate) fn compute_legacy_validator_set_root_at_height(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use indra_core::{
+        codec::{Decode, Encode},
         types::{
             primitives::{
                 hard_forks::{
-                    REGISTERED_VALIDATOR_CAP_HEIGHT, STATE_COMMITMENT_V2_HEIGHT,
-                    VALIDATOR_NETWORK_ADDRESS_HEIGHT,
+                    COMPRESSED_AUTH_TREE_HEIGHT, REGISTERED_VALIDATOR_CAP_HEIGHT,
+                    STATE_COMMITMENT_V2_HEIGHT, VALIDATOR_NETWORK_ADDRESS_HEIGHT,
                 },
                 DUST_LIMIT_SPARK,
             },
@@ -360,6 +363,33 @@ mod tests {
         let _ = state.utxos.insert(dummy_output(0x20), 1, 0, 0);
         let root1 = compute_state_root(&state);
         assert_ne!(root0, root1);
+    }
+
+    #[test]
+    fn utxo_and_nullifier_roots_switch_only_at_compressed_tree_activation() {
+        let mut state = ChainState::new_genesis();
+        let _ = state.utxos.insert(dummy_output(0x21), 1, 0, 0);
+        let nullifier = Bytes32::from(sha256(b"compressed-tree-nullifier"));
+        state.nullifiers.insert(nullifier);
+
+        let pre_activation = COMPRESSED_AUTH_TREE_HEIGHT.saturating_sub(1);
+        assert_eq!(
+            state.utxos.root_at_height(pre_activation),
+            state.utxos.root()
+        );
+        assert_eq!(
+            state.nullifiers.root_at_height(pre_activation),
+            state.nullifiers.root()
+        );
+
+        assert_ne!(
+            state.utxos.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            state.utxos.root()
+        );
+        assert_ne!(
+            state.nullifiers.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            state.nullifiers.root()
+        );
     }
 
     #[test]
@@ -520,6 +550,240 @@ mod tests {
         assert_eq!(
             StateCommitmentV2::from_state(&replayed, activation).root(),
             warm_root
+        );
+    }
+
+    #[test]
+    fn compressed_tree_and_state_commitment_rebuild_after_decode_matches_warm_cache() {
+        let activation = COMPRESSED_AUTH_TREE_HEIGHT.max(STATE_COMMITMENT_V2_HEIGHT);
+        let mut continuous = ChainState::new_genesis();
+        continuous.height = activation;
+        let _ = continuous.utxos.insert(dummy_output(0x31), 1, 0, 0);
+        let nullifier = Bytes32::from(sha256(b"compressed-tree-replay-nullifier"));
+        continuous.nullifiers.insert(nullifier);
+        continuous.validators.upsert(validator_fixture()).unwrap();
+        continuous.rebuild_state_commitment_v2(activation);
+        let warm_root = compute_state_root(&continuous);
+
+        let decoded = ChainState::decode_exact(&continuous.encode_to_vec()).unwrap();
+        assert!(
+            decoded.state_commitment_v2.is_none(),
+            "StateCommitmentV2 cache is derived and must not be persisted"
+        );
+        assert_eq!(
+            compute_state_root(&decoded),
+            warm_root,
+            "decoded/replayed state must rebuild compressed roots and StateCommitmentV2 deterministically"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReplayMutation {
+        InsertUtxo(u8),
+        SpendUtxo(u8),
+        InsertNullifier(u8),
+        UpsertValidator { tag: u8, stake_spark: u64 },
+        UpdateValidatorStake { tag: u8, stake_spark: u64 },
+    }
+
+    #[derive(Clone, Debug)]
+    struct ReplayBlock {
+        height: u64,
+        mutations: Vec<ReplayMutation>,
+    }
+
+    fn replay_validator_fixture(tag: u8, stake_spark: u64) -> ValidatorEntry {
+        let mut validator = validator_fixture();
+        validator.validator_id = Bytes32::from([tag; 32]);
+        validator.name = format!("validator-{tag:02x}");
+        validator.hybrid_classical_pk = Some([tag.wrapping_add(1); 32]);
+        validator.hybrid_pq_pk = Some(vec![tag.wrapping_add(2); 80]);
+        validator.vrf_pk = Some([tag.wrapping_add(3); 32]);
+        validator.stake_spark = stake_spark;
+        validator
+    }
+
+    fn replay_nullifier(tag: u8) -> Bytes32 {
+        let mut data = b"compressed-replay-nullifier".to_vec();
+        data.push(tag);
+        Bytes32::from(sha256(&data))
+    }
+
+    fn apply_replay_block(
+        state: &mut ChainState,
+        block: &ReplayBlock,
+        known_utxos: &mut BTreeMap<u8, Bytes32>,
+    ) {
+        state.height = block.height;
+        state.ensure_state_commitment_v2(block.height);
+
+        for mutation in &block.mutations {
+            match *mutation {
+                ReplayMutation::InsertUtxo(tag) => {
+                    let utxo_id = state
+                        .utxos
+                        .insert(dummy_output(tag), block.height, 0, tag as u32)
+                        .unwrap();
+                    known_utxos.insert(tag, utxo_id);
+                }
+                ReplayMutation::SpendUtxo(tag) => {
+                    let utxo_id = known_utxos
+                        .get(&tag)
+                        .copied()
+                        .expect("test replay must spend a previously inserted UTXO");
+                    state
+                        .utxos
+                        .spend(&utxo_id)
+                        .expect("test replay UTXO must still be unspent");
+                }
+                ReplayMutation::InsertNullifier(tag) => {
+                    assert!(state.nullifiers.insert(replay_nullifier(tag)));
+                }
+                ReplayMutation::UpsertValidator { tag, stake_spark } => {
+                    let validator = replay_validator_fixture(tag, stake_spark);
+                    state.validators.upsert(validator.clone()).unwrap();
+                    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+                        commitment.put_validator(&validator, block.height);
+                    }
+                }
+                ReplayMutation::UpdateValidatorStake { tag, stake_spark } => {
+                    let updated = {
+                        let validator_id = Bytes32::from([tag; 32]);
+                        let validator = state
+                            .validators
+                            .get_mut(&validator_id)
+                            .expect("test replay validator must exist before update");
+                        validator.stake_spark = stake_spark;
+                        validator.clone()
+                    };
+                    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+                        commitment.put_validator(&updated, block.height);
+                    }
+                }
+            }
+        }
+    }
+
+    fn replay_root_after_blocks(blocks: &[ReplayBlock]) -> Bytes32 {
+        let mut state = ChainState::new_genesis();
+        let mut known_utxos = BTreeMap::new();
+        for block in blocks {
+            apply_replay_block(&mut state, block, &mut known_utxos);
+        }
+
+        let decoded = ChainState::decode_exact(&state.encode_to_vec()).unwrap();
+        assert!(
+            decoded.state_commitment_v2.is_none(),
+            "StateCommitmentV2 is a derived cache and must be rebuilt during replay/snapshot load"
+        );
+        compute_state_root(&decoded)
+    }
+
+    fn compressed_activation_replay_blocks() -> Vec<ReplayBlock> {
+        let compressed_activation = COMPRESSED_AUTH_TREE_HEIGHT;
+        let commitment_activation = STATE_COMMITMENT_V2_HEIGHT;
+
+        let mut blocks: BTreeMap<u64, Vec<ReplayMutation>> = BTreeMap::new();
+        let mut add = |height: u64, mutation: ReplayMutation| {
+            blocks.entry(height).or_default().push(mutation);
+        };
+
+        add(
+            compressed_activation.saturating_sub(2),
+            ReplayMutation::InsertUtxo(0x41),
+        );
+        add(
+            compressed_activation.saturating_sub(1),
+            ReplayMutation::InsertNullifier(0x51),
+        );
+        add(compressed_activation, ReplayMutation::SpendUtxo(0x41));
+        add(compressed_activation, ReplayMutation::InsertUtxo(0x42));
+        add(compressed_activation, ReplayMutation::InsertNullifier(0x52));
+        if let Some(after_compressed_activation) = compressed_activation.checked_add(1) {
+            add(
+                after_compressed_activation,
+                ReplayMutation::InsertUtxo(0x43),
+            );
+            add(after_compressed_activation, ReplayMutation::SpendUtxo(0x42));
+        }
+
+        add(
+            commitment_activation.saturating_sub(1),
+            ReplayMutation::UpsertValidator {
+                tag: 0x61,
+                stake_spark: 100_000,
+            },
+        );
+        add(
+            commitment_activation,
+            ReplayMutation::UpdateValidatorStake {
+                tag: 0x61,
+                stake_spark: 125_000,
+            },
+        );
+        if let Some(after_commitment_activation) = commitment_activation.checked_add(1) {
+            add(
+                after_commitment_activation,
+                ReplayMutation::UpdateValidatorStake {
+                    tag: 0x61,
+                    stake_spark: 150_000,
+                },
+            );
+        }
+
+        blocks
+            .into_iter()
+            .map(|(height, mutations)| ReplayBlock { height, mutations })
+            .collect()
+    }
+
+    #[test]
+    fn compressed_auth_tree_and_state_commitment_activation_replay_is_deterministic() {
+        let blocks = compressed_activation_replay_blocks();
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.height < COMPRESSED_AUTH_TREE_HEIGHT),
+            "test must include pre-compressed-auth-tree activation mutations"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.height == COMPRESSED_AUTH_TREE_HEIGHT),
+            "test must include mutations exactly at compressed-auth-tree activation"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.height < STATE_COMMITMENT_V2_HEIGHT),
+            "test must include pre-StateCommitmentV2 activation mutations"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.height == STATE_COMMITMENT_V2_HEIGHT),
+            "test must include mutations exactly at StateCommitmentV2 activation"
+        );
+
+        let mut continuous = ChainState::new_genesis();
+        let mut continuous_utxos = BTreeMap::new();
+
+        for checkpoint in 0..blocks.len() {
+            apply_replay_block(&mut continuous, &blocks[checkpoint], &mut continuous_utxos);
+            let continuous_root = compute_state_root(&continuous);
+            let replayed_root = replay_root_after_blocks(&blocks[..=checkpoint]);
+            assert_eq!(
+                continuous_root, replayed_root,
+                "continuous live application and genesis replay diverged at checkpoint {checkpoint} height {}",
+                blocks[checkpoint].height
+            );
+        }
+
+        let final_replayed_root = replay_root_after_blocks(&blocks);
+        assert_eq!(
+            compute_state_root(&continuous),
+            final_replayed_root,
+            "final root after compressed-auth-tree and StateCommitmentV2 activation must be replay-deterministic"
         );
     }
 

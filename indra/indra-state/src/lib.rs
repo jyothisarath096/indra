@@ -59,7 +59,10 @@ pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
 pub use governance_apply::apply_governance_op;
 pub use nullifier::NullifierSet;
-pub use smt::{MerkleProof, SparseMerkleTree, SMT_DEPTH};
+pub use smt::{
+    AuthTreeProof, CompressedAuthTree, CompressedChildKind, CompressedProof, CompressedProofChild,
+    CompressedProofStep, MerkleProof, ProofTerminal, SparseMerkleTree, SMT_DEPTH,
+};
 pub use state_commitment::StateCommitmentV2;
 pub use state_root::{compute_state_root, compute_validator_set_root};
 pub use utxo::{UtxoEntry, UtxoSet};

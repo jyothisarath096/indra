@@ -12,7 +12,7 @@ use indra_core::{
     },
     Bytes32,
 };
-use indra_state::ChainState;
+use indra_state::{AuthTreeProof, ChainState, ProofTerminal};
 
 use crate::{
     error::{RpcError, RpcResult},
@@ -1883,27 +1883,118 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
         Ok(id) => id,
         Err(_) => return Ok("null".to_string()),
     };
-    let proof = state.chain.utxos.prove(&utxo_id);
-    let siblings = proof
-        .siblings
-        .iter()
-        .map(|sibling| format!(r#""{}""#, hex::encode(sibling)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let value_hash = proof.value.map(hex::encode).unwrap_or_default();
+    let proof = state
+        .chain
+        .utxos
+        .prove_at_height(&utxo_id, state.chain.height);
     let state_root = indra_state::compute_state_root(&state.chain);
-    Ok(format!(
-        r#"{{"utxo_id":"{}","present":{},"value_hash":"{}","siblings":[{}],"state_root":"{}"}}"#,
-        hex::encode(utxo_id.0),
-        if proof.value.is_some() {
-            "true"
-        } else {
-            "false"
-        },
-        value_hash,
-        siblings,
-        hex::encode(state_root.0),
-    ))
+    match proof {
+        AuthTreeProof::V1LegacySparse(proof) => {
+            let siblings = proof
+                .siblings
+                .iter()
+                .map(|sibling| format!(r#""{}""#, hex::encode(sibling)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let value_hash = proof.value.map(hex::encode).unwrap_or_default();
+            Ok(format!(
+                r#"{{"proof_version":"legacy-smt-v1","utxo_id":"{}","present":{},"value_hash":"{}","siblings":[{}],"state_root":"{}"}}"#,
+                hex::encode(utxo_id.0),
+                if proof.value.is_some() {
+                    "true"
+                } else {
+                    "false"
+                },
+                value_hash,
+                siblings,
+                hex::encode(state_root.0),
+            ))
+        }
+        AuthTreeProof::V2Compressed(proof) => {
+            let value_hash = proof.value.map(hex::encode).unwrap_or_default();
+            Ok(format!(
+                r#"{{"proof_version":"compressed-auth-tree-v2","utxo_id":"{}","present":{},"value_hash":"{}","terminal":{},"steps":[{}],"state_root":"{}"}}"#,
+                hex::encode(utxo_id.0),
+                if proof.value.is_some() {
+                    "true"
+                } else {
+                    "false"
+                },
+                value_hash,
+                compressed_terminal_json(&proof.terminal),
+                proof
+                    .steps
+                    .iter()
+                    .map(compressed_step_json)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                hex::encode(state_root.0),
+            ))
+        }
+    }
+}
+
+fn compressed_terminal_json(terminal: &ProofTerminal) -> String {
+    match terminal {
+        ProofTerminal::Included => r#"{"kind":"included"}"#.to_string(),
+        ProofTerminal::MissingChild => r#"{"kind":"missing_child"}"#.to_string(),
+        ProofTerminal::DivergentLeaf {
+            existing_key,
+            existing_value_hash,
+        } => format!(
+            r#"{{"kind":"divergent_leaf","existing_key":"{}","existing_value_hash":"{}"}}"#,
+            hex::encode(existing_key),
+            hex::encode(existing_value_hash)
+        ),
+        ProofTerminal::PrefixMismatch {
+            branch_prefix,
+            children,
+        } => format!(
+            r#"{{"kind":"prefix_mismatch","branch_prefix":"{}","children":[{}]}}"#,
+            encode_nibble_path(branch_prefix),
+            children
+                .iter()
+                .map(compressed_child_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn compressed_step_json(step: &indra_state::CompressedProofStep) -> String {
+    format!(
+        r#"{{"branch_prefix":"{}","target_nibble":{},"child_bitmap":{},"siblings":[{}]}}"#,
+        encode_nibble_path(&step.branch_prefix),
+        step.target_nibble,
+        step.child_bitmap,
+        step.siblings
+            .iter()
+            .map(compressed_child_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn compressed_child_json(child: &indra_state::CompressedProofChild) -> String {
+    let kind = match child.kind {
+        indra_state::smt::CompressedChildKind::Leaf => "leaf",
+        indra_state::smt::CompressedChildKind::Branch => "branch",
+    };
+    format!(
+        r#"{{"nibble":{},"kind":"{}","hash":"{}"}}"#,
+        child.nibble,
+        kind,
+        hex::encode(child.hash)
+    )
+}
+
+fn encode_nibble_path(path: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(path.len());
+    for nibble in path {
+        out.push(HEX[usize::from(*nibble & 0x0F)] as char);
+    }
+    out
 }
 
 /// `indra_sendTransaction` — submit a hex-encoded signed transaction.

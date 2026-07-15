@@ -17,11 +17,11 @@ use std::collections::HashSet;
 use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    types::primitives::Bytes32,
+    types::primitives::{compressed_auth_tree_active, Bytes32},
 };
 use indra_crypto::sha256;
 
-use crate::smt::{MerkleProof, SparseMerkleTree};
+use crate::smt::{AuthTreeProof, CompressedAuthTree, MerkleProof, SparseMerkleTree};
 
 /// Defensive snapshot decode ceiling for spent nullifiers.
 ///
@@ -37,11 +37,14 @@ pub const MAX_NULLIFIERS_DECODE: usize = 1_000_000;
 pub struct NullifierSet {
     spent: HashSet<Bytes32>,
     smt: SparseMerkleTree,
+    compressed: CompressedAuthTree,
 }
 
 impl PartialEq for NullifierSet {
     fn eq(&self, other: &Self) -> bool {
-        self.spent == other.spent && self.smt.root() == other.smt.root()
+        self.spent == other.spent
+            && self.smt.root() == other.smt.root()
+            && self.compressed.root() == other.compressed.root()
     }
 }
 
@@ -81,6 +84,7 @@ impl Decode for NullifierSet {
             }
             set.smt.insert(nullifier.0, sha256(&nullifier.0));
         }
+        set.rebuild_compressed_cache();
         Ok(set)
     }
 }
@@ -91,6 +95,7 @@ impl NullifierSet {
         Self {
             spent: HashSet::new(),
             smt: SparseMerkleTree::new(),
+            compressed: CompressedAuthTree::new(),
         }
     }
 
@@ -120,6 +125,7 @@ impl NullifierSet {
         let inserted = self.spent.insert(nullifier);
         if inserted {
             self.smt.insert(nullifier.0, sha256(&nullifier.0));
+            self.compressed.insert(nullifier.0, sha256(&nullifier.0));
         }
         inserted
     }
@@ -142,9 +148,37 @@ impl NullifierSet {
         self.smt.root()
     }
 
+    /// Consensus root for all spent nullifiers under the root rule active at `height`.
+    pub fn root_at_height(&self, height: u64) -> [u8; 32] {
+        if compressed_auth_tree_active(height) {
+            self.compressed.root()
+        } else {
+            self.smt.root()
+        }
+    }
+
     /// Inclusion or exclusion proof for a nullifier.
     pub fn prove(&self, nullifier: &Bytes32) -> MerkleProof {
         self.smt.prove(nullifier.0)
+    }
+
+    /// Versioned proof under the proof rule active at `height`.
+    pub fn prove_at_height(&self, nullifier: &Bytes32, height: u64) -> AuthTreeProof {
+        if compressed_auth_tree_active(height) {
+            AuthTreeProof::V2Compressed(self.compressed.prove(nullifier.0))
+        } else {
+            AuthTreeProof::V1LegacySparse(self.smt.prove(nullifier.0))
+        }
+    }
+
+    fn rebuild_compressed_cache(&mut self) {
+        self.compressed = CompressedAuthTree::from_pairs(
+            self.spent
+                .iter()
+                .copied()
+                .map(|nullifier| (nullifier.0, sha256(&nullifier.0))),
+        )
+        .expect("nullifiers are unique in NullifierSet");
     }
 }
 
@@ -254,6 +288,30 @@ mod tests {
             set.root(),
             missing.0,
             &excluded
+        ));
+    }
+
+    #[test]
+    fn compressed_auth_tree_roots_and_proofs_switch_only_at_activation_height() {
+        let mut set = NullifierSet::new();
+        let present = nullifier(0x35);
+        set.insert(present);
+
+        assert_eq!(set.root_at_height(u64::MAX - 1), set.root());
+        assert!(matches!(
+            set.prove_at_height(&present, u64::MAX - 1),
+            AuthTreeProof::V1LegacySparse(_)
+        ));
+
+        let compressed_root = set.root_at_height(u64::MAX);
+        assert_ne!(compressed_root, set.root());
+        let AuthTreeProof::V2Compressed(proof) = set.prove_at_height(&present, u64::MAX) else {
+            panic!("expected compressed proof at activation");
+        };
+        assert!(CompressedAuthTree::verify_proof(
+            compressed_root,
+            present.0,
+            &proof
         ));
     }
 }

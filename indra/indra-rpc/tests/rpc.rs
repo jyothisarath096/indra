@@ -6,7 +6,9 @@ use indra_core::types::{
     crypto::HybridPubKey,
     governance::{GovernableAction, ProposalTier},
     primitives::{Bytes32, VariableBytes},
+    transaction::OutputV1,
 };
+use indra_core::CommitmentV1;
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_rpc::types::parse_request;
 use indra_rpc::{
@@ -68,6 +70,21 @@ fn decode_hex32(hex_value: &str) -> [u8; 32] {
     out
 }
 
+fn dummy_output(byte: u8) -> OutputV1 {
+    OutputV1 {
+        value_spark: 1_000 + byte as u64,
+        commitment: CommitmentV1 {
+            compressed_point: Bytes32::from([byte; 32]),
+        },
+        owner_pubkey: HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+        },
+        range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+        lock_height: 0,
+    }
+}
+
 #[test]
 fn rpc_get_height() {
     let e = engine("rpc_h");
@@ -81,6 +98,30 @@ fn rpc_get_tip() {
     let resp = call_rpc("indra_getTip", &[], &e);
     assert!(resp.contains("\"tip_hash\""));
     assert!(resp.contains("\"height\""));
+}
+
+#[test]
+fn rpc_get_utxo_proof_reports_versioned_shape_before_and_after_compressed_activation() {
+    let mut legacy = engine("rpc_utxo_proof_legacy");
+    let id = legacy.utxos.insert(dummy_output(0xB1), 1, 0, 0).unwrap();
+    let legacy_resp = call_rpc(
+        "indra_getUtxoProof",
+        &[format!(r#""{}""#, hex::encode(id.0))],
+        &legacy,
+    );
+    assert!(legacy_resp.contains(r#""proof_version":"legacy-smt-v1""#));
+    assert!(legacy_resp.contains(r#""siblings":["#));
+
+    let mut compressed = legacy.clone();
+    compressed.height = u64::MAX;
+    let compressed_resp = call_rpc(
+        "indra_getUtxoProof",
+        &[format!(r#""{}""#, hex::encode(id.0))],
+        &compressed,
+    );
+    assert!(compressed_resp.contains(r#""proof_version":"compressed-auth-tree-v2""#));
+    assert!(compressed_resp.contains(r#""terminal":"#));
+    assert!(compressed_resp.contains(r#""steps":["#));
 }
 
 #[test]
