@@ -490,6 +490,22 @@ pub mod hard_forks {
     /// rule at an arbitrary, meaningless point in mainnet's own history rather
     /// than from genesis.
     pub const GOVERNANCE_PROPOSAL_PRUNING_HEIGHT: u64 = 97_000;
+
+    /// Incremental validator/delegation/staking state commitment.
+    ///
+    /// At/after this height, block headers use StateCommitmentV2 for the
+    /// validator/delegation/staking commitment instead of rebuilding the legacy
+    /// sorted-vector validator-set Merkle root on every block. The canonical
+    /// state maps remain the source of truth; the commitment cache is rebuilt
+    /// deterministically from them on startup/snapshot load.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
+    /// with no per-chain-ID differentiation. It is intentionally unscheduled
+    /// until a coordinated deployment height is chosen. Before building mainnet
+    /// genesis, this MUST be deliberately reset (almost certainly to 0 if the
+    /// rule should be active from mainnet's first block). It will NOT
+    /// automatically differ between testnet and mainnet.
+    pub const STATE_COMMITMENT_V2_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -552,6 +568,13 @@ pub fn registered_validator_cap_active(height: u64) -> bool {
 #[inline]
 pub fn governance_proposal_pruning_active(height: u64) -> bool {
     height >= hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
+}
+
+/// Whether validator/delegation/staking state uses the incremental
+/// StateCommitmentV2 root rule.
+#[inline]
+pub fn state_commitment_v2_active(height: u64) -> bool {
+    height >= hard_forks::STATE_COMMITMENT_V2_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

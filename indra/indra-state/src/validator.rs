@@ -1399,6 +1399,14 @@ impl DelegationMap {
         self.delegators.iter()
     }
 
+    /// Test/benchmark-only direct insertion helper for constructing very large
+    /// synthetic delegation maps without making setup O(n²) through the normal
+    /// live add path.
+    #[cfg(test)]
+    pub(crate) fn push_delegator_for_test(&mut self, validator_id: Bytes32, entry: DelegatorEntry) {
+        self.delegators.entry(validator_id).or_default().push(entry);
+    }
+
     /// Mutable access to delegators for a validator.
     pub fn get_delegators_mut(
         &mut self,

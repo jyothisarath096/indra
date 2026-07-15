@@ -45,6 +45,7 @@ pub mod governance;
 pub mod governance_apply;
 pub mod nullifier;
 pub mod smt;
+pub mod state_commitment;
 pub mod state_root;
 pub mod utxo;
 pub mod validator;
@@ -59,6 +60,7 @@ pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalR
 pub use governance_apply::apply_governance_op;
 pub use nullifier::NullifierSet;
 pub use smt::{MerkleProof, SparseMerkleTree, SMT_DEPTH};
+pub use state_commitment::StateCommitmentV2;
 pub use state_root::{compute_state_root, compute_validator_set_root};
 pub use utxo::{UtxoEntry, UtxoSet};
 pub use validator::{DelegationReturnEvent, DelegationReturnReason, DelegatorEntry};

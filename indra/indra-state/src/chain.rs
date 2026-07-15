@@ -9,13 +9,14 @@ use indra_core::error::IndraResult;
 use std::collections::{BTreeMap, HashSet};
 
 use indra_core::types::primitives::{
-    Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
-    MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
+    state_commitment_v2_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK,
+    INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
 };
 
 use crate::{
     governance::GovernanceState,
     nullifier::NullifierSet,
+    state_commitment::StateCommitmentV2,
     utxo::UtxoSet,
     validator::{
         decode_delegation_return_events, delegation_return_events_encoded_len,
@@ -92,6 +93,16 @@ pub struct ChainState {
     /// This is consensus-visible after the registered-validator-cap activation
     /// so delegators can discover forced returns caused by validator eviction.
     pub delegation_return_events: Vec<DelegationReturnEvent>,
+
+    /// Derived, non-authoritative StateCommitmentV2 cache.
+    ///
+    /// This is intentionally not encoded in snapshots. Canonical maps above
+    /// remain the only persisted consensus state; the cache is rebuilt from
+    /// them on decode/startup or before the first post-activation mutation.
+    /// This task does not solve three separate scale costs: full-state clone
+    /// during projected block application, linear per-validator delegation Vec
+    /// lookup, or the O(touched delegators) reward distribution pass.
+    pub state_commitment_v2: Option<StateCommitmentV2>,
 
     /// Transient fee burns accumulated for the current epoch summary.
     /// Not encoded and not included in consensus state roots.
@@ -193,6 +204,7 @@ impl Decode for ChainState {
             } else {
                 Vec::new()
             },
+            state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -223,6 +235,7 @@ impl ChainState {
             applied_slash_hashes: HashSet::new(),
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
+            state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -255,6 +268,7 @@ impl ChainState {
             },
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
+            state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
@@ -283,10 +297,33 @@ impl ChainState {
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
+            state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
         })
+    }
+
+    /// Ensure the derived StateCommitmentV2 cache exists when the V2 root rule
+    /// is active at `height`.
+    pub fn ensure_state_commitment_v2(&mut self, height: u64) {
+        if state_commitment_v2_active(height) && self.state_commitment_v2.is_none() {
+            self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
+        }
+    }
+
+    /// Rebuild the derived StateCommitmentV2 cache from canonical state.
+    pub fn rebuild_state_commitment_v2(&mut self, height: u64) {
+        self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
+    }
+
+    /// Return the StateCommitmentV2 root, rebuilding from canonical state if
+    /// this decoded/restarted state does not yet have a warm cache.
+    pub fn state_commitment_v2_root(&self, height: u64) -> Bytes32 {
+        self.state_commitment_v2
+            .as_ref()
+            .map(StateCommitmentV2::root)
+            .unwrap_or_else(|| StateCommitmentV2::from_state(self, height).root())
     }
 
     /// Current epoch number (0-indexed).
@@ -302,13 +339,21 @@ impl ChainState {
     /// Append a delegation-return event and prune the oldest entries if the
     /// fixed global retention bound is exceeded.
     pub fn push_delegation_return_event(&mut self, event: DelegationReturnEvent) {
+        if let Some(commitment) = self.state_commitment_v2.as_mut() {
+            commitment.put_delegation_return_event(&event);
+        }
         self.delegation_return_events.push(event);
         let excess = self
             .delegation_return_events
             .len()
             .saturating_sub(MAX_DELEGATION_RETURN_EVENTS);
         if excess > 0 {
-            self.delegation_return_events.drain(0..excess);
+            let removed: Vec<_> = self.delegation_return_events.drain(0..excess).collect();
+            if let Some(commitment) = self.state_commitment_v2.as_mut() {
+                for event in &removed {
+                    commitment.delete_delegation_return_event(event);
+                }
+            }
         }
     }
 }

@@ -153,7 +153,7 @@ pub fn apply_staking_op(
         StakingOpBody::SetAutoDelegate {
             validator_id,
             target_validator_id,
-        } => apply_set_auto_delegate(state, *validator_id, *target_validator_id),
+        } => apply_set_auto_delegate(state, *validator_id, *target_validator_id, current_height),
         StakingOpBody::UpdateNetworkAddress {
             validator_id,
             network_addr,
@@ -179,6 +179,9 @@ pub fn apply_staking_op(
 
     result?;
     state.staking_nonces.insert(signer_id, op.nonce);
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_staking_nonce(&signer_id, op.nonce);
+    }
     Ok(())
 }
 
@@ -380,19 +383,23 @@ fn apply_register_validator(
         network_addr: None,
         network_addr_last_updated_epoch: None,
     };
-    state.validators.upsert(entry)?;
-    state.staked_bonds.insert(
-        bond_utxo_id,
-        StakeBondEntry {
-            utxo_id: bond_utxo_id,
-            validator_id,
-            delegator_id: validator_id,
-            amount_spark,
-            bonded_epoch: epoch_for_height(current_height),
-            unbonding_end_epoch: None,
-            original_output,
-        },
-    );
+    state.validators.upsert(entry.clone())?;
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_validator(&entry, current_height);
+    }
+    let bond = StakeBondEntry {
+        utxo_id: bond_utxo_id,
+        validator_id,
+        delegator_id: validator_id,
+        amount_spark,
+        bonded_epoch: epoch_for_height(current_height),
+        unbonding_end_epoch: None,
+        original_output,
+    };
+    state.staked_bonds.insert(bond_utxo_id, bond.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_staked_bond(&bond_utxo_id, &bond);
+    }
     Ok(())
 }
 
@@ -429,6 +436,11 @@ fn evict_validator_for_registry_replacement(
         .cloned()
         .ok_or(StateError::ValidatorNotFound)?;
     let delegators = state.delegations.take_delegators(&validator_id);
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        for entry in &delegators {
+            commitment.delete_delegator(&validator_id, &entry.delegator_id);
+        }
+    }
 
     if validator.pending_rewards > 0 {
         payout_or_burn_pending_reward(
@@ -481,6 +493,9 @@ fn evict_validator_for_registry_replacement(
     bond_ids.sort_by_key(|id| id.0);
     for bond_id in bond_ids {
         if let Some(bond) = state.staked_bonds.remove(&bond_id) {
+            if let Some(commitment) = state.state_commitment_v2.as_mut() {
+                commitment.delete_staked_bond(&bond_id);
+            }
             let output = crate::epoch::released_bond_output(&bond, current_height)?;
             let output_index =
                 u32::try_from(state.utxos.len()).unwrap_or(u32::MAX.saturating_sub(1));
@@ -504,6 +519,9 @@ fn evict_validator_for_registry_replacement(
     }
 
     state.validators.remove(&validator_id);
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.delete_validator(&validator_id);
+    }
     eprintln!(
         "[staking] evicted validator {} from full registry and returned {} delegation entries",
         hex::encode(&validator_id.0[..4]),
@@ -655,23 +673,34 @@ fn apply_delegate(
     let original_output = utxo_entry.output;
     let _ = state.utxos.spend(&bond_utxo_id);
 
-    state.staked_bonds.insert(
-        bond_utxo_id,
-        StakeBondEntry {
-            utxo_id: bond_utxo_id,
-            validator_id: *validator_id,
-            delegator_id,
-            amount_spark,
-            bonded_epoch: current_epoch,
-            unbonding_end_epoch: None,
-            original_output,
-        },
-    );
+    let bond = StakeBondEntry {
+        utxo_id: bond_utxo_id,
+        validator_id: *validator_id,
+        delegator_id,
+        amount_spark,
+        bonded_epoch: current_epoch,
+        unbonding_end_epoch: None,
+        original_output,
+    };
+    state.staked_bonds.insert(bond_utxo_id, bond.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_staked_bond(&bond_utxo_id, &bond);
+    }
 
     state
         .delegations
         .add_delegation(*validator_id, delegator_id, amount_spark, current_epoch)
         .map_err(|reason| StateError::InvalidStakingOp(reason.into()))?;
+    if let (Some(commitment), Some(delegator)) = (
+        state.state_commitment_v2.as_mut(),
+        state
+            .delegations
+            .get_delegators(validator_id)
+            .iter()
+            .find(|entry| entry.delegator_id == delegator_id),
+    ) {
+        commitment.put_delegator(validator_id, delegator);
+    }
 
     Ok(())
 }
@@ -713,11 +742,26 @@ fn apply_undelegate(
     let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
     bond.unbonding_end_epoch = Some(unbonding_end);
     let amount_spark = bond.amount_spark;
+    let updated_bond = bond.clone();
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
+    }
 
     state
         .delegations
         .begin_undelegate(validator_id, &delegator_id, amount_spark, unbonding_end)
-        .map_err(|e| StateError::InvalidStakingOp(e.into()))
+        .map_err(|e| StateError::InvalidStakingOp(e.into()))?;
+    if let (Some(commitment), Some(delegator)) = (
+        state.state_commitment_v2.as_mut(),
+        state
+            .delegations
+            .get_delegators(validator_id)
+            .iter()
+            .find(|entry| entry.delegator_id == delegator_id),
+    ) {
+        commitment.put_delegator(validator_id, delegator);
+    }
+    Ok(())
 }
 
 /// Bond a validator-owned UTXO as validator self-stake.
@@ -775,20 +819,28 @@ fn apply_self_stake(
     let current_epoch = epoch_for_height(current_height);
     let original_output = utxo_entry.output;
     let _ = state.utxos.spend(&bond_utxo_id);
-    state.staked_bonds.insert(
-        bond_utxo_id,
-        StakeBondEntry {
-            utxo_id: bond_utxo_id,
-            validator_id,
-            delegator_id: validator_id,
-            amount_spark,
-            bonded_epoch: current_epoch,
-            unbonding_end_epoch: None,
-            original_output,
-        },
-    );
+    let bond = StakeBondEntry {
+        utxo_id: bond_utxo_id,
+        validator_id,
+        delegator_id: validator_id,
+        amount_spark,
+        bonded_epoch: current_epoch,
+        unbonding_end_epoch: None,
+        original_output,
+    };
+    state.staked_bonds.insert(bond_utxo_id, bond.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_staked_bond(&bond_utxo_id, &bond);
+    }
+    let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
         v.stake_spark = v.stake_spark.saturating_add(amount_spark);
+        updated_validator = Some(v.clone());
+    }
+    if let (Some(commitment), Some(validator)) =
+        (state.state_commitment_v2.as_mut(), updated_validator)
+    {
+        commitment.put_validator(&validator, current_height);
     }
     Ok(())
 }
@@ -836,6 +888,11 @@ fn apply_self_unstake(
     let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
     let amount_spark = bond.amount_spark;
     bond.unbonding_end_epoch = Some(unbonding_end);
+    let updated_bond = bond.clone();
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
+    }
+    let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
         v.stake_spark = v.stake_spark.saturating_sub(amount_spark);
         if matches!(v.status, ValidatorStatus::Active)
@@ -849,6 +906,12 @@ fn apply_self_unstake(
             );
             v.status = ValidatorStatus::Registered;
         }
+        updated_validator = Some(v.clone());
+    }
+    if let (Some(commitment), Some(validator)) =
+        (state.state_commitment_v2.as_mut(), updated_validator)
+    {
+        commitment.put_validator(&validator, current_height);
     }
     Ok(())
 }
@@ -892,14 +955,24 @@ fn apply_claim_rewards(
         )));
     }
     if claim_from_validator {
+        let mut updated_validator = None;
         if let Some(validator) = state.validators.get_mut(validator_id) {
             validator.pending_rewards = 0;
+            updated_validator = Some(validator.clone());
+        }
+        if let (Some(commitment), Some(validator)) =
+            (state.state_commitment_v2.as_mut(), updated_validator)
+        {
+            commitment.put_validator(&validator, current_height);
         }
     } else if let Some(entry) = state
         .delegations
         .get_delegator_mut(validator_id, &delegator_id)
     {
         entry.pending_rewards = 0;
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_delegator(validator_id, entry);
+        }
     }
 
     let mut blinding_input = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
@@ -972,6 +1045,10 @@ fn apply_set_commission(
         epoch_for_height(current_height).saturating_add(COMMISSION_CHANGE_DELAY_EPOCHS);
     validator.pending_commission_bps = Some(pending);
     validator.pending_commission_effective_epoch = Some(effective_epoch);
+    let updated_validator = validator.clone();
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_validator(&updated_validator, current_height);
+    }
     eprintln!(
         "[staking] validator {} commission change staged: {}bps effective_epoch={}",
         hex::encode(&validator_id.0[..4]),
@@ -985,6 +1062,7 @@ fn apply_set_auto_delegate(
     state: &mut ChainState,
     validator_id: Bytes32,
     target_validator_id: Bytes32,
+    current_height: u64,
 ) -> StateResult<()> {
     let validator = state
         .validators
@@ -999,8 +1077,15 @@ fn apply_set_auto_delegate(
     }
 
     if target_validator_id == Bytes32::ZERO {
+        let mut updated_validator = None;
         if let Some(v) = state.validators.get_mut(&validator_id) {
             v.auto_delegate_to = None;
+            updated_validator = Some(v.clone());
+        }
+        if let (Some(commitment), Some(validator)) =
+            (state.state_commitment_v2.as_mut(), updated_validator)
+        {
+            commitment.put_validator(&validator, current_height);
         }
         return Ok(());
     }
@@ -1017,6 +1102,10 @@ fn apply_set_auto_delegate(
 
     if let Some(v) = state.validators.get_mut(&validator_id) {
         v.auto_delegate_to = Some(target_validator_id);
+        let updated_validator = v.clone();
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_validator(&updated_validator, current_height);
+        }
     }
     Ok(())
 }
@@ -1055,6 +1144,10 @@ fn apply_update_network_address(
     }
     validator.network_addr = network_addr;
     validator.network_addr_last_updated_epoch = Some(current_epoch);
+    let updated_validator = validator.clone();
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_validator(&updated_validator, current_height);
+    }
     Ok(())
 }
 

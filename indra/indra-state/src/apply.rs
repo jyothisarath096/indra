@@ -261,16 +261,23 @@ fn apply_slash_at_height_with_accounting(
     let mut total_bond_slashed: u64 = 0;
     let mut active_bond_slashed: u64 = 0;
     for bond_id in &bond_ids {
-        if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
+        let updated_bond = if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
             let bond_slash = bps(bond.amount_spark, slash_bps);
             if bond.unbonding_end_epoch.is_none() {
                 active_bond_slashed = active_bond_slashed.saturating_add(bond_slash);
             }
             bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
             total_bond_slashed = total_bond_slashed.saturating_add(bond_slash);
+            Some(bond.clone())
+        } else {
+            None
+        };
+        if let (Some(commitment), Some(bond)) = (state.state_commitment_v2.as_mut(), updated_bond) {
+            commitment.put_staked_bond(bond_id, &bond);
         }
     }
 
+    let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
         let stake_slash = if slashable_bond_stake > 0 {
             active_bond_slashed
@@ -279,6 +286,12 @@ fn apply_slash_at_height_with_accounting(
         };
         v.stake_spark = v.stake_spark.saturating_sub(stake_slash);
         v.status = ValidatorStatus::Slashed;
+        updated_validator = Some(v.clone());
+    }
+    if let (Some(commitment), Some(validator)) =
+        (state.state_commitment_v2.as_mut(), updated_validator)
+    {
+        commitment.put_validator(&validator, height);
     }
 
     let reporter_reward = if potential_reporter_reward >= DUST_LIMIT_SPARK {
@@ -300,6 +313,9 @@ fn apply_slash_at_height_with_accounting(
     let burned = slash_amount.saturating_sub(reporter_reward);
     state.total_supply = state.total_supply.saturating_sub(burned);
     state.applied_slash_hashes.insert(evidence_hash);
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_slash_hash(&evidence_hash);
+    }
 
     eprintln!(
         "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
@@ -630,6 +646,8 @@ fn apply_block_inner(
 
     // ── Phase 3: State mutation (all validation passed) ───────────────────
 
+    state.ensure_state_commitment_v2(block.header.height);
+
     // Apply each transaction
     for (tx_idx, tx) in block.transactions.iter().enumerate() {
         apply_transaction(state, tx, block.header.height, tx_idx as u32)?;
@@ -720,9 +738,18 @@ fn update_last_active_epoch_from_block_qc(state: &mut ChainState, block: &BlockV
     };
 
     let current_epoch = epoch_for_height(block.header.height);
+    let mut changed = Vec::new();
     for signature in qc.pq_signatures {
         if let Some(validator) = state.validators.get_mut(&signature.validator_id) {
             validator.last_active_epoch = current_epoch;
+            changed.push(signature.validator_id);
+        }
+    }
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        for validator_id in changed {
+            if let Some(validator) = state.validators.get(&validator_id) {
+                commitment.put_validator(validator, block.header.height);
+            }
         }
     }
 }

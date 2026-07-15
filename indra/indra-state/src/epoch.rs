@@ -20,11 +20,12 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, governance_proposal_pruning_active, muldiv, overflow_fix_active, Bytes32,
-            VariableBytes, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
-            ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
-            ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS,
-            SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
+            bps_of, governance_proposal_pruning_active, muldiv, overflow_fix_active,
+            state_commitment_v2_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
+            EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+            ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+            HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN,
+            STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -188,6 +189,9 @@ pub fn apply_epoch_transition_at_height(
     state.epoch_fees_burned = 0;
     state.epoch_slashed_spark = 0;
     state.epoch_slash_event_count = 0;
+    if state_commitment_v2_active(height) {
+        state.rebuild_state_commitment_v2(height);
+    }
     Ok(record)
 }
 

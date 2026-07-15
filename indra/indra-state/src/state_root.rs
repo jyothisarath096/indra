@@ -12,8 +12,8 @@
 use indra_core::{
     codec::Encode,
     types::primitives::{
-        registered_validator_cap_active, validator_network_address_active, Bytes32, VariableBytes,
-        MAX_CHAIN_ID_BYTES,
+        registered_validator_cap_active, state_commitment_v2_active,
+        validator_network_address_active, Bytes32, VariableBytes, MAX_CHAIN_ID_BYTES,
     },
 };
 use indra_crypto::sha256;
@@ -60,6 +60,17 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
 /// must reproduce the exact pre-v4 validator preimage; emitting `false`
 /// presence bits for the new fields would still change old committed roots.
 pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> Bytes32 {
+    if state_commitment_v2_active(height) {
+        return state.state_commitment_v2_root(height);
+    }
+
+    compute_legacy_validator_set_root_at_height(state, height)
+}
+
+pub(crate) fn compute_legacy_validator_set_root_at_height(
+    state: &ChainState,
+    height: u64,
+) -> Bytes32 {
     let include_network_addr = validator_network_address_active(height);
     let mut leaves: Vec<(Vec<u8>, [u8; 32])> = state
         .validators
@@ -225,7 +236,10 @@ mod tests {
     use indra_core::{
         types::{
             primitives::{
-                hard_forks::{REGISTERED_VALIDATOR_CAP_HEIGHT, VALIDATOR_NETWORK_ADDRESS_HEIGHT},
+                hard_forks::{
+                    REGISTERED_VALIDATOR_CAP_HEIGHT, STATE_COMMITMENT_V2_HEIGHT,
+                    VALIDATOR_NETWORK_ADDRESS_HEIGHT,
+                },
                 DUST_LIMIT_SPARK,
             },
             transaction::OutputV1,
@@ -237,6 +251,7 @@ mod tests {
     use crate::validator::{
         DelegationReturnEvent, DelegationReturnReason, ValidatorEntry, ValidatorStatus,
     };
+    use crate::StateCommitmentV2;
 
     use super::*;
 
@@ -459,6 +474,52 @@ mod tests {
         assert_ne!(
             compute_validator_set_root(&at_activation_empty),
             compute_validator_set_root(&at_activation)
+        );
+    }
+
+    #[test]
+    fn state_commitment_v2_root_switches_only_at_activation() {
+        let mut state = ChainState::new_genesis();
+        let validator = validator_fixture();
+        state.validators.upsert(validator).unwrap();
+
+        let pre_activation = STATE_COMMITMENT_V2_HEIGHT.saturating_sub(1);
+        state.height = pre_activation;
+        assert_eq!(
+            compute_validator_set_root_at_height(&state, pre_activation),
+            compute_legacy_validator_set_root_at_height(&state, pre_activation),
+            "pre-activation validator root must remain byte-identical to legacy"
+        );
+
+        let activation = STATE_COMMITMENT_V2_HEIGHT;
+        state.height = activation;
+        state.rebuild_state_commitment_v2(activation);
+        assert_eq!(
+            compute_validator_set_root_at_height(&state, activation),
+            state.state_commitment_v2_root(activation),
+            "at activation the validator root must switch to StateCommitmentV2"
+        );
+    }
+
+    #[test]
+    fn state_commitment_v2_replay_style_rebuild_matches_warm_cache() {
+        let activation = STATE_COMMITMENT_V2_HEIGHT;
+        let mut continuous = ChainState::new_genesis();
+        continuous.height = activation;
+        continuous.validators.upsert(validator_fixture()).unwrap();
+        continuous.rebuild_state_commitment_v2(activation);
+        let warm_root = compute_validator_set_root(&continuous);
+
+        let mut replayed = continuous.clone();
+        replayed.state_commitment_v2 = None;
+        assert_eq!(
+            compute_validator_set_root(&replayed),
+            warm_root,
+            "a restarted/replayed state with no persisted cache must rebuild the same V2 root"
+        );
+        assert_eq!(
+            StateCommitmentV2::from_state(&replayed, activation).root(),
+            warm_root
         );
     }
 

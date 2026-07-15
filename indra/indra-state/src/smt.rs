@@ -45,7 +45,7 @@ struct NodeLoc {
 }
 
 /// Sparse Merkle Tree with a 256-bit key space.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SparseMerkleTree {
     leaves: HashMap<[u8; 32], [u8; 32]>,
     nodes: HashMap<NodeLoc, [u8; 32]>,
@@ -66,13 +66,13 @@ impl SparseMerkleTree {
     /// Insert or replace a leaf.
     pub fn insert(&mut self, key: [u8; 32], value: [u8; 32]) {
         self.leaves.insert(key, value);
-        self.recompute();
+        self.update_path(key);
     }
 
     /// Delete a leaf if it exists.
     pub fn delete(&mut self, key: [u8; 32]) {
         self.leaves.remove(&key);
-        self.recompute();
+        self.update_path(key);
     }
 
     /// Current root hash.
@@ -132,6 +132,7 @@ impl SparseMerkleTree {
         acc == root
     }
 
+    #[cfg(test)]
     fn recompute(&mut self) {
         // DETERMINISM SAFETY: This function uses HashMap internally for
         // intermediate node storage. The computed root is order-insensitive
@@ -207,6 +208,71 @@ impl SparseMerkleTree {
             })
             .copied()
             .unwrap_or_else(|| empty_hashes.first().copied().unwrap_or([0u8; 32]));
+    }
+
+    fn update_path(&mut self, key: [u8; 32]) {
+        let empty_hashes = empty_hashes();
+        let mut acc = self
+            .leaves
+            .get(&key)
+            .map(|value| hash_leaf(&key, value))
+            .unwrap_or_else(|| empty_hashes.get(SMT_DEPTH).copied().unwrap_or([0u8; 32]));
+
+        let leaf_loc = NodeLoc {
+            depth: depth_from_bit(SMT_DEPTH),
+            prefix: key,
+        };
+        set_or_remove_node(
+            &mut self.nodes,
+            leaf_loc,
+            acc,
+            empty_hashes.get(SMT_DEPTH).copied().unwrap_or([0u8; 32]),
+        );
+
+        for bit_index in (0..SMT_DEPTH).rev() {
+            let child_depth = bit_index + 1;
+            let sibling_loc = NodeLoc {
+                depth: depth_from_bit(child_depth),
+                prefix: sibling_prefix(key, bit_index),
+            };
+            let sibling_hash = self
+                .nodes
+                .get(&sibling_loc)
+                .copied()
+                .unwrap_or_else(|| empty_hashes.get(child_depth).copied().unwrap_or([0u8; 32]));
+
+            acc = if bit_at(&key, bit_index) {
+                hash_internal(&sibling_hash, &acc)
+            } else {
+                hash_internal(&acc, &sibling_hash)
+            };
+
+            let parent_loc = NodeLoc {
+                depth: depth_from_bit(bit_index),
+                prefix: truncate_key(key, bit_index),
+            };
+            set_or_remove_node(
+                &mut self.nodes,
+                parent_loc,
+                acc,
+                empty_hashes.get(bit_index).copied().unwrap_or([0u8; 32]),
+            );
+        }
+
+        self.root = acc;
+    }
+}
+
+fn set_or_remove_node(
+    nodes: &mut HashMap<NodeLoc, [u8; 32]>,
+    loc: NodeLoc,
+    hash: [u8; 32],
+    empty_hash: [u8; 32],
+) {
+    if hash == empty_hash {
+        nodes.remove(&loc);
+    } else {
+        nodes.insert(loc, hash);
     }
 }
 
@@ -406,5 +472,58 @@ mod tests {
             b.root(),
             "SMT root must be identical regardless of deletion order"
         );
+    }
+
+    #[test]
+    fn incremental_insert_delete_matches_full_recompute_sequence() {
+        let mut incremental = SparseMerkleTree::new();
+        let mut full = SparseMerkleTree::new();
+
+        for i in 0u8..64 {
+            let k = key(i.wrapping_mul(17));
+            let v = value(i.wrapping_mul(31));
+            incremental.insert(k, v);
+            full.leaves.insert(k, v);
+            full.recompute();
+            assert_eq!(
+                incremental.root(),
+                full.root(),
+                "incremental insert must match full recompute at step {i}"
+            );
+        }
+
+        for i in (0u8..64).step_by(3) {
+            let k = key(i.wrapping_mul(17));
+            incremental.delete(k);
+            full.leaves.remove(&k);
+            full.recompute();
+            assert_eq!(
+                incremental.root(),
+                full.root(),
+                "incremental delete must match full recompute at step {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn proofs_verify_after_incremental_update_sequence() {
+        let mut smt = SparseMerkleTree::new();
+        let mut present = Vec::new();
+        for i in 0u8..32 {
+            let k = key(i.wrapping_mul(9));
+            smt.insert(k, value(i.wrapping_add(1)));
+            present.push(k);
+        }
+        for k in present.iter().step_by(4) {
+            smt.delete(*k);
+        }
+
+        for k in &present {
+            let proof = smt.prove(*k);
+            assert!(SparseMerkleTree::verify_proof(smt.root(), *k, &proof));
+        }
+        let absent = key(0xFE);
+        let proof = smt.prove(absent);
+        assert!(SparseMerkleTree::verify_proof(smt.root(), absent, &proof));
     }
 }
