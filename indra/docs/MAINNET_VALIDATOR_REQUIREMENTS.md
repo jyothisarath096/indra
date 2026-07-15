@@ -66,7 +66,10 @@ independent authorities for "who is active and how do I reach them."
 Operationally, DNS seed records should be generated from the current active
 validator set by querying `indra_getValidatorSet` and publishing active
 validators' non-null `network_addr` values. The DNS publishing script/service is
-out of scope for the protocol field itself, but the intended relationship is:
+out of scope for the protocol field itself. The operational publisher is
+documented in
+[`DNS_SEED_PUBLISHING_AUTOMATION.md`](DNS_SEED_PUBLISHING_AUTOMATION.md), and
+the intended relationship is:
 
 1. chain state records validator identity, active status, and `network_addr`;
 2. `indra_getValidatorSet` exposes those fields;

@@ -85,6 +85,9 @@ The intended relationship is:
 3. DNS seed publishing caches that current active-address set;
 4. PEX and persisted peer tables accelerate discovery after first contact.
 
+The operational publisher and its Cloudflare safety model are documented in
+[`DNS_SEED_PUBLISHING_AUTOMATION.md`](DNS_SEED_PUBLISHING_AUTOMATION.md).
+
 When DNSSEC is enabled, it authenticates the DNS cache contents. It does not
 replace the requirement that the cache be generated from current on-chain
 validator state.
