@@ -9,7 +9,12 @@ use std::{
     str::FromStr,
 };
 
-use hickory_resolver::{config::ResolveHosts, proto::rr::RecordType, Resolver};
+use hickory_resolver::{
+    config::{ResolveHosts, ResolverConfig, CLOUDFLARE},
+    net::runtime::TokioRuntimeProvider,
+    proto::{dnssec::Proof, rr::RecordType},
+    Resolver,
+};
 use indra_core::types::primitives::{DNS_SEED_HOSTS, MAX_PEER_LIST_SIZE};
 use indra_network::PeerListEntry;
 
@@ -95,6 +100,9 @@ pub enum DnsSeedValidationStatus {
     Unsigned,
     /// DNSSEC validation failed or the answer could not be authenticated.
     Bogus,
+    /// The resolver could not determine whether the answer should have been
+    /// signed, usually because required DNSSEC metadata was unavailable.
+    Indeterminate,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +258,7 @@ fn dnssec_status_label(status: DnsSeedValidationStatus) -> &'static str {
         DnsSeedValidationStatus::Secure => "secure",
         DnsSeedValidationStatus::Unsigned => "unsigned",
         DnsSeedValidationStatus::Bogus => "bogus",
+        DnsSeedValidationStatus::Indeterminate => "indeterminate",
     }
 }
 
@@ -307,12 +316,16 @@ async fn resolve_seed_with_hickory_dnssec_async(
             status: DnsSeedValidationStatus::Unchecked,
         });
     }
-    let mut builder = Resolver::builder_tokio().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("DNS resolver configuration failed: {e}"),
-        )
-    })?;
+    // Seed DNSSEC validation must not depend on each validator host's
+    // `/etc/resolv.conf`. Hickory's `builder_tokio()` intentionally uses the
+    // operating-system resolver configuration, which may point at a local or
+    // provider resolver that strips DNSSEC metadata. For seed trust decisions we
+    // query the same DNSSEC-capable Cloudflare resolver used by the operational
+    // verification runbooks, then let Hickory validate the returned records.
+    let mut builder = Resolver::builder_with_config(
+        dnssec_seed_resolver_config(),
+        TokioRuntimeProvider::default(),
+    );
     {
         let opts = builder.options_mut();
         opts.validate = true;
@@ -329,6 +342,8 @@ async fn resolve_seed_with_hickory_dnssec_async(
     let mut addrs = Vec::new();
     let mut saw_unsigned_answer = false;
     let mut saw_secure_answer = false;
+    let mut saw_bogus_answer = false;
+    let mut saw_indeterminate_answer = false;
     let mut saw_lookup_error = false;
 
     let query_host = if host.ends_with('.') {
@@ -349,10 +364,12 @@ async fn resolve_seed_with_hickory_dnssec_async(
                 if ips.is_empty() {
                     continue;
                 }
-                if lookup_contains_rrsig(&lookup) {
-                    saw_secure_answer = true;
-                } else {
-                    saw_unsigned_answer = true;
+                match dnssec_status_for_lookup_answers(&lookup, record_type) {
+                    DnsSeedValidationStatus::Secure => saw_secure_answer = true,
+                    DnsSeedValidationStatus::Unsigned => saw_unsigned_answer = true,
+                    DnsSeedValidationStatus::Bogus => saw_bogus_answer = true,
+                    DnsSeedValidationStatus::Indeterminate => saw_indeterminate_answer = true,
+                    DnsSeedValidationStatus::Unchecked => {}
                 }
                 addrs.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port)));
             }
@@ -366,7 +383,11 @@ async fn resolve_seed_with_hickory_dnssec_async(
         }
     }
 
-    let status = if !addrs.is_empty() && saw_secure_answer && !saw_unsigned_answer {
+    let status = if saw_bogus_answer {
+        DnsSeedValidationStatus::Bogus
+    } else if saw_indeterminate_answer {
+        DnsSeedValidationStatus::Indeterminate
+    } else if !addrs.is_empty() && saw_secure_answer && !saw_unsigned_answer {
         DnsSeedValidationStatus::Secure
     } else if !addrs.is_empty() && saw_unsigned_answer {
         DnsSeedValidationStatus::Unsigned
@@ -381,13 +402,52 @@ async fn resolve_seed_with_hickory_dnssec_async(
     Ok(DnsSeedLookup { addrs, status })
 }
 
-fn lookup_contains_rrsig(lookup: &hickory_resolver::lookup::Lookup) -> bool {
-    lookup
-        .answers()
-        .iter()
-        .chain(lookup.authorities().iter())
-        .chain(lookup.additionals().iter())
-        .any(|record| record.record_type() == RecordType::RRSIG)
+fn dnssec_status_for_lookup_answers(
+    lookup: &hickory_resolver::lookup::Lookup,
+    record_type: RecordType,
+) -> DnsSeedValidationStatus {
+    dnssec_status_from_proofs(
+        lookup
+            .answers()
+            .iter()
+            .filter(move |record| record.record_type() == record_type)
+            .map(|record| record.proof),
+    )
+}
+
+fn dnssec_status_from_proofs<I>(proofs: I) -> DnsSeedValidationStatus
+where
+    I: IntoIterator<Item = Proof>,
+{
+    let mut saw_secure = false;
+    let mut saw_insecure = false;
+    let mut saw_bogus = false;
+    let mut saw_indeterminate = false;
+
+    for proof in proofs {
+        match proof {
+            Proof::Secure => saw_secure = true,
+            Proof::Insecure => saw_insecure = true,
+            Proof::Bogus => saw_bogus = true,
+            Proof::Indeterminate => saw_indeterminate = true,
+        }
+    }
+
+    if saw_bogus {
+        DnsSeedValidationStatus::Bogus
+    } else if saw_indeterminate {
+        DnsSeedValidationStatus::Indeterminate
+    } else if saw_insecure {
+        DnsSeedValidationStatus::Unsigned
+    } else if saw_secure {
+        DnsSeedValidationStatus::Secure
+    } else {
+        DnsSeedValidationStatus::Unsigned
+    }
+}
+
+fn dnssec_seed_resolver_config() -> ResolverConfig {
+    ResolverConfig::udp_and_tcp(&CLOUDFLARE)
 }
 
 fn split_host_port(addr_str: &str) -> io::Result<(String, u16)> {
@@ -658,6 +718,52 @@ mod tests {
             &[RecordType::A],
             "do not query AAAA for IPv4-only seed records; absent AAAA records in signed zones can produce DNSSEC negative-response errors that add no usable peers"
         );
+    }
+
+    #[test]
+    fn dnssec_status_uses_hickory_proof_not_rrsig_presence() {
+        assert_eq!(
+            dnssec_status_from_proofs([Proof::Secure]),
+            DnsSeedValidationStatus::Secure,
+            "Hickory stores DNSSEC validation on each answer record's Proof; a secure answer must not be downgraded just because the lookup sections do not expose a raw RRSIG record"
+        );
+    }
+
+    #[test]
+    fn dnssec_status_maps_hickory_proof_values() {
+        assert_eq!(
+            dnssec_status_from_proofs([Proof::Insecure]),
+            DnsSeedValidationStatus::Unsigned
+        );
+        assert_eq!(
+            dnssec_status_from_proofs([Proof::Bogus]),
+            DnsSeedValidationStatus::Bogus
+        );
+        assert_eq!(
+            dnssec_status_from_proofs([Proof::Indeterminate]),
+            DnsSeedValidationStatus::Indeterminate
+        );
+        assert_eq!(
+            dnssec_status_from_proofs([Proof::Secure, Proof::Bogus]),
+            DnsSeedValidationStatus::Bogus,
+            "a mixed answer is only as trustworthy as its weakest proof"
+        );
+    }
+
+    #[test]
+    fn dnssec_seed_resolver_uses_explicit_cloudflare_upstream() {
+        let config = dnssec_seed_resolver_config();
+        let upstreams: HashSet<_> = config
+            .name_servers()
+            .iter()
+            .map(|server| server.ip)
+            .collect();
+
+        assert!(
+            upstreams.contains(&"1.1.1.1".parse().unwrap()),
+            "DNSSEC seed validation should not depend on the validator host's system resolver"
+        );
+        assert!(upstreams.contains(&"1.0.0.1".parse().unwrap()));
     }
 
     #[tokio::test]
