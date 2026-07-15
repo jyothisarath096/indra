@@ -471,7 +471,7 @@ pub mod hard_forks {
     /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
     /// deliberately for mainnet genesis. Leaving `u64::MAX` here means this rule
     /// never activates on that network.
-    pub const REGISTERED_VALIDATOR_CAP_HEIGHT: u64 = u64::MAX;
+    pub const REGISTERED_VALIDATOR_CAP_HEIGHT: u64 = 97_000;
 
     /// Governance terminal-proposal pruning.
     ///
