@@ -9,7 +9,7 @@ use indra_core::types::primitives::MAX_ACTIVE_VALIDATORS;
 use indra_state::governance::MAX_ACTIVE_GOVERNANCE_PROPOSALS;
 use indra_storage::PruneConfig;
 
-use crate::discovery::DnsSeedValidationMode;
+use crate::discovery::{DnsSeedValidationMode, SignedDnsSeedValidationMode};
 
 /// All configuration for a running INDRA node.
 #[derive(Debug, Clone)]
@@ -55,6 +55,15 @@ pub struct NodeConfig {
 
     /// DNSSEC validation policy for DNS seed hostname responses.
     pub dns_seed_validation: DnsSeedValidationMode,
+
+    /// Signed DNS node-list validation policy.
+    pub dns_seed_signed_validation: SignedDnsSeedValidationMode,
+
+    /// ML-DSA-87 public key for signed DNS node-list verification.
+    ///
+    /// This key is the trust anchor for signed discovery and must be known
+    /// independently of DNS. DNS is only transport for the signed list.
+    pub dns_seed_signed_public_key: Option<Vec<u8>>,
 
     /// Path to peer table persistence file.
     pub peers_file: String,
@@ -118,6 +127,8 @@ impl NodeConfig {
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
             dns_seed_validation: DnsSeedValidationMode::DEFAULT,
+            dns_seed_signed_validation: SignedDnsSeedValidationMode::DEFAULT,
+            dns_seed_signed_public_key: None,
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
@@ -144,6 +155,8 @@ impl NodeConfig {
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
             dns_seed_validation: DnsSeedValidationMode::DEFAULT,
+            dns_seed_signed_validation: SignedDnsSeedValidationMode::DEFAULT,
+            dns_seed_signed_public_key: None,
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,
@@ -173,6 +186,8 @@ impl NodeConfig {
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
             dns_seed_validation: DnsSeedValidationMode::DEFAULT,
+            dns_seed_signed_validation: SignedDnsSeedValidationMode::DEFAULT,
+            dns_seed_signed_public_key: None,
             peers_file,
             snapshot_interval: 300,
             mempool_capacity: 5_000,

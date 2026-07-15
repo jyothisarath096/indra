@@ -15,6 +15,15 @@ class FakeCloudflare:
     def list_a_records(self, names):
         return []
 
+    def list_records(self, names, record_types):
+        return []
+
+    def create_record(self, record):
+        self.created.append(record)
+
+    def update_record(self, record_id, record):
+        self.updated.append((record_id, record))
+
     def create_a_record(self, record):
         self.created.append(record)
 
@@ -23,6 +32,17 @@ class FakeCloudflare:
 
     def delete_record(self, record_id):
         self.deleted.append(record_id)
+
+
+class FakeSigner:
+    def sign(self, addresses, seq):
+        self.addresses = list(addresses)
+        self.seq = seq
+        return dns.SignedSeedRecords(
+            root_txt=f"indradisc-root:v1 seq={seq} nodes=00 nodes_chunks=1 sig=11 sig_chunks=1",
+            node_chunks=[("_indra-seed-nodes-0-deadbeef", "abcdef")],
+            sig_chunks=[("_indra-seed-sig-0-feedface", "123456")],
+        )
 
 
 class DnsPublishSeedRecordsTests(unittest.TestCase):
@@ -168,6 +188,54 @@ class DnsPublishSeedRecordsTests(unittest.TestCase):
             self.assertEqual(dns.read_token_from_file(path), "secret-token")
         finally:
             os.unlink(path)
+
+    def test_signed_records_require_signing_credentials(self):
+        validator_set = {
+            "validators": [
+                {"validator_id": "a", "network_addr": "116.203.185.28:30303"},
+            ]
+        }
+
+        with self.assertRaises(dns.DnsPublishError):
+            dns.derive_desired_signed_txt_records(
+                validator_set,
+                ["seeds.indraprotocol.com"],
+                min_expected_validators=1,
+                seq=1,
+                signer=None,
+            )
+
+    def test_signed_records_construct_root_and_chunk_txt_records(self):
+        validator_set = {
+            "validators": [
+                {"validator_id": "a", "network_addr": "116.203.185.28:30303"},
+                {"validator_id": "b", "network_addr": "5.161.221.10:30303"},
+            ]
+        }
+        signer = FakeSigner()
+
+        records = dns.derive_desired_signed_txt_records(
+            validator_set,
+            ["seeds.indraprotocol.com"],
+            min_expected_validators=1,
+            seq=42,
+            signer=signer,
+        )
+
+        self.assertEqual(
+            signer.addresses,
+            ["116.203.185.28:30303", "5.161.221.10:30303"],
+        )
+        self.assertEqual(signer.seq, 42)
+        self.assertEqual({record.record_type for record in records}, {"TXT"})
+        self.assertIn(
+            ("seeds.indraprotocol.com", "indradisc-root:v1"),
+            {(record.name, record.content.split()[0]) for record in records},
+        )
+        self.assertIn(
+            "_indra-seed-nodes-0-deadbeef.seeds.indraprotocol.com",
+            {record.name for record in records},
+        )
 
 
 if __name__ == "__main__":

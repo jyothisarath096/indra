@@ -12,10 +12,14 @@ use std::{
 use hickory_resolver::{
     config::{ResolveHosts, ResolverConfig, CLOUDFLARE},
     net::runtime::TokioRuntimeProvider,
-    proto::{dnssec::Proof, rr::RecordType},
+    proto::{
+        dnssec::Proof,
+        rr::{RData, RecordType},
+    },
     Resolver,
 };
 use indra_core::types::primitives::{DNS_SEED_HOSTS, MAX_PEER_LIST_SIZE};
+use indra_crypto::{sha256, verify_pq, PqKeypair, PqPublicKey, PqSignature};
 use indra_network::PeerListEntry;
 
 /// DNS seeds currently publish IPv4 validator addresses only.
@@ -26,6 +30,47 @@ use indra_network::PeerListEntry;
 /// records and validator operations explicitly support IPv6 bootstrap
 /// addresses.
 const DNS_SEED_RECORD_TYPES: &[RecordType] = &[RecordType::A];
+
+/// Root record prefix for INDRA's signed DNS discovery list.
+///
+/// Ethereum EIP-1459 signs a compact secp256k1 root directly in one TXT
+/// record. INDRA keeps the same "DNS is transport, a separately-known public
+/// key is the trust anchor" model, but uses ML-DSA-87. The ML-DSA signature is
+/// too large for one practical DNS TXT record, so the root commits to
+/// hash-addressed signature chunks and node-list chunks instead of embedding
+/// the signature inline.
+pub const SIGNED_DNS_DISCOVERY_ROOT_PREFIX: &str = "indradisc-root:v1";
+
+/// Domain separator for the ML-DSA-87 signature over a signed DNS seed root.
+pub const SIGNED_DNS_DISCOVERY_SIGNING_DOMAIN: &[u8] = b"INDRA-signed-dns-discovery-root-v1:";
+
+const SIGNED_DNS_DISCOVERY_CHUNK_HEX_LEN: usize = 240;
+
+/// Parsed signed DNS discovery root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedDnsSeedRoot {
+    /// Monotonically increasing publisher sequence number.
+    pub seq: u64,
+    /// SHA-256 hash of the concatenated node-list payload.
+    pub nodes_hash: [u8; 32],
+    /// Number of node-list TXT chunks.
+    pub nodes_chunks: usize,
+    /// SHA-256 hash of the concatenated ML-DSA signature bytes.
+    pub sig_hash: [u8; 32],
+    /// Number of signature TXT chunks.
+    pub sig_chunks: usize,
+}
+
+/// DNS TXT records needed to publish a signed discovery list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedDnsSeedRecords {
+    /// Root TXT record content for the seed hostname.
+    pub root_txt: String,
+    /// Hash-addressed node-list chunk records: `(relative_name, txt_content)`.
+    pub node_chunks: Vec<(String, String)>,
+    /// Hash-addressed signature chunk records: `(relative_name, txt_content)`.
+    pub sig_chunks: Vec<(String, String)>,
+}
 
 /// DNSSEC policy for DNS seed hostname resolution.
 ///
@@ -88,6 +133,58 @@ impl FromStr for DnsSeedValidationMode {
     }
 }
 
+/// Validation policy for INDRA's signed DNS node-list overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedDnsSeedValidationMode {
+    /// Do not attempt signed-list discovery; use existing A-record discovery.
+    Off,
+    /// Prefer a valid signed list when configured, but fall back to A records.
+    Warn,
+    /// Require a valid signed list when DNS seed discovery is used.
+    Require,
+}
+
+impl SignedDnsSeedValidationMode {
+    /// Default signed DNS discovery mode.
+    pub const DEFAULT: Self = Self::Off;
+
+    /// Return the config-file string for this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Require => "require",
+        }
+    }
+}
+
+impl Default for SignedDnsSeedValidationMode {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl fmt::Display for SignedDnsSeedValidationMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SignedDnsSeedValidationMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "warn" => Ok(Self::Warn),
+            "require" => Ok(Self::Require),
+            other => Err(format!(
+                "network.dns_seed_signed_validation must be one of off, warn, require (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// DNSSEC validation status for a seed response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsSeedValidationStatus {
@@ -109,6 +206,13 @@ pub enum DnsSeedValidationStatus {
 struct DnsSeedLookup {
     addrs: Vec<SocketAddr>,
     status: DnsSeedValidationStatus,
+}
+
+#[derive(Debug, Clone)]
+struct SignedDnsSeedTxtLookup {
+    root_txt: String,
+    node_chunks: Vec<String>,
+    sig_chunks: Vec<String>,
 }
 
 /// Encode the default DNS seed list into the existing config string field.
@@ -252,6 +356,120 @@ where
     resolved
 }
 
+#[cfg(test)]
+fn resolve_signed_dns_seed_hosts_with<F>(
+    hosts: &[String],
+    mode: SignedDnsSeedValidationMode,
+    public_key: Option<&PqPublicKey>,
+    mut resolver: F,
+) -> Vec<SocketAddr>
+where
+    F: FnMut(&str) -> io::Result<SignedDnsSeedTxtLookup>,
+{
+    let mut addrs = HashSet::new();
+    if mode == SignedDnsSeedValidationMode::Off {
+        return Vec::new();
+    }
+    let Some(public_key) = public_key else {
+        eprintln!(
+            "[discovery] signed DNS discovery {}: no public key configured",
+            if mode == SignedDnsSeedValidationMode::Require {
+                "required but unavailable"
+            } else {
+                "unavailable"
+            }
+        );
+        return Vec::new();
+    };
+
+    for host in hosts {
+        match resolver(host) {
+            Ok(lookup) => match verify_signed_dns_seed_records(
+                &lookup.root_txt,
+                &lookup.node_chunks,
+                &lookup.sig_chunks,
+                public_key,
+            ) {
+                Ok(host_addrs) => {
+                    eprintln!(
+                        "[discovery] signed DNS seed {} verified {} addresses",
+                        host,
+                        host_addrs.len()
+                    );
+                    addrs.extend(host_addrs);
+                }
+                Err(err) => {
+                    eprintln!("[discovery] signed DNS seed {} rejected: {}", host, err);
+                }
+            },
+            Err(err) => {
+                eprintln!("[discovery] signed DNS seed {} unavailable: {}", host, err);
+            }
+        }
+    }
+
+    let mut resolved: Vec<SocketAddr> = addrs.into_iter().collect();
+    resolved.sort();
+    resolved
+}
+
+async fn resolve_signed_dns_seed_hosts_with_async<F, Fut>(
+    hosts: &[String],
+    mode: SignedDnsSeedValidationMode,
+    public_key: Option<&PqPublicKey>,
+    mut resolver: F,
+) -> Vec<SocketAddr>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = io::Result<SignedDnsSeedTxtLookup>>,
+{
+    let mut addrs = HashSet::new();
+    if mode == SignedDnsSeedValidationMode::Off {
+        return Vec::new();
+    }
+    let Some(public_key) = public_key else {
+        eprintln!(
+            "[discovery] signed DNS discovery {}: no public key configured",
+            if mode == SignedDnsSeedValidationMode::Require {
+                "required but unavailable"
+            } else {
+                "unavailable"
+            }
+        );
+        return Vec::new();
+    };
+
+    for host in hosts {
+        match resolver(host.clone()).await {
+            Ok(lookup) => match verify_signed_dns_seed_records(
+                &lookup.root_txt,
+                &lookup.node_chunks,
+                &lookup.sig_chunks,
+                public_key,
+            ) {
+                Ok(host_addrs) => {
+                    eprintln!(
+                        "[discovery] signed DNS seed {} verified {} addresses",
+                        host,
+                        host_addrs.len()
+                    );
+                    addrs.extend(host_addrs);
+                }
+                Err(err) => {
+                    eprintln!("[discovery] signed DNS seed {} rejected: {}", host, err);
+                }
+            },
+            Err(err) => {
+                eprintln!("[discovery] signed DNS seed {} unavailable: {}", host, err);
+            }
+        }
+    }
+
+    let mut resolved: Vec<SocketAddr> = addrs.into_iter().collect();
+    resolved.sort();
+    resolved
+}
+
 fn dnssec_status_label(status: DnsSeedValidationStatus) -> &'static str {
     match status {
         DnsSeedValidationStatus::Unchecked => "unchecked",
@@ -284,7 +502,39 @@ pub async fn resolve_dns_seeds_with_validation(
     port: u16,
     mode: DnsSeedValidationMode,
 ) -> Vec<SocketAddr> {
+    resolve_dns_seeds_with_policies(hosts, port, mode, SignedDnsSeedValidationMode::Off, None).await
+}
+
+/// Resolve DNS seed hostnames with DNSSEC and signed-list policy controls.
+///
+/// A valid signed list is preferred when configured. In `require` mode an
+/// absent or invalid signed list rejects DNS seed discovery for that cycle, but
+/// discovery remains best-effort overall: bootstrap peers, persisted peers,
+/// PEX, genesis hints, and on-chain validator addresses continue to work.
+pub async fn resolve_dns_seeds_with_policies(
+    hosts: &str,
+    port: u16,
+    mode: DnsSeedValidationMode,
+    signed_mode: SignedDnsSeedValidationMode,
+    signed_public_key: Option<&PqPublicKey>,
+) -> Vec<SocketAddr> {
     let hosts = parse_dns_seed_hosts(hosts);
+    if signed_mode != SignedDnsSeedValidationMode::Off {
+        let signed = resolve_signed_dns_seed_hosts_with_async(
+            &hosts,
+            signed_mode,
+            signed_public_key,
+            |host| async move { resolve_signed_seed_with_hickory_dnssec_async(&host).await },
+        )
+        .await;
+        if !signed.is_empty() || signed_mode == SignedDnsSeedValidationMode::Require {
+            return signed;
+        }
+        eprintln!(
+            "[discovery] signed DNS discovery did not produce peers; falling back to DNS A records"
+        );
+    }
+
     match mode {
         DnsSeedValidationMode::Off => resolve_dns_seed_hosts_with(&hosts, port, |addr_str| {
             addr_str
@@ -346,11 +596,7 @@ async fn resolve_seed_with_hickory_dnssec_async(
     let mut saw_indeterminate_answer = false;
     let mut saw_lookup_error = false;
 
-    let query_host = if host.ends_with('.') {
-        host.to_string()
-    } else {
-        format!("{host}.")
-    };
+    let query_host = dns_query_name(host);
 
     for &record_type in DNS_SEED_RECORD_TYPES {
         match resolver.lookup(query_host.as_str(), record_type).await {
@@ -448,6 +694,365 @@ where
 
 fn dnssec_seed_resolver_config() -> ResolverConfig {
     ResolverConfig::udp_and_tcp(&CLOUDFLARE)
+}
+
+fn dns_query_name(host: &str) -> String {
+    if host.ends_with('.') {
+        host.to_string()
+    } else {
+        format!("{host}.")
+    }
+}
+
+async fn resolve_txt_records_dnssec(
+    resolver: &Resolver<TokioRuntimeProvider>,
+    name: &str,
+) -> io::Result<Vec<String>> {
+    let lookup = resolver
+        .lookup(dns_query_name(name).as_str(), RecordType::TXT)
+        .await
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("TXT lookup for {name} failed: {e}"),
+            )
+        })?;
+    let status = dnssec_status_for_lookup_answers(&lookup, RecordType::TXT);
+    if status != DnsSeedValidationStatus::Secure {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "TXT lookup for {name} was not DNSSEC-secure (status={})",
+                dnssec_status_label(status)
+            ),
+        ));
+    }
+
+    let records = lookup
+        .answers()
+        .iter()
+        .filter(|record| record.record_type() == RecordType::TXT)
+        .filter_map(|record| match &record.data {
+            RData::TXT(txt) => {
+                let bytes = txt
+                    .txt_data
+                    .iter()
+                    .flat_map(|part| part.iter().copied())
+                    .collect::<Vec<_>>();
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Ok(records)
+}
+
+async fn resolve_signed_seed_with_hickory_dnssec_async(
+    host: &str,
+) -> io::Result<SignedDnsSeedTxtLookup> {
+    let mut builder = Resolver::builder_with_config(
+        dnssec_seed_resolver_config(),
+        TokioRuntimeProvider::default(),
+    );
+    {
+        let opts = builder.options_mut();
+        opts.validate = true;
+        opts.use_hosts_file = ResolveHosts::Never;
+        opts.try_tcp_on_error = true;
+    }
+    let resolver = builder.build().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("DNS resolver build failed: {e}"),
+        )
+    })?;
+
+    let roots = resolve_txt_records_dnssec(&resolver, host).await?;
+    let root_txt = roots
+        .into_iter()
+        .find(|record| record.starts_with(SIGNED_DNS_DISCOVERY_ROOT_PREFIX))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("signed DNS root TXT not found at {host}"),
+            )
+        })?;
+    let root = parse_signed_dns_seed_root(&root_txt)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+    let mut node_chunks = Vec::with_capacity(root.nodes_chunks);
+    for idx in 0..root.nodes_chunks {
+        let relative = signed_dns_seed_chunk_name("nodes", root.nodes_hash, idx);
+        let name = format!("{relative}.{}", host.trim_end_matches('.'));
+        let records = resolve_txt_records_dnssec(&resolver, &name).await?;
+        let chunk = records.into_iter().next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("signed DNS node chunk {idx} not found at {name}"),
+            )
+        })?;
+        node_chunks.push(chunk);
+    }
+
+    let mut sig_chunks = Vec::with_capacity(root.sig_chunks);
+    for idx in 0..root.sig_chunks {
+        let relative = signed_dns_seed_chunk_name("sig", root.sig_hash, idx);
+        let name = format!("{relative}.{}", host.trim_end_matches('.'));
+        let records = resolve_txt_records_dnssec(&resolver, &name).await?;
+        let chunk = records.into_iter().next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("signed DNS signature chunk {idx} not found at {name}"),
+            )
+        })?;
+        sig_chunks.push(chunk);
+    }
+
+    Ok(SignedDnsSeedTxtLookup {
+        root_txt,
+        node_chunks,
+        sig_chunks,
+    })
+}
+
+fn hex32(bytes: [u8; 32]) -> String {
+    hex::encode(bytes)
+}
+
+fn parse_hex32(value: &str, field: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(value).map_err(|_| format!("{field} must be hex"))?;
+    if bytes.len() != 32 {
+        return Err(format!("{field} must be 32 bytes"));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn parse_usize_field(value: &str, field: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{field} must be an integer"))
+}
+
+fn parse_u64_field(value: &str, field: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{field} must be an integer"))
+}
+
+/// Parse an `indradisc-root:v1` TXT record.
+pub fn parse_signed_dns_seed_root(root_txt: &str) -> Result<SignedDnsSeedRoot, String> {
+    let mut parts = root_txt.split_whitespace();
+    let prefix = parts
+        .next()
+        .ok_or_else(|| "signed DNS root is empty".to_string())?;
+    if prefix != SIGNED_DNS_DISCOVERY_ROOT_PREFIX {
+        return Err(format!(
+            "signed DNS root must start with {SIGNED_DNS_DISCOVERY_ROOT_PREFIX}"
+        ));
+    }
+
+    let mut seq = None;
+    let mut nodes_hash = None;
+    let mut nodes_chunks = None;
+    let mut sig_hash = None;
+    let mut sig_chunks = None;
+
+    for part in parts {
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("invalid signed DNS root field {part:?}"))?;
+        match key {
+            "seq" => seq = Some(parse_u64_field(value, "seq")?),
+            "nodes" => nodes_hash = Some(parse_hex32(value, "nodes")?),
+            "nodes_chunks" => nodes_chunks = Some(parse_usize_field(value, "nodes_chunks")?),
+            "sig" => sig_hash = Some(parse_hex32(value, "sig")?),
+            "sig_chunks" => sig_chunks = Some(parse_usize_field(value, "sig_chunks")?),
+            _ => return Err(format!("unknown signed DNS root field {key:?}")),
+        }
+    }
+
+    let root = SignedDnsSeedRoot {
+        seq: seq.ok_or_else(|| "signed DNS root missing seq".to_string())?,
+        nodes_hash: nodes_hash.ok_or_else(|| "signed DNS root missing nodes".to_string())?,
+        nodes_chunks: nodes_chunks
+            .ok_or_else(|| "signed DNS root missing nodes_chunks".to_string())?,
+        sig_hash: sig_hash.ok_or_else(|| "signed DNS root missing sig".to_string())?,
+        sig_chunks: sig_chunks.ok_or_else(|| "signed DNS root missing sig_chunks".to_string())?,
+    };
+    if root.nodes_chunks == 0 {
+        return Err("signed DNS root must have at least one node chunk".to_string());
+    }
+    if root.sig_chunks == 0 {
+        return Err("signed DNS root must have at least one signature chunk".to_string());
+    }
+    Ok(root)
+}
+
+fn signed_dns_seed_root_without_signature_fields(root: &SignedDnsSeedRoot) -> String {
+    format!(
+        "{} seq={} nodes={} nodes_chunks={}",
+        SIGNED_DNS_DISCOVERY_ROOT_PREFIX,
+        root.seq,
+        hex32(root.nodes_hash),
+        root.nodes_chunks,
+    )
+}
+
+fn signed_dns_seed_signing_message(root: &SignedDnsSeedRoot) -> Vec<u8> {
+    let canonical = signed_dns_seed_root_without_signature_fields(root);
+    let mut msg = Vec::with_capacity(SIGNED_DNS_DISCOVERY_SIGNING_DOMAIN.len() + canonical.len());
+    msg.extend_from_slice(SIGNED_DNS_DISCOVERY_SIGNING_DOMAIN);
+    msg.extend_from_slice(canonical.as_bytes());
+    msg
+}
+
+fn chunk_hex(bytes: &[u8]) -> Vec<String> {
+    let hex = hex::encode(bytes);
+    hex.as_bytes()
+        .chunks(SIGNED_DNS_DISCOVERY_CHUNK_HEX_LEN)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect()
+}
+
+fn reassemble_hex_chunks(
+    chunks: &[String],
+    expected_count: usize,
+    field: &str,
+) -> Result<Vec<u8>, String> {
+    if chunks.len() != expected_count {
+        return Err(format!(
+            "{field} chunk count mismatch: got {}, expected {expected_count}",
+            chunks.len()
+        ));
+    }
+    let joined = chunks.join("");
+    hex::decode(joined).map_err(|_| format!("{field} chunks are not valid hex"))
+}
+
+fn signed_dns_seed_chunk_name(kind: &str, hash: [u8; 32], index: usize) -> String {
+    format!(
+        "_indra-seed-{}-{}-{}",
+        kind,
+        index,
+        &hex::encode(hash)[..16]
+    )
+}
+
+/// Canonicalize peer addresses for signed DNS discovery.
+pub fn signed_dns_seed_nodes_payload(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<u8> {
+    let mut addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+    addrs.sort();
+    addrs.dedup();
+    addrs
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
+}
+
+/// Build signed DNS discovery records using an ML-DSA-87 signing key.
+pub fn build_signed_dns_seed_records(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    seq: u64,
+    signing_key: &PqKeypair,
+) -> Result<SignedDnsSeedRecords, String> {
+    let nodes_payload = signed_dns_seed_nodes_payload(addrs);
+    let node_chunks_content = chunk_hex(&nodes_payload);
+    let mut root = SignedDnsSeedRoot {
+        seq,
+        nodes_hash: sha256(&nodes_payload),
+        nodes_chunks: node_chunks_content.len(),
+        sig_hash: [0u8; 32],
+        sig_chunks: 1,
+    };
+    let signature = signing_key
+        .sign(&signed_dns_seed_signing_message(&root))
+        .map_err(|error| format!("ML-DSA DNS discovery signing failed: {error}"))?;
+    let sig_chunks_content = chunk_hex(&signature.0);
+    root.sig_hash = sha256(&signature.0);
+    root.sig_chunks = sig_chunks_content.len();
+
+    let root_txt = format!(
+        "{} sig={} sig_chunks={}",
+        signed_dns_seed_root_without_signature_fields(&root),
+        hex32(root.sig_hash),
+        root.sig_chunks
+    );
+    let node_chunks = node_chunks_content
+        .into_iter()
+        .enumerate()
+        .map(|(idx, content)| {
+            (
+                signed_dns_seed_chunk_name("nodes", root.nodes_hash, idx),
+                content,
+            )
+        })
+        .collect();
+    let sig_chunks = sig_chunks_content
+        .into_iter()
+        .enumerate()
+        .map(|(idx, content)| {
+            (
+                signed_dns_seed_chunk_name("sig", root.sig_hash, idx),
+                content,
+            )
+        })
+        .collect();
+
+    Ok(SignedDnsSeedRecords {
+        root_txt,
+        node_chunks,
+        sig_chunks,
+    })
+}
+
+/// Verify and decode signed DNS discovery records using a public key known
+/// independently of DNS.
+pub fn verify_signed_dns_seed_records(
+    root_txt: &str,
+    node_chunks: &[String],
+    sig_chunks: &[String],
+    public_key: &PqPublicKey,
+) -> Result<Vec<SocketAddr>, String> {
+    let root = parse_signed_dns_seed_root(root_txt)?;
+    let nodes_payload = reassemble_hex_chunks(node_chunks, root.nodes_chunks, "node")?;
+    if sha256(&nodes_payload) != root.nodes_hash {
+        return Err("signed DNS node-list payload hash mismatch".to_string());
+    }
+    let sig_bytes = reassemble_hex_chunks(sig_chunks, root.sig_chunks, "signature")?;
+    if sig_bytes.len() != indra_crypto::PQ_SIG_BYTES {
+        return Err(format!(
+            "signed DNS signature must be {} bytes",
+            indra_crypto::PQ_SIG_BYTES
+        ));
+    }
+    if sha256(&sig_bytes) != root.sig_hash {
+        return Err("signed DNS signature hash mismatch".to_string());
+    }
+    let mut sig = [0u8; indra_crypto::PQ_SIG_BYTES];
+    sig.copy_from_slice(&sig_bytes);
+    verify_pq(
+        &signed_dns_seed_signing_message(&root),
+        &PqSignature(sig),
+        public_key,
+    )
+    .map_err(|_| "signed DNS root ML-DSA signature verification failed".to_string())?;
+
+    let text = String::from_utf8(nodes_payload)
+        .map_err(|_| "signed DNS node-list payload is not UTF-8".to_string())?;
+    let mut addrs = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let addr = line
+            .parse::<SocketAddr>()
+            .map_err(|_| format!("signed DNS node-list contains invalid address {line:?}"))?;
+        addrs.push(addr);
+    }
+    addrs.sort();
+    addrs.dedup();
+    Ok(addrs)
 }
 
 fn split_host_port(addr_str: &str) -> io::Result<(String, u16)> {
@@ -748,6 +1353,173 @@ mod tests {
             DnsSeedValidationStatus::Bogus,
             "a mixed answer is only as trustworthy as its weakest proof"
         );
+    }
+
+    #[test]
+    fn signed_dns_seed_list_verifies_with_correct_public_key() {
+        let key = PqKeypair::from_seed(&[0x51; 32]).unwrap();
+        let records = build_signed_dns_seed_records(
+            [
+                "203.0.113.10:30303".parse().unwrap(),
+                "198.51.100.7:30303".parse().unwrap(),
+                "203.0.113.10:30303".parse().unwrap(),
+            ],
+            7,
+            &key,
+        )
+        .unwrap();
+        let nodes: Vec<String> = records
+            .node_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let sig: Vec<String> = records
+            .sig_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+
+        let resolved =
+            verify_signed_dns_seed_records(&records.root_txt, &nodes, &sig, &key.public_key())
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            vec![
+                "198.51.100.7:30303".parse().unwrap(),
+                "203.0.113.10:30303".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn signed_dns_seed_tampered_list_fails_verification() {
+        let key = PqKeypair::from_seed(&[0x52; 32]).unwrap();
+        let records =
+            build_signed_dns_seed_records(["203.0.113.10:30303".parse().unwrap()], 1, &key)
+                .unwrap();
+        let mut nodes: Vec<String> = records
+            .node_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        nodes[0].push_str("00");
+        let sig: Vec<String> = records
+            .sig_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+
+        let err =
+            verify_signed_dns_seed_records(&records.root_txt, &nodes, &sig, &key.public_key())
+                .unwrap_err();
+        assert!(err.contains("hash mismatch") || err.contains("invalid address"));
+    }
+
+    #[test]
+    fn signed_dns_seed_wrong_key_fails_verification() {
+        let key = PqKeypair::from_seed(&[0x53; 32]).unwrap();
+        let wrong = PqKeypair::from_seed(&[0x54; 32]).unwrap();
+        let records =
+            build_signed_dns_seed_records(["203.0.113.10:30303".parse().unwrap()], 1, &key)
+                .unwrap();
+        let nodes: Vec<String> = records
+            .node_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let sig: Vec<String> = records
+            .sig_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+
+        let err =
+            verify_signed_dns_seed_records(&records.root_txt, &nodes, &sig, &wrong.public_key())
+                .unwrap_err();
+        assert!(err.contains("signature verification failed"));
+    }
+
+    #[test]
+    fn signed_dns_seed_root_signature_is_chunked_for_dns_txt_practicality() {
+        let key = PqKeypair::from_seed(&[0x55; 32]).unwrap();
+        let records =
+            build_signed_dns_seed_records(["203.0.113.10:30303".parse().unwrap()], 1, &key)
+                .unwrap();
+        assert!(
+            records.sig_chunks.len() > 1,
+            "ML-DSA-87 signatures are intentionally chunked instead of embedded in one TXT root"
+        );
+        assert!(records
+            .sig_chunks
+            .iter()
+            .all(|(_, value)| value.len() <= SIGNED_DNS_DISCOVERY_CHUNK_HEX_LEN));
+    }
+
+    #[test]
+    fn signed_dns_seed_require_rejects_unsigned_or_invalid_list() {
+        let key = PqKeypair::from_seed(&[0x56; 32]).unwrap();
+        let records =
+            build_signed_dns_seed_records(["203.0.113.10:30303".parse().unwrap()], 1, &key)
+                .unwrap();
+        let mut node_chunks: Vec<String> = records
+            .node_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        node_chunks[0].push_str("00");
+        let sig_chunks: Vec<String> = records
+            .sig_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+
+        let resolved = resolve_signed_dns_seed_hosts_with(
+            &["seeds.example".to_string()],
+            SignedDnsSeedValidationMode::Require,
+            Some(&key.public_key()),
+            |_| {
+                Ok(SignedDnsSeedTxtLookup {
+                    root_txt: records.root_txt.clone(),
+                    node_chunks: node_chunks.clone(),
+                    sig_chunks: sig_chunks.clone(),
+                })
+            },
+        );
+        assert!(resolved.is_empty());
+
+        let no_key = resolve_signed_dns_seed_hosts_with(
+            &["seeds.example".to_string()],
+            SignedDnsSeedValidationMode::Require,
+            None,
+            |_| unreachable!("require mode without a public key must not query DNS"),
+        );
+        assert!(no_key.is_empty());
+    }
+
+    #[test]
+    fn signed_dns_seed_warn_can_fall_back_to_plain_a_records() {
+        let key = PqKeypair::from_seed(&[0x57; 32]).unwrap();
+        let signed = resolve_signed_dns_seed_hosts_with(
+            &["seeds.example".to_string()],
+            SignedDnsSeedValidationMode::Warn,
+            Some(&key.public_key()),
+            |_| Err(io::Error::new(io::ErrorKind::NotFound, "no signed root")),
+        );
+        assert!(signed.is_empty());
+
+        let plain = resolve_dns_seed_hosts_with_status(
+            &["seeds.example".to_string()],
+            30303,
+            DnsSeedValidationMode::Warn,
+            |_| {
+                Ok(DnsSeedLookup {
+                    addrs: vec!["203.0.113.10:30303".parse().unwrap()],
+                    status: DnsSeedValidationStatus::Secure,
+                })
+            },
+        );
+        assert_eq!(plain, vec!["203.0.113.10:30303".parse().unwrap()]);
     }
 
     #[test]

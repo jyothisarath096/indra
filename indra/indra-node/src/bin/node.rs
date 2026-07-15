@@ -35,8 +35,8 @@ use indra_node::{
     config::{default_governance_mempool_capacity, DEFAULT_STAKING_MEMPOOL_CAPACITY},
     discovery::{
         default_dns_seed_hosts_config, load_peers, peer_list_payload,
-        resolve_dns_seeds_with_validation, resolve_peer_addr, sanitize_loaded_peers, save_peers,
-        DnsSeedValidationMode,
+        resolve_dns_seeds_with_policies, resolve_peer_addr, sanitize_loaded_peers, save_peers,
+        DnsSeedValidationMode, SignedDnsSeedValidationMode,
     },
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     genesis::load_genesis_seed_peers,
@@ -786,6 +786,8 @@ fn start_network_runtime(
     peers_file_path: String,
     dns_seed_host: String,
     dns_seed_validation: DnsSeedValidationMode,
+    dns_seed_signed_validation: SignedDnsSeedValidationMode,
+    dns_seed_signed_public_key: Option<Vec<u8>>,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
 ) -> (
     Arc<NetworkBridge>,
@@ -1005,6 +1007,7 @@ fn start_network_runtime(
                     let failure_counts = Arc::clone(&failure_counts);
                     let peers_file_path = peers_file_path.clone();
                     let dns_seed_host = dns_seed_host.clone();
+                    let dns_seed_signed_public_key = dns_seed_signed_public_key.clone();
                     let p2p_addr_for_port = p2p_addr.clone();
                     async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1049,10 +1052,17 @@ fn start_network_runtime(
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
-                        let dns_peers = resolve_dns_seeds_with_validation(
+                        let signed_public_key = dns_seed_signed_public_key.as_ref().and_then(|bytes| {
+                            let array: [u8; indra_crypto::PQ_PK_BYTES] =
+                                bytes.as_slice().try_into().ok()?;
+                            Some(PqPublicKey(array))
+                        });
+                        let dns_peers = resolve_dns_seeds_with_policies(
                             &dns_seed_host,
                             p2p_port,
                             dns_seed_validation,
+                            dns_seed_signed_validation,
+                            signed_public_key.as_ref(),
                         )
                         .await;
                         {
@@ -1663,6 +1673,25 @@ fn main() {
             std::process::exit(1);
         })
         .unwrap_or_default();
+    let dns_seed_signed_validation = cfg_file
+        .dns_seed_signed_validation
+        .as_deref()
+        .map(str::parse::<SignedDnsSeedValidationMode>)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap_or_default();
+    let dns_seed_signed_public_key = cfg_file
+        .dns_seed_signed_public_key
+        .as_deref()
+        .map(|value| hex::decode(value.trim()))
+        .transpose()
+        .unwrap_or_else(|_| {
+            eprintln!("ERROR: network.dns_seed_signed_public_key must be valid hex");
+            std::process::exit(1);
+        });
     let prune_keep_cfg = cfg_file
         .prune_keep_blocks
         .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS);
@@ -1742,6 +1771,8 @@ fn main() {
         bootstrap_peers: bootstrap_peers.clone(),
         dns_seed_host: dns_seed_host.clone(),
         dns_seed_validation,
+        dns_seed_signed_validation,
+        dns_seed_signed_public_key: dns_seed_signed_public_key.clone(),
         peers_file: peers_file.clone(),
         snapshot_interval: cfg_file.snapshot_interval.unwrap_or(300),
         mempool_capacity: cfg_file.mempool_capacity.unwrap_or(5_000),
@@ -1799,6 +1830,8 @@ fn main() {
             peers_file.clone(),
             dns_seed_host.clone(),
             dns_seed_validation,
+            dns_seed_signed_validation,
+            dns_seed_signed_public_key.clone(),
             Arc::clone(&handshake_config),
         );
     if let Some(addr) = observer_addr {
@@ -3150,6 +3183,10 @@ bootstrap_peers = {}
 dns_seed_host   = "{}"
 # off = ordinary DNS, warn = log DNSSEC problems but use answers, require = secure answers only.
 dns_seed_validation = "warn"
+# Signed DNS discovery is INDRA's EIP-1459-style overlay. It requires an
+# independently configured ML-DSA-87 public key; DNS only transports the list.
+dns_seed_signed_validation = "off"
+# dns_seed_signed_public_key = "<ML-DSA-87 public key hex>"
 peers_file      = "{}/peers.json"
 
 [rpc]

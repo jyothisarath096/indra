@@ -11,10 +11,11 @@ use toml::Value;
 use crate::config::{
     default_governance_mempool_capacity, NodeConfig, DEFAULT_STAKING_MEMPOOL_CAPACITY,
 };
-use crate::discovery::DnsSeedValidationMode;
+use crate::discovery::{DnsSeedValidationMode, SignedDnsSeedValidationMode};
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DNS_SEED_HOSTS, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT,
 };
+use indra_crypto::PQ_PK_BYTES;
 
 /// Parsed key material loaded from `keys.json`.
 #[derive(Debug, Clone)]
@@ -56,6 +57,10 @@ pub struct NodeConfigFile {
     pub dns_seed_host: Option<String>,
     /// `[network].dns_seed_validation`.
     pub dns_seed_validation: Option<String>,
+    /// `[network].dns_seed_signed_validation`.
+    pub dns_seed_signed_validation: Option<String>,
+    /// `[network].dns_seed_signed_public_key`.
+    pub dns_seed_signed_public_key: Option<String>,
     /// `[network].peers_file`.
     pub peers_file: Option<String>,
     /// `[rpc].addr`.
@@ -119,6 +124,8 @@ impl NodeConfigFile {
             bootstrap_peers: get_str_array(&table, "network", "bootstrap_peers"),
             dns_seed_host: get_str(&table, "network", "dns_seed_host"),
             dns_seed_validation: get_str(&table, "network", "dns_seed_validation"),
+            dns_seed_signed_validation: get_str(&table, "network", "dns_seed_signed_validation"),
+            dns_seed_signed_public_key: get_str(&table, "network", "dns_seed_signed_public_key"),
             peers_file: get_str(&table, "network", "peers_file"),
             rpc_addr: get_str(&table, "rpc", "addr"),
             rpc_enabled: get_bool(&table, "rpc", "enabled"),
@@ -179,6 +186,23 @@ impl NodeConfigFile {
         if let Some(mode) = self.dns_seed_validation.as_deref() {
             if let Err(err) = mode.parse::<DnsSeedValidationMode>() {
                 errors.push(err);
+            }
+        }
+        if let Some(mode) = self.dns_seed_signed_validation.as_deref() {
+            if let Err(err) = mode.parse::<SignedDnsSeedValidationMode>() {
+                errors.push(err);
+            }
+        }
+        if let Some(pk_hex) = self.dns_seed_signed_public_key.as_deref() {
+            match hex::decode(pk_hex.trim()) {
+                Ok(bytes) if bytes.len() == PQ_PK_BYTES => {}
+                Ok(bytes) => errors.push(format!(
+                    "network.dns_seed_signed_public_key must be {PQ_PK_BYTES} bytes of hex (got {} bytes)",
+                    bytes.len()
+                )),
+                Err(_) => errors.push(
+                    "network.dns_seed_signed_public_key must be valid hex".to_string(),
+                ),
             }
         }
         if let Some(addr) = self.metrics_addr.as_deref() {
@@ -334,6 +358,18 @@ impl NodeConfigFile {
                 .map(str::parse::<DnsSeedValidationMode>)
                 .transpose()?
                 .unwrap_or_default(),
+            dns_seed_signed_validation: self
+                .dns_seed_signed_validation
+                .as_deref()
+                .map(str::parse::<SignedDnsSeedValidationMode>)
+                .transpose()?
+                .unwrap_or_default(),
+            dns_seed_signed_public_key: self
+                .dns_seed_signed_public_key
+                .as_deref()
+                .map(|hex| hex::decode(hex.trim()))
+                .transpose()
+                .map_err(|_| "network.dns_seed_signed_public_key must be valid hex".to_string())?,
             peers_file,
             snapshot_interval: self.snapshot_interval.unwrap_or(300),
             mempool_capacity: self.mempool_capacity.unwrap_or(5_000),
@@ -491,6 +527,7 @@ observer_addr = "0.0.0.0:30304"
 bootstrap_peers = ["1.1.1.1:30303", "2.2.2.2:30303"]
 dns_seed_host = "seeds.indraprotocol.com"
 dns_seed_validation = "require"
+dns_seed_signed_validation = "warn"
 peers_file = "/root/.indra/data/peers.json"
 
 [rpc]
@@ -526,6 +563,7 @@ governance_mempool_capacity = 2400
         assert_eq!(cfg.p2p_addr.as_deref(), Some("0.0.0.0:30303"));
         assert_eq!(cfg.bootstrap_peers.len(), 2);
         assert_eq!(cfg.dns_seed_validation.as_deref(), Some("require"));
+        assert_eq!(cfg.dns_seed_signed_validation.as_deref(), Some("warn"));
         assert_eq!(cfg.rpc_enabled, Some(true));
         assert_eq!(cfg.rpc_admin_token.as_deref(), Some("local-admin"));
         assert_eq!(
@@ -576,6 +614,10 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
         observer.mode = Some("observer".to_string());
         let node = observer.to_node_config(None).unwrap();
         assert_eq!(node.dns_seed_validation, DnsSeedValidationMode::Warn);
+        assert_eq!(
+            node.dns_seed_signed_validation,
+            SignedDnsSeedValidationMode::Off
+        );
     }
 
     #[test]
@@ -584,6 +626,16 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
         cfg.dns_seed_validation = Some("maybe".to_string());
         let err = cfg.validate().err().unwrap_or_else(|| vec![]);
         assert!(err.iter().any(|e| e.contains("dns_seed_validation")));
+    }
+
+    #[test]
+    fn test_validate_invalid_signed_dns_seed_config() {
+        let mut cfg = minimal();
+        cfg.dns_seed_signed_validation = Some("maybe".to_string());
+        cfg.dns_seed_signed_public_key = Some("abcd".to_string());
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err.iter().any(|e| e.contains("dns_seed_signed_validation")));
+        assert!(err.iter().any(|e| e.contains("dns_seed_signed_public_key")));
     }
 
     #[test]
