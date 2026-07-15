@@ -77,3 +77,34 @@ out of scope for the protocol field itself, but the intended relationship is:
 For the initial version, `network_addr` is intentionally strict IP:port syntax
 only. Hostnames are rejected so the authoritative discovery field does not
 reintroduce a live DNS dependency or hostname-hijack surface.
+
+## Mainnet genesis hard-fork height reset checklist
+
+Before mainnet launch, reset every testnet-specific hard-fork activation height
+to an explicit mainnet-genesis value. These constants are single global values
+in source code; they are **not automatically network-aware** and do **not**
+derive from `chain_id`. Reusing a height chosen for this already-running testnet
+would activate a rule at an arbitrary, meaningless point in mainnet history.
+
+For rules intended to exist from mainnet genesis, set the activation height to
+`0` before building the mainnet genesis/release. For rules intentionally deferred
+past mainnet genesis, record the release hash, planned activation height, and
+operator rollout plan before launch.
+
+Current hardcoded hard-fork/activation-height constants that must be reviewed:
+
+- `STAKING_COMMITMENT_PROOF_HEIGHT`
+- `OVERFLOW_FIX_HEIGHT`
+- `VRF_VERIFIED_OUTPUT_HEIGHT`
+- `HYBRID_QC_HEIGHT`
+- `VOTE_CHAIN_ID_HEIGHT`
+- `PUBLIC_PROPOSER_ELECTION_HEIGHT`
+- `VRF_COMMIT_REVEAL_ELECTION_HEIGHT`
+- `REVEAL_SET_COMMITMENT_HEIGHT`
+- `VALIDATOR_NETWORK_ADDRESS_HEIGHT`
+- `REGISTERED_VALIDATOR_CAP_HEIGHT`
+- `GOVERNANCE_PROPOSAL_PRUNING_HEIGHT`
+
+This checklist is intentionally broader than currently-live testnet features.
+Any future constant following the same hardcoded height-gate pattern must be
+added here before merge, otherwise mainnet readiness review can miss it.

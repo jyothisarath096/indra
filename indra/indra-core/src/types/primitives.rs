@@ -103,6 +103,15 @@ pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
 ///
 /// `0` means required from genesis on fresh testnet. For mainnet, set this to
 /// a future announced hard-fork height.
+///
+/// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
+/// no per-chain-ID differentiation. It currently holds a testnet-specific
+/// activation height. Before building mainnet genesis, this MUST be
+/// deliberately reset to the correct mainnet value (often 0 when the rule
+/// should be active from mainnet's first block). It will NOT automatically
+/// differ between testnet and mainnet, and silently reusing a testnet value
+/// would activate this rule at an arbitrary, meaningless point in mainnet's own
+/// history.
 pub const STAKING_COMMITMENT_PROOF_HEIGHT: u64 = 0;
 
 /// True when staking bond operations must prove that the bonded UTXO's
@@ -383,39 +392,71 @@ pub fn bps_of(value: u64, bps: u32) -> u64 {
 
 /// Consensus hard-fork activation heights.
 ///
-/// Testnet activates existing arithmetic fixes from genesis. Mainnet values
-/// must be set and announced before the corresponding release is deployed.
+/// MAINNET GENESIS REQUIREMENT: every constant in this module is a single,
+/// global value with no per-chain-ID differentiation. Current values may be
+/// testnet-specific activation heights chosen for this already-running testnet's
+/// deployment history. Before building mainnet genesis, each one MUST be
+/// deliberately reset to the correct mainnet value (often 0 when the rule should
+/// be active from mainnet's first block). These values will NOT automatically
+/// differ between testnet and mainnet, and silently reusing testnet values would
+/// activate rules at arbitrary, meaningless points in mainnet's own history.
 pub mod hard_forks {
     /// u128 intermediate arithmetic for proportional reward and slash math.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const OVERFLOW_FIX_HEIGHT: u64 = 0;
     /// Proposer election uses verified VRF output instead of public key grinding hashes.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const VRF_VERIFIED_OUTPUT_HEIGHT: u64 = 0;
     /// Quorum certificates require both Ed25519 and ML-DSA vote signatures.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const HYBRID_QC_HEIGHT: u64 = 0;
     /// Vote signatures include the chain ID in their signing domain.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const VOTE_CHAIN_ID_HEIGHT: u64 = 0;
     /// Proposer election uses a fully public deterministic score.
     ///
     /// Testnet activates this from genesis after a fresh reset. Mainnet may
     /// choose a future height if migrating an existing chain.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const PUBLIC_PROPOSER_ELECTION_HEIGHT: u64 = 0;
     /// Commit-reveal VRF proposer election.
     ///
     /// Testnet activates this from genesis after a fresh reset. Mainnet must
     /// choose a future announced hard-fork height.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const VRF_COMMIT_REVEAL_ELECTION_HEIGHT: u64 = 0;
     /// Block bodies commit to full proposer-specified VRF reveal evidence.
     ///
     /// This is intentionally unscheduled in source. A concrete testnet/mainnet
     /// activation height must be selected during coordinated deployment, after
     /// all validators have upgraded.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis.
     pub const REVEAL_SET_COMMITMENT_HEIGHT: u64 = 5400;
     /// Validators may publish an on-chain P2P dial address.
     ///
-    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
-    /// coordinated deployment, comfortably ahead of the live chain tip at that
-    /// time. Do not deploy with this placeholder if the feature is intended to
-    /// activate on a live network.
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
+    /// with no per-chain-ID differentiation. It currently holds a
+    /// testnet-specific activation height chosen for this already-running
+    /// testnet's rolling deployment. Before building mainnet genesis, this MUST
+    /// be deliberately reset (almost certainly to 0, so the rule is active from
+    /// mainnet's first block). It will NOT automatically differ between testnet
+    /// and mainnet, and silently reusing the testnet value would activate this
+    /// rule at an arbitrary, meaningless point in mainnet's own history rather
+    /// than from genesis.
     pub const VALIDATOR_NETWORK_ADDRESS_HEIGHT: u64 = 19900;
 
     /// Registered-validator cap replacement rule.
@@ -426,17 +467,29 @@ pub mod hard_forks {
     /// registrations exactly as before. At/after this height, a higher
     /// total-stake registration may synchronously evict the lowest total-stake
     /// registered validator to preserve the hard cap without first-come bias.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
+    /// deliberately for mainnet genesis. Leaving `u64::MAX` here means this rule
+    /// never activates on that network.
     pub const REGISTERED_VALIDATOR_CAP_HEIGHT: u64 = u64::MAX;
 
     /// Governance terminal-proposal pruning.
     ///
-    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
-    /// coordinated deployment, comfortably ahead of the live chain tip at that
-    /// time. At/after this height, consensus state retains all active
-    /// governance proposals and only the most recent terminal proposal records.
-    /// Deep historical governance transparency is delegated to archive
-    /// nodes/indexers, matching block-pruning precedent.
-    pub const GOVERNANCE_PROPOSAL_PRUNING_HEIGHT: u64 = u64::MAX;
+    /// At/after this height, consensus state retains all active governance
+    /// proposals and only the most recent terminal proposal records. Deep
+    /// historical governance transparency is delegated to archive nodes/indexers,
+    /// matching block-pruning precedent.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
+    /// with no per-chain-ID differentiation. It currently holds a
+    /// testnet-specific activation height chosen for this already-running
+    /// testnet's rolling deployment. Before building mainnet genesis, this MUST
+    /// be deliberately reset (almost certainly to 0, so the rule is active from
+    /// mainnet's first block). It will NOT automatically differ between testnet
+    /// and mainnet, and silently reusing the testnet value would activate this
+    /// rule at an arbitrary, meaningless point in mainnet's own history rather
+    /// than from genesis.
+    pub const GOVERNANCE_PROPOSAL_PRUNING_HEIGHT: u64 = 97_000;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
