@@ -20,16 +20,16 @@ signature scheme for all transactions, ensuring security under both
 classical and quantum threat models simultaneously. Consensus finality
 uses ML-DSA-87-only Quorum Certificates — fully post-quantum. Validator
 transport is encrypted with hybrid X25519 + ML-KEM-1024 (NIST FIPS 203)
-key encapsulation. Transaction amounts are confidential, secured by
-Pedersen commitments and Bulletproof range proofs.
+key encapsulation. The current OutputV1 transaction format includes
+Pedersen commitments and Bulletproof range proofs for value-validation
+machinery, but it still stores owner and value metadata publicly.
 
 **Important scope note:** INDRA transaction ownership and consensus
-finality are post-quantum secure. Transaction amount confidentiality
-uses classical Ristretto255 elliptic-curve cryptography — a known and
-acknowledged limitation documented in Section 7.3. A quantum adversary
-cannot steal funds or forge consensus, but could potentially determine
-hidden transaction amounts from historical data. This distinction is
-stated clearly here and not buried.
+finality are post-quantum secure. The current chain format does not
+provide node-level owner or amount privacy: full nodes and raw block-data
+observers can see OutputV1 owner/value metadata. Future transaction
+privacy work is documented as planned, not implemented. This distinction
+is stated clearly here and not buried.
 
 The monetary policy is simple and immutable: one billion INDRA, all
 pre-minted at genesis and locked in a protocol reward reserve, released
@@ -136,9 +136,10 @@ this assumption from the beginning.
 3. **Post-quantum transport.** Validator-to-validator communication
    uses ML-KEM-1024 for key encapsulation.
 
-4. **Amount confidentiality.** Transaction amounts must not be visible
-   to classical observers. Post-quantum amount confidentiality is a
-   known future goal — see Section 7.3.
+4. **Future transaction privacy.** The current OutputV1 format exposes
+   owner/value metadata to raw-chain observers. A future OutputV2 design
+   must provide owner and amount privacy without compromising INDRA's
+   post-quantum security posture — see Section 7.3.
 
 5. **Monetary simplicity.** The supply schedule must be simple,
    deterministic, and immutable — not subject to governance votes.
@@ -172,7 +173,9 @@ indra-storage       Block store, state snapshots, epoch history
 indra-node          Node binary and JSON-RPC server
 indra-rpc           RPC handler and dispatch
 indra-cli           CLI wallet, stake manager, governance CLI
+indra-keystore      Encrypted validator/wallet key-file support
 indra-ffi           C-compatible FFI bridge for mobile wallets
+indra-bench         Benchmarks and scale experiments
 ```
 
 ### 2.2 Transaction signature scheme
@@ -231,17 +234,17 @@ forward secrecy under both classical and quantum adversaries.
 | QC finality proofs | ML-DSA-87 only | Yes |
 | Validator transport | X25519 + ML-KEM-1024 | Yes (hybrid) |
 | Block hashing | SHA-256 | Partial (Grover, 2x) |
-| Pedersen commitments | Ristretto255 | No (acknowledged) |
-| Bulletproof range proofs | Ristretto255 | No (acknowledged) |
+| Pedersen commitments | Ristretto255 | Classical only |
+| Bulletproof range proofs | Ristretto255 | Classical only |
 
 Transaction ownership, consensus finality, and validator transport are
-fully post-quantum secure. Amount confidentiality uses classical
-cryptography — an acknowledged limitation described in Section 7.3.
+post-quantum secure. Current OutputV1 owner/value metadata is not hidden
+from raw-chain observers; the classical Pedersen/Bulletproof machinery is
+therefore not described here as full transaction privacy.
 
-### 2.6 Confidential transactions
+### 2.6 Value commitments and range proofs
 
-INDRA transaction amounts are hidden using Pedersen commitments on the
-Ristretto255 group:
+INDRA includes Pedersen commitments on the Ristretto255 group:
 
 ```
 C = v·G + r·H
@@ -249,12 +252,15 @@ C = v·G + r·H
 
 where G and H are independent generators, v is the amount, and r is a
 randomly chosen blinding factor known only to the sender and receiver.
-The commitment perfectly hides v and is computationally binding against
-classical adversaries.
+The commitment construction can hide v cryptographically, and Bulletproof
+range proofs prove that each committed value lies in [0, 2^64) without
+opening the commitment.
 
-Bulletproof range proofs prove that each committed value lies in
-[0, 2^64) without revealing the value. Proof size is approximately
-674 bytes.
+However, the current OutputV1 format also stores `value_spark` as public
+metadata. That public field is read by validation, staking, governance
+deposit, and wallet tooling. As a result, today's chain does not provide
+amount privacy against anyone reading raw block/state data, even though
+the commitment/proof machinery exists.
 
 ### 2.7 UTXO model
 
@@ -320,10 +326,31 @@ that allows protocol upgrades without chain state wipes:
 - Decoders handle both old and new encodings
 - Migration functions transform existing state to new schema on startup
 - A `migration.log` records all migrations for operator audit
-- `indra_getSchemaInfo` RPC exposes current schema version and migration history
+- Admin-gated `indra_getSchemaInfo` RPC exposes current schema version and
+  migration history for operators
 
-The current schema version is 3. This framework is essential for
+The current schema version is 4. This framework is essential for
 mainnet deployments where state wipes are not acceptable.
+
+### 2.10 Discovery and operator trust boundaries
+
+Peer discovery is layered rather than DNS-only. Nodes can use static
+bootstrap peers, persisted peers, peer exchange, on-chain validator
+network addresses, DNS seed A records with DNSSEC validation, and INDRA's
+signed DNS discovery format.
+
+Signed DNS discovery is INDRA's post-quantum analogue to Ethereum's
+EIP-1459 idea: DNS transports a chunked node list, but the list itself is
+signed with an independent ML-DSA-87 discovery key whose public key is
+configured outside DNS. DNSSEC protects the transport path; the INDRA
+signature protects against a compromised DNS operator publishing a forged
+node list. Plain DNS A records remain a rollout fallback.
+
+Operator keys are stored in encrypted `keys.json` files by default using
+Argon2id password derivation and ChaCha20-Poly1305 authenticated
+encryption. For mobile/FFI consumers, production APIs use opaque
+in-process key handles so raw private keys do not cross the C ABI
+boundary; legacy raw-key exports are feature-gated for migration/testing.
 
 ---
 
@@ -417,31 +444,32 @@ is 200 validators, constrained by QC size requirements.
 
 ## 4. Privacy Model
 
-### 4.1 Amount confidentiality
+### 4.1 Current owner/value privacy
 
-INDRA hides transaction amounts. The sender, recipient public keys,
-and transaction graph are visible on-chain. What is hidden is the
-specific amount transferred.
+INDRA's current OutputV1 format does not hide transaction owners or
+amounts from raw-chain observers. Sender/recipient public keys,
+transaction graph metadata, and `value_spark` output metadata are visible
+to full nodes and anyone reading block/state data directly.
 
-This provides meaningful privacy for legitimate financial activity
-under a classical adversary. It does not provide full anonymity —
-transaction graph analysis can still reveal relationships between
-addresses.
+The existing RPC hardening prevents casual remote address surveillance
+through public RPC endpoints, but that is not the same as protocol-level
+transaction privacy.
 
-### 4.2 What confidential transactions do not hide
+### 4.2 What current RPC hardening does not hide
 
 - Sender and recipient public keys are public
+- Output value metadata is public in OutputV1
 - Transaction existence is public
 - Transaction timing is public
 - The fact that a specific UTXO was spent is public
 
 ### 4.3 Current privacy boundary and future view-key work
 
-INDRA currently uses Pedersen commitments and Bulletproof range proofs
-for transaction amount confidentiality, but the current OutputV1 format
-still exposes recipient public keys and value metadata to anyone reading
-raw chain data directly. This is the same owner-level transparency model
-as Bitcoin, not a full transaction-privacy model.
+INDRA currently includes Pedersen commitments and Bulletproof range proofs,
+but the current OutputV1 format still exposes recipient public keys and
+value metadata to anyone reading raw chain data directly. This is the same
+owner/value transparency model as Bitcoin, not a full transaction-privacy
+model.
 
 Remote RPC-based legacy address scanning requires authorization: a caller
 must prove ownership of the address before using the legacy UTXO/balance
@@ -478,6 +506,17 @@ delegations) are active at each epoch boundary.
 they may displace an incumbent at the next epoch reselection. The
 displaced validator remains registered — stake is not burned. They
 can re-enter by gaining more delegation.
+
+**Registered-validator cap:** The validator registry itself is bounded
+at 1,500 total registered validators. On the current testnet this
+replacement rule activates at block height 97,000. Before activation,
+a full registry rejects additional registrations. At or after activation,
+a new registration is accepted into a full registry only if its self-bond
+exceeds the lowest-ranked registered validator's total stake; in that
+case the lowest-ranked registered validator is synchronously evicted
+from the registry and all associated stake bonds are returned as UTXOs.
+This prevents unbounded permanent validator-state growth without turning
+registration into a first-come-first-served race.
 
 ### 5.2 Validator lifecycle
 
@@ -584,7 +623,8 @@ Phase 1  DELIBERATION   30 epochs  (~15 hours)
 
 Phase 2  COMMIT         20 epochs  (~10 hours)
   All Snapshot 1 eligible validators MUST submit:
-    hash(vote_byte || nonce_32_bytes)
+    H("INDRA-gov-commit-v1:" || proposal_id || validator_id
+      || vote_byte || nonce_32_bytes)
   Their vote is hidden. Missing commit = abstain.
 
 Phase 3  REVEAL         10 epochs  (~5 hours)
@@ -716,6 +756,16 @@ Double-precommit slash:     5.00%
 Surround-vote slash:        10.00%
 ```
 
+### 6.10 Proposal history retention
+
+Active proposals are retained unconditionally. Terminal proposal records
+(`Failed`, `Cancelled`, and `Executed`) are consensus-retained only for
+the 1,024 most recent terminal proposals, ordered deterministically by
+proposal epoch and ID. Older terminal records may be absent from ordinary
+node RPC responses; deep historical governance lookup is an archive-node
+or indexer responsibility. This pruning rule is height-gated and is
+scheduled for activation on the current testnet at block height 97,000.
+
 ---
 
 ## 7. Current Status and Limitations
@@ -727,8 +777,9 @@ running continuously producing blocks with full consensus, epoch
 transitions, governance state, and epoch history recording. The
 protocol has not yet been subjected to public adversarial conditions.
 
-Test coverage: 662 unit and integration tests across 11 crates, zero
-failures.
+The repository contains a large unit and integration test suite across
+the workspace. Exact test counts change as hardening work continues and
+should be taken from the current CI run, not from this document.
 
 ### 7.2 Security review status
 
@@ -743,31 +794,37 @@ professional cryptographic review. None of these have yet occurred.
 
 ### 7.3 Known limitations
 
-**Amount confidentiality is not post-quantum.** INDRA protects fund
-ownership and consensus finality against quantum adversaries. It does
-not protect transaction amounts against a quantum adversary. Ristretto255
-Pedersen commitments are quantum-vulnerable. A sufficiently capable
-quantum computer could determine historical transaction amounts. This
-does not enable theft of funds. Post-quantum commitment schemes exist
-but are not yet standardised for deployment. This will be addressed in
-a future protocol version.
+**Full transaction privacy is not implemented.** INDRA protects fund
+ownership and consensus finality against quantum adversaries, but the
+current OutputV1 format exposes owner and value metadata to raw-chain
+observers. Full owner/amount privacy requires a future OutputV2 protocol
+upgrade with stealth destinations, encrypted recipient notes, and reviewed
+post-quantum-appropriate view-key machinery.
 
 **Bulletproof generation on mobile is unbenchmarked.** Proof generation
 on server hardware takes 300–500ms. Performance on low-end devices has
-not been systematically measured. Public (non-confidential) transactions
-are available for use cases where proof generation time is unacceptable.
-Benchmarks will be published before mainnet.
+not been systematically measured. OutputV1 currently exposes value
+metadata publicly, but still includes range-proof machinery; mobile proof
+generation benchmarks will be published before mainnet.
 
 **No smart contracts.** INDRA is a settlement layer. This is a
 deliberate design choice.
 
-**Public testnet not yet launched.** A minimum three-month public
-testnet with open validator participation is required before mainnet.
+**Open public testnet period not yet complete.** A four-validator
+testnet is running, but a minimum three-month public testnet with open
+validator participation is still required before mainnet.
 
 **Key separation not yet implemented.** The current implementation
 uses a unified key derived from a 24-word recovery phrase. Hot/cold
 key separation (hot consensus key, cold withdrawal key) is planned
 before mainnet stake reaches significant value.
+
+**StateCommitmentV2 and compressed authenticated trees are not active.**
+Incremental validator/delegation/staking commitments and compressed
+authenticated UTXO/nullifier trees have been implemented behind hard-fork
+height gates, but both activation constants remain deliberately
+unscheduled (`u64::MAX`) pending further review. Live testnet state roots
+therefore still use the currently-active commitment rules.
 
 ---
 
@@ -835,7 +892,7 @@ be pruned from ordinary node state; deep historical governance lookup is an
 archive-node or indexer responsibility, matching block-pruning behavior.
 
 Schema
-  indra_getSchemaInfo        Schema version and migration history
+  indra_getSchemaInfo        Admin-only schema version and migration history
 
 Submission
   indra_sendTransaction      Submit a transaction
@@ -845,6 +902,10 @@ Submission
   indra_getLegacyUtxosAuthorized      Authorized legacy UTXO scan
   indra_getStakingNonce      Replay-protection nonce for staking ops
   indra_getPeers             Connected validator and observer peers
+  indra_getRpcPolicy         Listener mode and admin-token policy, no token value
+
+Admin-only operator diagnostics
+  indra_getPeerTopology      Full peer topology, protected by X-Admin-Token
 ```
 
 ---
@@ -855,11 +916,11 @@ Milestones, not dates. Each milestone completes before the next.
 
 **Phase 1 — Protocol implementation (complete)**
 Core protocol in Rust, ML-DSA-87 hybrid signatures, ML-DSA-87-only
-QC consensus, hybrid PQ transport (X25519 + ML-KEM-1024), confidential
-transactions, BFT consensus with stability fixes, UTXO delegation,
+QC consensus, hybrid PQ transport (X25519 + ML-KEM-1024), OutputV1 value
+commitment/range-proof machinery, BFT consensus with stability fixes, UTXO delegation,
 auto-delegation, five-phase commit-reveal governance, epoch history,
-state migration framework, CLI tooling (stake + governance), JSON-RPC,
-662 tests passing, four-validator private testnet running.
+state migration framework, encrypted key storage, CLI tooling (stake +
+governance), JSON-RPC, and a four-validator testnet.
 
 **Phase 2 — Public testnet**
 Public bootstrap nodes in multiple geographic regions. Public testnet
@@ -875,8 +936,9 @@ key separation implemented.
 
 **Phase 4 — Mainnet**
 Reproducible genesis ceremony with publicly verifiable genesis hash.
-Bootstrap nodes operational. DNS seeds live. Wallets available on
-App Store and Play Store. Block explorer live.
+Bootstrap nodes operational. DNS seeds live with DNSSEC and INDRA signed
+discovery. Wallets available on App Store and Play Store. Block explorer
+live.
 
 **Phase 5 — Ecosystem**
 Exchange integrations as demand warrants. SDK releases.
@@ -918,8 +980,8 @@ Repository: github.com/jyothisarath096/indra
 | ML-KEM-1024 | Transport key encap | Level 5 | Yes | NIST FIPS 203 |
 | X25519 | Transport classical ECDH | 128-bit | No | RFC 7748 |
 | ChaCha20-Poly1305 | Transport encryption | 256-bit | Partial | RFC 8439 |
-| Ristretto255 | Amount hiding (Pedersen) | 128-bit classical | No | draft-irtf-cfrg |
-| Bulletproofs | Range proofs | 128-bit classical | No | IEEE S&P 2018 |
+| Ristretto255 | Value commitments (OutputV1 still public) | 128-bit classical | No | draft-irtf-cfrg |
+| Bulletproofs | Range proofs (OutputV1 still public) | 128-bit classical | No | IEEE S&P 2018 |
 | SHA-256 | Hashing | 128-bit* | Partial | FIPS 180-4 |
 | VRF/Ed25519 | Proposer election | 128-bit | No | draft-irtf-cfrg-vrf |
 
@@ -976,7 +1038,7 @@ Governance (default):
   Per-proposer max:          1 active at a time
   Cooldown:                  10 epochs between proposals
 
-Schema version:              3 (as of v2.0 specification)
+Schema version:              4 (as of v2.0 specification)
 ```
 
 ### C. Reward mathematics
@@ -1006,7 +1068,7 @@ At 20 validators:  17,838,000,000 Spark/epoch = 178.38 INDRA/epoch
 | Quantum attack on QC | Forge consensus | ML-DSA-87-only QC — fully PQ |
 | Break X25519 transport | Intercept P2P | ML-KEM-1024 still protects |
 | Break ML-KEM-1024 | Intercept P2P | X25519 still protects |
-| Break Pedersen commitment | Reveal hidden amounts | Does not enable theft |
+| Break Pedersen commitment | Undermine commitment hiding | Does not enable theft; OutputV1 values are already public metadata |
 | Grover on SHA-256 | Weaken hashing | 2x speedup only, acceptable |
 
 The hybrid construction at every layer ensures that breaking one
@@ -1027,10 +1089,10 @@ Block 300 (epoch 1 boundary) — Proposal submitted:
   Exec after:    epoch 171
 
 Epoch 31 — Phase 2 (Commit):
-  buddhi:  submits hash(YES || nonce_A)
-  bonkai:  submits hash(NO  || nonce_B)
-  siddhi:  submits hash(YES || nonce_C)
-  kushal:  submits hash(NO  || nonce_D)
+  buddhi:  submits H(domain || proposal || buddhi || YES || nonce_A)
+  bonkai:  submits H(domain || proposal || bonkai || NO  || nonce_B)
+  siddhi:  submits H(domain || proposal || siddhi || YES || nonce_C)
+  kushal:  submits H(domain || proposal || kushal || NO  || nonce_D)
 
 Epoch 61 — Phase 3 (Reveal):
   All four validators reveal (YES/NO, nonce)

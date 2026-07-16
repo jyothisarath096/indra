@@ -4,8 +4,8 @@
 
 INDRA is a post-quantum Layer 1 blockchain written in Rust. It implements
 ML-DSA-87 + Ed25519 hybrid signatures, hybrid X25519 + ML-KEM-1024
-encrypted transport, confidential transactions via Pedersen commitments
-and Bulletproof range proofs, BFT consensus with 6-second absolute
+encrypted transport, OutputV1 value commitments and Bulletproof range
+proofs, BFT consensus with 6-second absolute
 finality, and on-chain five-phase commit-reveal governance.
 
 One billion INDRA. No new coins ever. No foundation. No pre-mine.
@@ -26,7 +26,7 @@ Finality:         Instant (BFT — no forks possible)
 Tx signatures:    Ed25519 + ML-DSA-87 (NIST FIPS 204, level 5)
 QC signatures:    ML-DSA-87 only (fully post-quantum)
 Transport:        X25519 + ML-KEM-1024 + ChaCha20-Poly1305 + ML-DSA-87
-Transactions:     Confidential (Pedersen commitments + Bulletproofs)
+Transactions:     OutputV1 value commitments + Bulletproofs; owner/value metadata still public
 Era 1 reward:     11.892 INDRA/block (Year 1–4)
 Fee split:        50% burned / 50% to validators
 Consensus:        Proof of Stake (Tendermint-style BFT)
@@ -50,6 +50,7 @@ indra/
 ├── indra-node/           Node binary, engine, RPC dispatch
 ├── indra-rpc/            JSON-RPC 2.0 server and handlers
 ├── indra-cli/            CLI tools (stake, governance, keygen, send, wallet-scan)
+├── indra-keystore/       Encrypted keys.json parsing and migration support
 ├── indra-ffi/            C FFI bridge for iOS/Android wallets
 └── indra-bench/          Benchmarks
 ```
@@ -80,7 +81,7 @@ cargo build --release
 ## Test
 
 ```bash
-# Full test suite (662 tests, zero failures)
+# Full workspace suite, excluding the optional FFI crate
 cargo test --workspace --exclude indra-ffi
 
 # Single crate
@@ -104,7 +105,21 @@ cargo run -p indra-cli --bin indra-keygen --release -- \
 ```
 
 Your `keys.json` contains your validator identity, ML-DSA-87 and Ed25519
-public keys, ML-DSA-87 secret key, and Ed25519 seed. Keep it secure.
+public keys. New key generation writes an encrypted keystore by default and
+prompts for a password; private seeds and signing keys are encrypted with
+Argon2id + ChaCha20-Poly1305.
+
+For unattended validator startup, store the keystore password in a separate
+mode-0600 file and reference it from `[keys].password_file` in `config.toml`,
+or pass `--keys-password-file` to the node. For local test/dev only, keygen
+also supports an explicit `--plaintext-unsafe` opt-out.
+
+Existing plaintext files can be migrated without regenerating keys:
+
+```bash
+indra-keygen encrypt --keys ~/.indra/data/keys.json --replace --password-file ~/.indra/data/keys.pass
+indra-keygen inspect --keys ~/.indra/data/keys.json
+```
 
 ### 2. Generate config
 
@@ -118,7 +133,8 @@ This interactively generates `~/.indra/data/config.toml`.
 
 ```bash
 cargo run -p indra-node --bin node --release -- \
-  --config ~/.indra/data/config.toml
+  --config ~/.indra/data/config.toml \
+  --keys-password-file ~/.indra/data/keys.pass
 ```
 
 The node starts:
@@ -141,7 +157,8 @@ curl -s http://127.0.0.1:8545 \
 
 ```bash
 # Register as a validator
-indra-stake register --keys ~/.indra/data/keys.json --commission 1000
+indra-stake register --keys ~/.indra/data/keys.json \
+  --commission 1000 --utxo <utxo_id>
 
 # Self-stake a UTXO
 indra-stake self-stake --keys ~/.indra/data/keys.json --utxo <utxo_id>
@@ -151,11 +168,12 @@ indra-stake delegate --keys ~/.indra/data/keys.json \
   --validator <validator_id> --utxo <utxo_id>
 
 # Claim rewards
-indra-stake claim-rewards --keys ~/.indra/data/keys.json
+indra-stake claim-rewards --keys ~/.indra/data/keys.json \
+  --validator <validator_id>
 
 # Set auto-delegation target (for validators outside the active set)
 indra-stake auto-delegate --keys ~/.indra/data/keys.json \
-  --target <validator_id>
+  --validator <your_validator_id> --target <target_validator_id>
 
 # View all subcommands
 indra-stake --help
@@ -176,25 +194,25 @@ indra-governance propose \
 
 # Commit a hidden vote (Phase 2)
 indra-governance commit \
-  --proposal <proposal_id> --vote yes \
-  --keys ~/.indra/data/keys.json
-# Nonce saved to ~/.indra/gov_nonces/<proposal_id>.json
+  --proposal-id <proposal_id> --vote yes \
+  --keys ~/.indra/data/keys.json --wait
+# Vote nonce is generated automatically and saved beside keys.json by default.
 
 # Reveal your vote (Phase 3)
 indra-governance reveal \
-  --proposal <proposal_id> \
-  --keys ~/.indra/data/keys.json
+  --proposal-id <proposal_id> --vote yes \
+  --keys ~/.indra/data/keys.json --wait
 
 # Redelegate vote weight (Phase 3 only, delegators only)
 indra-governance redelegate \
-  --proposal <proposal_id> \
-  --from <validator_id> --to <validator_id> \
-  --amount 100000000000 \
+  --proposal-id <proposal_id> \
+  --from-validator <validator_id> --to-validator <validator_id> \
+  --amount-spark 100000000000 \
   --keys ~/.indra/data/keys.json
 
 # Execute a passed proposal (after delay)
 indra-governance execute \
-  --proposal <proposal_id> \
+  --proposal-id <proposal_id> \
   --keys ~/.indra/data/keys.json
 
 # List proposals and governance parameters
@@ -229,7 +247,12 @@ indra-send \
 
 ## JSON-RPC reference
 
-All endpoints accept JSON-RPC 2.0 POST to `http://node:8545`.
+The full local listener accepts JSON-RPC 2.0 POST to `http://node:8545`.
+The optional `rpc_public` listener is structurally read-only, has stricter
+public-endpoint limits, and should be exposed through a reverse proxy/CDN/WAF
+for real internet traffic. Normal transaction, staking, and governance
+submissions remain authenticated by their signed payloads; operator-only
+diagnostics require `X-Admin-Token` on the full listener.
 
 **Chain**
 | Method | Description |
@@ -238,7 +261,8 @@ All endpoints accept JSON-RPC 2.0 POST to `http://node:8545`.
 | `indra_getBlock` | Full block by height |
 | `indra_getTip` | Current tip hash and height |
 | `indra_getMempoolSize` | Pending transaction count |
-| `indra_getPeers` | Connected peers |
+| `indra_getPeers` | Summary-only connected peer information |
+| `indra_getRpcPolicy` | Listener mode and admin-token policy, without revealing token value |
 
 **Validators**
 | Method | Description |
@@ -273,10 +297,11 @@ All endpoints accept JSON-RPC 2.0 POST to `http://node:8545`.
 | `indra_getGovernanceNonce` | Replay-protection nonce |
 | `indra_submitGovernanceOp` | Submit a governance operation |
 
-**Schema**
+**Admin/operator**
 | Method | Description |
 |--------|-------------|
-| `indra_getSchemaInfo` | Schema version and migration history |
+| `indra_getSchemaInfo` | Admin-only schema version and migration history |
+| `indra_getPeerTopology` | Admin-only full peer topology |
 
 **Wallet**
 | Method | Description |
@@ -316,11 +341,12 @@ Supply direction:  Decreasing over time (fee burn)
 | QC finality proofs | ML-DSA-87 only | Yes |
 | Validator transport | X25519 + ML-KEM-1024 | Yes (hybrid) |
 | Block hashing | SHA-256 | Partial (Grover) |
-| Amount hiding | Ristretto255 / Pedersen | No (acknowledged) |
+| Value commitments | Ristretto255 / Pedersen | Classical only |
 
 Transaction ownership and consensus finality are fully post-quantum.
-Amount confidentiality uses classical cryptography — documented in the
-[whitepaper](docs/WHITEPAPER.md) Section 7.3.
+Current OutputV1 owner/value metadata is public to raw-chain observers;
+RPC-based legacy address scans require ownership authorization. See the
+[whitepaper](docs/WHITEPAPER.md) Section 4 and [privacy status](docs/PRIVACY_STATUS.md).
 
 ---
 
@@ -338,6 +364,13 @@ Phase 5  Exec delay    100 epochs   Queued parameter change, auto-executes
 
 Monetary parameters (hard cap, era rewards) and safety parameters
 (consensus quorum) are permanently immutable regardless of governance.
+The governance threshold is intentionally conservative: YES stake must
+strictly exceed the configured fraction of total Snapshot 1 stake. This is
+not a participation-quorum-plus-majority model.
+
+Ordinary nodes retain all active proposals plus the 1,024 most recent terminal
+proposals in consensus state. Older terminal proposal history is an archive
+node or indexer responsibility.
 
 See [whitepaper Section 6](docs/WHITEPAPER.md) for full governance specification.
 
@@ -351,25 +384,34 @@ RPC:         https://rpc.indraprotocol.com
 P2P:         116.203.185.28:30303
 Observer:    116.203.185.28:30304
 Explorer:    https://indraprotocol.com/#explorer
-Schema:      v3
+Schema:      v4
 ```
 
 Genesis validators:
 
 | Name | Validator ID |
 |------|-------------|
-| buddhi | `8b06a9b0e9e883828ad7f9492060247b068c1530098d409a6f12b81eca4cf490` |
-| bonkai | `7cf530e0d358a41cc86cb0026c33f4f796af0947dbd2e1c694586559d9918839` |
-| siddhi | `3e202b95d9b98b695580272b102c5c040ada5d9a4330eb03aa8971a02c29b4a7` |
-| kushal | `458c74da954351ddd15cf906f5cd1bf7cc9fd994f9b026c8ce788b8aa8120d29` |
+| buddhi | `a8c62f6a12e9b662a70efb09356854b6997e173735b80c621a4059cd9e55f019` |
+| bonkai | `bab8ecad302c48f16859af6313c48e1c41f074e1cfb249a5d88b85d75dba9476` |
+| siddhi | `8cb883e7cbec5b7d697f1a5254eab885d2ae39c0c71ceea48e5948a949d4ceb3` |
+| kushal | `0fd6df9dc13dcf8a49b09d8534bc5ebdc24d8bba296f43a643f91f3b2258089b` |
+
+Discovery uses DNS seed A records with DNSSEC validation support, plus INDRA's
+signed DNS discovery format: an ML-DSA-87-signed node list whose public
+verification key is configured independently of DNS. Plain A-record discovery
+remains a fallback during rollout.
 
 ---
 
 ## iOS wallet
 
 Native iOS wallet at [github.com/jyothisarath096/indra-ios](https://github.com/jyothisarath096/indra-ios).
-Built with SwiftUI. Uses `indra-ffi` via XCFramework for ML-DSA-87 key
-generation and signing. Keys stored in iOS Keychain.
+Built with SwiftUI. Uses `indra-ffi` via XCFramework. Production FFI builds use
+opaque in-process key handles (`IndraKeyHandle`) and public metadata structs so
+raw private keys do not cross the FFI boundary. Legacy raw-key exports are
+available only behind the `legacy_raw_keys` Cargo feature for migration/testing.
+Long-term persistence remains the consuming app's platform secure storage
+(iOS Keychain today; Android Keystore for a future Android app).
 
 ---
 
