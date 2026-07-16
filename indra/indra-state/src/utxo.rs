@@ -306,6 +306,18 @@ impl UtxoSet {
         removed
     }
 
+    pub(crate) fn remove_for_rollback(&mut self, id: &Bytes32) -> Option<UtxoEntry> {
+        self.spend(id)
+    }
+
+    pub(crate) fn restore_for_rollback(&mut self, entry: UtxoEntry) {
+        let id = entry.utxo_id;
+        let value = Self::leaf_value(&entry);
+        self.entries.insert(id, entry);
+        self.smt.insert(id.0, value);
+        self.compressed.insert(id.0, value);
+    }
+
     /// Check whether a UTXO exists (is unspent).
     /// Iterate over all UTXO entries (used for wallet scan and balance queries).
     pub fn all_entries(&self) -> impl Iterator<Item = &UtxoEntry> {

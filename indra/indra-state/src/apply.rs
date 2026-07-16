@@ -67,6 +67,7 @@ use crate::{
     error::{StateError, StateResult},
     fee::compute_next_base_fee,
     governance_apply::apply_governance_op,
+    txn::StateTxn,
 };
 
 /// Apply slash evidence to chain state.
@@ -534,17 +535,17 @@ pub fn apply_block(
     block: &BlockV1,
     timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
 ) -> StateResult<Option<EpochRecord>> {
-    // Consensus atomicity: apply the entire block, including any epoch
-    // transition, to a scratch state first. Only commit the scratch state back
-    // to the caller after every validation and mutation step succeeds.
-    let mut scratch = state.clone();
-    let epoch_record = apply_block_inner(&mut scratch, block, timestamp_secs)?;
-    *state = scratch;
+    // Consensus atomicity: validation is read-only, then mutations happen
+    // through a scoped undo log. If any mutation step fails, the transaction
+    // drops without commit and rolls back every recorded change.
+    let mut txn = StateTxn::begin(state, block.header.height);
+    let epoch_record = apply_block_inner(&mut txn, block, timestamp_secs)?;
+    txn.commit();
     Ok(epoch_record)
 }
 
 fn apply_block_inner(
-    state: &mut ChainState,
+    txn: &mut StateTxn<'_>,
     block: &BlockV1,
     timestamp_secs: u64,
 ) -> StateResult<Option<EpochRecord>> {
@@ -559,6 +560,7 @@ fn apply_block_inner(
 
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
+    let state = txn.state();
     validate_block_header(state, block)?;
 
     if block.staking_ops.len() > MAX_STAKING_OPS_PER_BLOCK {
@@ -646,62 +648,66 @@ fn apply_block_inner(
 
     // ── Phase 3: State mutation (all validation passed) ───────────────────
 
-    state.ensure_state_commitment_v2(block.header.height);
+    txn.ensure_state_commitment_v2()?;
 
     // Apply each transaction
     for (tx_idx, tx) in block.transactions.iter().enumerate() {
-        apply_transaction(state, tx, block.header.height, tx_idx as u32)?;
+        apply_transaction(txn, tx, block.header.height, tx_idx as u32)?;
     }
 
-    let chain_id = state.chain_id.clone();
+    let chain_id = txn.state().chain_id.clone();
     for op in &block.staking_ops {
-        apply_staking_op(state, op, &chain_id, block.header.height).map_err(|_| {
+        txn.snapshot_staking_scope();
+        apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
             StateError::InvariantViolation {
                 message: "staking op failed on real state after shadow validation",
             }
         })?;
+        txn.after_mutation()?;
     }
 
     let current_epoch = epoch_for_height(block.header.height);
-    let chain_id = state.chain_id.clone();
+    let chain_id = txn.state().chain_id.clone();
     for op in &block.governance_ops {
-        apply_governance_op(state, op, current_epoch, &chain_id).map_err(|_| {
+        txn.snapshot_governance_scope();
+        apply_governance_op(txn.state_mut(), op, current_epoch, &chain_id).map_err(|_| {
             StateError::InvariantViolation {
                 message: "governance op failed on real state after shadow validation",
             }
         })?;
+        txn.after_mutation()?;
     }
 
-    let chain_id_for_slash = state.chain_id.clone();
-    let reporter_pubkey = slash_reporter_pubkey_for_block(state, block);
+    let chain_id_for_slash = txn.state().chain_id.clone();
+    let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block);
     for evidence in &block.slashing_evidence {
+        txn.snapshot_slashing_scope();
         let accounting = apply_slash_at_height_with_accounting(
-            state,
+            txn.state_mut(),
             evidence,
             &chain_id_for_slash,
             block.header.height,
             reporter_pubkey.as_ref(),
         )
-        .expect("slash failed on real state after shadow validation — invariant violation");
-        state.epoch_slashed_spark = state
-            .epoch_slashed_spark
-            .saturating_add(accounting.slash_amount);
-        state.epoch_slash_event_count = state.epoch_slash_event_count.saturating_add(1);
+        .map_err(|_| StateError::InvariantViolation {
+            message: "slash failed on real state after shadow validation",
+        })?;
+        txn.add_slash_accounting(accounting.slash_amount)?;
     }
 
     // Update base fee for next block
-    let next_fee = compute_next_base_fee(state.base_fee, block.transactions.len());
-    state.base_fee = next_fee;
+    let next_fee = compute_next_base_fee(txn.state().base_fee, block.transactions.len());
+    txn.set_base_fee(next_fee)?;
 
     // Advance height and tip hash
-    state.height = block.header.height;
-    state.tip_hash = block.header.block_hash();
+    txn.set_tip(block.header.height, block.header.block_hash())?;
 
     // Apply epoch transition if this is the last block of an epoch
-    let epoch_record = if is_epoch_boundary(state.height) {
-        let epoch = epoch_for_height(state.height);
+    let epoch_record = if is_epoch_boundary(txn.state().height) {
+        let epoch = epoch_for_height(txn.state().height);
+        txn.snapshot_epoch_scope();
         Some(crate::epoch::apply_epoch_transition_at_height(
-            state,
+            txn.state_mut(),
             epoch,
             timestamp_secs,
             block.header.height,
@@ -709,14 +715,19 @@ fn apply_block_inner(
     } else {
         None
     };
+    if epoch_record.is_some() {
+        txn.after_mutation()?;
+    }
 
-    if state.total_supply > HARD_CAP_SPARK {
+    if txn.state().total_supply > HARD_CAP_SPARK {
         return Err(StateError::InvariantViolation {
             message: "CRITICAL: total supply exceeds hard cap — constitutional invariant violated",
         });
     }
 
-    update_last_active_epoch_from_block_qc(state, block);
+    txn.snapshot_validator_activity_scope();
+    update_last_active_epoch_from_block_qc(txn.state_mut(), block);
+    txn.after_mutation()?;
 
     Ok(epoch_record)
 }
@@ -979,32 +990,28 @@ pub fn validate_transaction(
 ///
 /// Called only after validate_transaction has passed for all transactions.
 fn apply_transaction(
-    state: &mut ChainState,
+    txn: &mut StateTxn<'_>,
     tx: &TransactionV1,
     height: u64,
     tx_index: u32,
 ) -> StateResult<()> {
     for input in &tx.inputs {
-        if state.utxos.spend(&input.utxo_id).is_none() {
+        if txn.spend_utxo(&input.utxo_id)?.is_none() {
             return Err(StateError::InvariantViolation {
                 message: "attempted to spend an already-spent UTXO during apply_transaction",
             });
         }
-        state.nullifiers.insert_or_double_spend(input.nullifier)?;
+        txn.insert_nullifier(input.nullifier)?;
     }
 
     // Create outputs: insert new UTXOs
     for (out_idx, output) in tx.outputs.iter().enumerate() {
-        state
-            .utxos
-            .insert(output.clone(), height, tx_index, out_idx as u32)?;
+        txn.insert_utxo(output.clone(), height, tx_index, out_idx as u32)?;
     }
 
     let burn_amount = tx.fee_amount / 2;
     let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
-    state.total_supply = state.total_supply.saturating_sub(burn_amount);
-    state.fee_reward_pool = state.fee_reward_pool.saturating_add(validator_amount);
-    state.epoch_fees_burned = state.epoch_fees_burned.saturating_add(burn_amount);
+    txn.apply_fee_accounting(burn_amount, validator_amount)?;
 
     Ok(())
 }
@@ -1013,16 +1020,25 @@ fn apply_transaction(
 mod tests {
     use super::*;
     use crate::chain::ChainState;
+    use crate::governance::{
+        GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit,
+    };
     use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
+        codec::Encode,
         types::{
             block::{BlockHeaderV1, BlockV1},
-            governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
+            governance::{
+                compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
+                GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
+            },
             primitives::{
                 DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-                INITIAL_BASE_FEE_SPARK_PER_KB, MINIMUM_VALIDATOR_BOND_SPARK,
-                SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
+                MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
+                MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+                UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
             staking::{StakingOp, StakingOpBody},
@@ -1031,8 +1047,9 @@ mod tests {
         },
         Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::{commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PqKeypair};
     use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::BTreeMap;
 
     const TEST_INPUT_VALUE: u64 = 1_000_000;
 
@@ -1080,6 +1097,172 @@ mod tests {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
         };
+    }
+
+    fn governance_validator_id(pubkey: &HybridPubKey) -> Bytes32 {
+        Bytes32::from(sha256(&pubkey.classical_pk.0))
+    }
+
+    fn sign_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair, chain_id: &str) {
+        let domain = governance_signing_domain(
+            op.action_type,
+            op.signer_id,
+            op.nonce,
+            &op.payload,
+            chain_id,
+        );
+        let msg_hash = sha256(&domain);
+        let sig = keypair.sign(&msg_hash).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
+    fn install_governance_validator(
+        state: &mut ChainState,
+        seed: [u8; 32],
+        stake_spark: u64,
+    ) -> (HybridPubKey, HybridKeypair, Bytes32) {
+        let (pubkey, keypair) = make_test_keypair(seed);
+        let validator_id = governance_validator_id(&pubkey);
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: "governance-txn-validator".into(),
+                hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
+                vrf_pk: Some(seed),
+                stake_spark,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: 1_000,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: 1,
+                auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
+            })
+            .unwrap();
+        (pubkey, keypair, validator_id)
+    }
+
+    fn governance_deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
+        output_with_value(value_spark, owner_pubkey, 0x44)
+    }
+
+    fn governance_propose_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposer_pubkey: HybridPubKey,
+        deposit_utxo_id: Bytes32,
+        nonce: u64,
+        action: GovernableAction,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Propose {
+            action,
+            deposit_utxo_id,
+            proposer_pubkey,
+            title: VariableBytes::from_slice(b"txn oracle").unwrap(),
+            description: VariableBytes::from_slice(b"state txn governance test").unwrap(),
+        };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ProposeChange,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
+    }
+
+    fn governance_commit_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposal_id: Bytes32,
+        commit_hash: Bytes32,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Commit {
+            proposal_id,
+            commit_hash,
+        };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
+    }
+
+    fn governance_reveal_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposal_id: Bytes32,
+        vote: u8,
+        vote_nonce: Bytes32,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Reveal {
+            proposal_id,
+            vote,
+            nonce: vote_nonce,
+        };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::RevealVote,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
+    }
+
+    fn governance_execute_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposal_id: Bytes32,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Execute { proposal_id };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ExecuteProposal,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
+    }
+
+    fn governance_cancel_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposal_id: Bytes32,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Cancel { proposal_id };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::CancelProposal,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
     }
 
     fn signed_register_validator_op(
@@ -1340,11 +1523,75 @@ mod tests {
         tx
     }
 
+    fn make_multi_io_tx(
+        state: &ChainState,
+        keypair: &HybridKeypair,
+        inputs: &[(Bytes32, u64, [u8; 32], Bytes32)],
+        output_count: usize,
+    ) -> TransactionV1 {
+        assert_eq!(inputs.len(), MAX_INPUTS);
+        assert_eq!(output_count, MAX_OUTPUTS);
+        let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 100;
+        let input_total = inputs.iter().map(|(_, value, _, _)| *value).sum::<u64>();
+        let spendable = input_total - fee;
+        let base_output_value = spendable / output_count as u64;
+        let mut output_blindings = Vec::new();
+        let mut outputs = Vec::new();
+        let (owner_pubkey, _) = make_test_keypair([0x5A; 32]);
+        for idx in 0..output_count {
+            let value = if idx + 1 == output_count {
+                spendable - base_output_value * (output_count as u64 - 1)
+            } else {
+                base_output_value
+            };
+            let blinding = [0x80u8.saturating_add(idx as u8); 32];
+            output_blindings.push(blinding);
+            let commitment = commit(value, &blinding);
+            let mut rng = StdRng::from_seed(blinding);
+            let proof = prove_range(value, &blinding, &mut rng).unwrap();
+            outputs.push(OutputV1 {
+                value_spark: value,
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::from(commitment.0),
+                },
+                owner_pubkey: owner_pubkey.clone(),
+                range_proof: VariableBytes::from_slice(&proof).unwrap(),
+                lock_height: 0,
+            });
+        }
+        let input_blindings = inputs
+            .iter()
+            .map(|(_, _, blinding, _)| *blinding)
+            .collect::<Vec<_>>();
+        let fee_blinding = derive_fee_blinding(&input_blindings, &output_blindings);
+        let fee_commitment = commit(fee, &fee_blinding);
+        let mut tx = TransactionV1 {
+            version: ProtocolVersion::CURRENT,
+            signature_module_id: 1,
+            inputs: inputs
+                .iter()
+                .map(|(utxo_id, _, _, nullifier)| InputV1 {
+                    utxo_id: *utxo_id,
+                    nullifier: *nullifier,
+                })
+                .collect(),
+            outputs,
+            fee_amount: fee,
+            fee_blinding: Bytes32::from(fee_blinding),
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(fee_commitment.0),
+            },
+            signature: dummy_sig(),
+        };
+        tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
+        tx
+    }
+
     fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
         let height = state.height + 1;
         BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion::CURRENT,
+                protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
                 height,
                 prev_hash: state.tip_hash,
                 timestamp: 1_700_000_000 + height,
@@ -1368,7 +1615,856 @@ mod tests {
         }
     }
 
+    fn assert_same_consensus_state(left: &ChainState, right: &ChainState) {
+        assert_eq!(left.encode_to_vec(), right.encode_to_vec());
+        assert_eq!(
+            crate::state_root::compute_state_root(left),
+            crate::state_root::compute_state_root(right)
+        );
+        assert_eq!(
+            crate::state_root::compute_validator_set_root(left),
+            crate::state_root::compute_validator_set_root(right)
+        );
+    }
+
+    #[derive(Debug)]
+    struct OracleOutcome {
+        state: ChainState,
+        state_root: Bytes32,
+        validator_set_root: Bytes32,
+        value_hash: Bytes32,
+        epoch_record: Option<EpochRecord>,
+    }
+
+    fn clone_atomic_reference_apply_block(
+        pre_state: &ChainState,
+        block: &BlockV1,
+        timestamp_secs: u64,
+    ) -> StateResult<OracleOutcome> {
+        let mut scratch = pre_state.clone();
+        let epoch_record = apply_block(&mut scratch, block, timestamp_secs)?;
+        Ok(OracleOutcome {
+            state_root: crate::state_root::compute_state_root(&scratch),
+            validator_set_root: crate::state_root::compute_validator_set_root(&scratch),
+            value_hash: block.compute_value_hash(scratch.total_supply),
+            state: scratch,
+            epoch_record,
+        })
+    }
+
+    fn undo_apply_block_outcome(
+        pre_state: &ChainState,
+        block: &BlockV1,
+        timestamp_secs: u64,
+    ) -> StateResult<OracleOutcome> {
+        let mut state = pre_state.clone();
+        let epoch_record = apply_block(&mut state, block, timestamp_secs)?;
+        Ok(OracleOutcome {
+            state_root: crate::state_root::compute_state_root(&state),
+            validator_set_root: crate::state_root::compute_validator_set_root(&state),
+            value_hash: block.compute_value_hash(state.total_supply),
+            state,
+            epoch_record,
+        })
+    }
+
+    fn assert_oracle_matches(pre_state: &ChainState, block: &BlockV1, timestamp_secs: u64) {
+        let reference = clone_atomic_reference_apply_block(pre_state, block, timestamp_secs)
+            .expect("clone-atomic reference apply must succeed");
+        let candidate = undo_apply_block_outcome(pre_state, block, timestamp_secs)
+            .expect("undo apply must succeed");
+        assert_eq!(candidate.state.encode_to_vec(), reference.state.encode_to_vec());
+        assert_eq!(candidate.state_root, reference.state_root);
+        assert_eq!(candidate.validator_set_root, reference.validator_set_root);
+        assert_eq!(candidate.value_hash, reference.value_hash);
+        assert_eq!(candidate.epoch_record, reference.epoch_record);
+    }
+
+    fn test_proposal_record(
+        proposal_id: Bytes32,
+        proposer_id: Bytes32,
+        proposer_pubkey: HybridPubKey,
+        action: GovernableAction,
+        phase: ProposalPhase,
+    ) -> ProposalRecord {
+        ProposalRecord {
+            proposal_id,
+            proposer_id,
+            proposer_pubkey,
+            tier: action.tier(),
+            action,
+            title: "state-txn".into(),
+            description: "state transaction test proposal".into(),
+            deposit_spark: 1_000,
+            deposit_burned: false,
+            proposed_epoch: 0,
+            commit_start_epoch: 0,
+            reveal_start_epoch: 0,
+            tally_epoch: 0,
+            exec_delay_epochs: 0,
+            executable_after_epoch: 0,
+            phase,
+            snapshot1: None,
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: Vec::new(),
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: None,
+        }
+    }
+
+    fn governance_proposal_state(
+        phase: ProposalPhase,
+    ) -> (ChainState, HybridPubKey, HybridKeypair, Bytes32, Bytes32) {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair, proposer_id) =
+            install_governance_validator(&mut state, [0x91; 32], 100_000);
+        let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
+        let proposal_id = compute_proposal_id(proposer_id, &action, 0, DEFAULT_CHAIN_ID);
+        let mut proposal = test_proposal_record(
+            proposal_id,
+            proposer_id,
+            proposer_pubkey.clone(),
+            action,
+            phase,
+        );
+        proposal.snapshot1 = Some(GovernanceSnapshot {
+            weights: BTreeMap::from([(proposer_id, 100_000)]),
+            total_stake: 100_000,
+        });
+        state.governance.proposals.insert(proposal_id, proposal);
+        (state, proposer_pubkey, proposer_keypair, proposer_id, proposal_id)
+    }
+
+    fn assert_all_failpoints_roll_back(state: &ChainState, block: &BlockV1) -> usize {
+        crate::txn::set_fail_after_mutation(None);
+        let mut success_state = state.clone();
+        apply_block(&mut success_state, block, 0).unwrap();
+        let mutation_count = crate::txn::mutation_count();
+        assert!(mutation_count > 0);
+        println!(
+            "state_txn_failpoint_coverage height={} mutation_count={mutation_count}",
+            block.header.height
+        );
+
+        for fail_after in 1..=mutation_count {
+            crate::txn::set_fail_after_mutation(Some(fail_after));
+            let mut candidate = state.clone();
+            let err = apply_block(&mut candidate, block, 0).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("state transaction failpoint injected after mutation"),
+                "unexpected error at failpoint {fail_after}: {err}"
+            );
+            assert_same_consensus_state(&candidate, state);
+        }
+        crate::txn::set_fail_after_mutation(None);
+        mutation_count
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn state_txn_rolls_back_after_each_transaction_mutation_failpoint() {
+        let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            value,
+            blinding,
+            Bytes32::from([0xA1; 32]),
+        );
+        let block = make_block(&state, vec![tx]);
+
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 6,
+            "transaction block should exercise several undo-recorded mutations, got {mutation_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_staking_scope_failpoints() {
+        let mut state = ChainState::new_genesis();
+        let (op, _) = signed_register_validator_op(&mut state, [0x61; 32], 1);
+        let mut block = make_block(&state, vec![]);
+        block.staking_ops.push(op);
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 4,
+            "staking block should exercise scoped undo mutations, got {mutation_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_slashing_scope_failpoints() {
+        let (state, validator_id, keypair) =
+            slash_validator_state([0x62; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let mut block = make_block(&state, vec![]);
+        block.slashing_evidence.push(evidence);
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 4,
+            "slashing block should exercise scoped undo mutations, got {mutation_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_epoch_transition_scope_failpoints() {
+        let mut state = ChainState::new_genesis();
+        state.height = EPOCH_DURATION_BLOCKS - 1;
+        let block = make_block(&state, vec![]);
+        assert!(is_epoch_boundary(block.header.height));
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 4,
+            "epoch-boundary block should exercise scoped undo mutations, got {mutation_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_governance_proposal_failpoints() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair, proposer_id) =
+            install_governance_validator(&mut state, [0x81; 32], 100_000);
+        let deposit = state
+            .utxos
+            .insert(
+                governance_deposit_output(proposer_pubkey.clone(), 1_500),
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let op = governance_propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey,
+            deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark { value: 100_000 },
+        );
+        let mut block = make_block(&state, vec![]);
+        block.governance_ops.push(op);
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 4,
+            "governance proposal block should exercise scoped undo mutations, got {mutation_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_governance_commit_reveal_execute_cancel_failpoints() {
+        let vote_nonce = Bytes32::from([0xA7; 32]);
+
+        let (commit_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Commit);
+        let commit_hash = governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
+        let commit_op =
+            governance_commit_op(proposer_id, &proposer_keypair, proposal_id, commit_hash, 1);
+        let mut commit_block = make_block(&commit_state, vec![]);
+        commit_block.governance_ops.push(commit_op);
+        let commit_count = assert_all_failpoints_roll_back(&commit_state, &commit_block);
+        assert!(
+            commit_count >= 3,
+            "governance commit block should exercise scoped undo mutations, got {commit_count}"
+        );
+
+        let (mut reveal_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Reveal);
+        let commit_hash = governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
+        reveal_state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap()
+            .commits
+            .insert(
+                proposer_id,
+                VoteCommit {
+                    validator_id: proposer_id,
+                    commit_hash,
+                    committed_epoch: 0,
+                },
+            );
+        reveal_state.governance.gov_nonces.insert(proposer_id, 1);
+        let reveal_op =
+            governance_reveal_op(proposer_id, &proposer_keypair, proposal_id, 1, vote_nonce, 2);
+        let mut reveal_block = make_block(&reveal_state, vec![]);
+        reveal_block.governance_ops.push(reveal_op);
+        let reveal_count = assert_all_failpoints_roll_back(&reveal_state, &reveal_block);
+        assert!(
+            reveal_count >= 3,
+            "governance reveal block should exercise scoped undo mutations, got {reveal_count}"
+        );
+
+        let (mut execute_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::ExecDelay);
+        execute_state
+            .governance
+            .queued_executions
+            .push(QueuedExecution {
+                proposal_id,
+                action: GovernableAction::SetMinDelegationSpark { value: 100_001 },
+                executable_epoch: 0,
+                executed: false,
+            });
+        let execute_op = governance_execute_op(proposer_id, &proposer_keypair, proposal_id, 1);
+        let mut execute_block = make_block(&execute_state, vec![]);
+        execute_block.governance_ops.push(execute_op);
+        let execute_count = assert_all_failpoints_roll_back(&execute_state, &execute_block);
+        assert!(
+            execute_count >= 3,
+            "governance execute block should exercise scoped undo mutations, got {execute_count}"
+        );
+
+        let (cancel_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Deliberation);
+        let cancel_op = governance_cancel_op(proposer_id, &proposer_keypair, proposal_id, 1);
+        let mut cancel_block = make_block(&cancel_state, vec![]);
+        cancel_block.governance_ops.push(cancel_op);
+        let cancel_count = assert_all_failpoints_roll_back(&cancel_state, &cancel_block);
+        assert!(
+            cancel_count >= 3,
+            "governance cancel block should exercise scoped undo mutations, got {cancel_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rebuilds_state_commitment_v2_cache_after_rollback() {
+        let mut state = ChainState::new_genesis();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        let block = BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion(block_protocol_version_for_height(u64::MAX)),
+                height: u64::MAX,
+                prev_hash: Bytes32::ZERO,
+                timestamp: 0,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: state.base_fee,
+                proposer_round: 0,
+                polc_round: indra_core::types::block::NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::ZERO,
+                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                election_result_hash: None,
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            vrf_reveals: vec![],
+        };
+
+        let mut success = state.clone();
+        crate::txn::set_fail_after_mutation(None);
+        apply_block(&mut success, &block, 0).unwrap();
+        let success_root = success.state_commitment_v2_root(block.header.height);
+        success.rebuild_state_commitment_v2(block.header.height);
+        assert_eq!(
+            success.state_commitment_v2_root(block.header.height),
+            success_root
+        );
+
+        let mut rolled_back = state.clone();
+        crate::txn::set_fail_after_mutation(Some(1));
+        let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("state transaction failpoint injected after mutation")
+        );
+        assert_same_consensus_state(&rolled_back, &state);
+        let rollback_root = rolled_back.state_commitment_v2_root(block.header.height);
+        rolled_back.rebuild_state_commitment_v2(block.header.height);
+        assert_eq!(
+            rolled_back.state_commitment_v2_root(block.header.height),
+            rollback_root
+        );
+        crate::txn::set_fail_after_mutation(None);
+    }
+
+    #[test]
+    fn state_txn_oracle_matches_clone_atomic_reference_across_block_types() {
+        let state = ChainState::new_genesis();
+        assert_oracle_matches(&state, &make_block(&state, vec![]), 0);
+
+        let (tx_state, utxo_id, keypair, blinding, value) = state_with_utxo();
+        let tx = make_tx(
+            &tx_state,
+            &keypair,
+            utxo_id,
+            value,
+            blinding,
+            Bytes32::from([0xB1; 32]),
+        );
+        assert_oracle_matches(&tx_state, &make_block(&tx_state, vec![tx]), 0);
+
+        let mut staking_state = ChainState::new_genesis();
+        let (staking_op, _) = signed_register_validator_op(&mut staking_state, [0xB2; 32], 1);
+        let mut staking_block = make_block(&staking_state, vec![]);
+        staking_block.staking_ops.push(staking_op);
+        assert_oracle_matches(&staking_state, &staking_block, 0);
+
+        let mut governance_state = ChainState::new_genesis();
+        governance_state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair, proposer_id) =
+            install_governance_validator(&mut governance_state, [0xB3; 32], 100_000);
+        let deposit = governance_state
+            .utxos
+            .insert(
+                governance_deposit_output(proposer_pubkey.clone(), 1_000),
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let governance_op = governance_propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey,
+            deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark { value: 100_000 },
+        );
+        let mut governance_block = make_block(&governance_state, vec![]);
+        governance_block.governance_ops.push(governance_op);
+        assert_oracle_matches(&governance_state, &governance_block, 0);
+
+        let (slash_state, validator_id, slash_keypair) =
+            slash_validator_state([0xB4; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        let mut slash_block = make_block(&slash_state, vec![]);
+        slash_block
+            .slashing_evidence
+            .push(slash_evidence(&slash_keypair, validator_id, VoteStep::Precommit));
+        assert_oracle_matches(&slash_state, &slash_block, 0);
+
+        let mut epoch_state = ChainState::new_genesis();
+        epoch_state.height = EPOCH_DURATION_BLOCKS - 1;
+        let epoch_block = make_block(&epoch_state, vec![]);
+        assert!(is_epoch_boundary(epoch_block.header.height));
+        assert_oracle_matches(&epoch_state, &epoch_block, 123_456);
+    }
+
+    fn assert_reference_and_candidate_sequences_match(
+        initial: ChainState,
+        mut make_next_block: impl FnMut(&ChainState, usize) -> BlockV1,
+        count: usize,
+    ) {
+        let mut reference = initial.clone();
+        let mut candidate = initial;
+        for index in 0..count {
+            let reference_block = make_next_block(&reference, index);
+            let candidate_block = reference_block.clone();
+            let reference_outcome =
+                clone_atomic_reference_apply_block(&reference, &reference_block, index as u64)
+                    .unwrap();
+            reference = reference_outcome.state;
+            apply_block(&mut candidate, &candidate_block, index as u64).unwrap();
+            assert_same_consensus_state(&candidate, &reference);
+        }
+    }
+
+    #[test]
+    fn state_txn_replay_determinism_normal_and_epoch_boundary_sequences() {
+        assert_reference_and_candidate_sequences_match(
+            ChainState::new_genesis(),
+            |state, _| make_block(state, vec![]),
+            5,
+        );
+
+        let mut epoch_initial = ChainState::new_genesis();
+        epoch_initial.height = EPOCH_DURATION_BLOCKS - 2;
+        assert_reference_and_candidate_sequences_match(
+            epoch_initial,
+            |state, _| make_block(state, vec![]),
+            3,
+        );
+    }
+
+    #[test]
+    fn state_txn_replay_determinism_governance_phase_boundary_sequence() {
+        let (mut initial, _, _, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Deliberation);
+        initial.height = EPOCH_DURATION_BLOCKS - 1;
+        {
+            let proposal = initial.governance.proposals.get_mut(&proposal_id).unwrap();
+            proposal.commit_start_epoch = 1;
+            proposal.reveal_start_epoch = 2;
+            proposal.tally_epoch = 3;
+            proposal.executable_after_epoch = 4;
+            proposal.snapshot1 = None;
+        }
+        initial.governance.params.governance_quorum_bps = 4_000;
+
+        let mut reference = initial.clone();
+        let mut candidate = initial;
+        for target_epoch in 1..=4 {
+            reference.height = target_epoch * EPOCH_DURATION_BLOCKS - 1;
+            candidate.height = reference.height;
+            let block = make_block(&reference, vec![]);
+            if target_epoch == 2 {
+                let vote_nonce = Bytes32::from([0xC2; 32]);
+                let commit_hash = governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
+                if let Some(proposal) = reference.governance.proposals.get_mut(&proposal_id) {
+                    proposal.commits.insert(
+                        proposer_id,
+                        VoteCommit {
+                            validator_id: proposer_id,
+                            commit_hash,
+                            committed_epoch: 1,
+                        },
+                    );
+                }
+                if let Some(proposal) = candidate.governance.proposals.get_mut(&proposal_id) {
+                    proposal.commits.insert(
+                        proposer_id,
+                        VoteCommit {
+                            validator_id: proposer_id,
+                            commit_hash,
+                            committed_epoch: 1,
+                        },
+                    );
+                }
+            }
+            if target_epoch == 3 {
+                if let Some(proposal) = reference.governance.proposals.get_mut(&proposal_id) {
+                    proposal.reveals.insert(
+                        proposer_id,
+                        crate::governance::VoteReveal {
+                            validator_id: proposer_id,
+                            vote: true,
+                            revealed_epoch: 2,
+                        },
+                    );
+                }
+                if let Some(proposal) = candidate.governance.proposals.get_mut(&proposal_id) {
+                    proposal.reveals.insert(
+                        proposer_id,
+                        crate::governance::VoteReveal {
+                            validator_id: proposer_id,
+                            vote: true,
+                            revealed_epoch: 2,
+                        },
+                    );
+                }
+            }
+            let outcome = clone_atomic_reference_apply_block(&reference, &block, target_epoch)
+                .unwrap();
+            reference = outcome.state;
+            apply_block(&mut candidate, &block, target_epoch).unwrap();
+            assert_same_consensus_state(&candidate, &reference);
+        }
+    }
+
+    #[test]
+    fn state_txn_replay_determinism_rejected_block_then_valid_block() {
+        let mut reference = ChainState::new_genesis();
+        let mut candidate = reference.clone();
+        let mut bad_block = make_block(&reference, vec![]);
+        bad_block.header.prev_hash = Bytes32::from([0xEE; 32]);
+        let reference_before = reference.clone();
+        assert!(clone_atomic_reference_apply_block(&reference, &bad_block, 0).is_err());
+        assert!(apply_block(&mut candidate, &bad_block, 0).is_err());
+        assert_same_consensus_state(&reference, &reference_before);
+        assert_same_consensus_state(&candidate, &reference_before);
+
+        let valid_block = make_block(&reference, vec![]);
+        reference = clone_atomic_reference_apply_block(&reference, &valid_block, 0)
+            .unwrap()
+            .state;
+        apply_block(&mut candidate, &valid_block, 0).unwrap();
+        assert_same_consensus_state(&candidate, &reference);
+    }
+
+    #[test]
+    #[ignore = "realistic state transaction clone-cost benchmark; run explicitly with --ignored --nocapture"]
+    fn state_txn_realistic_import_clone_cost_benchmark() {
+        use std::time::Instant;
+
+        fn realistic_state(staked_bonds: usize) -> ChainState {
+            let mut state = ChainState::new_genesis();
+            let validator_id = Bytes32::from([0x55; 32]);
+            let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
+            let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
+            for index in 0..staked_bonds {
+                let mut id_bytes = [0u8; 32];
+                for (dst, src) in id_bytes
+                    .iter_mut()
+                    .zip((index as u64).to_le_bytes().into_iter())
+                {
+                    *dst = src;
+                }
+                let utxo_id = Bytes32::from(id_bytes);
+                let output = OutputV1 {
+                    value_spark: 1_000,
+                    commitment: CommitmentV1 {
+                        compressed_point: Bytes32::from([0x77; 32]),
+                    },
+                    owner_pubkey: HybridPubKey {
+                        classical_pk: Bytes32::from([0x88; 32]),
+                        pq_pk: pq_pk.clone(),
+                    },
+                    range_proof: range_proof.clone(),
+                    lock_height: 0,
+                };
+                state.staked_bonds.insert(
+                    utxo_id,
+                    StakeBondEntry {
+                        utxo_id,
+                        validator_id,
+                        delegator_id: Bytes32::from([0x66; 32]),
+                        amount_spark: 1_000,
+                        bonded_epoch: 0,
+                        unbonding_end_epoch: None,
+                        original_output: output,
+                    },
+                );
+            }
+            state
+        }
+
+        for size in [100_000usize, 1_000_000usize] {
+            let state = realistic_state(size);
+            let block = make_block(&state, vec![]);
+
+            let start = Instant::now();
+            let mut projected_before = state.clone();
+            let mut scratch_before = projected_before.clone();
+            apply_block(&mut scratch_before, &block, 0).unwrap();
+            projected_before = scratch_before;
+            let before = start.elapsed();
+
+            let start = Instant::now();
+            let mut projected_after = state.clone();
+            apply_block(&mut projected_after, &block, 0).unwrap();
+            let after = start.elapsed();
+
+            let mut undo_only_state = state.clone();
+            let start = Instant::now();
+            apply_block(&mut undo_only_state, &block, 0).unwrap();
+            let undo_only = start.elapsed();
+
+            println!(
+                "state_txn_realistic_import_clone_cost size={size} simulated_before_two_clones={before:?} after_outer_clone_plus_undo={after:?} undo_only={undo_only:?} final_heights=({}, {}, {})",
+                projected_before.height,
+                projected_after.height,
+                undo_only_state.height
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "max-cap StateTxn stress benchmark; run explicitly with --ignored --nocapture"]
+    fn state_txn_stress_max_op_caps_applies_and_rolls_back() {
+        use std::time::Instant;
+
+        let mut state = ChainState::new_genesis();
+
+        let (tx_owner_pubkey, tx_keypair) = make_test_keypair([0xD0; 32]);
+        let mut multi_inputs = Vec::new();
+        for index in 0..MAX_INPUTS {
+            let seed = 0x10u8.saturating_add(index as u8);
+            let value = TEST_INPUT_VALUE + seed as u64 + 10_000;
+            let utxo_id = state
+                .utxos
+                .insert(output_with_value(value, tx_owner_pubkey.clone(), seed), 0, 0, index as u32)
+                .unwrap();
+            multi_inputs.push((utxo_id, value, [seed; 32], Bytes32::from([seed; 32])));
+        }
+        let mut transactions = vec![make_multi_io_tx(
+            &state,
+            &tx_keypair,
+            &multi_inputs,
+            MAX_OUTPUTS,
+        )];
+        for index in 1..MAX_TX_PER_BLOCK {
+            let seed = 0x30u8.wrapping_add(index as u8);
+            let value = TEST_INPUT_VALUE + seed as u64 + 10_000;
+            let utxo_id = state
+                .utxos
+                .insert(
+                    output_with_value(value, tx_owner_pubkey.clone(), seed),
+                    0,
+                    1,
+                    index as u32,
+                )
+                .unwrap();
+            transactions.push(make_tx(
+                &state,
+                &tx_keypair,
+                utxo_id,
+                value,
+                [seed; 32],
+                Bytes32::from([seed.wrapping_add(1); 32]),
+            ));
+        }
+        assert_eq!(transactions.len(), MAX_TX_PER_BLOCK);
+        assert_eq!(transactions[0].inputs.len(), MAX_INPUTS);
+        assert_eq!(transactions[0].outputs.len(), MAX_OUTPUTS);
+
+        let mut staking_ops = Vec::new();
+        for index in 0..MAX_STAKING_OPS_PER_BLOCK {
+            let seed = [0xE0u8.wrapping_add(index as u8); 32];
+            let (op, _) = signed_register_validator_op(&mut state, seed, 1);
+            staking_ops.push(op);
+        }
+        assert_eq!(staking_ops.len(), MAX_STAKING_OPS_PER_BLOCK);
+
+        let (proposer_pubkey, proposer_keypair, proposer_id) =
+            install_governance_validator(&mut state, [0xA1; 32], 100_000);
+        let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
+        let proposal_id = compute_proposal_id(proposer_id, &action, 0, DEFAULT_CHAIN_ID);
+        let mut proposal = test_proposal_record(
+            proposal_id,
+            proposer_id,
+            proposer_pubkey,
+            action,
+            ProposalPhase::Commit,
+        );
+        let mut weights = BTreeMap::from([(proposer_id, 100_000)]);
+        let mut governance_signers = vec![(proposer_id, proposer_keypair)];
+        for index in 1..MAX_GOV_OPS_PER_BLOCK {
+            let (_, keypair, validator_id) =
+                install_governance_validator(&mut state, [0xA1u8 + index as u8; 32], 100_000);
+            weights.insert(validator_id, 100_000);
+            governance_signers.push((validator_id, keypair));
+        }
+        proposal.snapshot1 = Some(GovernanceSnapshot {
+            weights,
+            total_stake: 100_000 * MAX_GOV_OPS_PER_BLOCK as u64,
+        });
+        state.governance.proposals.insert(proposal_id, proposal);
+        let governance_ops = governance_signers
+            .iter()
+            .enumerate()
+            .map(|(index, (validator_id, keypair))| {
+                governance_commit_op(
+                    *validator_id,
+                    keypair,
+                    proposal_id,
+                    Bytes32::from([0xB0u8.wrapping_add(index as u8); 32]),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(governance_ops.len(), MAX_GOV_OPS_PER_BLOCK);
+
+        let mut slashing_evidence = Vec::new();
+        for index in 0..MAX_SLASHES_PER_BLOCK {
+            let (slash_state, validator_id, keypair) =
+                slash_validator_state([0xC0u8.wrapping_add(index as u8); 32], 100_000);
+            let validator = slash_state.validators.get(&validator_id).unwrap().clone();
+            state.validators.upsert(validator).unwrap();
+            slashing_evidence.push(slash_evidence(&keypair, validator_id, VoteStep::Precommit));
+        }
+        assert_eq!(slashing_evidence.len(), MAX_SLASHES_PER_BLOCK);
+
+        let mut block = make_block(&state, transactions);
+        block.staking_ops = staking_ops;
+        block.governance_ops = governance_ops;
+        block.slashing_evidence = slashing_evidence;
+
+        let time_apply_case = |label: &str, block: &BlockV1| {
+            let start = Instant::now();
+            let mut candidate = state.clone();
+            apply_block(&mut candidate, block, 0).unwrap();
+            let elapsed = start.elapsed();
+            println!("state_txn_max_cap_component {label}={elapsed:?}");
+            elapsed
+        };
+        let tx_only = make_block(&state, block.transactions.clone());
+        let mut staking_only = make_block(&state, vec![]);
+        staking_only.staking_ops = block.staking_ops.clone();
+        let mut governance_only = make_block(&state, vec![]);
+        governance_only.governance_ops = block.governance_ops.clone();
+        let mut slash_only = make_block(&state, vec![]);
+        slash_only.slashing_evidence = block.slashing_evidence.clone();
+        let start = Instant::now();
+        let mut seen_tx_hashes: HashSet<Vec<u8>> = HashSet::new();
+        let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
+        let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
+        for tx in &tx_only.transactions {
+            assert!(seen_tx_hashes.insert(tx.encode_to_vec()));
+            validate_transaction(
+                &state,
+                tx,
+                &state.chain_id,
+                &mut block_nullifiers,
+                &mut block_input_utxos,
+                tx_only.header.height,
+            )
+            .unwrap();
+        }
+        let tx_validation_only_elapsed = start.elapsed();
+        let tx_input_count = tx_only
+            .transactions
+            .iter()
+            .map(|tx| tx.inputs.len())
+            .sum::<usize>();
+        let tx_output_count = tx_only
+            .transactions
+            .iter()
+            .map(|tx| tx.outputs.len())
+            .sum::<usize>();
+        println!(
+            "state_txn_max_cap_component tx_validation_only={tx_validation_only_elapsed:?} tx_inputs={tx_input_count} tx_outputs={tx_output_count}"
+        );
+        let tx_only_elapsed = time_apply_case("tx_only", &tx_only);
+        let staking_only_elapsed = time_apply_case("staking_only", &staking_only);
+        let governance_only_elapsed = time_apply_case("governance_only", &governance_only);
+        let slash_only_elapsed = time_apply_case("slash_only", &slash_only);
+
+        crate::txn::reset_timing();
+        crate::txn::set_fail_after_mutation(None);
+        let start = Instant::now();
+        let mut applied = state.clone();
+        apply_block(&mut applied, &block, 0).unwrap();
+        let apply_elapsed = start.elapsed();
+        let apply_txn_timing = crate::txn::timing();
+
+        let mutation_count = crate::txn::mutation_count();
+        let fail_after = mutation_count.max(1);
+        crate::txn::set_fail_after_mutation(Some(fail_after));
+        crate::txn::reset_timing();
+        let start = Instant::now();
+        let mut rolled_back = state.clone();
+        let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
+        let rollback_elapsed = start.elapsed();
+        let rollback_txn_timing = crate::txn::timing();
+        assert!(
+            err.to_string()
+                .contains("state transaction failpoint injected after mutation")
+        );
+        assert_same_consensus_state(&rolled_back, &state);
+        crate::txn::set_fail_after_mutation(None);
+
+        println!(
+            "state_txn_max_cap_stress txs={} max_inputs={} max_outputs={} staking_ops={} governance_ops={} slashes={} mutation_count={} fail_after={} apply={apply_elapsed:?} rollback={rollback_elapsed:?} apply_undo_recording={:?} rollback_undo_recording={:?} rollback_only={:?} components=(tx_only:{tx_only_elapsed:?}, staking_only:{staking_only_elapsed:?}, governance_only:{governance_only_elapsed:?}, slash_only:{slash_only_elapsed:?})",
+            MAX_TX_PER_BLOCK,
+            MAX_INPUTS,
+            MAX_OUTPUTS,
+            MAX_STAKING_OPS_PER_BLOCK,
+            MAX_GOV_OPS_PER_BLOCK,
+            MAX_SLASHES_PER_BLOCK,
+            mutation_count,
+            fail_after,
+            apply_txn_timing.undo_recording,
+            rollback_txn_timing.undo_recording,
+            rollback_txn_timing.rollback,
+        );
+    }
 
     #[test]
     fn block_protocol_version_validation_is_strict_allow_list() {
@@ -1642,8 +2738,9 @@ mod tests {
         );
         assert!(state.utxos.spend(&utxo_id).is_some());
 
+        let mut txn = StateTxn::begin(&mut state, 1);
         assert_eq!(
-            apply_transaction(&mut state, &tx, 1, 0),
+            apply_transaction(&mut txn, &tx, 1, 0),
             Err(StateError::InvariantViolation {
                 message: "attempted to spend an already-spent UTXO during apply_transaction",
             })

@@ -47,6 +47,7 @@ pub mod nullifier;
 pub mod smt;
 pub mod state_commitment;
 pub mod state_root;
+pub(crate) mod txn;
 pub mod utxo;
 pub mod validator;
 

@@ -143,6 +143,15 @@ impl NullifierSet {
         Ok(())
     }
 
+    pub(crate) fn remove_for_rollback(&mut self, nullifier: &Bytes32) -> bool {
+        let removed = self.spent.remove(nullifier);
+        if removed {
+            self.smt.delete(nullifier.0);
+            self.compressed.delete(nullifier.0);
+        }
+        removed
+    }
+
     /// Current SMT root for all spent nullifiers.
     pub fn root(&self) -> [u8; 32] {
         self.smt.root()
