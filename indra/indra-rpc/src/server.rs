@@ -84,6 +84,10 @@ pub const RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN: u64 = 30;
 /// Maximum expensive public read-only calls per minute across a listener.
 pub const RPC_PUBLIC_EXPENSIVE_GLOBAL_RATE_PER_MIN: u64 = 300;
 
+fn body_exceeds_rpc_limit(content_length: usize) -> bool {
+    content_length > MAX_RPC_BODY_BYTES
+}
+
 /// Shared per-IP fixed-window limiter for expensive UTXO scan endpoints.
 #[derive(Debug, Default)]
 pub struct RpcWindowRateLimiter {
@@ -444,7 +448,7 @@ where
         }
 
         // Read body
-        if content_length > MAX_RPC_BODY_BYTES {
+        if body_exceeds_rpc_limit(content_length) {
             return Ok("__PAYLOAD_TOO_LARGE__".to_string());
         }
 
@@ -568,7 +572,7 @@ fn read_and_process_ref<E: RpcEngineView>(
         .to_json());
     }
 
-    if content_length > MAX_RPC_BODY_BYTES {
+    if body_exceeds_rpc_limit(content_length) {
         return Ok("__PAYLOAD_TOO_LARGE__".to_string());
     }
 
@@ -837,6 +841,8 @@ mod tests {
 
     #[test]
     fn rpc_rejects_oversized_body_before_allocation() {
+        assert!(!body_exceeds_rpc_limit(MAX_RPC_BODY_BYTES));
+        assert!(body_exceeds_rpc_limit(MAX_RPC_BODY_BYTES + 1));
         let response = http_json_error(
             "413 Payload Too Large",
             -32600,

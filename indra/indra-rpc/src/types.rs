@@ -1,7 +1,9 @@
 //! JSON-RPC 2.0 request and response types.
 //!
-//! All serialisation is manual (no serde) to keep dependencies minimal.
-//! Values are represented as JSON strings and parsed on demand.
+//! Request envelopes are parsed with `serde_json` and method parameters remain
+//! represented as raw JSON value strings for the existing handler layer.
+
+use serde_json::Value;
 
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Clone)]
@@ -108,161 +110,55 @@ impl RpcResponse {
 
 /// Parse a JSON-RPC request from a raw JSON string.
 ///
-/// Minimal parser — handles the standard JSON-RPC 2.0 envelope.
+/// Strictly parses the JSON-RPC 2.0 envelope while preserving the existing
+/// handler-facing representation of `params` as raw JSON value strings.
 pub fn parse_request(json: &str) -> Result<RpcRequest, String> {
-    let json = json.trim();
+    let value: Value =
+        serde_json::from_str(json.trim()).map_err(|error| format!("invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "JSON-RPC request must be an object".to_string())?;
 
-    // Extract method
-    let method =
-        extract_string_field(json, "method").ok_or_else(|| "missing 'method' field".to_string())?;
+    let jsonrpc = object
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing or invalid 'jsonrpc' field".to_string())?;
+    if jsonrpc != "2.0" {
+        return Err("invalid 'jsonrpc' version: expected \"2.0\"".to_string());
+    }
 
-    // Extract jsonrpc
-    let jsonrpc = extract_string_field(json, "jsonrpc").unwrap_or_else(|| "2.0".to_string());
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing or invalid 'method' field".to_string())?
+        .to_string();
 
-    // Extract id
-    let id = extract_id(json);
+    let id = match object.get("id") {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(JsonId::Number)
+            .ok_or_else(|| "unsupported 'id' number".to_string())?,
+        Some(Value::String(value)) => JsonId::Str(value.clone()),
+        Some(Value::Null) | None => JsonId::Null,
+        Some(_) => return Err("invalid 'id' field".to_string()),
+    };
 
-    // Extract params array (simplified: extract as individual string tokens)
-    let params = extract_params(json);
+    let params = match object.get("params") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("invalid 'params' value: {error}"))?,
+        Some(_) => return Err("'params' must be an array".to_string()),
+        None => Vec::new(),
+    };
 
     Ok(RpcRequest {
-        jsonrpc,
+        jsonrpc: jsonrpc.to_string(),
         method,
         params,
         id,
     })
-}
-
-/// Extract a string field value from a JSON object.
-fn extract_string_field(json: &str, field: &str) -> Option<String> {
-    let key = format!("\"{}\"", field);
-    let pos = json.find(&key)?;
-    let after_key = &json[pos + key.len()..];
-    let colon_pos = after_key.find(':')?;
-    let after_colon = after_key[colon_pos + 1..].trim_start();
-
-    if let Some(content) = after_colon.strip_prefix('"') {
-        // String value
-        let end = content.find('"')?;
-        Some(content[..end].to_string())
-    } else {
-        None
-    }
-}
-
-/// Extract the id field (string or number).
-fn extract_id(json: &str) -> JsonId {
-    let key = "\"id\"";
-    let pos = match json.find(key) {
-        Some(p) => p,
-        None => return JsonId::Null,
-    };
-    let after_key = &json[pos + key.len()..];
-    let colon_pos = match after_key.find(':') {
-        Some(p) => p,
-        None => return JsonId::Null,
-    };
-    let after_colon = after_key[colon_pos + 1..].trim_start();
-
-    if let Some(content) = after_colon.strip_prefix('"') {
-        if let Some(end) = content.find('"') {
-            return JsonId::Str(content[..end].to_string());
-        }
-    } else if after_colon.starts_with("null") {
-        return JsonId::Null;
-    } else {
-        // Try to parse as number
-        let num_str: String = after_colon
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '-')
-            .collect();
-        if let Ok(n) = num_str.parse::<i64>() {
-            return JsonId::Number(n);
-        }
-    }
-    JsonId::Null
-}
-
-/// Extract params array as a list of raw JSON value strings.
-fn extract_params(json: &str) -> Vec<String> {
-    let key = "\"params\"";
-    let pos = match json.find(key) {
-        Some(p) => p,
-        None => return vec![],
-    };
-    let after_key = &json[pos + key.len()..];
-    let colon_pos = match after_key.find(':') {
-        Some(p) => p,
-        None => return vec![],
-    };
-    let after_colon = after_key[colon_pos + 1..].trim_start();
-
-    if !after_colon.starts_with('[') {
-        return vec![];
-    }
-
-    // Find the matching closing bracket
-    let mut depth = 0i32;
-    let mut end = 0;
-    for (i, c) in after_colon.char_indices() {
-        match c {
-            '[' | '{' => depth += 1,
-            ']' | '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let array_content = &after_colon[1..end]; // strip outer [ ]
-    if array_content.trim().is_empty() {
-        return vec![];
-    }
-
-    // Split by top-level commas
-    let mut params = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut prev_char = ' ';
-
-    for c in array_content.chars() {
-        match c {
-            '"' if prev_char != '\\' => {
-                in_string = !in_string;
-                current.push(c);
-            }
-            '[' | '{' if !in_string => {
-                depth += 1;
-                current.push(c);
-            }
-            ']' | '}' if !in_string => {
-                depth -= 1;
-                current.push(c);
-            }
-            ',' if !in_string && depth == 0 => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    params.push(trimmed);
-                }
-                current.clear();
-            }
-            _ => {
-                current.push(c);
-            }
-        }
-        prev_char = c;
-    }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        params.push(trimmed);
-    }
-
-    params
 }
 
 /// Strip surrounding quotes from a JSON string value.
@@ -283,6 +179,7 @@ mod tests {
     fn parse_simple_request() {
         let json = r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":[],"id":1}"#;
         let req = parse_request(json).unwrap();
+        assert_eq!(req.jsonrpc, "2.0");
         assert_eq!(req.method, "indra_getHeight");
         assert_eq!(req.params.len(), 0);
         assert!(matches!(req.id, JsonId::Number(1)));
@@ -293,7 +190,68 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"indra_getBlock","params":["42"],"id":2}"#;
         let req = parse_request(json).unwrap();
         assert_eq!(req.method, "indra_getBlock");
-        assert_eq!(req.params.len(), 1);
+        assert_eq!(req.params, vec![r#""42""#.to_string()]);
+    }
+
+    #[test]
+    fn parse_request_preserves_raw_json_params_for_handlers() {
+        let json = r#"{"jsonrpc":"2.0","method":"indra_method","params":["x",42,true,null,{"a":[1,2]}],"id":"abc"}"#;
+        let req = parse_request(json).unwrap();
+        assert_eq!(req.method, "indra_method");
+        assert!(matches!(req.id, JsonId::Str(ref value) if value == "abc"));
+        assert_eq!(
+            req.params,
+            vec![
+                r#""x""#.to_string(),
+                "42".to_string(),
+                "true".to_string(),
+                "null".to_string(),
+                r#"{"a":[1,2]}"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_request_rejects_malformed_json_cleanly() {
+        let err = parse_request(r#"{"jsonrpc":"2.0","method":"indra_getHeight","#)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("invalid JSON"), "{err}");
+    }
+
+    #[test]
+    fn parse_request_rejects_missing_jsonrpc() {
+        let err = parse_request(r#"{"method":"indra_getHeight","params":[],"id":1}"#)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("jsonrpc"), "{err}");
+    }
+
+    #[test]
+    fn parse_request_rejects_incorrect_jsonrpc_version() {
+        let err =
+            parse_request(r#"{"jsonrpc":"1.0","method":"indra_getHeight","params":[],"id":1}"#)
+                .err()
+                .unwrap_or_default();
+        assert!(err.contains("expected \"2.0\""), "{err}");
+    }
+
+    #[test]
+    fn parse_request_rejects_top_level_array() {
+        let err = parse_request(r#"[{"jsonrpc":"2.0","method":"indra_getHeight","id":1}]"#)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("must be an object"), "{err}");
+    }
+
+    #[test]
+    fn parse_request_rejects_non_array_params() {
+        let err = parse_request(
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":{"x":1},"id":1}"#,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(err.contains("params"), "{err}");
     }
 
     #[test]

@@ -37,10 +37,10 @@
 //! {"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}
 //! ```
 //!
-//! ## No external dependencies
+//! ## Transport scope
 //!
-//! The HTTP server and JSON codec use only the Rust standard library.
-//! This keeps the binary small and the dependency tree auditable.
+//! The HTTP server remains a small, bounded stdlib transport. JSON-RPC
+//! envelopes are parsed with `serde_json` before dispatch.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

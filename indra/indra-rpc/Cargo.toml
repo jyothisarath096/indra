@@ -13,6 +13,7 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
 thiserror.workspace = true
 hex.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }

@@ -1015,6 +1015,7 @@ dependencies = [
  "indra-core",
  "indra-crypto",
  "indra-state",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
