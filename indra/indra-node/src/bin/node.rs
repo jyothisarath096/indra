@@ -1052,11 +1052,21 @@ fn start_network_runtime(
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
-                        let signed_public_key = dns_seed_signed_public_key.as_ref().and_then(|bytes| {
-                            let array: [u8; indra_crypto::PQ_PK_BYTES] =
-                                bytes.as_slice().try_into().ok()?;
-                            Some(PqPublicKey(array))
-                        });
+                        eprintln!(
+                            "[discovery] invoking DNS seed resolver with dnssec={} signed={} signed_key_bytes={}",
+                            dns_seed_validation,
+                            dns_seed_signed_validation,
+                            dns_seed_signed_public_key
+                                .as_ref()
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(0)
+                        );
+                        let signed_public_key =
+                            dns_seed_signed_public_key.as_ref().and_then(|bytes| {
+                                let array: [u8; indra_crypto::PQ_PK_BYTES] =
+                                    bytes.as_slice().try_into().ok()?;
+                                Some(PqPublicKey(array))
+                            });
                         let dns_peers = resolve_dns_seeds_with_policies(
                             &dns_seed_host,
                             p2p_port,
@@ -1692,6 +1702,25 @@ fn main() {
             eprintln!("ERROR: network.dns_seed_signed_public_key must be valid hex");
             std::process::exit(1);
         });
+    if dns_seed_signed_validation != SignedDnsSeedValidationMode::Off {
+        match dns_seed_signed_public_key.as_ref().map(Vec::len) {
+            Some(indra_crypto::PQ_PK_BYTES) => {}
+            Some(len) => {
+                eprintln!(
+                    "ERROR: network.dns_seed_signed_public_key must be {} bytes when signed DNS discovery is enabled (got {len})",
+                    indra_crypto::PQ_PK_BYTES
+                );
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!(
+                    "ERROR: network.dns_seed_signed_public_key is required when network.dns_seed_signed_validation={}",
+                    dns_seed_signed_validation
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     let prune_keep_cfg = cfg_file
         .prune_keep_blocks
         .unwrap_or(DEFAULT_PRUNE_KEEP_BLOCKS);
@@ -1708,6 +1737,15 @@ fn main() {
     eprintln!("Keys:      {}", keys_path);
     eprintln!("Data:      {}", data_dir);
     eprintln!("P2P:       {}", p2p_addr);
+    eprintln!(
+        "DNS seed:  dnssec={} signed={} signed_key_bytes={}",
+        dns_seed_validation,
+        dns_seed_signed_validation,
+        dns_seed_signed_public_key
+            .as_ref()
+            .map(|bytes| bytes.len())
+            .unwrap_or(0)
+    );
     eprintln!(
         "Observer:  {}",
         observer_addr.as_deref().unwrap_or("(disabled)")

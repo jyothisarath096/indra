@@ -425,6 +425,7 @@ where
 {
     let mut addrs = HashSet::new();
     if mode == SignedDnsSeedValidationMode::Off {
+        eprintln!("[discovery] signed DNS discovery disabled (mode=off)");
         return Vec::new();
     }
     let Some(public_key) = public_key else {
@@ -440,25 +441,37 @@ where
     };
 
     for host in hosts {
+        eprintln!(
+            "[discovery] signed DNS seed {}: starting lookup (mode={})",
+            host, mode
+        );
         match resolver(host.clone()).await {
-            Ok(lookup) => match verify_signed_dns_seed_records(
-                &lookup.root_txt,
-                &lookup.node_chunks,
-                &lookup.sig_chunks,
-                public_key,
-            ) {
-                Ok(host_addrs) => {
-                    eprintln!(
-                        "[discovery] signed DNS seed {} verified {} addresses",
-                        host,
-                        host_addrs.len()
-                    );
-                    addrs.extend(host_addrs);
+            Ok(lookup) => {
+                eprintln!(
+                    "[discovery] signed DNS seed {}: fetched root plus {} node chunk(s) and {} signature chunk(s)",
+                    host,
+                    lookup.node_chunks.len(),
+                    lookup.sig_chunks.len()
+                );
+                match verify_signed_dns_seed_records(
+                    &lookup.root_txt,
+                    &lookup.node_chunks,
+                    &lookup.sig_chunks,
+                    public_key,
+                ) {
+                    Ok(host_addrs) => {
+                        eprintln!(
+                            "[discovery] signed DNS seed {} verified {} addresses",
+                            host,
+                            host_addrs.len()
+                        );
+                        addrs.extend(host_addrs);
+                    }
+                    Err(err) => {
+                        eprintln!("[discovery] signed DNS seed {} rejected: {}", host, err);
+                    }
                 }
-                Err(err) => {
-                    eprintln!("[discovery] signed DNS seed {} rejected: {}", host, err);
-                }
-            },
+            }
             Err(err) => {
                 eprintln!("[discovery] signed DNS seed {} unavailable: {}", host, err);
             }
@@ -519,6 +532,13 @@ pub async fn resolve_dns_seeds_with_policies(
     signed_public_key: Option<&PqPublicKey>,
 ) -> Vec<SocketAddr> {
     let hosts = parse_dns_seed_hosts(hosts);
+    eprintln!(
+        "[discovery] DNS seed policy: hosts={} dnssec={} signed={} signed_key_configured={}",
+        hosts.join(","),
+        mode,
+        signed_mode,
+        signed_public_key.is_some()
+    );
     if signed_mode != SignedDnsSeedValidationMode::Off {
         let signed = resolve_signed_dns_seed_hosts_with_async(
             &hosts,
@@ -528,11 +548,18 @@ pub async fn resolve_dns_seeds_with_policies(
         )
         .await;
         if !signed.is_empty() || signed_mode == SignedDnsSeedValidationMode::Require {
+            eprintln!(
+                "[discovery] signed DNS discovery final outcome: {} peer(s), fallback={}",
+                signed.len(),
+                false
+            );
             return signed;
         }
         eprintln!(
             "[discovery] signed DNS discovery did not produce peers; falling back to DNS A records"
         );
+    } else {
+        eprintln!("[discovery] signed DNS discovery not attempted because mode=off");
     }
 
     match mode {
@@ -708,6 +735,7 @@ async fn resolve_txt_records_dnssec(
     resolver: &Resolver<TokioRuntimeProvider>,
     name: &str,
 ) -> io::Result<Vec<String>> {
+    eprintln!("[discovery] signed DNS TXT lookup: querying {name}");
     let lookup = resolver
         .lookup(dns_query_name(name).as_str(), RecordType::TXT)
         .await
@@ -744,6 +772,11 @@ async fn resolve_txt_records_dnssec(
             _ => None,
         })
         .collect::<Vec<_>>();
+    eprintln!(
+        "[discovery] signed DNS TXT lookup: {} returned {} secure TXT record(s)",
+        name,
+        records.len()
+    );
     Ok(records)
 }
 
@@ -779,6 +812,10 @@ async fn resolve_signed_seed_with_hickory_dnssec_async(
         })?;
     let root = parse_signed_dns_seed_root(&root_txt)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    eprintln!(
+        "[discovery] signed DNS seed {}: root seq={} nodes_chunks={} sig_chunks={}",
+        host, root.seq, root.nodes_chunks, root.sig_chunks
+    );
 
     let mut node_chunks = Vec::with_capacity(root.nodes_chunks);
     for idx in 0..root.nodes_chunks {
@@ -793,6 +830,11 @@ async fn resolve_signed_seed_with_hickory_dnssec_async(
         })?;
         node_chunks.push(chunk);
     }
+    eprintln!(
+        "[discovery] signed DNS seed {}: fetched all {} node chunk(s)",
+        host,
+        node_chunks.len()
+    );
 
     let mut sig_chunks = Vec::with_capacity(root.sig_chunks);
     for idx in 0..root.sig_chunks {
@@ -807,6 +849,11 @@ async fn resolve_signed_seed_with_hickory_dnssec_async(
         })?;
         sig_chunks.push(chunk);
     }
+    eprintln!(
+        "[discovery] signed DNS seed {}: fetched all {} signature chunk(s)",
+        host,
+        sig_chunks.len()
+    );
 
     Ok(SignedDnsSeedTxtLookup {
         root_txt,
@@ -1520,6 +1567,57 @@ mod tests {
             },
         );
         assert_eq!(plain, vec!["203.0.113.10:30303".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn signed_dns_seed_async_path_verifies_chunked_records() {
+        let key = PqKeypair::from_seed(&[0x58; 32]).unwrap();
+        let records = build_signed_dns_seed_records(
+            [
+                "203.0.113.10:30303".parse().unwrap(),
+                "198.51.100.7:30303".parse().unwrap(),
+            ],
+            11,
+            &key,
+        )
+        .unwrap();
+        let node_chunks: Vec<String> = records
+            .node_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let sig_chunks: Vec<String> = records
+            .sig_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+
+        let resolved = resolve_signed_dns_seed_hosts_with_async(
+            &["seeds.example".to_string()],
+            SignedDnsSeedValidationMode::Warn,
+            Some(&key.public_key()),
+            |_| {
+                let root_txt = records.root_txt.clone();
+                let node_chunks = node_chunks.clone();
+                let sig_chunks = sig_chunks.clone();
+                async move {
+                    Ok(SignedDnsSeedTxtLookup {
+                        root_txt,
+                        node_chunks,
+                        sig_chunks,
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            resolved,
+            vec![
+                "198.51.100.7:30303".parse().unwrap(),
+                "203.0.113.10:30303".parse().unwrap()
+            ]
+        );
     }
 
     #[test]

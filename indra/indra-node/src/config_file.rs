@@ -205,6 +205,18 @@ impl NodeConfigFile {
                 ),
             }
         }
+        let signed_mode = self
+            .dns_seed_signed_validation
+            .as_deref()
+            .and_then(|mode| mode.parse::<SignedDnsSeedValidationMode>().ok())
+            .unwrap_or_default();
+        if signed_mode != SignedDnsSeedValidationMode::Off
+            && self.dns_seed_signed_public_key.is_none()
+        {
+            errors.push(format!(
+                "network.dns_seed_signed_public_key is required when network.dns_seed_signed_validation={signed_mode}"
+            ));
+        }
         if let Some(addr) = self.metrics_addr.as_deref() {
             if !addr.is_empty() && !is_valid_addr(addr) {
                 errors.push("metrics.addr must be valid host:port, empty, or omitted".to_string());
@@ -636,6 +648,16 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
         let err = cfg.validate().err().unwrap_or_else(|| vec![]);
         assert!(err.iter().any(|e| e.contains("dns_seed_signed_validation")));
         assert!(err.iter().any(|e| e.contains("dns_seed_signed_public_key")));
+    }
+
+    #[test]
+    fn test_validate_signed_dns_seed_requires_public_key() {
+        let mut cfg = minimal();
+        cfg.dns_seed_signed_validation = Some("warn".to_string());
+        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        assert!(err
+            .iter()
+            .any(|e| e.contains("dns_seed_signed_public_key is required")));
     }
 
     #[test]
