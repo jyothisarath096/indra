@@ -3,10 +3,10 @@
 //! `import_block` is the single entry point for adding a block to the chain.
 //! It:
 //!   1. Validates the block's structural invariants
-//!   2. Applies it to the chain state via `apply_block`
-//!   3. Computes and stores the new state root
+//!   2. Projects the block once, verifies the projected header roots
+//!   3. Commits the verified projection to chain state
 //!   4. Writes the block to the block store
-//!   5. Evicts spent transactions from the mempool
+//!   5. Evicts spent/invalid transactions from the mempool
 //!   6. Optionally takes a state snapshot
 
 use std::net::SocketAddr;
@@ -214,7 +214,7 @@ impl SyncState {
 /// Import a block into the chain.
 ///
 /// This is the canonical block processing pipeline:
-/// validate → apply → store → evict mempool → snapshot.
+/// validate → project/verify → commit projection → evict mempool → store → snapshot.
 pub fn import_block(
     block: &BlockV1,
     state: &mut ChainState,
@@ -265,20 +265,24 @@ fn validate_and_apply_imported_block(
         verify_block_qc(block, state)?;
     }
 
-    verify_block_state_root(block, state)?;
+    let projection = project_and_verify_block_state_root(block, state, timestamp_secs)?;
+    let verified_state_root = projection.state_root;
+    let verified_validator_set_root = projection.validator_set_root;
+    let verified_value_hash = projection.value_hash;
+    let epoch_record = projection.epoch_record;
+    *state = projection.state;
+    debug_assert_eq!(compute_state_root(state), verified_state_root);
+    debug_assert_eq!(
+        compute_validator_set_root(state),
+        verified_validator_set_root
+    );
+    debug_assert_eq!(
+        block.compute_value_hash(state.total_supply),
+        verified_value_hash
+    );
 
-    // 1. Apply block to state (validates everything)
-    let epoch_record =
-        apply_block(state, block, timestamp_secs).map_err(|e| NodeError::BlockInvalid {
-            height,
-            reason: e.to_string(),
-        })?;
-
-    // 2. Compute state root and store it in the state
-    //    (the block header's state_root is checked against this in Phase 6)
-    let _state_root = compute_state_root(state);
-
-    // 3. Evict spent transactions from mempool
+    // Evict spent transactions from mempool after the verified projection has
+    // become the real state.
     mempool.evict_spent(&state.nullifiers);
     mempool.evict_invalid(state);
 
@@ -690,17 +694,31 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
     verify_qc_strict(&qc, &validators, total_stake, &state.chain_id).map_err(NodeError::Consensus)
 }
 
-pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+pub(crate) struct VerifiedBlockProjection {
+    pub(crate) state: ChainState,
+    pub(crate) epoch_record: Option<EpochRecord>,
+    pub(crate) state_root: Bytes32,
+    pub(crate) validator_set_root: Bytes32,
+    pub(crate) value_hash: Bytes32,
+}
+
+pub(crate) fn project_and_verify_block_state_root(
+    block: &BlockV1,
+    pre_state: &ChainState,
+    timestamp_secs: u64,
+) -> NodeResult<VerifiedBlockProjection> {
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
 
-    // Intentionally verify against a cloned projected state first. Sync then
-    // applies the same block a second time inside `import_block` to mutate the
-    // real chain state only after all header commitments match.
-    let mut projected = state.clone();
-    apply_block(&mut projected, block, 0).map_err(|e| NodeError::BlockInvalid {
-        height: block.header.height,
-        reason: format!("block failed during pre-apply root verification: {e}"),
+    // Verify against a detached projected state first. The caller commits this
+    // same projection only after all header commitments match, so import/replay
+    // never applies the same block a second time.
+    let mut projected = pre_state.clone();
+    let epoch_record = apply_block(&mut projected, block, timestamp_secs).map_err(|e| {
+        NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!("block failed during pre-apply root verification: {e}"),
+        }
     })?;
 
     let actual_state_root = compute_state_root(&projected);
@@ -743,7 +761,18 @@ pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> No
         });
     }
 
-    Ok(())
+    Ok(VerifiedBlockProjection {
+        state: projected,
+        epoch_record,
+        state_root: actual_state_root,
+        validator_set_root: actual_validator_root,
+        value_hash: actual_value_hash,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+    project_and_verify_block_state_root(block, state, 0).map(|_| ())
 }
 
 #[cfg(test)]
@@ -760,7 +789,8 @@ mod tests {
         types::{
             block::{BlockHeaderV1, BlockV1},
             primitives::{
-                BLOCK_PROTOCOL_VERSION_REVEAL_SET, DEFAULT_CHAIN_ID, MAX_VRF_PROOF_BYTES,
+                BLOCK_PROTOCOL_VERSION_REVEAL_SET, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
+                MAX_VRF_PROOF_BYTES,
             },
             vote::VoteStep,
             vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
@@ -1085,6 +1115,49 @@ mod tests {
         block
     }
 
+    fn reference_two_step_validate_and_apply(
+        block: &BlockV1,
+        state: &mut ChainState,
+        mempool: &mut Mempool,
+        timestamp_secs: u64,
+    ) -> NodeResult<Option<EpochRecord>> {
+        verify_block_state_root(block, state)?;
+        let epoch_record =
+            apply_block(state, block, timestamp_secs).map_err(|e| NodeError::BlockInvalid {
+                height: block.header.height,
+                reason: e.to_string(),
+            })?;
+        let _state_root = compute_state_root(state);
+        mempool.evict_spent(&state.nullifiers);
+        mempool.evict_invalid(state);
+        Ok(epoch_record)
+    }
+
+    fn assert_import_state_equivalent(
+        reference_state: &ChainState,
+        actual_state: &ChainState,
+        block: &BlockV1,
+    ) {
+        assert_eq!(reference_state, actual_state);
+        assert_eq!(
+            reference_state.encode_to_vec(),
+            actual_state.encode_to_vec(),
+            "canonical encoded state must remain byte-identical"
+        );
+        assert_eq!(
+            compute_state_root(reference_state),
+            compute_state_root(actual_state)
+        );
+        assert_eq!(
+            compute_validator_set_root(reference_state),
+            compute_validator_set_root(actual_state)
+        );
+        assert_eq!(
+            block.compute_value_hash(reference_state.total_supply),
+            block.compute_value_hash(actual_state.total_supply)
+        );
+    }
+
     #[test]
     fn import_single_block() {
         let dir = temp_dir("a");
@@ -1114,6 +1187,274 @@ mod tests {
         assert_eq!(block_store.len(), 2); // genesis (0) + block 1
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn imported_projection_commit_matches_reference_two_step_sequence() {
+        let mut reference_state = ChainState::new_genesis();
+        let (validator_id, hybrid) =
+            install_active_validator(&mut reference_state, 0x61, 10_000, true, true);
+        let mut actual_state = reference_state.clone();
+        let mut reference_mempool = Mempool::default_config();
+        let mut actual_mempool = Mempool::default_config();
+        let mut prev_qc = Vec::new();
+
+        for _ in 0..5 {
+            let block = make_strict_block(&actual_state, 0x61, 0, prev_qc.clone());
+            let reference_record = reference_two_step_validate_and_apply(
+                &block,
+                &mut reference_state,
+                &mut reference_mempool,
+                1_900_000_000,
+            )
+            .unwrap();
+            let actual_record = validate_and_apply_imported_block(
+                &block,
+                &mut actual_state,
+                &mut actual_mempool,
+                1_900_000_000,
+            )
+            .unwrap();
+
+            assert_eq!(reference_record, actual_record);
+            assert_import_state_equivalent(&reference_state, &actual_state, &block);
+            assert_eq!(reference_mempool.len(), actual_mempool.len());
+            assert_eq!(reference_mempool.is_empty(), actual_mempool.is_empty());
+
+            prev_qc = build_qc_bytes(
+                block.header.height,
+                block.header.proposer_round,
+                block.header.block_hash(),
+                validator_id,
+                &hybrid,
+                hybrid.public_key().pq.0.to_vec(),
+                10_000,
+            );
+        }
+    }
+
+    #[test]
+    fn live_import_projection_commit_preserves_epoch_record_timestamp() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x62, 10_000, true, true);
+        state.height = EPOCH_DURATION_BLOCKS - 1;
+        state.tip_hash = Bytes32::from([0xA5; 32]);
+
+        let parent_qc = build_qc_bytes(
+            state.height,
+            0,
+            state.tip_hash,
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let mut mempool = Mempool::default_config();
+        let timestamp_secs = 1_999_999_999;
+        let block = make_strict_block(&state, 0x62, 0, parent_qc);
+
+        let record =
+            validate_and_apply_imported_block(&block, &mut state, &mut mempool, timestamp_secs)
+                .unwrap()
+                .expect("height 300 must produce an epoch record");
+
+        assert_eq!(block.header.height, EPOCH_DURATION_BLOCKS);
+        assert_eq!(record.epoch, 0);
+        assert_eq!(record.start_height, 0);
+        assert_eq!(record.end_height, EPOCH_DURATION_BLOCKS - 1);
+        assert_eq!(record.timestamp_secs, timestamp_secs);
+        assert_eq!(state.height, EPOCH_DURATION_BLOCKS);
+        assert_eq!(compute_state_root(&state), block.header.state_root);
+    }
+
+    #[test]
+    fn failed_projection_root_mismatch_rolls_back_state_mempool_and_storage() {
+        let dir = temp_dir("projection_root_rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = ChainState::new_genesis();
+        let original_state = state.clone();
+        let mut mempool = Mempool::default_config();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        )
+        .unwrap();
+        let state_store = StateStore::open(dir.join("state")).unwrap();
+        let mut block = make_block(&state);
+        block.header.state_root = Bytes32::from([0xEE; 32]);
+
+        let err = import_block(
+            &block,
+            &mut state,
+            &mut mempool,
+            &mut block_store,
+            &state_store,
+            0,
+        )
+        .unwrap_err();
+
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("state_root mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(state, original_state);
+        assert_eq!(mempool.len(), 0);
+        assert!(block_store.is_empty());
+        assert_eq!(state_store.latest_snapshot_height().unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_projection_apply_error_rolls_back_state_mempool_and_storage() {
+        let dir = temp_dir("projection_apply_rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = ChainState::new_genesis();
+        let original_state = state.clone();
+        let mut mempool = Mempool::default_config();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        )
+        .unwrap();
+        let state_store = StateStore::open(dir.join("state")).unwrap();
+        let mut block = make_block(&state);
+        block.header.prev_hash = Bytes32::from([0xAB; 32]);
+
+        let err = import_block(
+            &block,
+            &mut state,
+            &mut mempool,
+            &mut block_store,
+            &state_store,
+            0,
+        )
+        .unwrap_err();
+
+        match err {
+            NodeError::BlockInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("block failed during pre-apply root verification"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(state, original_state);
+        assert_eq!(mempool.len(), 0);
+        assert!(block_store.is_empty());
+        assert_eq!(state_store.latest_snapshot_height().unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projected_verifier_preserves_root_error_strings() {
+        let state = ChainState::new_genesis();
+
+        let mut bad_state_root = make_block(&state);
+        bad_state_root.header.state_root = Bytes32::from([0xE1; 32]);
+        let err = verify_block_state_root(&bad_state_root, &state).unwrap_err();
+        assert!(err.to_string().contains("state_root mismatch"));
+
+        let mut bad_validator_root = make_block(&state);
+        bad_validator_root.header.validator_set_root = Bytes32::from([0xE2; 32]);
+        let err = verify_block_state_root(&bad_validator_root, &state).unwrap_err();
+        assert!(err.to_string().contains("validator_set_root mismatch"));
+
+        let mut bad_value_hash = make_block(&state);
+        bad_value_hash.header.value_hash = Bytes32::from([0xE3; 32]);
+        let err = verify_block_state_root(&bad_value_hash, &state).unwrap_err();
+        assert!(err.to_string().contains("value_hash mismatch"));
+
+        let mut apply_failure = make_block(&state);
+        apply_failure.header.prev_hash = Bytes32::from([0xE4; 32]);
+        let err = verify_block_state_root(&apply_failure, &state).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("block failed during pre-apply root verification"));
+    }
+
+    #[test]
+    #[ignore = "synthetic import projection clone-cost benchmark; run explicitly with --ignored --nocapture"]
+    fn import_projection_clone_cost_benchmark() {
+        use std::time::Instant;
+
+        let sizes = std::env::var("INDRA_IMPORT_PROJECTION_BENCH_SIZES")
+            .unwrap_or_else(|_| "100000".to_string())
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .collect::<Vec<_>>();
+
+        eprintln!(
+            "[import-projection-bench] original Step 0 baseline: normal import/commit ≈7 clone-equivalents, 1M delegators ≈11.6-11.9s"
+        );
+        eprintln!(
+            "[import-projection-bench] Round A current baseline before this patch: empty import ≈3 clone-equivalents; after this patch: ≈2 clone-equivalents"
+        );
+
+        for size in sizes {
+            let setup_start = Instant::now();
+            let state = synthetic_delegation_state(size);
+            let setup_elapsed = setup_start.elapsed();
+            let block = make_block(&state);
+
+            let mut reference_state = state.clone();
+            let mut reference_mempool = Mempool::default_config();
+            let reference_start = Instant::now();
+            reference_two_step_validate_and_apply(
+                &block,
+                &mut reference_state,
+                &mut reference_mempool,
+                0,
+            )
+            .unwrap();
+            let reference_elapsed = reference_start.elapsed();
+
+            let mut optimized_state = state.clone();
+            let mut optimized_mempool = Mempool::default_config();
+            let optimized_start = Instant::now();
+            validate_and_apply_imported_block(
+                &block,
+                &mut optimized_state,
+                &mut optimized_mempool,
+                0,
+            )
+            .unwrap();
+            let optimized_elapsed = optimized_start.elapsed();
+
+            assert_import_state_equivalent(&reference_state, &optimized_state, &block);
+            eprintln!(
+                "[import-projection-bench] delegators={size} setup={:?} reference_two_step_3clones={:?} optimized_single_projection_2clones={:?}",
+                setup_elapsed, reference_elapsed, optimized_elapsed
+            );
+        }
+    }
+
+    fn synthetic_delegation_state(delegators: usize) -> ChainState {
+        let mut state = ChainState::new_genesis();
+        let buckets = delegators.clamp(1, 10_000);
+        for index in 0..delegators {
+            let bucket = index % buckets;
+            let mut validator = [0u8; 32];
+            validator[0] = 0xB0;
+            validator[8..16].copy_from_slice(&(bucket as u64).to_be_bytes());
+            let mut delegator = [0u8; 32];
+            delegator[0] = 0xD0;
+            delegator[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+            state
+                .delegations
+                .add_delegation(Bytes32::from(validator), Bytes32::from(delegator), 1_000, 0)
+                .unwrap();
+        }
+        state
     }
 
     #[test]

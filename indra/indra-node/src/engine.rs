@@ -55,7 +55,7 @@ use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
     genesis::{build_genesis_block, load_genesis_validators},
-    sync::{import_block, verify_block_state_root},
+    sync::{import_block, project_and_verify_block_state_root},
 };
 
 /// The node engine: owns all state and drives consensus.
@@ -960,13 +960,16 @@ fn rebuild_state_from_height(
 
     for height in start_height.max(1)..block_store.next_height() {
         let block = block_store.get(height)?;
-        verify_block_state_root(&block, state).map_err(|err| NodeError::StartupReplayFailed {
-            height: block.header.height,
-            reason: format!(
-                "stored block failed header commitment verification during startup replay: {err}"
-            ),
-        })?;
-        indra_state::apply_block(state, &block, 0)?;
+        let projection =
+            project_and_verify_block_state_root(&block, state, 0).map_err(|err| {
+                NodeError::StartupReplayFailed {
+                    height: block.header.height,
+                    reason: format!(
+                        "stored block failed header commitment verification during startup replay: {err}"
+                    ),
+                }
+            })?;
+        *state = projection.state;
     }
 
     Ok(())
@@ -1551,10 +1554,16 @@ mod tests {
             engine.block_store.append(&block).unwrap();
         }
 
-        assert!(matches!(
-            NodeEngine::init(config),
-            Err(NodeError::StartupReplayFailed { height: 1, .. })
-        ));
+        match NodeEngine::init(config) {
+            Err(NodeError::StartupReplayFailed { height: 1, reason }) => {
+                assert!(
+                    reason.contains("state_root mismatch"),
+                    "startup replay must preserve projected root-mismatch reason, got: {reason}"
+                );
+            }
+            Ok(_) => panic!("startup replay unexpectedly accepted a corrupt stored block"),
+            Err(other) => panic!("unexpected startup replay error: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
