@@ -610,7 +610,7 @@ fn apply_block_inner(
         )?;
     }
 
-    {
+    if !block.staking_ops.is_empty() {
         let mut shadow = state.clone();
         let chain_id = state.chain_id.clone();
         for op in &block.staking_ops {
@@ -620,7 +620,7 @@ fn apply_block_inner(
         }
     }
 
-    {
+    if !block.governance_ops.is_empty() {
         let mut shadow = state.clone();
         let chain_id = state.chain_id.clone();
         let current_epoch = epoch_for_height(block.header.height);
@@ -1018,6 +1018,7 @@ mod tests {
     use indra_core::{
         types::{
             block::{BlockHeaderV1, BlockV1},
+            governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
             primitives::{
                 DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MINIMUM_VALIDATOR_BOND_SPARK,
@@ -1475,6 +1476,72 @@ mod tests {
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
+    }
+
+    #[test]
+    fn apply_block_empty_and_nonempty_fast_paths_replay_deterministically() {
+        let mut initial = ChainState::new_genesis();
+        let (register_op, _validator_id) =
+            signed_register_validator_op(&mut initial, [0x91; 32], 1);
+
+        let mut continuous = initial.clone();
+        let mut blocks = Vec::new();
+        let mut continuous_roots = Vec::new();
+
+        let block1 = make_block(&continuous, vec![]);
+        apply_block(&mut continuous, &block1, 0).unwrap();
+        continuous_roots.push(crate::state_root::compute_state_root(&continuous));
+        blocks.push(block1);
+
+        let mut block2 = make_block(&continuous, vec![]);
+        block2.staking_ops = vec![register_op];
+        apply_block(&mut continuous, &block2, 0).unwrap();
+        assert_eq!(continuous.validators.len(), 1);
+        continuous_roots.push(crate::state_root::compute_state_root(&continuous));
+        blocks.push(block2);
+
+        let block3 = make_block(&continuous, vec![]);
+        apply_block(&mut continuous, &block3, 0).unwrap();
+        continuous_roots.push(crate::state_root::compute_state_root(&continuous));
+        blocks.push(block3);
+
+        let mut replayed = initial;
+        for (block, expected_root) in blocks.iter().zip(continuous_roots.iter()) {
+            apply_block(&mut replayed, block, 0).unwrap();
+            assert_eq!(
+                crate::state_root::compute_state_root(&replayed),
+                *expected_root
+            );
+        }
+        assert_eq!(replayed, continuous);
+    }
+
+    #[test]
+    fn apply_block_nonempty_governance_shadow_still_rejects_invalid_op_before_real_apply() {
+        let mut state = ChainState::new_genesis();
+        let mut block = make_block(&state, vec![]);
+        block.governance_ops = vec![GovernanceOpV2 {
+            action_type: GovernanceActionType::ExecuteProposal,
+            signer_id: Bytes32::from([0xAB; 32]),
+            nonce: 1,
+            payload: GovernancePayload::Execute {
+                proposal_id: Bytes32::from([0xCD; 32]),
+            },
+            signature: dummy_sig(),
+        }];
+
+        let original = state.clone();
+        let err = apply_block(&mut state, &block, 0).unwrap_err();
+        assert!(
+            !matches!(
+                err,
+                StateError::InvariantViolation {
+                    message: "governance op failed on real state after shadow validation"
+                }
+            ),
+            "non-empty governance blocks must still run the shadow validation path before real apply"
+        );
+        assert_eq!(state, original);
     }
 
     #[test]

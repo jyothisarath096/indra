@@ -2818,8 +2818,11 @@ impl ConsensusDriver {
             Err(_) => return vec![DriverAction::None],
         };
 
-        let state = self.engine.state.clone();
-        match self.engine.mempool.submit_validated(tx.clone(), &state) {
+        match self
+            .engine
+            .mempool
+            .submit_validated(tx.clone(), &self.engine.state)
+        {
             Ok(_) => vec![DriverAction::BroadcastTx(tx)],
             Err(_) => vec![DriverAction::None],
         }

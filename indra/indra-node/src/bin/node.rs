@@ -4129,11 +4129,10 @@ fn handle_rpc(
                             .lock()
                             .map_err(|_| "consensus driver lock poisoned".to_string())
                             .and_then(|mut guard| {
-                                let state = guard.engine.state.clone();
-                                guard
-                                    .engine
+                                let engine = &mut guard.engine;
+                                engine
                                     .mempool
-                                    .submit_validated(tx.clone(), &state)
+                                    .submit_validated(tx.clone(), &engine.state)
                                     .map_err(|e| e.to_string())
                             });
                         match submit_result {

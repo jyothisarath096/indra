@@ -135,9 +135,8 @@ impl indra_rpc::handlers::RpcEngineMut for NodeEngine {
         &mut self,
         tx: indra_core::types::transaction::TransactionV1,
     ) -> Result<indra_core::Bytes32, String> {
-        let state = self.state.clone();
         self.mempool
-            .submit_validated(tx, &state)
+            .submit_validated(tx, &self.state)
             .map_err(|error| error.to_string())
     }
 }

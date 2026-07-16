@@ -315,6 +315,9 @@ impl NodeEngine {
     /// Remove governance operations that are no longer valid against the
     /// current tip before selecting them for a new block.
     pub fn prune_invalid_governance_ops(&mut self) {
+        if self.governance_mempool.is_empty() {
+            return;
+        }
         let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
         let chain_id = self.state.chain_id.clone();
         let state = self.state.clone();
@@ -372,6 +375,9 @@ impl NodeEngine {
 
     /// Select governance operations for block inclusion.
     pub fn select_governance_ops(&mut self) -> Vec<GovernanceOpV2> {
+        if self.governance_mempool.is_empty() {
+            return Vec::new();
+        }
         let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
         let chain_id = self.state.chain_id.clone();
         let mut scratch = self.state.clone();
@@ -2090,6 +2096,40 @@ mod tests {
 
         engine.add_governance_op(op.clone()).unwrap();
 
+        assert_eq!(engine.governance_mempool, vec![op]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_empty_fast_paths_are_noops() {
+        let dir = temp_dir("governance_empty_fast_path");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let original_state = engine.state.clone();
+
+        engine.prune_invalid_governance_ops();
+        let selected = engine.select_governance_ops();
+
+        assert!(selected.is_empty());
+        assert!(engine.governance_mempool.is_empty());
+        assert_eq!(engine.state, original_state);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_nonempty_selection_still_uses_validation_path() {
+        let dir = temp_dir("governance_nonempty_selection");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x55; 32], "gov-select");
+        let op = valid_governance_propose_op(&mut engine, &keypair, 1);
+        engine.governance_mempool.push(op.clone());
+
+        let selected = engine.select_governance_ops();
+
+        assert_eq!(selected, vec![op.clone()]);
         assert_eq!(engine.governance_mempool, vec![op]);
 
         let _ = std::fs::remove_dir_all(&dir);
