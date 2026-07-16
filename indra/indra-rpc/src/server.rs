@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    error::{ERR_INTERNAL_ERROR, ERR_PARSE_ERROR},
+    error::{ERR_INTERNAL_ERROR, ERR_INVALID_REQUEST, ERR_PARSE_ERROR},
     handlers::{
         check_rpc_method_allowed, dispatch_with_mode, DispatchResult, NodeState, RpcEngineMut,
         RpcEngineView, RpcMode,
@@ -300,6 +300,21 @@ pub fn is_batch_request_body(body: &str) -> bool {
     body.trim_start().starts_with('[')
 }
 
+/// Parse a JSON-RPC request body or return the JSON-RPC error response that
+/// should be sent for envelope-level failures.
+pub fn parse_http_json_rpc_body(body: &str) -> Result<crate::types::RpcRequest, RpcResponse> {
+    if is_batch_request_body(body) {
+        return Err(RpcResponse::err(
+            JsonId::Null,
+            ERR_INVALID_REQUEST,
+            "batch requests not supported".to_string(),
+        ));
+    }
+
+    parse_request(body)
+        .map_err(|error| RpcResponse::err(JsonId::Null, error.code(), error.response_message()))
+}
+
 /// Build CORS response headers. Empty allowlist means no browser cross-origin access.
 pub fn cors_headers(origin: Option<&str>, allowlist: &[String]) -> String {
     let Some(origin) = origin else {
@@ -456,20 +471,11 @@ where
         use std::io::Read;
         reader.read_exact(&mut body)?;
         let body_str = String::from_utf8_lossy(&body);
-        if is_batch_request_body(&body_str) {
-            return Ok(RpcResponse::err(
-                JsonId::Null,
-                -32600,
-                "batch requests not supported".to_string(),
-            )
-            .to_json());
-        }
-
         // Parse JSON-RPC request
-        let req = match parse_request(&body_str) {
+        let req = match parse_http_json_rpc_body(&body_str) {
             Ok(r) => r,
-            Err(e) => {
-                return Ok(RpcResponse::err(JsonId::Null, ERR_PARSE_ERROR, e).to_json());
+            Err(response) => {
+                return Ok(response.to_json());
             }
         };
 
@@ -580,19 +586,10 @@ fn read_and_process_ref<E: RpcEngineView>(
     use std::io::Read;
     reader.read_exact(&mut body)?;
     let body_str = String::from_utf8_lossy(&body);
-    if is_batch_request_body(&body_str) {
-        return Ok(RpcResponse::err(
-            JsonId::Null,
-            -32600,
-            "batch requests not supported".to_string(),
-        )
-        .to_json());
-    }
-
-    let req = match parse_request(&body_str) {
+    let req = match parse_http_json_rpc_body(&body_str) {
         Ok(r) => r,
-        Err(e) => {
-            return Ok(RpcResponse::err(JsonId::Null, ERR_PARSE_ERROR, e).to_json());
+        Err(response) => {
+            return Ok(response.to_json());
         }
     };
 
@@ -706,6 +703,30 @@ fn dispatch_to_response<E: RpcEngineMut>(
 mod tests {
     use super::*;
     use indra_state::ChainState;
+
+    fn http_rpc_response_body(body: &str) -> String {
+        let request = match parse_http_json_rpc_body(body) {
+            Ok(request) => request,
+            Err(response) => return response.to_json(),
+        };
+        let mut engine = ChainState::new_genesis();
+        dispatch_to_response(
+            &request.method,
+            &request.params,
+            request.id,
+            &mut engine,
+            RpcMode::Full,
+        )
+    }
+
+    fn assert_rpc_error_code(body: &str, code: i32) -> String {
+        let response = http_rpc_response_body(body);
+        assert!(
+            response.contains(&format!(r#""code":{}"#, code)),
+            "expected code {code}, got {response}"
+        );
+        response
+    }
 
     #[test]
     fn call_rpc_get_height() {
@@ -821,6 +842,85 @@ mod tests {
             RpcMethodCost::Expensive
         );
         assert_eq!(rpc_method_cost("indra_getHeight"), RpcMethodCost::Cheap);
+    }
+
+    #[test]
+    fn rpc_http_invalid_jsonrpc_version_returns_invalid_request() {
+        let response = assert_rpc_error_code(
+            r#"{"jsonrpc":"1.0","method":"indra_getChainInfo","params":[],"id":1}"#,
+            -32600,
+        );
+        assert!(response.contains("Invalid Request"));
+        assert!(response.contains("jsonrpc"));
+    }
+
+    #[test]
+    fn rpc_http_missing_jsonrpc_returns_invalid_request() {
+        assert_rpc_error_code(
+            r#"{"method":"indra_getChainInfo","params":[],"id":1}"#,
+            -32600,
+        );
+    }
+
+    #[test]
+    fn rpc_http_missing_or_invalid_method_returns_invalid_request() {
+        assert_rpc_error_code(r#"{"jsonrpc":"2.0","params":[],"id":1}"#, -32600);
+        assert_rpc_error_code(
+            r#"{"jsonrpc":"2.0","method":42,"params":[],"id":1}"#,
+            -32600,
+        );
+    }
+
+    #[test]
+    fn rpc_http_invalid_id_type_returns_invalid_request() {
+        assert_rpc_error_code(
+            r#"{"jsonrpc":"2.0","method":"indra_getChainInfo","params":[],"id":{}}"#,
+            -32600,
+        );
+    }
+
+    #[test]
+    fn rpc_http_non_array_params_returns_invalid_request() {
+        assert_rpc_error_code(
+            r#"{"jsonrpc":"2.0","method":"indra_getChainInfo","params":{"x":1},"id":1}"#,
+            -32600,
+        );
+    }
+
+    #[test]
+    fn rpc_http_non_object_top_level_json_returns_invalid_request() {
+        assert_rpc_error_code(r#""hello""#, -32600);
+        assert_rpc_error_code("42", -32600);
+        assert_rpc_error_code("null", -32600);
+    }
+
+    #[test]
+    fn rpc_http_malformed_json_returns_parse_error() {
+        let response = assert_rpc_error_code(
+            r#"{"jsonrpc":"2.0","method":"indra_getChainInfo","params":[],"id":1"#,
+            -32700,
+        );
+        assert!(response.contains("parse error"));
+    }
+
+    #[test]
+    fn rpc_http_missing_params_still_succeeds() {
+        let response =
+            http_rpc_response_body(r#"{"jsonrpc":"2.0","method":"indra_getChainInfo","id":1}"#);
+        assert!(
+            response.contains(r#""result":"#),
+            "missing params should remain valid, got {response}"
+        );
+        assert!(!response.contains(r#""error":"#), "{response}");
+    }
+
+    #[test]
+    fn rpc_http_top_level_array_still_returns_batch_rejection() {
+        let response = assert_rpc_error_code(
+            r#"[{"jsonrpc":"2.0","method":"indra_getChainInfo","params":[],"id":1}]"#,
+            -32600,
+        );
+        assert!(response.contains("batch requests not supported"));
     }
 
     #[test]

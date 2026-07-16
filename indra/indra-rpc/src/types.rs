@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+use crate::error::{ERR_INVALID_REQUEST, ERR_PARSE_ERROR};
+
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Clone)]
 pub struct RpcRequest {
@@ -16,6 +18,40 @@ pub struct RpcRequest {
     pub params: Vec<String>,
     /// Request ID (string or number).
     pub id: JsonId,
+}
+
+/// Error produced while parsing a JSON-RPC envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcParseError {
+    /// The request body was not syntactically valid JSON.
+    Syntax(String),
+    /// The body was valid JSON but not a valid JSON-RPC 2.0 request object.
+    InvalidRequest(String),
+}
+
+impl RpcParseError {
+    /// JSON-RPC error code for this parse/validation failure.
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::Syntax(_) => ERR_PARSE_ERROR,
+            Self::InvalidRequest(_) => ERR_INVALID_REQUEST,
+        }
+    }
+
+    /// Public JSON-RPC error message used in HTTP responses.
+    pub fn response_message(&self) -> String {
+        match self {
+            Self::Syntax(_) => "parse error".to_string(),
+            Self::InvalidRequest(reason) => format!("Invalid Request: {reason}"),
+        }
+    }
+
+    /// Detailed reason retained for tests and internal diagnostics.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Syntax(reason) | Self::InvalidRequest(reason) => reason,
+        }
+    }
 }
 
 /// A JSON-RPC 2.0 response.
@@ -112,35 +148,45 @@ impl RpcResponse {
 ///
 /// Strictly parses the JSON-RPC 2.0 envelope while preserving the existing
 /// handler-facing representation of `params` as raw JSON value strings.
-pub fn parse_request(json: &str) -> Result<RpcRequest, String> {
-    let value: Value =
-        serde_json::from_str(json.trim()).map_err(|error| format!("invalid JSON: {error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "JSON-RPC request must be an object".to_string())?;
+pub fn parse_request(json: &str) -> Result<RpcRequest, RpcParseError> {
+    let value: Value = serde_json::from_str(json.trim())
+        .map_err(|error| RpcParseError::Syntax(format!("invalid JSON: {error}")))?;
+    let object = value.as_object().ok_or_else(|| {
+        RpcParseError::InvalidRequest("JSON-RPC request must be an object".to_string())
+    })?;
 
     let jsonrpc = object
         .get("jsonrpc")
         .and_then(Value::as_str)
-        .ok_or_else(|| "missing or invalid 'jsonrpc' field".to_string())?;
+        .ok_or_else(|| {
+            RpcParseError::InvalidRequest("missing or invalid 'jsonrpc' field".to_string())
+        })?;
     if jsonrpc != "2.0" {
-        return Err("invalid 'jsonrpc' version: expected \"2.0\"".to_string());
+        return Err(RpcParseError::InvalidRequest(
+            "invalid 'jsonrpc' version: expected \"2.0\"".to_string(),
+        ));
     }
 
     let method = object
         .get("method")
         .and_then(Value::as_str)
-        .ok_or_else(|| "missing or invalid 'method' field".to_string())?
+        .ok_or_else(|| {
+            RpcParseError::InvalidRequest("missing or invalid 'method' field".to_string())
+        })?
         .to_string();
 
     let id = match object.get("id") {
         Some(Value::Number(number)) => number
             .as_i64()
             .map(JsonId::Number)
-            .ok_or_else(|| "unsupported 'id' number".to_string())?,
+            .ok_or_else(|| RpcParseError::InvalidRequest("unsupported 'id' number".to_string()))?,
         Some(Value::String(value)) => JsonId::Str(value.clone()),
         Some(Value::Null) | None => JsonId::Null,
-        Some(_) => return Err("invalid 'id' field".to_string()),
+        Some(_) => {
+            return Err(RpcParseError::InvalidRequest(
+                "invalid 'id' field".to_string(),
+            ))
+        }
     };
 
     let params = match object.get("params") {
@@ -148,8 +194,14 @@ pub fn parse_request(json: &str) -> Result<RpcRequest, String> {
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("invalid 'params' value: {error}"))?,
-        Some(_) => return Err("'params' must be an array".to_string()),
+            .map_err(|error| {
+                RpcParseError::InvalidRequest(format!("invalid 'params' value: {error}"))
+            })?,
+        Some(_) => {
+            return Err(RpcParseError::InvalidRequest(
+                "'params' must be an array".to_string(),
+            ))
+        }
         None => Vec::new(),
     };
 
@@ -213,35 +265,37 @@ mod tests {
 
     #[test]
     fn parse_request_rejects_malformed_json_cleanly() {
-        let err = parse_request(r#"{"jsonrpc":"2.0","method":"indra_getHeight","#)
-            .err()
-            .unwrap_or_default();
-        assert!(err.contains("invalid JSON"), "{err}");
+        let err = parse_request(r#"{"jsonrpc":"2.0","method":"indra_getHeight","#).unwrap_err();
+        assert!(
+            matches!(err, RpcParseError::Syntax(ref reason) if reason.contains("invalid JSON"))
+        );
     }
 
     #[test]
     fn parse_request_rejects_missing_jsonrpc() {
-        let err = parse_request(r#"{"method":"indra_getHeight","params":[],"id":1}"#)
-            .err()
-            .unwrap_or_default();
-        assert!(err.contains("jsonrpc"), "{err}");
+        let err = parse_request(r#"{"method":"indra_getHeight","params":[],"id":1}"#).unwrap_err();
+        assert!(
+            matches!(err, RpcParseError::InvalidRequest(ref reason) if reason.contains("jsonrpc"))
+        );
     }
 
     #[test]
     fn parse_request_rejects_incorrect_jsonrpc_version() {
         let err =
             parse_request(r#"{"jsonrpc":"1.0","method":"indra_getHeight","params":[],"id":1}"#)
-                .err()
-                .unwrap_or_default();
-        assert!(err.contains("expected \"2.0\""), "{err}");
+                .unwrap_err();
+        assert!(
+            matches!(err, RpcParseError::InvalidRequest(ref reason) if reason.contains("expected \"2.0\""))
+        );
     }
 
     #[test]
     fn parse_request_rejects_top_level_array() {
-        let err = parse_request(r#"[{"jsonrpc":"2.0","method":"indra_getHeight","id":1}]"#)
-            .err()
-            .unwrap_or_default();
-        assert!(err.contains("must be an object"), "{err}");
+        let err =
+            parse_request(r#"[{"jsonrpc":"2.0","method":"indra_getHeight","id":1}]"#).unwrap_err();
+        assert!(
+            matches!(err, RpcParseError::InvalidRequest(ref reason) if reason.contains("must be an object"))
+        );
     }
 
     #[test]
@@ -249,9 +303,10 @@ mod tests {
         let err = parse_request(
             r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":{"x":1},"id":1}"#,
         )
-        .err()
-        .unwrap_or_default();
-        assert!(err.contains("params"), "{err}");
+        .unwrap_err();
+        assert!(
+            matches!(err, RpcParseError::InvalidRequest(ref reason) if reason.contains("params"))
+        );
     }
 
     #[test]

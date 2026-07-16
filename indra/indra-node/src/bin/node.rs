@@ -3768,7 +3768,7 @@ fn handle_rpc(
     use indra_rpc::handlers::{
         check_rpc_method_allowed_with_admin, dispatch_with_admin, DispatchResult, NodeState,
     };
-    use indra_rpc::types::{parse_request, RpcResponse};
+    use indra_rpc::types::RpcResponse;
     use std::io::{BufRead, BufReader, Read};
 
     let _ = stream.set_read_timeout(Some(policy.request_timeout));
@@ -3909,18 +3909,11 @@ fn handle_rpc(
         return;
     }
     let body_str = String::from_utf8_lossy(&body_bytes);
-    if indra_rpc::server::is_batch_request_body(&body_str) {
-        let body = r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"batch requests not supported"},"id":null}"#;
-        send_http(&stream, &cors, body);
-        return;
-    }
-
-    let req = match parse_request(&body_str) {
+    let req = match indra_rpc::server::parse_http_json_rpc_body(&body_str) {
         Ok(request) => request,
-        Err(_) => {
-            let body =
-                r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"parse error"},"id":null}"#;
-            send_http(&stream, &cors, body);
+        Err(response) => {
+            let body = response.to_json();
+            send_http(&stream, &cors, &body);
             return;
         }
     };
