@@ -1353,4 +1353,166 @@ mod tests {
         proof.steps[0].siblings[0].hash[0] ^= 0x80;
         assert!(!CompressedAuthTree::verify_proof(tree.root(), k1, &proof));
     }
+
+    #[test]
+    fn adversarial_compressed_inclusion_forgery_attempts_fail() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let absent = ckey(0x1, 0x2);
+        let tree = CompressedAuthTree::from_pairs([(k1, value(1)), (k2, value(2))]).unwrap();
+        let proof = tree.prove(k1);
+        assert!(CompressedAuthTree::verify_proof(tree.root(), k1, &proof));
+
+        let mut forged_value = proof.clone();
+        forged_value.value = Some(value(99));
+        assert!(
+            !CompressedAuthTree::verify_proof(tree.root(), k1, &forged_value),
+            "changing only the claimed value must not forge inclusion"
+        );
+
+        let mut stolen_for_absent_key = proof.clone();
+        stolen_for_absent_key.key = absent;
+        assert!(
+            !CompressedAuthTree::verify_proof(tree.root(), absent, &stolen_for_absent_key),
+            "a valid proof for one key must not be reusable for another key"
+        );
+
+        let mut terminal_flip = proof.clone();
+        terminal_flip.value = None;
+        terminal_flip.terminal = ProofTerminal::MissingChild;
+        assert!(
+            !CompressedAuthTree::verify_proof(tree.root(), k1, &terminal_flip),
+            "flipping an inclusion proof into a non-membership terminal must fail"
+        );
+    }
+
+    #[test]
+    fn adversarial_compressed_non_membership_cannot_hide_present_keys() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let missing_child_key = ckey(0x1, 0x2);
+        let prefix_mismatch_key = ckey(0x2, 0x0);
+        let two_leaf_tree =
+            CompressedAuthTree::from_pairs([(k1, value(1)), (k2, value(2))]).unwrap();
+
+        let mut missing_child_proof = two_leaf_tree.prove(missing_child_key);
+        assert!(matches!(
+            missing_child_proof.terminal,
+            ProofTerminal::MissingChild
+        ));
+        missing_child_proof.key = k1;
+        assert!(
+            !CompressedAuthTree::verify_proof(two_leaf_tree.root(), k1, &missing_child_proof),
+            "a missing-child proof for an absent nibble must not prove non-membership for a present key"
+        );
+
+        let mut prefix_mismatch_proof = two_leaf_tree.prove(prefix_mismatch_key);
+        assert!(matches!(
+            prefix_mismatch_proof.terminal,
+            ProofTerminal::PrefixMismatch { .. }
+        ));
+        prefix_mismatch_proof.key = k1;
+        assert!(
+            !CompressedAuthTree::verify_proof(two_leaf_tree.root(), k1, &prefix_mismatch_proof),
+            "a prefix-mismatch proof must not be reusable against a key under that prefix"
+        );
+
+        let single_leaf_tree = CompressedAuthTree::from_pairs([(k1, value(1))]).unwrap();
+        let mut divergent_leaf_proof = single_leaf_tree.prove(k2);
+        assert!(matches!(
+            divergent_leaf_proof.terminal,
+            ProofTerminal::DivergentLeaf { .. }
+        ));
+        divergent_leaf_proof.key = k1;
+        assert!(
+            !CompressedAuthTree::verify_proof(single_leaf_tree.root(), k1, &divergent_leaf_proof),
+            "a divergent-leaf proof naming the present leaf must not hide that same present key"
+        );
+    }
+
+    #[test]
+    fn adversarial_compressed_domain_and_child_encoding_confusion_fails() {
+        let k1 = ckey(0x1, 0x0);
+        let k2 = ckey(0x1, 0x1);
+        let v1 = value(1);
+        let v2 = value(2);
+        let leaf_hash = hash_compressed_leaf(&k1, &v1);
+        let branch_hash = hash_branch_from_children(
+            &[0x1],
+            &[
+                CompressedProofChild {
+                    nibble: 0,
+                    kind: CompressedChildKind::Leaf,
+                    hash: leaf_hash,
+                },
+                CompressedProofChild {
+                    nibble: 1,
+                    kind: CompressedChildKind::Leaf,
+                    hash: hash_compressed_leaf(&k2, &v2),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_ne!(compressed_empty_hash(), leaf_hash);
+        assert_ne!(compressed_empty_hash(), branch_hash);
+        assert_ne!(
+            leaf_hash, branch_hash,
+            "leaf and branch hash domains must remain structurally non-interchangeable"
+        );
+
+        let tree = CompressedAuthTree::from_pairs([(k1, v1), (k2, v2)]).unwrap();
+        let mut proof = tree.prove(k1);
+        assert!(CompressedAuthTree::verify_proof(tree.root(), k1, &proof));
+        let duplicated_sibling = proof.steps[0].siblings[0];
+        proof.steps[0].siblings.push(CompressedProofChild {
+            nibble: duplicated_sibling.nibble,
+            kind: CompressedChildKind::Leaf,
+            hash: duplicated_sibling.hash,
+        });
+        assert!(
+            !CompressedAuthTree::verify_proof(tree.root(), k1, &proof),
+            "duplicate child encodings must be rejected rather than hashed ambiguously"
+        );
+    }
+
+    #[test]
+    fn adversarial_compressed_pathological_keys_and_ordering_are_deterministic() {
+        let mut k1 = [0u8; 32];
+        let mut k2 = [0u8; 32];
+        k2[31] = 1;
+        let mut k3 = [0xFFu8; 32];
+        k3[31] = 0xFE;
+        let pairs = vec![(k1, value(1)), (k2, value(2)), (k3, value(3))];
+
+        assert!(
+            CompressedAuthTree::from_pairs([(k1, value(1)), (k1, value(2))]).is_err(),
+            "batch construction must reject duplicate keys instead of silently choosing an ordering"
+        );
+
+        let batch = CompressedAuthTree::from_pairs(pairs.clone()).unwrap();
+        let mut forward = CompressedAuthTree::new();
+        for (key, value_hash) in &pairs {
+            forward.insert(*key, *value_hash);
+        }
+        let mut reverse = CompressedAuthTree::new();
+        for (key, value_hash) in pairs.iter().rev() {
+            reverse.insert(*key, *value_hash);
+        }
+
+        assert_eq!(batch.root(), forward.root());
+        assert_eq!(batch.root(), reverse.root());
+        for (key, _) in &pairs {
+            let proof = reverse.prove(*key);
+            assert!(CompressedAuthTree::verify_proof(
+                reverse.root(),
+                *key,
+                &proof
+            ));
+        }
+
+        k1[31] = 2;
+        let missing = batch.prove(k1);
+        assert!(CompressedAuthTree::verify_proof(batch.root(), k1, &missing));
+    }
 }

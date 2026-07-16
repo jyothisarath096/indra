@@ -112,6 +112,7 @@ impl NodeConfigFile {
             .map_err(|e| format!("cannot read config file {}: {}", path.display(), e))?;
         let table = toml::from_str::<Value>(&content)
             .map_err(|e| format!("config.toml parse error: {}", e))?;
+        validate_known_config_keys(&table)?;
         Ok(Self {
             mode: get_str(&table, "node", "mode"),
             chain_id: get_str(&table, "node", "chain_id"),
@@ -406,6 +407,75 @@ fn get_str(table: &Value, section: &str, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn validate_known_config_keys(table: &Value) -> Result<(), String> {
+    let Some(root) = table.as_table() else {
+        return Err("config.toml root must be a table".to_string());
+    };
+    let mut errors = Vec::new();
+    for (section, value) in root {
+        let Some(allowed_keys) = allowed_config_keys(section) else {
+            errors.push(format!(
+                "unrecognized config table [{section}]; expected one of [node], [keys], [network], [rpc], [rpc_public], [metrics], [storage]"
+            ));
+            continue;
+        };
+        let Some(section_table) = value.as_table() else {
+            errors.push(format!("config section [{section}] must be a TOML table"));
+            continue;
+        };
+        for key in section_table.keys() {
+            if !allowed_keys.contains(&key.as_str()) {
+                errors.push(format!(
+                    "unrecognized config key {section}.{key}; if this was intended for a different section, move it there instead of leaving it silently ignored"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn allowed_config_keys(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "node" => Some(&["mode", "chain_id", "data_dir", "genesis"]),
+        "keys" => Some(&["path", "password_file"]),
+        "network" => Some(&[
+            "p2p_addr",
+            "observer_addr",
+            "bootstrap_peers",
+            "dns_seed_host",
+            "dns_seed_validation",
+            "dns_seed_signed_validation",
+            "dns_seed_signed_public_key",
+            "peers_file",
+        ]),
+        "rpc" => Some(&["addr", "enabled", "admin_token", "cors_origins"]),
+        "rpc_public" => Some(&[
+            "addr",
+            "enabled",
+            "cors_origins",
+            "per_ip_rate_per_sec",
+            "per_ip_burst",
+            "global_rate_per_sec",
+            "global_burst",
+            "max_body_bytes",
+            "timeout_ms",
+        ]),
+        "metrics" => Some(&["addr", "enabled"]),
+        "storage" => Some(&[
+            "prune_keep_blocks",
+            "snapshot_interval",
+            "mempool_capacity",
+            "staking_mempool_capacity",
+            "governance_mempool_capacity",
+        ]),
+        _ => None,
+    }
+}
+
 fn get_bool(table: &Value, section: &str, key: &str) -> Option<bool> {
     table.get(section)?.get(key)?.as_bool()
 }
@@ -658,6 +728,65 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
         assert!(err
             .iter()
             .any(|e| e.contains("dns_seed_signed_public_key is required")));
+    }
+
+    #[test]
+    fn signed_dns_seed_security_setting_misplaced_outside_network_is_rejected() {
+        let path = temp_file(
+            "misplaced-signed-dns-config",
+            &format!(
+                r#"
+[node]
+mode = "observer"
+data_dir = "/tmp/indra"
+genesis = "/tmp/indra/genesis.toml"
+
+[rpc]
+dns_seed_signed_validation = "warn"
+dns_seed_signed_public_key = "{}"
+"#,
+                "00".repeat(PQ_PK_BYTES)
+            ),
+        );
+        let err = NodeConfigFile::load(&path).err().unwrap_or_default();
+
+        assert!(err.contains("unrecognized config key rpc.dns_seed_signed_validation"));
+        assert!(err.contains("unrecognized config key rpc.dns_seed_signed_public_key"));
+        assert!(err.contains("move it there"));
+    }
+
+    #[test]
+    fn unknown_config_table_is_rejected() {
+        let path = temp_file(
+            "unknown-config-table",
+            r#"
+[node]
+mode = "observer"
+data_dir = "/tmp/indra"
+genesis = "/tmp/indra/genesis.toml"
+
+[experimental]
+future_flag = true
+"#,
+        );
+        let err = NodeConfigFile::load(&path).err().unwrap_or_default();
+        assert!(err.contains("unrecognized config table [experimental]"));
+    }
+
+    #[test]
+    fn unknown_config_key_in_known_table_is_rejected() {
+        let path = temp_file(
+            "unknown-config-key",
+            r#"
+[node]
+mode = "observer"
+data_dir = "/tmp/indra"
+genesis = "/tmp/indra/genesis.toml"
+extra_security_mode = "warn"
+"#,
+        );
+        let err = NodeConfigFile::load(&path).err().unwrap_or_default();
+        assert!(err.contains("unrecognized config key node.extra_security_mode"));
     }
 
     #[test]

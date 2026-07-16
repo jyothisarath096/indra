@@ -1,11 +1,12 @@
 //! Peer discovery — DNS seeding, peer exchange, and peer table persistence.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
     io,
     net::{SocketAddr, ToSocketAddrs},
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -215,6 +216,115 @@ struct SignedDnsSeedTxtLookup {
     sig_chunks: Vec<String>,
 }
 
+/// Node-local replay protection for signed DNS discovery.
+///
+/// DNS remains a best-effort discovery layer, but signed discovery must not
+/// accept a lower sequence number after this node has already verified a newer
+/// list for the same seed hostname. The file is node-local operational state,
+/// not consensus state.
+#[derive(Debug, Default)]
+struct SignedDnsSeqStore {
+    path: Option<PathBuf>,
+    highest_by_host: HashMap<String, u64>,
+}
+
+impl SignedDnsSeqStore {
+    fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let mut highest_by_host = HashMap::new();
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                for (line_no, line) in content.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let Some(host) = parts.next() else {
+                        continue;
+                    };
+                    let Some(seq) = parts.next() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "signed DNS replay state {} line {} missing sequence",
+                                path.display(),
+                                line_no + 1
+                            ),
+                        ));
+                    };
+                    if parts.next().is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "signed DNS replay state {} line {} has extra fields",
+                                path.display(),
+                                line_no + 1
+                            ),
+                        ));
+                    }
+                    let seq = seq.parse::<u64>().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "signed DNS replay state {} line {} has invalid sequence",
+                                path.display(),
+                                line_no + 1
+                            ),
+                        )
+                    })?;
+                    highest_by_host.insert(host.to_string(), seq);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        Ok(Self {
+            path: Some(path),
+            highest_by_host,
+        })
+    }
+
+    fn highest_seq(&self, host: &str) -> Option<u64> {
+        self.highest_by_host.get(host).copied()
+    }
+
+    fn record_verified(&mut self, host: &str, seq: u64) -> io::Result<()> {
+        if self.highest_seq(host).is_some_and(|current| seq <= current) {
+            return Ok(());
+        }
+        self.highest_by_host.insert(host.to_string(), seq);
+        self.save()
+    }
+
+    fn save(&self) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut entries: Vec<_> = self.highest_by_host.iter().collect();
+        entries.sort_by(|(host_a, _), (host_b, _)| host_a.cmp(host_b));
+        let mut content = String::from("# INDRA signed DNS discovery highest verified sequences\n");
+        for (host, seq) in entries {
+            content.push_str(host);
+            content.push(' ');
+            content.push_str(&seq.to_string());
+            content.push('\n');
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+}
+
+/// Default node-local path for signed DNS replay-protection state.
+pub fn signed_dns_replay_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("signed_dns_sequences")
+}
+
 /// Encode the default DNS seed list into the existing config string field.
 pub fn default_dns_seed_hosts_config() -> String {
     DNS_SEED_HOSTS.join(",")
@@ -417,6 +527,7 @@ async fn resolve_signed_dns_seed_hosts_with_async<F, Fut>(
     hosts: &[String],
     mode: SignedDnsSeedValidationMode,
     public_key: Option<&PqPublicKey>,
+    mut replay_store: Option<&mut SignedDnsSeqStore>,
     mut resolver: F,
 ) -> Vec<SocketAddr>
 where
@@ -453,6 +564,24 @@ where
                     lookup.node_chunks.len(),
                     lookup.sig_chunks.len()
                 );
+                let root = match parse_signed_dns_seed_root(&lookup.root_txt) {
+                    Ok(root) => root,
+                    Err(err) => {
+                        eprintln!("[discovery] signed DNS seed {} rejected: {}", host, err);
+                        continue;
+                    }
+                };
+                if let Some(store) = replay_store.as_deref_mut() {
+                    if let Some(highest) = store.highest_seq(host) {
+                        if root.seq < highest {
+                            eprintln!(
+                                "[discovery] signed DNS seed {} rejected: replayed sequence {} below persisted highest {}",
+                                host, root.seq, highest
+                            );
+                            continue;
+                        }
+                    }
+                }
                 match verify_signed_dns_seed_records(
                     &lookup.root_txt,
                     &lookup.node_chunks,
@@ -460,10 +589,20 @@ where
                     public_key,
                 ) {
                     Ok(host_addrs) => {
+                        if let Some(store) = replay_store.as_deref_mut() {
+                            if let Err(err) = store.record_verified(host, root.seq) {
+                                eprintln!(
+                                    "[discovery] signed DNS seed {} rejected: could not persist verified sequence {}: {}",
+                                    host, root.seq, err
+                                );
+                                continue;
+                            }
+                        }
                         eprintln!(
-                            "[discovery] signed DNS seed {} verified {} addresses",
+                            "[discovery] signed DNS seed {} verified {} addresses at seq={}",
                             host,
-                            host_addrs.len()
+                            host_addrs.len(),
+                            root.seq
                         );
                         addrs.extend(host_addrs);
                     }
@@ -531,6 +670,27 @@ pub async fn resolve_dns_seeds_with_policies(
     signed_mode: SignedDnsSeedValidationMode,
     signed_public_key: Option<&PqPublicKey>,
 ) -> Vec<SocketAddr> {
+    resolve_dns_seeds_with_policies_and_replay_store(
+        hosts,
+        port,
+        mode,
+        signed_mode,
+        signed_public_key,
+        None,
+    )
+    .await
+}
+
+/// Resolve DNS seed hostnames with policy controls and node-local signed-list
+/// replay protection.
+pub async fn resolve_dns_seeds_with_policies_and_replay_store(
+    hosts: &str,
+    port: u16,
+    mode: DnsSeedValidationMode,
+    signed_mode: SignedDnsSeedValidationMode,
+    signed_public_key: Option<&PqPublicKey>,
+    signed_replay_state_path: Option<&Path>,
+) -> Vec<SocketAddr> {
     let hosts = parse_dns_seed_hosts(hosts);
     eprintln!(
         "[discovery] DNS seed policy: hosts={} dnssec={} signed={} signed_key_configured={}",
@@ -540,13 +700,40 @@ pub async fn resolve_dns_seeds_with_policies(
         signed_public_key.is_some()
     );
     if signed_mode != SignedDnsSeedValidationMode::Off {
-        let signed = resolve_signed_dns_seed_hosts_with_async(
-            &hosts,
-            signed_mode,
-            signed_public_key,
-            |host| async move { resolve_signed_seed_with_hickory_dnssec_async(&host).await },
-        )
-        .await;
+        let mut replay_store_unavailable = false;
+        let mut replay_store = match signed_replay_state_path {
+            Some(path) => match SignedDnsSeqStore::load(path) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    eprintln!(
+                        "[discovery] signed DNS replay state unavailable at {}: {}",
+                        path.display(),
+                        err
+                    );
+                    if signed_mode == SignedDnsSeedValidationMode::Require {
+                        return Vec::new();
+                    }
+                    replay_store_unavailable = true;
+                    None
+                }
+            },
+            None => None,
+        };
+        let signed = if replay_store_unavailable {
+            eprintln!(
+                "[discovery] signed DNS discovery skipped because replay protection state is unavailable; falling back to DNS A records"
+            );
+            Vec::new()
+        } else {
+            resolve_signed_dns_seed_hosts_with_async(
+                &hosts,
+                signed_mode,
+                signed_public_key,
+                replay_store.as_mut(),
+                |host| async move { resolve_signed_seed_with_hickory_dnssec_async(&host).await },
+            )
+            .await
+        };
         if !signed.is_empty() || signed_mode == SignedDnsSeedValidationMode::Require {
             eprintln!(
                 "[discovery] signed DNS discovery final outcome: {} peer(s), fallback={}",
@@ -1488,6 +1675,222 @@ mod tests {
     }
 
     #[test]
+    fn signed_dns_seed_chunk_reordering_substitution_partial_and_malformed_fail() {
+        let key = PqKeypair::from_seed(&[0x5A; 32]).unwrap();
+        let addrs: Vec<SocketAddr> = (1..=24)
+            .map(|i| format!("203.0.113.{i}:30303").parse().unwrap())
+            .collect();
+        let records = build_signed_dns_seed_records(addrs, 8, &key).unwrap();
+        let replacement =
+            build_signed_dns_seed_records(["198.51.100.200:30303".parse().unwrap()], 8, &key)
+                .unwrap();
+        let nodes: Vec<String> = records
+            .node_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let sig: Vec<String> = records
+            .sig_chunks
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert!(
+            nodes.len() > 1,
+            "test vector must exercise node chunk order"
+        );
+        assert!(sig.len() > 1, "ML-DSA signature must be chunked");
+
+        let mut reordered_nodes = nodes.clone();
+        reordered_nodes.swap(0, 1);
+        let err = verify_signed_dns_seed_records(
+            &records.root_txt,
+            &reordered_nodes,
+            &sig,
+            &key.public_key(),
+        )
+        .unwrap_err();
+        assert!(err.contains("hash mismatch") || err.contains("invalid address"));
+
+        let mut reordered_sig = sig.clone();
+        reordered_sig.swap(0, 1);
+        let err = verify_signed_dns_seed_records(
+            &records.root_txt,
+            &nodes,
+            &reordered_sig,
+            &key.public_key(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("signature hash mismatch")
+                || err.contains("signature verification failed")
+        );
+
+        let mut substituted_nodes = nodes.clone();
+        substituted_nodes[0] = replacement.node_chunks[0].1.clone();
+        let err = verify_signed_dns_seed_records(
+            &records.root_txt,
+            &substituted_nodes,
+            &sig,
+            &key.public_key(),
+        )
+        .unwrap_err();
+        assert!(err.contains("hash mismatch") || err.contains("invalid address"));
+
+        let partial_sig = &sig[..sig.len() - 1];
+        let err = verify_signed_dns_seed_records(
+            &records.root_txt,
+            &nodes,
+            partial_sig,
+            &key.public_key(),
+        )
+        .unwrap_err();
+        assert!(err.contains("chunk count mismatch"));
+
+        let mut malformed_nodes = nodes.clone();
+        malformed_nodes[0].replace_range(0..2, "zz");
+        let err = verify_signed_dns_seed_records(
+            &records.root_txt,
+            &malformed_nodes,
+            &sig,
+            &key.public_key(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not valid hex"));
+    }
+
+    #[tokio::test]
+    async fn signed_dns_seed_rejects_lower_sequence_after_persisted_higher_sequence() {
+        let key = PqKeypair::from_seed(&[0x5B; 32]).unwrap();
+        let older = build_signed_dns_seed_records(["203.0.113.10:30303".parse().unwrap()], 1, &key)
+            .unwrap();
+        let newer = build_signed_dns_seed_records(["203.0.113.11:30303".parse().unwrap()], 2, &key)
+            .unwrap();
+        let equal_seq =
+            build_signed_dns_seed_records(["203.0.113.12:30303".parse().unwrap()], 2, &key)
+                .unwrap();
+        let state_path = std::env::temp_dir().join(format!(
+            "indra-signed-dns-seq-{}-{}.txt",
+            std::process::id(),
+            crate::metrics::MetricsState::new()
+                .started_at
+                .elapsed()
+                .as_nanos()
+        ));
+        let host = "seeds.example".to_string();
+
+        assert_eq!(parse_signed_dns_seed_root(&older.root_txt).unwrap().seq, 1);
+        assert_eq!(parse_signed_dns_seed_root(&newer.root_txt).unwrap().seq, 2);
+        assert_eq!(
+            parse_signed_dns_seed_root(&equal_seq.root_txt).unwrap().seq,
+            2
+        );
+
+        let mut first_start_store = SignedDnsSeqStore::load(&state_path).unwrap();
+        let newer_resolved = resolve_signed_dns_seed_hosts_with_async(
+            &[host.clone()],
+            SignedDnsSeedValidationMode::Warn,
+            Some(&key.public_key()),
+            Some(&mut first_start_store),
+            |_| {
+                let root_txt = newer.root_txt.clone();
+                let node_chunks = newer
+                    .node_chunks
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                let sig_chunks = newer
+                    .sig_chunks
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                async move {
+                    Ok(SignedDnsSeedTxtLookup {
+                        root_txt,
+                        node_chunks,
+                        sig_chunks,
+                    })
+                }
+            },
+        )
+        .await;
+        assert_eq!(newer_resolved, vec!["203.0.113.11:30303".parse().unwrap()]);
+
+        let persisted_after_restart = SignedDnsSeqStore::load(&state_path).unwrap();
+        assert!(
+            persisted_after_restart.highest_seq(&host) == Some(2),
+            "verified sequence must survive restart via node-local persistence"
+        );
+        let mut restarted_store = persisted_after_restart;
+
+        let older_resolved = resolve_signed_dns_seed_hosts_with_async(
+            &[host.clone()],
+            SignedDnsSeedValidationMode::Warn,
+            Some(&key.public_key()),
+            Some(&mut restarted_store),
+            |_| {
+                let root_txt = older.root_txt.clone();
+                let node_chunks = older
+                    .node_chunks
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                let sig_chunks = older
+                    .sig_chunks
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                async move {
+                    Ok(SignedDnsSeedTxtLookup {
+                        root_txt,
+                        node_chunks,
+                        sig_chunks,
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(
+            older_resolved.is_empty(),
+            "lower-sequence replay must be rejected after a higher sequence was persisted"
+        );
+
+        let equal_resolved = resolve_signed_dns_seed_hosts_with_async(
+            &[host.clone()],
+            SignedDnsSeedValidationMode::Warn,
+            Some(&key.public_key()),
+            Some(&mut restarted_store),
+            |_| {
+                let root_txt = equal_seq.root_txt.clone();
+                let node_chunks = equal_seq
+                    .node_chunks
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                let sig_chunks = equal_seq
+                    .sig_chunks
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                async move {
+                    Ok(SignedDnsSeedTxtLookup {
+                        root_txt,
+                        node_chunks,
+                        sig_chunks,
+                    })
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            equal_resolved,
+            vec!["203.0.113.12:30303".parse().unwrap()],
+            "equal sequence lookups are allowed for cache hits/repeated publication"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
     fn signed_dns_seed_root_signature_is_chunked_for_dns_txt_practicality() {
         let key = PqKeypair::from_seed(&[0x55; 32]).unwrap();
         let records =
@@ -1596,6 +1999,7 @@ mod tests {
             &["seeds.example".to_string()],
             SignedDnsSeedValidationMode::Warn,
             Some(&key.public_key()),
+            None,
             |_| {
                 let root_txt = records.root_txt.clone();
                 let node_chunks = node_chunks.clone();

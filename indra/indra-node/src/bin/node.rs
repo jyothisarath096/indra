@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
@@ -35,8 +35,9 @@ use indra_node::{
     config::{default_governance_mempool_capacity, DEFAULT_STAKING_MEMPOOL_CAPACITY},
     discovery::{
         default_dns_seed_hosts_config, load_peers, peer_list_payload,
-        resolve_dns_seeds_with_policies, resolve_peer_addr, sanitize_loaded_peers, save_peers,
-        DnsSeedValidationMode, SignedDnsSeedValidationMode,
+        resolve_dns_seeds_with_policies_and_replay_store, resolve_peer_addr, sanitize_loaded_peers,
+        save_peers, signed_dns_replay_state_path, DnsSeedValidationMode,
+        SignedDnsSeedValidationMode,
     },
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     genesis::load_genesis_seed_peers,
@@ -788,6 +789,7 @@ fn start_network_runtime(
     dns_seed_validation: DnsSeedValidationMode,
     dns_seed_signed_validation: SignedDnsSeedValidationMode,
     dns_seed_signed_public_key: Option<Vec<u8>>,
+    signed_dns_replay_state_path: PathBuf,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
 ) -> (
     Arc<NetworkBridge>,
@@ -1009,6 +1011,7 @@ fn start_network_runtime(
                     let dns_seed_host = dns_seed_host.clone();
                     let dns_seed_signed_public_key = dns_seed_signed_public_key.clone();
                     let p2p_addr_for_port = p2p_addr.clone();
+                    let signed_dns_replay_state = signed_dns_replay_state_path.clone();
                     async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         let p2p_port = p2p_addr_for_port
@@ -1067,12 +1070,13 @@ fn start_network_runtime(
                                     bytes.as_slice().try_into().ok()?;
                                 Some(PqPublicKey(array))
                             });
-                        let dns_peers = resolve_dns_seeds_with_policies(
+                        let dns_peers = resolve_dns_seeds_with_policies_and_replay_store(
                             &dns_seed_host,
                             p2p_port,
                             dns_seed_validation,
                             dns_seed_signed_validation,
                             signed_public_key.as_ref(),
+                            Some(&signed_dns_replay_state),
                         )
                         .await;
                         {
@@ -1870,6 +1874,7 @@ fn main() {
             dns_seed_validation,
             dns_seed_signed_validation,
             dns_seed_signed_public_key.clone(),
+            signed_dns_replay_state_path(Path::new(&data_dir)),
             Arc::clone(&handshake_config),
         );
     if let Some(addr) = observer_addr {
