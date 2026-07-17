@@ -704,8 +704,15 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
 pub(crate) struct VerifiedBlockProjection {
     pub(crate) state: ChainState,
     pub(crate) epoch_record: Option<EpochRecord>,
+    // Retained for debug/test defense-in-depth assertions after committing the
+    // verified projection. Release builds skip those assertions, so these fields
+    // are intentionally release-dead even though the values are consumed when
+    // debug assertions are enabled.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) state_root: Bytes32,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) validator_set_root: Bytes32,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) value_hash: Bytes32,
 }
 
