@@ -2006,6 +2006,68 @@ mod tests {
     }
 
     #[test]
+    fn project_block_for_roots_preserves_active_state_commitment_v2_cache() {
+        let mut state = ChainState::new_genesis();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        state.rebuild_state_commitment_v2(state.height);
+        assert!(
+            state.state_commitment_v2.is_some(),
+            "test setup must start with a warm StateCommitmentV2 cache"
+        );
+        let original = state.clone();
+        let original_root = state.state_commitment_v2_root(state.height);
+        let mut rebuilt_original = state.clone();
+        rebuilt_original.rebuild_state_commitment_v2(state.height);
+        assert_eq!(
+            rebuilt_original.state_commitment_v2_root(state.height),
+            original_root,
+            "test setup cache must already match a full rebuild"
+        );
+
+        let success_block = empty_block_at(&state, u64::MAX, 0);
+        let projected = project_block_for_roots(&mut state, &success_block, 0).unwrap();
+        assert_ne!(projected.state_root, Bytes32::ZERO);
+        assert_same_consensus_state(&state, &original);
+        assert!(
+            state.state_commitment_v2.is_some(),
+            "successful rollback projection must preserve a cache that was already warm"
+        );
+        let success_rollback_root = state.state_commitment_v2_root(original.height);
+        state.rebuild_state_commitment_v2(original.height);
+        assert_eq!(
+            state.state_commitment_v2_root(original.height),
+            success_rollback_root,
+            "cache after successful rollback projection must match full rebuild"
+        );
+        assert_eq!(state, original);
+
+        let mut failing_state = original.clone();
+        let mut failing_block = success_block;
+        failing_block.header.prev_hash = Bytes32::from([0xEE; 32]);
+        let err = project_block_for_roots(&mut failing_state, &failing_block, 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            clone_atomic_reference_apply_block(&original, &failing_block, 0)
+                .unwrap_err()
+                .to_string()
+        );
+        assert_same_consensus_state(&failing_state, &original);
+        assert!(
+            failing_state.state_commitment_v2.is_some(),
+            "failed rollback projection must preserve a cache that was already warm"
+        );
+        let failure_rollback_root = failing_state.state_commitment_v2_root(original.height);
+        failing_state.rebuild_state_commitment_v2(original.height);
+        assert_eq!(
+            failing_state.state_commitment_v2_root(original.height),
+            failure_rollback_root,
+            "cache after failed rollback projection must match full rebuild"
+        );
+        assert_eq!(failing_state, original);
+    }
+
+    #[test]
     fn project_block_for_roots_failpoint_rollback_covers_each_mutation() {
         let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
         let tx = make_tx(
