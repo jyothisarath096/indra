@@ -70,6 +70,21 @@ use crate::{
     txn::StateTxn,
 };
 
+/// Roots and value commitment produced by temporarily projecting a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedBlockRoots {
+    /// State root after applying the projected block.
+    pub state_root: Bytes32,
+    /// Validator/delegation/staking root after applying the projected block.
+    pub validator_set_root: Bytes32,
+    /// Block value hash computed from the projected total supply.
+    pub value_hash: Bytes32,
+    /// Total supply after applying the projected block.
+    pub total_supply: u64,
+    /// Epoch record produced by the projected block, if it crosses an epoch boundary.
+    pub epoch_record: Option<EpochRecord>,
+}
+
 /// Apply slash evidence to chain state.
 ///
 /// Verification is fail-fast and performs no state mutation until all checks pass.
@@ -542,6 +557,45 @@ pub fn apply_block(
     let epoch_record = apply_block_inner(&mut txn, block, timestamp_secs)?;
     txn.commit();
     Ok(epoch_record)
+}
+
+/// Temporarily apply a block, compute its post-state roots, then roll back.
+///
+/// This helper is intentionally fully synchronous. It mutates `state` only
+/// inside a scoped [`StateTxn`], never commits that transaction, and restores the
+/// exact pre-call in-memory cache presence before returning. It is used by block
+/// production/reproposal to fill candidate headers without paying for a full
+/// detached `ChainState` clone.
+pub fn project_block_for_roots(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<ProjectedBlockRoots> {
+    let started_without_state_commitment_v2 = state.state_commitment_v2.is_none();
+    let projected = {
+        let mut txn = StateTxn::begin(state, block.header.height);
+        match apply_block_inner(&mut txn, block, timestamp_secs) {
+            Ok(epoch_record) => {
+                let projected_state = txn.state();
+                let roots = crate::state_root::compute_state_roots(projected_state);
+                let mut value_block = block.clone();
+                value_block.header.state_root = roots.state_root;
+                value_block.header.validator_set_root = roots.validator_set_root;
+                Ok(ProjectedBlockRoots {
+                    state_root: roots.state_root,
+                    validator_set_root: roots.validator_set_root,
+                    value_hash: value_block.compute_value_hash(projected_state.total_supply),
+                    total_supply: projected_state.total_supply,
+                    epoch_record,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    };
+    if started_without_state_commitment_v2 {
+        state.state_commitment_v2 = None;
+    }
+    projected
 }
 
 fn apply_block_inner(
@@ -1643,9 +1697,10 @@ mod tests {
     ) -> StateResult<OracleOutcome> {
         let mut scratch = pre_state.clone();
         let epoch_record = apply_block(&mut scratch, block, timestamp_secs)?;
+        let roots = crate::state_root::compute_state_roots(&scratch);
         Ok(OracleOutcome {
-            state_root: crate::state_root::compute_state_root(&scratch),
-            validator_set_root: crate::state_root::compute_validator_set_root(&scratch),
+            state_root: roots.state_root,
+            validator_set_root: roots.validator_set_root,
             value_hash: block.compute_value_hash(scratch.total_supply),
             state: scratch,
             epoch_record,
@@ -1659,9 +1714,10 @@ mod tests {
     ) -> StateResult<OracleOutcome> {
         let mut state = pre_state.clone();
         let epoch_record = apply_block(&mut state, block, timestamp_secs)?;
+        let roots = crate::state_root::compute_state_roots(&state);
         Ok(OracleOutcome {
-            state_root: crate::state_root::compute_state_root(&state),
-            validator_set_root: crate::state_root::compute_validator_set_root(&state),
+            state_root: roots.state_root,
+            validator_set_root: roots.validator_set_root,
             value_hash: block.compute_value_hash(state.total_supply),
             state,
             epoch_record,
@@ -1673,7 +1729,10 @@ mod tests {
             .expect("clone-atomic reference apply must succeed");
         let candidate = undo_apply_block_outcome(pre_state, block, timestamp_secs)
             .expect("undo apply must succeed");
-        assert_eq!(candidate.state.encode_to_vec(), reference.state.encode_to_vec());
+        assert_eq!(
+            candidate.state.encode_to_vec(),
+            reference.state.encode_to_vec()
+        );
         assert_eq!(candidate.state_root, reference.state_root);
         assert_eq!(candidate.validator_set_root, reference.validator_set_root);
         assert_eq!(candidate.value_hash, reference.value_hash);
@@ -1738,7 +1797,13 @@ mod tests {
             total_stake: 100_000,
         });
         state.governance.proposals.insert(proposal_id, proposal);
-        (state, proposer_pubkey, proposer_keypair, proposer_id, proposal_id)
+        (
+            state,
+            proposer_pubkey,
+            proposer_keypair,
+            proposer_id,
+            proposal_id,
+        )
     }
 
     fn assert_all_failpoints_roll_back(state: &ChainState, block: &BlockV1) -> usize {
@@ -1767,7 +1832,215 @@ mod tests {
         mutation_count
     }
 
+    fn empty_block_at(state: &ChainState, height: u64, timestamp: u64) -> BlockV1 {
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
+                height,
+                prev_hash: state.tip_hash,
+                timestamp,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: state.base_fee,
+                proposer_round: 0,
+                polc_round: indra_core::types::block::NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::ZERO,
+                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                election_result_hash: None,
+            },
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            vrf_reveals: vec![],
+        }
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn project_block_for_roots_matches_clone_projection() {
+        let mut cases: Vec<(String, ChainState, BlockV1, u64)> = Vec::new();
+
+        let empty_state = ChainState::new_genesis();
+        cases.push((
+            "empty".into(),
+            empty_state.clone(),
+            make_block(&empty_state, vec![]),
+            0,
+        ));
+
+        let (tx_state, utxo_id, keypair, blinding, value) = state_with_utxo();
+        let tx = make_tx(
+            &tx_state,
+            &keypair,
+            utxo_id,
+            value,
+            blinding,
+            Bytes32::from([0xA1; 32]),
+        );
+        cases.push((
+            "transaction".into(),
+            tx_state.clone(),
+            make_block(&tx_state, vec![tx]),
+            0,
+        ));
+
+        let mut staking_state = ChainState::new_genesis();
+        let (staking_op, _) = signed_register_validator_op(&mut staking_state, [0x61; 32], 1);
+        let mut staking_block = make_block(&staking_state, vec![]);
+        staking_block.staking_ops.push(staking_op);
+        cases.push(("staking".into(), staking_state, staking_block, 0));
+
+        let mut governance_state = ChainState::new_genesis();
+        governance_state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair, proposer_id) =
+            install_governance_validator(&mut governance_state, [0x81; 32], 100_000);
+        let deposit = governance_state
+            .utxos
+            .insert(
+                governance_deposit_output(proposer_pubkey.clone(), 1_500),
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let governance_op = governance_propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey,
+            deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark { value: 100_000 },
+        );
+        let mut governance_block = make_block(&governance_state, vec![]);
+        governance_block.governance_ops.push(governance_op);
+        cases.push(("governance".into(), governance_state, governance_block, 0));
+
+        let (slash_state, validator_id, slash_keypair) =
+            slash_validator_state([0x62; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        let mut slash_block = make_block(&slash_state, vec![]);
+        slash_block.slashing_evidence.push(slash_evidence(
+            &slash_keypair,
+            validator_id,
+            VoteStep::Precommit,
+        ));
+        cases.push(("slashing".into(), slash_state, slash_block, 0));
+
+        let mut epoch_state = ChainState::new_genesis();
+        epoch_state.height = EPOCH_DURATION_BLOCKS - 1;
+        let epoch_block = make_block(&epoch_state, vec![]);
+        assert!(is_epoch_boundary(epoch_block.header.height));
+        cases.push(("epoch-boundary".into(), epoch_state, epoch_block, 123_456));
+
+        for (label, state, block, timestamp_secs) in cases {
+            let reference =
+                clone_atomic_reference_apply_block(&state, &block, timestamp_secs).unwrap();
+            let mut projected_state = state.clone();
+            let projected =
+                project_block_for_roots(&mut projected_state, &block, timestamp_secs).unwrap();
+            assert_eq!(projected.state_root, reference.state_root, "{label}");
+            assert_eq!(
+                projected.validator_set_root, reference.validator_set_root,
+                "{label}"
+            );
+            let mut reference_block = block.clone();
+            reference_block.header.state_root = reference.state_root;
+            reference_block.header.validator_set_root = reference.validator_set_root;
+            assert_eq!(
+                projected.value_hash,
+                reference_block.compute_value_hash(reference.state.total_supply),
+                "{label}"
+            );
+            assert_eq!(
+                projected.total_supply, reference.state.total_supply,
+                "{label}"
+            );
+            assert_eq!(projected.epoch_record, reference.epoch_record, "{label}");
+            assert_same_consensus_state(&projected_state, &state);
+            assert_eq!(
+                projected_state.state_commitment_v2.is_some(),
+                state.state_commitment_v2.is_some(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_block_for_roots_restores_state_on_success() {
+        let mut state = ChainState::new_genesis();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        state.state_commitment_v2 = None;
+        let original = state.clone();
+        let block = empty_block_at(&state, u64::MAX, 0);
+
+        let projected = project_block_for_roots(&mut state, &block, 0).unwrap();
+        assert_ne!(projected.state_root, Bytes32::ZERO);
+        assert_same_consensus_state(&state, &original);
+        assert!(
+            state.state_commitment_v2.is_none(),
+            "projection must not leave behind a warmed StateCommitmentV2 cache"
+        );
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn project_block_for_roots_restores_state_on_apply_failure() {
+        let state = ChainState::new_genesis();
+        let mut block = make_block(&state, vec![]);
+        block.header.prev_hash = Bytes32::from([0xEE; 32]);
+        let reference_err = clone_atomic_reference_apply_block(&state, &block, 0).unwrap_err();
+
+        let mut projected_state = state.clone();
+        let projected_err = project_block_for_roots(&mut projected_state, &block, 0).unwrap_err();
+        assert_eq!(projected_err.to_string(), reference_err.to_string());
+        assert_same_consensus_state(&projected_state, &state);
+        assert_eq!(
+            projected_state.state_commitment_v2.is_some(),
+            state.state_commitment_v2.is_some()
+        );
+    }
+
+    #[test]
+    fn project_block_for_roots_failpoint_rollback_covers_each_mutation() {
+        let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            value,
+            blinding,
+            Bytes32::from([0xC1; 32]),
+        );
+        let block = make_block(&state, vec![tx]);
+
+        crate::txn::set_fail_after_mutation(None);
+        let mut success_state = state.clone();
+        project_block_for_roots(&mut success_state, &block, 0).unwrap();
+        let mutation_count = crate::txn::mutation_count();
+        assert!(mutation_count > 0);
+
+        for fail_after in 1..=mutation_count {
+            crate::txn::set_fail_after_mutation(Some(fail_after));
+            let mut candidate = state.clone();
+            let err = project_block_for_roots(&mut candidate, &block, 0).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("state transaction failpoint injected after mutation"),
+                "unexpected error at failpoint {fail_after}: {err}"
+            );
+            assert_same_consensus_state(&candidate, &state);
+            assert_eq!(
+                candidate.state_commitment_v2.is_some(),
+                state.state_commitment_v2.is_some()
+            );
+        }
+        crate::txn::set_fail_after_mutation(None);
+    }
 
     #[test]
     fn state_txn_rolls_back_after_each_transaction_mutation_failpoint() {
@@ -1896,8 +2169,14 @@ mod tests {
                 },
             );
         reveal_state.governance.gov_nonces.insert(proposer_id, 1);
-        let reveal_op =
-            governance_reveal_op(proposer_id, &proposer_keypair, proposal_id, 1, vote_nonce, 2);
+        let reveal_op = governance_reveal_op(
+            proposer_id,
+            &proposer_keypair,
+            proposal_id,
+            1,
+            vote_nonce,
+            2,
+        );
         let mut reveal_block = make_block(&reveal_state, vec![]);
         reveal_block.governance_ops.push(reveal_op);
         let reveal_count = assert_all_failpoints_roll_back(&reveal_state, &reveal_block);
@@ -1981,10 +2260,9 @@ mod tests {
         let mut rolled_back = state.clone();
         crate::txn::set_fail_after_mutation(Some(1));
         let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("state transaction failpoint injected after mutation")
-        );
+        assert!(err
+            .to_string()
+            .contains("state transaction failpoint injected after mutation"));
         assert_same_consensus_state(&rolled_back, &state);
         let rollback_root = rolled_back.state_commitment_v2_root(block.header.height);
         rolled_back.rebuild_state_commitment_v2(block.header.height);
@@ -2045,9 +2323,11 @@ mod tests {
         let (slash_state, validator_id, slash_keypair) =
             slash_validator_state([0xB4; 32], MINIMUM_VALIDATOR_BOND_SPARK);
         let mut slash_block = make_block(&slash_state, vec![]);
-        slash_block
-            .slashing_evidence
-            .push(slash_evidence(&slash_keypair, validator_id, VoteStep::Precommit));
+        slash_block.slashing_evidence.push(slash_evidence(
+            &slash_keypair,
+            validator_id,
+            VoteStep::Precommit,
+        ));
         assert_oracle_matches(&slash_state, &slash_block, 0);
 
         let mut epoch_state = ChainState::new_genesis();
@@ -2116,7 +2396,8 @@ mod tests {
             let block = make_block(&reference, vec![]);
             if target_epoch == 2 {
                 let vote_nonce = Bytes32::from([0xC2; 32]);
-                let commit_hash = governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
+                let commit_hash =
+                    governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
                 if let Some(proposal) = reference.governance.proposals.get_mut(&proposal_id) {
                     proposal.commits.insert(
                         proposer_id,
@@ -2160,8 +2441,8 @@ mod tests {
                     );
                 }
             }
-            let outcome = clone_atomic_reference_apply_block(&reference, &block, target_epoch)
-                .unwrap();
+            let outcome =
+                clone_atomic_reference_apply_block(&reference, &block, target_epoch).unwrap();
             reference = outcome.state;
             apply_block(&mut candidate, &block, target_epoch).unwrap();
             assert_same_consensus_state(&candidate, &reference);
@@ -2266,6 +2547,83 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "realistic production/reproposal projection benchmark; run explicitly with --ignored --nocapture"]
+    fn project_block_for_roots_realistic_projection_benchmark() {
+        use std::time::Instant;
+
+        fn realistic_state(staked_bonds: usize) -> ChainState {
+            let mut state = ChainState::new_genesis();
+            let validator_id = Bytes32::from([0x75; 32]);
+            let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
+            let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
+            for index in 0..staked_bonds {
+                let mut id_bytes = [0u8; 32];
+                for (dst, src) in id_bytes
+                    .iter_mut()
+                    .zip((index as u64).to_le_bytes().into_iter())
+                {
+                    *dst = src;
+                }
+                let utxo_id = Bytes32::from(id_bytes);
+                let output = OutputV1 {
+                    value_spark: 1_000,
+                    commitment: CommitmentV1 {
+                        compressed_point: Bytes32::from([0x77; 32]),
+                    },
+                    owner_pubkey: HybridPubKey {
+                        classical_pk: Bytes32::from([0x88; 32]),
+                        pq_pk: pq_pk.clone(),
+                    },
+                    range_proof: range_proof.clone(),
+                    lock_height: 0,
+                };
+                state.staked_bonds.insert(
+                    utxo_id,
+                    StakeBondEntry {
+                        utxo_id,
+                        validator_id,
+                        delegator_id: Bytes32::from([0x66; 32]),
+                        amount_spark: 1_000,
+                        bonded_epoch: 0,
+                        unbonding_end_epoch: None,
+                        original_output: output,
+                    },
+                );
+            }
+            state
+        }
+
+        for size in [100_000usize, 1_000_000usize] {
+            let mut state = realistic_state(size);
+            let block = make_block(&state, vec![]);
+
+            let start = Instant::now();
+            let mut clone_projection = state.clone();
+            apply_block(&mut clone_projection, &block, 0).unwrap();
+            let state_root = crate::state_root::compute_state_root(&clone_projection);
+            let validator_set_root =
+                crate::state_root::compute_validator_set_root(&clone_projection);
+            let mut clone_projected_block = block.clone();
+            clone_projected_block.header.state_root = state_root;
+            clone_projected_block.header.validator_set_root = validator_set_root;
+            let clone_value_hash =
+                clone_projected_block.compute_value_hash(clone_projection.total_supply);
+            let clone_projection_elapsed = start.elapsed();
+
+            let start = Instant::now();
+            let projected = project_block_for_roots(&mut state, &block, 0).unwrap();
+            let rollback_projection_elapsed = start.elapsed();
+
+            assert_eq!(projected.state_root, state_root);
+            assert_eq!(projected.validator_set_root, validator_set_root);
+            assert_eq!(projected.value_hash, clone_value_hash);
+            println!(
+                "project_block_for_roots_realistic_projection size={size} clone_based_projection={clone_projection_elapsed:?} rollback_projection={rollback_projection_elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "max-cap StateTxn stress benchmark; run explicitly with --ignored --nocapture"]
     fn state_txn_stress_max_op_caps_applies_and_rolls_back() {
         use std::time::Instant;
@@ -2279,7 +2637,12 @@ mod tests {
             let value = TEST_INPUT_VALUE + seed as u64 + 10_000;
             let utxo_id = state
                 .utxos
-                .insert(output_with_value(value, tx_owner_pubkey.clone(), seed), 0, 0, index as u32)
+                .insert(
+                    output_with_value(value, tx_owner_pubkey.clone(), seed),
+                    0,
+                    0,
+                    index as u32,
+                )
                 .unwrap();
             multi_inputs.push((utxo_id, value, [seed; 32], Bytes32::from([seed; 32])));
         }
@@ -2443,10 +2806,9 @@ mod tests {
         let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
         let rollback_elapsed = start.elapsed();
         let rollback_txn_timing = crate::txn::timing();
-        assert!(
-            err.to_string()
-                .contains("state transaction failpoint injected after mutation")
-        );
+        assert!(err
+            .to_string()
+            .contains("state transaction failpoint injected after mutation"));
         assert_same_consensus_state(&rolled_back, &state);
         crate::txn::set_fail_after_mutation(None);
 

@@ -225,7 +225,7 @@ fn mempool_to_block_pipeline() {
         vrf_reveals: vec![],
     };
 
-    let block = produce_block(&template, &state, &mempool, &election).unwrap();
+    let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
     assert_eq!(block.transactions.len(), 5);
     assert_eq!(block.header.height, 1);
 }

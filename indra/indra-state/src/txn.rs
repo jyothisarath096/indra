@@ -258,8 +258,7 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn add_slash_accounting(&mut self, amount: u64) -> StateResult<()> {
         self.record_scalars();
         self.state.epoch_slashed_spark = self.state.epoch_slashed_spark.saturating_add(amount);
-        self.state.epoch_slash_event_count =
-            self.state.epoch_slash_event_count.saturating_add(1);
+        self.state.epoch_slash_event_count = self.state.epoch_slash_event_count.saturating_add(1);
         self.after_mutation()
     }
 

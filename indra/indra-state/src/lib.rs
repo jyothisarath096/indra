@@ -51,7 +51,7 @@ pub(crate) mod txn;
 pub mod utxo;
 pub mod validator;
 
-pub use apply::apply_block;
+pub use apply::{apply_block, project_block_for_roots, ProjectedBlockRoots};
 pub use chain::ChainState;
 pub use delegation::apply_staking_op;
 pub use epoch::apply_epoch_transition;
@@ -65,7 +65,7 @@ pub use smt::{
     CompressedProofStep, MerkleProof, ProofTerminal, SparseMerkleTree, SMT_DEPTH,
 };
 pub use state_commitment::StateCommitmentV2;
-pub use state_root::{compute_state_root, compute_validator_set_root};
+pub use state_root::{compute_state_root, compute_state_roots, compute_validator_set_root};
 pub use utxo::{UtxoEntry, UtxoSet};
 pub use validator::{DelegationReturnEvent, DelegationReturnReason, DelegatorEntry};
 pub use validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};

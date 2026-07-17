@@ -20,11 +20,31 @@ use indra_crypto::sha256;
 
 use crate::ChainState;
 
+/// Root values computed from the same post-state snapshot.
+///
+/// `state_root` commits to the UTXO root, nullifier root, validator/staking
+/// root, and chain metadata. `validator_set_root` is exposed alongside it so
+/// block-header callers do not need to recompute the expensive validator/
+/// delegation/staking commitment a second time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputedStateRoots {
+    /// Full combined state root.
+    pub state_root: Bytes32,
+    /// Validator/delegation/staking commitment included inside `state_root`.
+    pub validator_set_root: Bytes32,
+}
+
 /// Compute the full state root for the given chain state.
 pub fn compute_state_root(state: &ChainState) -> Bytes32 {
+    compute_state_roots(state).state_root
+}
+
+/// Compute the full state root and the validator/delegation commitment in one
+/// pass.
+pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
     let utxo_root = state.utxos.root_at_height(state.height);
     let nullifier_root = state.nullifiers.root_at_height(state.height);
-    let validator_root = compute_validator_set_root(state);
+    let validator_set_root = compute_validator_set_root(state);
 
     let chain_id = VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
         .unwrap_or_default();
@@ -42,9 +62,12 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
     let mut combined = Vec::with_capacity(128);
     combined.extend_from_slice(&utxo_root);
     combined.extend_from_slice(&nullifier_root);
-    combined.extend_from_slice(&validator_root.0);
+    combined.extend_from_slice(&validator_set_root.0);
     combined.extend_from_slice(&metadata_hash);
-    Bytes32::from(sha256(&combined))
+    ComputedStateRoots {
+        state_root: Bytes32::from(sha256(&combined)),
+        validator_set_root,
+    }
 }
 
 /// Compute the validator/delegation commitment.
@@ -252,7 +275,8 @@ mod tests {
     use indra_crypto::sha256;
 
     use crate::validator::{
-        DelegationReturnEvent, DelegationReturnReason, ValidatorEntry, ValidatorStatus,
+        DelegationReturnEvent, DelegationReturnReason, DelegatorEntry, StakeBondEntry,
+        ValidatorEntry, ValidatorStatus,
     };
     use crate::StateCommitmentV2;
 
@@ -363,6 +387,112 @@ mod tests {
         let _ = state.utxos.insert(dummy_output(0x20), 1, 0, 0);
         let root1 = compute_state_root(&state);
         assert_ne!(root0, root1);
+    }
+
+    #[test]
+    fn compute_state_roots_matches_legacy_separate_calls() {
+        let empty = ChainState::new_genesis();
+        let empty_roots = compute_state_roots(&empty);
+        assert_eq!(empty_roots.state_root, compute_state_root(&empty));
+        assert_eq!(
+            empty_roots.validator_set_root,
+            compute_validator_set_root(&empty)
+        );
+
+        let mut small = ChainState::new_genesis();
+        small.height = REGISTERED_VALIDATOR_CAP_HEIGHT;
+        let validator = validator_fixture();
+        let validator_id = validator.validator_id;
+        small.validators.upsert(validator).unwrap();
+        small
+            .delegations
+            .add_delegation(validator_id, Bytes32::from([0xD1; 32]), 42_000, 3)
+            .unwrap();
+        small.staking_nonces.insert(Bytes32::from([0xD2; 32]), 7);
+        small.staked_bonds.insert(
+            Bytes32::from([0xD3; 32]),
+            StakeBondEntry {
+                utxo_id: Bytes32::from([0xD3; 32]),
+                validator_id,
+                delegator_id: Bytes32::from([0xD1; 32]),
+                amount_spark: 42_000,
+                bonded_epoch: 3,
+                unbonding_end_epoch: None,
+                original_output: dummy_output(0xD4),
+            },
+        );
+        small.applied_slash_hashes.insert(Bytes32::from([0xD5; 32]));
+        small.push_delegation_return_event(DelegationReturnEvent {
+            delegator_id: Bytes32::from([0xD1; 32]),
+            validator_id,
+            bond_utxo_id: Bytes32::from([0xD3; 32]),
+            amount_spark: 1,
+            reason: DelegationReturnReason::ValidatorEvicted,
+            returned_epoch: 4,
+            returned_height: small.height,
+            refund_utxo_id: Bytes32::from([0xD6; 32]),
+        });
+        let small_roots = compute_state_roots(&small);
+        assert_eq!(small_roots.state_root, compute_state_root(&small));
+        assert_eq!(
+            small_roots.validator_set_root,
+            compute_validator_set_root(&small)
+        );
+
+        let mut realistic = ChainState::new_genesis();
+        realistic.height = REGISTERED_VALIDATOR_CAP_HEIGHT;
+        let validator = validator_fixture();
+        let validator_id = validator.validator_id;
+        realistic.validators.upsert(validator).unwrap();
+        let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
+        let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
+        for index in 0..512u64 {
+            let mut id_bytes = [0u8; 32];
+            for (dst, src) in id_bytes.iter_mut().zip(index.to_le_bytes().into_iter()) {
+                *dst = src;
+            }
+            let utxo_id = Bytes32::from(id_bytes);
+            let delegator_id = Bytes32::from(sha256(&id_bytes));
+            realistic.delegations.push_delegator_for_test(
+                validator_id,
+                DelegatorEntry {
+                    delegator_id,
+                    staked_spark: 1_000,
+                    pending_rewards: index,
+                    rewards_last_epoch: 0,
+                    unbonding_end_epoch: None,
+                },
+            );
+            realistic.staked_bonds.insert(
+                utxo_id,
+                StakeBondEntry {
+                    utxo_id,
+                    validator_id,
+                    delegator_id,
+                    amount_spark: 1_000,
+                    bonded_epoch: 0,
+                    unbonding_end_epoch: None,
+                    original_output: OutputV1 {
+                        value_spark: 1_000,
+                        commitment: CommitmentV1 {
+                            compressed_point: Bytes32::from([0x77; 32]),
+                        },
+                        owner_pubkey: HybridPubKey {
+                            classical_pk: Bytes32::from([0x88; 32]),
+                            pq_pk: pq_pk.clone(),
+                        },
+                        range_proof: range_proof.clone(),
+                        lock_height: 0,
+                    },
+                },
+            );
+        }
+        let realistic_roots = compute_state_roots(&realistic);
+        assert_eq!(realistic_roots.state_root, compute_state_root(&realistic));
+        assert_eq!(
+            realistic_roots.validator_set_root,
+            compute_validator_set_root(&realistic)
+        );
     }
 
     #[test]

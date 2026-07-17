@@ -34,7 +34,7 @@ use indra_storage::{BlockStore, StateStore};
 
 use crate::{
     error::{NodeError, NodeResult},
-    state_root::{compute_state_root, compute_validator_set_root},
+    state_root::compute_state_roots,
 };
 
 /// Maximum blocks to request in one sync batch.
@@ -266,20 +266,27 @@ fn validate_and_apply_imported_block(
     }
 
     let projection = project_and_verify_block_state_root(block, state, timestamp_secs)?;
+    #[cfg(debug_assertions)]
     let verified_state_root = projection.state_root;
+    #[cfg(debug_assertions)]
     let verified_validator_set_root = projection.validator_set_root;
+    #[cfg(debug_assertions)]
     let verified_value_hash = projection.value_hash;
     let epoch_record = projection.epoch_record;
     *state = projection.state;
-    debug_assert_eq!(compute_state_root(state), verified_state_root);
-    debug_assert_eq!(
-        compute_validator_set_root(state),
-        verified_validator_set_root
-    );
-    debug_assert_eq!(
-        block.compute_value_hash(state.total_supply),
-        verified_value_hash
-    );
+    #[cfg(debug_assertions)]
+    {
+        let committed_roots = compute_state_roots(state);
+        debug_assert_eq!(committed_roots.state_root, verified_state_root);
+        debug_assert_eq!(
+            committed_roots.validator_set_root,
+            verified_validator_set_root
+        );
+        debug_assert_eq!(
+            block.compute_value_hash(state.total_supply),
+            verified_value_hash
+        );
+    }
 
     // Evict spent transactions from mempool after the verified projection has
     // become the real state.
@@ -721,26 +728,25 @@ pub(crate) fn project_and_verify_block_state_root(
         }
     })?;
 
-    let actual_state_root = compute_state_root(&projected);
-    if actual_state_root != expected_state_root {
+    let actual_roots = compute_state_roots(&projected);
+    if actual_roots.state_root != expected_state_root {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
                 "state_root mismatch: expected {}, got {}",
                 hex::encode(expected_state_root.0),
-                hex::encode(actual_state_root.0),
+                hex::encode(actual_roots.state_root.0),
             ),
         });
     }
 
-    let actual_validator_root = compute_validator_set_root(&projected);
-    if actual_validator_root != expected_validator_root {
+    if actual_roots.validator_set_root != expected_validator_root {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
                 "validator_set_root mismatch: expected {}, got {}",
                 hex::encode(expected_validator_root.0),
-                hex::encode(actual_validator_root.0),
+                hex::encode(actual_roots.validator_set_root.0),
             ),
         });
     }
@@ -764,8 +770,8 @@ pub(crate) fn project_and_verify_block_state_root(
     Ok(VerifiedBlockProjection {
         state: projected,
         epoch_record,
-        state_root: actual_state_root,
-        validator_set_root: actual_validator_root,
+        state_root: actual_roots.state_root,
+        validator_set_root: actual_roots.validator_set_root,
         value_hash: actual_value_hash,
     })
 }
@@ -792,18 +798,19 @@ mod tests {
                 BLOCK_PROTOCOL_VERSION_REVEAL_SET, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
                 MAX_VRF_PROOF_BYTES,
             },
+            transaction::OutputV1,
             vote::VoteStep,
             vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
         },
-        Bytes32, ProtocolVersion, QuorumCertificateV1, VariableBytes,
+        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, QuorumCertificateV1, VariableBytes,
     };
     use indra_crypto::{
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
         VrfKeypair,
     };
     use indra_state::{
-        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
-        ValidatorStatus,
+        apply_block, compute_state_root, compute_state_roots, compute_validator_set_root,
+        validator::StakeBondEntry, ValidatorEntry, ValidatorStatus,
     };
     use indra_storage::StateStore;
     use std::path::PathBuf;
@@ -936,7 +943,14 @@ mod tests {
             election_result: None,
             vrf_reveals: vec![],
         };
-        produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
+        let mut projection_state = state.clone();
+        produce_block(
+            &template,
+            &mut projection_state,
+            &Mempool::default_config(),
+            &election,
+        )
+        .unwrap()
     }
 
     fn make_reveal_set_block(
@@ -1037,8 +1051,9 @@ mod tests {
         if state.height.saturating_add(1) == block.header.height {
             let mut projected = state.clone();
             apply_block(&mut projected, &block, 0).unwrap();
-            block.header.state_root = compute_state_root(&projected);
-            block.header.validator_set_root = compute_validator_set_root(&projected);
+            let roots = compute_state_roots(&projected);
+            block.header.state_root = roots.state_root;
+            block.header.validator_set_root = roots.validator_set_root;
             block.header.value_hash = block.compute_value_hash(projected.total_supply);
         }
         block
@@ -1109,8 +1124,9 @@ mod tests {
 
         let mut projected = state.clone();
         apply_block(&mut projected, &block, 0).unwrap();
-        block.header.state_root = compute_state_root(&projected);
-        block.header.validator_set_root = compute_validator_set_root(&projected);
+        let roots = compute_state_roots(&projected);
+        block.header.state_root = roots.state_root;
+        block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }
@@ -1229,6 +1245,120 @@ mod tests {
                 &hybrid,
                 hybrid.public_key().pq.0.to_vec(),
                 10_000,
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_import_projection_roots_match_old_two_call_reference() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x71, 10_000, true, true);
+        let mut prev_qc = Vec::new();
+
+        for _ in 0..4 {
+            let block = make_strict_block(&state, 0x71, 0, prev_qc.clone());
+            let mut old_reference = state.clone();
+            let old_epoch_record = apply_block(&mut old_reference, &block, 1_900_000_000).unwrap();
+            let old_state_root = compute_state_root(&old_reference);
+            let old_validator_set_root = compute_validator_set_root(&old_reference);
+            let old_value_hash = block.compute_value_hash(old_reference.total_supply);
+
+            let optimized =
+                project_and_verify_block_state_root(&block, &state, 1_900_000_000).unwrap();
+            assert_eq!(optimized.epoch_record, old_epoch_record);
+            assert_eq!(optimized.state, old_reference);
+            assert_eq!(optimized.state_root, old_state_root);
+            assert_eq!(optimized.validator_set_root, old_validator_set_root);
+            assert_eq!(optimized.value_hash, old_value_hash);
+
+            state = optimized.state;
+            prev_qc = build_qc_bytes(
+                block.header.height,
+                block.header.proposer_round,
+                block.header.block_hash(),
+                validator_id,
+                &hybrid,
+                hybrid.public_key().pq.0.to_vec(),
+                10_000,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "realistic live-import root verification benchmark; run explicitly with --ignored --nocapture"]
+    fn project_and_verify_block_state_root_realistic_benchmark() {
+        use std::time::Instant;
+
+        fn realistic_state(staked_bonds: usize) -> ChainState {
+            let mut state = ChainState::new_genesis();
+            let validator_id = Bytes32::from([0x75; 32]);
+            let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
+            let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
+            for index in 0..staked_bonds {
+                let mut id_bytes = [0u8; 32];
+                for (dst, src) in id_bytes
+                    .iter_mut()
+                    .zip((index as u64).to_le_bytes().into_iter())
+                {
+                    *dst = src;
+                }
+                let utxo_id = Bytes32::from(id_bytes);
+                state.staked_bonds.insert(
+                    utxo_id,
+                    StakeBondEntry {
+                        utxo_id,
+                        validator_id,
+                        delegator_id: Bytes32::from([0x66; 32]),
+                        amount_spark: 1_000,
+                        bonded_epoch: 0,
+                        unbonding_end_epoch: None,
+                        original_output: OutputV1 {
+                            value_spark: 1_000,
+                            commitment: CommitmentV1 {
+                                compressed_point: Bytes32::from([0x77; 32]),
+                            },
+                            owner_pubkey: HybridPubKey {
+                                classical_pk: Bytes32::from([0x88; 32]),
+                                pq_pk: pq_pk.clone(),
+                            },
+                            range_proof: range_proof.clone(),
+                            lock_height: 0,
+                        },
+                    },
+                );
+            }
+            state
+        }
+
+        for size in [100_000usize, 1_000_000usize] {
+            let state = realistic_state(size);
+            let mut block = make_block(&state);
+            let mut expected_projection = state.clone();
+            apply_block(&mut expected_projection, &block, 0).unwrap();
+            let expected_roots = compute_state_roots(&expected_projection);
+            block.header.state_root = expected_roots.state_root;
+            block.header.validator_set_root = expected_roots.validator_set_root;
+            block.header.value_hash = block.compute_value_hash(expected_projection.total_supply);
+
+            let start = Instant::now();
+            let mut old_projection = state.clone();
+            let old_epoch_record = apply_block(&mut old_projection, &block, 0).unwrap();
+            let old_state_root = compute_state_root(&old_projection);
+            let old_validator_set_root = compute_validator_set_root(&old_projection);
+            let old_value_hash = block.compute_value_hash(old_projection.total_supply);
+            let old_elapsed = start.elapsed();
+
+            let start = Instant::now();
+            let optimized = project_and_verify_block_state_root(&block, &state, 0).unwrap();
+            let optimized_elapsed = start.elapsed();
+
+            assert_eq!(optimized.epoch_record, old_epoch_record);
+            assert_eq!(optimized.state, old_projection);
+            assert_eq!(optimized.state_root, old_state_root);
+            assert_eq!(optimized.validator_set_root, old_validator_set_root);
+            assert_eq!(optimized.value_hash, old_value_hash);
+            println!(
+                "project_and_verify_block_state_root_realistic size={size} old_two_call={old_elapsed:?} optimized_paired={optimized_elapsed:?}"
             );
         }
     }
@@ -2129,8 +2259,9 @@ mod tests {
             VariableBytes::from_slice(&transition_qc).unwrap();
         let mut projected = state.clone();
         apply_block(&mut projected, &post_activation, 0).unwrap();
-        post_activation.header.state_root = compute_state_root(&projected);
-        post_activation.header.validator_set_root = compute_validator_set_root(&projected);
+        let roots = compute_state_roots(&projected);
+        post_activation.header.state_root = roots.state_root;
+        post_activation.header.validator_set_root = roots.validator_set_root;
         post_activation.header.value_hash =
             post_activation.compute_value_hash(projected.total_supply);
         assert_eq!(post_activation.header.height, 5400);

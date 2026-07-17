@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS};
-use indra_state::{compute_state_root, compute_validator_set_root, ChainState};
+use indra_state::{compute_state_roots, ChainState};
 
 use crate::atomic::{crc32, write_atomic_synced};
 use crate::error::{StorageError, StorageResult};
@@ -85,11 +85,12 @@ impl StateStore {
         snapshot_bytes.extend_from_slice(&state_bytes);
         write_atomic_synced(&tmp_path, &final_path, &snapshot_bytes)?;
 
+        let roots = compute_state_roots(state);
         let meta = SnapshotMeta {
             height,
             block_hash: state.tip_hash,
-            state_root: compute_state_root(state),
-            validator_set_root: compute_validator_set_root(state),
+            state_root: roots.state_root,
+            validator_set_root: roots.validator_set_root,
             chain_id: state.chain_id.clone(),
             checksum: crc32(&snapshot_bytes),
         };
@@ -350,25 +351,24 @@ impl StateStore {
                 ),
             });
         }
-        let state_root = compute_state_root(state);
-        if meta.state_root != state_root {
+        let roots = compute_state_roots(state);
+        if meta.state_root != roots.state_root {
             return Err(StorageError::SnapshotRootMismatch {
                 height: state.height,
                 detail: format!(
                     "state root meta {} actual {}",
                     hex_bytes(&meta.state_root.0),
-                    hex_bytes(&state_root.0)
+                    hex_bytes(&roots.state_root.0)
                 ),
             });
         }
-        let validator_root = compute_validator_set_root(state);
-        if meta.validator_set_root != validator_root {
+        if meta.validator_set_root != roots.validator_set_root {
             return Err(StorageError::SnapshotRootMismatch {
                 height: state.height,
                 detail: format!(
                     "validator root meta {} actual {}",
                     hex_bytes(&meta.validator_set_root.0),
-                    hex_bytes(&validator_root.0)
+                    hex_bytes(&roots.validator_set_root.0)
                 ),
             });
         }
@@ -653,11 +653,12 @@ mod tests {
     }
 
     fn write_snapshot_meta(dir: &Path, state: &ChainState, snapshot_bytes: &[u8]) {
+        let roots = compute_state_roots(state);
         let meta = SnapshotMeta {
             height: state.height,
             block_hash: state.tip_hash,
-            state_root: compute_state_root(state),
-            validator_set_root: compute_validator_set_root(state),
+            state_root: roots.state_root,
+            validator_set_root: roots.validator_set_root,
             chain_id: state.chain_id.clone(),
             checksum: crc32(snapshot_bytes),
         };
@@ -952,8 +953,9 @@ mod tests {
 
         let mut projected = state.clone();
         apply_block(&mut projected, &block, 0).unwrap();
-        block.header.state_root = compute_state_root(&projected);
-        block.header.validator_set_root = compute_validator_set_root(&projected);
+        let roots = compute_state_roots(&projected);
+        block.header.state_root = roots.state_root;
+        block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }

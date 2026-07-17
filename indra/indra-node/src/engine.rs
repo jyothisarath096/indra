@@ -595,13 +595,14 @@ impl NodeEngine {
             "[proposer] producing block at height={} round={}",
             proposal_height, election.round
         );
-        produce_block(&template, &self.state, &self.mempool, election).map_err(NodeError::Consensus)
+        produce_block(&template, &mut self.state, &self.mempool, election)
+            .map_err(NodeError::Consensus)
     }
 
     /// Re-propose an already validated value in a later round while keeping
     /// its stable consensus value hash unchanged.
     pub fn repropose(
-        &self,
+        &mut self,
         original_block: &BlockV1,
         new_round: u32,
         valid_round: Option<u32>,
@@ -630,7 +631,7 @@ impl NodeEngine {
     /// re-proposals, preserving the same single-authority proposer identity
     /// rule across fresh proposals and re-proposals.
     pub fn repropose_with_election_result(
-        &self,
+        &mut self,
         original_block: &BlockV1,
         new_round: u32,
         valid_round: Option<u32>,
@@ -744,9 +745,8 @@ impl NodeEngine {
             vrf_reveals,
         };
 
-        let mut projected = self.state.clone();
-        indra_state::apply_block(&mut projected, &block, 0)?;
-        let expected_value_hash = block.compute_value_hash(projected.total_supply);
+        let projected = indra_state::project_block_for_roots(&mut self.state, &block, 0)?;
+        let expected_value_hash = projected.value_hash;
         if expected_value_hash != original_block.header.value_hash {
             return Err(NodeError::BlockInvalid {
                 height: block.header.height,
@@ -1373,9 +1373,10 @@ mod tests {
             election_result: None,
             vrf_reveals: vec![],
         };
+        let mut projection_state = state.clone();
         produce_block(
             &template,
-            state,
+            &mut projection_state,
             &indra_consensus::mempool::Mempool::default_config(),
             &election,
         )

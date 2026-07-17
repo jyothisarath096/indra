@@ -3192,8 +3192,7 @@ mod tests {
         VrfKeypair,
     };
     use indra_state::{
-        apply_block, compute_state_root, compute_validator_set_root, ChainState, ValidatorEntry,
-        ValidatorStatus,
+        apply_block, compute_state_roots, ChainState, ValidatorEntry, ValidatorStatus,
     };
     use std::{
         cmp::Ordering,
@@ -3240,8 +3239,9 @@ mod tests {
 
         let mut projected = state.clone();
         apply_block(&mut projected, &block, 0).unwrap();
-        block.header.state_root = compute_state_root(&projected);
-        block.header.validator_set_root = compute_validator_set_root(&projected);
+        let roots = compute_state_roots(&projected);
+        block.header.state_root = roots.state_root;
+        block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }
@@ -3545,8 +3545,9 @@ mod tests {
 
         let mut projected = driver.engine.state.clone();
         apply_block(&mut projected, &block, 0).unwrap();
-        block.header.state_root = compute_state_root(&projected);
-        block.header.validator_set_root = compute_validator_set_root(&projected);
+        let roots = compute_state_roots(&projected);
+        block.header.state_root = roots.state_root;
+        block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
         block
     }
@@ -3563,8 +3564,9 @@ mod tests {
         block.header.quorum_certificate = VariableBytes::from_slice(&parent_qc).unwrap();
         let mut projected = driver.engine.state.clone();
         apply_block(&mut projected, block, 0).unwrap();
-        block.header.state_root = compute_state_root(&projected);
-        block.header.validator_set_root = compute_validator_set_root(&projected);
+        let roots = compute_state_roots(&projected);
+        block.header.state_root = roots.state_root;
+        block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
     }
 
@@ -3745,9 +3747,10 @@ mod tests {
             election_result: None,
             vrf_reveals: vec![],
         };
+        let mut projection_state = driver.engine.state.clone();
         produce_block(
             &template,
-            &driver.engine.state,
+            &mut projection_state,
             &driver.engine.mempool,
             &election,
         )
@@ -6238,7 +6241,7 @@ mod tests {
         };
         let block = produce_block(
             &template,
-            &driver.engine.state,
+            &mut driver.engine.state,
             &driver.engine.mempool,
             &election,
         )
@@ -6323,7 +6326,7 @@ mod tests {
 
         produce_block(
             &template,
-            &driver.engine.state,
+            &mut driver.engine.state,
             &driver.engine.mempool,
             &election,
         )
@@ -8978,6 +8981,64 @@ mod tests {
 
         assert_eq!(proposal.header.value_hash, reproposed.header.value_hash);
         assert_ne!(proposal.header.block_hash(), reproposed.header.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repropose_matches_clone_based_reference() {
+        let (mut driver, dir) = local_driver([0x78u8; 32], "repropose_clone_reference");
+        let _local = install_active_validator(&mut driver, [0x78u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        let height = driver.engine.state.height + 1;
+        let election_round_zero = election_for_round(&driver, height, 0);
+        let proposal = driver
+            .engine
+            .propose(
+                &election_round_zero,
+                1_700_000_001,
+                driver.last_qc_bytes(),
+                None,
+                None,
+                vec![],
+            )
+            .expect("initial proposal should succeed");
+
+        let election_round_one = ProposerElection {
+            epoch_seed: election_round_zero.epoch_seed,
+            height,
+            round: 1,
+            candidates: election_round_zero.candidates.clone(),
+        };
+        let pre_state = driver.engine.state.clone();
+        let reproposed = driver
+            .engine
+            .repropose(
+                &proposal,
+                1,
+                Some(0),
+                &election_round_one,
+                proposal.header.timestamp,
+                driver.last_qc_bytes(),
+                None,
+                vec![],
+            )
+            .expect("reproposal should succeed");
+
+        let mut clone_reference = pre_state.clone();
+        apply_block(&mut clone_reference, &reproposed, 0).unwrap();
+        assert_eq!(
+            reproposed.header.value_hash,
+            reproposed.compute_value_hash(clone_reference.total_supply)
+        );
+        assert_eq!(proposal.header.value_hash, reproposed.header.value_hash);
+        assert_eq!(reproposed.header.proposer_round, 1);
+        assert_eq!(reproposed.header.polc_round, 0);
+        assert_eq!(
+            driver.engine.state, pre_state,
+            "reproposal projection must roll back and leave real engine state untouched"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

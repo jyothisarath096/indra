@@ -29,7 +29,7 @@ use indra_core::types::{
     vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
 };
 use indra_crypto::VrfKeypair;
-use indra_state::{apply_block, compute_state_root, compute_validator_set_root, ChainState};
+use indra_state::{project_block_for_roots, ChainState};
 
 use crate::{
     error::{ConsensusError, ConsensusResult},
@@ -81,7 +81,7 @@ pub struct BlockTemplate {
 /// It has NOT been applied to state yet.
 pub fn produce_block(
     template: &BlockTemplate,
-    state: &ChainState,
+    state: &mut ChainState,
     mempool: &Mempool,
     election: &ProposerElection,
 ) -> ConsensusResult<BlockV1> {
@@ -246,13 +246,13 @@ pub fn produce_block(
         },
     };
 
-    let mut projected = state.clone();
-    apply_block(&mut projected, &block, 0).map_err(|err| ConsensusError::CryptoError {
-        detail: format!("failed to project roots for produced block: {err}"),
-    })?;
-    block.header.state_root = compute_state_root(&projected);
-    block.header.validator_set_root = compute_validator_set_root(&projected);
-    block.header.value_hash = block.compute_value_hash(projected.total_supply);
+    let projected =
+        project_block_for_roots(state, &block, 0).map_err(|err| ConsensusError::CryptoError {
+            detail: format!("failed to project roots for produced block: {err}"),
+        })?;
+    block.header.state_root = projected.state_root;
+    block.header.validator_set_root = projected.validator_set_root;
+    block.header.value_hash = projected.value_hash;
 
     Ok(block)
 }
@@ -278,7 +278,7 @@ mod tests {
     use crate::mempool::Mempool;
     use indra_core::types::primitives::hard_forks::REVEAL_SET_COMMITMENT_HEIGHT;
     use indra_crypto::VrfKeypair;
-    use indra_state::ChainState;
+    use indra_state::{apply_block, state_root, ChainState};
 
     fn make_election(
         seed: &[u8; 32],
@@ -328,9 +328,43 @@ mod tests {
         .hash()
     }
 
+    fn assert_produced_block_matches_clone_projection(block: &BlockV1, pre_state: &ChainState) {
+        let mut projected_candidate = block.clone();
+        projected_candidate.header.state_root = Bytes32::ZERO;
+        projected_candidate.header.validator_set_root = Bytes32::ZERO;
+        projected_candidate.header.value_hash = Bytes32::ZERO;
+
+        let mut scratch = pre_state.clone();
+        apply_block(&mut scratch, &projected_candidate, 0).unwrap();
+        let roots = state_root::compute_state_roots(&scratch);
+        assert_eq!(block.header.state_root, roots.state_root);
+        assert_eq!(block.header.validator_set_root, roots.validator_set_root);
+        projected_candidate.header.state_root = block.header.state_root;
+        projected_candidate.header.validator_set_root = block.header.validator_set_root;
+        assert_eq!(
+            block.header.value_hash,
+            projected_candidate.compute_value_hash(scratch.total_supply)
+        );
+    }
+
+    fn clone_reference_block_from_produced(produced: &BlockV1, pre_state: &ChainState) -> BlockV1 {
+        let mut reference = produced.clone();
+        reference.header.state_root = Bytes32::ZERO;
+        reference.header.validator_set_root = Bytes32::ZERO;
+        reference.header.value_hash = Bytes32::ZERO;
+
+        let mut scratch = pre_state.clone();
+        apply_block(&mut scratch, &reference, 0).unwrap();
+        let roots = state_root::compute_state_roots(&scratch);
+        reference.header.state_root = roots.state_root;
+        reference.header.validator_set_root = roots.validator_set_root;
+        reference.header.value_hash = reference.compute_value_hash(scratch.total_supply);
+        reference
+    }
+
     #[test]
     fn produce_empty_block() {
-        let state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x42u8; 32];
         let election = make_election(&seed, 1, 0, seed, 1_000_000);
@@ -349,7 +383,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.header.prev_hash, state.tip_hash);
         assert_eq!(block.transactions.len(), 0);
@@ -357,7 +391,7 @@ mod tests {
 
     #[test]
     fn block_header_commits_to_election_result_hash() {
-        let state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x43u8; 32];
         let election = make_election(&seed, 1, 0, seed, 1_000_000);
@@ -376,7 +410,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
         let original_hash = block.header.block_hash();
         let mut tampered = block.header.clone();
         tampered.election_result_hash = Some(Bytes32::from([0x44; 32]));
@@ -387,7 +421,7 @@ mod tests {
 
     #[test]
     fn wrong_proposer_rejected() {
-        let state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x42u8; 32];
         let wrong_seed = [0x99u8; 32];
@@ -409,7 +443,7 @@ mod tests {
         };
 
         assert!(matches!(
-            produce_block(&template, &state, &mempool, &election),
+            produce_block(&template, &mut state, &mempool, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "local VRF key is not in election candidates"
         ));
@@ -455,7 +489,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
 
         assert_eq!(
             block.header.election_result_hash,
@@ -530,7 +564,7 @@ mod tests {
         };
 
         assert!(matches!(
-            produce_block(&template, &state, &mempool, &election),
+            produce_block(&template, &mut state, &mempool, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "authoritative election result does not match proposer slot"
         ));
@@ -575,7 +609,7 @@ mod tests {
             vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0xCD; 80]).unwrap(),
         }];
         assert!(matches!(
-            produce_block(&mismatched_evidence, &state, &mempool, &election),
+            produce_block(&mismatched_evidence, &mut state, &mempool, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "authoritative reveal-set commitment does not match proposal evidence"
         ));
@@ -584,7 +618,7 @@ mod tests {
         mismatched_hash.vrf_reveals = vec![];
         mismatched_hash.election_result_hash = Some(Bytes32::from([0xEF; 32]));
         assert!(matches!(
-            produce_block(&mismatched_hash, &state, &mempool, &election),
+            produce_block(&mismatched_hash, &mut state, &mempool, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "provided election_result_hash disagrees with authoritative result"
         ));
@@ -593,7 +627,7 @@ mod tests {
         missing_result.election_result_hash = None;
         missing_result.election_result = None;
         assert!(matches!(
-            produce_block(&missing_result, &state, &mempool, &election),
+            produce_block(&missing_result, &mut state, &mempool, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "missing authoritative election result after reveal-set activation"
         ));
@@ -601,7 +635,7 @@ mod tests {
 
     #[test]
     fn block_height_increments() {
-        let state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis();
         let mempool = Mempool::default_config();
         let seed = [0x10u8; 32];
         let election = make_election(&seed, 1, 0, seed, 1_000_000);
@@ -618,7 +652,76 @@ mod tests {
             election_result: None,
             vrf_reveals: vec![],
         };
-        let block = produce_block(&template, &state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
         assert_eq!(block.header.height, state.height + 1);
+    }
+
+    #[test]
+    fn produce_block_matches_clone_based_reference() {
+        let mut state = ChainState::new_genesis();
+        let original = state.clone();
+        let mempool = Mempool::default_config();
+        let seed = [0x6Au8; 32];
+        let election = make_election(&seed, 1, 0, seed, 1_000_000);
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+            epoch_seed: Bytes32::from(seed),
+            prev_qc_bytes: vec![],
+            timestamp: 1_700_000_001,
+            polc_round: None,
+            slash_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            election_result_hash: Some(election_hash_for(&election, seed)),
+            election_result: None,
+            vrf_reveals: vec![],
+        };
+
+        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+        assert_produced_block_matches_clone_projection(&block, &original);
+        assert_eq!(
+            block,
+            clone_reference_block_from_produced(&block, &original)
+        );
+        assert_eq!(
+            state, original,
+            "production projection must roll back and leave real state untouched"
+        );
+    }
+
+    #[test]
+    fn production_replay_determinism_matches_reference() {
+        let mut new_state = ChainState::new_genesis();
+        let mut reference_state = new_state.clone();
+        let mempool = Mempool::default_config();
+
+        for (index, seed_byte) in [0x70u8, 0x71, 0x72].into_iter().enumerate() {
+            let seed = [seed_byte; 32];
+            let height = new_state.height + 1;
+            let election = make_election(&seed, height, 0, seed, 1_000_000);
+            let template = BlockTemplate {
+                proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+                epoch_seed: Bytes32::from(seed),
+                prev_qc_bytes: vec![],
+                timestamp: 1_700_000_001 + index as u64,
+                polc_round: None,
+                slash_evidence: vec![],
+                governance_ops: vec![],
+                staking_ops: vec![],
+                election_result_hash: Some(election_hash_for(&election, seed)),
+                election_result: None,
+                vrf_reveals: vec![],
+            };
+
+            let produced = produce_block(&template, &mut new_state, &mempool, &election).unwrap();
+            let reference = clone_reference_block_from_produced(&produced, &reference_state);
+            assert_eq!(
+                produced, reference,
+                "candidate block mismatch at step {index}"
+            );
+            apply_block(&mut new_state, &produced, 0).unwrap();
+            apply_block(&mut reference_state, &reference, 0).unwrap();
+            assert_eq!(new_state, reference_state, "state mismatch at step {index}");
+        }
     }
 }

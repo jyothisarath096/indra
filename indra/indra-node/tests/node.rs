@@ -112,7 +112,14 @@ fn make_strict_block(
         election_result: None,
         vrf_reveals: vec![],
     };
-    produce_block(&template, state, &Mempool::default_config(), &election).unwrap()
+    let mut projection_state = state.clone();
+    produce_block(
+        &template,
+        &mut projection_state,
+        &Mempool::default_config(),
+        &election,
+    )
+    .unwrap()
 }
 
 async fn write_plain_msg<W>(writer: &mut W, msg: &Message)
