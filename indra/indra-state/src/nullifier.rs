@@ -194,6 +194,7 @@ impl NullifierSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT;
     use indra_crypto::sha256;
 
     fn nullifier(seed: u8) -> Bytes32 {
@@ -306,15 +307,23 @@ mod tests {
         let present = nullifier(0x35);
         set.insert(present);
 
-        assert_eq!(set.root_at_height(u64::MAX - 1), set.root());
+        assert!(
+            COMPRESSED_AUTH_TREE_HEIGHT > 0,
+            "this test needs a pre-activation height; update it if compressed auth trees activate at genesis"
+        );
+        let pre_activation_height = COMPRESSED_AUTH_TREE_HEIGHT - 1;
+
+        assert_eq!(set.root_at_height(pre_activation_height), set.root());
         assert!(matches!(
-            set.prove_at_height(&present, u64::MAX - 1),
+            set.prove_at_height(&present, pre_activation_height),
             AuthTreeProof::V1LegacySparse(_)
         ));
 
-        let compressed_root = set.root_at_height(u64::MAX);
+        let compressed_root = set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT);
         assert_ne!(compressed_root, set.root());
-        let AuthTreeProof::V2Compressed(proof) = set.prove_at_height(&present, u64::MAX) else {
+        let AuthTreeProof::V2Compressed(proof) =
+            set.prove_at_height(&present, COMPRESSED_AUTH_TREE_HEIGHT)
+        else {
             panic!("expected compressed proof at activation");
         };
         assert!(CompressedAuthTree::verify_proof(

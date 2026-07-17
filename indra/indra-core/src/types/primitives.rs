@@ -500,12 +500,13 @@ pub mod hard_forks {
     /// deterministically from them on startup/snapshot load.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
-    /// with no per-chain-ID differentiation. It is intentionally unscheduled
-    /// until a coordinated deployment height is chosen. Before building mainnet
-    /// genesis, this MUST be deliberately reset (almost certainly to 0 if the
-    /// rule should be active from mainnet's first block). It will NOT
-    /// automatically differ between testnet and mainnet.
-    pub const STATE_COMMITMENT_V2_HEIGHT: u64 = u64::MAX;
+    /// with no per-chain-ID differentiation. It currently holds a testnet-
+    /// specific activation height chosen for this already-running testnet's
+    /// coordinated deployment. Before building mainnet genesis, this MUST be
+    /// deliberately reset (almost certainly to 0 if the rule should be active
+    /// from mainnet's first block). It will NOT automatically differ between
+    /// testnet and mainnet.
+    pub const STATE_COMMITMENT_V2_HEIGHT: u64 = 120_000;
 
     /// Compressed authenticated tree for UTXO/nullifier roots and versioned proofs.
     ///
@@ -513,16 +514,17 @@ pub mod hard_forks {
     /// fixed-depth SMT to the compressed authenticated tree. This is separate
     /// from `STATE_COMMITMENT_V2_HEIGHT` because UTXO/nullifier roots are
     /// already-live consensus commitments with a different readiness/rollback
-    /// profile from the still-unscheduled validator/delegation/staking
-    /// commitment.
+    /// profile from the validator/delegation/staking commitment. This testnet
+    /// activation deliberately sets both heights to the same value.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
-    /// with no per-chain-ID differentiation. It is intentionally unscheduled
-    /// until a coordinated deployment height is chosen. Before building mainnet
-    /// genesis, this MUST be deliberately reset (almost certainly to 0 if the
-    /// rule should be active from mainnet's first block). It will NOT
-    /// automatically differ between testnet and mainnet.
-    pub const COMPRESSED_AUTH_TREE_HEIGHT: u64 = u64::MAX;
+    /// with no per-chain-ID differentiation. It currently holds a testnet-
+    /// specific activation height chosen for this already-running testnet's
+    /// coordinated deployment. Before building mainnet genesis, this MUST be
+    /// deliberately reset (almost certainly to 0 if the rule should be active
+    /// from mainnet's first block). It will NOT automatically differ between
+    /// testnet and mainnet.
+    pub const COMPRESSED_AUTH_TREE_HEIGHT: u64 = 120_000;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.

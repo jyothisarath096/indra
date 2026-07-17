@@ -384,7 +384,8 @@ impl UtxoSet {
 mod tests {
     use super::*;
     use indra_core::{
-        types::transaction::OutputV1, Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
+        types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT, types::transaction::OutputV1,
+        Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
 
     fn dummy_output(byte: u8) -> OutputV1 {
@@ -507,15 +508,23 @@ mod tests {
         let mut set = UtxoSet::new();
         let id = set.insert(dummy_output(0x12), 2, 1, 0).unwrap();
 
-        assert_eq!(set.root_at_height(u64::MAX - 1), set.root());
+        assert!(
+            COMPRESSED_AUTH_TREE_HEIGHT > 0,
+            "this test needs a pre-activation height; update it if compressed auth trees activate at genesis"
+        );
+        let pre_activation_height = COMPRESSED_AUTH_TREE_HEIGHT - 1;
+
+        assert_eq!(set.root_at_height(pre_activation_height), set.root());
         assert!(matches!(
-            set.prove_at_height(&id, u64::MAX - 1),
+            set.prove_at_height(&id, pre_activation_height),
             AuthTreeProof::V1LegacySparse(_)
         ));
 
-        let compressed_root = set.root_at_height(u64::MAX);
+        let compressed_root = set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT);
         assert_ne!(compressed_root, set.root());
-        let AuthTreeProof::V2Compressed(proof) = set.prove_at_height(&id, u64::MAX) else {
+        let AuthTreeProof::V2Compressed(proof) =
+            set.prove_at_height(&id, COMPRESSED_AUTH_TREE_HEIGHT)
+        else {
             panic!("expected compressed proof at activation");
         };
         assert!(CompressedAuthTree::verify_proof(
