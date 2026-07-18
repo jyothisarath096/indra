@@ -718,9 +718,10 @@ fn apply_undelegate(
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
 
-    let bond = state
+    let mut bond = state
         .staked_bonds
-        .get_mut(&bond_utxo_id)
+        .get(&bond_utxo_id)
+        .cloned()
         .ok_or_else(|| StateError::InvalidStakingOp("stake bond not found".into()))?;
     if bond.delegator_id != delegator_id {
         return Err(StateError::InvalidStakingOp(
@@ -743,6 +744,9 @@ fn apply_undelegate(
     bond.unbonding_end_epoch = Some(unbonding_end);
     let amount_spark = bond.amount_spark;
     let updated_bond = bond.clone();
+    state
+        .staked_bonds
+        .insert(bond_utxo_id, updated_bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
     }
@@ -864,9 +868,10 @@ fn apply_self_unstake(
         return Err(StateError::ValidatorNotActive);
     }
 
-    let bond = state
+    let mut bond = state
         .staked_bonds
-        .get_mut(&bond_utxo_id)
+        .get(&bond_utxo_id)
+        .cloned()
         .ok_or_else(|| StateError::InvalidStakingOp("self-stake bond not found".into()))?;
     if bond.delegator_id != validator_id {
         return Err(StateError::InvalidStakingOp(
@@ -889,6 +894,9 @@ fn apply_self_unstake(
     let amount_spark = bond.amount_spark;
     bond.unbonding_end_epoch = Some(unbonding_end);
     let updated_bond = bond.clone();
+    state
+        .staked_bonds
+        .insert(bond_utxo_id, updated_bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
     }

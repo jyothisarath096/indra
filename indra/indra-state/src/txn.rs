@@ -5,7 +5,7 @@
 //! and block production; those callers still need a separate projected state
 //! before committing candidate roots to their real state.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 #[cfg(test)]
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use crate::{
     chain::ChainState,
     error::StateResult,
     governance::GovernanceState,
+    persistent::PersistentOrdMap,
     utxo::{UtxoEntry, UtxoSet},
     validator::{DelegationMap, DelegationReturnEvent, StakeBondEntry, ValidatorSet},
 };
@@ -44,8 +45,8 @@ enum UndoEntry {
     NullifierInserted(Bytes32),
     Validators(ValidatorSet),
     Delegations(DelegationMap),
-    StakedBonds(BTreeMap<Bytes32, StakeBondEntry>),
-    StakingNonces(BTreeMap<Bytes32, u64>),
+    StakedBonds(PersistentOrdMap<Bytes32, StakeBondEntry>),
+    StakingNonces(PersistentOrdMap<Bytes32, u64>),
     SlashHashes(HashSet<Bytes32>),
     Governance(GovernanceState),
     Utxos(UtxoSet),
@@ -290,6 +291,9 @@ impl<'a> StateTxn<'a> {
 
     fn snapshot_staked_bonds(&mut self) {
         if !self.staked_bonds_recorded {
+            // `PersistentOrdMap::clone()` is an O(1) root-handle copy; the
+            // coarse staking snapshot remains the same rollback boundary, but
+            // no longer deep-copies every bonded position.
             let snapshot = measure_undo_recording(|| self.state.staked_bonds.clone());
             self.undo.push(UndoEntry::StakedBonds(snapshot));
             self.staked_bonds_recorded = true;
@@ -298,6 +302,7 @@ impl<'a> StateTxn<'a> {
 
     fn snapshot_staking_nonces(&mut self) {
         if !self.staking_nonces_recorded {
+            // `PersistentOrdMap::clone()` is an O(1) root-handle copy.
             let snapshot = measure_undo_recording(|| self.state.staking_nonces.clone());
             self.undo.push(UndoEntry::StakingNonces(snapshot));
             self.staking_nonces_recorded = true;
@@ -473,4 +478,85 @@ pub(crate) fn reset_timing() {
 #[cfg(test)]
 pub(crate) fn timing() -> StateTxnTiming {
     TIMING.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indra_core::{
+        types::{crypto::HybridPubKey, primitives::VariableBytes},
+        CommitmentV1,
+    };
+
+    fn test_output(byte: u8) -> OutputV1 {
+        OutputV1 {
+            value_spark: 1_000_000,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from([byte; 32]),
+            },
+            owner_pubkey: HybridPubKey {
+                classical_pk: Bytes32::from([byte; 32]),
+                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            },
+            range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn test_bond(byte: u8) -> StakeBondEntry {
+        StakeBondEntry {
+            utxo_id: Bytes32::from([byte; 32]),
+            validator_id: Bytes32::from([0xA0 | byte; 32]),
+            delegator_id: Bytes32::from([0xD0 | byte; 32]),
+            amount_spark: 1_000_000,
+            bonded_epoch: 7,
+            unbonding_end_epoch: None,
+            original_output: test_output(byte),
+        }
+    }
+
+    #[test]
+    fn persistent_bond_and_nonce_snapshots_restore_after_failpoint() {
+        let mut state = ChainState::new_genesis();
+        let original_bond = test_bond(0x01);
+        let original_bond_id = original_bond.utxo_id;
+        state
+            .staked_bonds
+            .insert(original_bond_id, original_bond.clone());
+        state.staking_nonces.insert(Bytes32::from([0x11; 32]), 7);
+        let original = state.clone();
+
+        set_fail_after_mutation(Some(1));
+        {
+            let mut txn = StateTxn::begin(&mut state, 1);
+            txn.snapshot_staking_scope();
+            txn.state_mut().staked_bonds.remove(&original_bond_id);
+            txn.state_mut()
+                .staked_bonds
+                .insert(Bytes32::from([0x02; 32]), test_bond(0x02));
+            txn.state_mut()
+                .staking_nonces
+                .insert(Bytes32::from([0x11; 32]), 8);
+            txn.state_mut()
+                .staking_nonces
+                .insert(Bytes32::from([0x22; 32]), 1);
+            assert!(txn.after_mutation().is_err());
+        }
+        set_fail_after_mutation(None);
+
+        assert_eq!(state, original);
+        assert_eq!(
+            state.staked_bonds.get(&original_bond_id),
+            Some(&original_bond)
+        );
+        assert_eq!(
+            state.staking_nonces.get(&Bytes32::from([0x11; 32])),
+            Some(&7)
+        );
+        assert!(state.staked_bonds.get(&Bytes32::from([0x02; 32])).is_none());
+        assert!(state
+            .staking_nonces
+            .get(&Bytes32::from([0x22; 32]))
+            .is_none());
+    }
 }

@@ -6,7 +6,7 @@
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use indra_core::types::primitives::{
     state_commitment_v2_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK,
@@ -16,6 +16,7 @@ use indra_core::types::primitives::{
 use crate::{
     governance::GovernanceState,
     nullifier::NullifierSet,
+    persistent::PersistentOrdMap,
     state_commitment::StateCommitmentV2,
     utxo::UtxoSet,
     validator::{
@@ -97,10 +98,10 @@ pub struct ChainState {
     pub delegations: DelegationMap,
 
     /// Stake bonds: UTXOs locked as delegation stake.
-    pub staked_bonds: BTreeMap<Bytes32, StakeBondEntry>,
+    pub staked_bonds: PersistentOrdMap<Bytes32, StakeBondEntry>,
 
     /// Monotonic nonces for staking op replay protection.
-    pub staking_nonces: BTreeMap<Bytes32, u64>,
+    pub staking_nonces: PersistentOrdMap<Bytes32, u64>,
 
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
@@ -251,8 +252,8 @@ impl ChainState {
             nullifiers: NullifierSet::new(),
             validators: ValidatorSet::new(),
             delegations: DelegationMap::new(),
-            staked_bonds: BTreeMap::new(),
-            staking_nonces: BTreeMap::new(),
+            staked_bonds: PersistentOrdMap::new(),
+            staking_nonces: PersistentOrdMap::new(),
             applied_slash_hashes: HashSet::new(),
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -415,7 +416,7 @@ fn decode_hash_set(r: &mut ByteReader<'_>, field: &'static str) -> IndraResult<H
     Ok(hashes)
 }
 
-fn encode_bond_map(bonds: &BTreeMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
+fn encode_bond_map(bonds: &PersistentOrdMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
     (bonds.len() as u32).encode(buf);
     for (utxo_id, bond) in bonds {
         utxo_id.encode(buf);
@@ -423,17 +424,19 @@ fn encode_bond_map(bonds: &BTreeMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>)
     }
 }
 
-fn bond_map_encoded_len(bonds: &BTreeMap<Bytes32, StakeBondEntry>) -> usize {
+fn bond_map_encoded_len(bonds: &PersistentOrdMap<Bytes32, StakeBondEntry>) -> usize {
     4 + bonds
         .iter()
         .map(|(utxo_id, bond)| utxo_id.encoded_len() + bond.encoded_len())
         .sum::<usize>()
 }
 
-fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, StakeBondEntry>> {
+fn decode_bond_map(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<PersistentOrdMap<Bytes32, StakeBondEntry>> {
     let count = u32::decode(r)? as usize;
     validate_bond_map_count(count)?;
-    let mut bonds = BTreeMap::new();
+    let mut bonds = PersistentOrdMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let bond = StakeBondEntry::decode(r)?;
@@ -453,10 +456,10 @@ fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, Stak
 
 fn decode_bond_map_legacy(
     r: &mut ByteReader<'_>,
-) -> IndraResult<BTreeMap<Bytes32, StakeBondEntry>> {
+) -> IndraResult<PersistentOrdMap<Bytes32, StakeBondEntry>> {
     let count = u32::decode(r)? as usize;
     validate_bond_map_count(count)?;
-    let mut bonds = BTreeMap::new();
+    let mut bonds = PersistentOrdMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
         let bond = StakeBondEntry::decode_legacy(r)?;
@@ -487,7 +490,7 @@ fn validate_bond_map_count(count: usize) -> IndraResult<()> {
     Ok(())
 }
 
-fn encode_nonce_map(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
+fn encode_nonce_map(nonces: &PersistentOrdMap<Bytes32, u64>, buf: &mut Vec<u8>) {
     (nonces.len() as u32).encode(buf);
     for (signer_id, nonce) in nonces {
         signer_id.encode(buf);
@@ -495,14 +498,14 @@ fn encode_nonce_map(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
     }
 }
 
-fn nonce_map_encoded_len(nonces: &BTreeMap<Bytes32, u64>) -> usize {
+fn nonce_map_encoded_len(nonces: &PersistentOrdMap<Bytes32, u64>) -> usize {
     4 + nonces.len() * (32 + 8)
 }
 
-fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, u64>> {
+fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<PersistentOrdMap<Bytes32, u64>> {
     let count = u32::decode(r)? as usize;
     validate_nonce_map_count(count)?;
-    let mut nonces = BTreeMap::new();
+    let mut nonces = PersistentOrdMap::new();
     for _ in 0..count {
         let signer_id = Bytes32::decode(r)?;
         let nonce = u64::decode(r)?;
@@ -529,6 +532,8 @@ fn validate_nonce_map_count(count: usize) -> IndraResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use indra_core::{
         codec::Encode,
         error::IndraError,
@@ -594,6 +599,22 @@ mod tests {
         }
     }
 
+    fn encode_bond_map_btree(bonds: &BTreeMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
+        (bonds.len() as u32).encode(buf);
+        for (utxo_id, bond) in bonds {
+            utxo_id.encode(buf);
+            bond.encode(buf);
+        }
+    }
+
+    fn encode_nonce_map_btree(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
+        (nonces.len() as u32).encode(buf);
+        for (signer_id, nonce) in nonces {
+            signer_id.encode(buf);
+            nonce.encode(buf);
+        }
+    }
+
     #[test]
     fn staked_bond_decode_cap_is_derived_from_validator_delegator_caps() {
         let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(1_000);
@@ -639,7 +660,7 @@ mod tests {
 
     #[test]
     fn staked_bond_encode_decode_round_trip_uses_same_cap_path() {
-        let mut bonds = BTreeMap::new();
+        let mut bonds = PersistentOrdMap::new();
         let bond_a = test_bond(0x01);
         let bond_b = test_bond(0x02);
         bonds.insert(bond_a.utxo_id, bond_a);
@@ -649,6 +670,49 @@ mod tests {
         encode_bond_map(&bonds, &mut bytes);
         let decoded = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap();
         assert_eq!(decoded, bonds);
+    }
+
+    #[test]
+    fn staked_bond_persistent_encoding_matches_legacy_btree_encoding() {
+        let mut legacy = BTreeMap::new();
+        let mut persistent = PersistentOrdMap::new();
+        for byte in [0x03, 0x01, 0x02] {
+            let bond = test_bond(byte);
+            legacy.insert(bond.utxo_id, bond.clone());
+            persistent.insert(bond.utxo_id, bond);
+        }
+
+        let mut legacy_bytes = Vec::new();
+        encode_bond_map_btree(&legacy, &mut legacy_bytes);
+        let mut persistent_bytes = Vec::new();
+        encode_bond_map(&persistent, &mut persistent_bytes);
+        assert_eq!(persistent_bytes, legacy_bytes);
+
+        let mut state = ChainState::new_genesis();
+        state.staked_bonds = persistent;
+        let encoded = state.encode_to_vec();
+        let decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn staked_bond_persistent_encoding_is_insertion_order_independent() {
+        let mut forward = PersistentOrdMap::new();
+        let mut reverse = PersistentOrdMap::new();
+        for byte in [0x01, 0x02, 0x03, 0x04] {
+            let bond = test_bond(byte);
+            forward.insert(bond.utxo_id, bond);
+        }
+        for byte in [0x04, 0x03, 0x02, 0x01] {
+            let bond = test_bond(byte);
+            reverse.insert(bond.utxo_id, bond);
+        }
+
+        let mut forward_bytes = Vec::new();
+        encode_bond_map(&forward, &mut forward_bytes);
+        let mut reverse_bytes = Vec::new();
+        encode_bond_map(&reverse, &mut reverse_bytes);
+        assert_eq!(forward_bytes, reverse_bytes);
     }
 
     #[test]
@@ -698,14 +762,184 @@ mod tests {
 
     #[test]
     fn staking_nonce_encode_decode_round_trip_uses_same_cap_path() {
-        let nonces = BTreeMap::from([
-            (Bytes32::from([0xA1; 32]), 7),
-            (Bytes32::from([0xD1; 32]), 11),
-        ]);
+        let mut nonces = PersistentOrdMap::new();
+        nonces.insert(Bytes32::from([0xA1; 32]), 7);
+        nonces.insert(Bytes32::from([0xD1; 32]), 11);
 
         let mut bytes = Vec::new();
         encode_nonce_map(&nonces, &mut bytes);
         let decoded = decode_nonce_map(&mut ByteReader::new(&bytes)).unwrap();
         assert_eq!(decoded, nonces);
+    }
+
+    #[test]
+    fn staking_nonce_persistent_encoding_matches_legacy_btree_encoding() {
+        let legacy = BTreeMap::from([
+            (Bytes32::from([0xD1; 32]), 11),
+            (Bytes32::from([0xA1; 32]), 7),
+            (Bytes32::from([0xB1; 32]), 9),
+        ]);
+        let mut persistent = PersistentOrdMap::new();
+        for (key, value) in [
+            (Bytes32::from([0xD1; 32]), 11),
+            (Bytes32::from([0xA1; 32]), 7),
+            (Bytes32::from([0xB1; 32]), 9),
+        ] {
+            persistent.insert(key, value);
+        }
+
+        let mut legacy_bytes = Vec::new();
+        encode_nonce_map_btree(&legacy, &mut legacy_bytes);
+        let mut persistent_bytes = Vec::new();
+        encode_nonce_map(&persistent, &mut persistent_bytes);
+        assert_eq!(persistent_bytes, legacy_bytes);
+    }
+
+    #[test]
+    fn staking_nonce_persistent_encoding_is_insertion_order_independent() {
+        let mut forward = PersistentOrdMap::new();
+        let mut reverse = PersistentOrdMap::new();
+        for byte in [0x01, 0x02, 0x03, 0x04] {
+            forward.insert(Bytes32::from([byte; 32]), byte as u64);
+        }
+        for byte in [0x04, 0x03, 0x02, 0x01] {
+            reverse.insert(Bytes32::from([byte; 32]), byte as u64);
+        }
+
+        let mut forward_bytes = Vec::new();
+        encode_nonce_map(&forward, &mut forward_bytes);
+        let mut reverse_bytes = Vec::new();
+        encode_nonce_map(&reverse, &mut reverse_bytes);
+        assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    #[ignore = "release-mode Stage 2a field-clone benchmark; run explicitly with --release --ignored --nocapture"]
+    fn stage2a_persistent_bonds_and_nonces_clone_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        fn id_from_index(index: usize) -> Bytes32 {
+            let mut bytes = [0u8; 32];
+            for (dst, src) in bytes
+                .iter_mut()
+                .zip((index as u64).to_le_bytes().into_iter())
+            {
+                *dst = src;
+            }
+            Bytes32::from(bytes)
+        }
+
+        fn heavy_output(index: usize) -> OutputV1 {
+            let byte = (index as u8).wrapping_add(1);
+            OutputV1 {
+                value_spark: 1_000,
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::from([byte; 32]),
+                },
+                owner_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from([byte.wrapping_add(1); 32]),
+                    pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(2); 2_592]).unwrap(),
+                },
+                range_proof: VariableBytes::from_slice(&vec![byte.wrapping_add(3); 674]).unwrap(),
+                lock_height: 0,
+            }
+        }
+
+        fn heavy_bond(index: usize) -> StakeBondEntry {
+            let utxo_id = id_from_index(index);
+            StakeBondEntry {
+                utxo_id,
+                validator_id: Bytes32::from([0x55; 32]),
+                delegator_id: id_from_index(index + 1_000_000),
+                amount_spark: 1_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: heavy_output(index),
+            }
+        }
+
+        fn legacy_bonds(size: usize) -> BTreeMap<Bytes32, StakeBondEntry> {
+            let mut map = BTreeMap::new();
+            for index in 0..size {
+                let bond = heavy_bond(index);
+                map.insert(bond.utxo_id, bond);
+            }
+            map
+        }
+
+        fn persistent_bonds(size: usize) -> PersistentOrdMap<Bytes32, StakeBondEntry> {
+            let mut map = PersistentOrdMap::new();
+            for index in 0..size {
+                let bond = heavy_bond(index);
+                map.insert(bond.utxo_id, bond);
+            }
+            map
+        }
+
+        fn legacy_nonces(size: usize) -> BTreeMap<Bytes32, u64> {
+            let mut map = BTreeMap::new();
+            for index in 0..size {
+                map.insert(id_from_index(index), index as u64);
+            }
+            map
+        }
+
+        fn persistent_nonces(size: usize) -> PersistentOrdMap<Bytes32, u64> {
+            let mut map = PersistentOrdMap::new();
+            for index in 0..size {
+                map.insert(id_from_index(index), index as u64);
+            }
+            map
+        }
+
+        // This is intentionally ignored and release-only: debug timings for
+        // million-entry heavy bond maps are dominated by instrumentation and are
+        // not meaningful for validator deployment decisions.
+        for size in [100_000usize, 1_000_000usize] {
+            let legacy = legacy_bonds(size);
+            let start = Instant::now();
+            let legacy_clone = legacy.clone();
+            black_box(&legacy_clone);
+            let legacy_bond_clone = start.elapsed();
+            drop(legacy_clone);
+            drop(legacy);
+
+            let persistent = persistent_bonds(size);
+            let start = Instant::now();
+            let persistent_clone = persistent.clone();
+            black_box(&persistent_clone);
+            let persistent_bond_clone = start.elapsed();
+            drop(persistent_clone);
+            drop(persistent);
+
+            let legacy = legacy_nonces(size);
+            let start = Instant::now();
+            let legacy_clone = legacy.clone();
+            black_box(&legacy_clone);
+            let legacy_nonce_clone = start.elapsed();
+            drop(legacy_clone);
+            drop(legacy);
+
+            let persistent = persistent_nonces(size);
+            let start = Instant::now();
+            let persistent_clone = persistent.clone();
+            black_box(&persistent_clone);
+            let persistent_nonce_clone = start.elapsed();
+            drop(persistent_clone);
+            drop(persistent);
+
+            println!(
+                "stage2a_persistent_bonds_and_nonces_clone size={size} legacy_bonds_clone={legacy_bond_clone:?} persistent_bonds_clone={persistent_bond_clone:?} legacy_nonces_clone={legacy_nonce_clone:?} persistent_nonces_clone={persistent_nonce_clone:?}"
+            );
+
+            assert!(
+                persistent_bond_clone < legacy_bond_clone,
+                "persistent staked_bonds clone should be cheaper than legacy BTreeMap clone at size {size}"
+            );
+            assert!(
+                persistent_nonce_clone < legacy_nonce_clone,
+                "persistent staking_nonces clone should be cheaper than legacy BTreeMap clone at size {size}"
+            );
+        }
     }
 }

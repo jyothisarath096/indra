@@ -81,6 +81,11 @@ where
         None
     }
 
+    /// True if a key exists in the map.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
     /// Insert or replace a key/value pair.
     ///
     /// Returns the previous value when replacing an existing key.
@@ -120,9 +125,28 @@ where
         iter
     }
 
+    /// Iterate values in canonical key order.
+    pub fn values(&self) -> PersistentOrdMapValues<'_, K, V> {
+        PersistentOrdMapValues { inner: self.iter() }
+    }
+
     #[cfg(test)]
     fn root_arc(&self) -> Option<Arc<MapNode<K, V>>> {
         self.root.clone()
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for PersistentOrdMap<K, V>
+where
+    K: Ord + Clone,
+    V: Clone,
+{
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        let mut map = Self::new();
+        for (key, value) in iter {
+            map.insert(key, value);
+        }
+        map
     }
 }
 
@@ -147,6 +171,32 @@ impl<'a, K, V> Iterator for PersistentOrdMapIter<'a, K, V> {
         let node = self.stack.pop()?;
         self.push_left(node.right.as_deref());
         Some((&node.key, &node.value))
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a PersistentOrdMap<K, V>
+where
+    K: Ord + Clone,
+    V: Clone,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = PersistentOrdMapIter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Ordered values iterator.
+pub struct PersistentOrdMapValues<'a, K, V> {
+    inner: PersistentOrdMapIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for PersistentOrdMapValues<'a, K, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, value)| value)
     }
 }
 

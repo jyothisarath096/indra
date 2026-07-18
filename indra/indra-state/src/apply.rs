@@ -277,14 +277,15 @@ fn apply_slash_at_height_with_accounting(
     let mut total_bond_slashed: u64 = 0;
     let mut active_bond_slashed: u64 = 0;
     for bond_id in &bond_ids {
-        let updated_bond = if let Some(bond) = state.staked_bonds.get_mut(bond_id) {
+        let updated_bond = if let Some(mut bond) = state.staked_bonds.remove(bond_id) {
             let bond_slash = bps(bond.amount_spark, slash_bps);
             if bond.unbonding_end_epoch.is_none() {
                 active_bond_slashed = active_bond_slashed.saturating_add(bond_slash);
             }
             bond.amount_spark = bond.amount_spark.saturating_sub(bond_slash);
             total_bond_slashed = total_bond_slashed.saturating_add(bond_slash);
-            Some(bond.clone())
+            state.staked_bonds.insert(*bond_id, bond.clone());
+            Some(bond)
         } else {
             None
         };
