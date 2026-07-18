@@ -388,7 +388,8 @@ impl NodeEngine {
                 retained.push(op);
                 continue;
             }
-            match apply_governance_op(&mut scratch, &op, current_epoch, &chain_id) {
+            let current_height = scratch.height;
+            match apply_governance_op(&mut scratch, &op, current_epoch, current_height, &chain_id) {
                 Ok(()) => {
                     selected.push(op.clone());
                     retained.push(op);

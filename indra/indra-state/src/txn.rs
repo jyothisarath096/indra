@@ -194,7 +194,7 @@ impl<'a> StateTxn<'a> {
 
     /// Spend a UTXO with precise rollback.
     pub(crate) fn spend_utxo(&mut self, id: &Bytes32) -> StateResult<Option<UtxoEntry>> {
-        let removed = self.state.utxos.spend(id);
+        let removed = self.state.utxos.spend_at_height(id, self.height);
         if let Some(entry) = &removed {
             let entry = measure_undo_recording(|| entry.clone());
             self.undo.push(UndoEntry::UtxoSpent(entry));
@@ -222,7 +222,9 @@ impl<'a> StateTxn<'a> {
 
     /// Insert a nullifier with precise rollback.
     pub(crate) fn insert_nullifier(&mut self, nullifier: Bytes32) -> StateResult<()> {
-        self.state.nullifiers.insert_or_double_spend(nullifier)?;
+        self.state
+            .nullifiers
+            .insert_or_double_spend_at_height(nullifier, self.height)?;
         measure_undo_recording(|| self.undo.push(UndoEntry::NullifierInserted(nullifier)));
         self.after_mutation()
     }
@@ -358,12 +360,21 @@ impl<'a> StateTxn<'a> {
                     self.state.epoch_slashed_spark = snapshot.epoch_slashed_spark;
                     self.state.epoch_slash_event_count = snapshot.epoch_slash_event_count;
                 }
-                UndoEntry::UtxoSpent(entry) => self.state.utxos.restore_for_rollback(entry),
+                UndoEntry::UtxoSpent(entry) => self
+                    .state
+                    .utxos
+                    .restore_for_rollback_at_height(entry, self.height),
                 UndoEntry::UtxoInserted(id) => {
-                    let _ = self.state.utxos.remove_for_rollback(&id);
+                    let _ = self
+                        .state
+                        .utxos
+                        .remove_for_rollback_at_height(&id, self.height);
                 }
                 UndoEntry::NullifierInserted(nullifier) => {
-                    let _ = self.state.nullifiers.remove_for_rollback(&nullifier);
+                    let _ = self
+                        .state
+                        .nullifiers
+                        .remove_for_rollback_at_height(&nullifier, self.height);
                 }
                 UndoEntry::Validators(validators) => self.state.validators = validators,
                 UndoEntry::Delegations(delegations) => self.state.delegations = delegations,

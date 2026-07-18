@@ -12,7 +12,7 @@
 //! In-memory HashSet. Phase 5 replaces this with a persistent Merkle trie.
 //! The interface is unchanged.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
@@ -36,15 +36,17 @@ pub const MAX_NULLIFIERS_DECODE: usize = 1_000_000;
 #[derive(Debug, Clone, Default)]
 pub struct NullifierSet {
     spent: HashSet<Bytes32>,
-    smt: SparseMerkleTree,
+    smt: Arc<SparseMerkleTree>,
     compressed: CompressedAuthTree,
 }
 
 impl PartialEq for NullifierSet {
     fn eq(&self, other: &Self) -> bool {
-        self.spent == other.spent
-            && self.smt.root() == other.smt.root()
-            && self.compressed.root() == other.compressed.root()
+        // The legacy SMT is a derived pre-activation cache. At/after
+        // `COMPRESSED_AUTH_TREE_HEIGHT`, nullifier roots/proofs use the
+        // compressed tree, so post-activation snapshots may omit or freeze the
+        // legacy cache without changing consensus-visible state.
+        self.spent == other.spent && self.compressed.root() == other.compressed.root()
     }
 }
 
@@ -66,6 +68,18 @@ impl Encode for NullifierSet {
 
 impl Decode for NullifierSet {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Self::decode_at_height(r, 0)
+    }
+}
+
+impl NullifierSet {
+    /// Decode a nullifier set for a state snapshot at `height`.
+    ///
+    /// Pre-activation states rebuild the legacy SMT because their consensus root
+    /// still depends on it. Post-activation states intentionally skip rebuilding
+    /// that cold cache; roots/proofs use the compressed tree at and after
+    /// `COMPRESSED_AUTH_TREE_HEIGHT`.
+    pub fn decode_at_height(r: &mut ByteReader<'_>, height: u64) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
         if count > MAX_NULLIFIERS_DECODE {
             return Err(IndraError::LengthExceeded {
@@ -75,6 +89,7 @@ impl Decode for NullifierSet {
             });
         }
         let mut set = Self::new();
+        let update_legacy = should_update_legacy_smt(height);
         for _ in 0..count {
             let nullifier = Bytes32::decode(r)?;
             if !set.spent.insert(nullifier) {
@@ -82,19 +97,19 @@ impl Decode for NullifierSet {
                     field: "snapshot.nullifiers",
                 });
             }
-            set.smt.insert(nullifier.0, sha256(&nullifier.0));
+            if update_legacy {
+                Arc::make_mut(&mut set.smt).insert(nullifier.0, sha256(&nullifier.0));
+            }
         }
         set.rebuild_compressed_cache();
         Ok(set)
     }
-}
 
-impl NullifierSet {
     /// Create an empty nullifier set.
     pub fn new() -> Self {
         Self {
             spent: HashSet::new(),
-            smt: SparseMerkleTree::new(),
+            smt: Arc::new(SparseMerkleTree::new()),
             compressed: CompressedAuthTree::new(),
         }
     }
@@ -122,9 +137,16 @@ impl NullifierSet {
     /// Returns true if the nullifier was newly inserted.
     /// Returns false if it was already present (double-spend attempt).
     pub fn insert(&mut self, nullifier: Bytes32) -> bool {
+        self.insert_at_height(nullifier, 0)
+    }
+
+    /// Insert a nullifier at a specific resulting block height.
+    pub fn insert_at_height(&mut self, nullifier: Bytes32, height: u64) -> bool {
         let inserted = self.spent.insert(nullifier);
         if inserted {
-            self.smt.insert(nullifier.0, sha256(&nullifier.0));
+            if should_update_legacy_smt(height) {
+                Arc::make_mut(&mut self.smt).insert(nullifier.0, sha256(&nullifier.0));
+            }
             self.compressed.insert(nullifier.0, sha256(&nullifier.0));
         }
         inserted
@@ -137,16 +159,32 @@ impl NullifierSet {
         &mut self,
         nullifier: Bytes32,
     ) -> Result<(), crate::error::StateError> {
-        if !self.insert(nullifier) {
+        self.insert_or_double_spend_at_height(nullifier, 0)
+    }
+
+    /// Insert a nullifier at a specific resulting block height, returning an
+    /// error if it was already present.
+    pub fn insert_or_double_spend_at_height(
+        &mut self,
+        nullifier: Bytes32,
+        height: u64,
+    ) -> Result<(), crate::error::StateError> {
+        if !self.insert_at_height(nullifier, height) {
             return Err(crate::error::StateError::DoubleSpend);
         }
         Ok(())
     }
 
-    pub(crate) fn remove_for_rollback(&mut self, nullifier: &Bytes32) -> bool {
+    pub(crate) fn remove_for_rollback_at_height(
+        &mut self,
+        nullifier: &Bytes32,
+        height: u64,
+    ) -> bool {
         let removed = self.spent.remove(nullifier);
         if removed {
-            self.smt.delete(nullifier.0);
+            if should_update_legacy_smt(height) {
+                Arc::make_mut(&mut self.smt).delete(nullifier.0);
+            }
             self.compressed.delete(nullifier.0);
         }
         removed
@@ -189,13 +227,25 @@ impl NullifierSet {
         )
         .expect("nullifiers are unique in NullifierSet");
     }
+
+    #[cfg(test)]
+    fn legacy_smt_ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.smt, &other.smt)
+    }
+}
+
+fn should_update_legacy_smt(height: u64) -> bool {
+    !compressed_auth_tree_active(height)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT;
+    use indra_core::{
+        codec::ByteReader, types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT,
+    };
     use indra_crypto::sha256;
+    use std::{env, time::Instant};
 
     fn nullifier(seed: u8) -> Bytes32 {
         Bytes32::from(sha256(&[seed; 64]))
@@ -331,5 +381,145 @@ mod tests {
             present.0,
             &proof
         ));
+    }
+
+    #[test]
+    fn legacy_smt_updates_until_activation_then_freezes() {
+        let mut set = NullifierSet::new();
+        assert!(
+            COMPRESSED_AUTH_TREE_HEIGHT > 0,
+            "this test needs a pre-activation height"
+        );
+        let last_legacy_height = COMPRESSED_AUTH_TREE_HEIGHT - 1;
+        let activation_height = COMPRESSED_AUTH_TREE_HEIGHT;
+
+        let legacy_root_before = set.root();
+        let first = nullifier(0x81);
+        assert!(set.insert_at_height(first, last_legacy_height));
+        assert_ne!(
+            set.root(),
+            legacy_root_before,
+            "legacy SMT must still be updated by the last pre-activation block"
+        );
+        let frozen_legacy_root = set.root();
+        let compressed_before_activation_mutation = set.root_at_height(activation_height);
+        let before_activation_mutation = set.clone();
+
+        let second = nullifier(0x82);
+        assert!(set.insert_at_height(second, activation_height));
+        assert!(set.contains(&first));
+        assert!(set.contains(&second));
+        assert_eq!(
+            set.root(),
+            frozen_legacy_root,
+            "legacy SMT must be untouched at the first compressed-tree block height"
+        );
+        assert!(
+            set.legacy_smt_ptr_eq(&before_activation_mutation),
+            "post-activation nullifier mutation must not copy or mutate the frozen legacy SMT"
+        );
+        assert_ne!(
+            set.root_at_height(activation_height),
+            compressed_before_activation_mutation,
+            "compressed tree must still track post-activation canonical nullifier mutations"
+        );
+
+        let before_rollback_remove = set.clone();
+        assert!(set.remove_for_rollback_at_height(&first, activation_height));
+        assert_eq!(
+            set.root(),
+            frozen_legacy_root,
+            "post-activation nullifier rollback removal must not mutate the frozen legacy SMT"
+        );
+        assert!(
+            set.legacy_smt_ptr_eq(&before_rollback_remove),
+            "post-activation rollback removal must keep sharing the frozen legacy SMT"
+        );
+    }
+
+    #[test]
+    fn post_activation_decode_skips_legacy_smt_rebuild_but_preserves_compressed_root() {
+        let mut set = NullifierSet::new();
+        set.insert(nullifier(0x91));
+        set.insert(nullifier(0x92));
+        let encoded = set.encode_to_vec();
+        let expected_compressed_root = set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT);
+
+        let decoded = NullifierSet::decode_at_height(
+            &mut ByteReader::new(&encoded),
+            COMPRESSED_AUTH_TREE_HEIGHT,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.len(), set.len());
+        assert_eq!(
+            decoded.root(),
+            SparseMerkleTree::new().root(),
+            "post-activation snapshots do not rebuild the unread legacy SMT"
+        );
+        assert_eq!(
+            decoded.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            expected_compressed_root,
+            "post-activation consensus root still comes from the rebuilt compressed tree"
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode legacy SMT freeze benchmark; run with --release --ignored --nocapture"]
+    fn legacy_smt_freeze_decode_and_clone_benchmark() {
+        let sizes = env::var("INDRA_LEGACY_SMT_FREEZE_BENCH_SIZES")
+            .unwrap_or_else(|_| "100000".to_string());
+        let skip_old_baseline = env::var("INDRA_LEGACY_SMT_FREEZE_BENCH_SKIP_OLD")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        for size in sizes
+            .split(',')
+            .map(|raw| raw.trim().parse::<usize>().expect("valid benchmark size"))
+        {
+            let mut nullifiers: Vec<_> = (0..size)
+                .map(|i| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    Bytes32::from(sha256(&bytes))
+                })
+                .collect();
+            nullifiers.sort_by_key(|nullifier| nullifier.0);
+            let mut encoded = Vec::new();
+            encode_list(&nullifiers, &mut encoded);
+
+            let start = Instant::now();
+            let post_activation = NullifierSet::decode_at_height(
+                &mut ByteReader::new(&encoded),
+                COMPRESSED_AUTH_TREE_HEIGHT,
+            )
+            .unwrap();
+            let post_activation_decode = start.elapsed();
+
+            let start = Instant::now();
+            let legacy_arc_clone = post_activation.smt.clone();
+            let arc_clone = start.elapsed();
+            std::hint::black_box(legacy_arc_clone);
+
+            let (old_deep_clone, pre_activation_decode) = if skip_old_baseline {
+                (None, None)
+            } else {
+                let start = Instant::now();
+                let pre_activation =
+                    NullifierSet::decode_at_height(&mut ByteReader::new(&encoded), 0).unwrap();
+                let pre_activation_decode = start.elapsed();
+
+                let start = Instant::now();
+                let legacy_deep_clone = (*pre_activation.smt).clone();
+                let old_deep_clone = start.elapsed();
+                std::hint::black_box(legacy_deep_clone);
+                std::hint::black_box(pre_activation);
+                (Some(old_deep_clone), Some(pre_activation_decode))
+            };
+
+            eprintln!(
+                "[legacy-smt-freeze] nullifiers={size} post_activation_decode={:?} pre_activation_decode_old_rebuild={:?} legacy_arc_clone={:?} legacy_deep_clone_old={:?}",
+                post_activation_decode, pre_activation_decode, arc_clone, old_deep_clone
+            );
+        }
     }
 }

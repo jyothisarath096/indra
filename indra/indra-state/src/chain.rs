@@ -203,18 +203,20 @@ impl Encode for ChainState {
 impl Decode for ChainState {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
+        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
+            .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
+        let height = u64::decode(r)?;
         Ok(Self {
-            chain_id: String::from_utf8(chain_id_bytes.as_slice().to_vec())
-                .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string()),
-            height: u64::decode(r)?,
+            chain_id,
+            height,
             tip_hash: Bytes32::decode(r)?,
             base_fee: u64::decode(r)?,
             total_supply: u64::decode(r)?,
             treasury_balance: u64::decode(r)?,
             burn_buffer: u64::decode(r)?,
             fee_reward_pool: u64::decode(r)?,
-            utxos: UtxoSet::decode(r)?,
-            nullifiers: NullifierSet::decode(r)?,
+            utxos: UtxoSet::decode_at_height(r, height)?,
+            nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode(r)?,
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
@@ -267,18 +269,20 @@ impl ChainState {
     /// Decode a legacy unversioned snapshot payload at the supplied schema version.
     pub fn decode_legacy_snapshot(r: &mut ByteReader<'_>, schema_version: u8) -> IndraResult<Self> {
         let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
+        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
+            .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
+        let height = u64::decode(r)?;
         Ok(Self {
-            chain_id: String::from_utf8(chain_id_bytes.as_slice().to_vec())
-                .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string()),
-            height: u64::decode(r)?,
+            chain_id,
+            height,
             tip_hash: Bytes32::decode(r)?,
             base_fee: u64::decode(r)?,
             total_supply: u64::decode(r)?,
             treasury_balance: u64::decode(r)?,
             burn_buffer: u64::decode(r)?,
             fee_reward_pool: u64::decode(r)?,
-            utxos: UtxoSet::decode_legacy(r)?,
-            nullifiers: NullifierSet::decode(r)?,
+            utxos: UtxoSet::decode_legacy_at_height(r, height)?,
+            nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode_legacy(r, schema_version)?,
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map_legacy(r)?,
@@ -300,18 +304,20 @@ impl ChainState {
     /// Decode a schema-v2 versioned snapshot payload that predates governance.
     pub fn decode_schema_v2_snapshot(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
+        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
+            .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
+        let height = u64::decode(r)?;
         Ok(Self {
-            chain_id: String::from_utf8(chain_id_bytes.as_slice().to_vec())
-                .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string()),
-            height: u64::decode(r)?,
+            chain_id,
+            height,
             tip_hash: Bytes32::decode(r)?,
             base_fee: u64::decode(r)?,
             total_supply: u64::decode(r)?,
             treasury_balance: u64::decode(r)?,
             burn_buffer: u64::decode(r)?,
             fee_reward_pool: u64::decode(r)?,
-            utxos: UtxoSet::decode(r)?,
-            nullifiers: NullifierSet::decode(r)?,
+            utxos: UtxoSet::decode_at_height(r, height)?,
+            nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode(r)?,
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,

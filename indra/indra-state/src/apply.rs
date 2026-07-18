@@ -682,7 +682,13 @@ fn apply_block_inner(
         let chain_id = state.chain_id.clone();
         let current_epoch = epoch_for_height(block.header.height);
         for op in &block.governance_ops {
-            apply_governance_op(&mut shadow, op, current_epoch, &chain_id)?;
+            apply_governance_op(
+                &mut shadow,
+                op,
+                current_epoch,
+                block.header.height,
+                &chain_id,
+            )?;
         }
     }
 
@@ -725,10 +731,15 @@ fn apply_block_inner(
     let chain_id = txn.state().chain_id.clone();
     for op in &block.governance_ops {
         txn.snapshot_governance_scope();
-        apply_governance_op(txn.state_mut(), op, current_epoch, &chain_id).map_err(|_| {
-            StateError::InvariantViolation {
-                message: "governance op failed on real state after shadow validation",
-            }
+        apply_governance_op(
+            txn.state_mut(),
+            op,
+            current_epoch,
+            block.header.height,
+            &chain_id,
+        )
+        .map_err(|_| StateError::InvariantViolation {
+            message: "governance op failed on real state after shadow validation",
         })?;
         txn.after_mutation()?;
     }

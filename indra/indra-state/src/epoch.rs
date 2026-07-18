@@ -300,7 +300,7 @@ pub fn apply_governance_phase_transitions(
                 }
             }
             ProposalPhase::ExecDelay => {
-                auto_execute_ready(state, proposal_id, current_epoch);
+                auto_execute_ready(state, proposal_id, current_epoch, height);
             }
             _ => {}
         }
@@ -383,12 +383,17 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
         state.governance.queued_executions.push(exec);
     }
     if should_return_deposit {
-        return_governance_deposit(state, proposal_id)?;
+        return_governance_deposit(state, proposal_id, height)?;
     }
     Ok(())
 }
 
-fn auto_execute_ready(state: &mut ChainState, proposal_id: Bytes32, current_epoch: u64) {
+fn auto_execute_ready(
+    state: &mut ChainState,
+    proposal_id: Bytes32,
+    current_epoch: u64,
+    height: u64,
+) {
     let Some(exec_index) = state.governance.queued_executions.iter().position(|exec| {
         exec.proposal_id == proposal_id && !exec.executed && current_epoch >= exec.executable_epoch
     }) else {
@@ -397,7 +402,7 @@ fn auto_execute_ready(state: &mut ChainState, proposal_id: Bytes32, current_epoc
     let action = state.governance.queued_executions[exec_index]
         .action
         .clone();
-    match revalidate_queued_governance_action_or_fail(state, proposal_id, &action) {
+    match revalidate_queued_governance_action_or_fail(state, proposal_id, &action, height) {
         Ok(true) => {
             state.governance.params.apply_action(&action);
             state.governance.queued_executions[exec_index].executed = true;

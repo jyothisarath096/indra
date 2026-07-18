@@ -30,6 +30,7 @@ pub fn apply_governance_op(
     state: &mut ChainState,
     op: &GovernanceOpV2,
     current_epoch: u64,
+    current_height: u64,
     chain_id: &str,
 ) -> StateResult<()> {
     if op.payload.action_type() != op.action_type {
@@ -55,6 +56,7 @@ pub fn apply_governance_op(
             proposer_pubkey,
             title.as_slice(),
             description.as_slice(),
+            current_height,
         ),
         GovernancePayload::Commit {
             proposal_id,
@@ -79,7 +81,7 @@ pub fn apply_governance_op(
             *amount_spark,
         ),
         GovernancePayload::Execute { proposal_id } => {
-            apply_execute(state, current_epoch, proposal_id)
+            apply_execute(state, current_epoch, current_height, proposal_id)
         }
         GovernancePayload::Cancel { proposal_id } => apply_cancel(state, op, proposal_id),
     }
@@ -96,7 +98,7 @@ pub fn validate_governance_op(
     chain_id: &str,
 ) -> StateResult<()> {
     let mut scratch = state.clone();
-    apply_governance_op(&mut scratch, op, current_epoch, chain_id)
+    apply_governance_op(&mut scratch, op, current_epoch, state.height, chain_id)
 }
 
 fn apply_propose(
@@ -109,6 +111,7 @@ fn apply_propose(
     proposer_pubkey: &HybridPubKey,
     title_bytes: &[u8],
     description_bytes: &[u8],
+    current_height: u64,
 ) -> StateResult<()> {
     let proposer = state
         .validators
@@ -176,12 +179,12 @@ fn apply_propose(
         None
     };
 
-    let _ = state.utxos.spend(deposit_utxo_id);
+    let _ = state.utxos.spend_at_height(deposit_utxo_id, current_height);
     if let Some(change_output) = change_output {
         let output_index = state.utxos.len() as u32;
         state
             .utxos
-            .insert(change_output, state.height, u32::MAX - 3, output_index)
+            .insert(change_output, current_height, u32::MAX - 3, output_index)
             .map_err(|_| StateError::InvariantViolation {
                 message: "UTXO ID collision in governance deposit change output",
             })?;
@@ -384,6 +387,7 @@ fn apply_redelegate(
 fn apply_execute(
     state: &mut ChainState,
     current_epoch: u64,
+    current_height: u64,
     proposal_id: &Bytes32,
 ) -> StateResult<()> {
     let exec_index = state
@@ -400,7 +404,7 @@ fn apply_execute(
         return invalid("proposal execution delay has not elapsed");
     }
     let action = exec.action.clone();
-    if !revalidate_queued_governance_action_or_fail(state, *proposal_id, &action)? {
+    if !revalidate_queued_governance_action_or_fail(state, *proposal_id, &action, current_height)? {
         state.governance.queued_executions[exec_index].executed = true;
         return Ok(());
     }
@@ -426,6 +430,7 @@ pub(crate) fn revalidate_queued_governance_action_or_fail(
     state: &mut ChainState,
     proposal_id: Bytes32,
     action: &indra_core::types::governance::GovernableAction,
+    current_height: u64,
 ) -> StateResult<bool> {
     if let Err(reason) = state.governance.params.validate_action(action) {
         if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
@@ -436,7 +441,7 @@ pub(crate) fn revalidate_queued_governance_action_or_fail(
             hex::encode(&proposal_id.0[..4]),
             reason
         );
-        return_governance_deposit(state, proposal_id)?;
+        return_governance_deposit(state, proposal_id, current_height)?;
         return Ok(false);
     }
     Ok(true)
@@ -582,7 +587,11 @@ fn delegation_pubkey(
 }
 
 /// Return a deposit to a proposer as a new UTXO.
-pub fn return_governance_deposit(state: &mut ChainState, proposal_id: Bytes32) -> StateResult<()> {
+pub fn return_governance_deposit(
+    state: &mut ChainState,
+    proposal_id: Bytes32,
+    current_height: u64,
+) -> StateResult<()> {
     let Some(proposal) = state.governance.proposals.get(&proposal_id).cloned() else {
         return Err(StateError::GovernanceProposalNotFound);
     };
@@ -599,7 +608,7 @@ pub fn return_governance_deposit(state: &mut ChainState, proposal_id: Bytes32) -
     let output_index = state.utxos.len() as u32;
     state
         .utxos
-        .insert(output, state.height, u32::MAX - 2, output_index)
+        .insert(output, current_height, u32::MAX - 2, output_index)
         .map_err(|_| StateError::InvariantViolation {
             message: "UTXO ID collision in governance refund output",
         })?;
@@ -911,7 +920,7 @@ mod tests {
             victim_deposit,
             1,
         );
-        let result = apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -942,7 +951,7 @@ mod tests {
             1,
         );
 
-        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
 
         assert!(state.utxos.get(&deposit).is_none());
         assert_eq!(state.governance.proposals.len(), 1);
@@ -969,7 +978,7 @@ mod tests {
             1,
         );
 
-        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
 
         assert!(state.utxos.get(&deposit).is_none());
         assert_eq!(
@@ -1006,7 +1015,7 @@ mod tests {
             1,
         );
 
-        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
 
         assert!(state.utxos.get(&deposit).is_none());
         assert_eq!(
@@ -1031,7 +1040,7 @@ mod tests {
             .unwrap();
         let op = propose_op(proposer_id, &proposer_keypair, proposer_pubkey, deposit, 1);
 
-        let result = apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -1064,7 +1073,7 @@ mod tests {
                 value: DUST_LIMIT_SPARK,
             },
         );
-        apply_governance_op(&mut state, &first, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &first, 0, 0, DEFAULT_CHAIN_ID).unwrap();
 
         let second = propose_op_with_action(
             second_id,
@@ -1076,7 +1085,7 @@ mod tests {
                 value: DUST_LIMIT_SPARK + 1,
             },
         );
-        let result = apply_governance_op(&mut state, &second, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &second, 0, 0, DEFAULT_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -1110,7 +1119,7 @@ mod tests {
                     value: DUST_LIMIT_SPARK,
                 },
             );
-            apply_governance_op(&mut state, &first, 0, DEFAULT_CHAIN_ID).unwrap();
+            apply_governance_op(&mut state, &first, 0, 0, DEFAULT_CHAIN_ID).unwrap();
             let first_proposal_id = *state.governance.proposals.keys().next().unwrap();
             state
                 .governance
@@ -1130,7 +1139,7 @@ mod tests {
                 },
             );
 
-            apply_governance_op(&mut state, &second, 0, DEFAULT_CHAIN_ID)
+            apply_governance_op(&mut state, &second, 0, 0, DEFAULT_CHAIN_ID)
                 .unwrap_or_else(|err| panic!("terminal phase {terminal_phase:?} blocked: {err}"));
             assert_eq!(state.governance.proposals.len(), 2);
         }
@@ -1155,7 +1164,7 @@ mod tests {
                 value: DUST_LIMIT_SPARK,
             },
         );
-        apply_governance_op(&mut state, &first, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &first, 0, 0, DEFAULT_CHAIN_ID).unwrap();
 
         let second = propose_op_with_action(
             second_id,
@@ -1165,7 +1174,7 @@ mod tests {
             1,
             GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
         );
-        apply_governance_op(&mut state, &second, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &second, 0, 0, DEFAULT_CHAIN_ID).unwrap();
 
         assert_eq!(state.governance.proposals.len(), 2);
     }
@@ -1187,10 +1196,10 @@ mod tests {
             deposit,
             1,
         );
-        apply_governance_op(&mut state, &op, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
         let proposal_id = *state.governance.proposals.keys().next().unwrap();
 
-        return_governance_deposit(&mut state, proposal_id).unwrap();
+        return_governance_deposit(&mut state, proposal_id, 0).unwrap();
 
         assert!(state.utxos.all_entries().any(|entry| {
             entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
@@ -1232,7 +1241,7 @@ mod tests {
                 executed: false,
             });
 
-        apply_execute(&mut state, 0, &proposal_id).unwrap();
+        apply_execute(&mut state, 0, 0, &proposal_id).unwrap();
 
         assert_eq!(state.governance.params.governance_quorum_bps, 7_000);
         assert_eq!(
@@ -1268,7 +1277,7 @@ mod tests {
                 executed: false,
             });
 
-        apply_execute(&mut state, 0, &proposal_id).unwrap();
+        apply_execute(&mut state, 0, 0, &proposal_id).unwrap();
 
         assert_eq!(state.governance.params.governance_quorum_bps, 6_000);
         assert_eq!(
@@ -1340,7 +1349,7 @@ mod tests {
                 executed: false,
             });
 
-        apply_execute(&mut state, 0, &proposal_id).unwrap();
+        apply_execute(&mut state, 0, 0, &proposal_id).unwrap();
 
         let proposal = state.governance.proposals.get(&proposal_id).unwrap();
         assert_eq!(proposal.phase, ProposalPhase::Failed);

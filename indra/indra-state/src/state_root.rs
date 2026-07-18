@@ -763,11 +763,13 @@ mod tests {
                         .expect("test replay must spend a previously inserted UTXO");
                     state
                         .utxos
-                        .spend(&utxo_id)
+                        .spend_at_height(&utxo_id, block.height)
                         .expect("test replay UTXO must still be unspent");
                 }
                 ReplayMutation::InsertNullifier(tag) => {
-                    assert!(state.nullifiers.insert(replay_nullifier(tag)));
+                    assert!(state
+                        .nullifiers
+                        .insert_at_height(replay_nullifier(tag), block.height));
                 }
                 ReplayMutation::UpsertValidator { tag, stake_spark } => {
                     let validator = replay_validator_fixture(tag, stake_spark);

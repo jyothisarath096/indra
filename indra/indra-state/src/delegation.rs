@@ -355,7 +355,7 @@ fn apply_register_validator(
     }
 
     let original_output = utxo_entry.output;
-    let spent = state.utxos.spend(&bond_utxo_id);
+    let spent = state.utxos.spend_at_height(&bond_utxo_id, current_height);
     if spent.is_none() {
         return Err(StateError::InvariantViolation {
             message: "registration bond UTXO disappeared during validator registration",
@@ -671,7 +671,7 @@ fn apply_delegate(
     }
 
     let original_output = utxo_entry.output;
-    let _ = state.utxos.spend(&bond_utxo_id);
+    let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
 
     let bond = StakeBondEntry {
         utxo_id: bond_utxo_id,
@@ -822,7 +822,7 @@ fn apply_self_stake(
 
     let current_epoch = epoch_for_height(current_height);
     let original_output = utxo_entry.output;
-    let _ = state.utxos.spend(&bond_utxo_id);
+    let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
     let bond = StakeBondEntry {
         utxo_id: bond_utxo_id,
         validator_id,
