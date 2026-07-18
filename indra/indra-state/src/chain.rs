@@ -34,6 +34,18 @@ use crate::{
 pub const MAX_STAKED_BONDS_DECODE: usize = indra_core::types::primitives::MAX_VALIDATORS
     .saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR);
 
+/// Defensive snapshot decode ceiling for staking nonce entries.
+///
+/// Staking nonces are keyed by staking signer identity: validator identities
+/// for validator-owned ops and delegator identities for delegation-owned ops.
+/// This guard must therefore cover the largest current validator/delegator
+/// identity set the protocol can retain, not only validators.
+pub const MAX_STAKING_NONCES_DECODE: usize = indra_core::types::primitives::MAX_VALIDATORS
+    .saturating_add(
+        indra_core::types::primitives::MAX_VALIDATORS
+            .saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR),
+    );
+
 /// The complete chain state at a given block height.
 ///
 /// Two `ChainState` values are equivalent if and only if they represent
@@ -488,18 +500,8 @@ fn nonce_map_encoded_len(nonces: &BTreeMap<Bytes32, u64>) -> usize {
 }
 
 fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, u64>> {
-    use indra_core::error::IndraError;
-    use indra_core::types::primitives::MAX_VALIDATORS;
-
     let count = u32::decode(r)? as usize;
-    let max = MAX_VALIDATORS.saturating_mul(100);
-    if count > max {
-        return Err(IndraError::LengthExceeded {
-            field: "snapshot.staking_nonces",
-            max,
-            actual: count,
-        });
-    }
+    validate_nonce_map_count(count)?;
     let mut nonces = BTreeMap::new();
     for _ in 0..count {
         let signer_id = Bytes32::decode(r)?;
@@ -511,6 +513,17 @@ fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, u64
         }
     }
     Ok(nonces)
+}
+
+fn validate_nonce_map_count(count: usize) -> IndraResult<()> {
+    if count > MAX_STAKING_NONCES_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.staking_nonces",
+            max: MAX_STAKING_NONCES_DECODE,
+            actual: count,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -636,5 +649,63 @@ mod tests {
         encode_bond_map(&bonds, &mut bytes);
         let decoded = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap();
         assert_eq!(decoded, bonds);
+    }
+
+    #[test]
+    fn staking_nonce_decode_cap_is_derived_from_staking_signer_capacity() {
+        let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(100);
+        assert!(
+            MAX_STAKING_NONCES_DECODE > old_placeholder_cap,
+            "corrected cap must accept signer nonce counts above the old validator-only placeholder"
+        );
+        assert_eq!(
+            MAX_STAKING_NONCES_DECODE,
+            MAX_VALIDATORS.saturating_add(
+                MAX_VALIDATORS.saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR)
+            )
+        );
+        assert!(validate_nonce_map_count(old_placeholder_cap + 1).is_ok());
+    }
+
+    #[test]
+    fn staking_nonce_decode_no_longer_rejects_count_above_old_placeholder_cap() {
+        let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(100);
+        let mut bytes = Vec::new();
+        ((old_placeholder_cap + 1) as u32).encode(&mut bytes);
+
+        let err = decode_nonce_map(&mut ByteReader::new(&bytes)).unwrap_err();
+        assert!(
+            matches!(err, IndraError::UnexpectedEof { .. }),
+            "count above old placeholder cap should pass the staking_nonces cap guard and fail only because this synthetic stream has no entries; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn staking_nonce_decode_rejects_count_above_corrected_cap_cleanly() {
+        let mut bytes = Vec::new();
+        ((MAX_STAKING_NONCES_DECODE + 1) as u32).encode(&mut bytes);
+
+        let err = decode_nonce_map(&mut ByteReader::new(&bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::LengthExceeded {
+                field: "snapshot.staking_nonces",
+                max: MAX_STAKING_NONCES_DECODE,
+                actual
+            } if actual == MAX_STAKING_NONCES_DECODE + 1
+        ));
+    }
+
+    #[test]
+    fn staking_nonce_encode_decode_round_trip_uses_same_cap_path() {
+        let nonces = BTreeMap::from([
+            (Bytes32::from([0xA1; 32]), 7),
+            (Bytes32::from([0xD1; 32]), 11),
+        ]);
+
+        let mut bytes = Vec::new();
+        encode_nonce_map(&nonces, &mut bytes);
+        let decoded = decode_nonce_map(&mut ByteReader::new(&bytes)).unwrap();
+        assert_eq!(decoded, nonces);
     }
 }
