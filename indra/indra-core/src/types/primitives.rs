@@ -616,33 +616,34 @@ pub const DISK_WARN_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Disk space critical threshold in bytes (500 MB).
 pub const DISK_CRITICAL_THRESHOLD_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Slash for intentional double-signing (equivocation), in basis points.
+/// Legacy double-sign slash constant, in basis points.
 /// 1000 bps = 10% of stake burned.
 ///
-/// ## Slashing philosophy (v7.1)
+/// ## Slashing and liveness-penalty philosophy
 ///
-/// INDRA does NOT slash validators for being offline.
-/// Offline validators simply earn no rewards — the economic
-/// incentive to stay online is sufficient without punitive slashing.
+/// INDRA distinguishes explicit slash evidence from liveness penalties.
 ///
-/// This follows Bitcoin's model: miners who stop mining earn nothing,
-/// but are not penalised for stopping. Validators who go offline earn
-/// nothing, but their stake is not burned.
+/// Explicit slash evidence is reserved for unambiguous consensus-safety
+/// violations: signing conflicting precommits or a surround vote. These
+/// evidence-based slashes can carry larger penalties and may change validator
+/// lifecycle status.
 ///
-/// The ONLY slashable offence is intentional equivocation:
-/// signing two different blocks at the same height (double-sign).
-/// This is an unambiguous malicious act that threatens consensus safety.
-/// All other failures (missed blocks, downtime, crashes) result only
-/// in lost rewards for the affected epochs.
+/// Offline validators are not subject to that explicit equivocation-evidence
+/// slashing path merely for downtime. However, persistent inactivity is not
+/// consequence-free: after `SLASH_LIVENESS_THRESHOLD_EPOCHS` missed epochs,
+/// `apply_liveness_penalties` reduces the validator's stake by
+/// `SLASH_LIVENESS_BPS` and burns the same amount from total supply at each
+/// penalised epoch transition.
 ///
 /// Rationale:
-/// - A validator who can only run 4 hours/day should be welcome.
-///   They earn proportionally. They are not punished.
-/// - Infrastructure failures (crashes, ISP outages) should not
-///   destroy a validator's stake. This would centralise validation
-///   toward only large professional operators with redundant infra.
-/// - Liveness is maintained by the economic incentive to earn rewards,
-///   not by the threat of stake destruction.
+/// - Brief downtime loses rewards but does not trigger evidence-based
+///   equivocation slashing.
+/// - Persistent downtime eventually carries a small, compounding liveness
+///   penalty so inactive validators cannot remain in the active set with no
+///   stake consequence.
+/// - The terminology is intentionally narrower than "no stake can ever be
+///   burned for downtime": liveness penalties do burn stake/supply, but they
+///   are distinct from explicit malicious-equivocation slash evidence.
 pub const SLASH_DOUBLE_SIGN_BPS: u32 = 1_000;
 
 /// Initial base fee in Spark per KB.

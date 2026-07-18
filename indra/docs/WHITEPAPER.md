@@ -547,14 +547,14 @@ when outside the active set.
 
 ### 5.4 Slashing
 
-INDRA's slashing model is deliberate and minimal.
+INDRA's explicit-evidence slashing model is deliberate and minimal.
 
 ```
 Offence                      Penalty            Notes
 ──────────────────────────────────────────────────────────
 Miss block as proposer       Lost reward only   Not slashed
-Offline (any duration)       No rewards         Stake never burned
-Liveness failure (3+ epochs  0.10% per epoch    After threshold
+Brief offline period         No rewards         No evidence-based slash
+Liveness failure (3+ epochs  0.10% per epoch    Stake reduced; amount burned
   without participation)
 Double-precommit             5.00% of stake     Slashed and exited
 Equivocating surround vote   10.00% of stake    Slashed and exited
@@ -564,7 +564,8 @@ Reporter reward              5.00% of slash     Paid to reporter
 
 **Liveness:** After 3 consecutive epochs without participation, a
 validator incurs a 0.10% per-epoch penalty. This is the only ongoing
-penalty for offline behaviour — stake is never burned for downtime alone.
+penalty for offline behaviour: it reduces validator stake and burns the
+same amount from total supply at each penalised epoch transition.
 
 **Double-signing:** Only intentional equivocation (signing two different
 blocks at the same height and round) results in meaningful stake burn.
@@ -577,8 +578,11 @@ can self-report within 5 epochs, incurring only a 1% penalty rather
 than the full equivocation slash. This incentivises honest key
 management disclosure.
 
-**Philosophy:** Earn when you work, nothing when you don't. No stake
-is burned for being offline — only for deliberate betrayal of consensus.
+**Philosophy:** Brief downtime loses rewards but does not enter the
+explicit malicious-equivocation slashing path. Persistent downtime is
+different: after the liveness threshold, the protocol applies a small,
+compounding stake penalty so inactive validators cannot remain active
+with no economic consequence.
 
 ### 5.5 Delegation
 
@@ -839,7 +843,8 @@ Network:  10 Mbps stable upload and download
           Ports 30303 (P2P) and 30304 (observer) open
           Static IP recommended but not required
 Uptime:   No minimum — validators earn proportional to uptime
-          No slash penalty for offline (lost rewards only)
+          Brief downtime loses rewards; persistent inactivity triggers
+          liveness penalties after the configured threshold
 OS:       macOS 12+, Ubuntu 20.04+, Windows 10+ (64-bit)
 ```
 
