@@ -4,7 +4,7 @@
 //! It is the input and output of `apply_block`.
 
 use indra_core::codec::{ByteReader, Decode, Encode};
-use indra_core::error::IndraResult;
+use indra_core::error::{IndraError, IndraResult};
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -24,6 +24,15 @@ use crate::{
         ValidatorSet,
     },
 };
+
+/// Defensive snapshot decode ceiling for staked-bond entries.
+///
+/// This must not be lower than the validator/delegator state that the protocol
+/// itself can accept: every retained delegator position may have at least one
+/// corresponding bonded UTXO. The guard remains finite so corrupted snapshots
+/// cannot request unbounded decode work.
+pub const MAX_STAKED_BONDS_DECODE: usize = indra_core::types::primitives::MAX_VALIDATORS
+    .saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR);
 
 /// The complete chain state at a given block height.
 ///
@@ -410,18 +419,8 @@ fn bond_map_encoded_len(bonds: &BTreeMap<Bytes32, StakeBondEntry>) -> usize {
 }
 
 fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, StakeBondEntry>> {
-    use indra_core::error::IndraError;
-    use indra_core::types::primitives::MAX_VALIDATORS;
-
     let count = u32::decode(r)? as usize;
-    let max = MAX_VALIDATORS.saturating_mul(1_000);
-    if count > max {
-        return Err(IndraError::LengthExceeded {
-            field: "snapshot.staked_bonds",
-            max,
-            actual: count,
-        });
-    }
+    validate_bond_map_count(count)?;
     let mut bonds = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
@@ -443,18 +442,8 @@ fn decode_bond_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, Stak
 fn decode_bond_map_legacy(
     r: &mut ByteReader<'_>,
 ) -> IndraResult<BTreeMap<Bytes32, StakeBondEntry>> {
-    use indra_core::error::IndraError;
-    use indra_core::types::primitives::MAX_VALIDATORS;
-
     let count = u32::decode(r)? as usize;
-    let max = MAX_VALIDATORS.saturating_mul(1_000);
-    if count > max {
-        return Err(IndraError::LengthExceeded {
-            field: "snapshot.staked_bonds",
-            max,
-            actual: count,
-        });
-    }
+    validate_bond_map_count(count)?;
     let mut bonds = BTreeMap::new();
     for _ in 0..count {
         let key = Bytes32::decode(r)?;
@@ -471,6 +460,19 @@ fn decode_bond_map_legacy(
         }
     }
     Ok(bonds)
+}
+
+fn validate_bond_map_count(count: usize) -> IndraResult<()> {
+    use indra_core::error::IndraError;
+
+    if count > MAX_STAKED_BONDS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.staked_bonds",
+            max: MAX_STAKED_BONDS_DECODE,
+            actual: count,
+        });
+    }
+    Ok(())
 }
 
 fn encode_nonce_map(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
@@ -514,7 +516,18 @@ fn decode_nonce_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::{GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB};
+    use indra_core::{
+        codec::Encode,
+        error::IndraError,
+        types::{
+            crypto::HybridPubKey,
+            primitives::{
+                VariableBytes, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS,
+            },
+            transaction::OutputV1,
+        },
+        CommitmentV1,
+    };
 
     #[test]
     fn genesis_state_is_correct() {
@@ -539,5 +552,89 @@ mod tests {
     #[test]
     fn genesis_epoch_is_zero() {
         assert_eq!(ChainState::new_genesis().current_epoch(), 0);
+    }
+
+    fn test_output(byte: u8) -> OutputV1 {
+        OutputV1 {
+            value_spark: 1_000_000,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from([byte; 32]),
+            },
+            owner_pubkey: HybridPubKey {
+                classical_pk: Bytes32::from([byte; 32]),
+                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            },
+            range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn test_bond(byte: u8) -> StakeBondEntry {
+        StakeBondEntry {
+            utxo_id: Bytes32::from([byte; 32]),
+            validator_id: Bytes32::from([0xA0 | byte; 32]),
+            delegator_id: Bytes32::from([0xD0 | byte; 32]),
+            amount_spark: 1_000_000,
+            bonded_epoch: 7,
+            unbonding_end_epoch: None,
+            original_output: test_output(byte),
+        }
+    }
+
+    #[test]
+    fn staked_bond_decode_cap_is_derived_from_validator_delegator_caps() {
+        let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(1_000);
+        assert!(
+            MAX_STAKED_BONDS_DECODE > old_placeholder_cap,
+            "corrected cap must accept states above the old placeholder ceiling"
+        );
+        assert_eq!(
+            MAX_STAKED_BONDS_DECODE,
+            MAX_VALIDATORS.saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR)
+        );
+        assert!(validate_bond_map_count(old_placeholder_cap + 1).is_ok());
+    }
+
+    #[test]
+    fn staked_bond_decode_no_longer_rejects_count_above_old_placeholder_cap() {
+        let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(1_000);
+        let mut bytes = Vec::new();
+        ((old_placeholder_cap + 1) as u32).encode(&mut bytes);
+
+        let err = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap_err();
+        assert!(
+            matches!(err, IndraError::UnexpectedEof { .. }),
+            "count above old placeholder cap should pass the staked_bonds cap guard and fail only because this synthetic stream has no entries; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn staked_bond_decode_rejects_count_above_corrected_cap_cleanly() {
+        let mut bytes = Vec::new();
+        ((MAX_STAKED_BONDS_DECODE + 1) as u32).encode(&mut bytes);
+
+        let err = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::LengthExceeded {
+                field: "snapshot.staked_bonds",
+                max: MAX_STAKED_BONDS_DECODE,
+                actual
+            } if actual == MAX_STAKED_BONDS_DECODE + 1
+        ));
+    }
+
+    #[test]
+    fn staked_bond_encode_decode_round_trip_uses_same_cap_path() {
+        let mut bonds = BTreeMap::new();
+        let bond_a = test_bond(0x01);
+        let bond_b = test_bond(0x02);
+        bonds.insert(bond_a.utxo_id, bond_a);
+        bonds.insert(bond_b.utxo_id, bond_b);
+
+        let mut bytes = Vec::new();
+        encode_bond_map(&bonds, &mut bytes);
+        let decoded = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap();
+        assert_eq!(decoded, bonds);
     }
 }
