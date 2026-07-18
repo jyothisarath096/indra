@@ -52,7 +52,9 @@ pub use epoch_store::EpochStore;
 pub use error::{StorageError, StorageResult};
 pub use manifest::{load_chain_manifest, save_chain_manifest, ChainManifest};
 pub use migration::{migrate_chain_state, migration_record, MigrationLog, MigrationRecord};
-pub use qc_store::{load_last_qc, save_last_qc};
+pub use qc_store::{
+    clear_pending_last_qc, load_last_qc, load_pending_last_qc, save_last_qc, save_pending_last_qc,
+};
 pub use state_store::StateStore;
 pub use vote_safety::{VoteSafetyLoadResult, VoteSafetyRecord, VoteSafetyStore};
 pub use wal::MempoolWal;

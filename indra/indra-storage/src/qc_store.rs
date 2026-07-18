@@ -7,6 +7,8 @@ use crate::error::StorageResult;
 
 const LAST_QC_FILE: &str = "last_qc.bin";
 const LAST_QC_TMP_FILE: &str = "last_qc.bin.tmp";
+const PENDING_LAST_QC_FILE: &str = "pending_last_qc.bin";
+const PENDING_LAST_QC_TMP_FILE: &str = "pending_last_qc.bin.tmp";
 
 /// Write the last committed QC bytes to disk.
 ///
@@ -20,6 +22,21 @@ pub fn save_last_qc(state_dir: &Path, qc_bytes: &[u8]) -> StorageResult<()> {
     Ok(())
 }
 
+/// Durably stage the QC for a block that is about to be committed.
+///
+/// Block headers carry the previous block's QC, so a locally finalising node
+/// must persist the current-tip QC out-of-band. This pending file closes the
+/// crash window between "QC has been built" and "`last_qc.bin` has been
+/// promoted after the block commit": startup may use it only if the rebuilt
+/// state height matches the QC's certified height.
+pub fn save_pending_last_qc(state_dir: &Path, qc_bytes: &[u8]) -> StorageResult<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let tmp = state_dir.join(PENDING_LAST_QC_TMP_FILE);
+    let final_path = state_dir.join(PENDING_LAST_QC_FILE);
+    write_atomic_synced(&tmp, &final_path, qc_bytes)?;
+    Ok(())
+}
+
 /// Read the last committed QC bytes from disk.
 ///
 /// Returns `Ok(None)` when no QC has been persisted yet.
@@ -28,6 +45,31 @@ pub fn load_last_qc(state_dir: &Path) -> StorageResult<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Read the staged current-tip QC bytes, if any.
+pub fn load_pending_last_qc(state_dir: &Path) -> StorageResult<Option<Vec<u8>>> {
+    let path = state_dir.join(PENDING_LAST_QC_FILE);
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Remove the staged current-tip QC after it has been promoted or found stale.
+pub fn clear_pending_last_qc(state_dir: &Path) -> StorageResult<()> {
+    let path = state_dir.join(PENDING_LAST_QC_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                crate::atomic::fsync_dir(parent)?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
 }
@@ -57,6 +99,17 @@ mod tests {
         let bytes = vec![1, 2, 3, 4, 5, 6];
         save_last_qc(&dir, &bytes).unwrap();
         assert_eq!(load_last_qc(&dir).unwrap(), Some(bytes));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_last_qc_round_trip_and_clear() {
+        let dir = temp_dir("pending_roundtrip");
+        let bytes = vec![9, 8, 7, 6];
+        save_pending_last_qc(&dir, &bytes).unwrap();
+        assert_eq!(load_pending_last_qc(&dir).unwrap(), Some(bytes));
+        clear_pending_last_qc(&dir).unwrap();
+        assert_eq!(load_pending_last_qc(&dir).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

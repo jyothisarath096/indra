@@ -458,45 +458,7 @@ impl ConsensusDriver {
             SyncState::follower(driver.engine.state.height)
         };
         if driver.engine.state.height > 0 {
-            match driver.engine.load_persisted_qc() {
-                Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
-                    match QuorumCertificateV1::decode_exact(&qc_bytes) {
-                        Ok(qc) if qc.height == driver.engine.state.height => {
-                            eprintln!(
-                                "[driver] restored last_qc_bytes ({} bytes) for height {}",
-                                qc_bytes.len(),
-                                qc.height,
-                            );
-                            driver.last_qc_bytes = qc_bytes;
-                        }
-                        Ok(qc) => {
-                            eprintln!(
-                                "[driver] WARNING: persisted QC height {} does not match current state height {} — discarding and requesting from peers",
-                                qc.height,
-                                driver.engine.state.height,
-                            );
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "[driver] WARNING: persisted QC at height {} is not decodable by this binary: {} — discarding and requesting from peers",
-                                driver.engine.state.height,
-                                err,
-                            );
-                        }
-                    }
-                }
-                Ok(Some(_)) | Ok(None) => {
-                    eprintln!(
-                        "[driver] WARNING: no persisted QC found at height {} — node will not propose until another validator proposes first",
-                        driver.engine.state.height,
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[driver] WARNING: failed to load persisted QC: {e} — node will not propose until another validator proposes first"
-                    );
-                }
-            }
+            driver.restore_last_qc_for_startup();
         }
         driver.refresh_registered_voters();
         driver
@@ -521,6 +483,108 @@ impl ConsensusDriver {
     /// Return the height certified by the cached QC, if it is present and decodable.
     pub fn last_qc_height(&self) -> Option<u64> {
         Self::decode_qc_height(&self.last_qc_bytes)
+    }
+
+    fn restore_last_qc_for_startup(&mut self) {
+        let state_height = self.engine.state.height;
+        let state_dir = self.engine.config.state_dir();
+        match self.engine.load_persisted_qc() {
+            Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
+                match QuorumCertificateV1::decode_exact(&qc_bytes) {
+                    Ok(qc) if qc.height == state_height => {
+                        eprintln!(
+                            "[driver] restored last_qc_bytes ({} bytes) for height {}",
+                            qc_bytes.len(),
+                            qc.height,
+                        );
+                        self.last_qc_bytes = qc_bytes;
+                        let _ = indra_storage::clear_pending_last_qc(&state_dir);
+                        return;
+                    }
+                    Ok(qc) => {
+                        eprintln!(
+                            "[driver] persisted QC height {} does not match current state height {} — checking pending current-tip QC",
+                            qc.height, state_height,
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[driver] WARNING: persisted QC at height {} is not decodable by this binary: {} — checking pending current-tip QC",
+                            state_height, err,
+                        );
+                    }
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {
+                eprintln!(
+                    "[driver] no persisted QC found at height {} — checking pending current-tip QC",
+                    state_height,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[driver] WARNING: failed to load persisted QC: {e} — checking pending current-tip QC"
+                );
+            }
+        }
+
+        match indra_storage::load_pending_last_qc(&state_dir) {
+            Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
+                match QuorumCertificateV1::decode_exact(&qc_bytes) {
+                    Ok(qc) if qc.height == state_height => {
+                        eprintln!(
+                            "[driver] restored pending last_qc_bytes ({} bytes) for height {} after commit-boundary recovery",
+                            qc_bytes.len(),
+                            qc.height,
+                        );
+                        self.last_qc_bytes = qc_bytes.clone();
+                        if let Err(err) = indra_storage::save_last_qc(&state_dir, &qc_bytes) {
+                            eprintln!(
+                                "[driver] WARNING: failed to promote pending current-tip QC at height {}: {}",
+                                state_height, err,
+                            );
+                        } else {
+                            let _ = indra_storage::clear_pending_last_qc(&state_dir);
+                            let _ = self.engine.write_chain_manifest();
+                        }
+                        return;
+                    }
+                    Ok(qc) => {
+                        eprintln!(
+                            "[driver] pending QC height {} does not match current state height {} — discarding and requesting from peers",
+                            qc.height, state_height,
+                        );
+                        let _ = indra_storage::clear_pending_last_qc(&state_dir);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[driver] WARNING: pending QC at height {} is not decodable by this binary: {} — discarding and requesting from peers",
+                            state_height, err,
+                        );
+                        let _ = indra_storage::clear_pending_last_qc(&state_dir);
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                let _ = indra_storage::clear_pending_last_qc(&state_dir);
+                eprintln!(
+                    "[driver] WARNING: empty pending QC found at height {} — requesting from peers",
+                    state_height,
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "[driver] WARNING: failed to load pending current-tip QC: {} — requesting from peers",
+                    err,
+                );
+            }
+        }
+
+        eprintln!(
+            "[driver] WARNING: no current-tip QC available at height {} — node will not propose until another validator proposes first",
+            state_height,
+        );
     }
 
     fn decode_qc_height(qc_bytes: &[u8]) -> Option<u64> {
@@ -2728,6 +2792,17 @@ impl ConsensusDriver {
         }
 
         let old_height = self.engine.state.height;
+        let qc_bytes = qc.encode_to_vec();
+        if let Err(e) =
+            indra_storage::save_pending_last_qc(&self.engine.config.state_dir(), &qc_bytes)
+        {
+            eprintln!(
+                "[driver] WARNING: failed to durably stage consensus last_qc_bytes at height {} before commit: {}",
+                height, e,
+            );
+            return vec![DriverAction::None];
+        }
+
         match self.engine.commit_block(&block) {
             Ok(()) => {
                 self.pending_blocks.remove(&block_hash);
@@ -2739,13 +2814,18 @@ impl ConsensusDriver {
                     round,
                 );
 
-                if let Err(e) = self.set_last_qc_bytes_if_newer_from_source(
-                    height,
-                    qc.encode_to_vec(),
-                    "consensus",
-                ) {
+                if let Err(e) =
+                    self.set_last_qc_bytes_if_newer_from_source(height, qc_bytes, "consensus")
+                {
                     eprintln!(
                         "[driver] WARNING: failed to promote consensus last_qc_bytes at height {}: {}",
+                        height, e,
+                    );
+                } else if let Err(e) =
+                    indra_storage::clear_pending_last_qc(&self.engine.config.state_dir())
+                {
+                    eprintln!(
+                        "[driver] WARNING: failed to clear pending consensus last_qc_bytes at height {}: {}",
                         height, e,
                     );
                 }
@@ -8298,6 +8378,109 @@ mod tests {
         );
 
         drop(local);
+        let _ = std::fs::remove_dir_all(&source_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_recovers_pending_current_tip_qc_after_commit_boundary() {
+        let (mut source, source_dir) = local_driver([0xC1u8; 32], "pending_qc_source");
+        let _source_local = install_active_validator(&mut source, [0xC1u8; 32], "local");
+        source.refresh_registered_voters();
+
+        let block1 = make_strict_block(&source, [0xC1u8; 32], 0, vec![]);
+        let _ = source.process(DriverEvent::InboundBlock {
+            from: None,
+            block: block1.clone(),
+        });
+        let qc_for_height_1 = source.last_qc_bytes();
+        assert!(!qc_for_height_1.is_empty());
+
+        let (mut driver, dir) = local_driver([0xC1u8; 32], "pending_qc_restart");
+        let local = install_active_validator(&mut driver, [0xC1u8; 32], "local");
+        driver.refresh_registered_voters();
+
+        driver.engine.commit_block(&block1).unwrap();
+        driver
+            .set_last_qc_bytes_if_newer(1, qc_for_height_1.clone())
+            .unwrap();
+        assert_eq!(driver.height(), 1);
+        assert_eq!(driver.last_qc_height(), Some(1));
+
+        let block2 = make_strict_block(&driver, [0xC1u8; 32], 0, driver.last_qc_bytes());
+        let validator_id = validator_id_for(&local);
+        let qc_vote = indra_consensus::vote::produce_vote(
+            2,
+            block2.header.proposer_round,
+            VoteStep::Precommit,
+            block2.header.block_hash(),
+            validator_id,
+            DEFAULT_CHAIN_ID,
+            &local,
+        )
+        .unwrap();
+        let qc_for_height_2 = indra_consensus::build_qc(
+            2,
+            block2.header.proposer_round,
+            block2.header.block_hash(),
+            DEFAULT_CHAIN_ID,
+            &driver.engine.qc_validators(),
+            vec![&qc_vote],
+        )
+        .unwrap()
+        .encode_to_vec();
+
+        // Simulate the old crash boundary exactly: the current-tip QC has been
+        // durably staged, the block/state commit reaches height 2, but the
+        // process stops before `last_qc.bin` is promoted from height 1 to 2.
+        indra_storage::save_pending_last_qc(&driver.engine.config.state_dir(), &qc_for_height_2)
+            .unwrap();
+        driver.engine.commit_block(&block2).unwrap();
+        assert_eq!(driver.height(), 2);
+        assert_eq!(driver.last_qc_height(), Some(1));
+        assert_eq!(
+            ConsensusDriver::decode_qc_height(
+                &indra_storage::load_last_qc(&driver.engine.config.state_dir())
+                    .unwrap()
+                    .unwrap()
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            ConsensusDriver::decode_qc_height(
+                &indra_storage::load_pending_last_qc(&driver.engine.config.state_dir())
+                    .unwrap()
+                    .unwrap()
+            ),
+            Some(2)
+        );
+
+        let config = driver.engine.config.clone();
+        drop(local);
+        drop(driver);
+
+        let engine = NodeEngine::init(config).unwrap();
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let restarted = ConsensusDriver::new(engine, vote_safety);
+        assert_eq!(restarted.height(), 2);
+        assert_eq!(restarted.last_qc_height(), Some(2));
+        assert_eq!(restarted.last_qc_bytes(), qc_for_height_2);
+        assert!(!restarted.last_qc_is_stale());
+        assert!(restarted.request_qc_if_needed().is_empty());
+        assert_eq!(
+            ConsensusDriver::decode_qc_height(
+                &indra_storage::load_last_qc(&restarted.engine.config.state_dir())
+                    .unwrap()
+                    .unwrap()
+            ),
+            Some(2)
+        );
+        assert!(
+            indra_storage::load_pending_last_qc(&restarted.engine.config.state_dir())
+                .unwrap()
+                .is_none()
+        );
+
         let _ = std::fs::remove_dir_all(&source_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
