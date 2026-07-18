@@ -61,7 +61,9 @@ pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
 pub use governance_apply::apply_governance_op;
 pub use nullifier::NullifierSet;
-pub use persistent::{PersistentAuthTree, PersistentOrdMap};
+pub use persistent::{
+    PersistentAuthTree, PersistentOrdMap, PersistentOrdSet, PersistentSparseMerkleTree,
+};
 pub use smt::{
     AuthTreeProof, CompressedAuthTree, CompressedChildKind, CompressedProof, CompressedProofChild,
     CompressedProofStep, MerkleProof, ProofTerminal, SparseMerkleTree, SMT_DEPTH,
