@@ -2685,11 +2685,7 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "max-cap StateTxn stress benchmark; run explicitly with --ignored --nocapture"]
-    fn state_txn_stress_max_op_caps_applies_and_rolls_back() {
-        use std::time::Instant;
-
+    fn max_cap_stress_state_and_block() -> (ChainState, BlockV1) {
         let mut state = ChainState::new_genesis();
 
         let (tx_owner_pubkey, tx_keypair) = make_test_keypair([0xD0; 32]);
@@ -2800,6 +2796,63 @@ mod tests {
         block.staking_ops = staking_ops;
         block.governance_ops = governance_ops;
         block.slashing_evidence = slashing_evidence;
+
+        (state, block)
+    }
+
+    #[test]
+    #[ignore = "max-cap block validation timing guard; run explicitly with --release --ignored --nocapture"]
+    fn max_cap_block_apply_release_timing_guard() {
+        use std::time::{Duration, Instant};
+
+        const RELEASE_APPLY_LIMIT: Duration = Duration::from_secs(4);
+
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "max_cap_block_apply_release_timing_guard skipped: run with `cargo test -p indra-state max_cap_block_apply_release_timing_guard --release -- --ignored --nocapture`. Debug builds are expected to be dramatically slower and must not be interpreted as release-regression evidence."
+            );
+            return;
+        }
+
+        // This fixture intentionally mirrors the max-cap StateTxn stress case:
+        // 200 transactions total, including one 16-input/16-output transaction,
+        // plus 10 staking ops, 5 governance ops, and 3 slash evidence entries.
+        //
+        // This guard is meaningful only for optimized validator-style builds.
+        // In debug mode, the same crypto-heavy validation path has measured
+        // roughly 14x slower during this session; debug timing is useful for
+        // local profiling only, not for deployment-risk conclusions.
+        //
+        // The 4s limit is deliberately below the 6s target block time while
+        // leaving broad headroom over the current ~1.3s release measurement on
+        // the development Mac. If this trips in release mode, re-check hardware
+        // and load first, then treat a repeatable failure as a real regression.
+        let (state, block) = max_cap_stress_state_and_block();
+        let start = Instant::now();
+        let mut applied = state.clone();
+        apply_block(&mut applied, &block, 0).unwrap();
+        let elapsed = start.elapsed();
+        println!(
+            "max_cap_block_apply_release_timing_guard elapsed={elapsed:?} limit={RELEASE_APPLY_LIMIT:?} txs={} max_inputs={} max_outputs={} staking_ops={} governance_ops={} slashes={}",
+            MAX_TX_PER_BLOCK,
+            MAX_INPUTS,
+            MAX_OUTPUTS,
+            MAX_STAKING_OPS_PER_BLOCK,
+            MAX_GOV_OPS_PER_BLOCK,
+            MAX_SLASHES_PER_BLOCK,
+        );
+        assert!(
+            elapsed < RELEASE_APPLY_LIMIT,
+            "max-cap block apply took {elapsed:?}, exceeding release guard {RELEASE_APPLY_LIMIT:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "max-cap StateTxn stress benchmark; run explicitly with --ignored --nocapture"]
+    fn state_txn_stress_max_op_caps_applies_and_rolls_back() {
+        use std::time::Instant;
+
+        let (state, block) = max_cap_stress_state_and_block();
 
         let time_apply_case = |label: &str, block: &BlockV1| {
             let start = Instant::now();
