@@ -181,6 +181,23 @@ impl BlockStore {
 
     /// Read a block by height.
     pub fn get(&mut self, height: u64) -> StorageResult<BlockV1> {
+        let offset = self.block_offset(height)?;
+        read_block_at(&mut self.file, height, offset, self.format_version)
+    }
+
+    /// Read a block by height without mutably borrowing the block store.
+    ///
+    /// This is intended for read-only consumers such as RPC handlers. The
+    /// in-memory height index remains the source of truth for retained heights;
+    /// the file is opened independently so callers that only have `&self` do
+    /// not need to move the store's write cursor.
+    pub fn get_read_only(&self, height: u64) -> StorageResult<BlockV1> {
+        let offset = self.block_offset(height)?;
+        let mut file = File::open(&self.path)?;
+        read_block_at(&mut file, height, offset, self.format_version)
+    }
+
+    fn block_offset(&self, height: u64) -> StorageResult<u64> {
         if !self.index.is_empty() && height < self.lowest_height {
             return Err(StorageError::BlockPruned {
                 height,
@@ -188,64 +205,10 @@ impl BlockStore {
             });
         }
 
-        let offset = self
-            .index
+        self.index
             .get(&height)
             .copied()
-            .ok_or(StorageError::BlockNotFound { height })?;
-
-        self.file.seek(SeekFrom::Start(offset))?;
-
-        // Read header
-        let mut header = [0u8; ENTRY_HEADER_BYTES];
-        self.file.read_exact(&mut header)?;
-
-        let stored_height_bytes: [u8; 8] =
-            header[..8]
-                .try_into()
-                .map_err(|_| StorageError::Corruption {
-                    height,
-                    detail: "entry header truncated while reading height".to_string(),
-                })?;
-        let stored_height = u64::from_le_bytes(stored_height_bytes);
-        let length_bytes: [u8; 4] =
-            header[8..12]
-                .try_into()
-                .map_err(|_| StorageError::Corruption {
-                    height,
-                    detail: "entry header truncated while reading length".to_string(),
-                })?;
-        let length = u32::from_le_bytes(length_bytes) as usize;
-
-        if stored_height != height {
-            return Err(StorageError::Corruption {
-                height,
-                detail: format!("index mismatch: stored height {stored_height}"),
-            });
-        }
-
-        let mut block_bytes = vec![0u8; length];
-        self.file.read_exact(&mut block_bytes)?;
-        if self.format_version >= BLOCK_FILE_VERSION_V2 {
-            let mut checksum_bytes = [0u8; ENTRY_CHECKSUM_BYTES];
-            self.file.read_exact(&mut checksum_bytes)?;
-            let expected = u32::from_le_bytes(checksum_bytes);
-            let actual = block_entry_crc(stored_height, length as u32, &block_bytes);
-            if expected != actual {
-                return Err(StorageError::BlockChecksumMismatch {
-                    height,
-                    expected,
-                    actual,
-                });
-            }
-        }
-
-        use indra_core::codec::ByteReader;
-        let mut reader = ByteReader::new(&block_bytes);
-        BlockV1::decode(&mut reader).map_err(|e| StorageError::Corruption {
-            height,
-            detail: e.to_string(),
-        })
+            .ok_or(StorageError::BlockNotFound { height })
     }
 
     /// Remove all blocks with heights below `prune_below`.
@@ -541,6 +504,64 @@ fn write_block_entry_v2(file: &mut File, height: u64, block_bytes: &[u8]) -> Sto
     Ok(())
 }
 
+fn read_block_at(
+    file: &mut File,
+    height: u64,
+    offset: u64,
+    format_version: u8,
+) -> StorageResult<BlockV1> {
+    file.seek(SeekFrom::Start(offset))?;
+
+    let mut header = [0u8; ENTRY_HEADER_BYTES];
+    file.read_exact(&mut header)?;
+
+    let stored_height_bytes: [u8; 8] =
+        header[..8]
+            .try_into()
+            .map_err(|_| StorageError::Corruption {
+                height,
+                detail: "entry header truncated while reading height".to_string(),
+            })?;
+    let stored_height = u64::from_le_bytes(stored_height_bytes);
+    let length_bytes: [u8; 4] = header[8..12]
+        .try_into()
+        .map_err(|_| StorageError::Corruption {
+            height,
+            detail: "entry header truncated while reading length".to_string(),
+        })?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+
+    if stored_height != height {
+        return Err(StorageError::Corruption {
+            height,
+            detail: format!("index mismatch: stored height {stored_height}"),
+        });
+    }
+
+    let mut block_bytes = vec![0u8; length];
+    file.read_exact(&mut block_bytes)?;
+    if format_version >= BLOCK_FILE_VERSION_V2 {
+        let mut checksum_bytes = [0u8; ENTRY_CHECKSUM_BYTES];
+        file.read_exact(&mut checksum_bytes)?;
+        let expected = u32::from_le_bytes(checksum_bytes);
+        let actual = block_entry_crc(stored_height, length as u32, &block_bytes);
+        if expected != actual {
+            return Err(StorageError::BlockChecksumMismatch {
+                height,
+                expected,
+                actual,
+            });
+        }
+    }
+
+    use indra_core::codec::ByteReader;
+    let mut reader = ByteReader::new(&block_bytes);
+    BlockV1::decode(&mut reader).map_err(|e| StorageError::Corruption {
+        height,
+        detail: e.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +626,31 @@ mod tests {
         let got1 = store.get(1).unwrap();
         assert_eq!(got0.header.height, 0);
         assert_eq!(got1.header.height, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_only_get_returns_height_indexed_block() {
+        let path = temp_path("read_only_get");
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+
+        let b0 = dummy_block(0, [0u8; 32]);
+        let b1 = dummy_block(1, [1u8; 32]);
+        let b2 = dummy_block(2, [2u8; 32]);
+        store.append(&b0).unwrap();
+        store.append(&b1).unwrap();
+        store.append(&b2).unwrap();
+
+        let first = store.get_read_only(1).unwrap();
+        let second = store.get_read_only(1).unwrap();
+        assert_eq!(first.header.height, 1);
+        assert_eq!(first.header.prev_hash, Bytes32::from([1u8; 32]));
+        assert_eq!(first.header.block_hash(), second.header.block_hash());
+        assert_ne!(
+            first.header.block_hash(),
+            store.get_read_only(2).unwrap().header.block_hash()
+        );
 
         let _ = std::fs::remove_file(&path);
     }

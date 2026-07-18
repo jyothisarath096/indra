@@ -73,6 +73,18 @@ impl indra_rpc::handlers::RpcEngineView for NodeEngine {
         self.block_store.len()
     }
 
+    fn get_block_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<indra_core::types::block::BlockV1>, String> {
+        match self.block_store.get_read_only(height) {
+            Ok(block) => Ok(Some(block)),
+            Err(indra_storage::StorageError::BlockNotFound { .. })
+            | Err(indra_storage::StorageError::BlockPruned { .. }) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn get_epoch_record(&self, epoch: u64) -> Result<Option<indra_core::EpochRecord>, String> {
         match self.epoch_store.get(epoch) {
             Ok(record) => Ok(Some(record)),

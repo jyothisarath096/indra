@@ -3525,6 +3525,7 @@ struct RpcSnapshot {
     pruned_mode: bool,
     lowest_block: u64,
     blocks_retained: usize,
+    requested_block: Option<(u64, indra_core::types::block::BlockV1)>,
     latest_epoch: Option<u64>,
     epoch_records: HashMap<u64, indra_core::EpochRecord>,
     migration_history: Vec<indra_rpc::handlers::MigrationRecordView>,
@@ -3549,6 +3550,17 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
 
     fn blocks_retained(&self) -> usize {
         self.blocks_retained
+    }
+
+    fn get_block_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<indra_core::types::block::BlockV1>, String> {
+        Ok(self
+            .requested_block
+            .as_ref()
+            .filter(|(block_height, _)| *block_height == height)
+            .map(|(_, block)| block.clone()))
     }
 
     fn get_epoch_record(&self, epoch: u64) -> Result<Option<indra_core::EpochRecord>, String> {
@@ -3585,11 +3597,21 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
 
 fn snapshot_rpc_state(
     driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    requested_block_height: Option<u64>,
 ) -> Result<RpcSnapshot, String> {
     let guard = driver
         .lock()
         .map_err(|_| "consensus driver lock poisoned".to_string())?;
     let engine = &guard.engine;
+    let requested_block = match requested_block_height {
+        Some(height) => match engine.block_store.get_read_only(height) {
+            Ok(block) => Some((height, block)),
+            Err(indra_storage::StorageError::BlockNotFound { .. })
+            | Err(indra_storage::StorageError::BlockPruned { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        },
+        None => None,
+    };
     let latest_epoch = engine.epoch_store.latest_epoch();
     let epoch_records = match latest_epoch {
         Some(latest) => {
@@ -3626,10 +3648,20 @@ fn snapshot_rpc_state(
         pruned_mode: !engine.block_store.is_archive(),
         lowest_block: engine.block_store.lowest_height(),
         blocks_retained: engine.block_store.len(),
+        requested_block,
         latest_epoch,
         epoch_records,
         migration_history,
     })
+}
+
+fn requested_block_height_for_rpc(req: &indra_rpc::types::RpcRequest) -> Option<u64> {
+    if req.method != "indra_getBlock" {
+        return None;
+    }
+    req.params
+        .first()
+        .and_then(|param| indra_rpc::types::unquote(param).parse::<u64>().ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4012,7 +4044,7 @@ fn handle_rpc(
     }
 
     let response_body = {
-        let snapshot = match snapshot_rpc_state(driver) {
+        let snapshot = match snapshot_rpc_state(driver, requested_block_height_for_rpc(&req)) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let body = RpcResponse::err(req.id.clone(), -32000, error).to_json();
@@ -4903,6 +4935,7 @@ mod tests {
             pruned_mode: false,
             lowest_block: 0,
             blocks_retained: 43,
+            requested_block: None,
             latest_epoch: None,
             epoch_records: HashMap::new(),
             migration_history: Vec::new(),
@@ -4914,6 +4947,62 @@ mod tests {
                 assert_eq!(result, r#"{"height":42}"#);
             }
             _ => panic!("height query should be served from snapshot"),
+        }
+    }
+
+    #[test]
+    fn rpc_snapshot_serves_requested_block_without_tip_stub() {
+        let mut chain = indra_state::ChainState::new_genesis();
+        chain.height = 2;
+        let block = indra_core::types::block::BlockV1 {
+            header: indra_core::types::block::BlockHeaderV1 {
+                protocol_version: indra_core::ProtocolVersion::CURRENT,
+                height: 1,
+                prev_hash: indra_core::Bytes32::from([0x10; 32]),
+                timestamp: 1_700_000_001,
+                state_root: indra_core::Bytes32::from([0x11; 32]),
+                validator_set_root: indra_core::Bytes32::from([0x12; 32]),
+                mempool_set_root: indra_core::Bytes32::from([0x13; 32]),
+                value_hash: indra_core::Bytes32::from([0x14; 32]),
+                base_fee: 101,
+                proposer_round: 0,
+                polc_round: indra_core::types::block::NO_POLC_ROUND,
+                proposer_vrf_output: indra_core::Bytes32::from([0x15; 32]),
+                proposer_vrf_proof: indra_core::VariableBytes::<
+                    { indra_core::types::primitives::MAX_VRF_PROOF_BYTES },
+                >::from_slice(&[0x16; 64])
+                .unwrap(),
+                quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
+            },
+            transactions: Vec::new(),
+            slashing_evidence: Vec::new(),
+            governance_ops: Vec::new(),
+            staking_ops: Vec::new(),
+            vrf_reveals: Vec::new(),
+        };
+        let expected_hash = hex::encode(block.header.block_hash().0);
+        let snapshot = RpcSnapshot {
+            chain,
+            mempool_size: 0,
+            pruned_mode: true,
+            lowest_block: 1,
+            blocks_retained: 2,
+            requested_block: Some((1, block)),
+            latest_epoch: None,
+            epoch_records: HashMap::new(),
+            migration_history: Vec::new(),
+        };
+        let state = indra_rpc::handlers::NodeState::read_only(&snapshot);
+
+        match indra_rpc::handlers::dispatch("indra_getBlock", &["1".to_string()], &state) {
+            indra_rpc::handlers::DispatchResult::Ready(Ok(result)) => {
+                assert!(result.contains(r#""height":1"#));
+                assert!(result.contains(&format!(r#""block_hash":"{expected_hash}""#)));
+                assert!(result.contains(r#""timestamp":1700000001"#));
+                assert!(!result.contains("full block retrieval added in Phase 8"));
+            }
+            _ => panic!("getBlock should be served from requested block snapshot"),
         }
     }
 

@@ -7,7 +7,10 @@ use indra_core::{
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{SCHEMA_VERSION, SCHEMA_VERSION_GENESIS},
     types::{
-        epoch_record::EpochRecord, governance::GovernanceOpV2, staking::StakingOp,
+        block::{BlockV1, NO_POLC_ROUND},
+        epoch_record::EpochRecord,
+        governance::GovernanceOpV2,
+        staking::StakingOp,
         transaction::TransactionV1,
     },
     Bytes32,
@@ -196,6 +199,10 @@ pub trait RpcEngineView {
     fn lowest_block(&self) -> u64;
     /// Return the number of locally retained blocks.
     fn blocks_retained(&self) -> usize;
+    /// Return a retained block by height, if this RPC context has block-store access.
+    fn get_block_by_height(&self, _height: u64) -> Result<Option<BlockV1>, String> {
+        Ok(None)
+    }
     /// Return a stored epoch record, if available.
     fn get_epoch_record(&self, _epoch: u64) -> Result<Option<EpochRecord>, String> {
         Ok(None)
@@ -608,8 +615,9 @@ fn get_mempool_size(state: &NodeState<'_>) -> RpcResult<String> {
 /// `indra_getBlock` — returns a block by height.
 ///
 /// Params: `[<height: number>]`
-/// Result: `{"height", "prev_hash", "state_root", "base_fee",
-///           "tx_count", "timestamp"}`
+/// Result: header-level block metadata for a retained block. This method does
+/// not return full transaction or operation payloads; those remain a separate
+/// full-block/RPC-size policy decision.
 fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let height_str = params
         .first()
@@ -619,30 +627,78 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
         .parse()
         .map_err(|_| RpcError::InvalidParams(format!("invalid height: {height_str}")))?;
 
-    // For now, return current block info if height matches current height
-    // Full block retrieval from block_store requires &mut (Phase 8 refactor)
     let s = &state.chain;
     if height < state.lowest_block {
         return Err(RpcError::NotFound(format!(
-            "Block {height} has been pruned. Lowest available: {}. Use an archive node for historical queries.",
+            "block {height} is below the local retention window; lowest available block is {}. Use an archive node for historical queries.",
             state.lowest_block
         )));
     }
 
     if height > s.height {
         return Err(RpcError::NotFound(format!(
-            "block {height} not yet produced"
+            "block {height} exceeds current tip {}",
+            s.height
         )));
     }
 
-    // Return summary info available from chain state
-    let tip = hex::encode(s.tip_hash.0);
-    Ok(format!(
-        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"note":"full block retrieval added in Phase 8"}}"#,
-        height = height,
-        tip = tip,
-        base_fee = s.base_fee,
-    ))
+    match state.engine.get_block_by_height(height) {
+        Ok(Some(block)) => Ok(block_rpc_json(&block)),
+        Ok(None) => Err(RpcError::NotFound(format!(
+            "block {height} is not available in this node's retained block log"
+        ))),
+        Err(error) => Err(RpcError::Internal(format!(
+            "failed to read block {height}: {error}"
+        ))),
+    }
+}
+
+fn optional_hex_json(value: Option<Bytes32>) -> String {
+    value
+        .map(|bytes| format!(r#""{}""#, hex::encode(bytes.0)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn polc_round_json(polc_round: u32) -> String {
+    if polc_round == NO_POLC_ROUND {
+        "null".to_string()
+    } else {
+        polc_round.to_string()
+    }
+}
+
+fn block_rpc_json(block: &BlockV1) -> String {
+    let header = &block.header;
+    format!(
+        concat!(
+            r#"{{"height":{},"block_hash":"{}","protocol_version":{},"prev_hash":"{}","#,
+            r#""timestamp":{},"state_root":"{}","validator_set_root":"{}","#,
+            r#""mempool_set_root":"{}","value_hash":"{}","base_fee":{},"proposer_round":{},"polc_round":{},"#,
+            r#""proposer_vrf_output":"{}","proposer_vrf_proof_len":{},"quorum_certificate_len":{},"election_result_hash":{},"#,
+            r#""tx_count":{},"slash_evidence_count":{},"governance_op_count":{},"staking_op_count":{},"vrf_reveal_count":{}}}"#
+        ),
+        header.height,
+        hex::encode(header.block_hash().0),
+        header.protocol_version.0,
+        hex::encode(header.prev_hash.0),
+        header.timestamp,
+        hex::encode(header.state_root.0),
+        hex::encode(header.validator_set_root.0),
+        hex::encode(header.mempool_set_root.0),
+        hex::encode(header.value_hash.0),
+        header.base_fee,
+        header.proposer_round,
+        polc_round_json(header.polc_round),
+        hex::encode(header.proposer_vrf_output.0),
+        header.proposer_vrf_proof.len(),
+        header.quorum_certificate.len(),
+        optional_hex_json(header.election_result_hash),
+        block.transactions.len(),
+        block.slashing_evidence.len(),
+        block.governance_ops.len(),
+        block.staking_ops.len(),
+        block.vrf_reveals.len(),
+    )
 }
 
 /// Domain separator for the temporary legacy UTXO-scan ownership proof.
@@ -2022,10 +2078,91 @@ fn send_transaction(params: &[String]) -> DispatchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::{
+        types::{
+            block::{BlockHeaderV1, BlockV1},
+            primitives::MAX_VRF_PROOF_BYTES,
+        },
+        ProtocolVersion, VariableBytes,
+    };
     use indra_state::ChainState;
+    use std::collections::BTreeMap;
 
     fn make_state(_suffix: &str) -> ChainState {
         ChainState::new_genesis()
+    }
+
+    struct BlockBackedEngine {
+        chain: ChainState,
+        lowest_block: u64,
+        blocks: BTreeMap<u64, BlockV1>,
+    }
+
+    impl RpcEngineView for BlockBackedEngine {
+        fn chain_state(&self) -> &ChainState {
+            &self.chain
+        }
+
+        fn mempool_size(&self) -> usize {
+            0
+        }
+
+        fn pruned_mode(&self) -> bool {
+            true
+        }
+
+        fn lowest_block(&self) -> u64 {
+            self.lowest_block
+        }
+
+        fn blocks_retained(&self) -> usize {
+            self.blocks.len()
+        }
+
+        fn get_block_by_height(&self, height: u64) -> Result<Option<BlockV1>, String> {
+            Ok(self.blocks.get(&height).cloned())
+        }
+    }
+
+    fn dummy_block(height: u64, byte: u8) -> BlockV1 {
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion::CURRENT,
+                height,
+                prev_hash: Bytes32::from([byte.wrapping_sub(1); 32]),
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::from([byte; 32]),
+                validator_set_root: Bytes32::from([byte.wrapping_add(1); 32]),
+                mempool_set_root: Bytes32::from([byte.wrapping_add(2); 32]),
+                value_hash: Bytes32::from([byte.wrapping_add(3); 32]),
+                base_fee: 100 + height,
+                proposer_round: byte as u32,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::from([byte.wrapping_add(4); 32]),
+                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[byte; 64])
+                    .unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: Some(Bytes32::from([byte.wrapping_add(5); 32])),
+            },
+            transactions: Vec::new(),
+            slashing_evidence: Vec::new(),
+            governance_ops: Vec::new(),
+            staking_ops: Vec::new(),
+            vrf_reveals: Vec::new(),
+        }
+    }
+
+    fn block_backed_engine() -> BlockBackedEngine {
+        let mut chain = ChainState::new_genesis();
+        chain.height = 2;
+        let block1 = dummy_block(1, 0x11);
+        let block2 = dummy_block(2, 0x22);
+        chain.tip_hash = block2.header.block_hash();
+        BlockBackedEngine {
+            chain,
+            lowest_block: 1,
+            blocks: [(1, block1), (2, block2)].into_iter().collect(),
+        }
     }
 
     #[test]
@@ -2074,6 +2211,73 @@ mod tests {
         let state = NodeState::read_only(&engine);
         let result = get_block(&["999".to_string()], &state);
         assert!(matches!(result, Err(RpcError::NotFound(_))));
+    }
+
+    #[test]
+    fn get_block_returns_requested_historical_height_not_tip() {
+        let engine = block_backed_engine();
+        let state = NodeState::read_only(&engine);
+        let result = get_block(&["1".to_string()], &state).unwrap();
+        let expected_hash = hex::encode(engine.blocks[&1].header.block_hash().0);
+        let tip_hash = hex::encode(engine.blocks[&2].header.block_hash().0);
+        assert!(result.contains(r#""height":1"#), "{result}");
+        assert!(result.contains(&format!(r#""block_hash":"{expected_hash}""#)));
+        assert!(result.contains(r#""timestamp":1700000001"#));
+        assert!(result.contains(&format!(r#""state_root":"{}""#, "11".repeat(32))));
+        assert!(
+            !result.contains(&tip_hash),
+            "returned current tip instead of requested block: {result}"
+        );
+        assert!(!result.contains("full block retrieval added in Phase 8"));
+    }
+
+    #[test]
+    fn get_block_same_height_is_stable() {
+        let engine = block_backed_engine();
+        let state = NodeState::read_only(&engine);
+        let first = get_block(&["1".to_string()], &state).unwrap();
+        let second = get_block(&["1".to_string()], &state).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn get_block_below_retention_window_has_specific_error() {
+        let engine = block_backed_engine();
+        let state = NodeState::read_only(&engine);
+        let result = get_block(&["0".to_string()], &state);
+        match result {
+            Err(RpcError::NotFound(message)) => {
+                assert!(message.contains("below the local retention window"));
+                assert!(message.contains("lowest available block is 1"));
+            }
+            other => panic!("expected retention-window NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_block_above_tip_has_distinct_error() {
+        let engine = block_backed_engine();
+        let state = NodeState::read_only(&engine);
+        let result = get_block(&["3".to_string()], &state);
+        match result {
+            Err(RpcError::NotFound(message)) => {
+                assert!(message.contains("exceeds current tip 2"));
+                assert!(!message.contains("retention window"));
+            }
+            other => panic!("expected above-tip NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_block_current_tip_height_matches_chain_info_height() {
+        let engine = block_backed_engine();
+        let state = NodeState::read_only(&engine);
+        let block = get_block(&["2".to_string()], &state).unwrap();
+        let chain_info = get_chain_info(&state).unwrap();
+        assert!(block.contains(r#""height":2"#));
+        assert!(chain_info.contains(r#""height":2"#));
+        let expected_hash = hex::encode(engine.blocks[&2].header.block_hash().0);
+        assert!(block.contains(&format!(r#""block_hash":"{expected_hash}""#)));
     }
 
     #[test]
