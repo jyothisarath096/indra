@@ -973,13 +973,16 @@ fn apply_claim_rewards(
         {
             commitment.put_validator(&validator, current_height);
         }
-    } else if let Some(entry) = state
-        .delegations
-        .get_delegator_mut(validator_id, &delegator_id)
+    } else if let Some(updated_entry) =
+        state
+            .delegations
+            .update_delegator(validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = 0;
+                entry.clone()
+            })
     {
-        entry.pending_rewards = 0;
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_delegator(validator_id, entry);
+            commitment.put_delegator(validator_id, &updated_entry);
         }
     }
 
@@ -2263,9 +2266,10 @@ mod tests {
             .unwrap();
         state
             .delegations
-            .get_delegator_mut(&validator_id, &delegator_id)
-            .unwrap()
-            .pending_rewards = DUST_LIMIT_SPARK;
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
 
         let op = signed_op(
             StakingOpBody::ClaimRewards {
@@ -2295,9 +2299,10 @@ mod tests {
             .unwrap();
         state
             .delegations
-            .get_delegator_mut(&validator_id, &delegator_id)
-            .unwrap()
-            .pending_rewards = DUST_LIMIT_SPARK;
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
         let op = signed_op(
             StakingOpBody::ClaimRewards {
                 validator_id,
@@ -2312,7 +2317,9 @@ mod tests {
         assert_eq!(
             state
                 .delegations
-                .get_delegator_mut(&validator_id, &delegator_id)
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
                 .unwrap()
                 .pending_rewards,
             0
@@ -2332,9 +2339,10 @@ mod tests {
             .unwrap();
         state
             .delegations
-            .get_delegator_mut(&validator_id, &delegator_id)
-            .unwrap()
-            .pending_rewards = DUST_LIMIT_SPARK - 1;
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK - 1;
+            })
+            .unwrap();
         let op = signed_op(
             StakingOpBody::ClaimRewards {
                 validator_id,
@@ -3214,9 +3222,10 @@ mod tests {
             .unwrap();
         state
             .delegations
-            .get_delegator_mut(&lowest_id, &delegator)
-            .unwrap()
-            .pending_rewards = DUST_LIMIT_SPARK - 1;
+            .update_delegator(&lowest_id, &delegator, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK - 1;
+            })
+            .unwrap();
         state.staked_bonds.insert(
             delegator_bond,
             StakeBondEntry {

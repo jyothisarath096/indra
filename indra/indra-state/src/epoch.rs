@@ -562,7 +562,9 @@ fn apply_auto_delegations(
     for (delegator_id, target_id, amount_spark) in &virtual_delegations {
         let (previous_staked_spark, previous_pending_rewards, had_existing_entry) = state
             .delegations
-            .get_delegator_mut(target_id, delegator_id)
+            .get_delegators(target_id)
+            .iter()
+            .find(|entry| entry.delegator_id == *delegator_id)
             .map(|entry| (entry.staked_spark, entry.pending_rewards, true))
             .unwrap_or((0, 0, false));
         if let Err(reason) = state.delegations.add_delegation(
@@ -629,17 +631,18 @@ fn remove_auto_delegations(
             );
         }
         if snapshot.had_existing_entry {
-            if let Some(entry) = state
-                .delegations
-                .get_delegator_mut(&snapshot.target_id, &snapshot.delegator_id)
-            {
-                let real_reward = reward_delta.saturating_sub(virtual_reward);
-                entry.staked_spark = snapshot.previous_staked_spark;
-                entry.pending_rewards = snapshot
-                    .previous_pending_rewards
-                    .saturating_add(real_reward);
-                entry.rewards_last_epoch = current_epoch;
-            }
+            let _ = state.delegations.update_delegator(
+                &snapshot.target_id,
+                &snapshot.delegator_id,
+                |entry| {
+                    let real_reward = reward_delta.saturating_sub(virtual_reward);
+                    entry.staked_spark = snapshot.previous_staked_spark;
+                    entry.pending_rewards = snapshot
+                        .previous_pending_rewards
+                        .saturating_add(real_reward);
+                    entry.rewards_last_epoch = current_epoch;
+                },
+            );
         } else {
             state
                 .delegations

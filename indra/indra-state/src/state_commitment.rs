@@ -522,15 +522,19 @@ mod tests {
             state.rebuild_state_commitment_v2(height);
             let init = init_start.elapsed();
 
-            let updated = {
-                let entry = state
-                    .delegations
-                    .get_delegators_mut(&validator_id)
-                    .and_then(|entries| entries.first_mut())
-                    .unwrap();
-                entry.pending_rewards = entry.pending_rewards.saturating_add(1);
-                entry.clone()
-            };
+            let first_delegator_id = state
+                .delegations
+                .get_delegators(&validator_id)
+                .first()
+                .unwrap()
+                .delegator_id;
+            let updated = state
+                .delegations
+                .update_delegator(&validator_id, &first_delegator_id, |entry| {
+                    entry.pending_rewards = entry.pending_rewards.saturating_add(1);
+                    entry.clone()
+                })
+                .unwrap();
             let update_start = Instant::now();
             state
                 .state_commitment_v2

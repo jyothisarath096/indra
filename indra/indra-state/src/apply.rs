@@ -1402,6 +1402,27 @@ mod tests {
         op
     }
 
+    fn signed_undelegate_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        bond_utxo_id: Bytes32,
+        delegator_pubkey: HybridPubKey,
+        keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        let mut op = StakingOp {
+            body: StakingOpBody::Undelegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey,
+            },
+            nonce,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(keypair, &state.chain_id, &mut op);
+        op
+    }
+
     fn active_validator(validator_id: Bytes32) -> ValidatorEntry {
         ValidatorEntry {
             validator_id,
@@ -2146,6 +2167,52 @@ mod tests {
         assert!(
             mutation_count >= 4,
             "staking block should exercise scoped undo mutations, got {mutation_count}"
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_delegation_mutation_failpoints() {
+        let mut state = ChainState::new_genesis();
+        let (delegator_pubkey, keypair) = make_test_keypair([0x71; 32]);
+        let output = dummy_output(0x08, delegator_pubkey.clone());
+        let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
+        let validator_id = Bytes32::from([0x72; 32]);
+        state
+            .validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+
+        let delegate_op = signed_delegate_op(
+            &state,
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey.clone(),
+            &keypair,
+            1,
+        );
+        let mut delegate_block = make_block(&state, vec![]);
+        delegate_block.staking_ops.push(delegate_op);
+        let delegate_mutations = assert_all_failpoints_roll_back(&state, &delegate_block);
+        assert!(
+            delegate_mutations >= 5,
+            "delegation block should exercise delegation rollback mutations, got {delegate_mutations}"
+        );
+
+        apply_block(&mut state, &delegate_block, 0).unwrap();
+        let undelegate_op = signed_undelegate_op(
+            &state,
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey,
+            &keypair,
+            2,
+        );
+        let mut undelegate_block = make_block(&state, vec![]);
+        undelegate_block.staking_ops.push(undelegate_op);
+        let undelegate_mutations = assert_all_failpoints_roll_back(&state, &undelegate_block);
+        assert!(
+            undelegate_mutations >= 4,
+            "undelegation block should exercise delegation rollback mutations, got {undelegate_mutations}"
         );
     }
 
@@ -4033,7 +4100,9 @@ mod tests {
         assert_eq!(
             state
                 .delegations
-                .get_delegator_mut(&validator_id, &delegator_id)
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
                 .unwrap()
                 .staked_spark,
             200_000
