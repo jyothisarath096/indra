@@ -22,7 +22,7 @@ use indra_core::{
 use indra_crypto::sha256;
 
 use crate::{
-    smt::CompressedAuthTree,
+    persistent::PersistentAuthTree,
     validator::{DelegationReturnEvent, DelegatorEntry, StakeBondEntry, ValidatorEntry},
     ChainState,
 };
@@ -39,7 +39,7 @@ const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateCommitmentV2 {
-    tree: CompressedAuthTree,
+    tree: PersistentAuthTree,
 }
 
 impl StateCommitmentV2 {
@@ -81,7 +81,7 @@ impl StateCommitmentV2 {
             }
         }
         Self {
-            tree: CompressedAuthTree::from_pairs(leaves)
+            tree: PersistentAuthTree::from_pairs(leaves)
                 .expect("StateCommitmentV2 keys are domain-separated and unique"),
         }
     }
@@ -298,6 +298,9 @@ mod tests {
         },
         VariableBytes,
     };
+    use std::time::Instant;
+
+    use crate::smt::CompressedAuthTree;
 
     fn id(byte: u8) -> Bytes32 {
         Bytes32::from([byte; 32])
@@ -354,11 +357,109 @@ mod tests {
         }
     }
 
+    fn legacy_state_commitment_v2_root(state: &ChainState, height: u64) -> Bytes32 {
+        let mut leaves = Vec::new();
+        for validator in state.validators.all_validators() {
+            leaves.push((
+                validator_key(&validator.validator_id),
+                validator_value_hash(validator, height),
+            ));
+        }
+        for (validator_id, delegators) in state.delegations.all_delegators() {
+            for delegator in delegators {
+                leaves.push((
+                    delegator_key(validator_id, &delegator.delegator_id),
+                    delegator_value_hash(delegator),
+                ));
+            }
+        }
+        for (signer_id, nonce) in &state.staking_nonces {
+            leaves.push((
+                staking_nonce_key(signer_id),
+                staking_nonce_value_hash(signer_id, *nonce),
+            ));
+        }
+        for (utxo_id, bond) in &state.staked_bonds {
+            leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
+        }
+        for hash in &state.applied_slash_hashes {
+            leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
+        }
+        if registered_validator_cap_active(height) {
+            for event in &state.delegation_return_events {
+                leaves.push((
+                    delegation_return_event_key(event),
+                    delegation_return_event_value_hash(event),
+                ));
+            }
+        }
+        Bytes32::from(
+            CompressedAuthTree::from_pairs(leaves)
+                .expect("legacy oracle keys are domain-separated and unique")
+                .root(),
+        )
+    }
+
+    fn synthetic_delegation_state(size: usize, height: u64) -> ChainState {
+        let validator = validator(0x99);
+        let validator_id = validator.validator_id;
+        let mut state = ChainState::new_genesis();
+        state.validators.upsert(validator).unwrap();
+        for index in 0..size {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0xD0;
+            bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+            state.delegations.push_delegator_for_test(
+                validator_id,
+                DelegatorEntry {
+                    delegator_id: Bytes32::from(bytes),
+                    staked_spark: 1_000,
+                    pending_rewards: (index % 17) as u64,
+                    rewards_last_epoch: (index % 11) as u64,
+                    unbonding_end_epoch: (index % 97 == 0).then_some(100 + index as u64),
+                },
+            );
+        }
+        state.height = height;
+        state
+    }
+
+    fn synthetic_commitment_leaves(size: usize, height: u64) -> Vec<([u8; 32], [u8; 32])> {
+        let validator = validator(0x99);
+        let validator_id = validator.validator_id;
+        let mut leaves = Vec::with_capacity(size.saturating_add(1));
+        leaves.push((
+            validator_key(&validator_id),
+            validator_value_hash(&validator, height),
+        ));
+        for index in 0..size {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0xD0;
+            bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+            let delegator = DelegatorEntry {
+                delegator_id: Bytes32::from(bytes),
+                staked_spark: 1_000,
+                pending_rewards: (index % 17) as u64,
+                rewards_last_epoch: (index % 11) as u64,
+                unbonding_end_epoch: (index % 97 == 0).then_some(100 + index as u64),
+            };
+            leaves.push((
+                delegator_key(&validator_id, &delegator.delegator_id),
+                delegator_value_hash(&delegator),
+            ));
+        }
+        leaves
+    }
+
     #[test]
     fn state_commitment_v2_incremental_matches_rebuild_after_each_category() {
         let height = u64::MAX;
         let mut state = ChainState::new_genesis();
         state.rebuild_state_commitment_v2(height);
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
 
         let validator = validator(0x11);
         state.validators.upsert(validator.clone()).unwrap();
@@ -370,6 +471,10 @@ mod tests {
         assert_eq!(
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
         );
 
         let delegator = DelegatorEntry {
@@ -398,6 +503,10 @@ mod tests {
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
         );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
 
         state.staking_nonces.insert(id(0x33), 4);
         state
@@ -408,6 +517,10 @@ mod tests {
         assert_eq!(
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
         );
 
         let bond_id = id(0x44);
@@ -422,6 +535,10 @@ mod tests {
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
         );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
 
         let slash_hash = id(0x55);
         state.applied_slash_hashes.insert(slash_hash);
@@ -433,6 +550,10 @@ mod tests {
         assert_eq!(
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
         );
 
         let event = DelegationReturnEvent {
@@ -450,6 +571,10 @@ mod tests {
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
         );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
 
         state
             .state_commitment_v2
@@ -463,6 +588,24 @@ mod tests {
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
         );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
+    }
+
+    #[test]
+    fn state_commitment_v2_persistent_tree_matches_legacy_oracle_roots() {
+        for size in [0usize, 1, 17, 257] {
+            let height = u64::MAX;
+            let mut state = synthetic_delegation_state(size, height);
+            state.rebuild_state_commitment_v2(height);
+            assert_eq!(
+                state.state_commitment_v2_root(height),
+                legacy_state_commitment_v2_root(&state, height),
+                "persistent StateCommitmentV2 root diverged from legacy compressed oracle at size {size}"
+            );
+        }
     }
 
     #[test]
@@ -484,8 +627,6 @@ mod tests {
     #[test]
     #[ignore = "synthetic StateCommitmentV2 scale benchmark; run explicitly with --ignored --nocapture"]
     fn state_commitment_v2_synthetic_benchmark() {
-        use std::time::Instant;
-
         let sizes = std::env::var("INDRA_STATE_COMMITMENT_BENCH_SIZES")
             .unwrap_or_else(|_| "100000".to_string())
             .split(',')
@@ -498,29 +639,21 @@ mod tests {
         );
 
         for size in sizes {
-            let validator = validator(0x99);
-            let validator_id = validator.validator_id;
-            let mut state = ChainState::new_genesis();
-            state.validators.upsert(validator).unwrap();
-            for index in 0..size {
-                let mut bytes = [0u8; 32];
-                bytes[0] = 0xD0;
-                bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
-                state.delegations.push_delegator_for_test(
-                    validator_id,
-                    DelegatorEntry {
-                        delegator_id: Bytes32::from(bytes),
-                        staked_spark: 1_000,
-                        pending_rewards: 0,
-                        rewards_last_epoch: 0,
-                        unbonding_end_epoch: None,
-                    },
-                );
-            }
+            let mut state = synthetic_delegation_state(size, height);
+            let validator_id = state
+                .validators
+                .all_validators()
+                .next()
+                .unwrap()
+                .validator_id;
 
             let init_start = Instant::now();
             state.rebuild_state_commitment_v2(height);
             let init = init_start.elapsed();
+            assert_eq!(
+                state.state_commitment_v2_root(height),
+                legacy_state_commitment_v2_root(&state, height)
+            );
 
             let first_delegator_id = state
                 .delegations
@@ -556,6 +689,47 @@ mod tests {
                 update,
                 root_reads / 1_000,
                 hex::encode(root.0)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode StateCommitmentV2 tree-clone benchmark; run with --release --ignored --nocapture"]
+    fn state_commitment_v2_persistent_tree_clone_benchmark() {
+        let sizes = std::env::var("INDRA_STATE_COMMITMENT_V2_CLONE_BENCH_SIZES")
+            .unwrap_or_else(|_| "100000,1000000,10000000".to_string())
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        let height = u64::MAX;
+
+        for size in sizes {
+            let legacy_build_start = Instant::now();
+            let legacy_tree =
+                CompressedAuthTree::from_pairs(synthetic_commitment_leaves(size, height)).unwrap();
+            let legacy_build = legacy_build_start.elapsed();
+
+            let persistent_build_start = Instant::now();
+            let persistent_commitment = StateCommitmentV2 {
+                tree: PersistentAuthTree::from_pairs(synthetic_commitment_leaves(size, height))
+                    .unwrap(),
+            };
+            let persistent_build = persistent_build_start.elapsed();
+            let persistent_root = persistent_commitment.root();
+            assert_eq!(Bytes32::from(legacy_tree.root()), persistent_root);
+
+            let legacy_clone_start = Instant::now();
+            let legacy_clone = legacy_tree.clone();
+            let legacy_clone_elapsed = legacy_clone_start.elapsed();
+            assert_eq!(Bytes32::from(legacy_clone.root()), persistent_root);
+
+            let persistent_clone_start = Instant::now();
+            let persistent_clone = persistent_commitment.clone();
+            let persistent_clone_elapsed = persistent_clone_start.elapsed();
+            assert_eq!(persistent_clone.root(), persistent_root);
+
+            println!(
+                "stage2d_state_commitment_v2_clone delegators={size} legacy_build={legacy_build:?} persistent_build={persistent_build:?} legacy_compressed_tree_clone={legacy_clone_elapsed:?} persistent_auth_tree_clone={persistent_clone_elapsed:?}"
             );
         }
     }
