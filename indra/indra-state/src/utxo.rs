@@ -14,12 +14,13 @@
 //! This is collision-resistant and position-dependent: the same output bytes
 //! at different positions in the chain produce different IDs.
 //!
-//! ## Storage model (Phase 2)
+//! ## Storage model
 //!
-//! In-memory HashMap. Phase 5 replaces this with a persistent Merkle trie.
-//! The interface is unchanged — only the backing store swaps out.
+//! Canonical entries are kept in a persistent ordered map, with a frozen
+//! legacy sparse tree for pre-compressed-auth-tree compatibility and a
+//! persistent compressed authenticated tree for active roots/proofs.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
@@ -36,7 +37,8 @@ use indra_crypto::sha256;
 
 use crate::{
     error::{StateError, StateResult},
-    smt::{AuthTreeProof, CompressedAuthTree, MerkleProof, SparseMerkleTree},
+    persistent::{PersistentAuthTree, PersistentOrdMap},
+    smt::{AuthTreeProof, MerkleProof, SparseMerkleTree},
 };
 
 /// Defensive snapshot decode ceiling for UTXO entries.
@@ -129,12 +131,13 @@ fn decode_utxo_entry_fields(
 /// The complete set of unspent transaction outputs.
 ///
 /// Keyed by UTXO ID (32-byte hash). Supports insert, lookup, and spend.
-/// All operations are O(1) average via HashMap.
-#[derive(Debug, Clone, Default)]
+/// Cloning is structurally shared; mutations path-copy touched entries and
+/// compressed-tree nodes.
+#[derive(Debug, Clone)]
 pub struct UtxoSet {
-    entries: HashMap<Bytes32, UtxoEntry>,
+    entries: PersistentOrdMap<Bytes32, UtxoEntry>,
     smt: Arc<SparseMerkleTree>,
-    compressed: CompressedAuthTree,
+    compressed: PersistentAuthTree,
 }
 
 impl PartialEq for UtxoSet {
@@ -149,6 +152,12 @@ impl PartialEq for UtxoSet {
 }
 
 impl Eq for UtxoSet {}
+
+impl Default for UtxoSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Encode for UtxoSet {
     fn encode(&self, buf: &mut Vec<u8>) {
@@ -208,9 +217,9 @@ impl UtxoSet {
     /// Create an empty UTXO set.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: PersistentOrdMap::new(),
             smt: Arc::new(SparseMerkleTree::new()),
-            compressed: CompressedAuthTree::new(),
+            compressed: PersistentAuthTree::new(),
         }
     }
 
@@ -390,7 +399,7 @@ impl UtxoSet {
     /// Versioned proof under the proof rule active at `height`.
     pub fn prove_at_height(&self, id: &Bytes32, height: u64) -> AuthTreeProof {
         if compressed_auth_tree_active(height) {
-            AuthTreeProof::V2Compressed(self.compressed.prove(id.0))
+            self.compressed.prove(id.0)
         } else {
             AuthTreeProof::V1LegacySparse(self.smt.prove(id.0))
         }
@@ -402,7 +411,7 @@ impl UtxoSet {
     }
 
     fn rebuild_compressed_cache(&mut self) {
-        self.compressed = CompressedAuthTree::from_pairs(
+        self.compressed = PersistentAuthTree::from_pairs(
             self.entries
                 .values()
                 .map(|entry| (entry.utxo_id.0, Self::leaf_value(entry))),
@@ -431,11 +440,16 @@ fn should_update_legacy_smt(height: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smt::CompressedAuthTree;
     use indra_core::{
         codec::ByteReader, types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT,
         types::transaction::OutputV1, Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
     };
-    use std::{env, time::Instant};
+    use std::{
+        collections::HashMap,
+        env,
+        time::{Duration, Instant},
+    };
 
     fn dummy_output(byte: u8) -> OutputV1 {
         OutputV1 {
@@ -662,6 +676,147 @@ mod tests {
             expected_compressed_root,
             "post-activation consensus root still comes from the rebuilt compressed tree"
         );
+    }
+
+    #[test]
+    fn persistent_entries_preserve_legacy_encoding_order_and_compressed_proofs() {
+        let mut set = UtxoSet::new();
+        let mut legacy_entries = HashMap::new();
+        for (idx, tag) in [0x44, 0x11, 0x77, 0x22].into_iter().enumerate() {
+            let output = dummy_output(tag);
+            let id = set.insert(output.clone(), 10, 0, idx as u32).unwrap();
+            legacy_entries.insert(
+                id,
+                UtxoEntry {
+                    utxo_id: id,
+                    output,
+                    created_height: 10,
+                    tx_index: 0,
+                    output_index: idx as u32,
+                },
+            );
+        }
+
+        let mut legacy_encoded_entries: Vec<_> = legacy_entries.values().cloned().collect();
+        legacy_encoded_entries.sort_by_key(|entry| entry.utxo_id.0);
+        let mut legacy_encoded = Vec::new();
+        encode_list(&legacy_encoded_entries, &mut legacy_encoded);
+        assert_eq!(
+            set.encode_to_vec(),
+            legacy_encoded,
+            "PersistentOrdMap-backed UtxoSet encoding must remain byte-identical to sorted legacy HashMap encoding"
+        );
+
+        let legacy_compressed = CompressedAuthTree::from_pairs(
+            legacy_entries
+                .values()
+                .map(|entry| (entry.utxo_id.0, UtxoSet::leaf_value(entry))),
+        )
+        .unwrap();
+        assert_eq!(
+            set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            legacy_compressed.root()
+        );
+
+        for entry in legacy_entries.values() {
+            let AuthTreeProof::V2Compressed(proof) =
+                set.prove_at_height(&entry.utxo_id, COMPRESSED_AUTH_TREE_HEIGHT)
+            else {
+                panic!("expected compressed UTXO proof after activation");
+            };
+            assert_eq!(proof, legacy_compressed.prove(entry.utxo_id.0));
+        }
+    }
+
+    #[test]
+    fn persistent_entries_are_insertion_order_independent() {
+        let outputs: Vec<_> = (0..8u8).map(dummy_output).collect();
+        let mut forward = UtxoSet::new();
+        let mut reverse = UtxoSet::new();
+
+        for (idx, output) in outputs.iter().cloned().enumerate() {
+            forward.insert(output, 10, 0, idx as u32).unwrap();
+        }
+        for (idx, output) in outputs.into_iter().enumerate().rev() {
+            reverse.insert(output, 10, 0, idx as u32).unwrap();
+        }
+
+        assert_eq!(forward.encode_to_vec(), reverse.encode_to_vec());
+        assert_eq!(
+            forward.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            reverse.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode Stage 2b clone benchmark; run with --release --ignored --nocapture"]
+    fn persistent_entries_and_compressed_tree_clone_benchmark() {
+        // This is intentionally ignored and release-mode-only. The benchmark
+        // isolates the Stage 2b payoff: cloning canonical UTXO entries plus the
+        // active compressed tree. Debug-mode timings are not meaningful.
+        let sizes = env::var("INDRA_STAGE2B_UTXO_CLONE_BENCH_SIZES")
+            .unwrap_or_else(|_| "100000,1000000".to_string());
+        for size in sizes
+            .split(',')
+            .map(|raw| raw.trim().parse::<usize>().expect("valid benchmark size"))
+        {
+            let mut entries = Vec::with_capacity(size);
+            for i in 0..size {
+                let output = dummy_output((i & 0xff) as u8);
+                let utxo_id = UtxoSet::compute_utxo_id(&output, 1, 0, i as u32);
+                entries.push(UtxoEntry {
+                    utxo_id,
+                    output,
+                    created_height: 1,
+                    tx_index: 0,
+                    output_index: i as u32,
+                });
+            }
+            entries.sort_by_key(|entry| entry.utxo_id.0);
+
+            let mut migrated = UtxoSet::new();
+            for entry in entries.iter().cloned() {
+                migrated.restore_for_rollback_at_height(entry, COMPRESSED_AUTH_TREE_HEIGHT);
+            }
+            let mut legacy_entries = HashMap::with_capacity(size);
+            for entry in entries.iter().cloned() {
+                legacy_entries.insert(entry.utxo_id, entry);
+            }
+            let legacy_compressed = CompressedAuthTree::from_pairs(
+                entries
+                    .iter()
+                    .map(|entry| (entry.utxo_id.0, UtxoSet::leaf_value(entry))),
+            )
+            .unwrap();
+            let mut legacy_encoded = Vec::new();
+            encode_list(&entries, &mut legacy_encoded);
+            assert_eq!(
+                migrated.encode_to_vec(),
+                legacy_encoded,
+                "large-scale migrated UTXO encoding must stay byte-identical to the sorted legacy HashMap encoding"
+            );
+
+            let start = Instant::now();
+            let migrated_clone = migrated.clone();
+            let migrated_clone_time = start.elapsed();
+            std::hint::black_box(migrated_clone);
+
+            let start = Instant::now();
+            let legacy_entries_clone = legacy_entries.clone();
+            let legacy_compressed_clone = legacy_compressed.clone();
+            let legacy_clone_time = start.elapsed();
+            std::hint::black_box((legacy_entries_clone, legacy_compressed_clone));
+
+            assert!(
+                migrated_clone_time < Duration::from_millis(10),
+                "persistent UTXO clone should be near-constant, got {:?}",
+                migrated_clone_time
+            );
+            eprintln!(
+                "[stage2b-clone] utxos={size} migrated_entries_plus_compressed_clone={:?} legacy_hashmap_plus_compressed_clone={:?}",
+                migrated_clone_time, legacy_clone_time
+            );
+        }
     }
 
     #[test]

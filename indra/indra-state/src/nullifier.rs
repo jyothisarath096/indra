@@ -7,12 +7,13 @@
 //! It reveals nothing about which UTXO was spent or who owns it,
 //! but is deterministic: the same spend always produces the same nullifier.
 //!
-//! ## Storage model (Phase 2)
+//! ## Storage model
 //!
-//! In-memory HashSet. Phase 5 replaces this with a persistent Merkle trie.
-//! The interface is unchanged.
+//! Canonical nullifiers are kept in a persistent ordered set, with a frozen
+//! legacy sparse tree for pre-compressed-auth-tree compatibility and a
+//! persistent compressed authenticated tree for active roots/proofs.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
@@ -21,7 +22,10 @@ use indra_core::{
 };
 use indra_crypto::sha256;
 
-use crate::smt::{AuthTreeProof, CompressedAuthTree, MerkleProof, SparseMerkleTree};
+use crate::{
+    persistent::{PersistentAuthTree, PersistentOrdSet},
+    smt::{AuthTreeProof, MerkleProof, SparseMerkleTree},
+};
 
 /// Defensive snapshot decode ceiling for spent nullifiers.
 ///
@@ -31,13 +35,13 @@ pub const MAX_NULLIFIERS_DECODE: usize = 1_000_000;
 
 /// The complete set of spent nullifiers.
 ///
-/// Membership check is O(1) average. Insertion is O(1) average.
-/// There is no removal: nullifiers are permanent once added.
+/// There is no public removal: nullifiers are permanent once added. Internal
+/// rollback can remove a just-inserted nullifier through StateTxn.
 #[derive(Debug, Clone, Default)]
 pub struct NullifierSet {
-    spent: HashSet<Bytes32>,
+    spent: PersistentOrdSet<Bytes32>,
     smt: Arc<SparseMerkleTree>,
-    compressed: CompressedAuthTree,
+    compressed: PersistentAuthTree,
 }
 
 impl PartialEq for NullifierSet {
@@ -108,9 +112,9 @@ impl NullifierSet {
     /// Create an empty nullifier set.
     pub fn new() -> Self {
         Self {
-            spent: HashSet::new(),
+            spent: PersistentOrdSet::new(),
             smt: Arc::new(SparseMerkleTree::new()),
-            compressed: CompressedAuthTree::new(),
+            compressed: PersistentAuthTree::new(),
         }
     }
 
@@ -212,14 +216,14 @@ impl NullifierSet {
     /// Versioned proof under the proof rule active at `height`.
     pub fn prove_at_height(&self, nullifier: &Bytes32, height: u64) -> AuthTreeProof {
         if compressed_auth_tree_active(height) {
-            AuthTreeProof::V2Compressed(self.compressed.prove(nullifier.0))
+            self.compressed.prove(nullifier.0)
         } else {
             AuthTreeProof::V1LegacySparse(self.smt.prove(nullifier.0))
         }
     }
 
     fn rebuild_compressed_cache(&mut self) {
-        self.compressed = CompressedAuthTree::from_pairs(
+        self.compressed = PersistentAuthTree::from_pairs(
             self.spent
                 .iter()
                 .copied()
@@ -241,11 +245,16 @@ fn should_update_legacy_smt(height: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smt::CompressedAuthTree;
     use indra_core::{
         codec::ByteReader, types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT,
     };
     use indra_crypto::sha256;
-    use std::{env, time::Instant};
+    use std::{
+        collections::HashSet,
+        env,
+        time::{Duration, Instant},
+    };
 
     fn nullifier(seed: u8) -> Bytes32 {
         Bytes32::from(sha256(&[seed; 64]))
@@ -462,6 +471,132 @@ mod tests {
             expected_compressed_root,
             "post-activation consensus root still comes from the rebuilt compressed tree"
         );
+    }
+
+    #[test]
+    fn persistent_spent_preserves_legacy_encoding_order_and_compressed_proofs() {
+        let mut set = NullifierSet::new();
+        let mut legacy_spent = HashSet::new();
+        for tag in [0x44, 0x11, 0x77, 0x22] {
+            let n = nullifier(tag);
+            assert!(set.insert(n));
+            assert!(legacy_spent.insert(n));
+        }
+
+        let mut legacy_encoded_nullifiers: Vec<_> = legacy_spent.iter().copied().collect();
+        legacy_encoded_nullifiers.sort_by_key(|nullifier| nullifier.0);
+        let mut legacy_encoded = Vec::new();
+        encode_list(&legacy_encoded_nullifiers, &mut legacy_encoded);
+        assert_eq!(
+            set.encode_to_vec(),
+            legacy_encoded,
+            "PersistentOrdSet-backed NullifierSet encoding must remain byte-identical to sorted legacy HashSet encoding"
+        );
+
+        let legacy_compressed = CompressedAuthTree::from_pairs(
+            legacy_spent
+                .iter()
+                .copied()
+                .map(|nullifier| (nullifier.0, sha256(&nullifier.0))),
+        )
+        .unwrap();
+        assert_eq!(
+            set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            legacy_compressed.root()
+        );
+
+        for n in legacy_spent {
+            let AuthTreeProof::V2Compressed(proof) =
+                set.prove_at_height(&n, COMPRESSED_AUTH_TREE_HEIGHT)
+            else {
+                panic!("expected compressed nullifier proof after activation");
+            };
+            assert_eq!(proof, legacy_compressed.prove(n.0));
+        }
+    }
+
+    #[test]
+    fn persistent_spent_is_insertion_order_independent() {
+        let nullifiers: Vec<_> = (0..8u8).map(nullifier).collect();
+        let mut forward = NullifierSet::new();
+        let mut reverse = NullifierSet::new();
+
+        for n in nullifiers.iter().copied() {
+            assert!(forward.insert(n));
+        }
+        for n in nullifiers.into_iter().rev() {
+            assert!(reverse.insert(n));
+        }
+
+        assert_eq!(forward.encode_to_vec(), reverse.encode_to_vec());
+        assert_eq!(
+            forward.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
+            reverse.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode Stage 2b clone benchmark; run with --release --ignored --nocapture"]
+    fn persistent_spent_and_compressed_tree_clone_benchmark() {
+        // This is intentionally ignored and release-mode-only. The benchmark
+        // isolates the Stage 2b payoff: cloning canonical nullifiers plus the
+        // active compressed tree. Debug-mode timings are not meaningful.
+        let sizes = env::var("INDRA_STAGE2B_NULLIFIER_CLONE_BENCH_SIZES")
+            .unwrap_or_else(|_| "100000,1000000".to_string());
+        for size in sizes
+            .split(',')
+            .map(|raw| raw.trim().parse::<usize>().expect("valid benchmark size"))
+        {
+            let mut nullifiers: Vec<_> = (0..size)
+                .map(|i| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    Bytes32::from(sha256(&bytes))
+                })
+                .collect();
+            nullifiers.sort_by_key(|nullifier| nullifier.0);
+
+            let mut migrated = NullifierSet::new();
+            for n in nullifiers.iter().copied() {
+                assert!(migrated.insert_at_height(n, COMPRESSED_AUTH_TREE_HEIGHT));
+            }
+            let legacy_spent: HashSet<_> = nullifiers.iter().copied().collect();
+            let legacy_compressed = CompressedAuthTree::from_pairs(
+                nullifiers
+                    .iter()
+                    .copied()
+                    .map(|nullifier| (nullifier.0, sha256(&nullifier.0))),
+            )
+            .unwrap();
+            let mut legacy_encoded = Vec::new();
+            encode_list(&nullifiers, &mut legacy_encoded);
+            assert_eq!(
+                migrated.encode_to_vec(),
+                legacy_encoded,
+                "large-scale migrated nullifier encoding must stay byte-identical to the sorted legacy HashSet encoding"
+            );
+
+            let start = Instant::now();
+            let migrated_clone = migrated.clone();
+            let migrated_clone_time = start.elapsed();
+            std::hint::black_box(migrated_clone);
+
+            let start = Instant::now();
+            let legacy_spent_clone = legacy_spent.clone();
+            let legacy_compressed_clone = legacy_compressed.clone();
+            let legacy_clone_time = start.elapsed();
+            std::hint::black_box((legacy_spent_clone, legacy_compressed_clone));
+
+            assert!(
+                migrated_clone_time < Duration::from_millis(10),
+                "persistent nullifier clone should be near-constant, got {:?}",
+                migrated_clone_time
+            );
+            eprintln!(
+                "[stage2b-clone] nullifiers={size} migrated_spent_plus_compressed_clone={:?} legacy_hashset_plus_compressed_clone={:?}",
+                migrated_clone_time, legacy_clone_time
+            );
+        }
     }
 
     #[test]
