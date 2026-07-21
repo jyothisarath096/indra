@@ -600,7 +600,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
-            original_output: test_output(byte),
+            original_output: test_output(byte).into(),
         }
     }
 
@@ -684,6 +684,47 @@ mod tests {
         encode_bond_map(&bonds, &mut bytes);
         let decoded = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap();
         assert_eq!(decoded, bonds);
+    }
+
+    #[test]
+    fn mixed_legacy_and_compact_staked_bonds_encode_decode_and_root() {
+        let mut state = ChainState::new_genesis();
+        let legacy = StakeBondEntry::new_for_test_with_compact_activation(
+            Bytes32::from([0x21; 32]),
+            Bytes32::from([0xA1; 32]),
+            Bytes32::from([0xD1; 32]),
+            1_000_000,
+            7,
+            test_output(0x21),
+            9,
+            10,
+        );
+        let compact = StakeBondEntry::new_for_test_with_compact_activation(
+            Bytes32::from([0x22; 32]),
+            Bytes32::from([0xA2; 32]),
+            Bytes32::from([0xD2; 32]),
+            1_000_000,
+            8,
+            test_output(0x22),
+            10,
+            10,
+        );
+        assert!(legacy.original_output.range_proof.is_some());
+        assert!(compact.original_output.range_proof.is_none());
+        state.staked_bonds.insert(legacy.utxo_id, legacy);
+        state.staked_bonds.insert(compact.utxo_id, compact);
+
+        let encoded = state.encode_to_vec();
+        let decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(
+            crate::state_root::compute_state_root(&decoded),
+            crate::state_root::compute_state_root(&state)
+        );
+        assert_eq!(
+            crate::state_commitment::StateCommitmentV2::from_state(&decoded, u64::MAX).root(),
+            crate::state_commitment::StateCommitmentV2::from_state(&state, u64::MAX).root()
+        );
     }
 
     #[test]
@@ -947,7 +988,7 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: heavy_output(index),
+                original_output: heavy_output(index).into(),
             }
         }
 
@@ -1071,7 +1112,7 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: heavy_output(index),
+                original_output: heavy_output(index).into(),
             }
         }
 

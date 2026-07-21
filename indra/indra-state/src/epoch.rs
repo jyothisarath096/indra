@@ -22,10 +22,10 @@ use indra_core::{
         primitives::{
             bps_of, governance_proposal_pruning_active, muldiv, overflow_fix_active,
             state_commitment_v2_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
-            EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-            ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-            HARD_CAP_SPARK, SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN,
-            STAKING_TX_IDX,
+            COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
+            ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
+            ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
+            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -879,10 +879,23 @@ pub(crate) fn released_bond_output(
     bond: &crate::validator::StakeBondEntry,
     release_height: u64,
 ) -> StateResult<indra_core::types::transaction::OutputV1> {
+    if bond.original_output.range_proof.is_none() {
+        return regenerated_bond_output(
+            bond,
+            release_height,
+            derive_compact_stake_bond_release_blinding(bond, release_height),
+            "compact stake-bond release",
+        );
+    }
+
     if bond.delegator_id != bond.validator_id
         || bond.amount_spark >= bond.original_output.value_spark
     {
-        return Ok(bond.original_output.clone());
+        return bond.original_output.to_legacy_output().ok_or_else(|| {
+            crate::error::StateError::InvariantViolation {
+                message: "legacy stake bond release missing stored range proof",
+            }
+        });
     }
 
     let mut blinding_input =
@@ -892,16 +905,53 @@ pub(crate) fn released_bond_output(
     blinding_input.extend_from_slice(&bond.utxo_id.0);
     blinding_input.extend_from_slice(&release_height.to_le_bytes());
     let blinding = indra_crypto::sha256(&blinding_input);
+    regenerated_bond_output(bond, release_height, blinding, "slashed self-stake release")
+}
+
+/// Deterministic blinding for a compact stake-bond release.
+///
+/// External wallets can reproduce this as:
+/// `sha256(domain || validator_id || delegator_id || bond_utxo_id ||
+/// release_height_le || released_amount_spark_le)`.
+pub fn derive_compact_stake_bond_release_blinding(
+    bond: &crate::validator::StakeBondEntry,
+    release_height: u64,
+) -> [u8; 32] {
+    let mut blinding_input =
+        Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
+    blinding_input.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
+    blinding_input.extend_from_slice(&bond.validator_id.0);
+    blinding_input.extend_from_slice(&bond.delegator_id.0);
+    blinding_input.extend_from_slice(&bond.utxo_id.0);
+    blinding_input.extend_from_slice(&release_height.to_le_bytes());
+    blinding_input.extend_from_slice(&bond.amount_spark.to_le_bytes());
+    indra_crypto::sha256(&blinding_input)
+}
+
+fn regenerated_bond_output(
+    bond: &crate::validator::StakeBondEntry,
+    _release_height: u64,
+    blinding: [u8; 32],
+    context: &str,
+) -> StateResult<indra_core::types::transaction::OutputV1> {
     let commitment = indra_crypto::commit(bond.amount_spark, &blinding);
     let mut rng = rand::rngs::StdRng::from_seed(blinding);
     let proof =
         indra_crypto::prove_range(bond.amount_spark, &blinding, &mut rng).map_err(|_| {
-            crate::error::StateError::InvalidStakingOp(
-                "failed to generate range proof for slashed self-stake release".into(),
-            )
+            crate::error::StateError::InvalidStakingOp(format!(
+                "failed to generate range proof for {context}"
+            ))
         })?;
 
-    let mut output = bond.original_output.clone();
+    let mut output = bond.original_output.to_legacy_output().unwrap_or_else(|| {
+        indra_core::types::transaction::OutputV1 {
+            value_spark: bond.original_output.value_spark,
+            commitment: bond.original_output.commitment,
+            owner_pubkey: bond.original_output.owner_pubkey.clone(),
+            range_proof: VariableBytes::default(),
+            lock_height: bond.original_output.lock_height,
+        }
+    });
     output.value_spark = bond.amount_spark;
     output.commitment = CommitmentV1 {
         compressed_point: Bytes32::from(commitment.0),
@@ -974,6 +1024,7 @@ mod tests {
         validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
     };
     use indra_core::{
+        codec::Encode,
         types::{
             crypto::HybridPubKey,
             governance::GovernableAction,
@@ -1026,6 +1077,155 @@ mod tests {
             range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
             lock_height: 0,
         }
+    }
+
+    fn manual_compact_release_blinding(bond: &StakeBondEntry, release_height: u64) -> [u8; 32] {
+        let mut input = Vec::new();
+        input.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
+        input.extend_from_slice(&bond.validator_id.0);
+        input.extend_from_slice(&bond.delegator_id.0);
+        input.extend_from_slice(&bond.utxo_id.0);
+        input.extend_from_slice(&release_height.to_le_bytes());
+        input.extend_from_slice(&bond.amount_spark.to_le_bytes());
+        indra_crypto::sha256(&input)
+    }
+
+    fn compact_bond(
+        byte: u8,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+    ) -> StakeBondEntry {
+        StakeBondEntry::new_for_test_with_compact_activation(
+            Bytes32::from([byte; 32]),
+            validator_id,
+            delegator_id,
+            amount_spark,
+            2,
+            dummy_output(byte),
+            10,
+            10,
+        )
+    }
+
+    #[test]
+    fn compact_normal_release_generates_fresh_valid_output_with_documented_blinding() {
+        let validator_id = Bytes32::from([0xA1; 32]);
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        let bond = compact_bond(0x31, validator_id, delegator_id, 1_000_000);
+        assert!(bond.original_output.range_proof.is_none());
+        let release_height = 900;
+
+        let output = released_bond_output(&bond, release_height).unwrap();
+        let blinding = manual_compact_release_blinding(&bond, release_height);
+        assert_eq!(
+            derive_compact_stake_bond_release_blinding(&bond, release_height),
+            blinding
+        );
+        assert_ne!(output.commitment, bond.original_output.commitment);
+        assert_eq!(output.value_spark, bond.amount_spark);
+        assert_eq!(output.owner_pubkey, bond.original_output.owner_pubkey);
+        assert_eq!(output.lock_height, bond.original_output.lock_height);
+        assert!(indra_crypto::verify_opening(
+            &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
+            &indra_crypto::PedersenOpening {
+                value: output.value_spark,
+                blinding,
+            },
+        )
+        .is_ok());
+        assert!(indra_crypto::verify_range(
+            &output.commitment.compressed_point.0,
+            output.range_proof.as_slice(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn compact_slashed_release_generates_fresh_valid_output_with_documented_blinding() {
+        let validator_id = Bytes32::from([0xA2; 32]);
+        let bond = compact_bond(0x32, validator_id, validator_id, 400_000);
+        let release_height = 1_200;
+        let blinding = manual_compact_release_blinding(&bond, release_height);
+
+        let output = released_bond_output(&bond, release_height).unwrap();
+        assert_eq!(output.value_spark, 400_000);
+        assert!(indra_crypto::verify_opening(
+            &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
+            &indra_crypto::PedersenOpening {
+                value: 400_000,
+                blinding,
+            },
+        )
+        .is_ok());
+        assert!(indra_crypto::verify_range(
+            &output.commitment.compressed_point.0,
+            output.range_proof.as_slice(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn compact_activation_replay_sequence_is_deterministic() {
+        fn replay() -> ChainState {
+            let activation = 10;
+            let validator_id = Bytes32::from([0xA3; 32]);
+            let delegator_id = Bytes32::from([0xD3; 32]);
+            let mut state = ChainState::new_genesis();
+
+            let legacy = StakeBondEntry::new_for_test_with_compact_activation(
+                Bytes32::from([0x41; 32]),
+                validator_id,
+                delegator_id,
+                1_000_000,
+                0,
+                dummy_output(0x41),
+                activation - 1,
+                activation,
+            );
+            let compact_normal = StakeBondEntry::new_for_test_with_compact_activation(
+                Bytes32::from([0x42; 32]),
+                validator_id,
+                delegator_id,
+                1_000_000,
+                0,
+                dummy_output(0x42),
+                activation,
+                activation,
+            );
+            let compact_slashed = StakeBondEntry::new_for_test_with_compact_activation(
+                Bytes32::from([0x43; 32]),
+                validator_id,
+                validator_id,
+                600_000,
+                0,
+                dummy_output(0x43),
+                activation + 1,
+                activation,
+            );
+            assert!(legacy.original_output.range_proof.is_some());
+            assert!(compact_normal.original_output.range_proof.is_none());
+            assert!(compact_slashed.original_output.range_proof.is_none());
+
+            state.staked_bonds.insert(legacy.utxo_id, legacy);
+            let normal_output = released_bond_output(&compact_normal, activation + 2).unwrap();
+            state
+                .utxos
+                .insert(normal_output, activation + 2, STAKING_TX_IDX, 1)
+                .unwrap();
+            let slashed_output = released_bond_output(&compact_slashed, activation + 3).unwrap();
+            state
+                .utxos
+                .insert(slashed_output, activation + 3, STAKING_TX_IDX, 2)
+                .unwrap();
+            state.height = activation + 3;
+            state
+        }
+
+        let a = replay();
+        let b = replay();
+        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
+        assert_eq!(compute_state_root(&a), compute_state_root(&b));
     }
 
     fn governance_test_pubkey(byte: u8) -> HybridPubKey {
@@ -1987,7 +2187,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1),
-                original_output: dummy_output(0x44),
+                original_output: dummy_output(0x44).into(),
             },
         );
 
@@ -2010,7 +2210,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: dummy_output(0x45),
+                original_output: dummy_output(0x45).into(),
             },
         );
 

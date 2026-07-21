@@ -192,6 +192,10 @@ pub const STAKING_REWARD_BLINDING_DOMAIN: &[u8] = b"indra-staking-reward-v1";
 /// Domain for deterministic slashed self-stake bond release blinding derivation.
 pub const SLASH_BOND_RELEASE_BLINDING_DOMAIN: &[u8] = b"INDRA-slash-bond-release-v1";
 
+/// Domain for deterministic compact stake-bond release blinding derivation.
+pub const COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] =
+    b"INDRA-compact-stake-bond-release-v1";
+
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 
 /// Maximum Ed25519 signature size (bytes).
@@ -525,6 +529,21 @@ pub mod hard_forks {
     /// from mainnet's first block). It will NOT automatically differ between
     /// testnet and mainnet.
     pub const COMPRESSED_AUTH_TREE_HEIGHT: u64 = 120_000;
+
+    /// Compact stake-bond records omit stored range proofs for newly created bonds.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
+    /// coordinated activation height is explicitly chosen. At/after activation,
+    /// new `StakeBondEntry` records store enough output metadata to release stake
+    /// but no longer retain the original output range proof; legacy entries keep
+    /// their stored proof until they naturally drain from state.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
+    /// no per-chain-ID differentiation. Before building mainnet genesis, this
+    /// MUST be deliberately reset to the correct mainnet value (often 0 if the
+    /// compact layout should be active from mainnet's first block). Leaving
+    /// `u64::MAX` here means this rule never activates on that network.
+    pub const COMPACT_STAKE_BOND_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -600,6 +619,12 @@ pub fn state_commitment_v2_active(height: u64) -> bool {
 #[inline]
 pub fn compressed_auth_tree_active(height: u64) -> bool {
     height >= hard_forks::COMPRESSED_AUTH_TREE_HEIGHT
+}
+
+/// Whether newly created stake-bond records omit their stored output range proof.
+#[inline]
+pub fn compact_stake_bond_active(height: u64) -> bool {
+    height >= hard_forks::COMPACT_STAKE_BOND_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
