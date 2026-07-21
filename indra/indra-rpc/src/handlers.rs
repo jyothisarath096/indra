@@ -325,6 +325,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
     ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
+    ("indra_getStakeBondDebug", RpcMethodAccess::Admin),
     ("indra_getEpochInfo", RpcMethodAccess::ReadOnly),
     ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
     ("indra_getEpochHistory", RpcMethodAccess::ReadOnly),
@@ -454,6 +455,7 @@ pub fn dispatch_with_admin(
         "indra_getDelegatorRewards" => Ready(get_delegator_rewards(params, state)),
         "indra_getValidatorDelegators" => Ready(get_validator_delegators(params, state)),
         "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
+        "indra_getStakeBondDebug" => Ready(get_stake_bond_debug(params, state)),
         "indra_getEpochInfo" => Ready(get_epoch_info(state)),
         "indra_getEpochRecord" => Ready(get_epoch_record(params, state)),
         "indra_getEpochHistory" => Ready(get_epoch_history(params, state)),
@@ -1463,6 +1465,29 @@ fn get_stake_bonds(params: &[String], state: &NodeState<'_>) -> RpcResult<String
     ))
 }
 
+/// `indra_getStakeBondDebug` — admin-only compact-format check for one stake bond.
+fn get_stake_bond_debug(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let bond_utxo_id = parse_hex32_param(params, "bond_utxo_id")?;
+    let bond = state.chain.staked_bonds.get(&bond_utxo_id).ok_or_else(|| {
+        RpcError::NotFound(format!(
+            "stake bond {} not found",
+            hex::encode(bond_utxo_id.0)
+        ))
+    })?;
+    Ok(format!(
+        r#"{{"bond_utxo_id":"{}","compact":{},"bonded_epoch":{},"validator_id":"{}","delegator_id":"{}"}}"#,
+        hex::encode(bond.utxo_id.0),
+        if bond.original_output.range_proof.is_none() {
+            "true"
+        } else {
+            "false"
+        },
+        bond.bonded_epoch,
+        hex::encode(bond.validator_id.0),
+        hex::encode(bond.delegator_id.0),
+    ))
+}
+
 /// `indra_getEpochInfo` — returns current epoch details.
 fn get_epoch_info(state: &NodeState<'_>) -> RpcResult<String> {
     use indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
@@ -2081,11 +2106,16 @@ mod tests {
     use indra_core::{
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::MAX_VRF_PROOF_BYTES,
+            crypto::HybridPubKey,
+            primitives::{MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES},
+            transaction::OutputV1,
         },
-        ProtocolVersion, VariableBytes,
+        CommitmentV1, ProtocolVersion, VariableBytes,
     };
-    use indra_state::ChainState;
+    use indra_state::{
+        validator::{StakeBondEntry, StakeBondOutput},
+        ChainState,
+    };
     use std::collections::BTreeMap;
 
     fn make_state(_suffix: &str) -> ChainState {
@@ -2149,6 +2179,45 @@ mod tests {
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
             vrf_reveals: Vec::new(),
+        }
+    }
+
+    fn test_pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap_or_default(),
+        }
+    }
+
+    fn test_output(byte: u8) -> OutputV1 {
+        OutputV1 {
+            value_spark: 1_000_000,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from([byte; 32]),
+            },
+            owner_pubkey: test_pubkey(byte),
+            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[byte; 32])
+                .unwrap_or_default(),
+            lock_height: 0,
+        }
+    }
+
+    fn test_bond(byte: u8, compact: bool) -> StakeBondEntry {
+        let utxo_id = Bytes32::from([byte; 32]);
+        let validator_id = Bytes32::from([byte.wrapping_add(1); 32]);
+        let delegator_id = Bytes32::from([byte.wrapping_add(2); 32]);
+        let mut original_output: StakeBondOutput = test_output(byte).into();
+        if compact {
+            original_output.range_proof = None;
+        }
+        StakeBondEntry {
+            utxo_id,
+            validator_id,
+            delegator_id,
+            amount_spark: 1_000_000,
+            bonded_epoch: 7,
+            unbonding_end_epoch: None,
+            original_output,
         }
     }
 
@@ -2360,6 +2429,83 @@ mod tests {
         assert!(result.contains(r#""amount_spark":123"#));
         assert!(result.contains(r#""count":1"#));
         assert!(!result.contains(r#""amount_spark":456"#));
+    }
+
+    #[test]
+    fn stake_bond_debug_reports_legacy_and_compact_without_sensitive_material() {
+        let mut engine = make_state("sbd");
+        let legacy = test_bond(0x51, false);
+        let compact = test_bond(0x61, true);
+        let legacy_id = legacy.utxo_id;
+        let compact_id = compact.utxo_id;
+        engine.staked_bonds.insert(legacy_id, legacy);
+        engine.staked_bonds.insert(compact_id, compact);
+        let state = NodeState::read_only(&engine);
+
+        let legacy_result = get_stake_bond_debug(&[hex::encode(legacy_id.0)], &state).unwrap();
+        assert!(
+            legacy_result.contains(&format!(r#""bond_utxo_id":"{}""#, hex::encode(legacy_id.0)))
+        );
+        assert!(legacy_result.contains(r#""compact":false"#));
+        assert!(legacy_result.contains(r#""bonded_epoch":7"#));
+        assert!(legacy_result.contains(&format!(r#""validator_id":"{}""#, hex::encode([0x52; 32]))));
+        assert!(legacy_result.contains(&format!(r#""delegator_id":"{}""#, hex::encode([0x53; 32]))));
+        assert!(!legacy_result.contains("range_proof"));
+        assert!(!legacy_result.contains("commitment"));
+
+        let compact_result = get_stake_bond_debug(&[hex::encode(compact_id.0)], &state).unwrap();
+        assert!(compact_result.contains(r#""compact":true"#));
+        assert!(!compact_result.contains("range_proof"));
+        assert!(!compact_result.contains("commitment"));
+    }
+
+    #[test]
+    fn stake_bond_debug_is_admin_gated() {
+        let mut engine = make_state("sbd-admin");
+        let legacy = test_bond(0x71, false);
+        let legacy_id = legacy.utxo_id;
+        engine.staked_bonds.insert(legacy_id, legacy);
+        let state = NodeState::read_only(&engine);
+        let params = [hex::encode(legacy_id.0)];
+
+        let read_only = dispatch_with_admin(
+            "indra_getStakeBondDebug",
+            &params,
+            &state,
+            RpcMode::ReadOnly,
+            true,
+            true,
+        );
+        assert!(matches!(
+            read_only,
+            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
+        ));
+
+        let no_token = dispatch_with_admin(
+            "indra_getStakeBondDebug",
+            &params,
+            &state,
+            RpcMode::Full,
+            false,
+            false,
+        );
+        assert!(matches!(
+            no_token,
+            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
+        ));
+
+        let admin = dispatch_with_admin(
+            "indra_getStakeBondDebug",
+            &params,
+            &state,
+            RpcMode::Full,
+            true,
+            true,
+        );
+        assert!(matches!(
+            admin,
+            DispatchResult::Ready(Ok(result)) if result.contains(r#""compact":false"#)
+        ));
     }
 
     #[test]
