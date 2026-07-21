@@ -532,18 +532,18 @@ pub mod hard_forks {
 
     /// Compact stake-bond records omit stored range proofs for newly created bonds.
     ///
-    /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
-    /// coordinated activation height is explicitly chosen. At/after activation,
-    /// new `StakeBondEntry` records store enough output metadata to release stake
-    /// but no longer retain the original output range proof; legacy entries keep
-    /// their stored proof until they naturally drain from state.
+    /// TESTNET ACTIVATION: this source value schedules compact stake-bond
+    /// creation on the already-running testnet. All validators must run the same
+    /// binary before this height. At/after activation, new `StakeBondEntry`
+    /// records store enough output metadata to release stake but no longer retain
+    /// the original output range proof; legacy entries keep their stored proof
+    /// until they naturally drain from state.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
     /// no per-chain-ID differentiation. Before building mainnet genesis, this
     /// MUST be deliberately reset to the correct mainnet value (often 0 if the
-    /// compact layout should be active from mainnet's first block). Leaving
-    /// `u64::MAX` here means this rule never activates on that network.
-    pub const COMPACT_STAKE_BOND_HEIGHT: u64 = u64::MAX;
+    /// compact layout should be active from mainnet's first block).
+    pub const COMPACT_STAKE_BOND_HEIGHT: u64 = 152_500;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.

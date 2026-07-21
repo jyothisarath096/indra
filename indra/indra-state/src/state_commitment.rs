@@ -353,7 +353,7 @@ mod tests {
             amount_spark: 7_000,
             bonded_epoch: 3,
             unbonding_end_epoch: None,
-            original_output: output(0xAA, 7_000),
+            original_output: output(0xAA, 7_000).into(),
         }
     }
 

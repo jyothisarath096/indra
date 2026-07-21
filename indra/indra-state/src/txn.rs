@@ -523,7 +523,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
-            original_output: test_output(byte),
+            original_output: test_output(byte).into(),
         }
     }
 

@@ -418,7 +418,7 @@ mod tests {
                 amount_spark: 42_000,
                 bonded_epoch: 3,
                 unbonding_end_epoch: None,
-                original_output: dummy_output(0xD4),
+                original_output: dummy_output(0xD4).into(),
             },
         );
         small.applied_slash_hashes.insert(Bytes32::from([0xD5; 32]));
@@ -483,7 +483,8 @@ mod tests {
                         },
                         range_proof: range_proof.clone(),
                         lock_height: 0,
-                    },
+                    }
+                    .into(),
                 },
             );
         }

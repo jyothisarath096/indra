@@ -2650,7 +2650,7 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
-                        original_output: output,
+                        original_output: output.into(),
                     },
                 );
             }
@@ -2727,7 +2727,7 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
-                        original_output: output,
+                        original_output: output.into(),
                     },
                 );
             }
@@ -3100,7 +3100,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
-                original_output: output.clone(),
+                original_output: output.clone().into(),
             },
         );
         b.staked_bonds.insert(
@@ -3112,7 +3112,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
-                original_output: output,
+                original_output: output.into(),
             },
         );
 
@@ -3231,7 +3231,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(epoch_for_height(EPOCH_DURATION_BLOCKS)),
-                original_output: output,
+                original_output: output.into(),
             },
         );
         let original = state.clone();
@@ -4060,7 +4060,7 @@ mod tests {
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: dummy_output(0x20, owner),
+                original_output: dummy_output(0x20, owner).into(),
             },
         );
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
@@ -4091,7 +4091,7 @@ mod tests {
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: dummy_output(0x21, owner),
+                original_output: dummy_output(0x21, owner).into(),
             },
         );
         let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
@@ -4124,7 +4124,7 @@ mod tests {
                 amount_spark: original_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
-                original_output: output_with_value(original_bond, owner, 0x22),
+                original_output: output_with_value(original_bond, owner, 0x22).into(),
             },
         );
 
@@ -4184,7 +4184,7 @@ mod tests {
                 amount_spark: active_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: output_with_value(active_bond, owner_active, 0x23),
+                original_output: output_with_value(active_bond, owner_active, 0x23).into(),
             },
         );
         state.staked_bonds.insert(
@@ -4196,7 +4196,7 @@ mod tests {
                 amount_spark: unbonding_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
-                original_output: output_with_value(unbonding_bond, owner_unbonding, 0x24),
+                original_output: output_with_value(unbonding_bond, owner_unbonding, 0x24).into(),
             },
         );
 

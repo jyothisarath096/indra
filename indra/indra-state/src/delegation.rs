@@ -387,15 +387,15 @@ fn apply_register_validator(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_validator(&entry, current_height);
     }
-    let bond = StakeBondEntry {
-        utxo_id: bond_utxo_id,
+    let bond = StakeBondEntry::new(
+        bond_utxo_id,
         validator_id,
-        delegator_id: validator_id,
+        validator_id,
         amount_spark,
-        bonded_epoch: epoch_for_height(current_height),
-        unbonding_end_epoch: None,
+        epoch_for_height(current_height),
         original_output,
-    };
+        current_height,
+    );
     state.staked_bonds.insert(bond_utxo_id, bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &bond);
@@ -673,15 +673,15 @@ fn apply_delegate(
     let original_output = utxo_entry.output;
     let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
 
-    let bond = StakeBondEntry {
-        utxo_id: bond_utxo_id,
-        validator_id: *validator_id,
+    let bond = StakeBondEntry::new(
+        bond_utxo_id,
+        *validator_id,
         delegator_id,
         amount_spark,
-        bonded_epoch: current_epoch,
-        unbonding_end_epoch: None,
+        current_epoch,
         original_output,
-    };
+        current_height,
+    );
     state.staked_bonds.insert(bond_utxo_id, bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &bond);
@@ -823,15 +823,15 @@ fn apply_self_stake(
     let current_epoch = epoch_for_height(current_height);
     let original_output = utxo_entry.output;
     let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
-    let bond = StakeBondEntry {
-        utxo_id: bond_utxo_id,
+    let bond = StakeBondEntry::new(
+        bond_utxo_id,
         validator_id,
-        delegator_id: validator_id,
+        validator_id,
         amount_spark,
-        bonded_epoch: current_epoch,
-        unbonding_end_epoch: None,
+        current_epoch,
         original_output,
-    };
+        current_height,
+    );
     state.staked_bonds.insert(bond_utxo_id, bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &bond);
@@ -3070,7 +3070,7 @@ mod tests {
                 amount_spark: stake,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: raw_output(stake, pubkey, (index % 200) as u8),
+                original_output: raw_output(stake, pubkey, (index % 200) as u8).into(),
             },
         );
         validator_id
@@ -3172,7 +3172,7 @@ mod tests {
                 amount_spark: DUST_LIMIT_SPARK,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: test_output(DUST_LIMIT_SPARK, delegator_pubkey, 0x7A),
+                original_output: test_output(DUST_LIMIT_SPARK, delegator_pubkey, 0x7A).into(),
             },
         );
         let (op, new_bond) = registration_op_with_bond(
@@ -3235,7 +3235,7 @@ mod tests {
                 amount_spark: DUST_LIMIT_SPARK,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                original_output: test_output(DUST_LIMIT_SPARK, raw_pubkey(0x7C), 0x7C),
+                original_output: test_output(DUST_LIMIT_SPARK, raw_pubkey(0x7C), 0x7C).into(),
             },
         );
         let utxos_before = state.utxos.len();

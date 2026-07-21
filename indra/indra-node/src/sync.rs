@@ -1333,7 +1333,8 @@ mod tests {
                             },
                             range_proof: range_proof.clone(),
                             lock_height: 0,
-                        },
+                        }
+                        .into(),
                     },
                 );
             }
