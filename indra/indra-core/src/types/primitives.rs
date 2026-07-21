@@ -544,6 +544,21 @@ pub mod hard_forks {
     /// MUST be deliberately reset to the correct mainnet value (often 0 if the
     /// compact layout should be active from mainnet's first block).
     pub const COMPACT_STAKE_BOND_HEIGHT: u64 = 152_500;
+
+    /// Delegator identity registry binds each delegator_id to one full HybridPubKey.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
+    /// coordinated activation height is explicitly chosen. At/after activation,
+    /// delegator-owned staking/governance operations will be able to populate and
+    /// check a canonical `delegator_id -> HybridPubKey` registry; later stages will
+    /// wire this into live validation and compact stake-bond storage.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
+    /// no per-chain-ID differentiation. Before building mainnet genesis, this
+    /// MUST be deliberately reset to the correct mainnet value (often 0 if the
+    /// registry should be active from mainnet's first block). Leaving `u64::MAX`
+    /// here means this rule never activates on that network.
+    pub const DELEGATOR_IDENTITY_REGISTRY_HEIGHT: u64 = u64::MAX;
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -625,6 +640,12 @@ pub fn compressed_auth_tree_active(height: u64) -> bool {
 #[inline]
 pub fn compact_stake_bond_active(height: u64) -> bool {
     height >= hard_forks::COMPACT_STAKE_BOND_HEIGHT
+}
+
+/// Whether delegator identity registry rules are active.
+#[inline]
+pub fn delegator_identity_registry_active(height: u64) -> bool {
+    height >= hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

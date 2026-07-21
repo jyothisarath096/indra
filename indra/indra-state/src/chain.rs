@@ -5,6 +5,7 @@
 
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
+use indra_core::types::crypto::HybridPubKey;
 
 use indra_core::types::primitives::{
     state_commitment_v2_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK,
@@ -101,6 +102,9 @@ pub struct ChainState {
     /// Monotonic nonces for staking op replay protection.
     pub staking_nonces: PersistentOrdMap<Bytes32, u64>,
 
+    /// Canonical full public key for each post-activation delegator identity.
+    pub delegator_identities: PersistentOrdMap<Bytes32, HybridPubKey>,
+
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
     pub applied_slash_hashes: PersistentOrdSet<Bytes32>,
@@ -171,6 +175,9 @@ impl Encode for ChainState {
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
         encode_delegation_return_events(&self.delegation_return_events, buf);
+        if !self.delegator_identities.is_empty() {
+            encode_delegator_identity_registry(&self.delegator_identities, buf);
+        }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
     }
@@ -195,6 +202,11 @@ impl Encode for ChainState {
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
             + delegation_return_events_encoded_len(&self.delegation_return_events)
+            + if self.delegator_identities.is_empty() {
+                0
+            } else {
+                delegator_identity_registry_encoded_len(&self.delegator_identities)
+            }
     }
 }
 
@@ -204,28 +216,49 @@ impl Decode for ChainState {
         let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
             .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
         let height = u64::decode(r)?;
+        let tip_hash = Bytes32::decode(r)?;
+        let base_fee = u64::decode(r)?;
+        let total_supply = u64::decode(r)?;
+        let treasury_balance = u64::decode(r)?;
+        let burn_buffer = u64::decode(r)?;
+        let fee_reward_pool = u64::decode(r)?;
+        let utxos = UtxoSet::decode_at_height(r, height)?;
+        let nullifiers = NullifierSet::decode_at_height(r, height)?;
+        let validators = ValidatorSet::decode(r)?;
+        let delegations = DelegationMap::decode(r)?;
+        let staked_bonds = decode_bond_map(r)?;
+        let staking_nonces = decode_nonce_map(r)?;
+        let applied_slash_hashes = decode_hash_set(r, "snapshot.applied_slash_hashes")?;
+        let governance = GovernanceState::decode(r)?;
+        let delegation_return_events = if r.remaining() > 0 {
+            decode_delegation_return_events(r)?
+        } else {
+            Vec::new()
+        };
+        let delegator_identities = if r.remaining() > 0 {
+            decode_delegator_identity_registry(r)?
+        } else {
+            PersistentOrdMap::new()
+        };
         Ok(Self {
             chain_id,
             height,
-            tip_hash: Bytes32::decode(r)?,
-            base_fee: u64::decode(r)?,
-            total_supply: u64::decode(r)?,
-            treasury_balance: u64::decode(r)?,
-            burn_buffer: u64::decode(r)?,
-            fee_reward_pool: u64::decode(r)?,
-            utxos: UtxoSet::decode_at_height(r, height)?,
-            nullifiers: NullifierSet::decode_at_height(r, height)?,
-            validators: ValidatorSet::decode(r)?,
-            delegations: DelegationMap::decode(r)?,
-            staked_bonds: decode_bond_map(r)?,
-            staking_nonces: decode_nonce_map(r)?,
-            applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
-            governance: GovernanceState::decode(r)?,
-            delegation_return_events: if r.remaining() > 0 {
-                decode_delegation_return_events(r)?
-            } else {
-                Vec::new()
-            },
+            tip_hash,
+            base_fee,
+            total_supply,
+            treasury_balance,
+            burn_buffer,
+            fee_reward_pool,
+            utxos,
+            nullifiers,
+            validators,
+            delegations,
+            staked_bonds,
+            staking_nonces,
+            delegator_identities,
+            applied_slash_hashes,
+            governance,
+            delegation_return_events,
             state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
@@ -254,6 +287,7 @@ impl ChainState {
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
+            delegator_identities: PersistentOrdMap::new(),
             applied_slash_hashes: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -285,6 +319,7 @@ impl ChainState {
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map_legacy(r)?,
             staking_nonces: decode_nonce_map(r)?,
+            delegator_identities: PersistentOrdMap::new(),
             applied_slash_hashes: if r.remaining() > 0 {
                 decode_hash_set(r, "snapshot.applied_slash_hashes")?
             } else {
@@ -320,6 +355,7 @@ impl ChainState {
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
+            delegator_identities: PersistentOrdMap::new(),
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -534,6 +570,55 @@ fn validate_nonce_map_count(count: usize) -> IndraResult<()> {
     Ok(())
 }
 
+fn encode_delegator_identity_registry(
+    identities: &PersistentOrdMap<Bytes32, HybridPubKey>,
+    buf: &mut Vec<u8>,
+) {
+    (identities.len() as u32).encode(buf);
+    for (delegator_id, pubkey) in identities {
+        delegator_id.encode(buf);
+        pubkey.encode(buf);
+    }
+}
+
+fn delegator_identity_registry_encoded_len(
+    identities: &PersistentOrdMap<Bytes32, HybridPubKey>,
+) -> usize {
+    4 + identities
+        .iter()
+        .map(|(delegator_id, pubkey)| delegator_id.encoded_len() + pubkey.encoded_len())
+        .sum::<usize>()
+}
+
+fn decode_delegator_identity_registry(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<PersistentOrdMap<Bytes32, HybridPubKey>> {
+    let count = u32::decode(r)? as usize;
+    validate_delegator_identity_count(count)?;
+    let mut identities = PersistentOrdMap::new();
+    for _ in 0..count {
+        let delegator_id = Bytes32::decode(r)?;
+        let pubkey = HybridPubKey::decode(r)?;
+        if identities.insert(delegator_id, pubkey).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.delegator_identities",
+            });
+        }
+    }
+    Ok(identities)
+}
+
+fn validate_delegator_identity_count(count: usize) -> IndraResult<()> {
+    if count > MAX_STAKING_NONCES_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.delegator_identities",
+            max: MAX_STAKING_NONCES_DECODE,
+            actual: count,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +677,13 @@ mod tests {
         }
     }
 
+    fn test_hybrid_pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(1); 2_592]).unwrap(),
+        }
+    }
+
     fn test_bond(byte: u8) -> StakeBondEntry {
         StakeBondEntry {
             utxo_id: Bytes32::from([byte; 32]),
@@ -618,6 +710,30 @@ mod tests {
             signer_id.encode(buf);
             nonce.encode(buf);
         }
+    }
+
+    fn encode_chain_state_without_delegator_identities(state: &ChainState) -> Vec<u8> {
+        let mut buf = Vec::new();
+        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
+            .unwrap_or_default()
+            .encode(&mut buf);
+        state.height.encode(&mut buf);
+        state.tip_hash.encode(&mut buf);
+        state.base_fee.encode(&mut buf);
+        state.total_supply.encode(&mut buf);
+        state.treasury_balance.encode(&mut buf);
+        state.burn_buffer.encode(&mut buf);
+        state.fee_reward_pool.encode(&mut buf);
+        state.utxos.encode(&mut buf);
+        state.nullifiers.encode(&mut buf);
+        state.validators.encode(&mut buf);
+        state.delegations.encode(&mut buf);
+        encode_bond_map(&state.staked_bonds, &mut buf);
+        encode_nonce_map(&state.staking_nonces, &mut buf);
+        encode_hash_set(&state.applied_slash_hashes, &mut buf);
+        state.governance.encode(&mut buf);
+        encode_delegation_return_events(&state.delegation_return_events, &mut buf);
+        buf
     }
 
     fn encode_hash_set_hashset(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
@@ -866,6 +982,131 @@ mod tests {
         let mut reverse_bytes = Vec::new();
         encode_nonce_map(&reverse, &mut reverse_bytes);
         assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    fn delegator_identity_registry_insert_lookup_contains() {
+        let mut registry = PersistentOrdMap::new();
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        let pubkey = test_hybrid_pubkey(0x11);
+
+        assert!(registry.is_empty());
+        assert!(!registry.contains_key(&delegator_id));
+        assert_eq!(registry.insert(delegator_id, pubkey.clone()), None);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains_key(&delegator_id));
+        assert_eq!(registry.get(&delegator_id), Some(&pubkey));
+
+        let replacement = test_hybrid_pubkey(0x22);
+        assert_eq!(
+            registry.insert(delegator_id, replacement.clone()),
+            Some(pubkey)
+        );
+        assert_eq!(registry.get(&delegator_id), Some(&replacement));
+    }
+
+    #[test]
+    fn delegator_identity_registry_round_trips_empty_small_and_realistic_scale() {
+        for size in [0usize, 3, 2_000] {
+            let mut registry = PersistentOrdMap::new();
+            for index in 0..size {
+                let mut id = [0u8; 32];
+                id[0] = 0xD0;
+                id[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+                registry.insert(Bytes32::from(id), test_hybrid_pubkey(index as u8));
+            }
+
+            let mut bytes = Vec::new();
+            encode_delegator_identity_registry(&registry, &mut bytes);
+            assert_eq!(
+                bytes.len(),
+                delegator_identity_registry_encoded_len(&registry)
+            );
+            let decoded = decode_delegator_identity_registry(&mut ByteReader::new(&bytes)).unwrap();
+            assert_eq!(decoded, registry);
+        }
+    }
+
+    #[test]
+    fn delegator_identity_registry_encoding_is_insertion_order_independent() {
+        let mut forward = PersistentOrdMap::new();
+        let mut reverse = PersistentOrdMap::new();
+        for byte in [0x01, 0x02, 0x03, 0x04] {
+            forward.insert(Bytes32::from([byte; 32]), test_hybrid_pubkey(byte));
+        }
+        for byte in [0x04, 0x03, 0x02, 0x01] {
+            reverse.insert(Bytes32::from([byte; 32]), test_hybrid_pubkey(byte));
+        }
+
+        let mut forward_bytes = Vec::new();
+        encode_delegator_identity_registry(&forward, &mut forward_bytes);
+        let mut reverse_bytes = Vec::new();
+        encode_delegator_identity_registry(&reverse, &mut reverse_bytes);
+        assert_eq!(forward_bytes, reverse_bytes);
+        assert_eq!(
+            forward
+                .iter()
+                .map(|(delegator_id, _)| delegator_id.0[0])
+                .collect::<Vec<_>>(),
+            vec![0x01, 0x02, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn delegator_identity_registry_decode_rejects_duplicate_ids() {
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        let mut bytes = Vec::new();
+        2u32.encode(&mut bytes);
+        delegator_id.encode(&mut bytes);
+        test_hybrid_pubkey(0x11).encode(&mut bytes);
+        delegator_id.encode(&mut bytes);
+        test_hybrid_pubkey(0x22).encode(&mut bytes);
+
+        let err = decode_delegator_identity_registry(&mut ByteReader::new(&bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::DuplicateEntries {
+                field: "snapshot.delegator_identities"
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_delegator_identity_registry_preserves_chain_state_encoding() {
+        let mut state = ChainState::new_genesis();
+        state.height = 42;
+        state.staking_nonces.insert(Bytes32::from([0x44; 32]), 7);
+        state.applied_slash_hashes.insert(Bytes32::from([0x55; 32]));
+
+        let old_bytes = encode_chain_state_without_delegator_identities(&state);
+        let new_bytes = state.encode_to_vec();
+        assert!(state.delegator_identities.is_empty());
+        assert_eq!(new_bytes, old_bytes);
+        assert_eq!(new_bytes.len(), state.encoded_len());
+
+        let decoded = ChainState::decode_exact(&old_bytes).unwrap();
+        assert_eq!(decoded, state);
+        assert!(decoded.delegator_identities.is_empty());
+    }
+
+    #[test]
+    fn chain_state_round_trips_optional_delegator_identity_registry_tail() {
+        let mut state = ChainState::new_genesis();
+        state
+            .delegator_identities
+            .insert(Bytes32::from([0xD2; 32]), test_hybrid_pubkey(0x12));
+        state
+            .delegator_identities
+            .insert(Bytes32::from([0xD1; 32]), test_hybrid_pubkey(0x11));
+
+        let without_registry = encode_chain_state_without_delegator_identities(&state);
+        let encoded = state.encode_to_vec();
+        assert!(encoded.len() > without_registry.len());
+        assert!(encoded.starts_with(&without_registry));
+        assert_eq!(encoded.len(), state.encoded_len());
+
+        let decoded = ChainState::decode_exact(&encoded).unwrap();
+        assert_eq!(decoded, state);
     }
 
     #[test]
