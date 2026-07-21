@@ -1104,12 +1104,15 @@ mod tests {
     }
 
     fn make_block(state: &ChainState) -> BlockV1 {
+        let height = state.height + 1;
         let mut block = BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion::CURRENT,
-                height: state.height + 1,
+                protocol_version: ProtocolVersion(
+                    indra_core::types::primitives::block_protocol_version_for_height(height),
+                ),
+                height,
                 prev_hash: state.tip_hash,
-                timestamp: 1_700_000_000 + state.height + 1,
+                timestamp: 1_700_000_000 + height,
                 state_root: Bytes32::ZERO,
                 validator_set_root: Bytes32::ZERO,
                 mempool_set_root: Bytes32::ZERO,
@@ -1543,40 +1546,37 @@ mod tests {
             let setup_elapsed = setup_start.elapsed();
             let block = make_block(&state);
 
-            let mut reference_state = state.clone();
-            let mut reference_mempool = Mempool::default_config();
-            let reference_start = Instant::now();
-            reference_two_step_validate_and_apply(
-                &block,
-                &mut reference_state,
-                &mut reference_mempool,
-                0,
-            )
-            .unwrap();
-            let reference_elapsed = reference_start.elapsed();
+            let projection_start = Instant::now();
+            let projection = project_and_verify_block_state_root(&block, &state, 0).unwrap();
+            let projection_elapsed = projection_start.elapsed();
+            assert_eq!(projection.state.height, block.header.height);
+            assert_eq!(projection.state_root, block.header.state_root);
+            assert_eq!(
+                projection.validator_set_root,
+                block.header.validator_set_root
+            );
+            assert_eq!(projection.value_hash, block.header.value_hash);
 
-            let mut optimized_state = state.clone();
-            let mut optimized_mempool = Mempool::default_config();
-            let optimized_start = Instant::now();
-            validate_and_apply_imported_block(
-                &block,
-                &mut optimized_state,
-                &mut optimized_mempool,
-                0,
-            )
-            .unwrap();
-            let optimized_elapsed = optimized_start.elapsed();
+            let inbound_proposal_clone_start = Instant::now();
+            let mut inbound_projected_state = state.clone();
+            let inbound_clone_elapsed = inbound_proposal_clone_start.elapsed();
+            apply_block(&mut inbound_projected_state, &block, 0).unwrap();
+            assert_eq!(inbound_projected_state.height, block.header.height);
 
-            assert_import_state_equivalent(&reference_state, &optimized_state, &block);
+            let direct_clone_start = Instant::now();
+            let direct_clone = state.clone();
+            let direct_clone_elapsed = direct_clone_start.elapsed();
+            std::hint::black_box(direct_clone);
             eprintln!(
-                "[import-projection-bench] delegators={size} setup={:?} reference_two_step_3clones={:?} optimized_single_projection_2clones={:?}",
-                setup_elapsed, reference_elapsed, optimized_elapsed
+                "[import-projection-bench] delegators={size} setup={:?} sync_project_and_verify={projection_elapsed:?} inbound_proposal_clone_only={inbound_clone_elapsed:?} direct_chainstate_clone={direct_clone_elapsed:?}",
+                setup_elapsed
             );
         }
     }
 
     fn synthetic_delegation_state(delegators: usize) -> ChainState {
         let mut state = ChainState::new_genesis();
+        state.height = indra_core::types::primitives::hard_forks::STATE_COMMITMENT_V2_HEIGHT;
         let buckets = delegators.clamp(1, 10_000);
         for index in 0..delegators {
             let bucket = index % buckets;
@@ -1591,6 +1591,7 @@ mod tests {
                 .add_delegation(Bytes32::from(validator), Bytes32::from(delegator), 1_000, 0)
                 .unwrap();
         }
+        state.rebuild_state_commitment_v2(state.height);
         state
     }
 

@@ -6,8 +6,6 @@
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
 
-use std::collections::HashSet;
-
 use indra_core::types::primitives::{
     state_commitment_v2_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK,
     INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
@@ -16,7 +14,7 @@ use indra_core::types::primitives::{
 use crate::{
     governance::GovernanceState,
     nullifier::NullifierSet,
-    persistent::PersistentOrdMap,
+    persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::UtxoSet,
     validator::{
@@ -105,7 +103,7 @@ pub struct ChainState {
 
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
-    pub applied_slash_hashes: HashSet<Bytes32>,
+    pub applied_slash_hashes: PersistentOrdSet<Bytes32>,
 
     /// On-chain governance state.
     pub governance: GovernanceState,
@@ -256,7 +254,7 @@ impl ChainState {
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
-            applied_slash_hashes: HashSet::new(),
+            applied_slash_hashes: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
             state_commitment_v2: None,
@@ -290,7 +288,7 @@ impl ChainState {
             applied_slash_hashes: if r.remaining() > 0 {
                 decode_hash_set(r, "snapshot.applied_slash_hashes")?
             } else {
-                HashSet::new()
+                PersistentOrdSet::new()
             },
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -386,20 +384,21 @@ impl ChainState {
     }
 }
 
-fn encode_hash_set(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
-    let mut entries: Vec<_> = hashes.iter().copied().collect();
-    entries.sort_by_key(|hash| hash.0);
-    (entries.len() as u32).encode(buf);
-    for hash in entries {
+fn encode_hash_set(hashes: &PersistentOrdSet<Bytes32>, buf: &mut Vec<u8>) {
+    (hashes.len() as u32).encode(buf);
+    for hash in hashes {
         hash.encode(buf);
     }
 }
 
-fn hash_set_encoded_len(hashes: &HashSet<Bytes32>) -> usize {
+fn hash_set_encoded_len(hashes: &PersistentOrdSet<Bytes32>) -> usize {
     4 + hashes.len() * 32
 }
 
-fn decode_hash_set(r: &mut ByteReader<'_>, field: &'static str) -> IndraResult<HashSet<Bytes32>> {
+fn decode_hash_set(
+    r: &mut ByteReader<'_>,
+    field: &'static str,
+) -> IndraResult<PersistentOrdSet<Bytes32>> {
     use indra_core::error::IndraError;
     use indra_core::types::primitives::MAX_SLASHES_PER_BLOCK;
 
@@ -412,7 +411,7 @@ fn decode_hash_set(r: &mut ByteReader<'_>, field: &'static str) -> IndraResult<H
             actual: count,
         });
     }
-    let mut hashes = HashSet::with_capacity(count);
+    let mut hashes = PersistentOrdSet::new();
     for _ in 0..count {
         let hash = Bytes32::decode(r)?;
         if !hashes.insert(hash) {
@@ -538,7 +537,7 @@ fn validate_nonce_map_count(count: usize) -> IndraResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
 
     use indra_core::{
         codec::Encode,
@@ -618,6 +617,15 @@ mod tests {
         for (signer_id, nonce) in nonces {
             signer_id.encode(buf);
             nonce.encode(buf);
+        }
+    }
+
+    fn encode_hash_set_hashset(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
+        let mut entries: Vec<_> = hashes.iter().copied().collect();
+        entries.sort_by_key(|hash| hash.0);
+        (entries.len() as u32).encode(buf);
+        for hash in entries {
+            hash.encode(buf);
         }
     }
 
@@ -817,6 +825,209 @@ mod tests {
         let mut reverse_bytes = Vec::new();
         encode_nonce_map(&reverse, &mut reverse_bytes);
         assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    fn applied_slash_hash_persistent_encoding_matches_legacy_hashset_encoding() {
+        let mut legacy = HashSet::new();
+        let mut persistent = PersistentOrdSet::new();
+        for byte in [0x03, 0x01, 0x02, 0x04] {
+            let hash = Bytes32::from([byte; 32]);
+            legacy.insert(hash);
+            persistent.insert(hash);
+        }
+
+        let mut legacy_bytes = Vec::new();
+        encode_hash_set_hashset(&legacy, &mut legacy_bytes);
+        let mut persistent_bytes = Vec::new();
+        encode_hash_set(&persistent, &mut persistent_bytes);
+        assert_eq!(persistent_bytes, legacy_bytes);
+
+        let decoded = decode_hash_set(
+            &mut ByteReader::new(&persistent_bytes),
+            "snapshot.applied_slash_hashes",
+        )
+        .unwrap();
+        assert_eq!(decoded, persistent);
+    }
+
+    #[test]
+    fn applied_slash_hash_persistent_encoding_is_insertion_order_independent() {
+        let mut forward = PersistentOrdSet::new();
+        let mut reverse = PersistentOrdSet::new();
+        for byte in [0x01, 0x02, 0x03, 0x04] {
+            forward.insert(Bytes32::from([byte; 32]));
+        }
+        for byte in [0x04, 0x03, 0x02, 0x01] {
+            reverse.insert(Bytes32::from([byte; 32]));
+        }
+
+        let mut forward_bytes = Vec::new();
+        encode_hash_set(&forward, &mut forward_bytes);
+        let mut reverse_bytes = Vec::new();
+        encode_hash_set(&reverse, &mut reverse_bytes);
+        assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    fn chain_state_migrated_clone_matches_deep_materialized_oracle() {
+        let mut state = ChainState::new_genesis();
+        state.height = indra_core::types::primitives::hard_forks::STATE_COMMITMENT_V2_HEIGHT;
+        state.utxos.insert(test_output(0x11), 1, 0, 0).unwrap();
+        state.nullifiers.insert(Bytes32::from([0x22; 32]));
+        state
+            .staked_bonds
+            .insert(Bytes32::from([0x33; 32]), test_bond(0x33));
+        state.staking_nonces.insert(Bytes32::from([0x44; 32]), 7);
+        state.applied_slash_hashes.insert(Bytes32::from([0x55; 32]));
+        state.push_delegation_return_event(DelegationReturnEvent {
+            delegator_id: Bytes32::from([0x66; 32]),
+            validator_id: Bytes32::from([0x77; 32]),
+            bond_utxo_id: Bytes32::from([0x88; 32]),
+            amount_spark: 123,
+            reason: crate::validator::DelegationReturnReason::ValidatorEvicted,
+            returned_epoch: 9,
+            returned_height: state.height,
+            refund_utxo_id: Bytes32::from([0x99; 32]),
+        });
+        state.rebuild_state_commitment_v2(state.height);
+
+        let migrated_clone = state.clone();
+        let deep_materialized = ChainState::decode_exact(&state.encode_to_vec()).unwrap();
+
+        assert_eq!(
+            migrated_clone.encode_to_vec(),
+            deep_materialized.encode_to_vec()
+        );
+        assert_eq!(
+            crate::state_root::compute_state_roots(&migrated_clone),
+            crate::state_root::compute_state_roots(&deep_materialized)
+        );
+        assert_eq!(migrated_clone, state);
+    }
+
+    #[test]
+    #[ignore = "release-mode fix #6 capstone whole-ChainState clone benchmark; run with --release --ignored --nocapture"]
+    fn fix6_capstone_whole_chain_state_clone_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        fn id_from_index(domain: u8, index: usize) -> Bytes32 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = domain;
+            bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+            Bytes32::from(bytes)
+        }
+
+        fn heavy_output(index: usize) -> OutputV1 {
+            let byte = (index as u8).wrapping_add(1);
+            OutputV1 {
+                value_spark: 1_000,
+                commitment: CommitmentV1 {
+                    compressed_point: id_from_index(0xC0, index),
+                },
+                owner_pubkey: HybridPubKey {
+                    classical_pk: id_from_index(0xA0, index),
+                    pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(2); 2_592]).unwrap(),
+                },
+                range_proof: VariableBytes::from_slice(&vec![byte.wrapping_add(3); 674]).unwrap(),
+                lock_height: 0,
+            }
+        }
+
+        fn heavy_bond(
+            index: usize,
+            validator_id: Bytes32,
+            delegator_id: Bytes32,
+        ) -> StakeBondEntry {
+            let utxo_id = id_from_index(0xB0, index);
+            StakeBondEntry {
+                utxo_id,
+                validator_id,
+                delegator_id,
+                amount_spark: 1_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: None,
+                original_output: heavy_output(index),
+            }
+        }
+
+        fn populate_state(size: usize, heavy_bond_count: usize) -> ChainState {
+            let mut state = ChainState::new_genesis();
+            state.height = indra_core::types::primitives::hard_forks::STATE_COMMITMENT_V2_HEIGHT;
+            let validator_count = size.clamp(1, 10_000);
+            for index in 0..size {
+                let validator_id = id_from_index(0x70, index % validator_count);
+                let delegator_id = id_from_index(0xD0, index);
+                state
+                    .delegations
+                    .add_delegation(validator_id, delegator_id, 1_000, 0)
+                    .unwrap();
+                state.staking_nonces.insert(delegator_id, index as u64);
+                if index < heavy_bond_count {
+                    let bond = heavy_bond(index, validator_id, delegator_id);
+                    state.staked_bonds.insert(bond.utxo_id, bond);
+                }
+            }
+            for index in 0..size.min(30_000) {
+                state
+                    .applied_slash_hashes
+                    .insert(id_from_index(0xE0, index));
+            }
+            for index in 0..size.min(MAX_DELEGATION_RETURN_EVENTS) {
+                state.push_delegation_return_event(DelegationReturnEvent {
+                    delegator_id: id_from_index(0xD0, index),
+                    validator_id: id_from_index(0x70, index % validator_count),
+                    bond_utxo_id: id_from_index(0xB0, index),
+                    amount_spark: 1_000,
+                    reason: crate::validator::DelegationReturnReason::ValidatorEvicted,
+                    returned_epoch: index as u64 / 100,
+                    returned_height: state.height,
+                    refund_utxo_id: id_from_index(0xF0, index),
+                });
+            }
+            state.rebuild_state_commitment_v2(state.height);
+            state
+        }
+
+        let sizes = std::env::var("INDRA_FIX6_CAPSTONE_CLONE_BENCH_SIZES")
+            .unwrap_or_else(|_| "100000,1000000".to_string())
+            .split(',')
+            .map(|part| part.trim().parse::<usize>().unwrap())
+            .collect::<Vec<_>>();
+        let heavy_bond_limit = std::env::var("INDRA_FIX6_CAPSTONE_HEAVY_BOND_LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(1_000_000);
+
+        eprintln!(
+            "[fix6-capstone] original Step 0: normal import/commit ≈7 clone-equivalents and ≈11.6-11.9s at 1M delegators before the clone-cost arc"
+        );
+
+        for size in sizes {
+            let heavy_bonds = size.min(heavy_bond_limit);
+            let setup_start = Instant::now();
+            let state = populate_state(size, heavy_bonds);
+            let setup = setup_start.elapsed();
+
+            let whole_clone_start = Instant::now();
+            let whole_clone = state.clone();
+            let whole_clone_elapsed = whole_clone_start.elapsed();
+            black_box(&whole_clone);
+
+            let slash_hash_clone_start = Instant::now();
+            let slash_hash_clone = state.applied_slash_hashes.clone();
+            let slash_hash_clone_elapsed = slash_hash_clone_start.elapsed();
+            black_box(&slash_hash_clone);
+
+            let event_clone_start = Instant::now();
+            let event_clone = state.delegation_return_events.clone();
+            let event_clone_elapsed = event_clone_start.elapsed();
+            black_box(&event_clone);
+
+            println!(
+                "fix6_capstone_chainstate_clone delegators={size} heavy_bonds={heavy_bonds} setup={setup:?} whole_chainstate_clone={whole_clone_elapsed:?} applied_slash_hashes_clone={slash_hash_clone_elapsed:?} delegation_return_events_clone={event_clone_elapsed:?}"
+            );
+        }
     }
 
     #[test]

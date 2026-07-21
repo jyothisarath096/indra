@@ -5,8 +5,6 @@
 //! and block production; those callers still need a separate projected state
 //! before committing candidate roots to their real state.
 
-use std::collections::HashSet;
-
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -19,7 +17,7 @@ use crate::{
     chain::ChainState,
     error::StateResult,
     governance::GovernanceState,
-    persistent::PersistentOrdMap,
+    persistent::{PersistentOrdMap, PersistentOrdSet},
     utxo::{UtxoEntry, UtxoSet},
     validator::{DelegationMap, DelegationReturnEvent, StakeBondEntry, ValidatorSet},
 };
@@ -47,7 +45,7 @@ enum UndoEntry {
     Delegations(DelegationMap),
     StakedBonds(PersistentOrdMap<Bytes32, StakeBondEntry>),
     StakingNonces(PersistentOrdMap<Bytes32, u64>),
-    SlashHashes(HashSet<Bytes32>),
+    SlashHashes(PersistentOrdSet<Bytes32>),
     Governance(GovernanceState),
     Utxos(UtxoSet),
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
@@ -313,6 +311,9 @@ impl<'a> StateTxn<'a> {
 
     fn snapshot_slash_hashes(&mut self) {
         if !self.slash_hashes_recorded {
+            // `PersistentOrdSet::clone()` is an O(1) root-handle copy; applied
+            // slash hashes keep the same coarse rollback boundary without a
+            // full hash-table clone.
             let snapshot = measure_undo_recording(|| self.state.applied_slash_hashes.clone());
             self.undo.push(UndoEntry::SlashHashes(snapshot));
             self.slash_hashes_recorded = true;
