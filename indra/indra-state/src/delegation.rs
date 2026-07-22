@@ -144,6 +144,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             *bond_utxo_id,
             delegator_pubkey,
             current_height,
+            identity_registry_active,
         ),
         StakingOpBody::ClaimRewards {
             validator_id,
@@ -771,6 +772,7 @@ fn apply_undelegate(
     bond_utxo_id: Bytes32,
     delegator_pubkey: &HybridPubKey,
     current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
 
@@ -784,6 +786,20 @@ fn apply_undelegate(
             "bond does not belong to delegator".into(),
         ));
     }
+    let identity_outcome = if identity_registry_active {
+        let outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
+            .map_err(identity_error_to_state_error)?;
+        if matches!(outcome, IdentityCheckOutcome::NoPriorRecord)
+            && bond.original_output.owner_pubkey != *delegator_pubkey
+        {
+            return Err(StateError::InvalidStakingOp(format!(
+                "delegator identity bond owner pubkey mismatch for {delegator_id}"
+            )));
+        }
+        Some(outcome)
+    } else {
+        None
+    };
     if bond.validator_id != *validator_id {
         return Err(StateError::InvalidStakingOp(
             "bond not staked with this validator".into(),
@@ -820,6 +836,17 @@ fn apply_undelegate(
             .find(|entry| entry.delegator_id == delegator_id),
     ) {
         commitment.put_delegator(validator_id, delegator);
+    }
+    if matches!(
+        identity_outcome,
+        Some(IdentityCheckOutcome::NoPriorRecord | IdentityCheckOutcome::LegacyBondMatch)
+    ) {
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_delegator_identity(&delegator_id, delegator_pubkey);
+        }
     }
     Ok(())
 }
@@ -2055,6 +2082,307 @@ mod tests {
             Some(UNBONDING_PERIOD_EPOCHS)
         );
         assert_eq!(state.delegations.total_delegated(&validator_id), 0);
+    }
+
+    #[test]
+    fn undelegate_pre_identity_gate_ignores_registry_mismatch_and_behaves_as_before() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x35);
+        let legitimate_keypair = mixed_keypair(0x36, 0x37);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_keypair = mixed_keypair(0x36, 0x38);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
+        state
+            .delegator_identities
+            .insert(delegator_id, legitimate_pubkey.clone());
+
+        let bond_utxo_id = insert_delegator_utxo(&mut state, legitimate_pubkey, 1_000_000, 0x35);
+        let chain_id = state.chain_id.clone();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &legitimate_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, false)
+            .unwrap();
+
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &attacker_keypair, 2);
+        apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 1, false)
+            .unwrap();
+
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn undelegate_post_identity_gate_registered_match_succeeds_without_changing_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x39);
+        let delegator_keypair = keypair(0x3A);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+
+        let bond_utxo_id = insert_delegator_utxo(&mut state, delegator_pubkey, 1_000_000, 0x39);
+        let chain_id = state.chain_id.clone();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, true)
+            .unwrap();
+        let before = state.delegator_identities.clone();
+
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
+        apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 1, true)
+            .unwrap();
+
+        assert_eq!(state.delegator_identities, before);
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn undelegate_post_identity_gate_rejects_classical_key_only_pq_substitution_attack() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x3B);
+        let legitimate_keypair = mixed_keypair(0x3C, 0x3D);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, legitimate_pubkey.clone());
+        let attacker_keypair = mixed_keypair(0x3C, 0x3E);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
+
+        let bond_utxo_id =
+            insert_delegator_utxo(&mut state, legitimate_pubkey.clone(), 1_000_000, 0x3B);
+        let chain_id = state.chain_id.clone();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &legitimate_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, true)
+            .unwrap();
+
+        let mut before_attack_reference = state.clone();
+        let attack = signed_op(
+            StakingOpBody::Undelegate {
+                validator_id,
+                bond_utxo_id,
+                delegator_pubkey: attacker_pubkey,
+            },
+            2,
+            &attacker_keypair,
+            &state.chain_id,
+        );
+        apply_staking_op_with_identity_activation(
+            &mut before_attack_reference,
+            &attack,
+            &chain_id,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            before_attack_reference
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+
+        let err =
+            apply_staking_op_with_identity_activation(&mut state, &attack, &chain_id, 1, true)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            None
+        );
+    }
+
+    #[test]
+    fn undelegate_post_identity_gate_legacy_bonds_matching_submitted_key_populate_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x3F);
+        let delegator_keypair = keypair(0x40);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let bond_utxo_id =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x3F);
+        let chain_id = state.chain_id.clone();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, false)
+            .unwrap();
+        assert!(state.delegator_identities.is_empty());
+
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
+        apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 1, true)
+            .unwrap();
+
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn undelegate_post_identity_gate_compact_bond_no_prior_record_populates_when_owner_matches() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x43);
+        let delegator_keypair = keypair(0x44);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let bond_utxo_id = Bytes32::from([0x44; 32]);
+        let compact_bond = StakeBondEntry::new_for_test_with_compact_activation(
+            bond_utxo_id,
+            validator_id,
+            delegator_id,
+            1_000_000,
+            0,
+            test_output(1_000_000, delegator_pubkey.clone(), 0x44),
+            2,
+            1,
+        );
+        assert!(compact_bond.original_output.range_proof.is_none());
+        state.staked_bonds.insert(bond_utxo_id, compact_bond);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        let chain_id = state.chain_id.clone();
+
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 2, true)
+            .unwrap();
+
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn undelegate_post_identity_gate_compact_bond_no_prior_record_rejects_owner_mismatch() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x45);
+        let legitimate_keypair = mixed_keypair(0x46, 0x47);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_keypair = mixed_keypair(0x46, 0x48);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
+        let bond_utxo_id = Bytes32::from([0x46; 32]);
+        let compact_bond = StakeBondEntry::new_for_test_with_compact_activation(
+            bond_utxo_id,
+            validator_id,
+            delegator_id,
+            1_000_000,
+            0,
+            test_output(1_000_000, legitimate_pubkey, 0x46),
+            2,
+            1,
+        );
+        assert!(compact_bond.original_output.range_proof.is_none());
+        state.staked_bonds.insert(bond_utxo_id, compact_bond);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        let chain_id = state.chain_id.clone();
+
+        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &attacker_keypair, 1);
+        let err =
+            apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 2, true)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity bond owner pubkey mismatch")
+        ));
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            None
+        );
+        assert!(!state.delegator_identities.contains_key(&delegator_id));
+    }
+
+    #[test]
+    fn undelegate_post_identity_gate_rejects_conflicting_legacy_bonds_even_if_submitted_matches_one(
+    ) {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x41);
+        let first_keypair = mixed_keypair(0x42, 0x43);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let second_keypair = mixed_keypair(0x42, 0x44);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let delegator_id = pubkey_to_id(&first_pubkey);
+        assert_eq!(pubkey_to_id(&second_pubkey), delegator_id);
+
+        let first_bond = insert_delegator_utxo(&mut state, first_pubkey.clone(), 1_000_000, 0x41);
+        let second_bond = insert_delegator_utxo(&mut state, second_pubkey.clone(), 1_000_000, 0x42);
+        let chain_id = state.chain_id.clone();
+        let first_delegate = delegate_op(&state, validator_id, first_bond, &first_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &first_delegate, &chain_id, 1, false)
+            .unwrap();
+        let second_delegate = delegate_op(&state, validator_id, second_bond, &second_keypair, 2);
+        apply_staking_op_with_identity_activation(
+            &mut state,
+            &second_delegate,
+            &chain_id,
+            1,
+            false,
+        )
+        .unwrap();
+
+        let undelegate = undelegate_op(&state, validator_id, first_bond, &first_keypair, 3);
+        let err =
+            apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 1, true)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity has ambiguous legacy pubkeys")
+        ));
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&first_bond)
+                .and_then(|bond| bond.unbonding_end_epoch),
+            None
+        );
+        assert!(!state.delegator_identities.contains_key(&delegator_id));
     }
 
     #[test]
