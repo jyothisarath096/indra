@@ -170,6 +170,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             *vrf_pk,
             bond_proof.as_ref(),
             current_height,
+            identity_registry_active,
         ),
         StakingOpBody::SetCommission {
             validator_id,
@@ -195,11 +196,18 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             validator_pubkey,
             bond_proof.as_ref(),
             current_height,
+            identity_registry_active,
         ),
         StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey,
-        } => apply_self_unstake(state, *bond_utxo_id, validator_pubkey, current_height),
+        } => apply_self_unstake(
+            state,
+            *bond_utxo_id,
+            validator_pubkey,
+            current_height,
+            identity_registry_active,
+        ),
     };
 
     result?;
@@ -294,6 +302,7 @@ fn apply_register_validator(
     vrf_pk: [u8; 32],
     bond_proof: Option<&StakingBondProof>,
     current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
         || commission_bps > state.governance.params.max_commission_bps
@@ -306,6 +315,9 @@ fn apply_register_validator(
     let validator_id = pubkey_to_id(validator_pubkey);
     if state.validators.get(&validator_id).is_some() {
         return Err(StateError::ValidatorAlreadyRegistered);
+    }
+    if identity_registry_active {
+        check_validator_identity_registry_if_present(state, &validator_id, validator_pubkey)?;
     }
     let new_classical_pk = validator_pubkey.classical_pk.0;
     let new_pq_pk = validator_pubkey.pq_pk.as_slice();
@@ -424,6 +436,9 @@ fn apply_register_validator(
     state.staked_bonds.insert(bond_utxo_id, bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &bond);
+    }
+    if identity_registry_active {
+        check_or_insert_validator_identity(state, &validator_id, validator_pubkey)?;
     }
     Ok(())
 }
@@ -864,12 +879,16 @@ fn apply_self_stake(
     validator_pubkey: &HybridPubKey,
     bond_proof: Option<&StakingBondProof>,
     current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
     let validator = state
         .validators
         .get(&validator_id)
         .ok_or(StateError::ValidatorNotFound)?;
+    if identity_registry_active {
+        check_validator_identity_consistency(state, &validator_id, validator_pubkey)?;
+    }
     if !matches!(
         validator.status,
         ValidatorStatus::Active | ValidatorStatus::Registered
@@ -944,12 +963,16 @@ fn apply_self_unstake(
     bond_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
     current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
     let validator = state
         .validators
         .get(&validator_id)
         .ok_or(StateError::ValidatorNotFound)?;
+    if identity_registry_active {
+        check_validator_identity_consistency(state, &validator_id, validator_pubkey)?;
+    }
     if !matches!(
         validator.status,
         ValidatorStatus::Active | ValidatorStatus::Registered
@@ -1009,6 +1032,66 @@ fn apply_self_unstake(
         (state.state_commitment_v2.as_mut(), updated_validator)
     {
         commitment.put_validator(&validator, current_height);
+    }
+    Ok(())
+}
+
+fn check_or_insert_validator_identity(
+    state: &mut ChainState,
+    validator_id: &Bytes32,
+    validator_pubkey: &HybridPubKey,
+) -> StateResult<()> {
+    if state.delegator_identities.contains_key(validator_id) {
+        check_validator_identity_registry_if_present(state, validator_id, validator_pubkey)?;
+        return Ok(());
+    }
+    state
+        .delegator_identities
+        .insert(*validator_id, validator_pubkey.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_delegator_identity(validator_id, validator_pubkey);
+    }
+    Ok(())
+}
+
+fn check_validator_identity_registry_if_present(
+    state: &ChainState,
+    validator_id: &Bytes32,
+    validator_pubkey: &HybridPubKey,
+) -> StateResult<()> {
+    if let Some(registered) = state.delegator_identities.get(validator_id) {
+        if registered != validator_pubkey {
+            return Err(StateError::InvalidStakingOp(format!(
+                "validator identity registry pubkey mismatch for {validator_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_validator_identity_consistency(
+    state: &ChainState,
+    validator_id: &Bytes32,
+    submitted_pubkey: &HybridPubKey,
+) -> StateResult<()> {
+    let validator = state
+        .validators
+        .get(validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+    let matches_validator_key = validator.hybrid_classical_pk
+        == Some(submitted_pubkey.classical_pk.0)
+        && validator.hybrid_pq_pk.as_deref() == Some(submitted_pubkey.pq_pk.as_slice());
+    if !matches_validator_key {
+        return Err(StateError::InvalidStakingOp(format!(
+            "validator identity stored pubkey mismatch for {validator_id}"
+        )));
+    }
+    if let Some(registered) = state.delegator_identities.get(validator_id) {
+        if registered != submitted_pubkey {
+            return Err(StateError::InvalidStakingOp(format!(
+                "validator identity registry pubkey mismatch for {validator_id}"
+            )));
+        }
     }
     Ok(())
 }
@@ -1500,6 +1583,16 @@ mod tests {
         let keypair = keypair(seed);
         let pubkey = pubkey_from_keypair(&keypair);
         let validator_id = pubkey_to_id(&pubkey);
+        insert_active_validator_with_pubkey(state, validator_id, &pubkey, seed);
+        (validator_id, keypair)
+    }
+
+    fn insert_active_validator_with_pubkey(
+        state: &mut ChainState,
+        validator_id: Bytes32,
+        pubkey: &HybridPubKey,
+        seed: u8,
+    ) {
         let entry = ValidatorEntry {
             validator_id,
             name: format!("validator-{seed}"),
@@ -1522,7 +1615,6 @@ mod tests {
             network_addr_last_updated_epoch: None,
         };
         state.validators.upsert(entry).unwrap();
-        (validator_id, keypair)
     }
 
     #[test]
@@ -2556,6 +2648,171 @@ mod tests {
     }
 
     #[test]
+    fn validator_self_stake_pre_identity_gate_accepts_same_classical_different_pq_pubkey() {
+        let mut state = ChainState::new_genesis();
+        let legitimate_keypair = mixed_keypair(0x51, 0x52);
+        let attacker_keypair = mixed_keypair(0x51, 0x53);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let validator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), validator_id);
+        insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x51);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
+        let bond_utxo_id = insert_delegator_utxo(&mut state, legitimate_pubkey, 2_000_000, 0x51);
+        let op = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: attacker_pubkey,
+                bond_proof: Some(bond_proof(2_000_000, 0x51)),
+            },
+            1,
+            &attacker_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 0, false).unwrap();
+
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
+        assert!(state.delegator_identities.is_empty());
+    }
+
+    #[test]
+    fn validator_self_stake_post_identity_gate_rejects_same_classical_different_pq_pubkey() {
+        let mut state = ChainState::new_genesis();
+        let legitimate_keypair = mixed_keypair(0x54, 0x55);
+        let attacker_keypair = mixed_keypair(0x54, 0x56);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let validator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), validator_id);
+        insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x54);
+        state
+            .delegator_identities
+            .insert(validator_id, legitimate_pubkey.clone());
+        let bond_utxo_id = insert_delegator_utxo(&mut state, legitimate_pubkey, 2_000_000, 0x54);
+        let op = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey: attacker_pubkey,
+                bond_proof: Some(bond_proof(2_000_000, 0x54)),
+            },
+            1,
+            &attacker_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        let before = state.clone();
+
+        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("validator identity stored pubkey mismatch")
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn validator_self_bond_post_identity_gate_matches_validator_entry_and_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x57);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
+        let pubkey = pubkey_from_keypair(&validator_keypair);
+        state
+            .delegator_identities
+            .insert(validator_id, pubkey.clone());
+        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x57);
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &stake, &chain_id, 1, true).unwrap();
+        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
+        apply_staking_op_with_identity_activation(&mut state, &unstake, &chain_id, 1, true)
+            .unwrap();
+
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&bond_utxo_id)
+                .unwrap()
+                .unbonding_end_epoch,
+            Some(UNBONDING_PERIOD_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn validator_self_stake_post_identity_gate_rejects_registry_mismatch() {
+        let mut state = ChainState::new_genesis();
+        let legitimate_keypair = mixed_keypair(0x58, 0x59);
+        let conflicting_keypair = mixed_keypair(0x58, 0x5A);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let conflicting_pubkey = pubkey_from_keypair(&conflicting_keypair);
+        let validator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&conflicting_pubkey), validator_id);
+        insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x58);
+        state
+            .delegator_identities
+            .insert(validator_id, conflicting_pubkey);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, legitimate_pubkey, 2_000_000, 0x58);
+        let op = self_stake_op(&state, bond_utxo_id, &legitimate_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        let before = state.clone();
+
+        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("validator identity registry pubkey mismatch")
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn validator_self_unstake_post_identity_gate_rejects_validator_entry_mismatch_even_if_registry_matches(
+    ) {
+        let mut state = ChainState::new_genesis();
+        let legitimate_keypair = mixed_keypair(0x5B, 0x5C);
+        let attacker_keypair = mixed_keypair(0x5B, 0x5D);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let validator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), validator_id);
+        insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x5B);
+        state
+            .delegator_identities
+            .insert(validator_id, attacker_pubkey.clone());
+        let bond_utxo_id =
+            insert_delegator_utxo(&mut state, legitimate_pubkey.clone(), 2_000_000, 0x5B);
+        let chain_id = state.chain_id.clone();
+        let stake = self_stake_op(&state, bond_utxo_id, &legitimate_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &stake, &chain_id, 1, false).unwrap();
+        let op = signed_op(
+            StakingOpBody::SelfUnstake {
+                bond_utxo_id,
+                validator_pubkey: attacker_pubkey,
+            },
+            2,
+            &attacker_keypair,
+            &state.chain_id,
+        );
+        let before = state.clone();
+
+        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("validator identity stored pubkey mismatch")
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn self_stake_without_proof_fails_at_activation() {
         let mut state = ChainState::new_genesis();
         let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
@@ -3380,6 +3637,128 @@ mod tests {
         );
         assert!(state.staked_bonds.contains_key(&bond_utxo_id));
         assert!(!state.utxos.contains(&bond_utxo_id));
+    }
+
+    #[test]
+    fn register_validator_pre_identity_gate_does_not_populate_registry() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0xB0);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let validator_id = pubkey_to_id(&validator_pubkey);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xB0,
+        );
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey,
+                vrf_pk: [0xB0; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xB0)),
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 0, false).unwrap();
+
+        assert!(state.validators.get(&validator_id).is_some());
+        assert!(!state.delegator_identities.contains_key(&validator_id));
+    }
+
+    #[test]
+    fn register_validator_post_identity_gate_populates_registry() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = keypair(0xB1);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let validator_id = pubkey_to_id(&validator_pubkey);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xB1,
+        );
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey: validator_pubkey.clone(),
+                vrf_pk: [0xB1; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xB1)),
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true).unwrap();
+
+        assert_eq!(
+            state.delegator_identities.get(&validator_id),
+            Some(&validator_pubkey)
+        );
+    }
+
+    #[test]
+    fn register_validator_post_identity_gate_rejects_preexisting_registry_mismatch() {
+        let mut state = ChainState::new_genesis();
+        let validator_keypair = mixed_keypair(0xB2, 0xB3);
+        let conflicting_keypair = mixed_keypair(0xB2, 0xB4);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let conflicting_pubkey = pubkey_from_keypair(&conflicting_keypair);
+        let validator_id = pubkey_to_id(&validator_pubkey);
+        assert_eq!(pubkey_to_id(&conflicting_pubkey), validator_id);
+        state
+            .delegator_identities
+            .insert(validator_id, conflicting_pubkey);
+        let bond_utxo_id = insert_delegator_utxo(
+            &mut state,
+            validator_pubkey.clone(),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xB2,
+        );
+        let op = signed_op(
+            StakingOpBody::RegisterValidator {
+                commission_bps: 1_000,
+                bond_utxo_id,
+                validator_pubkey,
+                vrf_pk: [0xB2; 32],
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xB2)),
+            },
+            1,
+            &validator_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        let before = state.clone();
+
+        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("validator identity registry pubkey mismatch")
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn validator_and_delegator_registry_keys_are_classical_pubkey_identity_hashes() {
+        let validator_pubkey = pubkey_from_keypair(&keypair(0xB5));
+        let delegator_pubkey = pubkey_from_keypair(&keypair(0xB6));
+        let validator_id = pubkey_to_id(&validator_pubkey);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+
+        assert_ne!(validator_id, delegator_id);
+        assert_eq!(pubkey_to_id(&validator_pubkey), validator_id);
+        assert_eq!(pubkey_to_id(&delegator_pubkey), delegator_id);
     }
 
     #[test]

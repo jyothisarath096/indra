@@ -1095,7 +1095,7 @@ mod tests {
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
     };
-    use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus};
+    use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorSet, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         codec::Encode,
@@ -1388,7 +1388,7 @@ mod tests {
         nonce: u64,
     ) -> (StakingOp, Bytes32) {
         let (validator_pubkey, keypair) = make_test_keypair(seed);
-        let validator_id = pubkey_to_id_for_test(&validator_pubkey);
+        let validator_id = staking_delegator_id_for_test(&validator_pubkey);
         let bond_utxo_id = state
             .utxos
             .insert(
@@ -2626,6 +2626,40 @@ mod tests {
     }
 
     #[test]
+    fn state_txn_rolls_back_register_validator_identity_population_failpoints() {
+        let mut state = ChainState::new_genesis();
+        state.validators = ValidatorSet::new();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        let (op, validator_id) = signed_register_validator_op(&mut state, [0x93; 32], 1);
+        let validator_pubkey = match &op.body {
+            StakingOpBody::RegisterValidator {
+                validator_pubkey, ..
+            } => validator_pubkey.clone(),
+            _ => unreachable!(),
+        };
+        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        block.staking_ops.push(op);
+
+        crate::txn::set_fail_after_mutation(None);
+        let mut success = state.clone();
+        apply_block(&mut success, &block, 0).unwrap();
+        assert_eq!(
+            success.delegator_identities.get(&validator_id),
+            Some(&validator_pubkey)
+        );
+        assert!(success.validators.get(&validator_id).is_some());
+
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 3,
+            "validator identity registration should be rollback-covered, got {mutation_count}"
+        );
+        assert!(!state.delegator_identities.contains_key(&validator_id));
+        assert!(state.validators.get(&validator_id).is_none());
+    }
+
+    #[test]
     fn delegate_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate() {
         let activation_height = 2;
         let mut reference = ChainState::new_genesis();
@@ -3392,6 +3426,64 @@ mod tests {
                 if reason.contains("delegator identity has ambiguous legacy pubkeys")
         ));
         assert_eq!(state, before_post_gate);
+    }
+
+    #[test]
+    fn validator_identity_activation_replay_is_deterministic_before_gate_and_populates_after_gate()
+    {
+        let mut initial = ChainState::new_genesis();
+        initial.validators = ValidatorSet::new();
+        initial.height = u64::MAX - 2;
+        initial.tip_hash = Bytes32::ZERO;
+
+        let (pre_op, pre_validator_id) = signed_register_validator_op(&mut initial, [0x94; 32], 1);
+        let pre_pubkey = match &pre_op.body {
+            StakingOpBody::RegisterValidator {
+                validator_pubkey, ..
+            } => validator_pubkey.clone(),
+            _ => unreachable!(),
+        };
+        let mut pre_block = make_block_at_height(&initial, vec![], u64::MAX - 1, 0);
+        pre_block.staking_ops.push(pre_op);
+
+        let mut first_replay = initial.clone();
+        let mut second_replay = initial.clone();
+        apply_block(&mut first_replay, &pre_block, 0).unwrap();
+        apply_block(&mut second_replay, &pre_block, 0).unwrap();
+        assert_eq!(first_replay, second_replay);
+        assert!(first_replay.validators.get(&pre_validator_id).is_some());
+        assert!(!first_replay
+            .delegator_identities
+            .contains_key(&pre_validator_id));
+        assert_ne!(
+            first_replay.delegator_identities.get(&pre_validator_id),
+            Some(&pre_pubkey)
+        );
+
+        let (post_op, post_validator_id) =
+            signed_register_validator_op(&mut first_replay, [0x95; 32], 1);
+        let post_pubkey = match &post_op.body {
+            StakingOpBody::RegisterValidator {
+                validator_pubkey, ..
+            } => validator_pubkey.clone(),
+            _ => unreachable!(),
+        };
+        second_replay = first_replay.clone();
+        let mut post_block = make_block_at_height(&first_replay, vec![], u64::MAX, 0);
+        post_block.staking_ops.push(post_op.clone());
+        let mut post_block_second = make_block_at_height(&second_replay, vec![], u64::MAX, 0);
+        post_block_second.staking_ops.push(post_op);
+
+        apply_block(&mut first_replay, &post_block, 0).unwrap();
+        apply_block(&mut second_replay, &post_block_second, 0).unwrap();
+        assert_eq!(first_replay, second_replay);
+        assert_eq!(
+            first_replay.delegator_identities.get(&post_validator_id),
+            Some(&post_pubkey)
+        );
+        assert!(!first_replay
+            .delegator_identities
+            .contains_key(&pre_validator_id));
     }
 
     #[test]
