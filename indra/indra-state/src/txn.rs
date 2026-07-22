@@ -21,6 +21,7 @@ use crate::{
     utxo::{UtxoEntry, UtxoSet},
     validator::{DelegationMap, DelegationReturnEvent, StakeBondEntry, ValidatorSet},
 };
+use indra_core::types::crypto::HybridPubKey;
 
 #[derive(Clone)]
 struct ScalarSnapshot {
@@ -46,6 +47,8 @@ enum UndoEntry {
     StakedBonds(PersistentOrdMap<Bytes32, StakeBondEntry>),
     StakingNonces(PersistentOrdMap<Bytes32, u64>),
     SlashHashes(PersistentOrdSet<Bytes32>),
+    #[allow(dead_code)]
+    DelegatorIdentities(PersistentOrdMap<Bytes32, HybridPubKey>),
     Governance(GovernanceState),
     Utxos(UtxoSet),
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
@@ -70,6 +73,8 @@ pub(crate) struct StateTxn<'a> {
     staked_bonds_recorded: bool,
     staking_nonces_recorded: bool,
     slash_hashes_recorded: bool,
+    #[allow(dead_code)]
+    delegator_identities_recorded: bool,
     governance_recorded: bool,
     utxos_recorded: bool,
     delegation_return_events_recorded: bool,
@@ -90,6 +95,7 @@ impl<'a> StateTxn<'a> {
             staked_bonds_recorded: false,
             staking_nonces_recorded: false,
             slash_hashes_recorded: false,
+            delegator_identities_recorded: false,
             governance_recorded: false,
             utxos_recorded: false,
             delegation_return_events_recorded: false,
@@ -169,6 +175,14 @@ impl<'a> StateTxn<'a> {
         self.snapshot_slash_hashes();
         self.snapshot_utxos();
         self.record_scalars();
+        self.mark_commitment_touched();
+    }
+
+    /// Record delegator identity registry state before test-only or future
+    /// live-operation registry mutations.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_delegator_identity_scope(&mut self) {
+        self.snapshot_delegator_identities();
         self.mark_commitment_touched();
     }
 
@@ -320,6 +334,16 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    #[allow(dead_code)]
+    fn snapshot_delegator_identities(&mut self) {
+        if !self.delegator_identities_recorded {
+            // `PersistentOrdMap::clone()` is an O(1) root-handle copy.
+            let snapshot = measure_undo_recording(|| self.state.delegator_identities.clone());
+            self.undo.push(UndoEntry::DelegatorIdentities(snapshot));
+            self.delegator_identities_recorded = true;
+        }
+    }
+
     fn snapshot_governance(&mut self) {
         if !self.governance_recorded {
             let snapshot = measure_undo_recording(|| self.state.governance.clone());
@@ -382,6 +406,9 @@ impl<'a> StateTxn<'a> {
                 UndoEntry::StakedBonds(staked_bonds) => self.state.staked_bonds = staked_bonds,
                 UndoEntry::StakingNonces(nonces) => self.state.staking_nonces = nonces,
                 UndoEntry::SlashHashes(hashes) => self.state.applied_slash_hashes = hashes,
+                UndoEntry::DelegatorIdentities(identities) => {
+                    self.state.delegator_identities = identities;
+                }
                 UndoEntry::Governance(governance) => self.state.governance = governance,
                 UndoEntry::Utxos(utxos) => self.state.utxos = utxos,
                 UndoEntry::DelegationReturnEvents(events) => {

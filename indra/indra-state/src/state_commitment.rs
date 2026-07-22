@@ -15,8 +15,9 @@
 
 use indra_core::{
     codec::Encode,
-    types::primitives::{
-        registered_validator_cap_active, validator_network_address_active, Bytes32,
+    types::{
+        crypto::HybridPubKey,
+        primitives::{registered_validator_cap_active, validator_network_address_active, Bytes32},
     },
 };
 use indra_crypto::sha256;
@@ -35,6 +36,7 @@ const DOMAIN_STAKING_NONCE: u8 = 0x03;
 const DOMAIN_STAKED_BOND: u8 = 0x04;
 const DOMAIN_SLASH_HASH: u8 = 0x05;
 const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
+const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,6 +73,12 @@ impl StateCommitmentV2 {
         }
         for hash in &state.applied_slash_hashes {
             leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
+        }
+        for (delegator_id, pubkey) in &state.delegator_identities {
+            leaves.push((
+                delegator_identity_key(delegator_id),
+                delegator_identity_value_hash(delegator_id, pubkey),
+            ));
         }
         if registered_validator_cap_active(height) {
             for event in &state.delegation_return_events {
@@ -159,6 +167,14 @@ impl StateCommitmentV2 {
     pub fn delete_delegation_return_event(&mut self, event: &DelegationReturnEvent) {
         self.tree.delete(delegation_return_event_key(event));
     }
+
+    /// Insert or replace a delegator identity-registry leaf.
+    pub fn put_delegator_identity(&mut self, delegator_id: &Bytes32, pubkey: &HybridPubKey) {
+        self.tree.insert(
+            delegator_identity_key(delegator_id),
+            delegator_identity_value_hash(delegator_id, pubkey),
+        );
+    }
 }
 
 pub(crate) fn validator_key(validator_id: &Bytes32) -> [u8; 32] {
@@ -190,6 +206,10 @@ fn delegation_return_event_key(event: &DelegationReturnEvent) -> [u8; 32] {
     raw.extend_from_slice(&event.bond_utxo_id.0);
     raw.extend_from_slice(&event.returned_height.to_le_bytes());
     derive_key(DOMAIN_DELEGATION_RETURN_EVENT, &raw)
+}
+
+pub(crate) fn delegator_identity_key(delegator_id: &Bytes32) -> [u8; 32] {
+    derive_key(DOMAIN_DELEGATOR_IDENTITY, &delegator_id.0)
 }
 
 fn derive_key(domain: u8, raw_key: &[u8]) -> [u8; 32] {
@@ -287,6 +307,16 @@ fn delegation_return_event_value_hash(event: &DelegationReturnEvent) -> [u8; 32]
     sha256(&value)
 }
 
+pub(crate) fn delegator_identity_value_hash(
+    delegator_id: &Bytes32,
+    pubkey: &HybridPubKey,
+) -> [u8; 32] {
+    let mut value = Vec::with_capacity(32 + pubkey.encoded_len());
+    value.extend_from_slice(&delegator_id.0);
+    pubkey.encode(&mut value);
+    sha256(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +387,63 @@ mod tests {
         }
     }
 
+    fn pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: id(byte),
+            pq_pk: VariableBytes::from_slice(&[byte.wrapping_add(1); 2_592]).unwrap_or_default(),
+        }
+    }
+
     fn legacy_state_commitment_v2_root(state: &ChainState, height: u64) -> Bytes32 {
+        let mut leaves = Vec::new();
+        for validator in state.validators.all_validators() {
+            leaves.push((
+                validator_key(&validator.validator_id),
+                validator_value_hash(validator, height),
+            ));
+        }
+        for (validator_id, delegators) in state.delegations.all_delegators() {
+            for delegator in delegators {
+                leaves.push((
+                    delegator_key(validator_id, &delegator.delegator_id),
+                    delegator_value_hash(delegator),
+                ));
+            }
+        }
+        for (signer_id, nonce) in &state.staking_nonces {
+            leaves.push((
+                staking_nonce_key(signer_id),
+                staking_nonce_value_hash(signer_id, *nonce),
+            ));
+        }
+        for (utxo_id, bond) in &state.staked_bonds {
+            leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
+        }
+        for hash in &state.applied_slash_hashes {
+            leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
+        }
+        for (delegator_id, pubkey) in &state.delegator_identities {
+            leaves.push((
+                delegator_identity_key(delegator_id),
+                delegator_identity_value_hash(delegator_id, pubkey),
+            ));
+        }
+        if registered_validator_cap_active(height) {
+            for event in &state.delegation_return_events {
+                leaves.push((
+                    delegation_return_event_key(event),
+                    delegation_return_event_value_hash(event),
+                ));
+            }
+        }
+        Bytes32::from(
+            CompressedAuthTree::from_pairs(leaves)
+                .expect("legacy oracle keys are domain-separated and unique")
+                .root(),
+        )
+    }
+
+    fn pre_identity_state_commitment_v2_root(state: &ChainState, height: u64) -> Bytes32 {
         let mut leaves = Vec::new();
         for validator in state.validators.all_validators() {
             leaves.push((
@@ -395,9 +481,29 @@ mod tests {
         }
         Bytes32::from(
             CompressedAuthTree::from_pairs(leaves)
-                .expect("legacy oracle keys are domain-separated and unique")
+                .expect("pre-identity oracle keys are domain-separated and unique")
                 .root(),
         )
+    }
+
+    fn independent_delegator_identity_key(delegator_id: &Bytes32) -> [u8; 32] {
+        let mut data = Vec::with_capacity(KEY_DOMAIN.len() + 1 + 32);
+        data.extend_from_slice(KEY_DOMAIN);
+        data.push(0x07);
+        data.extend_from_slice(&delegator_id.0);
+        sha256(&data)
+    }
+
+    fn independent_delegator_identity_value_hash(
+        delegator_id: &Bytes32,
+        pubkey: &HybridPubKey,
+    ) -> [u8; 32] {
+        let mut encoded_pubkey = Vec::new();
+        pubkey.encode(&mut encoded_pubkey);
+        let mut value = Vec::with_capacity(32 + encoded_pubkey.len());
+        value.extend_from_slice(&delegator_id.0);
+        value.extend_from_slice(&encoded_pubkey);
+        sha256(&value)
     }
 
     fn synthetic_delegation_state(size: usize, height: u64) -> ChainState {
@@ -449,6 +555,142 @@ mod tests {
             ));
         }
         leaves
+    }
+
+    #[test]
+    fn delegator_identity_leaf_hashing_matches_documented_oracle_formula() {
+        for byte in [0x01u8, 0x7F, 0xA5, 0xFE] {
+            let delegator_id = id(byte);
+            let pubkey = pubkey(byte.wrapping_add(3));
+            assert_eq!(
+                delegator_identity_key(&delegator_id),
+                independent_delegator_identity_key(&delegator_id)
+            );
+            assert_eq!(
+                delegator_identity_value_hash(&delegator_id, &pubkey),
+                independent_delegator_identity_value_hash(&delegator_id, &pubkey)
+            );
+        }
+    }
+
+    #[test]
+    fn delegator_identity_incremental_updates_match_full_rebuild() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        let mut incremental = StateCommitmentV2::from_state(&state, height);
+
+        for index in 0..64u8 {
+            let delegator_id = id(index);
+            let identity = pubkey(index.wrapping_add(0x40));
+            state
+                .delegator_identities
+                .insert(delegator_id, identity.clone());
+            incremental.put_delegator_identity(&delegator_id, &identity);
+        }
+
+        assert_eq!(
+            incremental.root(),
+            StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            incremental.root(),
+            legacy_state_commitment_v2_root(&state, height)
+        );
+    }
+
+    #[test]
+    fn delegator_identity_leaves_are_root_sensitive_and_domain_separated() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        state.rebuild_state_commitment_v2(height);
+        let empty_root = state.state_commitment_v2_root(height);
+
+        let delegator_id = id(0x31);
+        let identity = pubkey(0x41);
+        state
+            .delegator_identities
+            .insert(delegator_id, identity.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_delegator_identity(&delegator_id, &identity);
+        let inserted_root = state.state_commitment_v2_root(height);
+        assert_ne!(empty_root, inserted_root);
+
+        let updated_identity = pubkey(0x42);
+        state
+            .delegator_identities
+            .insert(delegator_id, updated_identity.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_delegator_identity(&delegator_id, &updated_identity);
+        assert_ne!(inserted_root, state.state_commitment_v2_root(height));
+
+        let identity_key = delegator_identity_key(&delegator_id);
+        assert_ne!(identity_key, validator_key(&delegator_id));
+        assert_ne!(identity_key, staking_nonce_key(&delegator_id));
+        assert_ne!(identity_key, staked_bond_key(&delegator_id));
+        assert_ne!(identity_key, slash_hash_key(&delegator_id));
+    }
+
+    #[test]
+    fn state_txn_rollback_rebuilds_identity_commitment_from_canonical_registry() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        let existing_id = id(0x50);
+        let existing_identity = pubkey(0x51);
+        state
+            .delegator_identities
+            .insert(existing_id, existing_identity.clone());
+        state.rebuild_state_commitment_v2(height);
+        let baseline_root = state.state_commitment_v2_root(height);
+
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, height);
+            txn.ensure_state_commitment_v2().unwrap();
+            txn.snapshot_delegator_identity_scope();
+            let transient_id = id(0x60);
+            let transient_identity = pubkey(0x61);
+            txn.state_mut()
+                .delegator_identities
+                .insert(transient_id, transient_identity.clone());
+            txn.state_mut()
+                .state_commitment_v2
+                .as_mut()
+                .unwrap()
+                .put_delegator_identity(&transient_id, &transient_identity);
+            assert_ne!(txn.state().state_commitment_v2_root(height), baseline_root);
+        }
+
+        assert_eq!(state.delegator_identities.len(), 1);
+        assert_eq!(
+            state.delegator_identities.get(&existing_id),
+            Some(&existing_identity)
+        );
+        assert_eq!(state.state_commitment_v2_root(height), baseline_root);
+        state.rebuild_state_commitment_v2(height);
+        assert_eq!(state.state_commitment_v2_root(height), baseline_root);
+    }
+
+    #[test]
+    fn empty_delegator_identity_registry_preserves_pre_stage2_root() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        let validator = validator(0x70);
+        state.validators.upsert(validator.clone()).unwrap();
+        state.staking_nonces.insert(id(0x71), 12);
+        let bond_id = id(0x72);
+        state
+            .staked_bonds
+            .insert(bond_id, bond(bond_id, validator.validator_id, id(0x73)));
+        assert!(state.delegator_identities.is_empty());
+
+        let pre_stage2_root = pre_identity_state_commitment_v2_root(&state, height);
+        let post_stage2_root = StateCommitmentV2::from_state(&state, height).root();
+        assert_eq!(post_stage2_root, pre_stage2_root);
     }
 
     #[test]
@@ -567,6 +809,25 @@ mod tests {
             refund_utxo_id: id(0x66),
         };
         state.push_delegation_return_event(event);
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
+
+        let identity_id = id(0x77);
+        let identity_pubkey = pubkey(0x78);
+        state
+            .delegator_identities
+            .insert(identity_id, identity_pubkey.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_delegator_identity(&identity_id, &identity_pubkey);
         assert_eq!(
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()
