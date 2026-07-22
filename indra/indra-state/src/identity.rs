@@ -48,6 +48,27 @@ pub enum IdentityError {
     },
 }
 
+/// Resolve the spend owner for a stake bond.
+///
+/// Legacy and range-proof-compact bonds are authoritative for their own embedded
+/// owner key. Fully compact bonds must resolve through the identity registry.
+pub fn resolve_bond_owner_pubkey(
+    bond: &crate::validator::StakeBondEntry,
+    state: &ChainState,
+) -> Result<HybridPubKey, IdentityError> {
+    if let Some(owner_pubkey) = &bond.original_output.owner_pubkey {
+        return Ok(owner_pubkey.clone());
+    }
+    state
+        .delegator_identities
+        .get(&bond.delegator_id)
+        .cloned()
+        .ok_or(IdentityError::UnresolvableIdentity {
+            validator_id: Some(bond.validator_id),
+            delegator_id: bond.delegator_id,
+        })
+}
+
 /// Resolve and check a submitted delegator public key against existing state.
 ///
 /// Registry entries are authoritative. If no registry entry exists, only legacy
@@ -124,15 +145,23 @@ fn unique_legacy_bond_pubkey(
 ) -> LegacyPubkeyResolution {
     let mut unique_pubkey: Option<HybridPubKey> = None;
     for (_utxo_id, bond) in &state.staked_bonds {
-        if bond.original_output.range_proof.is_none() || !include_bond(bond) {
+        if bond.original_output.owner_pubkey.is_none()
+            || bond.original_output.range_proof.is_none()
+            || !include_bond(bond)
+        {
             continue;
         }
+        let owner_pubkey = bond
+            .original_output
+            .owner_pubkey
+            .as_ref()
+            .expect("checked above");
         match &unique_pubkey {
-            Some(existing) if existing != &bond.original_output.owner_pubkey => {
+            Some(existing) if existing != owner_pubkey => {
                 return LegacyPubkeyResolution::Ambiguous;
             }
             Some(_) => {}
-            None => unique_pubkey = Some(bond.original_output.owner_pubkey.clone()),
+            None => unique_pubkey = Some(owner_pubkey.clone()),
         }
     }
 
@@ -212,6 +241,26 @@ mod tests {
             output(owner_pubkey, byte),
             2,
             1,
+        )
+    }
+
+    fn fully_compact_bond(
+        utxo_id: Bytes32,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        owner_pubkey: HybridPubKey,
+        byte: u8,
+    ) -> StakeBondEntry {
+        StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
+            utxo_id,
+            validator_id,
+            delegator_id,
+            1_000,
+            1,
+            output(owner_pubkey, byte),
+            2,
+            1,
+            2,
         )
     }
 
@@ -345,6 +394,44 @@ mod tests {
             resolve_and_check_identity(&delegator_id, &owner, &state),
             Ok(IdentityCheckOutcome::NoPriorRecord)
         );
+    }
+
+    #[test]
+    fn bond_owner_resolution_prefers_embedded_pubkey() {
+        let mut state = ChainState::new_genesis();
+        let validator_id = id(0x27);
+        let delegator_id = id(0x1C);
+        let owner = pubkey(0x1C, 0xAC);
+        let registry_owner = pubkey(0x1C, 0xBC);
+        state
+            .delegator_identities
+            .insert(delegator_id, registry_owner);
+        let bond = compact_bond(id(0x98), validator_id, delegator_id, owner.clone(), 0x98);
+
+        assert_eq!(resolve_bond_owner_pubkey(&bond, &state), Ok(owner));
+    }
+
+    #[test]
+    fn fully_compact_bond_owner_resolution_uses_registry_or_fails_loudly() {
+        let mut state = ChainState::new_genesis();
+        let validator_id = id(0x28);
+        let delegator_id = id(0x1D);
+        let owner = pubkey(0x1D, 0xAD);
+        let bond = fully_compact_bond(id(0x99), validator_id, delegator_id, owner.clone(), 0x99);
+        assert!(bond.original_output.owner_pubkey.is_none());
+
+        assert_eq!(
+            resolve_bond_owner_pubkey(&bond, &state),
+            Err(IdentityError::UnresolvableIdentity {
+                validator_id: Some(validator_id),
+                delegator_id
+            })
+        );
+
+        state
+            .delegator_identities
+            .insert(delegator_id, owner.clone());
+        assert_eq!(resolve_bond_owner_pubkey(&bond, &state), Ok(owner));
     }
 
     #[test]

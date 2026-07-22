@@ -621,7 +621,7 @@ fn delegation_pubkey(
                 && &bond.delegator_id == delegator_id
                 && bond.unbonding_end_epoch.is_none()
         })
-        .map(|bond| bond.original_output.owner_pubkey.clone())
+        .and_then(|bond| bond.original_output.owner_pubkey.clone())
         .ok_or(StateError::DelegatorNotFound)
 }
 
@@ -1069,6 +1069,34 @@ mod tests {
             .unwrap_or_else(|err| panic!("legacy redelegation bond {byte:#x} failed: {err}"));
     }
 
+    fn install_fully_compact_redelegation_bond(
+        state: &mut ChainState,
+        bond_utxo_id: Bytes32,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        owner_pubkey: HybridPubKey,
+        amount_spark: u64,
+    ) {
+        let bond = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
+            bond_utxo_id,
+            validator_id,
+            delegator_id,
+            amount_spark,
+            0,
+            deposit_output(owner_pubkey, amount_spark),
+            2,
+            1,
+            2,
+        );
+        assert!(bond.original_output.range_proof.is_none());
+        assert!(bond.original_output.owner_pubkey.is_none());
+        state.staked_bonds.insert(bond_utxo_id, bond);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, amount_spark, 0)
+            .unwrap();
+    }
+
     #[test]
     fn governance_redelegation_pre_identity_gate_uses_first_matching_active_bond() {
         let mut state = ChainState::new_genesis();
@@ -1154,6 +1182,44 @@ mod tests {
         let proposal = state.governance.proposals.get(&proposal_id).unwrap();
         assert_eq!(proposal.redelegations.len(), 1);
         assert_eq!(state.delegator_identities, before_registry);
+    }
+
+    #[test]
+    fn governance_redelegation_post_identity_gate_fully_compact_bond_uses_registry_pubkey() {
+        let mut state = ChainState::new_genesis();
+        let from_validator = Bytes32::from([0xA9; 32]);
+        let to_validator = Bytes32::from([0xAA; 32]);
+        let proposal_id = Bytes32::from([0xAB; 32]);
+        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
+        let (delegator_pubkey, delegator_keypair) = keypair(0xAC);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        install_fully_compact_redelegation_bond(
+            &mut state,
+            Bytes32::from([0x33; 32]),
+            from_validator,
+            delegator_id,
+            delegator_pubkey.clone(),
+            1_000,
+        );
+
+        let op = redelegate_op(
+            delegator_id,
+            &delegator_keypair,
+            proposal_id,
+            from_validator,
+            to_validator,
+            500,
+            1,
+        );
+
+        apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(proposal.redelegations.len(), 1);
+        assert_eq!(proposal.redelegations[0].delegator_id, delegator_id);
     }
 
     #[test]

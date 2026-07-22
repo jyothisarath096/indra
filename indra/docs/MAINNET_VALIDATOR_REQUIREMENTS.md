@@ -111,6 +111,7 @@ Current hardcoded hard-fork/activation-height constants that must be reviewed:
 - `COMPRESSED_AUTH_TREE_HEIGHT`
 - `COMPACT_STAKE_BOND_HEIGHT`
 - `DELEGATOR_IDENTITY_REGISTRY_HEIGHT`
+- `COMPACT_BOND_PUBKEY_OMISSION_HEIGHT`
 
 This checklist is intentionally broader than currently-live testnet features.
 Any future constant following the same hardcoded height-gate pattern must be

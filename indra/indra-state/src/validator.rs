@@ -9,9 +9,10 @@ use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, 
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
-        compact_stake_bond_active, max_active_validators, muldiv, overflow_fix_active, Bytes32,
-        VariableBytes, DUST_LIMIT_SPARK, MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES,
-        MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+        compact_bond_pubkey_omission_active, compact_stake_bond_active, max_active_validators,
+        muldiv, overflow_fix_active, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
+        MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
+        MAX_VALIDATOR_NETWORK_ADDR_LEN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
         SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
     },
     transaction::OutputV1,
@@ -33,6 +34,7 @@ pub const MAX_DELEGATORS_PER_VALIDATOR: usize = 100_000;
 pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDATOR;
 
 const STAKE_BOND_COMPACT_MARKER: u8 = u8::MAX;
+const STAKE_BOND_FULLY_COMPACT_MARKER: u8 = u8::MAX - 1;
 
 /// Why a stake bond was returned outside the normal claim/undelegation flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,8 +1101,8 @@ pub struct StakeBondOutput {
     pub value_spark: u64,
     /// Pedersen commitment from the original bonded output.
     pub commitment: indra_core::types::crypto::CommitmentV1,
-    /// Owner's hybrid public key.
-    pub owner_pubkey: indra_core::types::crypto::HybridPubKey,
+    /// Owner's hybrid public key. Fully compact bonds intentionally omit it.
+    pub owner_pubkey: Option<indra_core::types::crypto::HybridPubKey>,
     /// Original range proof for legacy bonds. Compact bonds intentionally omit it.
     pub range_proof: Option<VariableBytes<MAX_RANGE_PROOF_BYTES>>,
     /// Block height at which this output unlocks.
@@ -1113,7 +1115,7 @@ impl StakeBondOutput {
         Some(OutputV1 {
             value_spark: self.value_spark,
             commitment: self.commitment,
-            owner_pubkey: self.owner_pubkey.clone(),
+            owner_pubkey: self.owner_pubkey.clone()?,
             range_proof: self.range_proof.clone()?,
             lock_height: self.lock_height,
         })
@@ -1128,7 +1130,16 @@ impl StakeBondOutput {
     fn encode_compact(&self, buf: &mut Vec<u8>) {
         self.value_spark.encode(buf);
         self.commitment.encode(buf);
-        self.owner_pubkey.encode(buf);
+        self.owner_pubkey
+            .as_ref()
+            .expect("range-proof-compact stake bond output must retain an owner pubkey")
+            .encode(buf);
+        self.lock_height.encode(buf);
+    }
+
+    fn encode_fully_compact(&self, buf: &mut Vec<u8>) {
+        self.value_spark.encode(buf);
+        self.commitment.encode(buf);
         self.lock_height.encode(buf);
     }
 
@@ -1141,7 +1152,17 @@ impl StakeBondOutput {
     fn compact_encoded_len(&self) -> usize {
         self.value_spark.encoded_len()
             + self.commitment.encoded_len()
-            + self.owner_pubkey.encoded_len()
+            + self
+                .owner_pubkey
+                .as_ref()
+                .expect("range-proof-compact stake bond output must retain an owner pubkey")
+                .encoded_len()
+            + self.lock_height.encoded_len()
+    }
+
+    fn fully_compact_encoded_len(&self) -> usize {
+        self.value_spark.encoded_len()
+            + self.commitment.encoded_len()
             + self.lock_height.encoded_len()
     }
 }
@@ -1151,7 +1172,7 @@ impl From<OutputV1> for StakeBondOutput {
         Self {
             value_spark: output.value_spark,
             commitment: output.commitment,
-            owner_pubkey: output.owner_pubkey,
+            owner_pubkey: Some(output.owner_pubkey),
             range_proof: Some(output.range_proof),
             lock_height: output.lock_height,
         }
@@ -1191,11 +1212,7 @@ pub struct StakeBondEntry {
 
 impl Encode for StakeBondEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
-        if self.original_output.range_proof.is_some() {
-            SCHEMA_VERSION.encode(buf);
-        } else {
-            STAKE_BOND_COMPACT_MARKER.encode(buf);
-        }
+        self.encoding_marker().encode(buf);
         self.utxo_id.encode(buf);
         self.validator_id.encode(buf);
         self.delegator_id.encode(buf);
@@ -1205,10 +1222,11 @@ impl Encode for StakeBondEntry {
         if let Some(epoch) = self.unbonding_end_epoch {
             epoch.encode(buf);
         }
-        if self.original_output.range_proof.is_some() {
-            self.original_output.encode_legacy(buf);
-        } else {
-            self.original_output.encode_compact(buf);
+        match self.encoding_marker() {
+            SCHEMA_VERSION => self.original_output.encode_legacy(buf),
+            STAKE_BOND_COMPACT_MARKER => self.original_output.encode_compact(buf),
+            STAKE_BOND_FULLY_COMPACT_MARKER => self.original_output.encode_fully_compact(buf),
+            _ => unreachable!("stake bond encoding marker is constrained"),
         }
     }
 
@@ -1220,10 +1238,11 @@ impl Encode for StakeBondEntry {
             + self.bonded_epoch.encoded_len()
             + 1
             + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
-            + if self.original_output.range_proof.is_some() {
-                self.original_output.legacy_encoded_len()
-            } else {
-                self.original_output.compact_encoded_len()
+            + match self.encoding_marker() {
+                SCHEMA_VERSION => self.original_output.legacy_encoded_len(),
+                STAKE_BOND_COMPACT_MARKER => self.original_output.compact_encoded_len(),
+                STAKE_BOND_FULLY_COMPACT_MARKER => self.original_output.fully_compact_encoded_len(),
+                _ => unreachable!("stake bond encoding marker is constrained"),
             }
     }
 }
@@ -1236,6 +1255,7 @@ impl Decode for StakeBondEntry {
             | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
             | SCHEMA_VERSION => decode_stake_bond_entry_fields(r, None),
             STAKE_BOND_COMPACT_MARKER => decode_compact_stake_bond_entry_fields(r),
+            STAKE_BOND_FULLY_COMPACT_MARKER => decode_fully_compact_stake_bond_entry_fields(r),
             other if r.remaining() == 0 => Err(unsupported_schema("StakeBondEntry", other)),
             first_byte => decode_stake_bond_entry_fields(r, Some(first_byte)),
         }
@@ -1243,6 +1263,20 @@ impl Decode for StakeBondEntry {
 }
 
 impl StakeBondEntry {
+    fn encoding_marker(&self) -> u8 {
+        match (
+            self.original_output.range_proof.is_some(),
+            self.original_output.owner_pubkey.is_some(),
+        ) {
+            (true, true) => SCHEMA_VERSION,
+            (false, true) => STAKE_BOND_COMPACT_MARKER,
+            (false, false) => STAKE_BOND_FULLY_COMPACT_MARKER,
+            (true, false) => {
+                panic!("stake bond cannot retain a range proof without an owner pubkey")
+            }
+        }
+    }
+
     /// Decode the legacy unversioned stake bond layout.
     pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         decode_stake_bond_entry_fields(r, None)
@@ -1295,6 +1329,20 @@ mod stake_bond_entry_tests {
         )
     }
 
+    fn fully_compact_bond(byte: u8) -> StakeBondEntry {
+        StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
+            Bytes32::from([byte; 32]),
+            Bytes32::from([0xA0; 32]),
+            Bytes32::from([0xD0; 32]),
+            1_000,
+            3,
+            output(byte, 674),
+            20,
+            10,
+            20,
+        )
+    }
+
     fn encode_old_layout(bond: &StakeBondEntry) -> Vec<u8> {
         let mut buf = Vec::new();
         SCHEMA_VERSION.encode(&mut buf);
@@ -1314,10 +1362,34 @@ mod stake_bond_entry_tests {
         buf
     }
 
+    fn encode_range_proof_compact_layout(bond: &StakeBondEntry) -> Vec<u8> {
+        let mut buf = Vec::new();
+        STAKE_BOND_COMPACT_MARKER.encode(&mut buf);
+        bond.utxo_id.encode(&mut buf);
+        bond.validator_id.encode(&mut buf);
+        bond.delegator_id.encode(&mut buf);
+        bond.amount_spark.encode(&mut buf);
+        bond.bonded_epoch.encode(&mut buf);
+        bond.unbonding_end_epoch.is_some().encode(&mut buf);
+        if let Some(epoch) = bond.unbonding_end_epoch {
+            epoch.encode(&mut buf);
+        }
+        bond.original_output.value_spark.encode(&mut buf);
+        bond.original_output.commitment.encode(&mut buf);
+        bond.original_output
+            .owner_pubkey
+            .as_ref()
+            .unwrap()
+            .encode(&mut buf);
+        bond.original_output.lock_height.encode(&mut buf);
+        buf
+    }
+
     #[test]
     fn legacy_stake_bond_encoding_is_byte_identical() {
         let bond = legacy_bond(0x11);
         assert!(bond.original_output.range_proof.is_some());
+        assert!(bond.original_output.owner_pubkey.is_some());
         let encoded = bond.encode_to_vec();
         assert_eq!(encoded, encode_old_layout(&bond));
         let decoded = StakeBondEntry::decode(&mut ByteReader::new(&encoded)).unwrap();
@@ -1329,11 +1401,29 @@ mod stake_bond_entry_tests {
     fn compact_stake_bond_encoding_omits_range_proof_and_round_trips() {
         let bond = compact_bond(0x12);
         assert!(bond.original_output.range_proof.is_none());
+        assert!(bond.original_output.owner_pubkey.is_some());
         let encoded = bond.encode_to_vec();
         assert_eq!(encoded[0], STAKE_BOND_COMPACT_MARKER);
+        assert_eq!(encoded, encode_range_proof_compact_layout(&bond));
         assert_eq!(
             encoded.len(),
             encode_old_layout(&legacy_bond(0x12)).len() - (4 + 674)
+        );
+        let decoded = StakeBondEntry::decode(&mut ByteReader::new(&encoded)).unwrap();
+        assert_eq!(decoded, bond);
+        assert_eq!(decoded.encode_to_vec(), encoded);
+    }
+
+    #[test]
+    fn fully_compact_bond_encoding_omits_range_proof_and_owner_pubkey_and_round_trips() {
+        let bond = fully_compact_bond(0x16);
+        assert!(bond.original_output.range_proof.is_none());
+        assert!(bond.original_output.owner_pubkey.is_none());
+        let encoded = bond.encode_to_vec();
+        assert_eq!(encoded[0], STAKE_BOND_FULLY_COMPACT_MARKER);
+        assert_eq!(
+            encoded.len(),
+            encode_old_layout(&legacy_bond(0x16)).len() - (4 + 674) - (4 + 2_624)
         );
         let decoded = StakeBondEntry::decode(&mut ByteReader::new(&encoded)).unwrap();
         assert_eq!(decoded, bond);
@@ -1362,14 +1452,74 @@ mod stake_bond_entry_tests {
     }
 
     #[test]
-    fn compact_bond_scale_savings_match_per_bond_measurement() {
-        let bonds = 10_000usize;
-        let legacy_total = legacy_bond(0x15).encoded_len() * bonds;
-        let compact_total = compact_bond(0x15).encoded_len() * bonds;
+    fn fully_compact_bond_measured_encoding_saves_range_proof_and_owner_pubkey() {
+        let legacy = legacy_bond(0x15);
+        let range_only = compact_bond(0x15);
+        let fully_compact = fully_compact_bond(0x15);
         assert_eq!(
-            legacy_total.saturating_sub(compact_total),
-            bonds * (4 + 674)
+            legacy
+                .encoded_len()
+                .saturating_sub(range_only.encoded_len()),
+            678
         );
+        assert_eq!(
+            range_only
+                .encoded_len()
+                .saturating_sub(fully_compact.encoded_len()),
+            2_628
+        );
+        assert_eq!(
+            legacy
+                .encoded_len()
+                .saturating_sub(fully_compact.encoded_len()),
+            3_306
+        );
+    }
+
+    #[test]
+    fn fully_compact_bond_scale_savings_capacity_curve() {
+        let legacy = legacy_bond(0x17).encoded_len();
+        let fully_compact = fully_compact_bond(0x17).encoded_len();
+        let per_bond = legacy.saturating_sub(fully_compact);
+        assert_eq!(per_bond, 3_306);
+        for bonds in [1_000_000usize, 10_000_000, 150_000_000] {
+            assert_eq!(
+                legacy
+                    .saturating_mul(bonds)
+                    .saturating_sub(fully_compact.saturating_mul(bonds)),
+                per_bond.saturating_mul(bonds)
+            );
+        }
+    }
+
+    #[test]
+    fn bond_shape_replay_is_deterministic_across_range_and_pubkey_omission_boundaries() {
+        fn replay() -> Vec<Vec<u8>> {
+            [9u8, 10, 20]
+                .into_iter()
+                .map(|height| {
+                    StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
+                        Bytes32::from([height; 32]),
+                        Bytes32::from([0xA0; 32]),
+                        Bytes32::from([0xD0; 32]),
+                        1_000,
+                        height as u64,
+                        output(height, 674),
+                        height as u64,
+                        10,
+                        20,
+                    )
+                    .encode_to_vec()
+                })
+                .collect()
+        }
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
+        assert_eq!(first[0][0], SCHEMA_VERSION);
+        assert_eq!(first[1][0], STAKE_BOND_COMPACT_MARKER);
+        assert_eq!(first[2][0], STAKE_BOND_FULLY_COMPACT_MARKER);
     }
 }
 
@@ -1408,7 +1558,31 @@ fn decode_compact_stake_bond_entry_fields(r: &mut ByteReader<'_>) -> IndraResult
         original_output: StakeBondOutput {
             value_spark: u64::decode(r)?,
             commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: indra_core::types::crypto::HybridPubKey::decode(r)?,
+            owner_pubkey: Some(indra_core::types::crypto::HybridPubKey::decode(r)?),
+            range_proof: None,
+            lock_height: u64::decode(r)?,
+        },
+    })
+}
+
+fn decode_fully_compact_stake_bond_entry_fields(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<StakeBondEntry> {
+    Ok(StakeBondEntry {
+        utxo_id: Bytes32::decode(r)?,
+        validator_id: Bytes32::decode(r)?,
+        delegator_id: Bytes32::decode(r)?,
+        amount_spark: u64::decode(r)?,
+        bonded_epoch: u64::decode(r)?,
+        unbonding_end_epoch: if bool::decode(r)? {
+            Some(u64::decode(r)?)
+        } else {
+            None
+        },
+        original_output: StakeBondOutput {
+            value_spark: u64::decode(r)?,
+            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
+            owner_pubkey: None,
             range_proof: None,
             lock_height: u64::decode(r)?,
         },
@@ -1429,6 +1603,10 @@ impl StakeBondEntry {
         let mut original_output: StakeBondOutput = original_output.into();
         if compact_stake_bond_active(current_height) {
             original_output.range_proof = None;
+        }
+        if compact_bond_pubkey_omission_active(current_height) {
+            original_output.range_proof = None;
+            original_output.owner_pubkey = None;
         }
         Self {
             utxo_id,
@@ -1455,6 +1633,37 @@ impl StakeBondEntry {
         let mut original_output: StakeBondOutput = original_output.into();
         if current_height >= compact_activation_height {
             original_output.range_proof = None;
+        }
+        Self {
+            utxo_id,
+            validator_id,
+            delegator_id,
+            amount_spark,
+            bonded_epoch,
+            unbonding_end_epoch: None,
+            original_output,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_compact_and_pubkey_activation(
+        utxo_id: Bytes32,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+        bonded_epoch: u64,
+        original_output: OutputV1,
+        current_height: u64,
+        compact_activation_height: u64,
+        pubkey_omission_height: u64,
+    ) -> Self {
+        let mut original_output: StakeBondOutput = original_output.into();
+        if current_height >= compact_activation_height {
+            original_output.range_proof = None;
+        }
+        if current_height >= pubkey_omission_height {
+            original_output.range_proof = None;
+            original_output.owner_pubkey = None;
         }
         Self {
             utxo_id,

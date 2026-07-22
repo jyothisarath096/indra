@@ -1,8 +1,8 @@
 # Compact Stake-Bond Releases
 
 `COMPACT_STAKE_BOND_HEIGHT` is the hard-fork height for compact stake-bond
-records. It is currently set to `u64::MAX`, so compact bond creation is inert
-until a coordinated activation height is deliberately selected.
+records that omit stored range proofs. On the current testnet it is set to
+`152_500`.
 
 Before activation, newly created `StakeBondEntry` records store the bonded
 output's full `OutputV1`, including its Bulletproof range proof. At or after
@@ -10,12 +10,25 @@ activation, newly created bond records omit the stored range proof. Existing
 legacy bonds are not migrated or rewritten; they keep their stored proof until
 they are released and naturally leave staking state.
 
+`COMPACT_BOND_PUBKEY_OMISSION_HEIGHT` is a later, separate hard-fork height for
+fully compact stake-bond records that also omit the embedded owner public key.
+It is intentionally unscheduled (`u64::MAX`) until the identity registry has
+been activated and observed independently. This height must be greater than or
+equal to `DELEGATOR_IDENTITY_REGISTRY_HEIGHT`.
+
+Fully compact bonds store `delegator_id` and `validator_id` but no embedded
+owner public key. Any consensus path that needs the owner key first uses an
+embedded key if the bond has one, otherwise it resolves the key from the
+canonical identity registry. If neither source exists, the operation fails; the
+chain must never synthesize an empty or default owner key.
+
 ## Compact Release Output
 
 When a compact bond is released, the chain does not recreate the original output
 byte-for-byte. Instead it creates a fresh valid UTXO for the released value:
 
-- owner public key: copied from the bonded output metadata
+- owner public key: copied from the bonded output metadata, or resolved from the
+  identity registry for fully compact bonds
 - lock height: copied from the bonded output metadata
 - value: the released `amount_spark`
 - commitment: freshly computed from `amount_spark` and the deterministic compact

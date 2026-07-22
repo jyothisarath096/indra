@@ -22,7 +22,9 @@ use crate::{
     chain::ChainState,
     epoch::epoch_for_height,
     error::{StateError, StateResult},
-    identity::{resolve_and_check_identity, IdentityCheckOutcome, IdentityError},
+    identity::{
+        resolve_and_check_identity, resolve_bond_owner_pubkey, IdentityCheckOutcome, IdentityError,
+    },
     validator::{
         DelegationReturnEvent, DelegationReturnReason, StakeBondEntry, ValidatorEntry,
         ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR,
@@ -502,12 +504,17 @@ fn evict_validator_for_registry_replacement(
                 })
                 .cloned()
             {
+                let owner_pubkey = resolve_bond_owner_pubkey(&bond, state).map_err(|_| {
+                    StateError::InvariantViolation {
+                        message: "delegator reward owner pubkey could not be resolved during validator eviction",
+                    }
+                })?;
                 payout_or_burn_pending_reward(
                     state,
                     &validator_id,
                     &entry.delegator_id,
                     entry.pending_rewards,
-                    bond.original_output.owner_pubkey,
+                    owner_pubkey,
                     current_height,
                 )?;
             } else if entry.pending_rewards < DUST_LIMIT_SPARK {
@@ -536,7 +543,7 @@ fn evict_validator_for_registry_replacement(
             if let Some(commitment) = state.state_commitment_v2.as_mut() {
                 commitment.delete_staked_bond(&bond_id);
             }
-            let output = crate::epoch::released_bond_output(&bond, current_height)?;
+            let output = crate::epoch::released_bond_output(state, &bond, current_height)?;
             let output_index =
                 u32::try_from(state.utxos.len()).unwrap_or(u32::MAX.saturating_sub(1));
             let refund_utxo_id = state
@@ -810,12 +817,17 @@ fn apply_undelegate(
     let identity_outcome = if identity_registry_active {
         let outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
             .map_err(identity_error_to_state_error)?;
-        if matches!(outcome, IdentityCheckOutcome::NoPriorRecord)
-            && bond.original_output.owner_pubkey != *delegator_pubkey
-        {
-            return Err(StateError::InvalidStakingOp(format!(
-                "delegator identity bond owner pubkey mismatch for {delegator_id}"
-            )));
+        if matches!(outcome, IdentityCheckOutcome::NoPriorRecord) {
+            let owner_pubkey = resolve_bond_owner_pubkey(&bond, state).map_err(|_| {
+                StateError::InvalidStakingOp(format!(
+                    "delegator identity bond owner is unresolvable for {delegator_id}"
+                ))
+            })?;
+            if owner_pubkey != *delegator_pubkey {
+                return Err(StateError::InvalidStakingOp(format!(
+                    "delegator identity bond owner pubkey mismatch for {delegator_id}"
+                )));
+            }
         }
         Some(outcome)
     } else {
@@ -1249,14 +1261,19 @@ fn check_claim_owner_identity_for_first_record(
             && bond.delegator_id == *delegator_id
             && bond.unbonding_end_epoch.is_none()
     }) {
+        let resolved_pubkey = resolve_bond_owner_pubkey(bond, state).map_err(|_| {
+            StateError::InvalidStakingOp(format!(
+                "delegator identity claim owner is unresolvable for {delegator_id}"
+            ))
+        })?;
         match &owner_pubkey {
-            Some(existing) if existing != &bond.original_output.owner_pubkey => {
+            Some(existing) if existing != &resolved_pubkey => {
                 return Err(StateError::InvalidStakingOp(format!(
                     "delegator identity has ambiguous claim owner pubkeys for {delegator_id}"
                 )));
             }
             Some(_) => {}
-            None => owner_pubkey = Some(bond.original_output.owner_pubkey.clone()),
+            None => owner_pubkey = Some(resolved_pubkey),
         }
     }
 
@@ -4620,6 +4637,66 @@ mod tests {
             .delegation_return_events
             .iter()
             .any(|event| event.delegator_id == delegator));
+    }
+
+    #[test]
+    fn validator_eviction_resolves_fully_compact_bond_owner_from_registry() {
+        let mut state = ChainState::new_genesis();
+        let lowest_id = fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
+        let delegator = raw_id(0x7D, 1);
+        let delegator_bond = raw_id(0x7E, 1);
+        let delegator_pubkey = raw_pubkey(0x7F);
+        state
+            .delegator_identities
+            .insert(delegator, delegator_pubkey.clone());
+        state
+            .delegations
+            .add_delegation(lowest_id, delegator, DUST_LIMIT_SPARK, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&lowest_id, &delegator, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        let compact_bond = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
+            delegator_bond,
+            lowest_id,
+            delegator,
+            DUST_LIMIT_SPARK,
+            0,
+            test_output(DUST_LIMIT_SPARK, delegator_pubkey.clone(), 0x7F),
+            20,
+            10,
+            20,
+        );
+        assert!(compact_bond.original_output.owner_pubkey.is_none());
+        state.staked_bonds.insert(delegator_bond, compact_bond);
+        let (op, _) = registration_op_with_bond(
+            &mut state,
+            0xF5,
+            MINIMUM_VALIDATOR_BOND_SPARK
+                .saturating_add(DUST_LIMIT_SPARK)
+                .saturating_add(1),
+            1,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
+
+        assert!(state.validators.get(&lowest_id).is_none());
+        let matching_outputs = state
+            .utxos
+            .all_entries()
+            .filter(|entry| {
+                entry.output.owner_pubkey == delegator_pubkey
+                    && entry.output.value_spark == DUST_LIMIT_SPARK
+            })
+            .count();
+        assert!(
+            matching_outputs >= 2,
+            "expected reward payout and returned principal to resolve to registry owner"
+        );
     }
 
     #[test]

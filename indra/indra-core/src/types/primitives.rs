@@ -559,6 +559,26 @@ pub mod hard_forks {
     /// registry should be active from mainnet's first block). Leaving `u64::MAX`
     /// here means this rule never activates on that network.
     pub const DELEGATOR_IDENTITY_REGISTRY_HEIGHT: u64 = u64::MAX;
+
+    /// Compact stake-bond records omit embedded owner pubkeys for newly created bonds.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
+    /// coordinated activation height is explicitly chosen. This gate must never
+    /// activate before `DELEGATOR_IDENTITY_REGISTRY_HEIGHT`; the registry must be
+    /// authoritative before newly created `StakeBondEntry` records can rely on
+    /// `delegator_id`/`validator_id` lookups instead of embedded owner pubkeys.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
+    /// no per-chain-ID differentiation. Before building mainnet genesis, this
+    /// MUST be deliberately reset to the correct mainnet value (often 0 if the
+    /// fully compact layout should be active from mainnet's first block). Leaving
+    /// `u64::MAX` here means this rule never activates on that network.
+    pub const COMPACT_BOND_PUBKEY_OMISSION_HEIGHT: u64 = u64::MAX;
+
+    const _: () = assert!(
+        COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
+        "compact bond pubkey omission must not activate before identity registry"
+    );
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.
@@ -646,6 +666,12 @@ pub fn compact_stake_bond_active(height: u64) -> bool {
 #[inline]
 pub fn delegator_identity_registry_active(height: u64) -> bool {
     height >= hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT
+}
+
+/// Whether newly created stake-bond records omit their embedded owner pubkey.
+#[inline]
+pub fn compact_bond_pubkey_omission_active(height: u64) -> bool {
+    height >= hard_forks::COMPACT_BOND_PUBKEY_OMISSION_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────

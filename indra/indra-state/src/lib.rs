@@ -62,8 +62,8 @@ pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
 pub use governance_apply::apply_governance_op;
 pub use identity::{
-    resolve_and_check_identity, resolve_delegator_identity_for_redelegation, IdentityCheckOutcome,
-    IdentityError,
+    resolve_and_check_identity, resolve_bond_owner_pubkey,
+    resolve_delegator_identity_for_redelegation, IdentityCheckOutcome, IdentityError,
 };
 pub use nullifier::NullifierSet;
 pub use persistent::{

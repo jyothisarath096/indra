@@ -803,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_legacy_and_compact_staked_bonds_encode_decode_and_root() {
+    fn mixed_legacy_range_compact_and_fully_compact_staked_bonds_encode_decode_and_root() {
         let mut state = ChainState::new_genesis();
         let legacy = StakeBondEntry::new_for_test_with_compact_activation(
             Bytes32::from([0x21; 32]),
@@ -825,10 +825,28 @@ mod tests {
             10,
             10,
         );
+        let fully_compact = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
+            Bytes32::from([0x23; 32]),
+            Bytes32::from([0xA3; 32]),
+            Bytes32::from([0xD3; 32]),
+            1_000_000,
+            9,
+            test_output(0x23),
+            20,
+            10,
+            20,
+        );
         assert!(legacy.original_output.range_proof.is_some());
+        assert!(legacy.original_output.owner_pubkey.is_some());
         assert!(compact.original_output.range_proof.is_none());
+        assert!(compact.original_output.owner_pubkey.is_some());
+        assert!(fully_compact.original_output.range_proof.is_none());
+        assert!(fully_compact.original_output.owner_pubkey.is_none());
         state.staked_bonds.insert(legacy.utxo_id, legacy);
         state.staked_bonds.insert(compact.utxo_id, compact);
+        state
+            .staked_bonds
+            .insert(fully_compact.utxo_id, fully_compact);
 
         let encoded = state.encode_to_vec();
         let decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();

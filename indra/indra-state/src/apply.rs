@@ -2388,6 +2388,9 @@ mod tests {
         let mut success = state.clone();
         apply_block(&mut success, &block, 0).unwrap();
         assert!(success.delegator_identities.contains_key(&delegator_id));
+        let success_bond = success.staked_bonds.get(&bond_utxo_id).unwrap();
+        assert!(success_bond.original_output.range_proof.is_none());
+        assert!(success_bond.original_output.owner_pubkey.is_none());
 
         let mutation_count = assert_all_failpoints_roll_back(&state, &block);
         assert!(
@@ -2395,6 +2398,7 @@ mod tests {
             "delegate identity population should be rollback-covered, got {mutation_count}"
         );
         assert!(!state.delegator_identities.contains_key(&delegator_id));
+        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
     }
 
     #[test]
