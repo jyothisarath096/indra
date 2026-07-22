@@ -40,9 +40,9 @@ use indra_core::{
         block::BlockV1,
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
-            block_protocol_version_for_height, bps_of, overflow_fix_active,
-            vrf_commit_reveal_election_active, Bytes32, ProtocolVersion, HARD_CAP_SPARK,
-            MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+            block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
+            overflow_fix_active, vrf_commit_reveal_election_active, Bytes32, ProtocolVersion,
+            HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
             MAX_TX_PER_BLOCK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
             UNBONDING_PERIOD_EPOCHS,
         },
@@ -719,6 +719,9 @@ fn apply_block_inner(
     let chain_id = txn.state().chain_id.clone();
     for op in &block.staking_ops {
         txn.snapshot_staking_scope();
+        if delegator_identity_registry_active(block.header.height) {
+            txn.snapshot_delegator_identity_scope();
+        }
         apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
             StateError::InvariantViolation {
                 message: "staking op failed on real state after shadow validation",
@@ -1133,6 +1136,21 @@ mod tests {
         (wire, keypair)
     }
 
+    fn make_mixed_test_keypair(
+        classical_seed: [u8; 32],
+        pq_seed: [u8; 32],
+    ) -> (HybridPubKey, HybridKeypair) {
+        let classical = ClassicalKeypair::from_seed(&classical_seed);
+        let pq = PqKeypair::from_seed(&pq_seed).unwrap();
+        let keypair = HybridKeypair::new(classical, pq);
+        let public = keypair.public_key();
+        let wire = HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        };
+        (wire, keypair)
+    }
+
     fn dummy_sig() -> HybridSignature {
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
@@ -1155,6 +1173,10 @@ mod tests {
     fn pubkey_to_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
         use indra_core::codec::Encode;
         Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+    }
+
+    fn staking_delegator_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
+        Bytes32::from(sha256(&pubkey.classical_pk.0))
     }
 
     fn sign_staking_op(keypair: &HybridKeypair, chain_id: &str, op: &mut StakingOp) {
@@ -1676,12 +1698,21 @@ mod tests {
 
     fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
         let height = state.height + 1;
+        make_block_at_height(state, txs, height, 1_700_000_000 + height)
+    }
+
+    fn make_block_at_height(
+        state: &ChainState,
+        txs: Vec<TransactionV1>,
+        height: u64,
+        timestamp: u64,
+    ) -> BlockV1 {
         BlockV1 {
             header: BlockHeaderV1 {
                 protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
                 height,
                 prev_hash: state.tip_hash,
-                timestamp: 1_700_000_000 + height,
+                timestamp,
                 state_root: Bytes32::ZERO,
                 validator_set_root: Bytes32::ZERO,
                 mempool_set_root: Bytes32::ZERO,
@@ -2214,6 +2245,214 @@ mod tests {
             undelegate_mutations >= 4,
             "undelegation block should exercise delegation rollback mutations, got {undelegate_mutations}"
         );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_delegate_identity_registry_population_failpoints() {
+        let mut state = ChainState::new_genesis();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        let (delegator_pubkey, keypair) = make_test_keypair([0x73; 32]);
+        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
+        let output = dummy_output(0x09, delegator_pubkey.clone());
+        let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
+        let validator_id = Bytes32::from([0x74; 32]);
+        state
+            .validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+
+        let delegate_op = signed_delegate_op(
+            &state,
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey,
+            &keypair,
+            1,
+        );
+        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        block.staking_ops.push(delegate_op);
+
+        crate::txn::set_fail_after_mutation(None);
+        let mut success = state.clone();
+        apply_block(&mut success, &block, 0).unwrap();
+        assert!(success.delegator_identities.contains_key(&delegator_id));
+
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 5,
+            "delegate identity population should be rollback-covered, got {mutation_count}"
+        );
+        assert!(!state.delegator_identities.contains_key(&delegator_id));
+    }
+
+    #[test]
+    fn delegate_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate() {
+        let activation_height = 2;
+        let mut reference = ChainState::new_genesis();
+        let mut candidate = reference.clone();
+        let validator_id = Bytes32::from([0x75; 32]);
+        reference
+            .validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+        candidate
+            .validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+
+        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0x76; 32], [0x77; 32]);
+        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
+        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0x76; 32], [0x78; 32]);
+        assert_eq!(
+            staking_delegator_id_for_test(&attacker_pubkey),
+            delegator_id
+        );
+        assert_ne!(attacker_pubkey, legit_pubkey);
+
+        let pre_gate_reference_utxo = reference
+            .utxos
+            .insert(dummy_output(0x0A, legit_pubkey.clone()), 0, 0, 0)
+            .unwrap();
+        let pre_gate_candidate_utxo = candidate
+            .utxos
+            .insert(dummy_output(0x0A, legit_pubkey.clone()), 0, 0, 0)
+            .unwrap();
+        assert_eq!(pre_gate_reference_utxo, pre_gate_candidate_utxo);
+        let pre_gate_reference = signed_delegate_op(
+            &reference,
+            validator_id,
+            pre_gate_reference_utxo,
+            legit_pubkey.clone(),
+            &legit_keypair,
+            1,
+        );
+        let pre_gate_candidate = signed_delegate_op(
+            &candidate,
+            validator_id,
+            pre_gate_candidate_utxo,
+            legit_pubkey.clone(),
+            &legit_keypair,
+            1,
+        );
+        let reference_chain_id = reference.chain_id.clone();
+        let candidate_chain_id = candidate.chain_id.clone();
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut reference,
+            &pre_gate_reference,
+            &reference_chain_id,
+            1,
+            false,
+        )
+        .unwrap();
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &pre_gate_candidate,
+            &candidate_chain_id,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reference.encode_to_vec(), candidate.encode_to_vec());
+        assert!(candidate.delegator_identities.is_empty());
+
+        let establish_reference_utxo = reference
+            .utxos
+            .insert(dummy_output(0x0B, legit_pubkey.clone()), 1, 0, 0)
+            .unwrap();
+        let establish_candidate_utxo = candidate
+            .utxos
+            .insert(dummy_output(0x0B, legit_pubkey.clone()), 1, 0, 0)
+            .unwrap();
+        assert_eq!(establish_reference_utxo, establish_candidate_utxo);
+        let establish_reference = signed_delegate_op(
+            &reference,
+            validator_id,
+            establish_reference_utxo,
+            legit_pubkey.clone(),
+            &legit_keypair,
+            2,
+        );
+        let establish_candidate = signed_delegate_op(
+            &candidate,
+            validator_id,
+            establish_candidate_utxo,
+            legit_pubkey.clone(),
+            &legit_keypair,
+            2,
+        );
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut reference,
+            &establish_reference,
+            &reference_chain_id,
+            activation_height,
+            false,
+        )
+        .unwrap();
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &establish_candidate,
+            &candidate_chain_id,
+            activation_height,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.delegator_identities.get(&delegator_id),
+            Some(&legit_pubkey)
+        );
+
+        let attack_reference_utxo = reference
+            .utxos
+            .insert(dummy_output(0x0C, attacker_pubkey.clone()), 2, 0, 0)
+            .unwrap();
+        let attack_candidate_utxo = candidate
+            .utxos
+            .insert(dummy_output(0x0C, attacker_pubkey.clone()), 2, 0, 0)
+            .unwrap();
+        assert_eq!(attack_reference_utxo, attack_candidate_utxo);
+        let attack_reference = signed_delegate_op(
+            &reference,
+            validator_id,
+            attack_reference_utxo,
+            attacker_pubkey.clone(),
+            &attacker_keypair,
+            3,
+        );
+        let attack_candidate = signed_delegate_op(
+            &candidate,
+            validator_id,
+            attack_candidate_utxo,
+            attacker_pubkey,
+            &attacker_keypair,
+            3,
+        );
+
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut reference,
+            &attack_reference,
+            &reference_chain_id,
+            activation_height + 1,
+            false,
+        )
+        .unwrap();
+        let candidate_before_attack = candidate.clone();
+        let err = crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &attack_candidate,
+            &candidate_chain_id,
+            activation_height + 1,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(candidate, candidate_before_attack);
+        assert!(reference.staked_bonds.contains_key(&attack_reference_utxo));
+        assert!(!candidate.staked_bonds.contains_key(&attack_candidate_utxo));
     }
 
     #[test]

@@ -7,11 +7,11 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        registered_validator_cap_active, staking_commitment_proof_required,
-        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
-        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
-        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        delegator_identity_registry_active, registered_validator_cap_active,
+        staking_commitment_proof_required, validator_network_address_active, Bytes32,
+        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
+        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -22,6 +22,7 @@ use crate::{
     chain::ChainState,
     epoch::epoch_for_height,
     error::{StateError, StateResult},
+    identity::{resolve_and_check_identity, IdentityCheckOutcome, IdentityError},
     validator::{
         DelegationReturnEvent, DelegationReturnReason, StakeBondEntry, ValidatorEntry,
         ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR,
@@ -37,6 +38,22 @@ pub fn apply_staking_op(
     op: &StakingOp,
     chain_id: &str,
     current_height: u64,
+) -> StateResult<()> {
+    apply_staking_op_with_identity_activation(
+        state,
+        op,
+        chain_id,
+        current_height,
+        delegator_identity_registry_active(current_height),
+    )
+}
+
+pub(crate) fn apply_staking_op_with_identity_activation(
+    state: &mut ChainState,
+    op: &StakingOp,
+    chain_id: &str,
+    current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     let signer_id = op.signer_id();
     let expected_nonce = state.staking_nonces.get(&signer_id).copied().unwrap_or(0) + 1;
@@ -115,6 +132,7 @@ pub fn apply_staking_op(
             delegator_pubkey,
             bond_proof.as_ref(),
             current_height,
+            identity_registry_active,
         ),
         StakingOpBody::Undelegate {
             validator_id,
@@ -610,6 +628,7 @@ fn apply_delegate(
     delegator_pubkey: &HybridPubKey,
     bond_proof: Option<&StakingBondProof>,
     current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     let validator = state
         .validators
@@ -644,6 +663,14 @@ fn apply_delegate(
             "UTXO does not belong to the delegator".into(),
         ));
     }
+    let identity_outcome = if identity_registry_active {
+        Some(
+            resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
+                .map_err(identity_error_to_state_error)?,
+        )
+    } else {
+        None
+    };
     require_and_validate_bond_proof(current_height, &utxo_entry.output, bond_proof)?;
 
     // Bond amount is taken from output.value_spark (public metadata field).
@@ -702,7 +729,36 @@ fn apply_delegate(
         commitment.put_delegator(validator_id, delegator);
     }
 
+    if matches!(
+        identity_outcome,
+        Some(IdentityCheckOutcome::NoPriorRecord | IdentityCheckOutcome::LegacyBondMatch)
+    ) {
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_delegator_identity(&delegator_id, delegator_pubkey);
+        }
+    }
+
     Ok(())
+}
+
+fn identity_error_to_state_error(error: IdentityError) -> StateError {
+    match error {
+        IdentityError::RegistryPubkeyMismatch { delegator_id } => StateError::InvalidStakingOp(
+            format!("delegator identity registry pubkey mismatch for {delegator_id}"),
+        ),
+        IdentityError::LegacyPubkeyMismatch { delegator_id } => StateError::InvalidStakingOp(
+            format!("delegator identity legacy pubkey mismatch for {delegator_id}"),
+        ),
+        IdentityError::AmbiguousLegacyPubkeys { delegator_id } => StateError::InvalidStakingOp(
+            format!("delegator identity has ambiguous legacy pubkeys for {delegator_id}"),
+        ),
+        IdentityError::UnresolvableIdentity { delegator_id, .. } => StateError::InvalidStakingOp(
+            format!("delegator identity is unresolvable for {delegator_id}"),
+        ),
+    }
 }
 
 /// Begin undelegating from a validator.
@@ -1556,6 +1612,179 @@ mod tests {
         assert!(!state.utxos.contains(&bond_utxo_id));
         assert!(state.staked_bonds.contains_key(&bond_utxo_id));
         assert_eq!(state.delegations.total_delegated(&validator_id), 1_000_000);
+    }
+
+    #[test]
+    fn delegate_pre_identity_gate_does_not_populate_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x24);
+        let delegator_keypair = keypair(0x25);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, delegator_pubkey, 1_000_000, 0x25);
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, false).unwrap();
+
+        assert!(!state.delegator_identities.contains_key(&delegator_id));
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
+    }
+
+    #[test]
+    fn delegate_post_identity_gate_new_identity_succeeds_and_populates_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x26);
+        let delegator_keypair = keypair(0x27);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let bond_utxo_id =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x27);
+        state.rebuild_state_commitment_v2(u64::MAX);
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true).unwrap();
+
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
+        let warm_root = state.state_commitment_v2_root(u64::MAX);
+        state.rebuild_state_commitment_v2(u64::MAX);
+        assert_eq!(state.state_commitment_v2_root(u64::MAX), warm_root);
+    }
+
+    #[test]
+    fn delegate_post_identity_gate_registered_match_succeeds_without_changing_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x28);
+        let delegator_keypair = keypair(0x29);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        let before = state.delegator_identities.clone();
+        let bond_utxo_id =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x29);
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true).unwrap();
+
+        assert_eq!(state.delegator_identities, before);
+        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
+    }
+
+    #[test]
+    fn delegate_post_identity_gate_rejects_classical_key_only_pq_substitution_attack() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x2A);
+        let legitimate_keypair = mixed_keypair(0x2B, 0x2C);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, legitimate_pubkey);
+
+        let attacker_keypair = mixed_keypair(0x2B, 0x2D);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
+        let bond_utxo_id = insert_delegator_utxo(&mut state, attacker_pubkey, 1_000_000, 0x2D);
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &attacker_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
+    }
+
+    #[test]
+    fn delegate_post_identity_gate_legacy_bonds_matching_submitted_key_populate_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x2E);
+        let delegator_keypair = keypair(0x2F);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let first_bond =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x2F);
+        let first = delegate_op(&state, validator_id, first_bond, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op_with_identity_activation(&mut state, &first, &chain_id, 1, false).unwrap();
+        assert!(state.delegator_identities.is_empty());
+
+        let second_bond =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x30);
+        let second = delegate_op(&state, validator_id, second_bond, &delegator_keypair, 2);
+        apply_staking_op_with_identity_activation(&mut state, &second, &chain_id, 1, true).unwrap();
+
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+        assert!(state.staked_bonds.contains_key(&second_bond));
+    }
+
+    #[test]
+    fn delegate_post_identity_gate_rejects_conflicting_legacy_bonds_even_if_submitted_matches_one()
+    {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x31);
+        let first_keypair = mixed_keypair(0x32, 0x33);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let second_keypair = mixed_keypair(0x32, 0x34);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let delegator_id = pubkey_to_id(&first_pubkey);
+        assert_eq!(pubkey_to_id(&second_pubkey), delegator_id);
+
+        let first_legacy = StakeBondEntry::new_for_test_with_compact_activation(
+            Bytes32::from([0xA1; 32]),
+            validator_id,
+            delegator_id,
+            1_000_000,
+            0,
+            test_output(1_000_000, first_pubkey.clone(), 0x31),
+            0,
+            u64::MAX,
+        );
+        let second_legacy = StakeBondEntry::new_for_test_with_compact_activation(
+            Bytes32::from([0xA2; 32]),
+            validator_id,
+            delegator_id,
+            1_000_000,
+            0,
+            test_output(1_000_000, second_pubkey, 0x32),
+            0,
+            u64::MAX,
+        );
+        state
+            .staked_bonds
+            .insert(first_legacy.utxo_id, first_legacy);
+        state
+            .staked_bonds
+            .insert(second_legacy.utxo_id, second_legacy);
+
+        let bond_utxo_id = insert_delegator_utxo(&mut state, first_pubkey, 1_000_000, 0x33);
+        let op = delegate_op(&state, validator_id, bond_utxo_id, &first_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity has ambiguous legacy pubkeys")
+        ));
+        assert!(state.utxos.contains(&bond_utxo_id));
+        assert!(!state.delegator_identities.contains_key(&delegator_id));
     }
 
     #[test]
