@@ -43,6 +43,7 @@ pub mod error;
 pub mod fee;
 pub mod governance;
 pub mod governance_apply;
+pub mod identity;
 pub mod nullifier;
 pub mod persistent;
 pub mod smt;
@@ -60,6 +61,10 @@ pub use error::{StateError, StateResult};
 pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
 pub use governance_apply::apply_governance_op;
+pub use identity::{
+    resolve_and_check_identity, resolve_delegator_identity_for_redelegation, IdentityCheckOutcome,
+    IdentityError,
+};
 pub use nullifier::NullifierSet;
 pub use persistent::{
     PersistentAuthTree, PersistentOrdMap, PersistentOrdSet, PersistentSparseMerkleTree,
