@@ -149,7 +149,13 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey,
-        } => apply_claim_rewards(state, validator_id, delegator_pubkey, current_height),
+        } => apply_claim_rewards(
+            state,
+            validator_id,
+            delegator_pubkey,
+            current_height,
+            identity_registry_active,
+        ),
         StakingOpBody::RegisterValidator {
             commission_bps,
             bond_utxo_id,
@@ -1017,6 +1023,7 @@ fn apply_claim_rewards(
     validator_id: &Bytes32,
     delegator_pubkey: &HybridPubKey,
     current_height: u64,
+    identity_registry_active: bool,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
 
@@ -1045,6 +1052,22 @@ fn apply_claim_rewards(
             claimed, DUST_LIMIT_SPARK
         )));
     }
+    let identity_outcome = if identity_registry_active {
+        let outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
+            .map_err(identity_error_to_state_error)?;
+        if matches!(outcome, IdentityCheckOutcome::NoPriorRecord) {
+            check_claim_owner_identity_for_first_record(
+                state,
+                validator_id,
+                &delegator_id,
+                delegator_pubkey,
+                claim_from_validator,
+            )?;
+        }
+        Some(outcome)
+    } else {
+        None
+    };
     if claim_from_validator {
         let mut updated_validator = None;
         if let Some(validator) = state.validators.get_mut(validator_id) {
@@ -1066,6 +1089,17 @@ fn apply_claim_rewards(
     {
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
             commitment.put_delegator(validator_id, &updated_entry);
+        }
+    }
+    if matches!(
+        identity_outcome,
+        Some(IdentityCheckOutcome::NoPriorRecord | IdentityCheckOutcome::LegacyBondMatch)
+    ) {
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_delegator_identity(&delegator_id, delegator_pubkey);
         }
     }
 
@@ -1098,6 +1132,61 @@ fn apply_claim_rewards(
         .map_err(|_| StateError::InvariantViolation {
             message: "UTXO ID collision in staking reward output",
         })?;
+
+    Ok(())
+}
+
+fn check_claim_owner_identity_for_first_record(
+    state: &ChainState,
+    validator_id: &Bytes32,
+    delegator_id: &Bytes32,
+    submitted_pubkey: &HybridPubKey,
+    claim_from_validator: bool,
+) -> StateResult<()> {
+    if claim_from_validator {
+        let validator = state
+            .validators
+            .get(validator_id)
+            .ok_or(StateError::ValidatorNotFound)?;
+        let matches_validator_key = validator.hybrid_classical_pk
+            == Some(submitted_pubkey.classical_pk.0)
+            && validator.hybrid_pq_pk.as_deref() == Some(submitted_pubkey.pq_pk.as_slice());
+        return if matches_validator_key {
+            Ok(())
+        } else {
+            Err(StateError::InvalidStakingOp(format!(
+                "delegator identity validator reward owner pubkey mismatch for {delegator_id}"
+            )))
+        };
+    }
+
+    let mut owner_pubkey: Option<HybridPubKey> = None;
+    for bond in state.staked_bonds.values().filter(|bond| {
+        bond.validator_id == *validator_id
+            && bond.delegator_id == *delegator_id
+            && bond.unbonding_end_epoch.is_none()
+    }) {
+        match &owner_pubkey {
+            Some(existing) if existing != &bond.original_output.owner_pubkey => {
+                return Err(StateError::InvalidStakingOp(format!(
+                    "delegator identity has ambiguous claim owner pubkeys for {delegator_id}"
+                )));
+            }
+            Some(_) => {}
+            None => owner_pubkey = Some(bond.original_output.owner_pubkey.clone()),
+        }
+    }
+
+    let owner_pubkey = owner_pubkey.ok_or_else(|| {
+        StateError::InvalidStakingOp(format!(
+            "delegator identity claim owner is unresolvable for {delegator_id}"
+        ))
+    })?;
+    if owner_pubkey != *submitted_pubkey {
+        return Err(StateError::InvalidStakingOp(format!(
+            "delegator identity claim owner pubkey mismatch for {delegator_id}"
+        )));
+    }
 
     Ok(())
 }
@@ -1544,6 +1633,23 @@ mod tests {
             StakingOpBody::Undelegate {
                 validator_id,
                 bond_utxo_id,
+                delegator_pubkey: pubkey_from_keypair(delegator_keypair),
+            },
+            nonce,
+            delegator_keypair,
+            &state.chain_id,
+        )
+    }
+
+    fn claim_rewards_op(
+        state: &ChainState,
+        validator_id: Bytes32,
+        delegator_keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
                 delegator_pubkey: pubkey_from_keypair(delegator_keypair),
             },
             nonce,
@@ -2914,6 +3020,327 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 42),
             Err(StateError::InvalidStakingOp(_))
         ));
+    }
+
+    #[test]
+    fn claim_rewards_pre_identity_gate_ignores_registry_mismatch_and_behaves_as_before() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x49);
+        let legitimate_keypair = mixed_keypair(0x4A, 0x4B);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_keypair = mixed_keypair(0x4A, 0x4C);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
+        state
+            .delegator_identities
+            .insert(delegator_id, legitimate_pubkey);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+
+        let before_utxos = state.utxos.len();
+        let claim = claim_rewards_op(&state, validator_id, &attacker_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, false)
+            .unwrap();
+
+        assert_eq!(state.utxos.len(), before_utxos + 1);
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            0
+        );
+    }
+
+    #[test]
+    fn claim_rewards_post_identity_gate_registered_match_pays_legitimate_claimant() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x4D);
+        let delegator_keypair = keypair(0x4E);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+
+        let before_utxos = state.utxos.len();
+        let claim = claim_rewards_op(&state, validator_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, true).unwrap();
+
+        assert_eq!(state.utxos.len(), before_utxos + 1);
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            0
+        );
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+    }
+
+    #[test]
+    fn claim_rewards_post_identity_gate_rejects_direct_theft_pq_substitution_attack() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x4F);
+        let legitimate_keypair = mixed_keypair(0x50, 0x51);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, legitimate_pubkey);
+        let attacker_keypair = mixed_keypair(0x50, 0x52);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+
+        let attack = claim_rewards_op(&state, validator_id, &attacker_keypair, 1);
+        let before_utxos = state.utxos.len();
+        let mut before_attack_reference = state.clone();
+        let chain_id = state.chain_id.clone();
+        apply_staking_op_with_identity_activation(
+            &mut before_attack_reference,
+            &attack,
+            &chain_id,
+            42,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            before_attack_reference
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            0
+        );
+        assert_eq!(before_attack_reference.utxos.len(), before_utxos + 1);
+
+        let err =
+            apply_staking_op_with_identity_activation(&mut state, &attack, &chain_id, 42, true)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(state.utxos.len(), before_utxos);
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            DUST_LIMIT_SPARK
+        );
+    }
+
+    #[test]
+    fn claim_rewards_identity_failure_happens_before_zeroing_or_utxo_creation() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x53);
+        let legitimate_keypair = mixed_keypair(0x54, 0x55);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let delegator_id = pubkey_to_id(&legitimate_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, legitimate_pubkey);
+        let attacker_keypair = mixed_keypair(0x54, 0x56);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        let before = state.clone();
+        let attack = claim_rewards_op(&state, validator_id, &attacker_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        let err =
+            apply_staking_op_with_identity_activation(&mut state, &attack, &chain_id, 42, true)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn claim_rewards_post_identity_gate_legacy_bonds_matching_submitted_key_populate_registry() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x57);
+        let delegator_keypair = keypair(0x58);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let bond_utxo_id =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x57);
+        let chain_id = state.chain_id.clone();
+        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, false)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        assert!(state.delegator_identities.is_empty());
+
+        let claim = claim_rewards_op(&state, validator_id, &delegator_keypair, 2);
+        let before_utxos = state.utxos.len();
+        apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, true).unwrap();
+
+        assert_eq!(state.utxos.len(), before_utxos + 1);
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+    }
+
+    #[test]
+    fn claim_rewards_post_identity_gate_compact_no_prior_record_populates_when_owner_matches() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x59);
+        let delegator_keypair = keypair(0x5A);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let bond_utxo_id = Bytes32::from([0x5A; 32]);
+        let compact_bond = StakeBondEntry::new_for_test_with_compact_activation(
+            bond_utxo_id,
+            validator_id,
+            delegator_id,
+            1_000_000,
+            0,
+            test_output(1_000_000, delegator_pubkey.clone(), 0x5A),
+            2,
+            1,
+        );
+        state.staked_bonds.insert(bond_utxo_id, compact_bond);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        let claim = claim_rewards_op(&state, validator_id, &delegator_keypair, 1);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, true).unwrap();
+
+        assert_eq!(
+            state.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            0
+        );
+    }
+
+    #[test]
+    fn claim_rewards_post_identity_gate_rejects_conflicting_legacy_bonds() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x5B);
+        let first_keypair = mixed_keypair(0x5C, 0x5D);
+        let first_pubkey = pubkey_from_keypair(&first_keypair);
+        let second_keypair = mixed_keypair(0x5C, 0x5E);
+        let second_pubkey = pubkey_from_keypair(&second_keypair);
+        let delegator_id = pubkey_to_id(&first_pubkey);
+        assert_eq!(pubkey_to_id(&second_pubkey), delegator_id);
+
+        let first_bond = insert_delegator_utxo(&mut state, first_pubkey, 1_000_000, 0x5B);
+        let second_bond = insert_delegator_utxo(&mut state, second_pubkey, 1_000_000, 0x5C);
+        let chain_id = state.chain_id.clone();
+        let first_delegate = delegate_op(&state, validator_id, first_bond, &first_keypair, 1);
+        apply_staking_op_with_identity_activation(&mut state, &first_delegate, &chain_id, 1, false)
+            .unwrap();
+        let second_delegate = delegate_op(&state, validator_id, second_bond, &second_keypair, 2);
+        apply_staking_op_with_identity_activation(
+            &mut state,
+            &second_delegate,
+            &chain_id,
+            1,
+            false,
+        )
+        .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        let before = state.clone();
+
+        let claim = claim_rewards_op(&state, validator_id, &first_keypair, 3);
+        let err =
+            apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, true)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(message)
+                if message.contains("delegator identity has ambiguous legacy pubkeys")
+        ));
+        assert_eq!(state, before);
     }
 
     #[test]
