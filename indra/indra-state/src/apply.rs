@@ -734,6 +734,9 @@ fn apply_block_inner(
     let chain_id = txn.state().chain_id.clone();
     for op in &block.governance_ops {
         txn.snapshot_governance_scope();
+        if delegator_identity_registry_active(block.header.height) {
+            txn.snapshot_delegator_identity_scope();
+        }
         apply_governance_op(
             txn.state_mut(),
             op,
@@ -1090,7 +1093,7 @@ mod tests {
     use super::*;
     use crate::chain::ChainState;
     use crate::governance::{
-        GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit,
+        GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
     };
     use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
@@ -1308,6 +1311,32 @@ mod tests {
         };
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::RevealVote,
+            signer_id,
+            nonce,
+            payload,
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        op
+    }
+
+    fn governance_redelegate_op(
+        signer_id: Bytes32,
+        keypair: &HybridKeypair,
+        proposal_id: Bytes32,
+        from_validator: Bytes32,
+        to_validator: Bytes32,
+        amount_spark: u64,
+        nonce: u64,
+    ) -> GovernanceOpV2 {
+        let payload = GovernancePayload::Redelegate {
+            proposal_id,
+            from_validator,
+            to_validator,
+            amount_spark,
+        };
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::GovernanceRedelegate,
             signer_id,
             nonce,
             payload,
@@ -1857,6 +1886,69 @@ mod tests {
             abstain_stake: 0,
             passed: None,
         }
+    }
+
+    fn install_reveal_phase_governance_proposal(
+        state: &mut ChainState,
+        proposal_id: Bytes32,
+        from_validator: Bytes32,
+        to_validator: Bytes32,
+    ) {
+        let (proposer_pubkey, _, proposer_id) =
+            install_governance_validator(state, [proposal_id.0[0]; 32], 100_000);
+        let mut proposal = test_proposal_record(
+            proposal_id,
+            proposer_id,
+            proposer_pubkey,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            ProposalPhase::Reveal,
+        );
+        proposal.reveals.insert(
+            from_validator,
+            VoteReveal {
+                validator_id: from_validator,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            to_validator,
+            VoteReveal {
+                validator_id: to_validator,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+    }
+
+    fn install_legacy_redelegation_bond(
+        state: &mut ChainState,
+        bond_utxo_id: Bytes32,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        owner_pubkey: HybridPubKey,
+        amount_spark: u64,
+        byte: u8,
+    ) {
+        let bond = StakeBondEntry::new_for_test_with_compact_activation(
+            bond_utxo_id,
+            validator_id,
+            delegator_id,
+            amount_spark,
+            0,
+            output_with_value(amount_spark, owner_pubkey, byte),
+            0,
+            u64::MAX,
+        );
+        assert!(bond.original_output.range_proof.is_some());
+        state.staked_bonds.insert(bond_utxo_id, bond);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, amount_spark, 0)
+            .unwrap();
     }
 
     fn governance_proposal_state(
@@ -2459,6 +2551,78 @@ mod tests {
                 .pending_rewards,
             DUST_LIMIT_SPARK
         );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_governance_redelegation_identity_population_failpoints() {
+        let mut state = ChainState::new_genesis();
+        let from_validator = Bytes32::from([0x87; 32]);
+        let to_validator = Bytes32::from([0x88; 32]);
+        let proposal_id = Bytes32::from([0x89; 32]);
+        install_reveal_phase_governance_proposal(
+            &mut state,
+            proposal_id,
+            from_validator,
+            to_validator,
+        );
+        let (delegator_pubkey, delegator_keypair) = make_test_keypair([0x8A; 32]);
+        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
+        install_legacy_redelegation_bond(
+            &mut state,
+            Bytes32::from([0x8B; 32]),
+            from_validator,
+            delegator_id,
+            delegator_pubkey.clone(),
+            1_000,
+            0x8B,
+        );
+        assert!(state.delegator_identities.is_empty());
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+
+        let op = governance_redelegate_op(
+            delegator_id,
+            &delegator_keypair,
+            proposal_id,
+            from_validator,
+            to_validator,
+            500,
+            1,
+        );
+        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        block.governance_ops.push(op);
+
+        crate::txn::set_fail_after_mutation(None);
+        let mut success = state.clone();
+        apply_block(&mut success, &block, 0).unwrap();
+        assert_eq!(
+            success.delegator_identities.get(&delegator_id),
+            Some(&delegator_pubkey)
+        );
+        assert_eq!(
+            success
+                .governance
+                .proposals
+                .get(&proposal_id)
+                .unwrap()
+                .redelegations
+                .len(),
+            1
+        );
+
+        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
+        assert!(
+            mutation_count >= 3,
+            "governance redelegation identity population should be rollback-covered, got {mutation_count}"
+        );
+        assert!(!state.delegator_identities.contains_key(&delegator_id));
+        assert!(state
+            .governance
+            .proposals
+            .get(&proposal_id)
+            .unwrap()
+            .redelegations
+            .is_empty());
     }
 
     #[test]
@@ -3118,6 +3282,116 @@ mod tests {
                 .pending_rewards,
             DUST_LIMIT_SPARK
         );
+    }
+
+    #[test]
+    fn governance_redelegation_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate(
+    ) {
+        let mut state = ChainState::new_genesis();
+        let from_validator = Bytes32::from([0x8C; 32]);
+        let to_validator = Bytes32::from([0x8D; 32]);
+        let pre_gate_proposal = Bytes32::from([0x8E; 32]);
+        let post_gate_proposal = Bytes32::from([0x8F; 32]);
+        install_reveal_phase_governance_proposal(
+            &mut state,
+            pre_gate_proposal,
+            from_validator,
+            to_validator,
+        );
+        install_reveal_phase_governance_proposal(
+            &mut state,
+            post_gate_proposal,
+            from_validator,
+            to_validator,
+        );
+        let (first_pubkey, first_keypair) = make_mixed_test_keypair([0x90; 32], [0x91; 32]);
+        let (second_pubkey, _) = make_mixed_test_keypair([0x90; 32], [0x92; 32]);
+        let delegator_id = staking_delegator_id_for_test(&first_pubkey);
+        assert_eq!(staking_delegator_id_for_test(&second_pubkey), delegator_id);
+        install_legacy_redelegation_bond(
+            &mut state,
+            Bytes32::from([0x01; 32]),
+            from_validator,
+            delegator_id,
+            first_pubkey,
+            1_000,
+            0x90,
+        );
+        install_legacy_redelegation_bond(
+            &mut state,
+            Bytes32::from([0x02; 32]),
+            from_validator,
+            delegator_id,
+            second_pubkey,
+            1_000,
+            0x91,
+        );
+        state.height = u64::MAX - 2;
+        state.tip_hash = Bytes32::ZERO;
+
+        let pre_gate = governance_redelegate_op(
+            delegator_id,
+            &first_keypair,
+            pre_gate_proposal,
+            from_validator,
+            to_validator,
+            500,
+            1,
+        );
+        let mut pre_gate_block = make_block_at_height(&state, vec![], u64::MAX - 1, 0);
+        pre_gate_block.governance_ops.push(pre_gate);
+        apply_block(&mut state, &pre_gate_block, 0).unwrap();
+        assert!(state.delegator_identities.is_empty());
+        assert_eq!(
+            state
+                .governance
+                .proposals
+                .get(&pre_gate_proposal)
+                .unwrap()
+                .redelegations
+                .len(),
+            1
+        );
+
+        let post_gate = governance_redelegate_op(
+            delegator_id,
+            &first_keypair,
+            post_gate_proposal,
+            from_validator,
+            to_validator,
+            500,
+            2,
+        );
+        let mut old_behavior = state.clone();
+        apply_governance_op(
+            &mut old_behavior,
+            &post_gate,
+            0,
+            u64::MAX - 1,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        assert_eq!(
+            old_behavior
+                .governance
+                .proposals
+                .get(&post_gate_proposal)
+                .unwrap()
+                .redelegations
+                .len(),
+            1
+        );
+
+        let before_post_gate = state.clone();
+        let mut post_gate_block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        post_gate_block.governance_ops.push(post_gate);
+        let err = apply_block(&mut state, &post_gate_block, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidGovernanceOp { reason }
+                if reason.contains("delegator identity has ambiguous legacy pubkeys")
+        ));
+        assert_eq!(state, before_post_gate);
     }
 
     #[test]
