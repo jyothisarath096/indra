@@ -1493,6 +1493,56 @@ mod stake_bond_entry_tests {
     }
 
     #[test]
+    fn realistic_mixed_population_capacity_curve_matches_measured_bond_shapes() {
+        let legacy_bond_bytes = legacy_bond(0x18).encoded_len();
+        let range_compact_bond_bytes = compact_bond(0x18).encoded_len();
+        let fully_compact_bond_bytes = fully_compact_bond(0x18).encoded_len();
+        assert_eq!(
+            legacy_bond_bytes.saturating_sub(range_compact_bond_bytes),
+            678
+        );
+        assert_eq!(
+            range_compact_bond_bytes.saturating_sub(fully_compact_bond_bytes),
+            2_628
+        );
+        assert_eq!(
+            legacy_bond_bytes.saturating_sub(fully_compact_bond_bytes),
+            3_306
+        );
+
+        // Scenario: a network some time after both gates, with old legacy
+        // bonds draining, live range-proof-compact bonds still present, and
+        // most newly-created bonds fully compact.
+        const LEGACY_PCT: usize = 10;
+        const RANGE_COMPACT_PCT: usize = 30;
+        const FULLY_COMPACT_PCT: usize = 60;
+        assert_eq!(LEGACY_PCT + RANGE_COMPACT_PCT + FULLY_COMPACT_PCT, 100);
+
+        for bonds in [100_000usize, 1_000_000, 10_000_000] {
+            let legacy_count = bonds * LEGACY_PCT / 100;
+            let range_compact_count = bonds * RANGE_COMPACT_PCT / 100;
+            let fully_compact_count = bonds - legacy_count - range_compact_count;
+            let original_total = legacy_bond_bytes.saturating_mul(bonds);
+            let realistic_mixed_total = legacy_bond_bytes
+                .saturating_mul(legacy_count)
+                .saturating_add(range_compact_bond_bytes.saturating_mul(range_compact_count))
+                .saturating_add(fully_compact_bond_bytes.saturating_mul(fully_compact_count));
+            let theoretical_best_total = fully_compact_bond_bytes.saturating_mul(bonds);
+
+            assert!(realistic_mixed_total < original_total);
+            assert!(theoretical_best_total < realistic_mixed_total);
+            assert_eq!(
+                original_total.saturating_sub(realistic_mixed_total),
+                bonds.saturating_mul(2_187)
+            );
+            assert_eq!(
+                original_total.saturating_sub(theoretical_best_total),
+                bonds.saturating_mul(3_306)
+            );
+        }
+    }
+
+    #[test]
     fn bond_shape_replay_is_deterministic_across_range_and_pubkey_omission_boundaries() {
         fn replay() -> Vec<Vec<u8>> {
             [9u8, 10, 20]

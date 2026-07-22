@@ -1493,6 +1493,37 @@ mod tests {
         op
     }
 
+    fn signed_self_stake_op(
+        state: &ChainState,
+        bond_utxo_id: Bytes32,
+        validator_pubkey: HybridPubKey,
+        keypair: &HybridKeypair,
+        nonce: u64,
+    ) -> StakingOp {
+        let bond_proof = state.utxos.get(&bond_utxo_id).and_then(|entry| {
+            (0u8..=u8::MAX).find_map(|seed| {
+                let candidate = commit(entry.output.value_spark, &[seed; 32]);
+                (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
+                    indra_core::types::staking::StakingBondProof {
+                        committed_value_spark: entry.output.value_spark,
+                        blinding_factor: Bytes32::from([seed; 32]),
+                    }
+                })
+            })
+        });
+        let mut op = StakingOp {
+            body: StakingOpBody::SelfStake {
+                bond_utxo_id,
+                validator_pubkey,
+                bond_proof,
+            },
+            nonce,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(keypair, &state.chain_id, &mut op);
+        op
+    }
+
     fn active_validator(validator_id: Bytes32) -> ValidatorEntry {
         ValidatorEntry {
             validator_id,
@@ -3488,6 +3519,438 @@ mod tests {
         assert!(!first_replay
             .delegator_identities
             .contains_key(&pre_validator_id));
+    }
+
+    #[test]
+    fn identity_registry_capstone_rejects_all_substitution_attacks_and_preserves_state() {
+        let mut base = ChainState::new_genesis();
+        let first_validator = Bytes32::from([0xA1; 32]);
+        let second_validator = Bytes32::from([0xA2; 32]);
+        base.validators
+            .upsert(active_validator(first_validator))
+            .unwrap();
+        base.validators
+            .upsert(active_validator(second_validator))
+            .unwrap();
+
+        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0xA3; 32], [0xA4; 32]);
+        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0xA3; 32], [0xA5; 32]);
+        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
+        assert_eq!(
+            staking_delegator_id_for_test(&attacker_pubkey),
+            delegator_id
+        );
+        assert_ne!(attacker_pubkey, legit_pubkey);
+        base.delegator_identities
+            .insert(delegator_id, legit_pubkey.clone());
+
+        install_legacy_redelegation_bond(
+            &mut base,
+            Bytes32::from([0xA6; 32]),
+            first_validator,
+            delegator_id,
+            legit_pubkey.clone(),
+            DUST_LIMIT_SPARK,
+            0xA6,
+        );
+        install_legacy_redelegation_bond(
+            &mut base,
+            Bytes32::from([0xA7; 32]),
+            second_validator,
+            delegator_id,
+            legit_pubkey.clone(),
+            DUST_LIMIT_SPARK,
+            0xA7,
+        );
+        base.delegations
+            .update_delegator(&second_validator, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+
+        let proposal_id = Bytes32::from([0xA8; 32]);
+        install_reveal_phase_governance_proposal(
+            &mut base,
+            proposal_id,
+            first_validator,
+            second_validator,
+        );
+
+        let (validator_pubkey, validator_keypair) = make_mixed_test_keypair([0xA9; 32], [0xAA; 32]);
+        let (attacker_validator_pubkey, attacker_validator_keypair) =
+            make_mixed_test_keypair([0xA9; 32], [0xAB; 32]);
+        let validator_id = staking_delegator_id_for_test(&validator_pubkey);
+        assert_eq!(
+            staking_delegator_id_for_test(&attacker_validator_pubkey),
+            validator_id
+        );
+        base.validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: "capstone-validator".into(),
+                hybrid_classical_pk: Some(validator_pubkey.classical_pk.0),
+                hybrid_pq_pk: Some(validator_pubkey.pq_pk.as_slice().to_vec()),
+                vrf_pk: Some([0xA9; 32]),
+                stake_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: 1_000,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
+            })
+            .unwrap();
+        base.delegator_identities
+            .insert(validator_id, validator_pubkey.clone());
+
+        let chain_id = base.chain_id.clone();
+
+        let mut legitimate_delegate_state = base.clone();
+        let legit_delegate_utxo = legitimate_delegate_state
+            .utxos
+            .insert(
+                output_with_value(DUST_LIMIT_SPARK, legit_pubkey.clone(), 0xB0),
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let legit_delegate = signed_delegate_op(
+            &legitimate_delegate_state,
+            second_validator,
+            legit_delegate_utxo,
+            legit_pubkey.clone(),
+            &legit_keypair,
+            1,
+        );
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut legitimate_delegate_state,
+            &legit_delegate,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap();
+        let new_bond = legitimate_delegate_state
+            .staked_bonds
+            .get(&legit_delegate_utxo)
+            .unwrap();
+        assert!(new_bond.original_output.range_proof.is_none());
+        assert!(new_bond.original_output.owner_pubkey.is_none());
+
+        let attack_delegate_utxo = base
+            .utxos
+            .insert(
+                output_with_value(DUST_LIMIT_SPARK, attacker_pubkey.clone(), 0xB1),
+                0,
+                0,
+                1,
+            )
+            .unwrap();
+        let delegate_attack = signed_delegate_op(
+            &base,
+            first_validator,
+            attack_delegate_utxo,
+            attacker_pubkey.clone(),
+            &attacker_keypair,
+            1,
+        );
+        let mut candidate = base.clone();
+        let err = crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &delegate_attack,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(reason)
+                if reason.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(candidate, base);
+
+        let undelegate_attack = signed_undelegate_op(
+            &base,
+            first_validator,
+            Bytes32::from([0xA6; 32]),
+            attacker_pubkey.clone(),
+            &attacker_keypair,
+            1,
+        );
+        let mut candidate = base.clone();
+        let err = crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &undelegate_attack,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(reason)
+                if reason.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(candidate, base);
+
+        let claim_attack = signed_claim_rewards_op(
+            &base,
+            second_validator,
+            attacker_pubkey.clone(),
+            &attacker_keypair,
+            1,
+        );
+        let mut candidate = base.clone();
+        let err = crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &claim_attack,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(reason)
+                if reason.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(candidate, base);
+
+        let governance_attack = governance_redelegate_op(
+            delegator_id,
+            &attacker_keypair,
+            proposal_id,
+            first_validator,
+            second_validator,
+            DUST_LIMIT_SPARK / 2,
+            1,
+        );
+        let mut candidate = base.clone();
+        let err = apply_governance_op(
+            &mut candidate,
+            &governance_attack,
+            0,
+            u64::MAX,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StateError::GovernanceSignatureInvalid { .. }));
+        assert_eq!(candidate, base);
+
+        let self_stake_utxo = base
+            .utxos
+            .insert(
+                output_with_value(DUST_LIMIT_SPARK, attacker_validator_pubkey.clone(), 0xB2),
+                0,
+                0,
+                2,
+            )
+            .unwrap();
+        let self_stake_attack = signed_self_stake_op(
+            &base,
+            self_stake_utxo,
+            attacker_validator_pubkey,
+            &attacker_validator_keypair,
+            1,
+        );
+        let mut candidate = base.clone();
+        let err = crate::delegation::apply_staking_op_with_identity_activation(
+            &mut candidate,
+            &self_stake_attack,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(reason)
+                if reason.contains("validator identity stored pubkey mismatch")
+        ));
+        assert_eq!(candidate, base);
+
+        let mut legitimate_claim_state = base.clone();
+        let legit_claim = signed_claim_rewards_op(
+            &legitimate_claim_state,
+            second_validator,
+            legit_pubkey.clone(),
+            &legit_keypair,
+            1,
+        );
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut legitimate_claim_state,
+            &legit_claim,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            legitimate_claim_state
+                .delegations
+                .get_delegators(&second_validator)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            0
+        );
+
+        let mut legitimate_governance_state = base.clone();
+        let legitimate_governance = governance_redelegate_op(
+            delegator_id,
+            &legit_keypair,
+            proposal_id,
+            first_validator,
+            second_validator,
+            DUST_LIMIT_SPARK / 2,
+            1,
+        );
+        apply_governance_op(
+            &mut legitimate_governance_state,
+            &legitimate_governance,
+            0,
+            u64::MAX,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        assert_eq!(
+            legitimate_governance_state
+                .governance
+                .proposals
+                .get(&proposal_id)
+                .unwrap()
+                .redelegations
+                .len(),
+            1
+        );
+
+        let mut legitimate_self_stake_state = base.clone();
+        let self_stake_utxo = legitimate_self_stake_state
+            .utxos
+            .insert(
+                output_with_value(DUST_LIMIT_SPARK, validator_pubkey.clone(), 0xB3),
+                0,
+                0,
+                3,
+            )
+            .unwrap();
+        let legitimate_self_stake = signed_self_stake_op(
+            &legitimate_self_stake_state,
+            self_stake_utxo,
+            validator_pubkey,
+            &validator_keypair,
+            1,
+        );
+        crate::delegation::apply_staking_op_with_identity_activation(
+            &mut legitimate_self_stake_state,
+            &legitimate_self_stake,
+            &chain_id,
+            u64::MAX,
+            true,
+        )
+        .unwrap();
+        let self_bond = legitimate_self_stake_state
+            .staked_bonds
+            .get(&self_stake_utxo)
+            .unwrap();
+        assert!(self_bond.original_output.owner_pubkey.is_none());
+    }
+
+    #[test]
+    fn identity_registry_capstone_rejected_mixed_block_rolls_back_prior_successes() {
+        let mut state = ChainState::new_genesis();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        let validator_id = Bytes32::from([0xB4; 32]);
+        state
+            .validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+
+        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0xB5; 32], [0xB6; 32]);
+        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0xB5; 32], [0xB7; 32]);
+        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, legit_pubkey.clone());
+        state.staking_nonces.insert(delegator_id, 1);
+        install_legacy_redelegation_bond(
+            &mut state,
+            Bytes32::from([0xB8; 32]),
+            validator_id,
+            delegator_id,
+            legit_pubkey.clone(),
+            DUST_LIMIT_SPARK,
+            0xB8,
+        );
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        let legit_utxo = state
+            .utxos
+            .insert(
+                output_with_value(DUST_LIMIT_SPARK, legit_pubkey.clone(), 0xB9),
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+
+        let legit_delegate = signed_delegate_op(
+            &state,
+            validator_id,
+            legit_utxo,
+            legit_pubkey,
+            &legit_keypair,
+            2,
+        );
+        let attack_claim =
+            signed_claim_rewards_op(&state, validator_id, attacker_pubkey, &attacker_keypair, 3);
+        let mut rejected_block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        rejected_block.staking_ops.push(legit_delegate.clone());
+        rejected_block.staking_ops.push(attack_claim);
+
+        let before = state.clone();
+        let err = apply_block(&mut state, &rejected_block, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::InvalidStakingOp(reason)
+                if reason.contains("delegator identity registry pubkey mismatch")
+        ));
+        assert_eq!(state, before);
+        assert!(!state.staked_bonds.contains_key(&legit_utxo));
+        assert_eq!(state.staking_nonces.get(&delegator_id), Some(&1));
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .pending_rewards,
+            DUST_LIMIT_SPARK
+        );
+
+        let mut clean_block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        clean_block.staking_ops.push(legit_delegate);
+        apply_block(&mut state, &clean_block, 0).unwrap();
+        let clean_bond = state.staked_bonds.get(&legit_utxo).unwrap();
+        assert!(clean_bond.original_output.range_proof.is_none());
+        assert!(clean_bond.original_output.owner_pubkey.is_none());
+        assert_eq!(state.staking_nonces.get(&delegator_id), Some(&2));
     }
 
     #[test]
