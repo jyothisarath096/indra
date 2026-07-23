@@ -508,7 +508,7 @@ struct PublicJson {
     hybrid_pq_pk: String,
     bls_pk: String,
     vrf_pk: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     payment_pubkey: Option<String>,
 }
 
@@ -555,7 +555,7 @@ struct PrivateJson {
     bls_seed: String,
     vrf_seed: String,
     pq_sk: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     payment_keypair: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -1133,6 +1133,126 @@ mod tests {
             encrypt_plaintext_keys_with_params(&keys, b"correct horse", [7; 32], [8; 12]).unwrap();
         let recovered = decrypt_encrypted_keys(&json, b"correct horse").unwrap();
         assert_eq!(recovered, keys);
+    }
+
+    fn legacy_stage5_encrypted_keys_json(keys: &KeysFile, password: &[u8]) -> String {
+        #[derive(Serialize)]
+        struct LegacyPublicJson {
+            hybrid_classical_pk: String,
+            hybrid_pq_pk: String,
+            bls_pk: String,
+            vrf_pk: String,
+        }
+        #[derive(Serialize)]
+        struct LegacyAad<'a> {
+            format: &'a str,
+            version: u8,
+            name: &'a str,
+            validator_id: &'a str,
+            public: &'a LegacyPublicJson,
+            kdf: &'a KdfJson,
+            cipher_function: &'a str,
+            cipher_params: &'a CipherParamsJson,
+        }
+        #[derive(Serialize)]
+        struct LegacyPrivateJson {
+            hybrid_seed: String,
+            bls_seed: String,
+            vrf_seed: String,
+            pq_sk: String,
+            warning: Option<String>,
+        }
+        #[derive(Serialize)]
+        struct LegacyPrivatePayload {
+            private: LegacyPrivateJson,
+        }
+        #[derive(Serialize)]
+        struct LegacyEncryptedContainer {
+            format: String,
+            version: u8,
+            name: String,
+            validator_id: String,
+            public: LegacyPublicJson,
+            crypto: CryptoJson,
+        }
+
+        let salt = [7u8; ARGON2_SALT_BYTES];
+        let nonce = [8u8; CHACHA_NONCE_BYTES];
+        let public = LegacyPublicJson {
+            hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
+            hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
+            bls_pk: hex::encode(keys.public.bls_pk),
+            vrf_pk: hex::encode(keys.public.vrf_pk),
+        };
+        let kdf = KdfJson {
+            function: "argon2id".to_string(),
+            params: KdfParamsJson {
+                version: 19,
+                memory_kib: ARGON2_MEMORY_KIB,
+                iterations: ARGON2_ITERATIONS,
+                parallelism: ARGON2_PARALLELISM,
+                salt: hex::encode(salt),
+            },
+        };
+        let cipher_params = CipherParamsJson {
+            nonce: hex::encode(nonce),
+        };
+        let validator_id = hex::encode(keys.public.validator_id);
+        let aad = serde_json::to_vec(&LegacyAad {
+            format: KEYSTORE_FORMAT,
+            version: KEYSTORE_VERSION,
+            name: &keys.name,
+            validator_id: &validator_id,
+            public: &public,
+            kdf: &kdf,
+            cipher_function: "chacha20-poly1305",
+            cipher_params: &cipher_params,
+        })
+        .unwrap();
+        let plaintext = serde_json::to_vec(&LegacyPrivatePayload {
+            private: LegacyPrivateJson {
+                hybrid_seed: hex::encode(keys.hybrid_seed),
+                bls_seed: hex::encode(keys.bls_seed),
+                vrf_seed: hex::encode(keys.vrf_seed),
+                pq_sk: hex::encode(&keys.pq_sk),
+                warning: None,
+            },
+        })
+        .unwrap();
+        let ciphertext = encrypt_payload(password, &salt, &nonce, &aad, &plaintext).unwrap();
+        serde_json::to_string_pretty(&LegacyEncryptedContainer {
+            format: KEYSTORE_FORMAT.to_string(),
+            version: KEYSTORE_VERSION,
+            name: keys.name.clone(),
+            validator_id,
+            public,
+            crypto: CryptoJson {
+                kdf,
+                cipher: CipherJson {
+                    function: "chacha20-poly1305".to_string(),
+                    params: cipher_params,
+                    ciphertext: hex::encode(ciphertext),
+                },
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn stage5_encrypted_keystore_without_payment_fields_still_decrypts() {
+        let keys = fixture();
+        let json = legacy_stage5_encrypted_keys_json(&keys, b"pw");
+        assert!(!json.contains("payment_pubkey"));
+        assert!(!json.contains("payment_keypair"));
+
+        let loaded = decrypt_encrypted_keys(&json, b"pw").unwrap();
+        assert_eq!(loaded.public.payment_pubkey, None);
+        assert_eq!(loaded.payment_keypair, None);
+        assert_eq!(
+            loaded.public.hybrid_classical_pk,
+            keys.public.hybrid_classical_pk
+        );
+        assert_eq!(loaded.pq_sk, keys.pq_sk);
     }
 
     #[test]
