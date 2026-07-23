@@ -1128,10 +1128,11 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
-                DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
-                MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-                MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+                hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK,
+                EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
+                MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK,
+                MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_BOND_SPARK,
+                SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
                 TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
@@ -2530,7 +2531,7 @@ mod tests {
     #[test]
     fn state_txn_rolls_back_delegate_identity_registry_population_failpoints() {
         let mut state = ChainState::new_genesis();
-        state.height = u64::MAX - 1;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
         state.tip_hash = Bytes32::ZERO;
         let (delegator_pubkey, keypair) = make_test_keypair([0x73; 32]);
         let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
@@ -2550,7 +2551,8 @@ mod tests {
             &keypair,
             1,
         );
-        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
         block.staking_ops.push(delegate_op);
 
         crate::txn::set_fail_after_mutation(None);
@@ -2559,7 +2561,7 @@ mod tests {
         assert!(success.delegator_identities.contains_key(&delegator_id));
         let success_bond = success.staked_bonds.get(&bond_utxo_id).unwrap();
         assert!(success_bond.original_output.range_proof.is_none());
-        assert!(success_bond.original_output.owner_pubkey.is_none());
+        assert!(success_bond.original_output.owner_pubkey.is_some());
 
         let mutation_count = assert_all_failpoints_roll_back(&state, &block);
         assert!(
@@ -2607,7 +2609,7 @@ mod tests {
                 .and_then(|bond| bond.unbonding_end_epoch),
             None
         );
-        state.height = u64::MAX - 1;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
         state.tip_hash = Bytes32::ZERO;
 
         let undelegate_op = signed_undelegate_op(
@@ -2618,7 +2620,8 @@ mod tests {
             &keypair,
             2,
         );
-        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
         block.staking_ops.push(undelegate_op);
 
         crate::txn::set_fail_after_mutation(None);
@@ -2685,11 +2688,12 @@ mod tests {
             })
             .unwrap();
         assert!(state.delegator_identities.is_empty());
-        state.height = u64::MAX - 1;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
         state.tip_hash = Bytes32::ZERO;
 
         let claim_op = signed_claim_rewards_op(&state, validator_id, delegator_pubkey, &keypair, 2);
-        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
         block.staking_ops.push(claim_op);
 
         crate::txn::set_fail_after_mutation(None);
@@ -2750,7 +2754,7 @@ mod tests {
             0x8B,
         );
         assert!(state.delegator_identities.is_empty());
-        state.height = u64::MAX - 1;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
         state.tip_hash = Bytes32::ZERO;
 
         let op = governance_redelegate_op(
@@ -2762,7 +2766,8 @@ mod tests {
             500,
             1,
         );
-        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
         block.governance_ops.push(op);
 
         crate::txn::set_fail_after_mutation(None);
@@ -2802,7 +2807,7 @@ mod tests {
     fn state_txn_rolls_back_register_validator_identity_population_failpoints() {
         let mut state = ChainState::new_genesis();
         state.validators = ValidatorSet::new();
-        state.height = u64::MAX - 1;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
         state.tip_hash = Bytes32::ZERO;
         let (op, validator_id) = signed_register_validator_op(&mut state, [0x93; 32], 1);
         let validator_pubkey = match &op.body {
@@ -2811,7 +2816,8 @@ mod tests {
             } => validator_pubkey.clone(),
             _ => unreachable!(),
         };
-        let mut block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
         block.staking_ops.push(op);
 
         crate::txn::set_fail_after_mutation(None);
@@ -3533,7 +3539,7 @@ mod tests {
             1_000,
             0x91,
         );
-        state.height = u64::MAX - 2;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 2;
         state.tip_hash = Bytes32::ZERO;
 
         let pre_gate = governance_redelegate_op(
@@ -3545,7 +3551,8 @@ mod tests {
             500,
             1,
         );
-        let mut pre_gate_block = make_block_at_height(&state, vec![], u64::MAX - 1, 0);
+        let mut pre_gate_block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1, 0);
         pre_gate_block.governance_ops.push(pre_gate);
         apply_block(&mut state, &pre_gate_block, 0).unwrap();
         assert!(state.delegator_identities.is_empty());
@@ -3574,7 +3581,7 @@ mod tests {
             &mut old_behavior,
             &post_gate,
             0,
-            u64::MAX - 1,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1,
             DEFAULT_CHAIN_ID,
         )
         .unwrap();
@@ -3590,7 +3597,8 @@ mod tests {
         );
 
         let before_post_gate = state.clone();
-        let mut post_gate_block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut post_gate_block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
         post_gate_block.governance_ops.push(post_gate);
         let err = apply_block(&mut state, &post_gate_block, 0).unwrap_err();
         assert!(matches!(
@@ -3606,7 +3614,7 @@ mod tests {
     {
         let mut initial = ChainState::new_genesis();
         initial.validators = ValidatorSet::new();
-        initial.height = u64::MAX - 2;
+        initial.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 2;
         initial.tip_hash = Bytes32::ZERO;
 
         let (pre_op, pre_validator_id) = signed_register_validator_op(&mut initial, [0x94; 32], 1);
@@ -3616,7 +3624,8 @@ mod tests {
             } => validator_pubkey.clone(),
             _ => unreachable!(),
         };
-        let mut pre_block = make_block_at_height(&initial, vec![], u64::MAX - 1, 0);
+        let mut pre_block =
+            make_block_at_height(&initial, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1, 0);
         pre_block.staking_ops.push(pre_op);
 
         let mut first_replay = initial.clone();
@@ -3642,9 +3651,15 @@ mod tests {
             _ => unreachable!(),
         };
         second_replay = first_replay.clone();
-        let mut post_block = make_block_at_height(&first_replay, vec![], u64::MAX, 0);
+        let mut post_block =
+            make_block_at_height(&first_replay, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
         post_block.staking_ops.push(post_op.clone());
-        let mut post_block_second = make_block_at_height(&second_replay, vec![], u64::MAX, 0);
+        let mut post_block_second = make_block_at_height(
+            &second_replay,
+            vec![],
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
+            0,
+        );
         post_block_second.staking_ops.push(post_op);
 
         apply_block(&mut first_replay, &post_block, 0).unwrap();
@@ -4167,7 +4182,7 @@ mod tests {
             &mut legitimate_delegate_state,
             &legit_delegate,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap();
@@ -4176,7 +4191,7 @@ mod tests {
             .get(&legit_delegate_utxo)
             .unwrap();
         assert!(new_bond.original_output.range_proof.is_none());
-        assert!(new_bond.original_output.owner_pubkey.is_none());
+        assert!(new_bond.original_output.owner_pubkey.is_some());
 
         let attack_delegate_utxo = base
             .utxos
@@ -4200,7 +4215,7 @@ mod tests {
             &mut candidate,
             &delegate_attack,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap_err();
@@ -4224,7 +4239,7 @@ mod tests {
             &mut candidate,
             &undelegate_attack,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap_err();
@@ -4247,7 +4262,7 @@ mod tests {
             &mut candidate,
             &claim_attack,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap_err();
@@ -4272,7 +4287,7 @@ mod tests {
             &mut candidate,
             &governance_attack,
             0,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             DEFAULT_CHAIN_ID,
         )
         .unwrap_err();
@@ -4300,7 +4315,7 @@ mod tests {
             &mut candidate,
             &self_stake_attack,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap_err();
@@ -4323,7 +4338,7 @@ mod tests {
             &mut legitimate_claim_state,
             &legit_claim,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap();
@@ -4352,7 +4367,7 @@ mod tests {
             &mut legitimate_governance_state,
             &legitimate_governance,
             0,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             DEFAULT_CHAIN_ID,
         )
         .unwrap();
@@ -4388,7 +4403,7 @@ mod tests {
             &mut legitimate_self_stake_state,
             &legitimate_self_stake,
             &chain_id,
-            u64::MAX,
+            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
             true,
         )
         .unwrap();
@@ -4396,13 +4411,13 @@ mod tests {
             .staked_bonds
             .get(&self_stake_utxo)
             .unwrap();
-        assert!(self_bond.original_output.owner_pubkey.is_none());
+        assert!(self_bond.original_output.owner_pubkey.is_some());
     }
 
     #[test]
     fn identity_registry_capstone_rejected_mixed_block_rolls_back_prior_successes() {
         let mut state = ChainState::new_genesis();
-        state.height = u64::MAX - 1;
+        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1;
         state.tip_hash = Bytes32::ZERO;
         let validator_id = Bytes32::from([0xB4; 32]);
         state
@@ -4452,7 +4467,8 @@ mod tests {
         );
         let attack_claim =
             signed_claim_rewards_op(&state, validator_id, attacker_pubkey, &attacker_keypair, 3);
-        let mut rejected_block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut rejected_block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
         rejected_block.staking_ops.push(legit_delegate.clone());
         rejected_block.staking_ops.push(attack_claim);
 
@@ -4477,12 +4493,13 @@ mod tests {
             DUST_LIMIT_SPARK
         );
 
-        let mut clean_block = make_block_at_height(&state, vec![], u64::MAX, 0);
+        let mut clean_block =
+            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
         clean_block.staking_ops.push(legit_delegate);
         apply_block(&mut state, &clean_block, 0).unwrap();
         let clean_bond = state.staked_bonds.get(&legit_utxo).unwrap();
         assert!(clean_bond.original_output.range_proof.is_none());
-        assert!(clean_bond.original_output.owner_pubkey.is_none());
+        assert!(clean_bond.original_output.owner_pubkey.is_some());
         assert_eq!(state.staking_nonces.get(&delegator_id), Some(&2));
     }
 

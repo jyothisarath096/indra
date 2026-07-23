@@ -547,18 +547,16 @@ pub mod hard_forks {
 
     /// Delegator identity registry binds each delegator_id to one full HybridPubKey.
     ///
-    /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
-    /// coordinated activation height is explicitly chosen. At/after activation,
-    /// delegator-owned staking/governance operations will be able to populate and
-    /// check a canonical `delegator_id -> HybridPubKey` registry; later stages will
-    /// wire this into live validation and compact stake-bond storage.
+    /// Testnet activation height for the delegator identity registry. At/after
+    /// activation, delegator-owned staking/governance operations populate and
+    /// check a canonical `delegator_id -> HybridPubKey` registry.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
     /// no per-chain-ID differentiation. Before building mainnet genesis, this
     /// MUST be deliberately reset to the correct mainnet value (often 0 if the
-    /// registry should be active from mainnet's first block). Leaving `u64::MAX`
-    /// here means this rule never activates on that network.
-    pub const DELEGATOR_IDENTITY_REGISTRY_HEIGHT: u64 = u64::MAX;
+    /// registry should be active from mainnet's first block). Do not silently
+    /// reuse this testnet activation height for mainnet.
+    pub const DELEGATOR_IDENTITY_REGISTRY_HEIGHT: u64 = 171_000;
 
     /// Payment blinding key registry and RegisterPaymentKey operation.
     ///
