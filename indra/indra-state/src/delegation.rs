@@ -7,11 +7,12 @@
 use indra_core::types::{
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        delegator_identity_registry_active, registered_validator_cap_active,
-        staking_commitment_proof_required, validator_network_address_active, Bytes32,
-        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
-        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        delegator_identity_registry_active, payment_blinding_active,
+        registered_validator_cap_active, staking_commitment_proof_required,
+        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
+        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -57,6 +58,14 @@ pub(crate) fn apply_staking_op_with_identity_activation(
     current_height: u64,
     identity_registry_active: bool,
 ) -> StateResult<()> {
+    if matches!(op.body, StakingOpBody::RegisterPaymentKey { .. })
+        && !payment_blinding_active(current_height)
+    {
+        return Err(StateError::InvalidStakingOp(
+            "RegisterPaymentKey is not active before PAYMENT_BLINDING_HEIGHT".into(),
+        ));
+    }
+
     let signer_id = op.signer_id();
     let expected_nonce = state.staking_nonces.get(&signer_id).copied().unwrap_or(0) + 1;
     if op.nonce != expected_nonce {
@@ -117,6 +126,14 @@ pub(crate) fn apply_staking_op_with_identity_activation(
                 &op.signature,
                 &validator_pubkey.classical_pk.0,
                 validator_pubkey.pq_pk.as_slice(),
+            )?;
+        }
+        StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } => {
+            verify_staking_sig(
+                &signing_bytes,
+                &op.signature,
+                &owner_pubkey.classical_pk.0,
+                owner_pubkey.pq_pk.as_slice(),
             )?;
         }
     }
@@ -210,12 +227,31 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             current_height,
             identity_registry_active,
         ),
+        StakingOpBody::RegisterPaymentKey {
+            owner_pubkey,
+            payment_pubkey,
+        } => apply_register_payment_key(state, owner_pubkey, payment_pubkey),
     };
 
     result?;
     state.staking_nonces.insert(signer_id, op.nonce);
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staking_nonce(&signer_id, op.nonce);
+    }
+    Ok(())
+}
+
+fn apply_register_payment_key(
+    state: &mut ChainState,
+    owner_pubkey: &HybridPubKey,
+    payment_pubkey: &indra_crypto::PaymentPubKeyV1,
+) -> StateResult<()> {
+    let owner_id = pubkey_to_id(owner_pubkey);
+    state
+        .payment_identities
+        .insert(owner_id, payment_pubkey.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_payment_identity(&owner_id, payment_pubkey);
     }
     Ok(())
 }
@@ -1461,7 +1497,7 @@ mod tests {
     use indra_crypto::{
         commit,
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
-        prove_range,
+        prove_range, PaymentKeypairV1, PaymentPubKeyV1, PAYMENT_VERSION_V1,
     };
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -1485,6 +1521,15 @@ mod tests {
             classical_pk: Bytes32::from(public.classical.0),
             pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
         }
+    }
+
+    fn payment_pubkey(seed: u8) -> PaymentPubKeyV1 {
+        PaymentKeypairV1 {
+            version: PAYMENT_VERSION_V1,
+            x25519_sk: [seed; 32],
+            ml_kem_1024_seed: [seed.wrapping_add(1); 64],
+        }
+        .public_key()
     }
 
     fn test_output(value_spark: u64, owner_pubkey: HybridPubKey, seed: u8) -> OutputV1 {
@@ -3188,6 +3233,195 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::StakingOpSignatureInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn register_payment_key_rejects_before_activation() {
+        let mut state = ChainState::new_genesis();
+        let owner_keypair = keypair(0x41);
+        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
+        let op = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey: payment_pubkey(0x42),
+            },
+            1,
+            &owner_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        let err = apply_staking_op(&mut state, &op, &chain_id, u64::MAX - 1).unwrap_err();
+        assert!(
+            matches!(err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
+        );
+        assert!(state.payment_identities.is_empty());
+        assert!(state.staking_nonces.is_empty());
+    }
+
+    #[test]
+    fn register_payment_key_succeeds_and_updates_commitment_after_activation() {
+        let mut state = ChainState::new_genesis();
+        let height = u64::MAX;
+        state.rebuild_state_commitment_v2(height);
+        let before_root = state.state_commitment_v2_root(height);
+        let owner_keypair = keypair(0x43);
+        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
+        let owner_id = pubkey_to_id(&owner_pubkey);
+        let payment_pubkey = payment_pubkey(0x44);
+        let op = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey: payment_pubkey.clone(),
+            },
+            1,
+            &owner_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, height).unwrap();
+
+        assert_eq!(
+            state.payment_identities.get(&owner_id),
+            Some(&payment_pubkey)
+        );
+        assert_eq!(state.staking_nonces.get(&owner_id), Some(&1));
+        let incremental_root = state.state_commitment_v2_root(height);
+        assert_ne!(incremental_root, before_root);
+        let rebuilt_root =
+            crate::state_commitment::StateCommitmentV2::from_state(&state, height).root();
+        assert_eq!(incremental_root, rebuilt_root);
+    }
+
+    #[test]
+    fn register_payment_key_rejects_wrong_signer() {
+        let mut state = ChainState::new_genesis();
+        let owner_keypair = keypair(0x45);
+        let wrong_keypair = keypair(0x46);
+        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
+        let op = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey: payment_pubkey(0x47),
+            },
+            1,
+            &wrong_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
+            Err(StateError::StakingOpSignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn register_payment_key_rejects_replayed_nonce() {
+        let mut state = ChainState::new_genesis();
+        let owner_keypair = keypair(0x48);
+        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
+        let payment_pubkey = payment_pubkey(0x49);
+        let op = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey,
+            },
+            1,
+            &owner_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
+        assert_eq!(
+            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
+            Err(StateError::StakingNonceInvalid {
+                expected: 2,
+                got: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn register_payment_key_allows_owner_rotation_by_replacement() {
+        let mut state = ChainState::new_genesis();
+        state.rebuild_state_commitment_v2(u64::MAX);
+        let owner_keypair = keypair(0x4A);
+        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
+        let owner_id = pubkey_to_id(&owner_pubkey);
+        let first_pubkey = payment_pubkey(0x4B);
+        let second_pubkey = payment_pubkey(0x4C);
+        let first = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey: owner_pubkey.clone(),
+                payment_pubkey: first_pubkey,
+            },
+            1,
+            &owner_keypair,
+            &state.chain_id,
+        );
+        let second = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey: second_pubkey.clone(),
+            },
+            2,
+            &owner_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &first, &chain_id, u64::MAX).unwrap();
+        let first_root = state.state_commitment_v2_root(u64::MAX);
+        apply_staking_op(&mut state, &second, &chain_id, u64::MAX).unwrap();
+
+        assert_eq!(
+            state.payment_identities.get(&owner_id),
+            Some(&second_pubkey)
+        );
+        assert_eq!(state.payment_identities.len(), 1);
+        assert_eq!(state.staking_nonces.get(&owner_id), Some(&2));
+        let second_root = state.state_commitment_v2_root(u64::MAX);
+        assert_ne!(first_root, second_root);
+        assert_eq!(
+            second_root,
+            crate::state_commitment::StateCommitmentV2::from_state(&state, u64::MAX).root()
+        );
+    }
+
+    #[test]
+    fn state_txn_rolls_back_register_payment_key_scope() {
+        let mut state = ChainState::new_genesis();
+        state.rebuild_state_commitment_v2(u64::MAX);
+        let original = state.clone();
+        let owner_keypair = keypair(0x4D);
+        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
+        let op = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey: payment_pubkey(0x4E),
+            },
+            1,
+            &owner_keypair,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, u64::MAX);
+            txn.snapshot_staking_scope();
+            txn.snapshot_payment_identity_scope();
+            apply_staking_op(txn.state_mut(), &op, &chain_id, u64::MAX).unwrap();
+        }
+
+        assert_eq!(state.payment_identities, original.payment_identities);
+        assert_eq!(state.staking_nonces, original.staking_nonces);
+        assert_eq!(
+            state.state_commitment_v2_root(u64::MAX),
+            original.state_commitment_v2_root(u64::MAX)
+        );
     }
 
     #[test]

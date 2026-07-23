@@ -39,7 +39,7 @@ pub use payment::{
     sender_derive_payment_blinding_v1, PaymentBlindingInputsV1, PaymentBlindingNoteV1,
     PaymentKeypairV1, PaymentPubKeyV1, RecipientPaymentBlindingV1, SenderPaymentBlindingV1,
     PAYMENT_BLINDING_CONTEXT_V1, PAYMENT_KEYPAIR_V1_ENCODED_LEN, PAYMENT_NOTE_V1_ENCODED_LEN,
-    PAYMENT_PUBKEY_V1_ENCODED_LEN,
+    PAYMENT_PUBKEY_V1_ENCODED_LEN, PAYMENT_VERSION_V1,
 };
 pub use pedersen::{commit, verify_opening, PedersenCommitment, PedersenOpening};
 pub use vrf::{vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};

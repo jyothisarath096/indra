@@ -10,9 +10,12 @@ use crate::{
     error::IndraResult,
     types::{
         crypto::{HybridPubKey, HybridSignature},
-        primitives::{Bytes32, MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN},
+        primitives::{
+            payment_blinding_active, Bytes32, MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN,
+        },
     },
 };
+use indra_crypto::PaymentPubKeyV1;
 
 /// Discriminant tags for StakingOp variants.
 const TAG_DELEGATE: u8 = 1;
@@ -24,6 +27,7 @@ const TAG_SELF_STAKE: u8 = 6;
 const TAG_SELF_UNSTAKE: u8 = 7;
 const TAG_SET_AUTO_DELEGATE: u8 = 8;
 const TAG_UPDATE_NETWORK_ADDRESS: u8 = 9;
+const TAG_REGISTER_PAYMENT_KEY: u8 = 10;
 
 /// Proof that a staking UTXO's Pedersen commitment opens to exactly
 /// `OutputV1.value_spark`.
@@ -169,6 +173,14 @@ pub enum StakingOpBody {
         /// Strict IP:port address. `None` clears the advertised address.
         network_addr: Option<String>,
     },
+
+    /// Publish or rotate the owner's current payment key-exchange public key.
+    RegisterPaymentKey {
+        /// Owner's permanent identity key proving control of owner_id.
+        owner_pubkey: HybridPubKey,
+        /// Current payment key-exchange public key for receiving blinded payments.
+        payment_pubkey: PaymentPubKeyV1,
+    },
 }
 
 impl StakingOp {
@@ -212,11 +224,17 @@ impl StakingOp {
             StakingOpBody::SetCommission { validator_id, .. }
             | StakingOpBody::SetAutoDelegate { validator_id, .. }
             | StakingOpBody::UpdateNetworkAddress { validator_id, .. } => *validator_id,
+            StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } => pubkey_to_id(owner_pubkey),
         }
     }
 
     /// Validate structural rules (does NOT verify crypto or state).
     pub fn validate_structure(&self) -> IndraResult<()> {
+        self.validate_structure_at_height(u64::MAX)
+    }
+
+    /// Validate structural rules under the operation set active at `height`.
+    pub fn validate_structure_at_height(&self, height: u64) -> IndraResult<()> {
         use crate::error::IndraError;
         match &self.body {
             StakingOpBody::Delegate { .. } => {}
@@ -248,6 +266,13 @@ impl StakingOp {
             StakingOpBody::UpdateNetworkAddress { network_addr, .. } => {
                 if let Some(addr) = network_addr {
                     validate_network_addr_string(addr)?;
+                }
+            }
+            StakingOpBody::RegisterPaymentKey { .. } => {
+                if !payment_blinding_active(height) {
+                    return Err(IndraError::InvalidStakingOp(
+                        "RegisterPaymentKey is not active before PAYMENT_BLINDING_HEIGHT".into(),
+                    ));
                 }
             }
         }
@@ -344,6 +369,14 @@ impl Encode for StakingOpBody {
                 validator_id.encode(buf);
                 encode_optional_network_addr(network_addr, buf);
             }
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey,
+            } => {
+                buf.push(TAG_REGISTER_PAYMENT_KEY);
+                owner_pubkey.encode(buf);
+                buf.extend_from_slice(&payment_pubkey.encode());
+            }
         }
     }
 
@@ -392,6 +425,10 @@ impl Encode for StakingOpBody {
                         .map(|addr| 2 + addr.len())
                         .unwrap_or(0)
             }
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey,
+            } => owner_pubkey.encoded_len() + payment_pubkey.encode().len(),
         }
     }
 }
@@ -444,6 +481,21 @@ impl Decode for StakingOpBody {
                 validator_id: Bytes32::decode(r)?,
                 network_addr: decode_optional_network_addr(r)?,
             }),
+            TAG_REGISTER_PAYMENT_KEY => {
+                let owner_pubkey = HybridPubKey::decode(r)?;
+                let payment_pubkey_bytes =
+                    r.read_bytes(indra_crypto::PAYMENT_PUBKEY_V1_ENCODED_LEN)?;
+                let payment_pubkey =
+                    PaymentPubKeyV1::decode(payment_pubkey_bytes).map_err(|_| {
+                        IndraError::InvalidStakingOp(
+                            "RegisterPaymentKey contains malformed payment public key".into(),
+                        )
+                    })?;
+                Ok(StakingOpBody::RegisterPaymentKey {
+                    owner_pubkey,
+                    payment_pubkey,
+                })
+            }
             _ => Err(IndraError::InvalidStakingOp(format!(
                 "unknown staking op tag: {}",
                 tag
@@ -588,6 +640,15 @@ mod tests {
         }
     }
 
+    fn dummy_payment_pubkey(byte: u8) -> PaymentPubKeyV1 {
+        indra_crypto::PaymentKeypairV1 {
+            version: indra_crypto::PAYMENT_VERSION_V1,
+            x25519_sk: [byte; 32],
+            ml_kem_1024_seed: [byte.wrapping_add(1); 64],
+        }
+        .public_key()
+    }
+
     fn op(body: StakingOpBody) -> StakingOp {
         StakingOp {
             body,
@@ -645,6 +706,10 @@ mod tests {
             op(StakingOpBody::UpdateNetworkAddress {
                 validator_id: Bytes32::from([0xABu8; 32]),
                 network_addr: None,
+            }),
+            op(StakingOpBody::RegisterPaymentKey {
+                owner_pubkey: dummy_pubkey(),
+                payment_pubkey: dummy_payment_pubkey(0xC0),
             }),
         ];
 
@@ -736,6 +801,16 @@ mod tests {
             bond_proof: None,
         });
         assert!(op.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn register_payment_key_is_height_gated_structurally() {
+        let op = op(StakingOpBody::RegisterPaymentKey {
+            owner_pubkey: dummy_pubkey(),
+            payment_pubkey: dummy_payment_pubkey(0xC1),
+        });
+        assert!(op.validate_structure_at_height(u64::MAX - 1).is_err());
+        assert!(op.validate_structure_at_height(u64::MAX).is_ok());
     }
 
     #[test]

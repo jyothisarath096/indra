@@ -560,6 +560,20 @@ pub mod hard_forks {
     /// here means this rule never activates on that network.
     pub const DELEGATOR_IDENTITY_REGISTRY_HEIGHT: u64 = u64::MAX;
 
+    /// Payment blinding key registry and RegisterPaymentKey operation.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this source value keeps the operation inert
+    /// until a coordinated activation height is explicitly chosen. At/after
+    /// activation, an owner may publish or rotate their current payment
+    /// key-exchange public key in canonical chain state.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
+    /// no per-chain-ID differentiation. Before building mainnet genesis, this
+    /// MUST be deliberately reset to the correct mainnet value (often 0 if the
+    /// registry should be active from mainnet's first block). Leaving `u64::MAX`
+    /// here means this operation never activates on that network.
+    pub const PAYMENT_BLINDING_HEIGHT: u64 = u64::MAX;
+
     /// Compact stake-bond records omit embedded owner pubkeys for newly created bonds.
     ///
     /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
@@ -666,6 +680,12 @@ pub fn compact_stake_bond_active(height: u64) -> bool {
 #[inline]
 pub fn delegator_identity_registry_active(height: u64) -> bool {
     height >= hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT
+}
+
+/// Whether payment blinding key registration is active.
+#[inline]
+pub fn payment_blinding_active(height: u64) -> bool {
+    height >= hard_forks::PAYMENT_BLINDING_HEIGHT
 }
 
 /// Whether newly created stake-bond records omit their embedded owner pubkey.

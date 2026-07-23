@@ -48,6 +48,7 @@ use indra_core::{
         },
         qc::QuorumCertificateV1,
         slashing::SlashEvidenceV1,
+        staking::StakingOpBody,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
         vrf_election::VrfElectionResult,
@@ -671,7 +672,7 @@ fn apply_block_inner(
         let mut shadow = state.clone();
         let chain_id = state.chain_id.clone();
         for op in &block.staking_ops {
-            op.validate_structure()
+            op.validate_structure_at_height(block.header.height)
                 .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
             apply_staking_op(&mut shadow, op, &chain_id, block.header.height)?;
         }
@@ -721,6 +722,9 @@ fn apply_block_inner(
         txn.snapshot_staking_scope();
         if delegator_identity_registry_active(block.header.height) {
             txn.snapshot_delegator_identity_scope();
+        }
+        if matches!(op.body, StakingOpBody::RegisterPaymentKey { .. }) {
+            txn.snapshot_payment_identity_scope();
         }
         apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
             StateError::InvariantViolation {
@@ -1119,7 +1123,10 @@ mod tests {
         },
         Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::{
+        commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1,
+        PaymentPubKeyV1, PqKeypair, PAYMENT_VERSION_V1,
+    };
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
 
@@ -1188,6 +1195,41 @@ mod tests {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
         };
+    }
+
+    fn payment_pubkey(seed: u8) -> PaymentPubKeyV1 {
+        PaymentKeypairV1 {
+            version: PAYMENT_VERSION_V1,
+            x25519_sk: [seed; 32],
+            ml_kem_1024_seed: [seed.wrapping_add(1); 64],
+        }
+        .public_key()
+    }
+
+    fn staking_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
+        let public = keypair.public_key();
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        }
+    }
+
+    fn signed_register_payment_key_op(
+        state: &ChainState,
+        owner_keypair: &HybridKeypair,
+        payment_pubkey: PaymentPubKeyV1,
+        nonce: u64,
+    ) -> StakingOp {
+        let mut op = StakingOp {
+            body: StakingOpBody::RegisterPaymentKey {
+                owner_pubkey: staking_pubkey_from_keypair(owner_keypair),
+                payment_pubkey,
+            },
+            nonce,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(owner_keypair, &state.chain_id, &mut op);
+        op
     }
 
     fn governance_validator_id(pubkey: &HybridPubKey) -> Bytes32 {
@@ -3573,6 +3615,65 @@ mod tests {
         assert!(!first_replay
             .delegator_identities
             .contains_key(&pre_validator_id));
+    }
+
+    #[test]
+    fn payment_key_activation_replay_is_deterministic_before_gate_and_populates_after_gate() {
+        let mut initial = ChainState::new_genesis();
+        initial.height = u64::MAX - 2;
+        initial.tip_hash = Bytes32::ZERO;
+
+        let owner_keypair = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0xA6; 32]),
+            PqKeypair::from_seed(&[0xA6; 32]).unwrap(),
+        );
+        let owner_pubkey = staking_pubkey_from_keypair(&owner_keypair);
+        let owner_id = staking_delegator_id_for_test(&owner_pubkey);
+        let pre_payment_pubkey = payment_pubkey(0xA7);
+        let pre_op =
+            signed_register_payment_key_op(&initial, &owner_keypair, pre_payment_pubkey, 1);
+        let mut pre_block = make_block_at_height(&initial, vec![], u64::MAX - 1, 0);
+        pre_block.staking_ops.push(pre_op);
+
+        let mut first_replay = initial.clone();
+        let mut second_replay = initial.clone();
+        let first_err = apply_block(&mut first_replay, &pre_block, 0).unwrap_err();
+        let second_err = apply_block(&mut second_replay, &pre_block, 0).unwrap_err();
+        assert!(
+            matches!(first_err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
+        );
+        assert!(
+            matches!(second_err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
+        );
+        assert_eq!(first_replay, initial);
+        assert_eq!(second_replay, initial);
+
+        let mut activated_initial = initial.clone();
+        activated_initial.height = u64::MAX - 1;
+        activated_initial.tip_hash = Bytes32::ZERO;
+        first_replay = activated_initial.clone();
+        second_replay = activated_initial.clone();
+
+        let post_payment_pubkey = payment_pubkey(0xA8);
+        let post_op = signed_register_payment_key_op(
+            &activated_initial,
+            &owner_keypair,
+            post_payment_pubkey.clone(),
+            1,
+        );
+        let mut post_block = make_block_at_height(&activated_initial, vec![], u64::MAX, 0);
+        post_block.staking_ops.push(post_op.clone());
+        let mut post_block_second = make_block_at_height(&second_replay, vec![], u64::MAX, 0);
+        post_block_second.staking_ops.push(post_op);
+
+        apply_block(&mut first_replay, &post_block, 0).unwrap();
+        apply_block(&mut second_replay, &post_block_second, 0).unwrap();
+        assert_eq!(first_replay, second_replay);
+        assert_eq!(
+            first_replay.payment_identities.get(&owner_id),
+            Some(&post_payment_pubkey)
+        );
+        assert_eq!(first_replay.staking_nonces.get(&owner_id), Some(&1));
     }
 
     #[test]
