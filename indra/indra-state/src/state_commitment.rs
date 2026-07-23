@@ -20,7 +20,7 @@ use indra_core::{
         primitives::{registered_validator_cap_active, validator_network_address_active, Bytes32},
     },
 };
-use indra_crypto::sha256;
+use indra_crypto::{sha256, PaymentPubKeyV1};
 
 use crate::{
     persistent::PersistentAuthTree,
@@ -37,6 +37,7 @@ const DOMAIN_STAKED_BOND: u8 = 0x04;
 const DOMAIN_SLASH_HASH: u8 = 0x05;
 const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
 const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
+const DOMAIN_PAYMENT_IDENTITY: u8 = 0x08;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,6 +79,12 @@ impl StateCommitmentV2 {
             leaves.push((
                 delegator_identity_key(delegator_id),
                 delegator_identity_value_hash(delegator_id, pubkey),
+            ));
+        }
+        for (owner_id, pubkey) in &state.payment_identities {
+            leaves.push((
+                payment_identity_key(owner_id),
+                payment_identity_value_hash(owner_id, pubkey),
             ));
         }
         if registered_validator_cap_active(height) {
@@ -175,6 +182,14 @@ impl StateCommitmentV2 {
             delegator_identity_value_hash(delegator_id, pubkey),
         );
     }
+
+    /// Insert or replace a payment identity-registry leaf.
+    pub fn put_payment_identity(&mut self, owner_id: &Bytes32, pubkey: &PaymentPubKeyV1) {
+        self.tree.insert(
+            payment_identity_key(owner_id),
+            payment_identity_value_hash(owner_id, pubkey),
+        );
+    }
 }
 
 pub(crate) fn validator_key(validator_id: &Bytes32) -> [u8; 32] {
@@ -210,6 +225,10 @@ fn delegation_return_event_key(event: &DelegationReturnEvent) -> [u8; 32] {
 
 pub(crate) fn delegator_identity_key(delegator_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_DELEGATOR_IDENTITY, &delegator_id.0)
+}
+
+pub(crate) fn payment_identity_key(owner_id: &Bytes32) -> [u8; 32] {
+    derive_key(DOMAIN_PAYMENT_IDENTITY, &owner_id.0)
 }
 
 fn derive_key(domain: u8, raw_key: &[u8]) -> [u8; 32] {
@@ -314,6 +333,17 @@ pub(crate) fn delegator_identity_value_hash(
     let mut value = Vec::with_capacity(32 + pubkey.encoded_len());
     value.extend_from_slice(&delegator_id.0);
     pubkey.encode(&mut value);
+    sha256(&value)
+}
+
+pub(crate) fn payment_identity_value_hash(
+    owner_id: &Bytes32,
+    pubkey: &PaymentPubKeyV1,
+) -> [u8; 32] {
+    let encoded_pubkey = pubkey.encode();
+    let mut value = Vec::with_capacity(32 + encoded_pubkey.len());
+    value.extend_from_slice(&owner_id.0);
+    value.extend_from_slice(&encoded_pubkey);
     sha256(&value)
 }
 
@@ -428,6 +458,12 @@ mod tests {
                 delegator_identity_value_hash(delegator_id, pubkey),
             ));
         }
+        for (owner_id, pubkey) in &state.payment_identities {
+            leaves.push((
+                payment_identity_key(owner_id),
+                payment_identity_value_hash(owner_id, pubkey),
+            ));
+        }
         if registered_validator_cap_active(height) {
             for event in &state.delegation_return_events {
                 leaves.push((
@@ -502,6 +538,40 @@ mod tests {
         pubkey.encode(&mut encoded_pubkey);
         let mut value = Vec::with_capacity(32 + encoded_pubkey.len());
         value.extend_from_slice(&delegator_id.0);
+        value.extend_from_slice(&encoded_pubkey);
+        sha256(&value)
+    }
+
+    fn payment_pubkey(index: usize) -> PaymentPubKeyV1 {
+        let mut x25519_sk = [0u8; 32];
+        x25519_sk[0] = 0xA5;
+        x25519_sk[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+        let mut ml_kem_1024_seed = [0u8; 64];
+        ml_kem_1024_seed[0] = 0x5A;
+        ml_kem_1024_seed[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+        indra_crypto::PaymentKeypairV1 {
+            version: indra_crypto::PAYMENT_VERSION_V1,
+            x25519_sk,
+            ml_kem_1024_seed,
+        }
+        .public_key()
+    }
+
+    fn independent_payment_identity_key(owner_id: &Bytes32) -> [u8; 32] {
+        let mut data = Vec::with_capacity(KEY_DOMAIN.len() + 1 + 32);
+        data.extend_from_slice(KEY_DOMAIN);
+        data.push(0x08);
+        data.extend_from_slice(&owner_id.0);
+        sha256(&data)
+    }
+
+    fn independent_payment_identity_value_hash(
+        owner_id: &Bytes32,
+        pubkey: &PaymentPubKeyV1,
+    ) -> [u8; 32] {
+        let encoded_pubkey = pubkey.encode();
+        let mut value = Vec::with_capacity(32 + encoded_pubkey.len());
+        value.extend_from_slice(&owner_id.0);
         value.extend_from_slice(&encoded_pubkey);
         sha256(&value)
     }
@@ -599,6 +669,45 @@ mod tests {
     }
 
     #[test]
+    fn payment_identity_leaf_hashing_matches_documented_oracle_formula() {
+        for byte in [0x01u8, 0x7F, 0xA5, 0xFE] {
+            let owner_id = id(byte);
+            let pubkey = payment_pubkey(byte as usize);
+            assert_eq!(
+                payment_identity_key(&owner_id),
+                independent_payment_identity_key(&owner_id)
+            );
+            assert_eq!(
+                payment_identity_value_hash(&owner_id, &pubkey),
+                independent_payment_identity_value_hash(&owner_id, &pubkey)
+            );
+        }
+    }
+
+    #[test]
+    fn payment_identity_incremental_updates_match_full_rebuild() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        let mut incremental = StateCommitmentV2::from_state(&state, height);
+
+        for index in 0..64usize {
+            let owner_id = id(index as u8);
+            let identity = payment_pubkey(index);
+            state.payment_identities.insert(owner_id, identity.clone());
+            incremental.put_payment_identity(&owner_id, &identity);
+        }
+
+        assert_eq!(
+            incremental.root(),
+            StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            incremental.root(),
+            legacy_state_commitment_v2_root(&state, height)
+        );
+    }
+
+    #[test]
     fn delegator_identity_leaves_are_root_sensitive_and_domain_separated() {
         let height = u64::MAX;
         let mut state = ChainState::new_genesis();
@@ -634,6 +743,44 @@ mod tests {
         assert_ne!(identity_key, staking_nonce_key(&delegator_id));
         assert_ne!(identity_key, staked_bond_key(&delegator_id));
         assert_ne!(identity_key, slash_hash_key(&delegator_id));
+    }
+
+    #[test]
+    fn payment_identity_leaves_are_root_sensitive_and_domain_separated() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        state.rebuild_state_commitment_v2(height);
+        let empty_root = state.state_commitment_v2_root(height);
+
+        let owner_id = id(0x31);
+        let identity = payment_pubkey(0x41);
+        state.payment_identities.insert(owner_id, identity.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_payment_identity(&owner_id, &identity);
+        let inserted_root = state.state_commitment_v2_root(height);
+        assert_ne!(empty_root, inserted_root);
+
+        let updated_identity = payment_pubkey(0x42);
+        state
+            .payment_identities
+            .insert(owner_id, updated_identity.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_payment_identity(&owner_id, &updated_identity);
+        assert_ne!(inserted_root, state.state_commitment_v2_root(height));
+
+        let identity_key = payment_identity_key(&owner_id);
+        assert_ne!(identity_key, validator_key(&owner_id));
+        assert_ne!(identity_key, delegator_key(&owner_id, &owner_id));
+        assert_ne!(identity_key, staking_nonce_key(&owner_id));
+        assert_ne!(identity_key, staked_bond_key(&owner_id));
+        assert_ne!(identity_key, slash_hash_key(&owner_id));
+        assert_ne!(identity_key, delegator_identity_key(&owner_id));
     }
 
     #[test]
@@ -676,6 +823,45 @@ mod tests {
     }
 
     #[test]
+    fn state_txn_rollback_rebuilds_payment_commitment_from_canonical_registry() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        let existing_id = id(0x50);
+        let existing_identity = payment_pubkey(0x51);
+        state
+            .payment_identities
+            .insert(existing_id, existing_identity.clone());
+        state.rebuild_state_commitment_v2(height);
+        let baseline_root = state.state_commitment_v2_root(height);
+
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, height);
+            txn.ensure_state_commitment_v2().unwrap();
+            txn.snapshot_payment_identity_scope();
+            let transient_id = id(0x60);
+            let transient_identity = payment_pubkey(0x61);
+            txn.state_mut()
+                .payment_identities
+                .insert(transient_id, transient_identity.clone());
+            txn.state_mut()
+                .state_commitment_v2
+                .as_mut()
+                .unwrap()
+                .put_payment_identity(&transient_id, &transient_identity);
+            assert_ne!(txn.state().state_commitment_v2_root(height), baseline_root);
+        }
+
+        assert_eq!(state.payment_identities.len(), 1);
+        assert_eq!(
+            state.payment_identities.get(&existing_id),
+            Some(&existing_identity)
+        );
+        assert_eq!(state.state_commitment_v2_root(height), baseline_root);
+        state.rebuild_state_commitment_v2(height);
+        assert_eq!(state.state_commitment_v2_root(height), baseline_root);
+    }
+
+    #[test]
     fn empty_delegator_identity_registry_preserves_pre_stage2_root() {
         let height = u64::MAX;
         let mut state = ChainState::new_genesis();
@@ -691,6 +877,51 @@ mod tests {
         let pre_stage2_root = pre_identity_state_commitment_v2_root(&state, height);
         let post_stage2_root = StateCommitmentV2::from_state(&state, height).root();
         assert_eq!(post_stage2_root, pre_stage2_root);
+    }
+
+    #[test]
+    fn empty_payment_identity_registry_preserves_pre_payment_root_with_unrelated_mutations() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        let validator = validator(0x70);
+        state.validators.upsert(validator.clone()).unwrap();
+        state.staking_nonces.insert(id(0x71), 12);
+        state.delegator_identities.insert(id(0x72), pubkey(0x73));
+        assert!(state.payment_identities.is_empty());
+
+        let pre_payment_root = legacy_state_commitment_v2_root(&state, height);
+        let post_payment_structure_root = StateCommitmentV2::from_state(&state, height).root();
+        assert_eq!(post_payment_structure_root, pre_payment_root);
+
+        state.delegator_identities.insert(id(0x74), pubkey(0x75));
+        assert_eq!(
+            StateCommitmentV2::from_state(&state, height).root(),
+            legacy_state_commitment_v2_root(&state, height)
+        );
+        assert!(state.payment_identities.is_empty());
+    }
+
+    #[test]
+    fn state_commitment_v2_domain_bytes_do_not_collide() {
+        let domains = [
+            ("validator", DOMAIN_VALIDATOR),
+            ("delegator", DOMAIN_DELEGATOR),
+            ("staking_nonce", DOMAIN_STAKING_NONCE),
+            ("staked_bond", DOMAIN_STAKED_BOND),
+            ("slash_hash", DOMAIN_SLASH_HASH),
+            ("delegation_return_event", DOMAIN_DELEGATION_RETURN_EVENT),
+            ("delegator_identity", DOMAIN_DELEGATOR_IDENTITY),
+            ("payment_identity", DOMAIN_PAYMENT_IDENTITY),
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for (name, domain) in domains {
+            assert_eq!(
+                seen.insert(domain, name),
+                None,
+                "StateCommitmentV2 domain byte collision at 0x{domain:02x}"
+            );
+        }
+        assert_eq!(DOMAIN_PAYMENT_IDENTITY, 0x08);
     }
 
     #[test]
@@ -828,6 +1059,25 @@ mod tests {
             .as_mut()
             .unwrap()
             .put_delegator_identity(&identity_id, &identity_pubkey);
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            StateCommitmentV2::from_state(&state, height).root()
+        );
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            legacy_state_commitment_v2_root(&state, height)
+        );
+
+        let payment_id = id(0x88);
+        let payment_pubkey = payment_pubkey(0x89);
+        state
+            .payment_identities
+            .insert(payment_id, payment_pubkey.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_payment_identity(&payment_id, &payment_pubkey);
         assert_eq!(
             state.state_commitment_v2_root(height),
             StateCommitmentV2::from_state(&state, height).root()

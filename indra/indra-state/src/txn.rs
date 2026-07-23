@@ -22,6 +22,7 @@ use crate::{
     validator::{DelegationMap, DelegationReturnEvent, StakeBondEntry, ValidatorSet},
 };
 use indra_core::types::crypto::HybridPubKey;
+use indra_crypto::PaymentPubKeyV1;
 
 #[derive(Clone)]
 struct ScalarSnapshot {
@@ -49,6 +50,8 @@ enum UndoEntry {
     SlashHashes(PersistentOrdSet<Bytes32>),
     #[allow(dead_code)]
     DelegatorIdentities(PersistentOrdMap<Bytes32, HybridPubKey>),
+    #[allow(dead_code)]
+    PaymentIdentities(PersistentOrdMap<Bytes32, PaymentPubKeyV1>),
     Governance(GovernanceState),
     Utxos(UtxoSet),
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
@@ -75,6 +78,8 @@ pub(crate) struct StateTxn<'a> {
     slash_hashes_recorded: bool,
     #[allow(dead_code)]
     delegator_identities_recorded: bool,
+    #[allow(dead_code)]
+    payment_identities_recorded: bool,
     governance_recorded: bool,
     utxos_recorded: bool,
     delegation_return_events_recorded: bool,
@@ -96,6 +101,7 @@ impl<'a> StateTxn<'a> {
             staking_nonces_recorded: false,
             slash_hashes_recorded: false,
             delegator_identities_recorded: false,
+            payment_identities_recorded: false,
             governance_recorded: false,
             utxos_recorded: false,
             delegation_return_events_recorded: false,
@@ -183,6 +189,14 @@ impl<'a> StateTxn<'a> {
     #[allow(dead_code)]
     pub(crate) fn snapshot_delegator_identity_scope(&mut self) {
         self.snapshot_delegator_identities();
+        self.mark_commitment_touched();
+    }
+
+    /// Record payment identity registry state before test-only or future
+    /// live-operation registry mutations.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_payment_identity_scope(&mut self) {
+        self.snapshot_payment_identities();
         self.mark_commitment_touched();
     }
 
@@ -344,6 +358,16 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    #[allow(dead_code)]
+    fn snapshot_payment_identities(&mut self) {
+        if !self.payment_identities_recorded {
+            // `PersistentOrdMap::clone()` is an O(1) root-handle copy.
+            let snapshot = measure_undo_recording(|| self.state.payment_identities.clone());
+            self.undo.push(UndoEntry::PaymentIdentities(snapshot));
+            self.payment_identities_recorded = true;
+        }
+    }
+
     fn snapshot_governance(&mut self) {
         if !self.governance_recorded {
             let snapshot = measure_undo_recording(|| self.state.governance.clone());
@@ -408,6 +432,9 @@ impl<'a> StateTxn<'a> {
                 UndoEntry::SlashHashes(hashes) => self.state.applied_slash_hashes = hashes,
                 UndoEntry::DelegatorIdentities(identities) => {
                     self.state.delegator_identities = identities;
+                }
+                UndoEntry::PaymentIdentities(identities) => {
+                    self.state.payment_identities = identities;
                 }
                 UndoEntry::Governance(governance) => self.state.governance = governance,
                 UndoEntry::Utxos(utxos) => self.state.utxos = utxos,

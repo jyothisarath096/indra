@@ -6,6 +6,7 @@
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::crypto::HybridPubKey;
+use indra_crypto::PaymentPubKeyV1;
 
 use indra_core::types::primitives::{
     state_commitment_v2_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK,
@@ -105,6 +106,9 @@ pub struct ChainState {
     /// Canonical full public key for each post-activation delegator identity.
     pub delegator_identities: PersistentOrdMap<Bytes32, HybridPubKey>,
 
+    /// Canonical payment key-exchange public key for each payment owner identity.
+    pub payment_identities: PersistentOrdMap<Bytes32, PaymentPubKeyV1>,
+
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
     pub applied_slash_hashes: PersistentOrdSet<Bytes32>,
@@ -175,8 +179,11 @@ impl Encode for ChainState {
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
         encode_delegation_return_events(&self.delegation_return_events, buf);
-        if !self.delegator_identities.is_empty() {
+        if !self.delegator_identities.is_empty() || !self.payment_identities.is_empty() {
             encode_delegator_identity_registry(&self.delegator_identities, buf);
+        }
+        if !self.payment_identities.is_empty() {
+            encode_payment_identity_registry(&self.payment_identities, buf);
         }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
@@ -202,10 +209,15 @@ impl Encode for ChainState {
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
             + delegation_return_events_encoded_len(&self.delegation_return_events)
-            + if self.delegator_identities.is_empty() {
+            + if self.delegator_identities.is_empty() && self.payment_identities.is_empty() {
                 0
             } else {
                 delegator_identity_registry_encoded_len(&self.delegator_identities)
+            }
+            + if self.payment_identities.is_empty() {
+                0
+            } else {
+                payment_identity_registry_encoded_len(&self.payment_identities)
             }
     }
 }
@@ -240,6 +252,11 @@ impl Decode for ChainState {
         } else {
             PersistentOrdMap::new()
         };
+        let payment_identities = if r.remaining() > 0 {
+            decode_payment_identity_registry(r)?
+        } else {
+            PersistentOrdMap::new()
+        };
         Ok(Self {
             chain_id,
             height,
@@ -256,6 +273,7 @@ impl Decode for ChainState {
             staked_bonds,
             staking_nonces,
             delegator_identities,
+            payment_identities,
             applied_slash_hashes,
             governance,
             delegation_return_events,
@@ -288,6 +306,7 @@ impl ChainState {
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
             delegator_identities: PersistentOrdMap::new(),
+            payment_identities: PersistentOrdMap::new(),
             applied_slash_hashes: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -320,6 +339,7 @@ impl ChainState {
             staked_bonds: decode_bond_map_legacy(r)?,
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
+            payment_identities: PersistentOrdMap::new(),
             applied_slash_hashes: if r.remaining() > 0 {
                 decode_hash_set(r, "snapshot.applied_slash_hashes")?
             } else {
@@ -356,6 +376,7 @@ impl ChainState {
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
+            payment_identities: PersistentOrdMap::new(),
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -619,6 +640,59 @@ fn validate_delegator_identity_count(count: usize) -> IndraResult<()> {
     Ok(())
 }
 
+fn encode_payment_identity_registry(
+    identities: &PersistentOrdMap<Bytes32, PaymentPubKeyV1>,
+    buf: &mut Vec<u8>,
+) {
+    (identities.len() as u32).encode(buf);
+    for (owner_id, pubkey) in identities {
+        owner_id.encode(buf);
+        buf.extend_from_slice(&pubkey.encode());
+    }
+}
+
+fn payment_identity_registry_encoded_len(
+    identities: &PersistentOrdMap<Bytes32, PaymentPubKeyV1>,
+) -> usize {
+    4 + identities
+        .iter()
+        .map(|(owner_id, pubkey)| owner_id.encoded_len() + pubkey.encode().len())
+        .sum::<usize>()
+}
+
+fn decode_payment_identity_registry(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<PersistentOrdMap<Bytes32, PaymentPubKeyV1>> {
+    let count = u32::decode(r)? as usize;
+    validate_payment_identity_count(count)?;
+    let mut identities = PersistentOrdMap::new();
+    for _ in 0..count {
+        let owner_id = Bytes32::decode(r)?;
+        let pubkey_bytes = r.read_bytes(indra_crypto::PAYMENT_PUBKEY_V1_ENCODED_LEN)?;
+        let pubkey =
+            PaymentPubKeyV1::decode(pubkey_bytes).map_err(|_| IndraError::InvariantViolation {
+                message: "snapshot.payment_identities contains malformed payment public key",
+            })?;
+        if identities.insert(owner_id, pubkey).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.payment_identities",
+            });
+        }
+    }
+    Ok(identities)
+}
+
+fn validate_payment_identity_count(count: usize) -> IndraResult<()> {
+    if count > MAX_STAKING_NONCES_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.payment_identities",
+            max: MAX_STAKING_NONCES_DECODE,
+            actual: count,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +710,7 @@ mod tests {
         },
         CommitmentV1,
     };
+    use indra_crypto::{PaymentKeypairV1, PAYMENT_VERSION_V1};
 
     #[test]
     fn genesis_state_is_correct() {
@@ -682,6 +757,21 @@ mod tests {
             classical_pk: Bytes32::from([byte; 32]),
             pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(1); 2_592]).unwrap(),
         }
+    }
+
+    fn test_payment_pubkey(index: usize) -> PaymentPubKeyV1 {
+        let mut x25519_sk = [0u8; 32];
+        x25519_sk[0] = 0xA5;
+        x25519_sk[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+        let mut ml_kem_1024_seed = [0u8; 64];
+        ml_kem_1024_seed[0] = 0x5A;
+        ml_kem_1024_seed[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+        PaymentKeypairV1 {
+            version: PAYMENT_VERSION_V1,
+            x25519_sk,
+            ml_kem_1024_seed,
+        }
+        .public_key()
     }
 
     fn test_bond(byte: u8) -> StakeBondEntry {
@@ -734,6 +824,10 @@ mod tests {
         state.governance.encode(&mut buf);
         encode_delegation_return_events(&state.delegation_return_events, &mut buf);
         buf
+    }
+
+    fn encode_chain_state_without_identity_tails(state: &ChainState) -> Vec<u8> {
+        encode_chain_state_without_delegator_identities(state)
     }
 
     fn encode_hash_set_hashset(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
@@ -1090,6 +1184,72 @@ mod tests {
     }
 
     #[test]
+    fn payment_identity_registry_round_trips_empty_small_and_realistic_scale() {
+        for size in [0usize, 3, 2_000] {
+            let mut registry = PersistentOrdMap::new();
+            for index in 0..size {
+                let mut id = [0u8; 32];
+                id[0] = 0xC0;
+                id[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+                registry.insert(Bytes32::from(id), test_payment_pubkey(index));
+            }
+
+            let mut bytes = Vec::new();
+            encode_payment_identity_registry(&registry, &mut bytes);
+            assert_eq!(
+                bytes.len(),
+                payment_identity_registry_encoded_len(&registry)
+            );
+            let decoded = decode_payment_identity_registry(&mut ByteReader::new(&bytes)).unwrap();
+            assert_eq!(decoded, registry);
+        }
+    }
+
+    #[test]
+    fn payment_identity_registry_encoding_is_insertion_order_independent() {
+        let mut forward = PersistentOrdMap::new();
+        let mut reverse = PersistentOrdMap::new();
+        for index in [1usize, 2, 3, 4] {
+            forward.insert(Bytes32::from([index as u8; 32]), test_payment_pubkey(index));
+        }
+        for index in [4usize, 3, 2, 1] {
+            reverse.insert(Bytes32::from([index as u8; 32]), test_payment_pubkey(index));
+        }
+
+        let mut forward_bytes = Vec::new();
+        encode_payment_identity_registry(&forward, &mut forward_bytes);
+        let mut reverse_bytes = Vec::new();
+        encode_payment_identity_registry(&reverse, &mut reverse_bytes);
+        assert_eq!(forward_bytes, reverse_bytes);
+        assert_eq!(
+            forward
+                .iter()
+                .map(|(owner_id, _)| owner_id.0[0])
+                .collect::<Vec<_>>(),
+            vec![0x01, 0x02, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn payment_identity_registry_decode_rejects_duplicate_ids() {
+        let owner_id = Bytes32::from([0xC1; 32]);
+        let mut bytes = Vec::new();
+        2u32.encode(&mut bytes);
+        owner_id.encode(&mut bytes);
+        bytes.extend_from_slice(&test_payment_pubkey(1).encode());
+        owner_id.encode(&mut bytes);
+        bytes.extend_from_slice(&test_payment_pubkey(2).encode());
+
+        let err = decode_payment_identity_registry(&mut ByteReader::new(&bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            IndraError::DuplicateEntries {
+                field: "snapshot.payment_identities"
+            }
+        ));
+    }
+
+    #[test]
     fn empty_delegator_identity_registry_preserves_chain_state_encoding() {
         let mut state = ChainState::new_genesis();
         state.height = 42;
@@ -1105,6 +1265,48 @@ mod tests {
         let decoded = ChainState::decode_exact(&old_bytes).unwrap();
         assert_eq!(decoded, state);
         assert!(decoded.delegator_identities.is_empty());
+    }
+
+    #[test]
+    fn empty_payment_identity_registry_preserves_chain_state_encoding() {
+        let mut state = ChainState::new_genesis();
+        state.height = 42;
+        state.staking_nonces.insert(Bytes32::from([0x44; 32]), 7);
+        state.applied_slash_hashes.insert(Bytes32::from([0x55; 32]));
+
+        let old_bytes = encode_chain_state_without_identity_tails(&state);
+        let new_bytes = state.encode_to_vec();
+        assert!(state.delegator_identities.is_empty());
+        assert!(state.payment_identities.is_empty());
+        assert_eq!(new_bytes, old_bytes);
+        assert_eq!(new_bytes.len(), state.encoded_len());
+
+        let decoded = ChainState::decode_exact(&old_bytes).unwrap();
+        assert_eq!(decoded, state);
+        assert!(decoded.delegator_identities.is_empty());
+        assert!(decoded.payment_identities.is_empty());
+    }
+
+    #[test]
+    fn chain_state_round_trips_optional_payment_identity_registry_tail() {
+        let mut state = ChainState::new_genesis();
+        state
+            .payment_identities
+            .insert(Bytes32::from([0xC2; 32]), test_payment_pubkey(2));
+        state
+            .payment_identities
+            .insert(Bytes32::from([0xC1; 32]), test_payment_pubkey(1));
+
+        let without_identity_tails = encode_chain_state_without_identity_tails(&state);
+        let encoded = state.encode_to_vec();
+        assert!(encoded.len() > without_identity_tails.len());
+        assert!(encoded.starts_with(&without_identity_tails));
+        assert_eq!(encoded.len(), state.encoded_len());
+
+        let decoded = ChainState::decode_exact(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert!(decoded.delegator_identities.is_empty());
+        assert_eq!(decoded.payment_identities.len(), 2);
     }
 
     #[test]
