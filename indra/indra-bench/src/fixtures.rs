@@ -39,6 +39,7 @@ pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
             range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             lock_height: 0,
         }],
+        payment_notes: Vec::new(),
         fee_amount: fee,
         fee_blinding: Bytes32::ZERO,
         fee_commitment: CommitmentV1 {

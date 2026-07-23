@@ -923,6 +923,7 @@ name = "indra-crypto"
 version = "0.1.0"
 dependencies = [
  "bip39",
+ "blake3",
  "blst",
  "curve25519-dalek",
  "ed25519-dalek",
@@ -930,9 +931,12 @@ dependencies = [
  "hmac",
  "indra-bulletproofs",
  "ml-dsa",
+ "ml-kem",
+ "rand_core 0.6.4",
  "sha2",
  "subtle",
  "thiserror 1.0.69",
+ "x25519-dalek",
  "zeroize",
 ]
 

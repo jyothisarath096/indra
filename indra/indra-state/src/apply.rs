@@ -41,10 +41,11 @@ use indra_core::{
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
             block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
-            overflow_fix_active, vrf_commit_reveal_election_active, Bytes32, ProtocolVersion,
-            HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-            MAX_TX_PER_BLOCK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
-            UNBONDING_PERIOD_EPOCHS,
+            overflow_fix_active, payment_blinding_active, vrf_commit_reveal_election_active,
+            Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK,
+            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
         slashing::SlashEvidenceV1,
@@ -919,10 +920,27 @@ pub fn validate_transaction(
     if tx.outputs.is_empty() {
         return Err(StateError::ZeroOutputs);
     }
-    if tx.version != ProtocolVersion::CURRENT {
-        return Err(StateError::UnsupportedTxVersion {
-            version: tx.version.0,
-        });
+    match tx.version.0 {
+        PROTOCOL_VERSION => {
+            if !tx.payment_notes.is_empty() {
+                return Err(StateError::InvariantViolation {
+                    message: "v1 transaction cannot carry payment notes",
+                });
+            }
+        }
+        TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES => {
+            if !payment_blinding_active(current_height) {
+                return Err(StateError::UnsupportedTxVersion {
+                    version: tx.version.0,
+                });
+            }
+            if tx.payment_notes.len() != tx.outputs.len() {
+                return Err(StateError::InvariantViolation {
+                    message: "payment_notes length must equal outputs length",
+                });
+            }
+        }
+        version => return Err(StateError::UnsupportedTxVersion { version }),
     }
     if tx.signature_module_id != 1 {
         return Err(StateError::UnsupportedSignatureModule {
@@ -1114,7 +1132,7 @@ mod tests {
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
                 MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
                 MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
-                UNBONDING_PERIOD_EPOCHS,
+                TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
             staking::{StakingOp, StakingOpBody},
@@ -1124,8 +1142,8 @@ mod tests {
         Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
     use indra_crypto::{
-        commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1,
-        PaymentPubKeyV1, PqKeypair, PAYMENT_VERSION_V1,
+        commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PaymentBlindingNoteV1,
+        PaymentKeypairV1, PaymentPubKeyV1, PqKeypair, PAYMENT_VERSION_V1,
     };
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
@@ -1204,6 +1222,28 @@ mod tests {
             ml_kem_1024_seed: [seed.wrapping_add(1); 64],
         }
         .public_key()
+    }
+
+    fn payment_note(seed: u8) -> PaymentBlindingNoteV1 {
+        PaymentBlindingNoteV1 {
+            version: PAYMENT_VERSION_V1,
+            owner_id: [seed; 32],
+            payment_pubkey_hash: [seed.wrapping_add(1); 32],
+            sender_x25519_ephemeral_pk: [seed.wrapping_add(2); 32],
+            ml_kem_1024_ciphertext: [seed.wrapping_add(3); 1568],
+            note_nonce: [seed.wrapping_add(4); 32],
+        }
+    }
+
+    fn set_v2_payment_notes(
+        tx: &mut TransactionV1,
+        keypair: &HybridKeypair,
+        chain_id: &str,
+        payment_notes: Vec<Option<PaymentBlindingNoteV1>>,
+    ) {
+        tx.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
+        tx.payment_notes = payment_notes;
+        tx.signature = sign_transaction(keypair, chain_id, tx);
     }
 
     fn staking_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
@@ -1742,6 +1782,7 @@ mod tests {
                 range_proof: VariableBytes::from_slice(&proof).unwrap(),
                 lock_height: 0,
             }],
+            payment_notes: Vec::new(),
             fee_amount: fee,
             fee_blinding: Bytes32::from(fee_blinding),
             fee_commitment: CommitmentV1 {
@@ -1806,6 +1847,7 @@ mod tests {
                 })
                 .collect(),
             outputs,
+            payment_notes: Vec::new(),
             fee_amount: fee,
             fee_blinding: Bytes32::from(fee_blinding),
             fee_commitment: CommitmentV1 {
@@ -3674,6 +3716,200 @@ mod tests {
             Some(&post_payment_pubkey)
         );
         assert_eq!(first_replay.staking_nonces.get(&owner_id), Some(&1));
+    }
+
+    #[test]
+    fn payment_notes_transaction_is_rejected_before_gate() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        state.height = u64::MAX - 2;
+        state.tip_hash = Bytes32::ZERO;
+
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0xB1; 32]),
+        );
+        set_v2_payment_notes(
+            &mut tx,
+            &keypair,
+            &state.chain_id.clone(),
+            vec![Some(payment_note(0xB2))],
+        );
+        let block = make_block_at_height(&state, vec![tx], u64::MAX - 1, 0);
+
+        let before = state.clone();
+        let err = apply_block(&mut state, &block, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::UnsupportedTxVersion {
+                version: TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
+            }
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn payment_notes_transaction_is_accepted_after_gate_and_mutates_no_new_state() {
+        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        state.height = u64::MAX - 1;
+        state.tip_hash = Bytes32::ZERO;
+        let original_payment_registry = state.payment_identities.clone();
+
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0xB3; 32]),
+        );
+        set_v2_payment_notes(
+            &mut tx,
+            &keypair,
+            &state.chain_id.clone(),
+            vec![Some(payment_note(0xB4))],
+        );
+        let block = make_block_at_height(&state, vec![tx], u64::MAX, 0);
+
+        apply_block(&mut state, &block, 0).unwrap();
+        assert_eq!(state.payment_identities, original_payment_registry);
+        assert!(!state.utxos.contains(&utxo_id));
+        assert!(state.nullifiers.contains(&Bytes32::from([0xB3; 32])));
+    }
+
+    #[test]
+    fn payment_notes_all_none_has_same_spendability_after_gate() {
+        let (mut initial, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
+        initial.height = u64::MAX - 1;
+        initial.tip_hash = Bytes32::ZERO;
+
+        let legacy_tx = make_tx(
+            &initial,
+            &keypair,
+            utxo_id,
+            input_value,
+            input_blinding,
+            Bytes32::from([0xB5; 32]),
+        );
+        let mut explicit_none_tx = legacy_tx.clone();
+        set_v2_payment_notes(
+            &mut explicit_none_tx,
+            &keypair,
+            &initial.chain_id.clone(),
+            vec![None],
+        );
+
+        let mut legacy_state = initial.clone();
+        let legacy_block = make_block_at_height(&legacy_state, vec![legacy_tx], u64::MAX, 0);
+        apply_block(&mut legacy_state, &legacy_block, 0).unwrap();
+
+        let mut explicit_none_state = initial;
+        let explicit_none_block =
+            make_block_at_height(&explicit_none_state, vec![explicit_none_tx], u64::MAX, 0);
+        apply_block(&mut explicit_none_state, &explicit_none_block, 0).unwrap();
+
+        assert_eq!(legacy_state.total_supply, explicit_none_state.total_supply);
+        assert_eq!(legacy_state.burn_buffer, explicit_none_state.burn_buffer);
+        assert_eq!(
+            legacy_state.fee_reward_pool,
+            explicit_none_state.fee_reward_pool
+        );
+        assert_eq!(
+            legacy_state.utxos.all_entries().count(),
+            explicit_none_state.utxos.all_entries().count()
+        );
+        assert_eq!(
+            legacy_state
+                .utxos
+                .all_entries()
+                .map(|entry| entry.output.value_spark)
+                .collect::<Vec<_>>(),
+            explicit_none_state
+                .utxos
+                .all_entries()
+                .map(|entry| entry.output.value_spark)
+                .collect::<Vec<_>>()
+        );
+        assert!(!legacy_state.utxos.contains(&utxo_id));
+        assert!(!explicit_none_state.utxos.contains(&utxo_id));
+    }
+
+    #[test]
+    fn payment_notes_activation_boundary_replay_is_deterministic_for_mixed_transactions() {
+        let mut initial = ChainState::new_genesis();
+        initial.height = u64::MAX - 1;
+        initial.tip_hash = Bytes32::ZERO;
+        let (owner_pubkey, keypair) = make_test_keypair([0xB6; 32]);
+        let mut inputs = Vec::new();
+        for index in 0..3u8 {
+            let input_blinding = [0xB7u8.wrapping_add(index); 32];
+            let output = output_with_value(
+                TEST_INPUT_VALUE + index as u64,
+                owner_pubkey.clone(),
+                0xB7u8.wrapping_add(index),
+            );
+            let utxo_id = initial.utxos.insert(output, 0, 0, index as u32).unwrap();
+            inputs.push((utxo_id, TEST_INPUT_VALUE + index as u64, input_blinding));
+        }
+
+        let legacy_tx = make_tx(
+            &initial,
+            &keypair,
+            inputs[0].0,
+            inputs[0].1,
+            inputs[0].2,
+            Bytes32::from([0xBA; 32]),
+        );
+        let mut noted_tx = make_tx(
+            &initial,
+            &keypair,
+            inputs[1].0,
+            inputs[1].1,
+            inputs[1].2,
+            Bytes32::from([0xBB; 32]),
+        );
+        set_v2_payment_notes(
+            &mut noted_tx,
+            &keypair,
+            &initial.chain_id.clone(),
+            vec![Some(payment_note(0xBC))],
+        );
+        let mut all_none_tx = make_tx(
+            &initial,
+            &keypair,
+            inputs[2].0,
+            inputs[2].1,
+            inputs[2].2,
+            Bytes32::from([0xBD; 32]),
+        );
+        set_v2_payment_notes(
+            &mut all_none_tx,
+            &keypair,
+            &initial.chain_id.clone(),
+            vec![None],
+        );
+
+        let mut first_replay = initial.clone();
+        let mut second_replay = initial;
+        let first_block = make_block_at_height(
+            &first_replay,
+            vec![legacy_tx.clone(), noted_tx.clone(), all_none_tx.clone()],
+            u64::MAX,
+            0,
+        );
+        let second_block = make_block_at_height(
+            &second_replay,
+            vec![legacy_tx, noted_tx, all_none_tx],
+            u64::MAX,
+            0,
+        );
+
+        apply_block(&mut first_replay, &first_block, 0).unwrap();
+        apply_block(&mut second_replay, &second_block, 0).unwrap();
+        assert_eq!(first_replay, second_replay);
     }
 
     #[test]

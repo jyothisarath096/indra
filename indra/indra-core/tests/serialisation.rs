@@ -62,6 +62,7 @@ fn minimal_tx() -> TransactionV1 {
         signature_module_id: 1,
         inputs: vec![input(0x01, 0x02)],
         outputs: vec![output(0x03)],
+        payment_notes: Vec::new(),
         fee_amount: 1_000,
         fee_blinding: Bytes32::ZERO,
         fee_commitment: commitment(0x00),

@@ -119,6 +119,10 @@ pub enum IndraError {
     #[error("duplicate nullifier in transaction")]
     DuplicateNullifier,
 
+    /// Transaction failed structural validation.
+    #[error("invalid transaction: {0}")]
+    InvalidTransaction(String),
+
     /// Duplicate transaction in block.
     #[error("duplicate transaction in block")]
     DuplicateTransaction,

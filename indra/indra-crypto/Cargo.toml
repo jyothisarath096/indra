@@ -17,4 +17,8 @@ blst.workspace               = true
 indra-bulletproofs.workspace = true
 zeroize                      = { version = "1", features = ["derive"] }
 ml-dsa.workspace             = true
+ml-kem.workspace             = true
+x25519-dalek.workspace       = true
+blake3.workspace             = true
 subtle.workspace             = true
+rand_core.workspace          = true

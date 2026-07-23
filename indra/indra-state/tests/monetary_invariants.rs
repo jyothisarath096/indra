@@ -1,21 +1,17 @@
 //! Monetary-policy invariant tests for staking, slashing, rewards and fees.
 
 use curve25519_dalek::scalar::Scalar;
-use indra_core::{
-    codec::Encode,
-    types::{
-        block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-        crypto::{CommitmentV1, HybridPubKey, HybridSignature},
-        primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID,
-            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES,
-            MAX_VRF_PROOF_BYTES, UNBONDING_PERIOD_EPOCHS,
-        },
-        slashing::SlashEvidenceV1,
-        staking::{StakingOp, StakingOpBody},
-        transaction::{InputV1, OutputV1, TransactionV1},
-        vote::{VoteStep, VoteV1},
+use indra_core::types::{
+    block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    crypto::{CommitmentV1, HybridPubKey, HybridSignature},
+    primitives::{
+        Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
+        MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES, UNBONDING_PERIOD_EPOCHS,
     },
+    slashing::SlashEvidenceV1,
+    staking::{StakingOp, StakingOpBody},
+    transaction::{InputV1, OutputV1, TransactionV1},
+    vote::{VoteStep, VoteV1},
 };
 use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_state::{
@@ -192,6 +188,7 @@ fn fee_tx(
             owner_pubkey,
             [0x43; 32],
         )],
+        payment_notes: Vec::new(),
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {

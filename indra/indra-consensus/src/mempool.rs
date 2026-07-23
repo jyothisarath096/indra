@@ -358,6 +358,7 @@ mod tests {
                 range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 lock_height: 0,
             }],
+            payment_notes: Vec::new(),
             fee_amount: fee,
             fee_blinding: Bytes32::ZERO,
             fee_commitment: CommitmentV1 {
@@ -444,6 +445,7 @@ mod tests {
                 owner_pubkey,
                 [0x61; 32],
             )],
+            payment_notes: Vec::new(),
             fee_amount: fee,
             fee_blinding: Bytes32::from(fee_blinding),
             fee_commitment: CommitmentV1 {

@@ -874,12 +874,18 @@ pub const PRUNE_WINDOW_EPOCHS: u64 = 500;
 /// The baseline protocol version for transactions and pre-reveal-set blocks.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Transaction protocol version carrying optional payment-blinding note sidecars.
+///
+/// This reuses the existing in-transaction `ProtocolVersion` field rather than
+/// introducing a wrapper format. Version 1 transactions remain byte-identical;
+/// version 2 transactions encode the payment-notes tail and are admitted only
+/// at/after `PAYMENT_BLINDING_HEIGHT`.
+pub const TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES: u16 = 2;
+
 /// Block protocol version used at/after REVEAL_SET_COMMITMENT_HEIGHT.
 ///
-/// Transactions continue to use PROTOCOL_VERSION = 1; this value is only for
-/// block headers. Old binaries reject this at header decode, preventing them
-/// from silently accepting post-activation blocks while ignoring the new body
-/// evidence field.
+/// Old binaries reject this at header decode, preventing them from silently
+/// accepting post-activation blocks while ignoring the new body evidence field.
 pub const BLOCK_PROTOCOL_VERSION_REVEAL_SET: u16 = 2;
 
 /// Protocol version required for a block at the supplied height.
@@ -1057,7 +1063,9 @@ impl ProtocolVersion {
 
     /// True if this version is supported.
     pub fn is_supported(&self) -> bool {
-        self.0 == PROTOCOL_VERSION || self.0 == BLOCK_PROTOCOL_VERSION_REVEAL_SET
+        self.0 == PROTOCOL_VERSION
+            || self.0 == TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
+            || self.0 == BLOCK_PROTOCOL_VERSION_REVEAL_SET
     }
 }
 
@@ -1073,7 +1081,10 @@ impl Encode for ProtocolVersion {
 impl Decode for ProtocolVersion {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let v = r.read_u16_le()?;
-        if v != PROTOCOL_VERSION && v != BLOCK_PROTOCOL_VERSION_REVEAL_SET {
+        if v != PROTOCOL_VERSION
+            && v != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
+            && v != BLOCK_PROTOCOL_VERSION_REVEAL_SET
+        {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
         Ok(Self(v))

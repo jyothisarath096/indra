@@ -84,6 +84,7 @@ fn tx_spending(
         signature_module_id: 1,
         inputs: vec![InputV1 { utxo_id, nullifier }],
         outputs: vec![output(value_out, output_blinding, owner_pubkey, proof_seed)],
+        payment_notes: Vec::new(),
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {
@@ -133,6 +134,7 @@ fn tx_spending_same_utxo_twice(
             },
         ],
         outputs: vec![output(value_out, output_blinding, owner_pubkey, [0x71; 32])],
+        payment_notes: Vec::new(),
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {
@@ -221,6 +223,7 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
             range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
             lock_height: 0,
         }],
+        payment_notes: Vec::new(),
         fee_amount: INITIAL_BASE_FEE_SPARK_PER_KB,
         fee_blinding: Bytes32::ZERO,
         fee_commitment: CommitmentV1 {

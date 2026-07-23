@@ -82,6 +82,7 @@ fn dummy_tx(
             nullifier: Bytes32::from([nonce; 32]),
         }],
         outputs: vec![dummy_output(nonce, output_value, owner_pubkey)],
+        payment_notes: Vec::new(),
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {

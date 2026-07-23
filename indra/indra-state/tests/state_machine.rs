@@ -213,6 +213,7 @@ fn make_tx(
             range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }],
+        payment_notes: Vec::new(),
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {

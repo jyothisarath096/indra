@@ -219,6 +219,7 @@ mod tests {
                 range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 lock_height: 0,
             }],
+            payment_notes: Vec::new(),
             fee_amount: 10_000,
             fee_blinding: Bytes32::ZERO,
             fee_commitment: CommitmentV1 {

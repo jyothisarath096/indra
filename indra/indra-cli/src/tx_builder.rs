@@ -208,6 +208,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         signature_module_id: 1,
         inputs,
         outputs,
+        payment_notes: Vec::new(),
         fee_amount: params.fee_spark,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {
