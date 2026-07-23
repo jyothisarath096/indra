@@ -28,3 +28,18 @@ pub const BLS_PK_BYTES: usize = 48;
 
 /// Maximum ECVRF proof size in bytes.
 pub const VRF_PROOF_BYTES: usize = 1_024;
+
+/// X25519 public key size in bytes.
+pub const X25519_PK_BYTES: usize = 32;
+
+/// X25519 static secret key storage size in bytes.
+pub const X25519_SK_BYTES: usize = 32;
+
+/// ML-KEM-1024 encapsulation key size in bytes.
+pub const ML_KEM_1024_EK_BYTES: usize = 1_568;
+
+/// ML-KEM-1024 ciphertext size in bytes.
+pub const ML_KEM_1024_CT_BYTES: usize = 1_568;
+
+/// ML-KEM seed storage size in bytes.
+pub const ML_KEM_SEED_BYTES: usize = 64;

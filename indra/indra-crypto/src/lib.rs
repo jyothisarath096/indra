@@ -12,6 +12,7 @@ pub mod error;
 pub mod hash;
 pub mod hybrid;
 pub mod mnemonic;
+pub mod payment;
 pub mod pedersen;
 pub mod vrf;
 
@@ -32,6 +33,13 @@ pub use indra_bulletproofs::{prove_range, verify_range, BulletproofError, RANGE_
 pub use mnemonic::{
     derive_all_seeds, generate_mnemonic, mnemonic_to_seed, mnemonic_words, validate_mnemonic,
     DerivedSeeds, MNEMONIC_WORD_COUNT,
+};
+pub use payment::{
+    derive_payment_blinding_v1, payment_x25519_shared_secret, recipient_derive_payment_blinding_v1,
+    sender_derive_payment_blinding_v1, PaymentBlindingInputsV1, PaymentBlindingNoteV1,
+    PaymentKeypairV1, PaymentPubKeyV1, RecipientPaymentBlindingV1, SenderPaymentBlindingV1,
+    PAYMENT_BLINDING_CONTEXT_V1, PAYMENT_KEYPAIR_V1_ENCODED_LEN, PAYMENT_NOTE_V1_ENCODED_LEN,
+    PAYMENT_PUBKEY_V1_ENCODED_LEN,
 };
 pub use pedersen::{commit, verify_opening, PedersenCommitment, PedersenOpening};
 pub use vrf::{vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};

@@ -61,6 +61,46 @@ pub enum CryptoError {
     /// Invalid or malformed BIP-39 mnemonic phrase.
     #[error("invalid BIP-39 mnemonic phrase")]
     InvalidMnemonic,
+
+    /// A decoded crypto object had an unsupported version byte.
+    #[error("unsupported crypto object version {version} for {scheme}")]
+    UnsupportedVersion {
+        /// Which scheme.
+        scheme: &'static str,
+        /// Version found.
+        version: u8,
+    },
+
+    /// A crypto object had the wrong encoded length.
+    #[error("malformed encoded {scheme}: got {actual} bytes")]
+    MalformedEncoding {
+        /// Which scheme.
+        scheme: &'static str,
+        /// Actual size received.
+        actual: usize,
+    },
+
+    /// A KDF input exceeded its stage-1 encoding limit.
+    #[error("KDF input '{field}' length {actual} exceeds maximum {max}")]
+    LengthExceeded {
+        /// Field name.
+        field: &'static str,
+        /// Maximum allowed length.
+        max: usize,
+        /// Actual length supplied.
+        actual: usize,
+    },
+
+    /// ML-KEM key material or ciphertext failed validation.
+    #[error("invalid ML-KEM-1024 {material}")]
+    InvalidMlKem {
+        /// Which material failed.
+        material: &'static str,
+    },
+
+    /// Payment blinding note did not target the provided recipient keypair.
+    #[error("payment blinding note target hash does not match recipient payment key")]
+    PaymentKeyHashMismatch,
 }
 
 /// Convenience alias.
