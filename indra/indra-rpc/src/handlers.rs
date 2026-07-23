@@ -15,6 +15,7 @@ use indra_core::{
     },
     Bytes32,
 };
+use indra_crypto::PaymentPubKeyV1;
 use indra_state::{AuthTreeProof, ChainState, ProofTerminal};
 
 use crate::{
@@ -322,6 +323,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getDelegations", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorPositions", RpcMethodAccess::ReadOnly),
     ("indra_getDelegationReturnEvents", RpcMethodAccess::ReadOnly),
+    ("indra_getPaymentIdentity", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
     ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
@@ -452,6 +454,7 @@ pub fn dispatch_with_admin(
         "indra_getDelegations" => Ready(get_delegations(params, state)),
         "indra_getDelegatorPositions" => Ready(get_delegator_positions(params, state)),
         "indra_getDelegationReturnEvents" => Ready(get_delegation_return_events(params, state)),
+        "indra_getPaymentIdentity" => Ready(get_payment_identity(params, state)),
         "indra_getDelegatorRewards" => Ready(get_delegator_rewards(params, state)),
         "indra_getValidatorDelegators" => Ready(get_validator_delegators(params, state)),
         "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
@@ -1105,6 +1108,29 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
             .map(hex::encode)
             .unwrap_or_default(),
     ))
+}
+
+/// `indra_getPaymentIdentity` — returns a registered payment public key by owner ID.
+///
+/// Params: `["<owner_id_hex>"]`
+/// Result: `null` or `{"owner_id","version","x25519_pk","ml_kem_1024_ek","payment_pubkey_hash"}`
+fn get_payment_identity(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let owner_id = parse_hex32_param(params, "owner_id")?;
+    let Some(pubkey) = state.chain.payment_identities.get(&owner_id) else {
+        return Ok("null".to_string());
+    };
+    Ok(payment_identity_json(&owner_id, pubkey))
+}
+
+fn payment_identity_json(owner_id: &Bytes32, pubkey: &PaymentPubKeyV1) -> String {
+    format!(
+        r#"{{"owner_id":"{}","version":{},"x25519_pk":"{}","ml_kem_1024_ek":"{}","payment_pubkey_hash":"{}"}}"#,
+        hex::encode(owner_id.0),
+        pubkey.version,
+        hex::encode(pubkey.x25519_pk),
+        hex::encode(pubkey.ml_kem_1024_ek),
+        hex::encode(pubkey.hash()),
+    )
 }
 
 /// `indra_getValidatorSelfStake` — returns active self-stake bonds for a validator.
@@ -2110,8 +2136,9 @@ mod tests {
             primitives::{MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES},
             transaction::OutputV1,
         },
-        CommitmentV1, ProtocolVersion, VariableBytes,
+        Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
     };
+    use indra_crypto::{sha256, PaymentKeypairV1};
     use indra_state::{
         validator::{StakeBondEntry, StakeBondOutput},
         ChainState,
@@ -2355,6 +2382,45 @@ mod tests {
         let state = NodeState::read_only(&engine);
         let result = get_validator(&["not_hex".to_string()], &state);
         assert!(matches!(result, Err(RpcError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn get_payment_identity_returns_null_or_registered_pubkey() {
+        assert!(rpc_method_is_read_only("indra_getPaymentIdentity"));
+        assert_eq!(
+            crate::server::rpc_method_cost("indra_getPaymentIdentity"),
+            crate::server::RpcMethodCost::Cheap
+        );
+
+        let mut engine = make_state("pi");
+        let owner_id = Bytes32::from(sha256(&[0xA1; 32]));
+        let payment_pubkey = PaymentKeypairV1::generate().public_key();
+        let state = NodeState::read_only(&engine);
+        assert_eq!(
+            get_payment_identity(&[hex::encode(owner_id.0)], &state).unwrap(),
+            "null"
+        );
+
+        engine
+            .payment_identities
+            .insert(owner_id, payment_pubkey.clone());
+        let state = NodeState::read_only(&engine);
+        let result = get_payment_identity(&[hex::encode(owner_id.0)], &state).unwrap();
+
+        assert!(result.contains(&format!(r#""owner_id":"{}""#, hex::encode(owner_id.0))));
+        assert!(result.contains(r#""version":1"#));
+        assert!(result.contains(&format!(
+            r#""x25519_pk":"{}""#,
+            hex::encode(payment_pubkey.x25519_pk)
+        )));
+        assert!(result.contains(&format!(
+            r#""ml_kem_1024_ek":"{}""#,
+            hex::encode(payment_pubkey.ml_kem_1024_ek)
+        )));
+        assert!(result.contains(&format!(
+            r#""payment_pubkey_hash":"{}""#,
+            hex::encode(payment_pubkey.hash())
+        )));
     }
 
     #[test]

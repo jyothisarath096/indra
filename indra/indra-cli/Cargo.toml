@@ -27,6 +27,7 @@ indra-core      = { path = "../indra-core" }
 indra-crypto    = { path = "../indra-crypto" }
 indra-node      = { path = "../indra-node" }
 indra-rpc       = { path = "../indra-rpc" }
+blake3.workspace = true
 
 [[bin]]
 name = "indra-send"

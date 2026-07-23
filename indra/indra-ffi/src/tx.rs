@@ -31,6 +31,7 @@ pub fn build(
         hybrid_seed: sender_classical_seed,
         pq_sk_bytes: sender_pq_sk.to_vec(),
         sender_pubkey: wallet_context.sender_pubkey,
+        recipient_payment_pubkey: None,
     };
 
     let built = match build_transaction(&params) {

@@ -120,6 +120,7 @@ fn cmd_send(args: &[String]) {
     let wallet = wallet_from_utxos_json(&utxos_raw);
 
     let recipient_pubkey = resolve_recipient_pubkey(&rpc, &recipient_address);
+    let recipient_payment_pubkey = lookup_payment_identity(&rpc, &recipient_address);
     let recipient_hex = format!(
         "{}:{}",
         hex::encode(recipient_pubkey.classical_pk.0),
@@ -143,6 +144,7 @@ fn cmd_send(args: &[String]) {
         hybrid_seed,
         pq_sk_bytes,
         sender_pubkey,
+        recipient_payment_pubkey,
     })
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
@@ -188,6 +190,26 @@ fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
             std::process::exit(1);
         }),
     }
+}
+
+fn lookup_payment_identity(
+    rpc: &str,
+    recipient_address_hex: &str,
+) -> Option<indra_crypto::PaymentPubKeyV1> {
+    let raw = rpc_call(
+        rpc,
+        "indra_getPaymentIdentity",
+        &[recipient_address_hex.to_string()],
+    );
+    payment_identity_from_rpc_json(&raw)
+}
+
+fn payment_identity_from_rpc_json(json: &str) -> Option<indra_crypto::PaymentPubKeyV1> {
+    let version = extract_number(json, "version")?;
+    let x25519_pk = hex::encode(extract_hex_string(json, "x25519_pk")?);
+    let ml_kem_1024_ek = hex::encode(extract_hex_string(json, "ml_kem_1024_ek")?);
+    let bytes = hex::decode(format!("{version:02x}{x25519_pk}{ml_kem_1024_ek}")).ok()?;
+    indra_crypto::PaymentPubKeyV1::decode(&bytes).ok()
 }
 
 fn wallet_from_utxos_json(json: &str) -> Wallet {
