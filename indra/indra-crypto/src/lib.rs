@@ -35,3 +35,21 @@ pub use mnemonic::{
 };
 pub use pedersen::{commit, verify_opening, PedersenCommitment, PedersenOpening};
 pub use vrf::{vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};
+
+/// Derive the deterministic blinding factor for a genesis validator UTXO.
+///
+/// The genesis state commits each validator's initial spendable UTXO with:
+///
+/// `SHA256("genesis-utxo-blinding" || validator_id)`
+///
+/// where `validator_id = SHA256(hybrid_classical_pk)`.
+pub fn derive_genesis_utxo_blinding(validator_id: &[u8; 32]) -> [u8; 32] {
+    sha256(&[b"genesis-utxo-blinding".as_slice(), validator_id.as_slice()].concat())
+}
+
+/// Derive the deterministic genesis UTXO blinding from a hybrid classical
+/// public key.
+pub fn derive_genesis_utxo_blinding_from_classical_pk(classical_pk: &[u8; 32]) -> [u8; 32] {
+    let validator_id = sha256(classical_pk);
+    derive_genesis_utxo_blinding(&validator_id)
+}

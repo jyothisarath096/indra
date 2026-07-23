@@ -203,8 +203,7 @@ fn derive_genesis_blinding(hybrid_seed: &[u8; 32]) -> [u8; 32] {
 
     let classical = ClassicalKeypair::from_seed(hybrid_seed);
     let classical_pk = classical.public_key().0;
-    let validator_id = indra_crypto::sha256(&classical_pk);
-    indra_crypto::sha256(&[b"genesis-utxo-blinding".as_slice(), &validator_id].concat())
+    indra_crypto::derive_genesis_utxo_blinding_from_classical_pk(&classical_pk)
 }
 
 struct RpcUtxo {

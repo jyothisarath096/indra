@@ -19,7 +19,7 @@
 use std::{ffi::c_char, panic::catch_unwind};
 
 use indra_bulletproofs::RANGE_PROOF_BYTES;
-use indra_crypto::sha256;
+use indra_crypto::{derive_genesis_utxo_blinding_from_classical_pk, sha256};
 
 pub mod errors;
 pub mod governance;
@@ -158,6 +158,19 @@ mod handle_tests {
         assert_eq!(fetched.classical_pk, public.classical_pk);
         assert_eq!(fetched.pq_pk, public.pq_pk);
         assert_eq!(fetched.vrf_pk, public.vrf_pk);
+    }
+
+    #[test]
+    fn genesis_utxo_blinding_ffi_matches_canonical_derivation() {
+        let classical_pk = [0x42u8; 32];
+        let mut out = [0u8; BYTES32_LEN];
+        let code = unsafe { indra_genesis_utxo_blinding(classical_pk.as_ptr(), out.as_mut_ptr()) };
+        let expected = derive_genesis_utxo_blinding_from_classical_pk(&classical_pk);
+        let old_ffi_formula = sha256(&[classical_pk.as_slice(), b"genesis-utxo-blinding"].concat());
+
+        assert_eq!(code, OK);
+        assert_eq!(out, expected);
+        assert_ne!(out, old_ffi_formula);
     }
 
     #[test]
@@ -1023,7 +1036,9 @@ pub unsafe extern "C" fn indra_genesis_utxo_blinding(
 
     match catch_unwind(|| {
         let classical_pk_bytes = std::slice::from_raw_parts(classical_pk, CLASSICAL_PK_BYTES);
-        let blinding = sha256(&[classical_pk_bytes, b"genesis-utxo-blinding"].concat());
+        let mut classical_pk_array = [0u8; CLASSICAL_PK_BYTES];
+        classical_pk_array.copy_from_slice(classical_pk_bytes);
+        let blinding = derive_genesis_utxo_blinding_from_classical_pk(&classical_pk_array);
         std::slice::from_raw_parts_mut(out_blinding, BYTES32_LEN).copy_from_slice(&blinding);
     }) {
         Ok(()) => IndraError::Ok.code(),
@@ -1137,6 +1152,20 @@ mod tests {
         assert_eq!(out1.classical_pk, out2.classical_pk);
         assert_eq!(out1.pq_pk, out2.pq_pk);
         assert_eq!(out1.pq_sk, out2.pq_sk);
+    }
+
+    #[test]
+    fn genesis_utxo_blinding_ffi_matches_canonical_derivation() {
+        let classical_pk = [0x42u8; 32];
+        let mut out = [0u8; BYTES32_LEN];
+        let result =
+            unsafe { indra_genesis_utxo_blinding(classical_pk.as_ptr(), out.as_mut_ptr()) };
+        let expected = derive_genesis_utxo_blinding_from_classical_pk(&classical_pk);
+        let old_ffi_formula = sha256(&[classical_pk.as_slice(), b"genesis-utxo-blinding"].concat());
+
+        assert_eq!(result, INDRA_OK);
+        assert_eq!(out, expected);
+        assert_ne!(out, old_ffi_formula);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use indra_core::types::{
     },
     transaction::OutputV1,
 };
-use indra_crypto::{commit, prove_range, sha256};
+use indra_crypto::{commit, derive_genesis_utxo_blinding, prove_range, sha256};
 use indra_state::ChainState;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -207,13 +207,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
             parse_vec_hex(v.get("hybrid_pq_pk")),
         ) {
-            let blinding = sha256(
-                &[
-                    b"genesis-utxo-blinding".as_slice(),
-                    validator_id.0.as_slice(),
-                ]
-                .concat(),
-            );
+            let blinding = derive_genesis_utxo_blinding(&validator_id.0);
             let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
             let mut rng = StdRng::from_seed(validator_id.0);
             if let Ok(proof) = prove_range(GENESIS_VALIDATOR_UTXO_SPARK, &blinding, &mut rng) {
@@ -290,6 +284,7 @@ pub fn load_genesis_seed_peers(genesis_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_crypto::derive_genesis_utxo_blinding_from_classical_pk;
 
     #[test]
     fn genesis_block_is_deterministic() {
@@ -314,5 +309,37 @@ mod tests {
     fn genesis_state_height_is_zero() {
         let s = build_genesis_state();
         assert_eq!(s.height, 0);
+    }
+
+    #[test]
+    fn genesis_utxo_blinding_opens_loaded_genesis_commitment() {
+        let classical_pk = [0x42u8; 32];
+        let validator_id = Bytes32::from(sha256(&classical_pk));
+        let pq_pk = vec![0x24u8; 2592];
+        let mut state = ChainState::new_genesis();
+        let path = std::env::temp_dir().join(format!(
+            "indra-genesis-blinding-test-{}.toml",
+            std::process::id()
+        ));
+        let contents = format!(
+            "chain_id = \"test\"\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = \"100000000000\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\n",
+            hex::encode(validator_id.0),
+            hex::encode(classical_pk),
+            hex::encode(&pq_pk),
+            hex::encode([0x11u8; 32])
+        );
+        std::fs::write(&path, contents).unwrap();
+
+        load_genesis_validators(path.to_str().unwrap(), &mut state);
+        let _ = std::fs::remove_file(&path);
+
+        let entry = state
+            .utxos
+            .all_entries()
+            .find(|entry| entry.output.owner_pubkey.classical_pk.0 == classical_pk)
+            .unwrap();
+        let blinding = derive_genesis_utxo_blinding_from_classical_pk(&classical_pk);
+        let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
+        assert_eq!(entry.output.commitment.compressed_point.0, commitment.0);
     }
 }
