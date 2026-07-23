@@ -346,6 +346,24 @@ pub fn build_register_validator_op(
     )
 }
 
+/// Build and sign a payment key registration staking operation.
+pub fn build_register_payment_key_op(
+    payment_pubkey: PaymentPubKeyV1,
+    owner_keypair: &HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    build_signed_staking_op(
+        StakingOpBody::RegisterPaymentKey {
+            owner_pubkey: hybrid_pubkey_from_keypair(owner_keypair)?,
+            payment_pubkey,
+        },
+        owner_keypair,
+        nonce,
+        chain_id,
+    )
+}
+
 /// Build and sign a delegate staking operation.
 pub fn build_delegate_op(
     validator_id: Bytes32,

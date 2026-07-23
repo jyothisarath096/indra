@@ -36,6 +36,9 @@ extern "C" {
 #define INDRA_BYTES32_LEN         32
 #define INDRA_TX_ID_BYTES         32
 #define INDRA_MNEMONIC_MAX_BYTES 300
+#define INDRA_PAYMENT_KEYPAIR_V1_BYTES 97
+#define INDRA_PAYMENT_PUBKEY_V1_BYTES 1601
+#define INDRA_PAYMENT_NOTE_V1_BYTES 1665
 
 typedef uint64_t IndraKeyHandle;
 #define INDRA_KEY_HANDLE_INVALID ((IndraKeyHandle)0)
@@ -65,6 +68,18 @@ typedef struct {
     size_t         utxo_count;
     IndraKeyHandle sender_handle;
 } IndraTxParamsV2;
+
+typedef struct {
+    const uint8_t* recipient_classical_pk;
+    uint64_t       amount_spark;
+    uint64_t       fee_spark;
+    const IndraUtxoEntry* utxos;
+    size_t         utxo_count;
+    IndraKeyHandle sender_handle;
+    /* Nullable. When non-null, points to INDRA_PAYMENT_PUBKEY_V1_BYTES bytes. */
+    const uint8_t* recipient_payment_pubkey;
+    const char*    chain_id;
+} IndraTxParamsV3;
 
 typedef struct {
     uint8_t  tx_id[INDRA_TX_ID_BYTES];
@@ -98,6 +113,21 @@ int32_t indra_key_handle_public(
     IndraPublicKeyInfo* out_public
 );
 
+int32_t indra_payment_keygen(
+    uint8_t* out_keypair,
+    uint8_t* out_pubkey
+);
+
+int32_t indra_key_handle_payment_pubkey(
+    IndraKeyHandle handle,
+    uint8_t* out_pubkey
+);
+
+int32_t indra_key_handle_payment_keypair(
+    IndraKeyHandle handle,
+    uint8_t* out_keypair
+);
+
 int32_t indra_destroy_key_handle(IndraKeyHandle handle);
 int32_t indra_destroy_all_key_handles(void);
 
@@ -113,6 +143,42 @@ int32_t indra_validator_id(
 int32_t indra_build_tx_with_handle(
     const IndraTxParamsV2* params,
     IndraTxResult* out
+);
+
+int32_t indra_build_tx_with_payment_with_handle(
+    const IndraTxParamsV3* params,
+    IndraTxResult* out
+);
+
+int32_t indra_derive_payment_note(
+    const uint8_t* recipient_payment_pubkey,
+    const uint8_t* owner_id,
+    const char* chain_id,
+    uint32_t output_index,
+    uint64_t value_spark,
+    uint64_t lock_height,
+    uint8_t* out_note,
+    uint8_t* out_blinding
+);
+
+int32_t indra_recover_payment_blinding(
+    const uint8_t* payment_keypair,
+    const uint8_t* note,
+    const char* chain_id,
+    uint32_t output_index,
+    uint64_t value_spark,
+    uint64_t lock_height,
+    uint8_t* out_blinding
+);
+
+int32_t indra_recover_payment_blinding_with_handle(
+    IndraKeyHandle handle,
+    const uint8_t* note,
+    const char* chain_id,
+    uint32_t output_index,
+    uint64_t value_spark,
+    uint64_t lock_height,
+    uint8_t* out_blinding
 );
 
 int32_t indra_tx_to_hex(
@@ -139,6 +205,15 @@ int32_t indra_build_register_validator_with_handle(
     uint64_t bond_value_spark,
     const uint8_t* bond_blinding_factor,
     IndraKeyHandle handle,
+    uint64_t nonce,
+    const char* chain_id,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_register_payment_key_with_handle(
+    IndraKeyHandle handle,
+    const uint8_t* payment_pubkey,
     uint64_t nonce,
     const char* chain_id,
     char* out_hex,

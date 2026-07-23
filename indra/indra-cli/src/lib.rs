@@ -65,5 +65,7 @@ pub use staking::{
     build_update_network_address_op, fetch_chain_id, fetch_staking_nonce, reconstruct_keypair,
     submit_staking_op,
 };
-pub use tx_builder::{build_transaction, BuiltStakingOp, BuiltTransaction, TxParams};
+pub use tx_builder::{
+    build_register_payment_key_op, build_transaction, BuiltStakingOp, BuiltTransaction, TxParams,
+};
 pub use wallet::{PendingChange, Wallet, WalletEntry};

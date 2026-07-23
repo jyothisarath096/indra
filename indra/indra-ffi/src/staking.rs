@@ -6,17 +6,21 @@ use std::{
 };
 
 use indra_cli::tx_builder::{
-    build_claim_rewards_op, build_delegate_op, build_register_validator_op, build_self_stake_op,
-    build_self_unstake_op, build_set_auto_delegate_op, build_set_commission_op,
-    build_undelegate_op,
+    build_claim_rewards_op, build_delegate_op, build_register_payment_key_op,
+    build_register_validator_op, build_self_stake_op, build_self_unstake_op,
+    build_set_auto_delegate_op, build_set_commission_op, build_undelegate_op,
 };
 use indra_core::types::primitives::Bytes32;
 use indra_core::types::staking::StakingBondProof;
 use indra_crypto::hybrid::HybridKeypair;
 #[cfg(feature = "legacy_raw_keys")]
 use indra_crypto::hybrid::{ClassicalKeypair, PqKeypair};
+use indra_crypto::PaymentPubKeyV1;
 
-use crate::{bounded_cstr, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES};
+use crate::{
+    bounded_cstr, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES,
+    PAYMENT_PUBKEY_V1_BYTES,
+};
 #[cfg(feature = "legacy_raw_keys")]
 use crate::{CLASSICAL_SK_BYTES, PQ_PK_BYTES, PQ_SK_BYTES};
 
@@ -261,6 +265,45 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
             let proof = read_staking_bond_proof(bond_value_spark, bond_blinding_factor);
             let vrf = handles::public_info(handle)?.vrf_pk;
             build_register_validator_op(commission_bps, bond, proof, keypair, vrf, nonce, chain)
+                .map(|built| built.op_hex)
+                .map_err(IndraError::from)
+        },
+    )
+}
+
+/// Build and sign a RegisterPaymentKey staking operation using an opaque handle.
+///
+/// # Safety
+///
+/// `payment_pubkey` must reference `INDRA_PAYMENT_PUBKEY_V1_BYTES` readable
+/// bytes. `chain_id` must be a valid null-terminated UTF-8 string. `out_hex`
+/// must point to a writable buffer of length `out_len`.
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_register_payment_key_with_handle(
+    handle: IndraKeyHandle,
+    payment_pubkey: *const u8,
+    nonce: u64,
+    chain_id: *const c_char,
+    out_hex: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if payment_pubkey.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    build_with_handle(
+        StakingHandleArgs {
+            handle,
+            nonce,
+            chain_id,
+            out_hex,
+            out_len,
+        },
+        |keypair, _validator_id, nonce, chain| {
+            let payment_pubkey_bytes =
+                std::slice::from_raw_parts(payment_pubkey, PAYMENT_PUBKEY_V1_BYTES);
+            let payment_pubkey = PaymentPubKeyV1::decode(payment_pubkey_bytes)
+                .map_err(|_| IndraError::InvalidParam)?;
+            build_register_payment_key_op(payment_pubkey, keypair, nonce, chain)
                 .map(|built| built.op_hex)
                 .map_err(IndraError::from)
         },

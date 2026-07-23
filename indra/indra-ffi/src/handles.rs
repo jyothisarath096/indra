@@ -13,6 +13,7 @@ use std::{
 
 use indra_cli::KeysFile;
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::{PaymentKeypairV1, PaymentPubKeyV1};
 use zeroize::Zeroize;
 
 use crate::{
@@ -65,6 +66,7 @@ struct StoredKeyMaterial {
     pq_sk: [u8; PQ_SK_BYTES],
     bls_seed: [u8; BYTES32_LEN],
     vrf_seed: [u8; BYTES32_LEN],
+    payment_keypair: PaymentKeypairV1,
 }
 
 impl StoredKeyMaterial {
@@ -76,6 +78,10 @@ impl StoredKeyMaterial {
         pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
         let mut pq_sk = [0u8; PQ_SK_BYTES];
         pq_sk.copy_from_slice(&keys.pq_sk);
+        let payment_keypair = keys
+            .payment_keypair
+            .clone()
+            .ok_or(IndraError::KeygenFailed)?;
         Ok(Self {
             public: IndraPublicKeyInfo {
                 validator_id: keys.public.validator_id,
@@ -87,6 +93,7 @@ impl StoredKeyMaterial {
             pq_sk,
             bls_seed: keys.bls_seed,
             vrf_seed: keys.vrf_seed,
+            payment_keypair,
         })
     }
 
@@ -97,6 +104,10 @@ impl StoredKeyMaterial {
             pq_sk: self.pq_sk,
         }
     }
+
+    fn payment_keypair(&self) -> PaymentKeypairV1 {
+        self.payment_keypair.clone()
+    }
 }
 
 impl Drop for StoredKeyMaterial {
@@ -105,6 +116,8 @@ impl Drop for StoredKeyMaterial {
         self.pq_sk.zeroize();
         self.bls_seed.zeroize();
         self.vrf_seed.zeroize();
+        self.payment_keypair.x25519_sk.zeroize();
+        self.payment_keypair.ml_kem_1024_seed.zeroize();
     }
 }
 
@@ -169,6 +182,22 @@ pub(crate) fn signing_material(handle: IndraKeyHandle) -> Result<SigningMaterial
         .entries
         .get(&handle)
         .map(StoredKeyMaterial::signing_material)
+        .ok_or(IndraError::InvalidHandle)
+}
+
+pub(crate) fn payment_pubkey(handle: IndraKeyHandle) -> Result<PaymentPubKeyV1, IndraError> {
+    payment_keypair(handle).map(|keypair| keypair.public_key())
+}
+
+pub(crate) fn payment_keypair(handle: IndraKeyHandle) -> Result<PaymentKeypairV1, IndraError> {
+    if handle == INDRA_KEY_HANDLE_INVALID {
+        return Err(IndraError::InvalidHandle);
+    }
+    let guard = registry().lock().map_err(|_| IndraError::Internal)?;
+    guard
+        .entries
+        .get(&handle)
+        .map(StoredKeyMaterial::payment_keypair)
         .ok_or(IndraError::InvalidHandle)
 }
 

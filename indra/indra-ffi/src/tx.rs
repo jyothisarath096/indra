@@ -1,5 +1,6 @@
 use indra_cli::{build_transaction, TxParams};
 use indra_core::{codec::Decode, types::transaction::TransactionV1};
+use indra_crypto::PaymentPubKeyV1;
 
 use crate::{errors::IndraError, wallet::WalletContext};
 
@@ -21,9 +22,32 @@ pub fn build(
     sender_pq_sk: &[u8],
     wallet_context: WalletContext,
 ) -> Result<BuiltTxOwned, IndraError> {
+    build_with_payment(
+        recipient_classical_pk,
+        amount_spark,
+        fee_spark,
+        sender_classical_seed,
+        sender_pq_sk,
+        indra_core::types::primitives::DEFAULT_CHAIN_ID,
+        None,
+        wallet_context,
+    )
+}
+
+/// Build and sign an INDRA transaction, optionally deriving a payment note.
+pub fn build_with_payment(
+    recipient_classical_pk: [u8; 32],
+    amount_spark: u64,
+    fee_spark: u64,
+    sender_classical_seed: [u8; 32],
+    sender_pq_sk: &[u8],
+    chain_id: &str,
+    recipient_payment_pubkey: Option<PaymentPubKeyV1>,
+    wallet_context: WalletContext,
+) -> Result<BuiltTxOwned, IndraError> {
     let recipient_pubkey_hex = hex::encode(recipient_classical_pk);
     let mut params = TxParams {
-        chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
+        chain_id,
         recipient_pubkey_hex: &recipient_pubkey_hex,
         amount_spark,
         fee_spark,
@@ -31,7 +55,7 @@ pub fn build(
         hybrid_seed: sender_classical_seed,
         pq_sk_bytes: sender_pq_sk.to_vec(),
         sender_pubkey: wallet_context.sender_pubkey,
-        recipient_payment_pubkey: None,
+        recipient_payment_pubkey,
     };
 
     let built = match build_transaction(&params) {
