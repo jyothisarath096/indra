@@ -152,6 +152,12 @@ fn main() {
         "  Classical PK:     {}",
         hex::encode(keys.public.hybrid_classical_pk)
     );
+    if let Some(payment_pubkey) = &keys.public.payment_pubkey {
+        println!(
+            "  Payment PK:       {}",
+            hex::encode(payment_pubkey.encode())
+        );
+    }
     println!("  Keys written to:  {}", output);
     if !plaintext_unsafe {
         println!("  Storage:          encrypted at rest");
@@ -258,6 +264,11 @@ fn cmd_inspect(args: &[String]) {
     println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
     println!("BLS PK:         {}", hex::encode(public.bls_pk));
     println!("VRF PK:         {}", hex::encode(public.vrf_pk));
+    if let Some(payment_pubkey) = &public.payment_pubkey {
+        println!("Payment PK:     {}", hex::encode(payment_pubkey.encode()));
+    } else {
+        println!("Payment PK:     <absent>");
+    }
 }
 
 fn get(args: &[String], flag: &str) -> Option<String> {

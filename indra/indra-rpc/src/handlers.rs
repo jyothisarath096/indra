@@ -4,6 +4,7 @@
 //! the node state, and returns a JSON string result or an RpcError.
 
 use indra_core::{
+    codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{SCHEMA_VERSION, SCHEMA_VERSION_GENESIS},
     types::{
@@ -311,6 +312,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getChainInfo", RpcMethodAccess::ReadOnly),
     ("indra_getMempoolSize", RpcMethodAccess::ReadOnly),
     ("indra_getBlock", RpcMethodAccess::ReadOnly),
+    ("indra_getTransaction", RpcMethodAccess::ReadOnly),
     ("indra_getLegacyScanChallenge", RpcMethodAccess::ReadOnly),
     (
         "indra_getLegacyBalanceAuthorized",
@@ -445,6 +447,7 @@ pub fn dispatch_with_admin(
         "indra_getChainInfo" => Ready(get_chain_info(state)),
         "indra_getMempoolSize" => Ready(get_mempool_size(state)),
         "indra_getBlock" => Ready(get_block(params, state)),
+        "indra_getTransaction" => Ready(get_transaction(params, state)),
         "indra_getLegacyScanChallenge" => Ready(get_legacy_scan_challenge(params, state)),
         "indra_getLegacyBalanceAuthorized" => Ready(get_legacy_balance_authorized(params, state)),
         "indra_getLegacyUtxosAuthorized" => Ready(get_legacy_utxos_authorized(params, state)),
@@ -649,6 +652,61 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 
     match state.engine.get_block_by_height(height) {
         Ok(Some(block)) => Ok(block_rpc_json(&block)),
+        Ok(None) => Err(RpcError::NotFound(format!(
+            "block {height} is not available in this node's retained block log"
+        ))),
+        Err(error) => Err(RpcError::Internal(format!(
+            "failed to read block {height}: {error}"
+        ))),
+    }
+}
+
+/// `indra_getTransaction` — returns a canonical transaction by block position.
+///
+/// Params: `[<height: number>, <tx_index: number>]`
+/// Result: retained transaction bytes as hex, plus its block position.
+fn get_transaction(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    if params.len() != 2 {
+        return Err(RpcError::InvalidParams(
+            "expected [height, tx_index]".to_string(),
+        ));
+    }
+    let height_str = &params[0];
+    let tx_index_str = &params[1];
+    let height: u64 = unquote(height_str)
+        .parse()
+        .map_err(|_| RpcError::InvalidParams(format!("invalid height: {height_str}")))?;
+    let tx_index: usize = unquote(tx_index_str)
+        .parse()
+        .map_err(|_| RpcError::InvalidParams(format!("invalid tx_index: {tx_index_str}")))?;
+
+    if height < state.lowest_block {
+        return Err(RpcError::NotFound(format!(
+            "block {height} is below the local retention window; lowest available block is {}. Use an archive node for historical queries.",
+            state.lowest_block
+        )));
+    }
+    if height > state.chain.height {
+        return Err(RpcError::NotFound(format!(
+            "block {height} exceeds current tip {}",
+            state.chain.height
+        )));
+    }
+
+    match state.engine.get_block_by_height(height) {
+        Ok(Some(block)) => {
+            let tx = block.transactions.get(tx_index).ok_or_else(|| {
+                RpcError::NotFound(format!(
+                    "transaction {tx_index} not found in block {height}"
+                ))
+            })?;
+            Ok(format!(
+                r#"{{"height":{},"tx_index":{},"tx_hex":"{}"}}"#,
+                height,
+                tx_index,
+                hex::encode(tx.encode_to_vec())
+            ))
+        }
         Ok(None) => Err(RpcError::NotFound(format!(
             "block {height} is not available in this node's retained block log"
         ))),
@@ -2209,6 +2267,28 @@ mod tests {
         }
     }
 
+    fn block_with_transaction() -> BlockBackedEngine {
+        let mut engine = block_backed_engine();
+        let tx = TransactionV1 {
+            version: ProtocolVersion::CURRENT,
+            signature_module_id: 1,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            payment_notes: Vec::new(),
+            fee_amount: 50_000,
+            fee_blinding: Bytes32::from([0x44; 32]),
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::from([0x45; 32]),
+            },
+            signature: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[0x46; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0x47; 32]).unwrap(),
+            },
+        };
+        engine.blocks.get_mut(&1).unwrap().transactions.push(tx);
+        engine
+    }
+
     fn test_pubkey(byte: u8) -> HybridPubKey {
         HybridPubKey {
             classical_pk: Bytes32::from([byte; 32]),
@@ -2362,6 +2442,22 @@ mod tests {
             }
             other => panic!("expected above-tip NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn get_transaction_returns_canonical_transaction_hex() {
+        assert!(rpc_method_is_read_only("indra_getTransaction"));
+        assert_eq!(
+            crate::server::rpc_method_cost("indra_getTransaction"),
+            crate::server::RpcMethodCost::Cheap
+        );
+        let engine = block_with_transaction();
+        let state = NodeState::read_only(&engine);
+        let result = get_transaction(&["1".to_string(), "0".to_string()], &state).unwrap();
+        let expected = hex::encode(engine.blocks[&1].transactions[0].encode_to_vec());
+        assert!(result.contains(r#""height":1"#), "{result}");
+        assert!(result.contains(r#""tx_index":0"#), "{result}");
+        assert!(result.contains(&format!(r#""tx_hex":"{expected}""#)));
     }
 
     #[test]

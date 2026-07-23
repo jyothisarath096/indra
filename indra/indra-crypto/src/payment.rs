@@ -97,7 +97,7 @@ impl PaymentPubKeyV1 {
 }
 
 /// Payment private keypair, version 1.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentKeypairV1 {
     /// Must be 1.
     pub version: u8,

@@ -28,6 +28,10 @@ pub struct DerivedSeeds {
     pub vrf_seed: [u8; 32],
     /// BLS keypair seed (for compatibility).
     pub bls_seed: [u8; 32],
+    /// Payment X25519 key seed.
+    pub payment_x25519_seed: [u8; 32],
+    /// Payment ML-KEM-1024 key seed.
+    pub payment_ml_kem_seed: [u8; 64],
 }
 
 /// Generate a new random 24-word BIP-39 mnemonic phrase.
@@ -56,11 +60,19 @@ pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
     let hybrid_seed = derive_seed(master_seed, b"indra-hybrid-v1");
     let vrf_seed = derive_seed(master_seed, b"indra-vrf-v1");
     let bls_seed = derive_seed(master_seed, b"indra-bls-v1");
+    let payment_x25519_seed = derive_seed(master_seed, b"indra-payment-x25519-v1");
+    let mut payment_ml_kem_seed = [0u8; 64];
+    payment_ml_kem_seed[..32]
+        .copy_from_slice(&derive_seed(master_seed, b"indra-payment-ml-kem-v1:0"));
+    payment_ml_kem_seed[32..]
+        .copy_from_slice(&derive_seed(master_seed, b"indra-payment-ml-kem-v1:1"));
     DerivedSeeds {
         master_seed: *master_seed,
         hybrid_seed,
         vrf_seed,
         bls_seed,
+        payment_x25519_seed,
+        payment_ml_kem_seed,
     }
 }
 
@@ -114,6 +126,8 @@ mod tests {
         assert_eq!(derived1.hybrid_seed, derived2.hybrid_seed);
         assert_eq!(derived1.vrf_seed, derived2.vrf_seed);
         assert_eq!(derived1.bls_seed, derived2.bls_seed);
+        assert_eq!(derived1.payment_x25519_seed, derived2.payment_x25519_seed);
+        assert_eq!(derived1.payment_ml_kem_seed, derived2.payment_ml_kem_seed);
     }
 
     #[test]
@@ -156,6 +170,8 @@ mod tests {
         assert_ne!(derived.hybrid_seed, derived.vrf_seed);
         assert_ne!(derived.hybrid_seed, derived.bls_seed);
         assert_ne!(derived.vrf_seed, derived.bls_seed);
+        assert_ne!(derived.hybrid_seed, derived.payment_x25519_seed);
+        assert_ne!(derived.vrf_seed, derived.payment_x25519_seed);
     }
 
     #[test]
