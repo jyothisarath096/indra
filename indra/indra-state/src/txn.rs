@@ -522,7 +522,9 @@ pub(crate) fn timing() -> StateTxnTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validator::DelegatorEntry;
     use indra_core::{
+        codec::Encode,
         types::{crypto::HybridPubKey, primitives::VariableBytes},
         CommitmentV1,
     };
@@ -597,5 +599,60 @@ mod tests {
             .staking_nonces
             .get(&Bytes32::from([0x22; 32]))
             .is_none());
+    }
+
+    #[test]
+    fn delegation_side_index_restores_through_staking_scope_rollback() {
+        let validator_id = Bytes32::from([0xA1; 32]);
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        let added_delegator_id = Bytes32::from([0xD2; 32]);
+        let mut state = ChainState::new_genesis();
+        state.delegations.push_delegator_for_test(
+            validator_id,
+            DelegatorEntry {
+                delegator_id,
+                staked_spark: 1_000,
+                pending_rewards: 7,
+                rewards_last_epoch: 3,
+                unbonding_end_epoch: None,
+            },
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id),
+            7
+        );
+        let original = state.clone();
+
+        set_fail_after_mutation(Some(1));
+        {
+            let mut txn = StateTxn::begin(&mut state, 1);
+            txn.snapshot_staking_scope();
+            txn.state_mut()
+                .delegations
+                .add_delegation(validator_id, added_delegator_id, 500, 4)
+                .unwrap();
+            assert!(txn.after_mutation().is_err());
+        }
+        set_fail_after_mutation(None);
+
+        assert_eq!(state, original);
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id),
+            7
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &added_delegator_id),
+            0
+        );
+        assert_eq!(
+            state.delegations.encode_to_vec(),
+            original.delegations.encode_to_vec()
+        );
     }
 }

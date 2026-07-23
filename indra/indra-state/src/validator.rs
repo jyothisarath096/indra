@@ -3,7 +3,7 @@
 //! Tracks each validator's stake, status, and accumulated reward.
 //! The validator set is snapshotted at each epoch boundary.
 
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap, fmt};
 
 use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
@@ -1818,7 +1818,6 @@ impl DelegatorEntry {
 /// Maps validator_id → list of delegator entries for that validator.
 ///
 /// Stored separately from ValidatorSet to keep validator lookups fast.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationMap {
     /// Inner map: validator_id → delegators.
     ///
@@ -1826,7 +1825,44 @@ pub struct DelegationMap {
     /// untouched validator delegation lists. The inner Vec deliberately stays
     /// unchanged because insertion order is consensus-visible in encoding.
     delegators: PersistentOrdMap<Bytes32, Vec<DelegatorEntry>>,
+    /// Non-canonical side index: validator_id → delegator_id → Vec position.
+    ///
+    /// This is a rebuildable cache only. It is deliberately excluded from
+    /// encoding, equality, and state roots; the canonical Vec remains the sole
+    /// consensus-visible source of truth.
+    delegator_index: RefCell<Option<PersistentOrdMap<Bytes32, PersistentOrdMap<Bytes32, usize>>>>,
 }
+
+impl fmt::Debug for DelegationMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DelegationMap")
+            .field("delegators", &self.delegators)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for DelegationMap {
+    fn clone(&self) -> Self {
+        Self {
+            delegators: self.delegators.clone(),
+            delegator_index: RefCell::new(self.delegator_index.borrow().clone()),
+        }
+    }
+}
+
+impl Default for DelegationMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for DelegationMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.delegators == other.delegators
+    }
+}
+
+impl Eq for DelegationMap {}
 
 impl Encode for DelegationMap {
     fn encode(&self, buf: &mut Vec<u8>) {
@@ -1876,15 +1912,20 @@ impl Decode for DelegationMap {
             )?;
             delegators.insert(validator_id, entries);
         }
-        Ok(Self { delegators })
+        Ok(Self::from_delegators(delegators))
     }
 }
 
 impl DelegationMap {
     /// Create an empty delegation map.
     pub fn new() -> Self {
+        Self::from_delegators(PersistentOrdMap::new())
+    }
+
+    fn from_delegators(delegators: PersistentOrdMap<Bytes32, Vec<DelegatorEntry>>) -> Self {
         Self {
-            delegators: PersistentOrdMap::new(),
+            delegators,
+            delegator_index: RefCell::new(None),
         }
     }
 
@@ -1920,7 +1961,7 @@ impl DelegationMap {
             }
             delegators.insert(validator_id, entries);
         }
-        Ok(Self { delegators })
+        Ok(Self::from_delegators(delegators))
     }
 
     /// Total delegated stake for a given validator in Spark.
@@ -1968,6 +2009,7 @@ impl DelegationMap {
             .cloned()
             .unwrap_or_default();
         entries.push(entry);
+        self.update_index_for_validator(&validator_id, &entries);
         self.delegators.insert(validator_id, entries);
     }
 
@@ -1979,10 +2021,12 @@ impl DelegationMap {
         f: impl FnOnce(&mut DelegatorEntry) -> R,
     ) -> Option<R> {
         let mut entries = self.delegators.get(validator_id)?.clone();
+        let position = self.delegator_position(validator_id, delegator_id)?;
         let result = {
-            let entry = entries
-                .iter_mut()
-                .find(|d| &d.delegator_id == delegator_id)?;
+            let entry = entries.get_mut(position)?;
+            if &entry.delegator_id != delegator_id {
+                return None;
+            }
             f(entry)
         };
         self.delegators.insert(*validator_id, entries);
@@ -1994,17 +2038,18 @@ impl DelegationMap {
         self.delegators
             .get(validator_id)
             .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|d| &d.delegator_id == delegator_id)
-                    .map(|d| d.pending_rewards)
+                self.delegator_position(validator_id, delegator_id)
+                    .and_then(|position| entries.get(position))
             })
+            .filter(|entry| &entry.delegator_id == delegator_id)
+            .map(|entry| entry.pending_rewards)
             .unwrap_or(0)
     }
 
     /// Remove all delegation entries for a validator, returning them for
     /// immediate principal/reward settlement.
     pub fn take_delegators(&mut self, validator_id: &Bytes32) -> Vec<DelegatorEntry> {
+        self.remove_index_for_validator(validator_id);
         self.delegators.remove(validator_id).unwrap_or_default()
     }
 
@@ -2016,7 +2061,9 @@ impl DelegationMap {
         entries.retain(|d| &d.delegator_id != delegator_id);
         if entries.is_empty() {
             self.delegators.remove(validator_id);
+            self.remove_index_for_validator(validator_id);
         } else {
+            self.update_index_for_validator(validator_id, &entries);
             self.delegators.insert(*validator_id, entries);
         }
     }
@@ -2034,7 +2081,13 @@ impl DelegationMap {
             .get(&validator_id)
             .cloned()
             .unwrap_or_default();
-        if let Some(existing) = entries.iter_mut().find(|d| d.delegator_id == delegator_id) {
+        if let Some(position) = self.delegator_position(&validator_id, &delegator_id) {
+            let Some(existing) = entries.get_mut(position) else {
+                return Err("delegator index out of bounds");
+            };
+            if existing.delegator_id != delegator_id {
+                return Err("delegator index mismatch");
+            }
             existing.staked_spark = existing.staked_spark.saturating_add(amount_spark);
         } else {
             if entries.len() >= MAX_DELEGATORS_PER_VALIDATOR {
@@ -2047,6 +2100,7 @@ impl DelegationMap {
                 rewards_last_epoch: current_epoch,
                 unbonding_end_epoch: None,
             });
+            self.update_index_for_validator(&validator_id, &entries);
         }
         self.delegators.insert(validator_id, entries);
         Ok(())
@@ -2065,10 +2119,13 @@ impl DelegationMap {
             .get(validator_id)
             .cloned()
             .ok_or("validator has no delegators")?;
-        let entry = entries
-            .iter_mut()
-            .find(|d| &d.delegator_id == delegator_id)
+        let position = self
+            .delegator_position(validator_id, delegator_id)
             .ok_or("delegator not found")?;
+        let entry = entries.get_mut(position).ok_or("delegator not found")?;
+        if &entry.delegator_id != delegator_id {
+            return Err("delegator index mismatch");
+        }
         if entry.is_unbonding() {
             return Err("already unbonding");
         }
@@ -2105,7 +2162,9 @@ impl DelegationMap {
             });
             if entries.is_empty() {
                 self.delegators.remove(&validator_id);
+                self.remove_index_for_validator(&validator_id);
             } else {
+                self.update_index_for_validator(&validator_id, &entries);
                 self.delegators.insert(validator_id, entries);
             }
         }
@@ -2172,12 +2231,67 @@ impl DelegationMap {
 
         pool.saturating_sub(distributed) // remainder back to treasury
     }
+
+    fn delegator_position(&self, validator_id: &Bytes32, delegator_id: &Bytes32) -> Option<usize> {
+        if self.delegator_index.borrow().is_none() {
+            self.rebuild_delegator_index();
+        }
+        self.delegator_index
+            .borrow()
+            .as_ref()
+            .and_then(|index| index.get(validator_id))
+            .and_then(|validator_index| validator_index.get(delegator_id))
+            .copied()
+    }
+
+    fn rebuild_delegator_index(&self) {
+        let mut index = PersistentOrdMap::new();
+        for (validator_id, entries) in self.delegators.iter() {
+            let validator_index = Self::build_validator_index(entries);
+            if !validator_index.is_empty() {
+                index.insert(*validator_id, validator_index);
+            }
+        }
+        *self.delegator_index.borrow_mut() = Some(index);
+    }
+
+    fn build_validator_index(entries: &[DelegatorEntry]) -> PersistentOrdMap<Bytes32, usize> {
+        let mut validator_index = PersistentOrdMap::new();
+        for (position, entry) in entries.iter().enumerate() {
+            if !validator_index.contains_key(&entry.delegator_id) {
+                validator_index.insert(entry.delegator_id, position);
+            }
+        }
+        validator_index
+    }
+
+    fn update_index_for_validator(&self, validator_id: &Bytes32, entries: &[DelegatorEntry]) {
+        let mut index = self.delegator_index.borrow_mut();
+        if let Some(index) = index.as_mut() {
+            if entries.is_empty() {
+                index.remove(validator_id);
+            } else {
+                index.insert(*validator_id, Self::build_validator_index(entries));
+            }
+        }
+    }
+
+    fn remove_index_for_validator(&self, validator_id: &Bytes32) {
+        if let Some(index) = self.delegator_index.borrow_mut().as_mut() {
+            index.remove(validator_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_delegator_index_for_test(&self) {
+        *self.delegator_index.borrow_mut() = None;
+    }
 }
 
 #[cfg(test)]
 mod delegation_map_tests {
     use super::*;
-    use std::{env, time::Instant};
+    use std::{env, hint::black_box, time::Instant};
 
     fn test_id(domain: u8, index: usize) -> Bytes32 {
         let mut bytes = [0u8; 32];
@@ -2200,7 +2314,7 @@ mod delegation_map_tests {
         let mut delegators = PersistentOrdMap::new();
         let entries = (0..count).map(delegator_entry).collect();
         delegators.insert(validator_id, entries);
-        DelegationMap { delegators }
+        DelegationMap::from_delegators(delegators)
     }
 
     fn encode_legacy_btreemap(map: &BTreeMap<Bytes32, Vec<DelegatorEntry>>) -> Vec<u8> {
@@ -2239,9 +2353,7 @@ mod delegation_map_tests {
             remaining -= count;
         }
         (
-            DelegationMap {
-                delegators: persistent,
-            },
+            DelegationMap::from_delegators(persistent),
             legacy,
             validator_count,
         )
@@ -2300,6 +2412,71 @@ mod delegation_map_tests {
         Ok(())
     }
 
+    fn legacy_get_delegator_reward(
+        map: &BTreeMap<Bytes32, Vec<DelegatorEntry>>,
+        validator_id: &Bytes32,
+        delegator_id: &Bytes32,
+    ) -> u64 {
+        map.get(validator_id)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| &entry.delegator_id == delegator_id)
+            })
+            .map(|entry| entry.pending_rewards)
+            .unwrap_or(0)
+    }
+
+    fn legacy_update_delegator<R>(
+        map: &mut BTreeMap<Bytes32, Vec<DelegatorEntry>>,
+        validator_id: &Bytes32,
+        delegator_id: &Bytes32,
+        f: impl FnOnce(&mut DelegatorEntry) -> R,
+    ) -> Option<R> {
+        let entry = map
+            .get_mut(validator_id)?
+            .iter_mut()
+            .find(|entry| &entry.delegator_id == delegator_id)?;
+        Some(f(entry))
+    }
+
+    fn legacy_remove_virtual_delegation(
+        map: &mut BTreeMap<Bytes32, Vec<DelegatorEntry>>,
+        validator_id: &Bytes32,
+        delegator_id: &Bytes32,
+    ) {
+        let Some(entries) = map.get_mut(validator_id) else {
+            return;
+        };
+        entries.retain(|entry| &entry.delegator_id != delegator_id);
+        if entries.is_empty() {
+            map.remove(validator_id);
+        }
+    }
+
+    fn legacy_take_delegators(
+        map: &mut BTreeMap<Bytes32, Vec<DelegatorEntry>>,
+        validator_id: &Bytes32,
+    ) -> Vec<DelegatorEntry> {
+        map.remove(validator_id).unwrap_or_default()
+    }
+
+    fn linear_scan_reward(
+        map: &DelegationMap,
+        validator_id: &Bytes32,
+        delegator_id: &Bytes32,
+    ) -> u64 {
+        map.delegators
+            .get(validator_id)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| &entry.delegator_id == delegator_id)
+            })
+            .map(|entry| entry.pending_rewards)
+            .unwrap_or(0)
+    }
+
     #[test]
     fn delegation_map_persistent_encoding_matches_legacy_btreemap() {
         for total in [0usize, 3, 11] {
@@ -2310,6 +2487,132 @@ mod delegation_map_tests {
                 map
             );
         }
+    }
+
+    #[test]
+    fn delegation_side_index_matches_legacy_linear_scan_behavior_byte_for_byte() {
+        let validator_id = test_id(0xA0, 0);
+        let target_id = test_id(0xD0, 9);
+        let remove_id = test_id(0xD0, 3);
+        let take_validator_id = test_id(0xA0, 1);
+        let (mut indexed, mut legacy, _) = build_maps(32);
+        legacy_add_delegation(&mut legacy, take_validator_id, test_id(0xE0, 1), 7_000, 2).unwrap();
+        indexed
+            .add_delegation(take_validator_id, test_id(0xE0, 1), 7_000, 2)
+            .unwrap();
+
+        indexed
+            .update_delegator(&validator_id, &target_id, |entry| {
+                entry.pending_rewards = 55;
+                entry.rewards_last_epoch = 8;
+            })
+            .unwrap();
+        legacy_update_delegator(&mut legacy, &validator_id, &target_id, |entry| {
+            entry.pending_rewards = 55;
+            entry.rewards_last_epoch = 8;
+        })
+        .unwrap();
+        assert_eq!(
+            indexed.get_delegator_reward(&validator_id, &target_id),
+            legacy_get_delegator_reward(&legacy, &validator_id, &target_id)
+        );
+
+        indexed
+            .add_delegation(validator_id, target_id, 123, 9)
+            .unwrap();
+        legacy_add_delegation(&mut legacy, validator_id, target_id, 123, 9).unwrap();
+        indexed
+            .begin_undelegate(&validator_id, &target_id, 100, 44)
+            .unwrap();
+        legacy_begin_undelegate(&mut legacy, &validator_id, &target_id, 100, 44).unwrap();
+        indexed.remove_virtual_delegation(&validator_id, &remove_id);
+        legacy_remove_virtual_delegation(&mut legacy, &validator_id, &remove_id);
+        let indexed_taken = indexed.take_delegators(&take_validator_id);
+        let legacy_taken = legacy_take_delegators(&mut legacy, &take_validator_id);
+
+        assert_eq!(indexed_taken, legacy_taken);
+        assert_eq!(indexed.encode_to_vec(), encode_legacy_btreemap(&legacy));
+        assert_eq!(
+            indexed.get_delegators(&validator_id),
+            legacy.get(&validator_id).unwrap().as_slice()
+        );
+    }
+
+    #[test]
+    fn delegation_side_index_is_rebuildable_and_query_order_independent() {
+        let validator_id = test_id(0xA0, 0);
+        let mut map = map_with_delegator_count(validator_id, 128);
+        for index in 0..128 {
+            let delegator_id = test_id(0xD0, index);
+            map.update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = index as u64;
+            })
+            .unwrap();
+        }
+        let encoded = map.encode_to_vec();
+
+        map.invalidate_delegator_index_for_test();
+        let forward: Vec<_> = (0..128)
+            .map(|index| map.get_delegator_reward(&validator_id, &test_id(0xD0, index)))
+            .collect();
+
+        map.invalidate_delegator_index_for_test();
+        let mut reverse: Vec<_> = (0..128)
+            .rev()
+            .map(|index| map.get_delegator_reward(&validator_id, &test_id(0xD0, index)))
+            .collect();
+        reverse.reverse();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(map.encode_to_vec(), encoded);
+    }
+
+    #[test]
+    fn delegation_side_index_is_excluded_from_canonical_encoding() {
+        let validator_id = test_id(0xA0, 0);
+        let map = map_with_delegator_count(validator_id, 16);
+        let before = map.encode_to_vec();
+        assert_eq!(
+            map.get_delegator_reward(&validator_id, &test_id(0xD0, 15)),
+            0
+        );
+        let after = map.encode_to_vec();
+        assert_eq!(after, before);
+        let decoded = DelegationMap::decode_exact(&after).unwrap();
+        assert_eq!(decoded.encode_to_vec(), before);
+    }
+
+    #[test]
+    fn delegation_side_index_lookup_is_faster_than_linear_scan_at_validator_cap() {
+        let validator_id = test_id(0xA0, 0);
+        let delegator_id = test_id(0xD0, MAX_DELEGATORS_PER_VALIDATOR - 1);
+        let map = map_with_delegator_count(validator_id, MAX_DELEGATORS_PER_VALIDATOR);
+        map.get_delegator_reward(&validator_id, &delegator_id);
+
+        let scan_start = Instant::now();
+        for _ in 0..64 {
+            black_box(linear_scan_reward(
+                black_box(&map),
+                black_box(&validator_id),
+                black_box(&delegator_id),
+            ));
+        }
+        let scan_elapsed = scan_start.elapsed();
+
+        let indexed_start = Instant::now();
+        for _ in 0..64 {
+            black_box(map.get_delegator_reward(black_box(&validator_id), black_box(&delegator_id)));
+        }
+        let indexed_elapsed = indexed_start.elapsed();
+
+        assert!(
+            indexed_elapsed < scan_elapsed,
+            "indexed lookup should beat worst-case linear scan at cap: indexed={indexed_elapsed:?} scan={scan_elapsed:?}"
+        );
+        println!(
+            "delegation_side_index_lookup cap={} repeated=64 indexed={indexed_elapsed:?} linear_scan={scan_elapsed:?}",
+            MAX_DELEGATORS_PER_VALIDATOR
+        );
     }
 
     #[test]

@@ -2390,6 +2390,60 @@ mod tests {
     }
 
     #[test]
+    fn delegation_side_index_replay_determinism_independent_of_cache_state() {
+        let mut base = ChainState::new_genesis();
+        let (delegator_pubkey, keypair) = make_test_keypair([0x75; 32]);
+        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
+        let output = dummy_output(0x0A, delegator_pubkey.clone());
+        let bond_utxo_id = base.utxos.insert(output, 0, 0, 0).unwrap();
+        let validator_id = Bytes32::from([0x76; 32]);
+        base.validators
+            .upsert(active_validator(validator_id))
+            .unwrap();
+
+        let delegate_op = signed_delegate_op(
+            &base,
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey.clone(),
+            &keypair,
+            1,
+        );
+        let mut delegate_block = make_block(&base, vec![]);
+        delegate_block.staking_ops.push(delegate_op);
+
+        let mut cache_cold = base.clone();
+        let mut cache_warm = base.clone();
+        apply_block(&mut cache_cold, &delegate_block, 0).unwrap();
+        apply_block(&mut cache_warm, &delegate_block, 0).unwrap();
+        assert_same_consensus_state(&cache_cold, &cache_warm);
+
+        cache_cold.delegations.invalidate_delegator_index_for_test();
+        assert_eq!(
+            cache_warm
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id),
+            0
+        );
+
+        let undelegate_op = signed_undelegate_op(
+            &cache_warm,
+            validator_id,
+            bond_utxo_id,
+            delegator_pubkey,
+            &keypair,
+            2,
+        );
+        let mut undelegate_block = make_block(&cache_warm, vec![]);
+        undelegate_block.staking_ops.push(undelegate_op);
+
+        apply_block(&mut cache_cold, &undelegate_block, 0).unwrap();
+        apply_block(&mut cache_warm, &undelegate_block, 0).unwrap();
+
+        assert_same_consensus_state(&cache_cold, &cache_warm);
+    }
+
+    #[test]
     fn state_txn_rolls_back_delegate_identity_registry_population_failpoints() {
         let mut state = ChainState::new_genesis();
         state.height = u64::MAX - 1;
