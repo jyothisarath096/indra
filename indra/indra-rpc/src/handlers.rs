@@ -2190,14 +2190,16 @@ mod tests {
     use indra_core::{
         types::{
             block::{BlockHeaderV1, BlockV1},
-            crypto::HybridPubKey,
+            crypto::{HybridPubKey, HybridSignature},
             primitives::{MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES},
+            staking::{StakingOp, StakingOpBody},
             transaction::OutputV1,
         },
         Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{sha256, PaymentKeypairV1};
+    use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1, PqKeypair};
     use indra_state::{
+        apply_staking_op,
         validator::{StakeBondEntry, StakeBondOutput},
         ChainState,
     };
@@ -2489,7 +2491,16 @@ mod tests {
         );
 
         let mut engine = make_state("pi");
-        let owner_id = Bytes32::from(sha256(&[0xA1; 32]));
+        let owner_keypair = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0xA1; 32]),
+            PqKeypair::from_seed(&[0xA1; 32]).unwrap(),
+        );
+        let owner_public = owner_keypair.public_key();
+        let owner_pubkey = HybridPubKey {
+            classical_pk: Bytes32::from(owner_public.classical.0),
+            pq_pk: VariableBytes::from_slice(&owner_public.pq.0).unwrap(),
+        };
+        let owner_id = Bytes32::from(sha256(&owner_pubkey.classical_pk.0));
         let payment_pubkey = PaymentKeypairV1::generate().public_key();
         let state = NodeState::read_only(&engine);
         assert_eq!(
@@ -2497,9 +2508,26 @@ mod tests {
             "null"
         );
 
-        engine
-            .payment_identities
-            .insert(owner_id, payment_pubkey.clone());
+        let mut op = StakingOp {
+            body: StakingOpBody::RegisterPaymentKey {
+                owner_pubkey,
+                payment_pubkey: payment_pubkey.clone(),
+            },
+            nonce: 1,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+            },
+        };
+        let sig = owner_keypair
+            .sign(&op.signing_bytes(&engine.chain_id))
+            .unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+        let chain_id = engine.chain_id.clone();
+        apply_staking_op(&mut engine, &op, &chain_id, u64::MAX).unwrap();
         let state = NodeState::read_only(&engine);
         let result = get_payment_identity(&[hex::encode(owner_id.0)], &state).unwrap();
 

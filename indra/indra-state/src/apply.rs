@@ -3913,6 +3913,148 @@ mod tests {
     }
 
     #[test]
+    fn payment_blinding_capstone_cross_gate_block_sequence_is_deterministic() {
+        let mut initial = ChainState::new_genesis();
+        initial.height = u64::MAX - 2;
+        initial.tip_hash = Bytes32::ZERO;
+        let (tx_owner_pubkey, tx_keypair) = make_test_keypair([0xC0; 32]);
+        let mut spendable = Vec::new();
+        for index in 0..4u8 {
+            let blinding = [0xC1u8.wrapping_add(index); 32];
+            let output = output_with_value(
+                TEST_INPUT_VALUE + 50_000 + index as u64,
+                tx_owner_pubkey.clone(),
+                0xC1u8.wrapping_add(index),
+            );
+            let utxo_id = initial.utxos.insert(output, 0, 10, index as u32).unwrap();
+            spendable.push((utxo_id, TEST_INPUT_VALUE + 50_000 + index as u64, blinding));
+        }
+
+        let pre_gate_tx = make_tx(
+            &initial,
+            &tx_keypair,
+            spendable[0].0,
+            spendable[0].1,
+            spendable[0].2,
+            Bytes32::from([0xD0; 32]),
+        );
+        let pre_gate_tx_bytes = pre_gate_tx.encode_to_vec();
+        let pre_gate_block =
+            make_block_at_height(&initial, vec![pre_gate_tx.clone()], u64::MAX - 1, 111);
+        let mut first = initial.clone();
+        let mut second = initial;
+        apply_block(&mut first, &pre_gate_block, 0).unwrap();
+        apply_block(&mut second, &pre_gate_block, 0).unwrap();
+        assert_eq!(pre_gate_tx.encode_to_vec(), pre_gate_tx_bytes);
+        assert_same_consensus_state(&first, &second);
+        assert!(first.payment_identities.is_empty());
+
+        let mut post_base = first;
+        let (registered_validator_op, registered_validator_id) =
+            signed_register_validator_op(&mut post_base, [0xD1; 32], 1);
+        let (governance_pubkey, governance_keypair, governance_validator_id) =
+            install_governance_validator(&mut post_base, [0xD2; 32], 10_000_000_000);
+        let governance_deposit_id = post_base
+            .utxos
+            .insert(
+                governance_deposit_output(
+                    governance_pubkey.clone(),
+                    post_base.governance.params.proposal_deposit_spark,
+                ),
+                0,
+                11,
+                0,
+            )
+            .unwrap();
+
+        let legacy_post_gate_tx = make_tx(
+            &post_base,
+            &tx_keypair,
+            spendable[1].0,
+            spendable[1].1,
+            spendable[1].2,
+            Bytes32::from([0xD3; 32]),
+        );
+        let mut noted_post_gate_tx = make_tx(
+            &post_base,
+            &tx_keypair,
+            spendable[2].0,
+            spendable[2].1,
+            spendable[2].2,
+            Bytes32::from([0xD4; 32]),
+        );
+        set_v2_payment_notes(
+            &mut noted_post_gate_tx,
+            &tx_keypair,
+            &post_base.chain_id.clone(),
+            vec![Some(payment_note(0xD5))],
+        );
+        let mut all_none_post_gate_tx = make_tx(
+            &post_base,
+            &tx_keypair,
+            spendable[3].0,
+            spendable[3].1,
+            spendable[3].2,
+            Bytes32::from([0xD6; 32]),
+        );
+        set_v2_payment_notes(
+            &mut all_none_post_gate_tx,
+            &tx_keypair,
+            &post_base.chain_id.clone(),
+            vec![None],
+        );
+
+        let (payment_owner_pubkey, payment_owner_keypair) = make_test_keypair([0xD7; 32]);
+        let payment_owner_id = Bytes32::from(sha256(&payment_owner_pubkey.classical_pk.0));
+        let payment_key = payment_pubkey(0xD8);
+        let register_payment_op = signed_register_payment_key_op(
+            &post_base,
+            &payment_owner_keypair,
+            payment_key.clone(),
+            1,
+        );
+        let governance_op = governance_propose_op(
+            governance_validator_id,
+            &governance_keypair,
+            governance_pubkey,
+            governance_deposit_id,
+            1,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+        );
+
+        let mut post_block = make_block_at_height(
+            &post_base,
+            vec![
+                legacy_post_gate_tx,
+                noted_post_gate_tx,
+                all_none_post_gate_tx,
+            ],
+            u64::MAX,
+            222,
+        );
+        post_block.staking_ops = vec![register_payment_op, registered_validator_op];
+        post_block.governance_ops = vec![governance_op];
+
+        let mut first_post_replay = post_base.clone();
+        let mut second_post_replay = post_base;
+        apply_block(&mut first_post_replay, &post_block, 0).unwrap();
+        apply_block(&mut second_post_replay, &post_block, 0).unwrap();
+
+        assert_same_consensus_state(&first_post_replay, &second_post_replay);
+        assert_eq!(
+            first_post_replay.payment_identities.get(&payment_owner_id),
+            Some(&payment_key)
+        );
+        assert!(first_post_replay
+            .validators
+            .get(&registered_validator_id)
+            .is_some());
+        assert_eq!(first_post_replay.governance.proposals.len(), 1);
+    }
+
+    #[test]
     fn identity_registry_capstone_rejects_all_substitution_attacks_and_preserves_state() {
         let mut base = ChainState::new_genesis();
         let first_validator = Bytes32::from([0xA1; 32]);
