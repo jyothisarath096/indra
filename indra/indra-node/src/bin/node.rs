@@ -3661,7 +3661,7 @@ fn requested_block_height_for_rpc(
     chain: &indra_state::ChainState,
 ) -> Option<u64> {
     match req.method.as_str() {
-        "indra_getBlock" => req
+        "indra_getBlock" | "indra_getTransaction" => req
             .params
             .first()
             .and_then(|param| indra_rpc::types::unquote(param).parse::<u64>().ok()),
@@ -5026,6 +5026,83 @@ mod tests {
             ..req
         };
         assert_eq!(requested_block_height_for_rpc(&unknown_req, &chain), None);
+    }
+
+    #[test]
+    fn get_transaction_rpc_prefetches_requested_block_height() {
+        let chain = indra_state::ChainState::new_genesis();
+        let req = indra_rpc::types::RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "indra_getTransaction".to_string(),
+            params: vec!["176677".to_string(), "0".to_string()],
+            id: indra_rpc::types::JsonId::Number(1),
+        };
+
+        assert_eq!(requested_block_height_for_rpc(&req, &chain), Some(176_677));
+    }
+
+    fn snapshot_test_transaction(byte: u8) -> indra_core::types::transaction::TransactionV1 {
+        indra_core::types::transaction::TransactionV1 {
+            version: indra_core::ProtocolVersion::CURRENT,
+            signature_module_id: 1,
+            inputs: vec![indra_core::types::transaction::InputV1 {
+                utxo_id: indra_core::Bytes32::from([byte; 32]),
+                nullifier: indra_core::Bytes32::from([byte.wrapping_add(1); 32]),
+            }],
+            outputs: vec![snapshot_test_output(byte.wrapping_add(2))],
+            payment_notes: Vec::new(),
+            fee_amount: 500,
+            fee_blinding: indra_core::Bytes32::from([byte.wrapping_add(3); 32]),
+            fee_commitment: indra_core::types::crypto::CommitmentV1 {
+                compressed_point: indra_core::Bytes32::from([byte.wrapping_add(4); 32]),
+            },
+            signature: indra_core::types::crypto::HybridSignature {
+                classical_sig: indra_core::types::primitives::VariableBytes::from_slice(
+                    &[byte.wrapping_add(5); 64],
+                )
+                .unwrap(),
+                pq_sig: indra_core::types::primitives::VariableBytes::from_slice(
+                    &[byte.wrapping_add(6); 64],
+                )
+                .unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn rpc_snapshot_serves_get_transaction_from_requested_block() {
+        let height = 176_677;
+        let mut chain = indra_state::ChainState::new_genesis();
+        chain.height = height + 2;
+        let tx = snapshot_test_transaction(0xA7);
+        let expected_tx_hex = hex::encode(tx.encode_to_vec());
+        let mut block = block_response_test_block(height);
+        block.transactions.push(tx);
+        let snapshot = RpcSnapshot {
+            chain,
+            mempool_size: 0,
+            pruned_mode: true,
+            lowest_block: 126_677,
+            blocks_retained: 50_000,
+            requested_block: Some((height, block)),
+            latest_epoch: None,
+            epoch_records: HashMap::new(),
+            migration_history: Vec::new(),
+        };
+        let state = indra_rpc::handlers::NodeState::read_only(&snapshot);
+
+        match indra_rpc::handlers::dispatch(
+            "indra_getTransaction",
+            &[height.to_string(), "0".to_string()],
+            &state,
+        ) {
+            indra_rpc::handlers::DispatchResult::Ready(Ok(result)) => {
+                assert!(result.contains(r#""height":176677"#));
+                assert!(result.contains(r#""tx_index":0"#));
+                assert!(result.contains(&format!(r#""tx_hex":"{expected_tx_hex}""#)));
+            }
+            _ => panic!("getTransaction should be served from requested block snapshot"),
+        }
     }
 
     #[test]
