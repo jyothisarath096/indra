@@ -434,16 +434,17 @@ fn recover_protocol_provenance_from_response(
 ) -> Result<ProtocolRecovery, String> {
     let root: serde_json::Value =
         serde_json::from_str(response).map_err(|e| format!("bad provenance JSON: {e}"))?;
-    verify_provenance_utxo_fields(utxo, &root)?;
+    let provenance = provenance_result_object(&root)?;
+    verify_provenance_utxo_fields(utxo, provenance)?;
 
-    let category = json_str(&root, "category")?.to_string();
-    let recoverable = root
+    let category = json_str(provenance, "category")?.to_string();
+    let recoverable = provenance
         .get("recoverable")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "provenance response missing recoverable flag".to_string())?;
 
     if !recoverable {
-        let reason = root
+        let reason = provenance
             .get("reason")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("node reported this UTXO is not recoverable")
@@ -454,12 +455,12 @@ fn recover_protocol_provenance_from_response(
         });
     }
 
-    let context = root
+    let context = provenance
         .get("context")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "recoverable provenance response missing context object".to_string())?;
     let blinding = derive_protocol_blinding(&category, context)?;
-    let output = provenance_output(&root)?;
+    let output = provenance_output(provenance)?;
     let expected_commitment = commit(output.value_spark, &blinding);
     if expected_commitment.0 != output.commitment.compressed_point.0 {
         return Err(format!(
@@ -467,6 +468,16 @@ fn recover_protocol_provenance_from_response(
         ));
     }
     Ok(ProtocolRecovery::Recovered { category, blinding })
+}
+
+fn provenance_result_object(root: &serde_json::Value) -> Result<&serde_json::Value, String> {
+    if let Some(error) = root.get("error") {
+        return Err(format!("provenance RPC error: {error}"));
+    }
+    if let Some(result) = root.get("result") {
+        return Ok(result);
+    }
+    Ok(root)
 }
 
 fn verify_provenance_utxo_fields(utxo: &RpcUtxo, root: &serde_json::Value) -> Result<(), String> {
@@ -752,14 +763,22 @@ mod tests {
     use indra_cli::{build_transaction, tx_builder::DUST_LIMIT_SPARK, TxParams, Wallet};
     use indra_core::{
         codec::{Decode, Encode},
-        types::{crypto::HybridPubKey, primitives::DEFAULT_CHAIN_ID},
-        Bytes32, CommitmentV1, VariableBytes,
+        types::{
+            block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+            crypto::{HybridPubKey, HybridSignature},
+            primitives::{DEFAULT_CHAIN_ID, MAX_VRF_PROOF_BYTES, STAKING_TX_IDX},
+            staking::{StakingOp, StakingOpBody},
+        },
+        Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
     };
     use indra_crypto::{
         hybrid::{ClassicalKeypair, PqKeypair},
         PaymentKeypairV1,
     };
     use indra_keystore::generate_keypairs;
+    use indra_rpc::{handlers::RpcEngineView, server::call_rpc};
+    use indra_state::ChainState;
+    use std::collections::BTreeMap;
 
     fn hybrid_material(seed_byte: u8) -> ([u8; 32], Vec<u8>, HybridPubKey) {
         let seed = [seed_byte; 32];
@@ -831,6 +850,72 @@ mod tests {
             created_height: height,
             tx_index,
             out_index,
+        }
+    }
+
+    struct BlockBackedEngine {
+        chain: ChainState,
+        blocks: BTreeMap<u64, BlockV1>,
+    }
+
+    impl RpcEngineView for BlockBackedEngine {
+        fn chain_state(&self) -> &ChainState {
+            &self.chain
+        }
+
+        fn mempool_size(&self) -> usize {
+            0
+        }
+
+        fn pruned_mode(&self) -> bool {
+            false
+        }
+
+        fn lowest_block(&self) -> u64 {
+            0
+        }
+
+        fn blocks_retained(&self) -> usize {
+            self.blocks.len()
+        }
+
+        fn get_block_by_height(&self, height: u64) -> Result<Option<BlockV1>, String> {
+            Ok(self.blocks.get(&height).cloned())
+        }
+    }
+
+    fn dummy_signature(byte: u8) -> HybridSignature {
+        HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[byte; 64]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+        }
+    }
+
+    fn dummy_block(height: u64) -> BlockV1 {
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion::CURRENT,
+                height,
+                prev_hash: Bytes32::from([0x01; 32]),
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::from([0x02; 32]),
+                validator_set_root: Bytes32::from([0x03; 32]),
+                mempool_set_root: Bytes32::from([0x04; 32]),
+                value_hash: Bytes32::from([0x05; 32]),
+                base_fee: 100,
+                proposer_round: 0,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::from([0x06; 32]),
+                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0x07; 64])
+                    .unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                election_result_hash: None,
+            },
+            transactions: Vec::new(),
+            slashing_evidence: Vec::new(),
+            governance_ops: Vec::new(),
+            staking_ops: Vec::new(),
+            vrf_reveals: Vec::new(),
         }
     }
 
@@ -1193,6 +1278,104 @@ mod tests {
 
         let err = recover_protocol_provenance_from_response(&utxo, &response).unwrap_err();
         assert!(err.contains("does not open"), "{err}");
+    }
+
+    #[test]
+    fn scanner_parses_real_rpc_provenance_envelope() {
+        let mut keys =
+            generate_keypairs("claimant".to_string(), [0x80; 32], [0x81; 32], [0x82; 32]).unwrap();
+        keys.payment_keypair = None;
+        keys.public.payment_pubkey = None;
+
+        let owner = HybridPubKey {
+            classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
+            pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap(),
+        };
+        let validator_id = Bytes32::from(indra_crypto::sha256(&owner.classical_pk.0));
+        let delegator_id = validator_id;
+        let height = 12;
+        let amount = 4_000_000;
+        let blinding = derive_staking_reward_blinding(&validator_id.0, &delegator_id.0, height);
+        let output = OutputV1 {
+            value_spark: amount,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commit(amount, &blinding).0),
+            },
+            owner_pubkey: owner.clone(),
+            range_proof: VariableBytes::from_slice(&[0x83; 32]).unwrap(),
+            lock_height: 0,
+        };
+        let mut chain = ChainState::new_genesis();
+        chain.height = height;
+        let utxo_id = chain
+            .utxos
+            .insert(output, height, STAKING_TX_IDX, 0)
+            .unwrap();
+        let mut block = dummy_block(height);
+        block.staking_ops.push(StakingOp {
+            body: StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey: owner,
+            },
+            nonce: 1,
+            signature: dummy_signature(0x84),
+        });
+        let engine = BlockBackedEngine {
+            chain,
+            blocks: [(height, block)].into_iter().collect(),
+        };
+
+        let address_hex = hex::encode(indra_crypto::sha256(&keys.public.hybrid_classical_pk));
+        let challenge_response = call_rpc(
+            "indra_getLegacyScanChallenge",
+            &[indra_cli::json_string(&address_hex)],
+            &engine,
+        );
+        let challenge_json: serde_json::Value = serde_json::from_str(&challenge_response).unwrap();
+        let challenge_hex = challenge_json["result"]["challenge"].as_str().unwrap();
+        let challenge = decode_hex32(challenge_hex, "challenge").unwrap();
+        let msg = indra_rpc::handlers::legacy_scan_auth_message(
+            decode_hex32(&address_hex, "address").unwrap(),
+            challenge,
+        );
+        let sig = indra_cli::reconstruct_keypair(&keys)
+            .unwrap()
+            .sign(&msg)
+            .unwrap();
+        let proof = format!(
+            r#"{{"version":1,"challenge":"{}","hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","classical_sig":"{}","pq_sig":"{}","reserved_output_v2":null}}"#,
+            challenge_hex,
+            hex::encode(keys.public.hybrid_classical_pk),
+            hex::encode(&keys.public.hybrid_pq_pk),
+            hex::encode(sig.classical.0),
+            hex::encode(sig.pq.0)
+        );
+        let response = call_rpc(
+            "indra_explainUtxoProvenanceAuthorized",
+            &[
+                indra_cli::json_string(&address_hex),
+                proof,
+                indra_cli::json_string(&hex::encode(utxo_id.0)),
+            ],
+            &engine,
+        );
+        assert!(response.contains(r#""result":"#), "{response}");
+
+        let utxo = RpcUtxo {
+            utxo_id,
+            value: amount,
+            created_height: height,
+            tx_index: STAKING_TX_IDX,
+            out_index: 0,
+        };
+        let recovered = recover_protocol_provenance_from_response(&utxo, &response).unwrap();
+        assert_eq!(
+            recovered,
+            ProtocolRecovery::Recovered {
+                category: "staking_reward_claim".to_string(),
+                blinding,
+            }
+        );
     }
 
     #[test]
