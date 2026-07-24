@@ -196,6 +196,10 @@ pub const SLASH_BOND_RELEASE_BLINDING_DOMAIN: &[u8] = b"INDRA-slash-bond-release
 pub const COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] =
     b"INDRA-compact-stake-bond-release-v1";
 
+/// Domain for deterministic normal stake-bond release blinding derivation.
+pub const NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] =
+    b"INDRA-normal-stake-bond-release-v1";
+
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 
 /// Maximum Ed25519 signature size (bytes).
@@ -587,6 +591,20 @@ pub mod hard_forks {
     /// silently reuse this testnet activation height for mainnet.
     pub const COMPACT_BOND_PUBKEY_OMISSION_HEIGHT: u64 = 175_000;
 
+    /// Normal stake-bond releases derive fresh deterministic blinding factors.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
+    /// coordinated deployment, comfortably ahead of the live chain tip at that
+    /// time. Before this height, normal legacy stake-bond releases continue to
+    /// reuse their original stored output bytes exactly as before. At/after this
+    /// height, normal releases may create fresh deterministic release outputs.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
+    /// no per-chain-ID differentiation. Before building mainnet genesis, this
+    /// MUST be deliberately reset to the correct mainnet value. Leaving
+    /// `u64::MAX` here means this rule never activates on that network.
+    pub const NORMAL_BOND_RELEASE_BLINDING_HEIGHT: u64 = u64::MAX;
+
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
         "compact bond pubkey omission must not activate before identity registry"
@@ -690,6 +708,12 @@ pub fn payment_blinding_active(height: u64) -> bool {
 #[inline]
 pub fn compact_bond_pubkey_omission_active(height: u64) -> bool {
     height >= hard_forks::COMPACT_BOND_PUBKEY_OMISSION_HEIGHT
+}
+
+/// Whether normal stake-bond releases derive fresh deterministic blindings.
+#[inline]
+pub fn normal_bond_release_blinding_active(height: u64) -> bool {
+    height >= hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -1211,5 +1235,18 @@ mod tests {
         assert!(governance_proposal_pruning_active(
             GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
         ));
+    }
+
+    #[test]
+    fn normal_bond_release_blinding_constants_are_stable() {
+        use hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
+
+        assert_eq!(
+            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            b"INDRA-normal-stake-bond-release-v1"
+        );
+        assert_eq!(NORMAL_BOND_RELEASE_BLINDING_HEIGHT, u64::MAX);
+        assert!(!normal_bond_release_blinding_active(u64::MAX - 1));
+        assert!(normal_bond_release_blinding_active(u64::MAX));
     }
 }
