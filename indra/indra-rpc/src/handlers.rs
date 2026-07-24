@@ -1981,9 +1981,19 @@ fn get_stake_bond_debug(params: &[String], state: &NodeState<'_>) -> RpcResult<S
         ))
     })?;
     Ok(format!(
-        r#"{{"bond_utxo_id":"{}","compact":{},"bonded_epoch":{},"validator_id":"{}","delegator_id":"{}"}}"#,
+        r#"{{"bond_utxo_id":"{}","compact":{},"has_range_proof":{},"has_owner_pubkey":{},"bonded_epoch":{},"validator_id":"{}","delegator_id":"{}"}}"#,
         hex::encode(bond.utxo_id.0),
         if bond.original_output.range_proof.is_none() {
+            "true"
+        } else {
+            "false"
+        },
+        if bond.original_output.range_proof.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+        if bond.original_output.owner_pubkey.is_some() {
             "true"
         } else {
             "false"
@@ -3469,10 +3479,14 @@ mod tests {
         let mut engine = make_state("sbd");
         let legacy = test_bond(0x51, false);
         let compact = test_bond(0x61, true);
+        let mut fully_compact = test_bond(0x71, true);
+        fully_compact.original_output.owner_pubkey = None;
         let legacy_id = legacy.utxo_id;
         let compact_id = compact.utxo_id;
+        let fully_compact_id = fully_compact.utxo_id;
         engine.staked_bonds.insert(legacy_id, legacy);
         engine.staked_bonds.insert(compact_id, compact);
+        engine.staked_bonds.insert(fully_compact_id, fully_compact);
         let state = NodeState::read_only(&engine);
 
         let legacy_result = get_stake_bond_debug(&[hex::encode(legacy_id.0)], &state).unwrap();
@@ -3480,16 +3494,31 @@ mod tests {
             legacy_result.contains(&format!(r#""bond_utxo_id":"{}""#, hex::encode(legacy_id.0)))
         );
         assert!(legacy_result.contains(r#""compact":false"#));
+        assert!(legacy_result.contains(r#""has_range_proof":true"#));
+        assert!(legacy_result.contains(r#""has_owner_pubkey":true"#));
         assert!(legacy_result.contains(r#""bonded_epoch":7"#));
         assert!(legacy_result.contains(&format!(r#""validator_id":"{}""#, hex::encode([0x52; 32]))));
         assert!(legacy_result.contains(&format!(r#""delegator_id":"{}""#, hex::encode([0x53; 32]))));
-        assert!(!legacy_result.contains("range_proof"));
         assert!(!legacy_result.contains("commitment"));
+        assert!(!legacy_result.contains("classical_pk"));
+        assert!(!legacy_result.contains("pq_pk"));
 
         let compact_result = get_stake_bond_debug(&[hex::encode(compact_id.0)], &state).unwrap();
         assert!(compact_result.contains(r#""compact":true"#));
-        assert!(!compact_result.contains("range_proof"));
+        assert!(compact_result.contains(r#""has_range_proof":false"#));
+        assert!(compact_result.contains(r#""has_owner_pubkey":true"#));
         assert!(!compact_result.contains("commitment"));
+        assert!(!compact_result.contains("classical_pk"));
+        assert!(!compact_result.contains("pq_pk"));
+
+        let fully_compact_result =
+            get_stake_bond_debug(&[hex::encode(fully_compact_id.0)], &state).unwrap();
+        assert!(fully_compact_result.contains(r#""compact":true"#));
+        assert!(fully_compact_result.contains(r#""has_range_proof":false"#));
+        assert!(fully_compact_result.contains(r#""has_owner_pubkey":false"#));
+        assert!(!fully_compact_result.contains("commitment"));
+        assert!(!fully_compact_result.contains("classical_pk"));
+        assert!(!fully_compact_result.contains("pq_pk"));
     }
 
     #[test]
