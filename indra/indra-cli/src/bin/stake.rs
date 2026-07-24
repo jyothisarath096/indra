@@ -31,6 +31,7 @@ fn run(args: Vec<String>) -> CliResult<()> {
         "delegate" => run_delegate(&args),
         "undelegate" => run_undelegate(&args),
         "claim-rewards" => run_claim_rewards(&args),
+        "register-payment-key" => run_register_payment_key(&args),
         "set-commission" => run_set_commission(&args),
         "auto-delegate" => run_auto_delegate(&args),
         "update-network-address" => run_update_network_address(&args),
@@ -250,6 +251,37 @@ fn run_claim_rewards(args: &[String]) -> CliResult<()> {
                 "Note",
                 "Use indra-wallet-scan to discover and add the reward UTXO to your wallet"
                     .to_string(),
+            ),
+        ],
+        None,
+    )
+}
+
+fn run_register_payment_key(args: &[String]) -> CliResult<()> {
+    if has_help(args) {
+        print_register_payment_key_help();
+        return Ok(());
+    }
+    let keys = load_keys(args)?;
+    let keypair = reconstruct_keypair(&keys)?;
+    let signer_id = staking_signer_id(&keys)?;
+    let payment_pubkey = payment_pubkey_from_keys(&keys)?;
+    let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
+    let chain_id = fetch_chain_id(&node_url)?;
+    let nonce = fetch_next_nonce(&node_url, &signer_id)?;
+    let built = build_register_payment_key_for_keys(&keys, &keypair, nonce, &chain_id)?;
+    finish_op(
+        args,
+        "register-payment-key",
+        &built,
+        &signer_id,
+        nonce,
+        &node_url,
+        &[
+            ("Payment PK", hex::encode(payment_pubkey.encode())),
+            (
+                "Note",
+                "Registers this keys.json payment key for payment-blinding delivery".to_string(),
             ),
         ],
         None,
@@ -586,6 +618,30 @@ fn staking_signer_id(keys: &KeysFile) -> CliResult<Bytes32> {
     Ok(validator_id_from_keys(keys))
 }
 
+fn payment_pubkey_from_keys(keys: &KeysFile) -> CliResult<indra_crypto::PaymentPubKeyV1> {
+    let payment_keypair = keys.payment_keypair.as_ref().ok_or_else(|| {
+        CliError::MissingArgument(
+            "keys.json does not contain a payment_keypair; generate/recover keys with current indra-keygen before registering a payment key"
+                .to_string(),
+        )
+    })?;
+    Ok(payment_keypair.public_key())
+}
+
+fn build_register_payment_key_for_keys(
+    keys: &KeysFile,
+    keypair: &indra_crypto::HybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    indra_cli::tx_builder::build_register_payment_key_op(
+        payment_pubkey_from_keys(keys)?,
+        keypair,
+        nonce,
+        chain_id,
+    )
+}
+
 fn validator_id_from_keys(keys: &KeysFile) -> Bytes32 {
     Bytes32::from(keys.public.validator_id)
 }
@@ -601,7 +657,7 @@ fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
 
 fn print_help() {
     println!(
-        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
+        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  register-payment-key    Register this keys.json payment key\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
     );
 }
 
@@ -627,6 +683,10 @@ fn print_undelegate_help() {
 
 fn print_claim_rewards_help() {
     println!("Usage: indra-stake claim-rewards --validator <validator_hex> [--keys keys.json] [--wallet wallet.json] [--node url] [--dry-run]");
+}
+
+fn print_register_payment_key_help() {
+    println!("Usage: indra-stake register-payment-key [--keys keys.json] [--node url] [--dry-run]");
 }
 
 fn print_set_commission_help() {
@@ -760,5 +820,37 @@ mod tests {
 
         assert_eq!(staking_signer_id(&keys).unwrap(), canonical);
         assert_eq!(op.signer_id(), canonical);
+    }
+
+    #[test]
+    fn register_payment_key_uses_keys_json_payment_key_and_signer() {
+        let keys =
+            generate_keypairs("validator".to_string(), [0xC1; 32], [0xC2; 32], [0xC3; 32]).unwrap();
+        let keypair = reconstruct_keypair(&keys).unwrap();
+        let canonical = validator_id_from_keys(&keys);
+        let payment_pubkey = payment_pubkey_from_keys(&keys).unwrap();
+        let built =
+            build_register_payment_key_for_keys(&keys, &keypair, 7, "indra-testnet-1").unwrap();
+        let op_bytes = hex::decode(&built.op_hex).unwrap();
+        let op = indra_core::types::staking::StakingOp::decode_exact(&op_bytes).unwrap();
+
+        assert_eq!(op.nonce, 7);
+        assert_eq!(op.signer_id(), canonical);
+        assert!(matches!(
+            op.body,
+            indra_core::types::staking::StakingOpBody::RegisterPaymentKey {
+                payment_pubkey: registered,
+                ..
+            } if registered == payment_pubkey
+        ));
+    }
+
+    #[test]
+    fn register_payment_key_requires_stored_payment_keypair() {
+        let mut keys =
+            generate_keypairs("validator".to_string(), [0xD1; 32], [0xD2; 32], [0xD3; 32]).unwrap();
+        keys.payment_keypair = None;
+
+        assert!(payment_pubkey_from_keys(&keys).is_err());
     }
 }
