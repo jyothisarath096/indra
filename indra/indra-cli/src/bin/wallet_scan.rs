@@ -12,7 +12,15 @@
 //!                   [--keys-password-file keys.pass] \
 //!                   --node http://127.0.0.1:8545
 
-use indra_core::{codec::Decode, types::transaction::TransactionV1};
+use indra_core::{
+    codec::Decode,
+    types::{
+        primitives::{
+            Bytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN,
+        },
+        transaction::{OutputV1, TransactionV1},
+    },
+};
 use indra_crypto::{commit, recipient_derive_payment_blinding_v1, PaymentKeypairV1};
 use indra_state::UtxoSet;
 
@@ -117,7 +125,15 @@ fn main() {
 
     // Query node for UTXOs
     println!("\nQuerying node for UTXOs...");
-    match query_utxos(&node_url, &keys, &address_hex) {
+    let scan_auth_proof =
+        match indra_cli::build_legacy_scan_auth_proof(&node_url, &keys, &address_hex) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("Error building scan authorization proof: {}", e);
+                std::process::exit(1);
+            }
+        };
+    match query_utxos(&node_url, &address_hex, &scan_auth_proof) {
         Ok(response) => {
             println!("Node response: {}", response);
             let discovered = parse_utxos_json(&response);
@@ -126,6 +142,8 @@ fn main() {
             let mut added = 0usize;
             let mut reconciled = 0usize;
             let mut recovered_payment_notes = 0usize;
+            let mut recovered_protocol = 0usize;
+            let mut unrecoverable_protocol = 0usize;
             for utxo in discovered {
                 if wallet.contains(&utxo.utxo_id) {
                     continue;
@@ -188,9 +206,45 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+                match recover_protocol_provenance_from_node(
+                    &node_url,
+                    &address_hex,
+                    &scan_auth_proof,
+                    &utxo,
+                ) {
+                    Ok(ProtocolRecovery::Recovered { category, blinding }) => {
+                        wallet.add_utxo(
+                            utxo.utxo_id,
+                            utxo.value,
+                            blinding,
+                            utxo.created_height,
+                            utxo.tx_index,
+                            utxo.out_index,
+                        );
+                        recovered_protocol += 1;
+                        println!(
+                            "Recovered protocol UTXO {} via {}.",
+                            hex::encode(utxo.utxo_id.0),
+                            category
+                        );
+                    }
+                    Ok(ProtocolRecovery::Unrecoverable { category, reason }) => {
+                        unrecoverable_protocol += 1;
+                        println!(
+                            "Unrecoverable protocol UTXO {} ({category}): {reason}",
+                            hex::encode(utxo.utxo_id.0)
+                        );
+                    }
+                    Ok(ProtocolRecovery::NotProtocolGenerated) => {}
+                    Err(e) => {
+                        eprintln!("Error recovering protocol-generated UTXO: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
 
-            if added > 0 || reconciled > 0 || recovered_payment_notes > 0 {
+            if added > 0 || reconciled > 0 || recovered_payment_notes > 0 || recovered_protocol > 0
+            {
                 wallet.save(&wallet_path).unwrap_or_else(|e| {
                     eprintln!("Error saving wallet: {}", e);
                     std::process::exit(1);
@@ -207,6 +261,18 @@ fn main() {
                 println!(
                     "Recovered {} payment-note UTXO(s) automatically.",
                     recovered_payment_notes
+                );
+            }
+            if recovered_protocol > 0 {
+                println!(
+                    "Recovered {} protocol-generated UTXO(s) automatically.",
+                    recovered_protocol
+                );
+            }
+            if unrecoverable_protocol > 0 {
+                println!(
+                    "Reported {} protocol-generated UTXO(s) as unrecoverable.",
+                    unrecoverable_protocol
                 );
             }
 
@@ -231,17 +297,32 @@ fn main() {
 }
 
 /// Query the node for UTXOs owned by this keypair's legacy address.
-fn query_utxos(
-    node_url: &str,
-    keys: &indra_cli::KeysFile,
-    address_hex: &str,
-) -> Result<String, String> {
-    let proof = indra_cli::build_legacy_scan_auth_proof(node_url, keys, address_hex)
-        .map_err(|e| e.to_string())?;
+fn query_utxos(node_url: &str, address_hex: &str, scan_auth_proof: &str) -> Result<String, String> {
     indra_cli::rpc_call_raw_params(
         node_url,
         "indra_getLegacyUtxosAuthorized",
-        &[indra_cli::json_string(address_hex), proof],
+        &[
+            indra_cli::json_string(address_hex),
+            scan_auth_proof.to_string(),
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn query_utxo_provenance(
+    node_url: &str,
+    address_hex: &str,
+    scan_auth_proof: &str,
+    utxo_id: Bytes32,
+) -> Result<String, String> {
+    indra_cli::rpc_call_raw_params(
+        node_url,
+        "indra_explainUtxoProvenanceAuthorized",
+        &[
+            indra_cli::json_string(address_hex),
+            scan_auth_proof.to_string(),
+            indra_cli::json_string(&hex::encode(utxo_id.0)),
+        ],
     )
     .map_err(|e| e.to_string())
 }
@@ -324,6 +405,269 @@ fn recover_payment_note_blinding(
     Ok(Some(recipient.blinding))
 }
 
+fn recover_protocol_provenance_from_node(
+    node_url: &str,
+    address_hex: &str,
+    scan_auth_proof: &str,
+    utxo: &RpcUtxo,
+) -> Result<ProtocolRecovery, String> {
+    let response = query_utxo_provenance(node_url, address_hex, scan_auth_proof, utxo.utxo_id)?;
+    recover_protocol_provenance_from_response(utxo, &response)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProtocolRecovery {
+    Recovered {
+        category: String,
+        blinding: [u8; 32],
+    },
+    Unrecoverable {
+        category: String,
+        reason: String,
+    },
+    NotProtocolGenerated,
+}
+
+fn recover_protocol_provenance_from_response(
+    utxo: &RpcUtxo,
+    response: &str,
+) -> Result<ProtocolRecovery, String> {
+    let root: serde_json::Value =
+        serde_json::from_str(response).map_err(|e| format!("bad provenance JSON: {e}"))?;
+    verify_provenance_utxo_fields(utxo, &root)?;
+
+    let category = json_str(&root, "category")?.to_string();
+    let recoverable = root
+        .get("recoverable")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "provenance response missing recoverable flag".to_string())?;
+
+    if !recoverable {
+        let reason = root
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("node reported this UTXO is not recoverable")
+            .to_string();
+        return Ok(match category.as_str() {
+            "ordinary_transaction_output" | "genesis" => ProtocolRecovery::NotProtocolGenerated,
+            _ => ProtocolRecovery::Unrecoverable { category, reason },
+        });
+    }
+
+    let context = root
+        .get("context")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "recoverable provenance response missing context object".to_string())?;
+    let blinding = derive_protocol_blinding(&category, context)?;
+    let output = provenance_output(&root)?;
+    let expected_commitment = commit(output.value_spark, &blinding);
+    if expected_commitment.0 != output.commitment.compressed_point.0 {
+        return Err(format!(
+            "recovered protocol blinding for {category} does not open the output commitment"
+        ));
+    }
+    Ok(ProtocolRecovery::Recovered { category, blinding })
+}
+
+fn verify_provenance_utxo_fields(utxo: &RpcUtxo, root: &serde_json::Value) -> Result<(), String> {
+    let response_utxo_id = decode_hex32(json_str(root, "utxo_id")?, "utxo_id")?;
+    if response_utxo_id != utxo.utxo_id.0 {
+        return Err("provenance response UTXO ID does not match requested UTXO".to_string());
+    }
+    let amount = json_u64(root, "amount")?;
+    if amount != utxo.value {
+        return Err("provenance response amount does not match discovered UTXO".to_string());
+    }
+    if json_u64(root, "created_height")? != utxo.created_height {
+        return Err("provenance response height does not match discovered UTXO".to_string());
+    }
+    if json_u64(root, "tx_index")? != u64::from(utxo.tx_index) {
+        return Err("provenance response tx_index does not match discovered UTXO".to_string());
+    }
+    if json_u64(root, "out_index")? != u64::from(utxo.out_index) {
+        return Err("provenance response out_index does not match discovered UTXO".to_string());
+    }
+
+    let output = provenance_output(root)?;
+    let computed_utxo_id =
+        UtxoSet::compute_utxo_id(&output, utxo.created_height, utxo.tx_index, utxo.out_index);
+    if computed_utxo_id != utxo.utxo_id {
+        return Err("provenance output_hex does not compute to the discovered UTXO ID".to_string());
+    }
+    if output.value_spark != utxo.value {
+        return Err("provenance output value does not match discovered UTXO".to_string());
+    }
+    let commitment = decode_hex32(json_str(root, "commitment")?, "commitment")?;
+    if commitment != output.commitment.compressed_point.0 {
+        return Err("provenance commitment does not match output_hex".to_string());
+    }
+
+    Ok(())
+}
+
+fn provenance_output(root: &serde_json::Value) -> Result<OutputV1, String> {
+    let output_hex = json_str(root, "output_hex")?;
+    let bytes = hex::decode(output_hex).map_err(|_| "bad provenance output_hex".to_string())?;
+    OutputV1::decode_exact(&bytes).map_err(|e| format!("bad provenance output encoding: {e}"))
+}
+
+fn derive_protocol_blinding(
+    category: &str,
+    context: &serde_json::Map<String, serde_json::Value>,
+) -> Result<[u8; 32], String> {
+    match category {
+        "staking_reward_claim" => derive_staking_reward_from_context(context, "claim_height"),
+        "validator_eviction_pending_reward" => {
+            derive_staking_reward_from_context(context, "returned_height")
+        }
+        "validator_eviction_bond_refund" => {
+            let validator_id = context_hex32(context, "validator_id")?;
+            let delegator_id = context_hex32(context, "delegator_id")?;
+            let bond_utxo_id = context_hex32(context, "bond_utxo_id")?;
+            let release_height = context_u64(context, "returned_height")?;
+            let amount_spark = context_u64(context, "amount_spark")?;
+            Ok(derive_compact_bond_release_blinding(
+                &validator_id,
+                &delegator_id,
+                &bond_utxo_id,
+                release_height,
+                amount_spark,
+            ))
+        }
+        "slash_reporter_reward" => {
+            let evidence_hash = context_hex32(context, "evidence_hash")?;
+            let block_height = context_u64(context, "block_height")?;
+            Ok(derive_slash_reward_blinding(&evidence_hash, block_height))
+        }
+        "governance_deposit_change" => {
+            let proposal_id = context_hex32(context, "proposal_id")?;
+            Ok(derive_governance_change_blinding(&proposal_id))
+        }
+        "governance_deposit_refund" => {
+            let proposal_id = context_hex32(context, "proposal_id")?;
+            Ok(derive_governance_refund_blinding(&proposal_id))
+        }
+        _ => Err(format!(
+            "node reported unsupported recoverable provenance category: {category}"
+        )),
+    }
+}
+
+fn derive_staking_reward_from_context(
+    context: &serde_json::Map<String, serde_json::Value>,
+    height_field: &str,
+) -> Result<[u8; 32], String> {
+    let validator_id = context_hex32(context, "validator_id")?;
+    let delegator_id = context_hex32(context, "delegator_id")?;
+    let height = context_u64(context, height_field)?;
+    Ok(derive_staking_reward_blinding(
+        &validator_id,
+        &delegator_id,
+        height,
+    ))
+}
+
+fn derive_staking_reward_blinding(
+    validator_id: &[u8; 32],
+    delegator_id: &[u8; 32],
+    height: u64,
+) -> [u8; 32] {
+    let mut data = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
+    data.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
+    data.extend_from_slice(validator_id);
+    data.extend_from_slice(delegator_id);
+    data.extend_from_slice(&height.to_le_bytes());
+    indra_crypto::sha256(&data)
+}
+
+fn derive_compact_bond_release_blinding(
+    validator_id: &[u8; 32],
+    delegator_id: &[u8; 32],
+    bond_utxo_id: &[u8; 32],
+    release_height: u64,
+    amount_spark: u64,
+) -> [u8; 32] {
+    let mut data =
+        Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
+    data.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
+    data.extend_from_slice(validator_id);
+    data.extend_from_slice(delegator_id);
+    data.extend_from_slice(bond_utxo_id);
+    data.extend_from_slice(&release_height.to_le_bytes());
+    data.extend_from_slice(&amount_spark.to_le_bytes());
+    indra_crypto::sha256(&data)
+}
+
+fn derive_slash_reward_blinding(evidence_hash: &[u8; 32], block_height: u64) -> [u8; 32] {
+    let mut data = b"INDRA-SLASH-REWARD-BLINDING-v1".to_vec();
+    data.extend_from_slice(evidence_hash);
+    data.extend_from_slice(&block_height.to_le_bytes());
+    indra_crypto::sha256(&data)
+}
+
+fn derive_governance_refund_blinding(proposal_id: &[u8; 32]) -> [u8; 32] {
+    indra_crypto::sha256(
+        &[
+            b"governance-refund-blinding".as_slice(),
+            proposal_id.as_slice(),
+        ]
+        .concat(),
+    )
+}
+
+fn derive_governance_change_blinding(proposal_id: &[u8; 32]) -> [u8; 32] {
+    indra_crypto::sha256(
+        &[
+            b"governance-deposit-change-blinding".as_slice(),
+            proposal_id.as_slice(),
+        ]
+        .concat(),
+    )
+}
+
+fn context_hex32(
+    context: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<[u8; 32], String> {
+    let value = context
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("provenance context missing {field}"))?;
+    decode_hex32(value, field)
+}
+
+fn context_u64(
+    context: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, String> {
+    context
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("provenance context missing numeric {field}"))
+}
+
+fn json_str<'a>(root: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
+    root.get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("provenance response missing {field}"))
+}
+
+fn json_u64(root: &serde_json::Value, field: &str) -> Result<u64, String> {
+    root.get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("provenance response missing numeric {field}"))
+}
+
+fn decode_hex32(value: &str, field: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(value).map_err(|_| format!("{field} must be 32-byte hex"))?;
+    if bytes.len() != 32 {
+        return Err(format!("{field} must be 32-byte hex"));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 /// Derive the genesis blinding factor for this validator's initial stake UTXO.
 /// This is deterministic from the hybrid seed.
 fn derive_genesis_blinding(hybrid_seed: &[u8; 32]) -> [u8; 32] {
@@ -334,6 +678,7 @@ fn derive_genesis_blinding(hybrid_seed: &[u8; 32]) -> [u8; 32] {
     indra_crypto::derive_genesis_utxo_blinding_from_classical_pk(&classical_pk)
 }
 
+#[derive(Debug, Clone)]
 struct RpcUtxo {
     utxo_id: indra_core::Bytes32,
     value: u64,
@@ -406,9 +751,9 @@ mod tests {
     use super::*;
     use indra_cli::{build_transaction, tx_builder::DUST_LIMIT_SPARK, TxParams, Wallet};
     use indra_core::{
-        codec::Decode,
+        codec::{Decode, Encode},
         types::{crypto::HybridPubKey, primitives::DEFAULT_CHAIN_ID},
-        Bytes32, VariableBytes,
+        Bytes32, CommitmentV1, VariableBytes,
     };
     use indra_crypto::{
         hybrid::{ClassicalKeypair, PqKeypair},
@@ -486,6 +831,136 @@ mod tests {
             tx_index,
             out_index,
         }
+    }
+
+    fn owned_protocol_output(amount: u64, blinding: [u8; 32]) -> OutputV1 {
+        let (_, _, owner_pubkey) = hybrid_material(0xA8);
+        OutputV1 {
+            value_spark: amount,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commit(amount, &blinding).0),
+            },
+            owner_pubkey,
+            range_proof: VariableBytes::from_slice(&[0x55; 32]).unwrap(),
+            lock_height: 0,
+        }
+    }
+
+    fn protocol_response(
+        category: &str,
+        context: &str,
+        amount: u64,
+        height: u64,
+        tx_index: u32,
+        out_index: u32,
+        blinding: [u8; 32],
+    ) -> (RpcUtxo, String) {
+        let output = owned_protocol_output(amount, blinding);
+        let utxo_id = UtxoSet::compute_utxo_id(&output, height, tx_index, out_index);
+        let response = format!(
+            r#"{{"address":"{}","utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{},"commitment":"{}","output_hex":"{}","category":"{}","recoverable":true,"context":{},"reason":null}}"#,
+            "aa".repeat(32),
+            hex::encode(utxo_id.0),
+            amount,
+            height,
+            tx_index,
+            out_index,
+            output.lock_height,
+            hex::encode(output.commitment.compressed_point.0),
+            hex::encode(output.encode_to_vec()),
+            category,
+            context,
+        );
+        (
+            RpcUtxo {
+                utxo_id,
+                value: amount,
+                created_height: height,
+                tx_index,
+                out_index,
+            },
+            response,
+        )
+    }
+
+    fn unrecoverable_response(category: &str, reason: &str) -> (RpcUtxo, String) {
+        let output = owned_protocol_output(4_000_000, [0xFE; 32]);
+        let height = 12;
+        let tx_index = indra_core::types::primitives::STAKING_TX_IDX;
+        let out_index = 1;
+        let utxo_id = UtxoSet::compute_utxo_id(&output, height, tx_index, out_index);
+        let response = format!(
+            r#"{{"address":"{}","utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{},"commitment":"{}","output_hex":"{}","category":"{}","recoverable":false,"context":null,"reason":"{}"}}"#,
+            "aa".repeat(32),
+            hex::encode(utxo_id.0),
+            output.value_spark,
+            height,
+            tx_index,
+            out_index,
+            output.lock_height,
+            hex::encode(output.commitment.compressed_point.0),
+            hex::encode(output.encode_to_vec()),
+            category,
+            reason,
+        );
+        (
+            RpcUtxo {
+                utxo_id,
+                value: output.value_spark,
+                created_height: height,
+                tx_index,
+                out_index,
+            },
+            response,
+        )
+    }
+
+    fn assert_recovered_wallet_entry(
+        category: &str,
+        context: String,
+        blinding: [u8; 32],
+    ) -> (Wallet, RpcUtxo) {
+        let (utxo, response) = protocol_response(
+            category,
+            &context,
+            4_000_000,
+            12,
+            indra_core::types::primitives::STAKING_TX_IDX,
+            0,
+            blinding,
+        );
+        let recovered = recover_protocol_provenance_from_response(&utxo, &response).unwrap();
+        let ProtocolRecovery::Recovered {
+            category: recovered_category,
+            blinding: recovered_blinding,
+        } = recovered
+        else {
+            panic!("expected recovered provenance");
+        };
+        assert_eq!(recovered_category, category);
+        assert_eq!(recovered_blinding, blinding);
+
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(
+            utxo.utxo_id,
+            utxo.value,
+            recovered_blinding,
+            utxo.created_height,
+            utxo.tx_index,
+            utxo.out_index,
+        );
+        let restored = Wallet::from_json(&wallet.to_json()).unwrap();
+        let entry = restored.get(&utxo.utxo_id).unwrap();
+        assert_eq!(entry.blinding, blinding);
+        assert_eq!(
+            commit(entry.value_spark, &entry.blinding).0,
+            commit(utxo.value, &blinding).0
+        );
+        (restored, utxo)
+    }
+
+    fn hex32(byte: u8) -> String {
+        hex::encode([byte; 32])
     }
 
     #[test]
@@ -591,5 +1066,209 @@ mod tests {
         assert_eq!(spend_tx.inputs.len(), 1);
         assert_eq!(spend_tx.inputs[0].utxo_id, utxo.utxo_id);
         assert!(spend.change_spark > DUST_LIMIT_SPARK);
+    }
+
+    #[test]
+    fn scanner_recovers_reward_claim_via_protocol_provenance() {
+        let validator_id = [0x11; 32];
+        let delegator_id = [0x12; 32];
+        let height = 12;
+        let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            height
+        );
+
+        assert_recovered_wallet_entry("staking_reward_claim", context, blinding);
+    }
+
+    #[test]
+    fn scanner_recovers_validator_eviction_pending_reward_via_protocol_provenance() {
+        let validator_id = [0x21; 32];
+        let delegator_id = [0x22; 32];
+        let height = 12;
+        let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":4000000,"derivation":"pending_reward_payout"}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            hex32(0x23),
+            height
+        );
+
+        assert_recovered_wallet_entry("validator_eviction_pending_reward", context, blinding);
+    }
+
+    #[test]
+    fn scanner_recovers_validator_eviction_compact_bond_refund_via_protocol_provenance() {
+        let validator_id = [0x31; 32];
+        let delegator_id = [0x32; 32];
+        let bond_utxo_id = [0x33; 32];
+        let height = 12;
+        let amount = 4_000_000;
+        let blinding = derive_compact_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"compact_bond_release"}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            hex::encode(bond_utxo_id),
+            height,
+            amount
+        );
+
+        assert_recovered_wallet_entry("validator_eviction_bond_refund", context, blinding);
+    }
+
+    #[test]
+    fn scanner_recovers_slash_reporter_reward_via_protocol_provenance() {
+        let evidence_hash = [0x41; 32];
+        let height = 12;
+        let blinding = derive_slash_reward_blinding(&evidence_hash, height);
+        let context = format!(
+            r#"{{"evidence_hash":"{}","block_height":{}}}"#,
+            hex::encode(evidence_hash),
+            height
+        );
+
+        assert_recovered_wallet_entry("slash_reporter_reward", context, blinding);
+    }
+
+    #[test]
+    fn scanner_recovers_governance_deposit_change_via_protocol_provenance() {
+        let proposal_id = [0x51; 32];
+        let blinding = derive_governance_change_blinding(&proposal_id);
+        let context = format!(
+            r#"{{"proposal_id":"{}","proposer_id":"{}","proposed_epoch":0}}"#,
+            hex::encode(proposal_id),
+            hex32(0x52)
+        );
+
+        assert_recovered_wallet_entry("governance_deposit_change", context, blinding);
+    }
+
+    #[test]
+    fn scanner_recovers_governance_deposit_refund_via_protocol_provenance() {
+        let proposal_id = [0x61; 32];
+        let blinding = derive_governance_refund_blinding(&proposal_id);
+        let context = format!(
+            r#"{{"proposal_id":"{}","proposer_id":"{}","proposed_epoch":0}}"#,
+            hex::encode(proposal_id),
+            hex32(0x62)
+        );
+
+        assert_recovered_wallet_entry("governance_deposit_refund", context, blinding);
+    }
+
+    #[test]
+    fn scanner_rejects_malformed_protocol_provenance_response() {
+        let validator_id = [0x71; 32];
+        let delegator_id = [0x72; 32];
+        let height = 12;
+        let real_blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
+        let wrong_delegator = [0x73; 32];
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
+            hex::encode(validator_id),
+            hex::encode(wrong_delegator),
+            height
+        );
+        let (utxo, response) = protocol_response(
+            "staking_reward_claim",
+            &context,
+            4_000_000,
+            height,
+            indra_core::types::primitives::STAKING_TX_IDX,
+            0,
+            real_blinding,
+        );
+
+        let err = recover_protocol_provenance_from_response(&utxo, &response).unwrap_err();
+        assert!(err.contains("does not open"), "{err}");
+    }
+
+    #[test]
+    fn scanner_reports_legacy_and_slashed_self_stake_as_unrecoverable() {
+        for (category, reason) in [
+            (
+                "legacy_bond_release",
+                "legacy bond release requires local wallet history",
+            ),
+            (
+                "slashed_self_stake_release",
+                "slashed self-stake release requires archive provenance",
+            ),
+        ] {
+            let (utxo, response) = unrecoverable_response(category, reason);
+            let result = recover_protocol_provenance_from_response(&utxo, &response).unwrap();
+            assert_eq!(
+                result,
+                ProtocolRecovery::Unrecoverable {
+                    category: category.to_string(),
+                    reason: reason.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_and_pending_change_recovery_paths_still_work() {
+        let (seed, _, _) = hybrid_material(0x81);
+        let genesis_blinding = derive_genesis_blinding(&seed);
+        let mut wallet = Wallet::new();
+        let genesis_utxo = Bytes32::from([0x82; 32]);
+        wallet.add_utxo(genesis_utxo, 1_000_000, genesis_blinding, 0, 0, 0);
+        assert_eq!(
+            wallet.get(&genesis_utxo).unwrap().blinding,
+            genesis_blinding
+        );
+
+        let change_output = owned_protocol_output(2_000_000, [0x83; 32]);
+        let change_id = UtxoSet::compute_utxo_id(&change_output, 20, 0, 1);
+        wallet.add_pending_change(change_output, [0x83; 32]);
+        assert!(wallet.reconcile_pending_change(change_id, 20, 0, 1));
+        assert_eq!(wallet.get(&change_id).unwrap().blinding, [0x83; 32]);
+    }
+
+    #[test]
+    fn recovered_protocol_utxo_is_spendable_after_wallet_scan() {
+        let validator_id = [0x91; 32];
+        let delegator_id = [0x92; 32];
+        let height = 12;
+        let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            height
+        );
+        let (wallet, utxo) =
+            assert_recovered_wallet_entry("staking_reward_claim", context, blinding);
+
+        let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0xA8);
+        let (_, _, destination_pubkey) = hybrid_material(0xA9);
+        let params = TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &pubkey_hex(&destination_pubkey),
+            amount_spark: 1_000_000,
+            fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
+            wallet: &wallet,
+            hybrid_seed: sender_seed,
+            pq_sk_bytes: sender_pq_sk,
+            sender_pubkey,
+            recipient_payment_pubkey: None,
+        };
+
+        let spend = build_transaction(&params).unwrap();
+        let spend_tx = TransactionV1::decode_exact(&hex::decode(&spend.tx_hex).unwrap()).unwrap();
+        assert_eq!(spend_tx.inputs.len(), 1);
+        assert_eq!(spend_tx.inputs[0].utxo_id, utxo.utxo_id);
     }
 }

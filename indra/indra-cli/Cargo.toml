@@ -16,6 +16,7 @@ indra-rpc       = { path = "../indra-rpc" }
 indra-keystore  = { path = "../indra-keystore" }
 thiserror.workspace = true
 hex.workspace = true
+serde_json.workspace = true
 bip39.workspace = true
 rand.workspace = true
 libc.workspace = true
