@@ -651,6 +651,8 @@ impl EncryptedContainer {
     }
 
     fn associated_data(&self) -> KeystoreResult<Vec<u8>> {
+        // AAD is authenticated byte-for-byte for existing encrypted keystores.
+        // Optional fields included here must omit `None` or be version-gated.
         #[derive(Serialize)]
         struct Aad<'a> {
             format: &'a str,
@@ -1253,6 +1255,19 @@ mod tests {
             keys.public.hybrid_classical_pk
         );
         assert_eq!(loaded.pq_sk, keys.pq_sk);
+    }
+
+    #[test]
+    fn encrypted_keystore_aad_omits_absent_optional_public_fields() {
+        let mut keys = fixture();
+        keys.public.payment_pubkey = None;
+        keys.payment_keypair = None;
+        let container =
+            EncryptedContainer::from_public(&keys, [7; ARGON2_SALT_BYTES], [8; 12], "00".into());
+        let aad = String::from_utf8(container.associated_data().unwrap()).unwrap();
+
+        assert!(!aad.contains("payment_pubkey"));
+        assert!(!aad.contains("null"));
     }
 
     #[test]
