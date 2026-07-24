@@ -3597,12 +3597,13 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
 
 fn snapshot_rpc_state(
     driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
-    requested_block_height: Option<u64>,
+    req: &indra_rpc::types::RpcRequest,
 ) -> Result<RpcSnapshot, String> {
     let guard = driver
         .lock()
         .map_err(|_| "consensus driver lock poisoned".to_string())?;
     let engine = &guard.engine;
+    let requested_block_height = requested_block_height_for_rpc(req, &engine.state);
     let requested_block = match requested_block_height {
         Some(height) => match engine.block_store.get_read_only(height) {
             Ok(block) => Some((height, block)),
@@ -3655,13 +3656,34 @@ fn snapshot_rpc_state(
     })
 }
 
-fn requested_block_height_for_rpc(req: &indra_rpc::types::RpcRequest) -> Option<u64> {
-    if req.method != "indra_getBlock" {
-        return None;
+fn requested_block_height_for_rpc(
+    req: &indra_rpc::types::RpcRequest,
+    chain: &indra_state::ChainState,
+) -> Option<u64> {
+    match req.method.as_str() {
+        "indra_getBlock" => req
+            .params
+            .first()
+            .and_then(|param| indra_rpc::types::unquote(param).parse::<u64>().ok()),
+        "indra_explainUtxoProvenanceAuthorized" => provenance_requested_block_height(req, chain),
+        _ => None,
     }
-    req.params
-        .first()
-        .and_then(|param| indra_rpc::types::unquote(param).parse::<u64>().ok())
+}
+
+fn provenance_requested_block_height(
+    req: &indra_rpc::types::RpcRequest,
+    chain: &indra_state::ChainState,
+) -> Option<u64> {
+    let utxo_hex = req
+        .params
+        .get(2)
+        .map(|param| indra_rpc::types::unquote(param))?;
+    let bytes = hex::decode(utxo_hex).ok()?;
+    let raw: [u8; 32] = bytes.try_into().ok()?;
+    chain
+        .utxos
+        .get(&indra_core::Bytes32::from(raw))
+        .map(|entry| entry.created_height)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4044,7 +4066,7 @@ fn handle_rpc(
     }
 
     let response_body = {
-        let snapshot = match snapshot_rpc_state(driver, requested_block_height_for_rpc(&req)) {
+        let snapshot = match snapshot_rpc_state(driver, &req) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let body = RpcResponse::err(req.id.clone(), -32000, error).to_json();
@@ -4948,6 +4970,62 @@ mod tests {
             }
             _ => panic!("height query should be served from snapshot"),
         }
+    }
+
+    fn snapshot_test_output(byte: u8) -> indra_core::types::transaction::OutputV1 {
+        indra_core::types::transaction::OutputV1 {
+            value_spark: 1_000_000,
+            commitment: indra_core::types::crypto::CommitmentV1 {
+                compressed_point: indra_core::Bytes32::from([byte; 32]),
+            },
+            owner_pubkey: indra_core::types::crypto::HybridPubKey {
+                classical_pk: indra_core::Bytes32::from([byte.wrapping_add(1); 32]),
+                pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[byte; 32])
+                    .unwrap_or_default(),
+            },
+            range_proof: indra_core::types::primitives::VariableBytes::<
+                { indra_core::types::primitives::MAX_RANGE_PROOF_BYTES },
+            >::from_slice(&[byte; 32])
+            .unwrap_or_default(),
+            lock_height: 0,
+        }
+    }
+
+    #[test]
+    fn provenance_rpc_prefetches_utxo_creation_block() {
+        let mut chain = indra_state::ChainState::new_genesis();
+        let created_height = 174_599;
+        let utxo_id = chain
+            .utxos
+            .insert(snapshot_test_output(0xA5), created_height, u32::MAX, 0)
+            .unwrap();
+        let req = indra_rpc::types::RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "indra_explainUtxoProvenanceAuthorized".to_string(),
+            params: vec![
+                r#""owner-address""#.to_string(),
+                r#""scan-proof""#.to_string(),
+                format!(r#""{}""#, hex::encode(utxo_id.0)),
+            ],
+            id: indra_rpc::types::JsonId::Number(1),
+        };
+
+        assert_eq!(
+            requested_block_height_for_rpc(&req, &chain),
+            Some(created_height)
+        );
+
+        let mut unknown = [0xCCu8; 32];
+        unknown[0] ^= utxo_id.0[0];
+        let unknown_req = indra_rpc::types::RpcRequest {
+            params: vec![
+                r#""owner-address""#.to_string(),
+                r#""scan-proof""#.to_string(),
+                format!(r#""{}""#, hex::encode(unknown)),
+            ],
+            ..req
+        };
+        assert_eq!(requested_block_height_for_rpc(&unknown_req, &chain), None);
     }
 
     #[test]
