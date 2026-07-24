@@ -169,26 +169,7 @@ fn main() {
                     reconciled += 1;
                     continue;
                 }
-                if keys.payment_keypair.is_none() {
-                    continue;
-                }
-                let chain_id_ref = match chain_id.as_deref() {
-                    Some(chain_id) => chain_id,
-                    None => {
-                        let fetched = match indra_cli::fetch_chain_id(&node_url) {
-                            Ok(chain_id) => chain_id,
-                            Err(e) => {
-                                eprintln!(
-                                    "Error fetching chain ID for payment-note recovery: {}",
-                                    e
-                                );
-                                std::process::exit(1);
-                            }
-                        };
-                        chain_id.insert(fetched).as_str()
-                    }
-                };
-                match recover_payment_note_from_node(&node_url, &utxo, &keys, chain_id_ref) {
+                match recover_payment_note_if_available(&node_url, &utxo, &keys, &mut chain_id) {
                     Ok(Some(blinding)) => {
                         wallet.add_utxo(
                             utxo.utxo_id,
@@ -361,6 +342,25 @@ fn recover_payment_note_from_node(
         return Ok(None);
     };
     recover_payment_note_blinding(&tx, utxo, payment_keypair, chain_id)
+}
+
+fn recover_payment_note_if_available(
+    node_url: &str,
+    utxo: &RpcUtxo,
+    keys: &indra_cli::KeysFile,
+    chain_id: &mut Option<String>,
+) -> Result<Option<[u8; 32]>, String> {
+    if keys.payment_keypair.is_none() {
+        return Ok(None);
+    }
+    let chain_id_ref = match chain_id.as_deref() {
+        Some(chain_id) => chain_id,
+        None => {
+            let fetched = indra_cli::fetch_chain_id(node_url).map_err(|e| e.to_string())?;
+            chain_id.insert(fetched).as_str()
+        }
+    };
+    recover_payment_note_from_node(node_url, utxo, keys, chain_id_ref)
 }
 
 fn recover_payment_note_blinding(
@@ -759,6 +759,7 @@ mod tests {
         hybrid::{ClassicalKeypair, PqKeypair},
         PaymentKeypairV1,
     };
+    use indra_keystore::generate_keypairs;
 
     fn hybrid_material(seed_byte: u8) -> ([u8; 32], Vec<u8>, HybridPubKey) {
         let seed = [seed_byte; 32];
@@ -1192,6 +1193,55 @@ mod tests {
 
         let err = recover_protocol_provenance_from_response(&utxo, &response).unwrap_err();
         assert!(err.contains("does not open"), "{err}");
+    }
+
+    #[test]
+    fn scanner_attempts_protocol_provenance_without_payment_keypair() {
+        let mut keys = generate_keypairs(
+            "legacy-validator".to_string(),
+            [0x7A; 32],
+            [0x7B; 32],
+            [0x7C; 32],
+        )
+        .unwrap();
+        keys.payment_keypair = None;
+        keys.public.payment_pubkey = None;
+        assert!(keys.payment_keypair.is_none());
+
+        let validator_id = [0x7D; 32];
+        let delegator_id = [0x7E; 32];
+        let height = 12;
+        let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            height
+        );
+        let (utxo, response) = protocol_response(
+            "staking_reward_claim",
+            &context,
+            4_000_000,
+            height,
+            indra_core::types::primitives::STAKING_TX_IDX,
+            0,
+            blinding,
+        );
+
+        let mut chain_id = None;
+        assert_eq!(
+            recover_payment_note_if_available("http://127.0.0.1:1", &utxo, &keys, &mut chain_id)
+                .unwrap(),
+            None
+        );
+        let recovered = recover_protocol_provenance_from_response(&utxo, &response).unwrap();
+        assert_eq!(
+            recovered,
+            ProtocolRecovery::Recovered {
+                category: "staking_reward_claim".to_string(),
+                blinding,
+            }
+        );
     }
 
     #[test]
