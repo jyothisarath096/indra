@@ -28,7 +28,7 @@ fn usage_and_exit() -> ! {
     eprintln!("Usage:");
     eprintln!("  indra-tx address --keys <keys.json> [--keys-password-file <path>]");
     eprintln!("  indra-tx balance --keys <keys.json> [--keys-password-file <path>] [--address <hex>] --rpc <url>");
-    eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] --to <address-hex> --amount <spark> --rpc <url>");
+    eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <spark> --rpc <url>");
     std::process::exit(1);
 }
 
@@ -86,6 +86,7 @@ fn cmd_balance(args: &[String]) {
 
 fn cmd_send(args: &[String]) {
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
+    let wallet_path = get_arg(args, "--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let recipient_address = required_arg(args, "--to");
     let amount_spark = required_arg(args, "--amount")
         .parse::<u64>()
@@ -117,7 +118,18 @@ fn cmd_send(args: &[String]) {
         eprintln!("Error querying authorized legacy UTXOs: {}", e);
         std::process::exit(1);
     });
-    let wallet = wallet_from_utxos_json(&utxos_raw);
+    let local_wallet = Wallet::load(&wallet_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Error loading wallet {}: {}. Run indra-wallet-scan to recover or add spendable UTXOs with their blinding factors.",
+            wallet_path, e
+        );
+        std::process::exit(1);
+    });
+    let wallet =
+        spendable_wallet_from_authorized_utxos(&utxos_raw, &local_wallet).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
 
     let recipient_pubkey = resolve_recipient_pubkey(&rpc, &recipient_address);
     let recipient_payment_pubkey = lookup_payment_identity(&rpc, &recipient_address);
@@ -212,12 +224,17 @@ fn payment_identity_from_rpc_json(json: &str) -> Option<indra_crypto::PaymentPub
     indra_crypto::PaymentPubKeyV1::decode(&bytes).ok()
 }
 
-fn wallet_from_utxos_json(json: &str) -> Wallet {
-    let mut wallet = Wallet::new();
+fn spendable_wallet_from_authorized_utxos(
+    json: &str,
+    local_wallet: &Wallet,
+) -> Result<Wallet, String> {
+    let mut spendable = Wallet::new();
     let Some(utxos_json) = extract_array(json, "utxos") else {
-        return wallet;
+        return Ok(spendable);
     };
 
+    let mut discovered = 0usize;
+    let mut spendable_count = 0usize;
     let mut pos = 0usize;
     while let Some(start_rel) = utxos_json[pos..].find('{') {
         let start = pos + start_rel;
@@ -236,18 +253,30 @@ fn wallet_from_utxos_json(json: &str) -> Wallet {
         let mut utxo_id_arr = [0u8; 32];
         if utxo_id.len() == 32 {
             utxo_id_arr.copy_from_slice(&utxo_id);
-            wallet.add_utxo(
-                Bytes32::from(utxo_id_arr),
-                amount,
-                [0u8; 32],
-                created_height,
-                tx_index,
-                out_index,
-            );
+            discovered += 1;
+            let utxo_id = Bytes32::from(utxo_id_arr);
+            if let Some(entry) = local_wallet.get(&utxo_id) {
+                if entry.value_spark == amount && !entry.spent {
+                    spendable_count += 1;
+                    spendable.add_utxo(
+                        utxo_id,
+                        amount,
+                        entry.blinding,
+                        created_height,
+                        tx_index,
+                        out_index,
+                    );
+                }
+            }
         }
         pos = end + 1;
     }
-    wallet
+    if discovered > 0 && spendable_count == 0 {
+        return Err(format!(
+            "authorized RPC found {discovered} UTXO(s), but none match an unspent local wallet entry with a known blinding factor; run indra-wallet-scan or add the UTXO with --add-utxo before sending"
+        ));
+    }
+    Ok(spendable)
 }
 
 fn extract_array<'a>(json: &'a str, field: &str) -> Option<&'a str> {
@@ -371,11 +400,151 @@ fn copy32(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_cli::tx_builder::MIN_FEE_SPARK;
+    use indra_core::{
+        codec::Decode,
+        types::{
+            primitives::VariableBytes,
+            transaction::{OutputV1, TransactionV1},
+        },
+    };
+    use indra_crypto::{
+        commitment::verify_balance, hybrid::ClassicalKeypair, pedersen::commit, PedersenCommitment,
+        PqKeypair,
+    };
 
     #[test]
-    fn wallet_from_nested_utxos_response_parses_balance() {
+    fn spendable_wallet_from_nested_utxos_response_uses_local_blinding() {
         let json = r#"{"jsonrpc":"2.0","result":{"address":"28ce6ab9565c324950a4308ccd1187c473fa737d4e687e12121c04b0e4c8c1b6","utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","amount":1000000000000,"created_height":0,"tx_index":0,"out_index":0,"lock_height":0}]},"id":1}"#;
-        let wallet = wallet_from_utxos_json(json);
+        let mut local_wallet = Wallet::new();
+        let utxo_id = Bytes32::from(copy32(
+            &hex::decode("e64a971111111111111111111111111111111111111111111111111111111111")
+                .unwrap(),
+        ));
+        local_wallet.add_utxo(utxo_id, 1_000_000_000_000, [0x42; 32], 0, 0, 0);
+
+        let wallet = spendable_wallet_from_authorized_utxos(json, &local_wallet).unwrap();
         assert_eq!(wallet.balance(), 1_000_000_000_000);
+        assert_eq!(wallet.get(&utxo_id).unwrap().blinding, [0x42; 32]);
+    }
+
+    #[test]
+    fn rpc_discovered_utxo_without_local_blinding_fails_clearly() {
+        let json = r#"{"jsonrpc":"2.0","result":{"utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","amount":1000000000000,"created_height":0,"tx_index":0,"out_index":0}]}}"#;
+        let err = spendable_wallet_from_authorized_utxos(json, &Wallet::new()).unwrap_err();
+
+        assert!(err.contains("authorized RPC found 1 UTXO"));
+        assert!(err.contains("known blinding factor"));
+        assert!(err.contains("indra-wallet-scan"));
+    }
+
+    #[test]
+    fn old_rpc_zero_blinding_path_builds_unbalanced_transaction() {
+        let (hybrid_seed, pq_sk, sender_pubkey) = key_material(0x11);
+        let (_, _, recipient_pubkey) = key_material(0x22);
+        let recipient_hex = pubkey_hex(&recipient_pubkey);
+        let utxo_id = Bytes32::from([0xA7; 32]);
+        let input_value = 1_000_000;
+        let real_input_blinding = [0x42; 32];
+
+        let mut old_rpc_wallet = Wallet::new();
+        old_rpc_wallet.add_utxo(utxo_id, input_value, [0u8; 32], 7, 0, 0);
+
+        let built = build_transaction(&TxParams {
+            chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &recipient_hex,
+            amount_spark: 500_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &old_rpc_wallet,
+            hybrid_seed,
+            pq_sk_bytes: pq_sk,
+            sender_pubkey,
+            recipient_payment_pubkey: None,
+        })
+        .unwrap();
+        let tx = decode_built_tx(&built);
+        let real_input_commitment = commit(input_value, &real_input_blinding);
+
+        assert!(verify_balance(
+            &[PedersenCommitment(real_input_commitment.0)],
+            &output_commitments(&tx.outputs),
+            &PedersenCommitment(tx.fee_commitment.compressed_point.0),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn known_local_blinding_builds_balanced_transaction() {
+        let (hybrid_seed, pq_sk, sender_pubkey) = key_material(0x33);
+        let (_, _, recipient_pubkey) = key_material(0x44);
+        let recipient_hex = pubkey_hex(&recipient_pubkey);
+        let utxo_id = Bytes32::from([0xB8; 32]);
+        let input_value = 1_000_000;
+        let real_input_blinding = [0x42; 32];
+        let rpc_json = format!(
+            r#"{{"result":{{"utxos":[{{"utxo_id":"{}","amount":{},"created_height":7,"tx_index":0,"out_index":0}}]}}}}"#,
+            hex::encode(utxo_id.0),
+            input_value
+        );
+        let mut local_wallet = Wallet::new();
+        local_wallet.add_utxo(utxo_id, input_value, real_input_blinding, 7, 0, 0);
+        let spendable_wallet =
+            spendable_wallet_from_authorized_utxos(&rpc_json, &local_wallet).unwrap();
+
+        let built = build_transaction(&TxParams {
+            chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &recipient_hex,
+            amount_spark: 500_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &spendable_wallet,
+            hybrid_seed,
+            pq_sk_bytes: pq_sk,
+            sender_pubkey,
+            recipient_payment_pubkey: None,
+        })
+        .unwrap();
+        let tx = decode_built_tx(&built);
+        let real_input_commitment = commit(input_value, &real_input_blinding);
+
+        verify_balance(
+            &[PedersenCommitment(real_input_commitment.0)],
+            &output_commitments(&tx.outputs),
+            &PedersenCommitment(tx.fee_commitment.compressed_point.0),
+        )
+        .unwrap();
+    }
+
+    fn key_material(seed_byte: u8) -> ([u8; 32], Vec<u8>, HybridPubKey) {
+        let seed = [seed_byte; 32];
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let pq_pk = pq.public_key();
+        (
+            seed,
+            pq.secret_key_bytes(),
+            HybridPubKey {
+                classical_pk: Bytes32::from(classical.public_key().0),
+                pq_pk: VariableBytes::from_slice(&pq_pk.0).unwrap(),
+            },
+        )
+    }
+
+    fn pubkey_hex(pubkey: &HybridPubKey) -> String {
+        format!(
+            "{}:{}",
+            hex::encode(pubkey.classical_pk.0),
+            hex::encode(pubkey.pq_pk.as_slice())
+        )
+    }
+
+    fn decode_built_tx(built: &indra_cli::BuiltTransaction) -> TransactionV1 {
+        TransactionV1::decode_exact(&hex::decode(&built.tx_hex).unwrap()).unwrap()
+    }
+
+    fn output_commitments(outputs: &[OutputV1]) -> Vec<PedersenCommitment> {
+        outputs
+            .iter()
+            .map(|output| PedersenCommitment(output.commitment.compressed_point.0))
+            .collect()
     }
 }
