@@ -7,12 +7,12 @@
 use crate::{CliError, CliResult};
 
 pub use indra_keystore::{
-    check_password_file_permissions, decrypt_encrypted_keys, encrypt_plaintext_keys,
-    encrypt_plaintext_keys_replace, generate_from_new_mnemonic, generate_from_passphrase,
-    generate_keypairs, has_secret_value_in_argv, inspect_public_metadata, load_keys,
-    recover_from_mnemonic, warn_if_key_file_permissive,
-    write_keys_secure as write_keys_file_secure, KeysFile, KeystoreError, PasswordSource,
-    ValidatorKeys,
+    add_payment_key_to_file, check_password_file_permissions, decrypt_encrypted_keys,
+    encrypt_plaintext_keys, encrypt_plaintext_keys_replace, generate_from_new_mnemonic,
+    generate_from_passphrase, generate_keypairs, has_secret_value_in_argv, inspect_public_metadata,
+    load_keys, recover_from_mnemonic, warn_if_key_file_permissive,
+    write_keys_secure as write_keys_file_secure, AddPaymentKeyReport, IdentityMaterialSnapshot,
+    KeysFile, KeystoreError, PasswordSource, ValidatorKeys,
 };
 
 /// Convert a keystore result into the CLI error type.

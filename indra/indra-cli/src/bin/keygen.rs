@@ -19,6 +19,10 @@ fn main() {
         cmd_inspect(&args[2..]);
         return;
     }
+    if args.get(1).map(String::as_str) == Some("add-payment-key") {
+        cmd_add_payment_key(&args[2..]);
+        return;
+    }
 
     let output = args
         .iter()
@@ -271,6 +275,61 @@ fn cmd_inspect(args: &[String]) {
     }
 }
 
+fn cmd_add_payment_key(args: &[String]) {
+    let keys_path = get(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
+    let out = get(args, "--out");
+    let replace = args.iter().any(|a| a == "--replace");
+    let force = args.iter().any(|a| a == "--force");
+    if replace && out.is_some() {
+        eprintln!("Error: choose either --replace or --out, not both");
+        std::process::exit(1);
+    }
+    let password = keygen_password_source_slice(args)
+        .resolve(false)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read keystore password: {}", e);
+            std::process::exit(1);
+        });
+    let out_path = out.as_deref().map(std::path::Path::new);
+    let report = indra_cli::add_payment_key_to_file(
+        std::path::Path::new(&keys_path),
+        password.as_bytes(),
+        out_path,
+        replace,
+        force,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to add payment key: {}", e);
+        std::process::exit(1);
+    });
+
+    println!("INDRA payment key retrofit complete");
+    println!("Input:       {}", keys_path);
+    println!("Output:      {}", report.output_path.display());
+    if let Some(backup) = &report.backup_path {
+        println!("Backup:      {}", backup.display());
+    }
+    println!("Payment PK:  {}", report.payment_pubkey_hex);
+    println!();
+    println!("Identity material before/after check:");
+    for (field, before, after, unchanged) in
+        indra_cli::IdentityMaterialSnapshot::comparison_rows(&report.before, &report.after)
+    {
+        println!(
+            "  {:<20} {}",
+            field,
+            if unchanged { "UNCHANGED" } else { "CHANGED" }
+        );
+        println!("    before: {}", before);
+        println!("    after:  {}", after);
+    }
+    println!();
+    println!("Only payment_keypair and public.payment_pubkey were added/updated.");
+    if !replace {
+        println!("Original file was not modified.");
+    }
+}
+
 fn get(args: &[String], flag: &str) -> Option<String> {
     get_ref(args, flag).map(ToString::to_string)
 }
@@ -302,7 +361,7 @@ fn keygen_password_source_slice(args: &[String]) -> indra_cli::PasswordSource<'_
 
 fn print_help() {
     println!(
-        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json"
+        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json\n  indra-keygen add-payment-key --keys keys.json [--keys-password-file path] [--out new-file.json | --replace] [--force]"
     );
 }
 

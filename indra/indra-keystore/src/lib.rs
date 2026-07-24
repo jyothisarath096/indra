@@ -111,6 +111,124 @@ pub struct KeysFile {
     pub payment_keypair: Option<PaymentKeypairV1>,
 }
 
+/// Byte-for-byte identity material snapshot used by payment-key retrofit checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityMaterialSnapshot {
+    /// Private hybrid seed.
+    pub hybrid_seed: [u8; 32],
+    /// Private BLS seed.
+    pub bls_seed: [u8; 32],
+    /// Private VRF seed.
+    pub vrf_seed: [u8; 32],
+    /// Private ML-DSA-87 key bytes.
+    pub pq_sk: Vec<u8>,
+    /// Public validator id.
+    pub validator_id: [u8; 32],
+    /// Public classical signing key.
+    pub hybrid_classical_pk: [u8; 32],
+    /// Public PQ signing key bytes.
+    pub hybrid_pq_pk: Vec<u8>,
+    /// Public BLS key.
+    pub bls_pk: [u8; 48],
+    /// Public VRF key.
+    pub vrf_pk: [u8; 32],
+}
+
+impl IdentityMaterialSnapshot {
+    /// Capture all non-payment identity material.
+    pub fn from_keys(keys: &KeysFile) -> Self {
+        Self {
+            hybrid_seed: keys.hybrid_seed,
+            bls_seed: keys.bls_seed,
+            vrf_seed: keys.vrf_seed,
+            pq_sk: keys.pq_sk.clone(),
+            validator_id: keys.public.validator_id,
+            hybrid_classical_pk: keys.public.hybrid_classical_pk,
+            hybrid_pq_pk: keys.public.hybrid_pq_pk.clone(),
+            bls_pk: keys.public.bls_pk,
+            vrf_pk: keys.public.vrf_pk,
+        }
+    }
+
+    /// Rows for explicit operator-facing before/after reporting.
+    pub fn comparison_rows(
+        before: &Self,
+        after: &Self,
+    ) -> Vec<(&'static str, String, String, bool)> {
+        vec![
+            (
+                "hybrid_seed",
+                hex::encode(before.hybrid_seed),
+                hex::encode(after.hybrid_seed),
+                before.hybrid_seed == after.hybrid_seed,
+            ),
+            (
+                "bls_seed",
+                hex::encode(before.bls_seed),
+                hex::encode(after.bls_seed),
+                before.bls_seed == after.bls_seed,
+            ),
+            (
+                "vrf_seed",
+                hex::encode(before.vrf_seed),
+                hex::encode(after.vrf_seed),
+                before.vrf_seed == after.vrf_seed,
+            ),
+            (
+                "pq_sk",
+                hex::encode(&before.pq_sk),
+                hex::encode(&after.pq_sk),
+                before.pq_sk == after.pq_sk,
+            ),
+            (
+                "validator_id",
+                hex::encode(before.validator_id),
+                hex::encode(after.validator_id),
+                before.validator_id == after.validator_id,
+            ),
+            (
+                "hybrid_classical_pk",
+                hex::encode(before.hybrid_classical_pk),
+                hex::encode(after.hybrid_classical_pk),
+                before.hybrid_classical_pk == after.hybrid_classical_pk,
+            ),
+            (
+                "hybrid_pq_pk",
+                hex::encode(&before.hybrid_pq_pk),
+                hex::encode(&after.hybrid_pq_pk),
+                before.hybrid_pq_pk == after.hybrid_pq_pk,
+            ),
+            (
+                "bls_pk",
+                hex::encode(before.bls_pk),
+                hex::encode(after.bls_pk),
+                before.bls_pk == after.bls_pk,
+            ),
+            (
+                "vrf_pk",
+                hex::encode(before.vrf_pk),
+                hex::encode(after.vrf_pk),
+                before.vrf_pk == after.vrf_pk,
+            ),
+        ]
+    }
+}
+
+/// Result of a payment-key retrofit operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPaymentKeyReport {
+    /// Identity material before adding payment fields.
+    pub before: IdentityMaterialSnapshot,
+    /// Identity material after adding payment fields.
+    pub after: IdentityMaterialSnapshot,
+    /// Newly installed payment public key, hex-encoded.
+    pub payment_pubkey_hex: String,
+    /// File written by the operation.
+    pub output_path: PathBuf,
+    /// Backup created before replacement, if `--replace` was used.
+    pub backup_path: Option<PathBuf>,
+}
+
 impl KeysFile {
     /// Render the legacy plaintext JSON format.
     pub fn to_json(&self) -> String {
@@ -478,6 +596,136 @@ pub fn encrypt_plaintext_keys_replace(
     std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
     set_secret_file_permissions(path)?;
     Ok(backup)
+}
+
+/// Add deterministic payment key material to an existing key set without
+/// changing any validator identity material.
+pub fn add_payment_key_material(keys: &KeysFile, force: bool) -> KeystoreResult<KeysFile> {
+    if keys.payment_keypair.is_some() && !force {
+        return Err(KeystoreError::Parse(
+            "payment_keypair already exists; pass --force to replace payment key material"
+                .to_string(),
+        ));
+    }
+    let before = IdentityMaterialSnapshot::from_keys(keys);
+    let payment_source = generate_keypairs(
+        keys.name.clone(),
+        keys.hybrid_seed,
+        keys.bls_seed,
+        keys.vrf_seed,
+    )?;
+    let payment_keypair = payment_source.payment_keypair.ok_or_else(|| {
+        KeystoreError::Crypto(
+            "compatibility payment-key derivation did not produce a keypair".into(),
+        )
+    })?;
+    let mut updated = keys.clone();
+    updated.payment_keypair = Some(payment_keypair.clone());
+    updated.public.payment_pubkey = Some(payment_keypair.public_key());
+    let after = IdentityMaterialSnapshot::from_keys(&updated);
+    if before != after {
+        return Err(KeystoreError::Crypto(
+            "payment-key retrofit changed validator identity material".to_string(),
+        ));
+    }
+    verify_public_metadata(&updated)?;
+    Ok(updated)
+}
+
+/// Add payment key material, encrypt, verify decryption, and write the result.
+///
+/// By default this writes a sibling file named `keys.with-payment.json`. Passing
+/// `replace=true` creates a timestamped backup and atomically replaces `path`.
+pub fn add_payment_key_to_file(
+    path: &Path,
+    password: &[u8],
+    out: Option<&Path>,
+    replace: bool,
+    force: bool,
+) -> KeystoreResult<AddPaymentKeyReport> {
+    add_payment_key_to_file_with_encryptor(
+        path,
+        password,
+        out,
+        replace,
+        force,
+        encrypt_plaintext_keys,
+    )
+}
+
+fn add_payment_key_to_file_with_encryptor(
+    path: &Path,
+    password: &[u8],
+    out: Option<&Path>,
+    replace: bool,
+    force: bool,
+    encryptor: fn(&KeysFile, &[u8]) -> KeystoreResult<String>,
+) -> KeystoreResult<AddPaymentKeyReport> {
+    if replace && out.is_some() {
+        return Err(KeystoreError::Parse(
+            "choose either --replace or --out, not both".to_string(),
+        ));
+    }
+    let json = std::fs::read_to_string(path)
+        .map_err(|e| KeystoreError::Io(format!("{}: {}", path.display(), e)))?;
+    let original = match detect_format(&json)? {
+        KeyFileFormat::Plaintext => plaintext_from_json(&json)?,
+        KeyFileFormat::Encrypted => decrypt_encrypted_keys(&json, password)?,
+    };
+    let before = IdentityMaterialSnapshot::from_keys(&original);
+    let updated = add_payment_key_material(&original, force)?;
+    let after = IdentityMaterialSnapshot::from_keys(&updated);
+    let encrypted = encryptor(&updated, password)?;
+    let verified = decrypt_encrypted_keys(&encrypted, password)?;
+    if verified != updated {
+        return Err(KeystoreError::Crypto(
+            "payment-key retrofit encryption round-trip verification failed".to_string(),
+        ));
+    }
+
+    let output_path = if replace {
+        path.to_path_buf()
+    } else {
+        out.map(Path::to_path_buf)
+            .unwrap_or_else(|| default_payment_key_output_path(path))
+    };
+    let backup_path = if replace {
+        let tmp = path.with_extension("json.payment-key.tmp");
+        write_keys_secure(path_to_str(&tmp)?, &encrypted)?;
+        let backup = timestamped_backup_path(path);
+        std::fs::rename(path, &backup).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        set_secret_file_permissions(&backup)?;
+        std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        set_secret_file_permissions(path)?;
+        Some(backup)
+    } else {
+        write_keys_secure(path_to_str(&output_path)?, &encrypted)?;
+        None
+    };
+
+    Ok(AddPaymentKeyReport {
+        before,
+        after,
+        payment_pubkey_hex: hex::encode(
+            updated
+                .public
+                .payment_pubkey
+                .as_ref()
+                .expect("retrofit installs payment_pubkey")
+                .encode(),
+        ),
+        output_path,
+        backup_path,
+    })
+}
+
+fn default_payment_key_output_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("keys");
+    parent.join(format!("{stem}.with-payment.json"))
 }
 
 fn timestamped_backup_path(path: &Path) -> PathBuf {
@@ -1128,6 +1376,24 @@ mod tests {
         generate_keypairs("validator".to_string(), [1; 32], [2; 32], [3; 32]).unwrap()
     }
 
+    fn fixture_without_payment() -> KeysFile {
+        let mut keys = fixture();
+        keys.payment_keypair = None;
+        keys.public.payment_pubkey = None;
+        keys
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn corrupt_encryptor(keys: &KeysFile, password: &[u8]) -> KeystoreResult<String> {
+        let encrypted = encrypt_plaintext_keys(keys, password)?;
+        Ok(encrypted.replacen(r#""ciphertext": ""#, r#""ciphertext": "00"#, 1))
+    }
+
     #[test]
     fn encrypted_keystore_round_trip_recovers_identical_keys() {
         let keys = fixture();
@@ -1304,6 +1570,131 @@ mod tests {
         let recovered = decrypt_encrypted_keys(&json, b"pw").unwrap();
         assert_eq!(recovered.payment_keypair, keys.payment_keypair);
         assert_eq!(recovered.public.payment_pubkey, keys.public.payment_pubkey);
+    }
+
+    #[test]
+    fn add_payment_key_writes_new_file_with_identity_material_unchanged() {
+        let dir = test_dir("indra-add-payment-key-new");
+        let path = dir.join("keys.json");
+        let out = dir.join("keys.retrofit.json");
+        let keys = fixture_without_payment();
+        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
+
+        let report = add_payment_key_to_file(&path, b"pw", Some(&out), false, false).unwrap();
+        let updated_json = std::fs::read_to_string(&out).unwrap();
+        let updated = decrypt_encrypted_keys(&updated_json, b"pw").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(report.output_path, out);
+        assert_eq!(report.backup_path, None);
+        assert!(updated.payment_keypair.is_some());
+        assert!(updated.public.payment_pubkey.is_some());
+        assert_eq!(
+            IdentityMaterialSnapshot::from_keys(&keys),
+            IdentityMaterialSnapshot::from_keys(&updated)
+        );
+        assert!(
+            IdentityMaterialSnapshot::comparison_rows(&report.before, &report.after)
+                .into_iter()
+                .all(|(_, _, _, unchanged)| unchanged)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_payment_key_refuses_existing_payment_key_unless_forced() {
+        let dir = test_dir("indra-add-payment-key-force");
+        let path = dir.join("keys.json");
+        let out = dir.join("forced.json");
+        let keys = fixture();
+        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
+
+        assert!(add_payment_key_to_file(&path, b"pw", Some(&out), false, false).is_err());
+        let report = add_payment_key_to_file(&path, b"pw", Some(&out), false, true).unwrap();
+        let forced =
+            decrypt_encrypted_keys(&std::fs::read_to_string(&out).unwrap(), b"pw").unwrap();
+
+        assert_eq!(report.output_path, out);
+        assert!(forced.payment_keypair.is_some());
+        assert_eq!(
+            IdentityMaterialSnapshot::from_keys(&keys),
+            IdentityMaterialSnapshot::from_keys(&forced)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_payment_key_round_trip_failure_does_not_write_output() {
+        let dir = test_dir("indra-add-payment-key-corrupt");
+        let path = dir.join("keys.json");
+        let out = dir.join("keys.with-payment.json");
+        let keys = fixture_without_payment();
+        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
+
+        let err = add_payment_key_to_file_with_encryptor(
+            &path,
+            b"pw",
+            Some(&out),
+            false,
+            false,
+            corrupt_encryptor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            KeystoreError::InvalidHex(_) | KeystoreError::Crypto(_)
+        ));
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_payment_key_replace_creates_backup_before_replacing() {
+        let dir = test_dir("indra-add-payment-key-replace");
+        let path = dir.join("keys.json");
+        let keys = fixture_without_payment();
+        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
+
+        let report = add_payment_key_to_file(&path, b"pw", None, true, false).unwrap();
+        let backup = report.backup_path.expect("replace creates backup");
+        let replaced =
+            decrypt_encrypted_keys(&std::fs::read_to_string(&path).unwrap(), b"pw").unwrap();
+        let backup_keys =
+            decrypt_encrypted_keys(&std::fs::read_to_string(&backup).unwrap(), b"pw").unwrap();
+
+        assert!(backup.exists());
+        assert_eq!(backup_keys.payment_keypair, None);
+        assert_eq!(backup_keys.public.payment_pubkey, None);
+        assert!(replaced.payment_keypair.is_some());
+        assert!(replaced.public.payment_pubkey.is_some());
+        assert_eq!(
+            IdentityMaterialSnapshot::from_keys(&keys),
+            IdentityMaterialSnapshot::from_keys(&replaced)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_payment_key_default_output_never_touches_original() {
+        let dir = test_dir("indra-add-payment-key-default");
+        let path = dir.join("keys.json");
+        let default_out = dir.join("keys.with-payment.json");
+        let keys = fixture_without_payment();
+        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
+
+        let report = add_payment_key_to_file(&path, b"pw", None, false, false).unwrap();
+
+        assert_eq!(report.output_path, default_out);
+        assert!(default_out.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

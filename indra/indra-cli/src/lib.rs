@@ -48,11 +48,12 @@ pub mod wallet;
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
 pub use keygen::{
-    decrypt_encrypted_keys, encrypt_plaintext_keys, encrypt_plaintext_keys_replace,
-    generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs,
-    has_secret_value_in_argv, inspect_public_metadata, load_keys_for_cli,
+    add_payment_key_to_file, decrypt_encrypted_keys, encrypt_plaintext_keys,
+    encrypt_plaintext_keys_replace, generate_from_new_mnemonic, generate_from_passphrase,
+    generate_keypairs, has_secret_value_in_argv, inspect_public_metadata, load_keys_for_cli,
     password_source_from_args, recover_from_mnemonic, warn_if_key_file_permissive,
-    write_keys_file_secure, KeysFile, PasswordSource, ValidatorKeys,
+    write_keys_file_secure, AddPaymentKeyReport, IdentityMaterialSnapshot, KeysFile,
+    PasswordSource, ValidatorKeys,
 };
 pub use legacy_scan_auth::{
     build_legacy_scan_auth_proof, fetch_legacy_scan_challenge, json_string, rpc_call_raw_params,
