@@ -1288,7 +1288,9 @@ mod stake_bond_entry_tests {
     use super::*;
     use indra_core::codec::Decode;
     use indra_core::types::crypto::{CommitmentV1, HybridPubKey};
-    use indra_core::types::primitives::hard_forks::COMPACT_STAKE_BOND_HEIGHT;
+    use indra_core::types::primitives::hard_forks::{
+        COMPACT_BOND_PUBKEY_OMISSION_HEIGHT, COMPACT_STAKE_BOND_HEIGHT,
+    };
 
     fn output(byte: u8, proof_len: usize) -> OutputV1 {
         OutputV1 {
@@ -1545,23 +1547,28 @@ mod stake_bond_entry_tests {
     #[test]
     fn bond_shape_replay_is_deterministic_across_range_and_pubkey_omission_boundaries() {
         fn replay() -> Vec<Vec<u8>> {
-            [9u8, 10, 20]
-                .into_iter()
-                .map(|height| {
-                    StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
-                        Bytes32::from([height; 32]),
-                        Bytes32::from([0xA0; 32]),
-                        Bytes32::from([0xD0; 32]),
-                        1_000,
-                        height as u64,
-                        output(height, 674),
-                        height as u64,
-                        10,
-                        20,
-                    )
-                    .encode_to_vec()
-                })
-                .collect()
+            [
+                COMPACT_STAKE_BOND_HEIGHT - 1,
+                COMPACT_STAKE_BOND_HEIGHT,
+                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT - 1,
+                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, height)| {
+                let byte = 0x30u8.wrapping_add(index as u8);
+                StakeBondEntry::new(
+                    Bytes32::from([byte; 32]),
+                    Bytes32::from([0xA0; 32]),
+                    Bytes32::from([0xD0; 32]),
+                    1_000,
+                    height,
+                    output(byte, 674),
+                    height,
+                )
+                .encode_to_vec()
+            })
+            .collect()
         }
 
         let first = replay();
@@ -1569,7 +1576,8 @@ mod stake_bond_entry_tests {
         assert_eq!(first, second);
         assert_eq!(first[0][0], SCHEMA_VERSION);
         assert_eq!(first[1][0], STAKE_BOND_COMPACT_MARKER);
-        assert_eq!(first[2][0], STAKE_BOND_FULLY_COMPACT_MARKER);
+        assert_eq!(first[2][0], STAKE_BOND_COMPACT_MARKER);
+        assert_eq!(first[3][0], STAKE_BOND_FULLY_COMPACT_MARKER);
     }
 }
 

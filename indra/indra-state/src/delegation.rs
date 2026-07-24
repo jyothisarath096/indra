@@ -1491,7 +1491,7 @@ mod tests {
     };
     use indra_core::types::{
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
-        primitives::VariableBytes,
+        primitives::{hard_forks::PAYMENT_BLINDING_HEIGHT, VariableBytes},
         transaction::OutputV1,
     };
     use indra_crypto::{
@@ -3251,7 +3251,8 @@ mod tests {
         );
         let chain_id = state.chain_id.clone();
 
-        let err = apply_staking_op(&mut state, &op, &chain_id, u64::MAX - 1).unwrap_err();
+        let err =
+            apply_staking_op(&mut state, &op, &chain_id, PAYMENT_BLINDING_HEIGHT - 1).unwrap_err();
         assert!(
             matches!(err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
         );
@@ -3262,7 +3263,7 @@ mod tests {
     #[test]
     fn register_payment_key_succeeds_and_updates_commitment_after_activation() {
         let mut state = ChainState::new_genesis();
-        let height = u64::MAX;
+        let height = PAYMENT_BLINDING_HEIGHT;
         state.rebuild_state_commitment_v2(height);
         let before_root = state.state_commitment_v2_root(height);
         let owner_keypair = keypair(0x43);

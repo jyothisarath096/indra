@@ -617,6 +617,7 @@ fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::primitives::hard_forks::PAYMENT_BLINDING_HEIGHT;
     use crate::{codec::Decode, types::primitives::VariableBytes};
 
     fn dummy_pubkey() -> HybridPubKey {
@@ -809,8 +810,12 @@ mod tests {
             owner_pubkey: dummy_pubkey(),
             payment_pubkey: dummy_payment_pubkey(0xC1),
         });
-        assert!(op.validate_structure_at_height(u64::MAX - 1).is_err());
-        assert!(op.validate_structure_at_height(u64::MAX).is_ok());
+        assert!(op
+            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT - 1)
+            .is_err());
+        assert!(op
+            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT)
+            .is_ok());
     }
 
     #[test]

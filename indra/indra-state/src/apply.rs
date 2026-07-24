@@ -1128,11 +1128,11 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
-                hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK,
-                EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
-                MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK,
-                MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_BOND_SPARK,
-                SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+                hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
+                DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
+                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
+                MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
+                MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
                 TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
@@ -3677,7 +3677,7 @@ mod tests {
     #[test]
     fn payment_key_activation_replay_is_deterministic_before_gate_and_populates_after_gate() {
         let mut initial = ChainState::new_genesis();
-        initial.height = u64::MAX - 2;
+        initial.height = PAYMENT_BLINDING_HEIGHT - 2;
         initial.tip_hash = Bytes32::ZERO;
 
         let owner_keypair = HybridKeypair::new(
@@ -3689,7 +3689,7 @@ mod tests {
         let pre_payment_pubkey = payment_pubkey(0xA7);
         let pre_op =
             signed_register_payment_key_op(&initial, &owner_keypair, pre_payment_pubkey, 1);
-        let mut pre_block = make_block_at_height(&initial, vec![], u64::MAX - 1, 0);
+        let mut pre_block = make_block_at_height(&initial, vec![], PAYMENT_BLINDING_HEIGHT - 1, 0);
         pre_block.staking_ops.push(pre_op);
 
         let mut first_replay = initial.clone();
@@ -3706,7 +3706,7 @@ mod tests {
         assert_eq!(second_replay, initial);
 
         let mut activated_initial = initial.clone();
-        activated_initial.height = u64::MAX - 1;
+        activated_initial.height = PAYMENT_BLINDING_HEIGHT - 1;
         activated_initial.tip_hash = Bytes32::ZERO;
         first_replay = activated_initial.clone();
         second_replay = activated_initial.clone();
@@ -3718,9 +3718,11 @@ mod tests {
             post_payment_pubkey.clone(),
             1,
         );
-        let mut post_block = make_block_at_height(&activated_initial, vec![], u64::MAX, 0);
+        let mut post_block =
+            make_block_at_height(&activated_initial, vec![], PAYMENT_BLINDING_HEIGHT, 0);
         post_block.staking_ops.push(post_op.clone());
-        let mut post_block_second = make_block_at_height(&second_replay, vec![], u64::MAX, 0);
+        let mut post_block_second =
+            make_block_at_height(&second_replay, vec![], PAYMENT_BLINDING_HEIGHT, 0);
         post_block_second.staking_ops.push(post_op);
 
         apply_block(&mut first_replay, &post_block, 0).unwrap();
@@ -3736,7 +3738,7 @@ mod tests {
     #[test]
     fn payment_notes_transaction_is_rejected_before_gate() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        state.height = u64::MAX - 2;
+        state.height = PAYMENT_BLINDING_HEIGHT - 2;
         state.tip_hash = Bytes32::ZERO;
 
         let mut tx = make_tx(
@@ -3753,7 +3755,7 @@ mod tests {
             &state.chain_id.clone(),
             vec![Some(payment_note(0xB2))],
         );
-        let block = make_block_at_height(&state, vec![tx], u64::MAX - 1, 0);
+        let block = make_block_at_height(&state, vec![tx], PAYMENT_BLINDING_HEIGHT - 1, 0);
 
         let before = state.clone();
         let err = apply_block(&mut state, &block, 0).unwrap_err();
@@ -3769,7 +3771,7 @@ mod tests {
     #[test]
     fn payment_notes_transaction_is_accepted_after_gate_and_mutates_no_new_state() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        state.height = u64::MAX - 1;
+        state.height = PAYMENT_BLINDING_HEIGHT - 1;
         state.tip_hash = Bytes32::ZERO;
         let original_payment_registry = state.payment_identities.clone();
 
@@ -3787,7 +3789,7 @@ mod tests {
             &state.chain_id.clone(),
             vec![Some(payment_note(0xB4))],
         );
-        let block = make_block_at_height(&state, vec![tx], u64::MAX, 0);
+        let block = make_block_at_height(&state, vec![tx], PAYMENT_BLINDING_HEIGHT, 0);
 
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.payment_identities, original_payment_registry);
@@ -3798,7 +3800,7 @@ mod tests {
     #[test]
     fn payment_notes_all_none_has_same_spendability_after_gate() {
         let (mut initial, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        initial.height = u64::MAX - 1;
+        initial.height = PAYMENT_BLINDING_HEIGHT - 1;
         initial.tip_hash = Bytes32::ZERO;
 
         let legacy_tx = make_tx(
@@ -3818,12 +3820,17 @@ mod tests {
         );
 
         let mut legacy_state = initial.clone();
-        let legacy_block = make_block_at_height(&legacy_state, vec![legacy_tx], u64::MAX, 0);
+        let legacy_block =
+            make_block_at_height(&legacy_state, vec![legacy_tx], PAYMENT_BLINDING_HEIGHT, 0);
         apply_block(&mut legacy_state, &legacy_block, 0).unwrap();
 
         let mut explicit_none_state = initial;
-        let explicit_none_block =
-            make_block_at_height(&explicit_none_state, vec![explicit_none_tx], u64::MAX, 0);
+        let explicit_none_block = make_block_at_height(
+            &explicit_none_state,
+            vec![explicit_none_tx],
+            PAYMENT_BLINDING_HEIGHT,
+            0,
+        );
         apply_block(&mut explicit_none_state, &explicit_none_block, 0).unwrap();
 
         assert_eq!(legacy_state.total_supply, explicit_none_state.total_supply);
@@ -3855,7 +3862,7 @@ mod tests {
     #[test]
     fn payment_notes_activation_boundary_replay_is_deterministic_for_mixed_transactions() {
         let mut initial = ChainState::new_genesis();
-        initial.height = u64::MAX - 1;
+        initial.height = PAYMENT_BLINDING_HEIGHT - 1;
         initial.tip_hash = Bytes32::ZERO;
         let (owner_pubkey, keypair) = make_test_keypair([0xB6; 32]);
         let mut inputs = Vec::new();
@@ -3912,13 +3919,13 @@ mod tests {
         let first_block = make_block_at_height(
             &first_replay,
             vec![legacy_tx.clone(), noted_tx.clone(), all_none_tx.clone()],
-            u64::MAX,
+            PAYMENT_BLINDING_HEIGHT,
             0,
         );
         let second_block = make_block_at_height(
             &second_replay,
             vec![legacy_tx, noted_tx, all_none_tx],
-            u64::MAX,
+            PAYMENT_BLINDING_HEIGHT,
             0,
         );
 
@@ -3930,7 +3937,7 @@ mod tests {
     #[test]
     fn payment_blinding_capstone_cross_gate_block_sequence_is_deterministic() {
         let mut initial = ChainState::new_genesis();
-        initial.height = u64::MAX - 2;
+        initial.height = PAYMENT_BLINDING_HEIGHT - 2;
         initial.tip_hash = Bytes32::ZERO;
         let (tx_owner_pubkey, tx_keypair) = make_test_keypair([0xC0; 32]);
         let mut spendable = Vec::new();
@@ -3954,8 +3961,12 @@ mod tests {
             Bytes32::from([0xD0; 32]),
         );
         let pre_gate_tx_bytes = pre_gate_tx.encode_to_vec();
-        let pre_gate_block =
-            make_block_at_height(&initial, vec![pre_gate_tx.clone()], u64::MAX - 1, 111);
+        let pre_gate_block = make_block_at_height(
+            &initial,
+            vec![pre_gate_tx.clone()],
+            PAYMENT_BLINDING_HEIGHT - 1,
+            111,
+        );
         let mut first = initial.clone();
         let mut second = initial;
         apply_block(&mut first, &pre_gate_block, 0).unwrap();
@@ -4046,7 +4057,7 @@ mod tests {
                 noted_post_gate_tx,
                 all_none_post_gate_tx,
             ],
-            u64::MAX,
+            PAYMENT_BLINDING_HEIGHT,
             222,
         );
         post_block.staking_ops = vec![register_payment_op, registered_validator_op];

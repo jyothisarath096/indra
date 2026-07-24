@@ -344,6 +344,7 @@ mod tests {
     use super::*;
     use crate::codec::Decode;
     use crate::codec::Encode;
+    use crate::types::primitives::hard_forks::PAYMENT_BLINDING_HEIGHT;
 
     fn dummy_pubkey() -> HybridPubKey {
         HybridPubKey {
@@ -514,8 +515,12 @@ mod tests {
         tx.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
         tx.payment_notes = vec![Some(note(0x30))];
 
-        assert!(tx.validate_structure_at_height(u64::MAX - 1).is_err());
-        assert!(tx.validate_structure_at_height(u64::MAX).is_ok());
+        assert!(tx
+            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT - 1)
+            .is_err());
+        assert!(tx
+            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT)
+            .is_ok());
     }
 
     #[test]

@@ -560,32 +560,32 @@ pub mod hard_forks {
 
     /// Payment blinding key registry and RegisterPaymentKey operation.
     ///
-    /// INTENTIONALLY UNSCHEDULED: this source value keeps the operation inert
-    /// until a coordinated activation height is explicitly chosen. At/after
-    /// activation, an owner may publish or rotate their current payment
-    /// key-exchange public key in canonical chain state.
+    /// Testnet activation height for the payment-blinding key registry and
+    /// RegisterPaymentKey operation. At/after activation, an owner may publish
+    /// or rotate their current payment key-exchange public key in canonical
+    /// chain state.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
     /// no per-chain-ID differentiation. Before building mainnet genesis, this
     /// MUST be deliberately reset to the correct mainnet value (often 0 if the
-    /// registry should be active from mainnet's first block). Leaving `u64::MAX`
-    /// here means this operation never activates on that network.
-    pub const PAYMENT_BLINDING_HEIGHT: u64 = u64::MAX;
+    /// registry should be active from mainnet's first block). Do not silently
+    /// reuse this testnet activation height for mainnet.
+    pub const PAYMENT_BLINDING_HEIGHT: u64 = 175_050;
 
     /// Compact stake-bond records omit embedded owner pubkeys for newly created bonds.
     ///
-    /// INTENTIONALLY UNSCHEDULED: this source value keeps the rule inert until a
-    /// coordinated activation height is explicitly chosen. This gate must never
-    /// activate before `DELEGATOR_IDENTITY_REGISTRY_HEIGHT`; the registry must be
-    /// authoritative before newly created `StakeBondEntry` records can rely on
+    /// Testnet activation height for omitting embedded owner pubkeys from newly
+    /// created compact stake-bond records. This gate must never activate before
+    /// `DELEGATOR_IDENTITY_REGISTRY_HEIGHT`; the registry must be authoritative
+    /// before newly created `StakeBondEntry` records can rely on
     /// `delegator_id`/`validator_id` lookups instead of embedded owner pubkeys.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
     /// no per-chain-ID differentiation. Before building mainnet genesis, this
     /// MUST be deliberately reset to the correct mainnet value (often 0 if the
-    /// fully compact layout should be active from mainnet's first block). Leaving
-    /// `u64::MAX` here means this rule never activates on that network.
-    pub const COMPACT_BOND_PUBKEY_OMISSION_HEIGHT: u64 = u64::MAX;
+    /// fully compact layout should be active from mainnet's first block). Do not
+    /// silently reuse this testnet activation height for mainnet.
+    pub const COMPACT_BOND_PUBKEY_OMISSION_HEIGHT: u64 = 175_000;
 
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
