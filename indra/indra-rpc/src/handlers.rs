@@ -329,6 +329,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
     ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
+    ("indra_getDelegatorIdentityDebug", RpcMethodAccess::Admin),
     ("indra_getStakeBondDebug", RpcMethodAccess::Admin),
     ("indra_getEpochInfo", RpcMethodAccess::ReadOnly),
     ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
@@ -461,6 +462,7 @@ pub fn dispatch_with_admin(
         "indra_getDelegatorRewards" => Ready(get_delegator_rewards(params, state)),
         "indra_getValidatorDelegators" => Ready(get_validator_delegators(params, state)),
         "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
+        "indra_getDelegatorIdentityDebug" => Ready(get_delegator_identity_debug(params, state)),
         "indra_getStakeBondDebug" => Ready(get_stake_bond_debug(params, state)),
         "indra_getEpochInfo" => Ready(get_epoch_info(state)),
         "indra_getEpochRecord" => Ready(get_epoch_record(params, state)),
@@ -1546,6 +1548,23 @@ fn get_stake_bonds(params: &[String], state: &NodeState<'_>) -> RpcResult<String
         r#"{{"delegator_id":"{}","bonds":[{}]}}"#,
         delegator_hex,
         bonds.join(",")
+    ))
+}
+
+/// `indra_getDelegatorIdentityDebug` — admin-only direct lookup for one delegator identity.
+fn get_delegator_identity_debug(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let delegator_id = parse_hex32_param(params, "delegator_id")?;
+    let Some(pubkey) = state.chain.delegator_identities.get(&delegator_id) else {
+        return Ok(format!(
+            r#"{{"delegator_id":"{}","exists":false,"pubkey":null}}"#,
+            hex::encode(delegator_id.0)
+        ));
+    };
+    Ok(format!(
+        r#"{{"delegator_id":"{}","exists":true,"pubkey":{{"classical_pk":"{}","pq_pk":"{}"}}}}"#,
+        hex::encode(delegator_id.0),
+        hex::encode(pubkey.classical_pk.0),
+        hex::encode(pubkey.pq_pk.as_slice()),
     ))
 }
 
@@ -2647,6 +2666,91 @@ mod tests {
         assert!(compact_result.contains(r#""compact":true"#));
         assert!(!compact_result.contains("range_proof"));
         assert!(!compact_result.contains("commitment"));
+    }
+
+    #[test]
+    fn delegator_identity_debug_reports_absent_or_registered_pubkey() {
+        let mut engine = make_state("did");
+        let delegator_id = Bytes32::from([0x91; 32]);
+        let pubkey = HybridPubKey {
+            classical_pk: Bytes32::from([0x92; 32]),
+            pq_pk: VariableBytes::from_slice(&[0x93; 32]).unwrap(),
+        };
+        let state = NodeState::read_only(&engine);
+        assert_eq!(
+            get_delegator_identity_debug(&[hex::encode(delegator_id.0)], &state).unwrap(),
+            format!(
+                r#"{{"delegator_id":"{}","exists":false,"pubkey":null}}"#,
+                hex::encode(delegator_id.0)
+            )
+        );
+
+        engine
+            .delegator_identities
+            .insert(delegator_id, pubkey.clone());
+        let state = NodeState::read_only(&engine);
+        let result = get_delegator_identity_debug(&[hex::encode(delegator_id.0)], &state).unwrap();
+        assert!(result.contains(&format!(
+            r#""delegator_id":"{}""#,
+            hex::encode(delegator_id.0)
+        )));
+        assert!(result.contains(r#""exists":true"#));
+        assert!(result.contains(&format!(
+            r#""classical_pk":"{}""#,
+            hex::encode(pubkey.classical_pk.0)
+        )));
+        assert!(result.contains(&format!(
+            r#""pq_pk":"{}""#,
+            hex::encode(pubkey.pq_pk.as_slice())
+        )));
+        assert!(!result.contains("range_proof"));
+        assert!(!result.contains("commitment"));
+    }
+
+    #[test]
+    fn delegator_identity_debug_is_admin_gated() {
+        let engine = make_state("did-admin");
+        let state = NodeState::read_only(&engine);
+        let params = [hex::encode([0x94; 32])];
+
+        let read_only = dispatch_with_admin(
+            "indra_getDelegatorIdentityDebug",
+            &params,
+            &state,
+            RpcMode::ReadOnly,
+            true,
+            true,
+        );
+        assert!(matches!(
+            read_only,
+            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
+        ));
+
+        let no_token = dispatch_with_admin(
+            "indra_getDelegatorIdentityDebug",
+            &params,
+            &state,
+            RpcMode::Full,
+            false,
+            false,
+        );
+        assert!(matches!(
+            no_token,
+            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
+        ));
+
+        let admin = dispatch_with_admin(
+            "indra_getDelegatorIdentityDebug",
+            &params,
+            &state,
+            RpcMode::Full,
+            true,
+            true,
+        );
+        assert!(matches!(
+            admin,
+            DispatchResult::Ready(Ok(result)) if result.contains(r#""exists":false"#)
+        ));
     }
 
     #[test]

@@ -517,6 +517,7 @@ fn test_all_methods_reachable_via_dispatch() {
         ("indra_getDelegatorRewards", vec![hex32.clone()]),
         ("indra_getValidatorDelegators", vec![hex32.clone()]),
         ("indra_getStakeBonds", vec![hex32.clone()]),
+        ("indra_getDelegatorIdentityDebug", vec![hex32.clone()]),
         ("indra_getEpochInfo", vec![]),
         ("indra_getEpochRecord", vec!["0".to_string()]),
         ("indra_getEpochHistory", vec![]),
