@@ -8,8 +8,6 @@ use indra_core::types::{
 };
 use indra_crypto::sha256;
 
-const SPARK_PER_INDRA: f64 = 100_000_000.0;
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -28,7 +26,7 @@ fn usage_and_exit() -> ! {
     eprintln!("Usage:");
     eprintln!("  indra-tx address --keys <keys.json> [--keys-password-file <path>]");
     eprintln!("  indra-tx balance --keys <keys.json> [--keys-password-file <path>] [--address <hex>] --rpc <url>");
-    eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <spark> --rpc <url>");
+    eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <INDRA> --rpc <url>");
     std::process::exit(1);
 }
 
@@ -80,7 +78,7 @@ fn cmd_balance(args: &[String]) {
         "Address: {}\nBalance: {} Spark ({:.8} INDRA)",
         address,
         balance,
-        balance as f64 / SPARK_PER_INDRA
+        balance as f64 / (indra_cli::SPARK_PER_INDRA as f64)
     );
 }
 
@@ -88,10 +86,9 @@ fn cmd_send(args: &[String]) {
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
     let wallet_path = get_arg(args, "--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let recipient_address = required_arg(args, "--to");
-    let amount_spark = required_arg(args, "--amount")
-        .parse::<u64>()
-        .unwrap_or_else(|_| {
-            eprintln!("Error: invalid --amount");
+    let amount_spark =
+        parse_send_amount_spark(&required_arg(args, "--amount")).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
             std::process::exit(1);
         });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
@@ -185,6 +182,10 @@ fn update_wallet_after_accepted_transaction(
 ) -> indra_cli::CliResult<()> {
     wallet.record_accepted_transaction(&built.spent_utxo_ids, built.pending_change.clone());
     wallet.save(wallet_path)
+}
+
+fn parse_send_amount_spark(raw: &str) -> indra_cli::CliResult<u64> {
+    indra_cli::parse_indra_amount_to_spark(raw, "--amount")
 }
 
 fn build_auth_or_exit(rpc: &str, keys: &KeysFile, address: &str) -> String {
@@ -428,6 +429,15 @@ mod tests {
         commitment::verify_balance, hybrid::ClassicalKeypair, pedersen::commit, PedersenCommitment,
         PqKeypair,
     };
+
+    #[test]
+    fn indra_tx_send_uses_shared_exact_indra_amount_parser() {
+        assert_eq!(parse_send_amount_spark("0.00000003").unwrap(), 3);
+        assert_eq!(
+            parse_send_amount_spark("10.5").unwrap(),
+            indra_cli::parse_indra_amount_to_spark("10.5", "--amount").unwrap()
+        );
+    }
 
     #[test]
     fn spendable_wallet_from_nested_utxos_response_uses_local_blinding() {

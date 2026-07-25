@@ -36,6 +36,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+pub mod amount;
 pub mod error;
 pub mod genesis_cmd;
 pub mod keygen;
@@ -45,6 +46,7 @@ pub mod staking;
 pub mod tx_builder;
 pub mod wallet;
 
+pub use amount::{parse_indra_amount_to_spark, SPARK_PER_INDRA};
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
 pub use keygen::{

@@ -10,8 +10,6 @@
 
 use std::io::Write;
 
-const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -37,27 +35,17 @@ fn main() {
     let chain_id = get("--chain-id")
         .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
 
-    // Parse amounts (accept INDRA as decimal, convert to Spark)
-    let amount_indra: f64 = amount_str.parse().unwrap_or_else(|_| {
-        eprintln!("Error: invalid amount '{}'", amount_str);
-        std::process::exit(1);
-    });
-    let fee_indra: f64 = fee_str.parse().unwrap_or_else(|_| {
-        eprintln!("Error: invalid fee '{}'", fee_str);
-        std::process::exit(1);
-    });
-
-    let amount_spark = (amount_indra * SPARK_PER_INDRA_F64) as u64;
-    let fee_spark = (fee_indra * SPARK_PER_INDRA_F64) as u64;
-    let fee_spark = fee_spark.max(indra_cli::tx_builder::MIN_FEE_SPARK);
+    let amount_spark = parse_amount_or_exit(&amount_str, "--amount");
+    let fee_spark =
+        parse_amount_or_exit(&fee_str, "--fee").max(indra_cli::tx_builder::MIN_FEE_SPARK);
 
     println!("INDRA Send");
     println!("──────────────────────────────────────");
     println!("Keys:    {}", keys_path);
     println!("Wallet:  {}", wallet_path);
     println!("To:      {}...", &to[..to.len().min(16)]);
-    println!("Amount:  {} INDRA ({} Spark)", amount_indra, amount_spark);
-    println!("Fee:     {} INDRA ({} Spark)", fee_indra, fee_spark);
+    println!("Amount:  {} INDRA ({} Spark)", amount_str, amount_spark);
+    println!("Fee:     {} INDRA ({} Spark)", fee_str, fee_spark);
     println!("Node:    {}", node_url);
     println!("──────────────────────────────────────");
 
@@ -91,7 +79,7 @@ fn main() {
     println!(
         "Wallet balance: {} Spark ({:.8} INDRA)",
         wallet.balance(),
-        wallet.balance() as f64 / SPARK_PER_INDRA_F64
+        wallet.balance() as f64 / (indra_cli::SPARK_PER_INDRA as f64)
     );
 
     if wallet.balance() == 0 {
@@ -129,7 +117,7 @@ fn main() {
     println!(
         "  Change:   {} Spark ({:.8} INDRA)",
         built.change_spark,
-        built.change_spark as f64 / SPARK_PER_INDRA_F64
+        built.change_spark as f64 / (indra_cli::SPARK_PER_INDRA as f64)
     );
     println!("  Inputs:   {}", built.spent_utxo_ids.len());
 
@@ -181,6 +169,17 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn parse_amount_or_exit(raw: &str, flag: &str) -> u64 {
+    parse_cli_indra_amount(raw, flag).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    })
+}
+
+fn parse_cli_indra_amount(raw: &str, flag: &str) -> indra_cli::CliResult<u64> {
+    indra_cli::parse_indra_amount_to_spark(raw, flag)
 }
 
 fn resolve_recipient(node_url: &str, to: &str) -> String {
@@ -291,4 +290,18 @@ fn extract_number(json: &str, field: &str) -> Option<u64> {
     let after = json[pos + key.len()..].trim_start();
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_uses_shared_exact_indra_amount_parser() {
+        assert_eq!(parse_cli_indra_amount("0.00000003", "--amount").unwrap(), 3);
+        assert_eq!(
+            parse_cli_indra_amount("10.5", "--amount").unwrap(),
+            indra_cli::parse_indra_amount_to_spark("10.5", "--amount").unwrap()
+        );
+    }
 }
