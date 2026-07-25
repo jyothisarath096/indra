@@ -872,7 +872,7 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
                 .map_err(|_| crate::error::StateError::InvariantViolation {
                     message: "UTXO ID collision in staking bond release",
                 })?;
-            if normal_bond_release_blinding_active(release_height) {
+            if legacy_normal_bond_release_uses_fresh_blinding(&bond, release_height) {
                 state.push_delegation_return_event(DelegationReturnEvent {
                     delegator_id: bond.delegator_id,
                     validator_id: bond.validator_id,
@@ -907,7 +907,7 @@ pub(crate) fn released_bond_output(
     if bond.delegator_id != bond.validator_id
         || bond.amount_spark >= bond.original_output.value_spark
     {
-        if normal_bond_release_blinding_active(release_height) {
+        if legacy_normal_bond_release_uses_fresh_blinding(bond, release_height) {
             return regenerated_bond_output(
                 bond,
                 state,
@@ -944,6 +944,59 @@ pub(crate) fn released_bond_output(
         blinding,
         "slashed self-stake release",
     )
+}
+
+fn legacy_normal_bond_release_uses_fresh_blinding(
+    bond: &crate::validator::StakeBondEntry,
+    release_height: u64,
+) -> bool {
+    bond.original_output.range_proof.is_some()
+        && (bond.delegator_id != bond.validator_id
+            || bond.amount_spark >= bond.original_output.value_spark)
+        && normal_bond_release_blinding_active_for_release(release_height)
+}
+
+fn normal_bond_release_blinding_active_for_release(height: u64) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(override_height) =
+            NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT.with(|slot| slot.get())
+        {
+            return height >= override_height;
+        }
+    }
+
+    normal_bond_release_blinding_active(height)
+}
+
+#[cfg(test)]
+thread_local! {
+    static NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct NormalBondReleaseBlindingHeightOverride {
+    previous: Option<u64>,
+}
+
+#[cfg(test)]
+impl NormalBondReleaseBlindingHeightOverride {
+    fn set(height: u64) -> Self {
+        let previous = NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT.with(|slot| {
+            let previous = slot.get();
+            slot.set(Some(height));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NormalBondReleaseBlindingHeightOverride {
+    fn drop(&mut self) {
+        NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT.with(|slot| slot.set(self.previous));
+    }
 }
 
 /// Deterministic blinding for a compact stake-bond release.
@@ -1096,11 +1149,13 @@ mod tests {
             crypto::HybridPubKey,
             governance::GovernableAction,
             primitives::{
-                hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT, Bytes32, VariableBytes,
-                COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
-                ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS,
-                SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
+                compact_bond_pubkey_omission_active, compact_stake_bond_active,
+                delegator_identity_registry_active, hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT,
+                payment_blinding_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+                DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS,
+                ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
+                ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS, SLASH_LIVENESS_BPS,
+                SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
         },
@@ -1549,6 +1604,157 @@ mod tests {
         let b = replay();
         assert_eq!(a.encode_to_vec(), b.encode_to_vec());
         assert_eq!(compute_state_root(&a), compute_state_root(&b));
+    }
+
+    #[test]
+    fn normal_release_capstone_lifecycle_crosses_test_configured_gate() {
+        let activation_height = 176_100;
+        let _guard = NormalBondReleaseBlindingHeightOverride::set(activation_height);
+        let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS - 1;
+        let post_epoch = activation_height / EPOCH_DURATION_BLOCKS;
+        let pre_height = pre_epoch * EPOCH_DURATION_BLOCKS;
+        let post_height = post_epoch * EPOCH_DURATION_BLOCKS;
+        assert!(pre_height < activation_height);
+        assert_eq!(post_height, activation_height);
+        assert!(compact_stake_bond_active(post_height));
+        assert!(compact_bond_pubkey_omission_active(post_height));
+        assert!(delegator_identity_registry_active(post_height));
+        assert!(payment_blinding_active(post_height));
+
+        let validator_id = Bytes32::from([0xB0; 32]);
+        let delegator_id = Bytes32::from([0xB1; 32]);
+        let mut pre_gate_bond = legacy_bond(0xB2, validator_id, delegator_id, 1_000_000);
+        let mut post_gate_bond = legacy_bond(0xB3, validator_id, delegator_id, 1_000_000);
+        pre_gate_bond.unbonding_end_epoch = Some(pre_epoch);
+        post_gate_bond.unbonding_end_epoch = Some(post_epoch);
+        let pre_gate_original_output = pre_gate_bond.original_output.to_legacy_output().unwrap();
+        let post_gate_original_output = post_gate_bond.original_output.to_legacy_output().unwrap();
+        let post_gate_bond_utxo_id = post_gate_bond.utxo_id;
+        let post_gate_amount = post_gate_bond.amount_spark;
+        let mut state = ChainState::new_genesis();
+        state
+            .staked_bonds
+            .insert(pre_gate_bond.utxo_id, pre_gate_bond.clone());
+        state
+            .staked_bonds
+            .insert(post_gate_bond.utxo_id, post_gate_bond.clone());
+
+        apply_epoch_transition_at_height(&mut state, pre_epoch, 1, pre_height).unwrap();
+        let pre_release_utxo_id = crate::utxo::UtxoSet::compute_utxo_id(
+            &pre_gate_original_output,
+            pre_height,
+            STAKING_TX_IDX,
+            1,
+        );
+        let pre_release = state.utxos.get(&pre_release_utxo_id).unwrap();
+        assert_eq!(
+            pre_release.output.encode_to_vec(),
+            pre_gate_original_output.encode_to_vec()
+        );
+        assert!(state.delegation_return_events.is_empty());
+
+        apply_epoch_transition_at_height(&mut state, post_epoch, 2, post_height).unwrap();
+        assert_eq!(state.delegation_return_events.len(), 1);
+        let event = &state.delegation_return_events[0];
+        assert_eq!(event.reason, DelegationReturnReason::UnbondingMatured);
+        assert_eq!(event.validator_id, validator_id);
+        assert_eq!(event.delegator_id, delegator_id);
+        assert_eq!(event.bond_utxo_id, post_gate_bond_utxo_id);
+        assert_eq!(event.amount_spark, post_gate_amount);
+        assert_eq!(event.returned_epoch, post_epoch);
+        assert_eq!(event.returned_height, post_height);
+        let post_release = state.utxos.get(&event.refund_utxo_id).unwrap();
+        assert_ne!(
+            post_release.output.encode_to_vec(),
+            post_gate_original_output.encode_to_vec()
+        );
+        let blinding = derive_normal_stake_bond_release_blinding(
+            validator_id,
+            delegator_id,
+            post_gate_bond_utxo_id,
+            post_height,
+            post_gate_amount,
+        );
+        assert_eq!(
+            post_release.output.commitment.compressed_point.0,
+            indra_crypto::commit(post_gate_amount, &blinding).0
+        );
+        assert!(indra_crypto::verify_opening(
+            &indra_crypto::PedersenCommitment(post_release.output.commitment.compressed_point.0),
+            &indra_crypto::PedersenOpening {
+                value: post_gate_amount,
+                blinding,
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn normal_release_capstone_replay_mixed_bond_shapes_across_active_gates() {
+        fn replay() -> ChainState {
+            let activation_height = 176_100;
+            let _guard = NormalBondReleaseBlindingHeightOverride::set(activation_height);
+            let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS - 1;
+            let post_epoch = activation_height / EPOCH_DURATION_BLOCKS;
+            let pre_height = pre_epoch * EPOCH_DURATION_BLOCKS;
+            let post_height = post_epoch * EPOCH_DURATION_BLOCKS;
+            assert!(compact_stake_bond_active(pre_height));
+            assert!(compact_bond_pubkey_omission_active(pre_height));
+            assert!(delegator_identity_registry_active(pre_height));
+            assert!(payment_blinding_active(pre_height));
+            assert!(compact_stake_bond_active(post_height));
+            assert!(compact_bond_pubkey_omission_active(post_height));
+            assert!(delegator_identity_registry_active(post_height));
+            assert!(payment_blinding_active(post_height));
+
+            let validator_id = Bytes32::from([0xC0; 32]);
+            let delegator_id = Bytes32::from([0xC1; 32]);
+            let mut pre_legacy = legacy_bond(0xC2, validator_id, delegator_id, 1_000_000);
+            let mut post_legacy = legacy_bond(0xC3, validator_id, delegator_id, 1_000_000);
+            let mut compact = compact_bond(0xC4, validator_id, delegator_id, 1_000_000);
+            let (mut fully_compact, owner_pubkey) =
+                fully_compact_bond(0xC5, validator_id, delegator_id, 750_000);
+            pre_legacy.unbonding_end_epoch = Some(pre_epoch);
+            post_legacy.unbonding_end_epoch = Some(post_epoch);
+            compact.unbonding_end_epoch = Some(post_epoch);
+            fully_compact.unbonding_end_epoch = Some(post_epoch);
+
+            let mut state = ChainState::new_genesis();
+            state
+                .delegator_identities
+                .insert(delegator_id, owner_pubkey.clone());
+            state.staked_bonds.insert(pre_legacy.utxo_id, pre_legacy);
+            let post_legacy_utxo_id = post_legacy.utxo_id;
+            state.staked_bonds.insert(post_legacy.utxo_id, post_legacy);
+            state.staked_bonds.insert(compact.utxo_id, compact);
+            state
+                .staked_bonds
+                .insert(fully_compact.utxo_id, fully_compact);
+
+            apply_epoch_transition_at_height(&mut state, pre_epoch, 1, pre_height).unwrap();
+            assert!(state.delegation_return_events.is_empty());
+            apply_epoch_transition_at_height(&mut state, post_epoch, 2, post_height).unwrap();
+            assert_eq!(state.delegation_return_events.len(), 1);
+            assert_eq!(
+                state.delegation_return_events[0].bond_utxo_id,
+                post_legacy_utxo_id
+            );
+            assert_eq!(
+                state.delegation_return_events[0].reason,
+                DelegationReturnReason::UnbondingMatured
+            );
+            state.rebuild_state_commitment_v2(post_height);
+            state
+        }
+
+        let a = replay();
+        let b = replay();
+        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
+        assert_eq!(compute_state_root(&a), compute_state_root(&b));
+        assert_eq!(
+            a.state_commitment_v2_root(176_100),
+            b.state_commitment_v2_root(176_100)
+        );
     }
 
     #[test]

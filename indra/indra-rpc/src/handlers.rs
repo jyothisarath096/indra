@@ -3081,6 +3081,111 @@ mod tests {
     }
 
     #[test]
+    fn explain_utxo_provenance_authorized_mixed_normal_release_adversarial_block() {
+        let mut engine = block_backed_engine();
+        let height = 2;
+        let validator_id = Bytes32::from([0x54; 32]);
+        let delegator_id = Bytes32::from([0x55; 32]);
+        let bond_utxo_id = Bytes32::from([0x56; 32]);
+        let amount = 9_000;
+        let blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let refund_utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(amount, blinding), height, STAKING_TX_IDX, 1)
+            .unwrap();
+        engine
+            .chain
+            .delegation_return_events
+            .push(DelegationReturnEvent {
+                delegator_id,
+                validator_id,
+                bond_utxo_id,
+                amount_spark: amount,
+                reason: DelegationReturnReason::UnbondingMatured,
+                returned_epoch: 0,
+                returned_height: height,
+                refund_utxo_id,
+            });
+
+        let wrong_bond_utxo_id = Bytes32::from([0x57; 32]);
+        let malformed_blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let malformed_utxo_id = engine
+            .chain
+            .utxos
+            .insert(
+                owned_output(amount, malformed_blinding),
+                height,
+                STAKING_TX_IDX,
+                2,
+            )
+            .unwrap();
+        engine
+            .chain
+            .delegation_return_events
+            .push(DelegationReturnEvent {
+                delegator_id,
+                validator_id,
+                bond_utxo_id: wrong_bond_utxo_id,
+                amount_spark: amount,
+                reason: DelegationReturnReason::UnbondingMatured,
+                returned_epoch: 0,
+                returned_height: height,
+                refund_utxo_id: malformed_utxo_id,
+            });
+
+        let unrelated_utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(7_000, [0x58; 32]), height, STAKING_TX_IDX, 3)
+            .unwrap();
+
+        let recovered = explain(&engine, refund_utxo_id);
+        assert!(
+            recovered.contains(r#""category":"normal_bond_release""#),
+            "{recovered}"
+        );
+        assert!(recovered.contains(r#""recoverable":true"#), "{recovered}");
+        assert!(
+            recovered.contains(&format!(r#""utxo_id":"{}""#, hex::encode(refund_utxo_id.0))),
+            "{recovered}"
+        );
+
+        let rejected = explain(&engine, malformed_utxo_id);
+        assert!(
+            rejected.contains(r#""category":"normal_bond_release""#),
+            "{rejected}"
+        );
+        assert!(rejected.contains(r#""recoverable":false"#), "{rejected}");
+        assert!(
+            rejected.contains("matured bond release provenance did not open"),
+            "{rejected}"
+        );
+
+        let unclassified = explain(&engine, unrelated_utxo_id);
+        assert!(
+            unclassified.contains(r#""category":"staking_protocol_output_unclassified""#),
+            "{unclassified}"
+        );
+        assert!(
+            unclassified.contains(r#""recoverable":false"#),
+            "{unclassified}"
+        );
+    }
+
+    #[test]
     fn explain_utxo_provenance_authorized_does_not_misclassify_pre_gate_matured_release() {
         let mut engine = block_backed_engine();
         let height = 2;
