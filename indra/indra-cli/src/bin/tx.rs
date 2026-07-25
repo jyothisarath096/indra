@@ -73,7 +73,10 @@ fn cmd_balance(args: &[String]) {
         eprintln!("Error querying authorized legacy balance: {}", e);
         std::process::exit(1);
     });
-    let balance = extract_number(&raw, "balance").unwrap_or(0);
+    let balance = parse_balance_response(&raw).unwrap_or_else(|e| {
+        eprintln!("Error parsing authorized balance response: {}", e);
+        std::process::exit(1);
+    });
     println!(
         "Address: {}\nBalance: {} Spark ({:.8} INDRA)",
         address,
@@ -241,13 +244,17 @@ fn payment_identity_from_rpc_json(json: &str) -> Option<indra_crypto::PaymentPub
     indra_crypto::PaymentPubKeyV1::decode(&bytes).ok()
 }
 
+fn parse_balance_response(json: &str) -> Result<u64, String> {
+    required_number(json, "balance")
+}
+
 fn spendable_wallet_from_authorized_utxos(
     json: &str,
     local_wallet: &Wallet,
 ) -> Result<Wallet, String> {
     let mut spendable = Wallet::new();
     let Some(utxos_json) = extract_array(json, "utxos") else {
-        return Ok(spendable);
+        return Err("authorized UTXO response missing required utxos array".to_string());
     };
 
     let mut discovered = 0usize;
@@ -260,13 +267,12 @@ fn spendable_wallet_from_authorized_utxos(
         };
         let obj = &utxos_json[start..=end];
         let Some(utxo_id) = extract_hex_string(obj, "utxo_id") else {
-            pos = end + 1;
-            continue;
+            return Err("authorized UTXO entry missing required utxo_id".to_string());
         };
-        let amount = extract_number(obj, "amount").unwrap_or(0);
-        let created_height = extract_number(obj, "created_height").unwrap_or(0);
-        let tx_index = extract_number(obj, "tx_index").unwrap_or(0) as u32;
-        let out_index = extract_number(obj, "out_index").unwrap_or(0) as u32;
+        let amount = required_number(obj, "amount")?;
+        let created_height = required_number(obj, "created_height")?;
+        let tx_index = required_u32(obj, "tx_index")?;
+        let out_index = required_u32(obj, "out_index")?;
         let mut utxo_id_arr = [0u8; 32];
         if utxo_id.len() == 32 {
             utxo_id_arr.copy_from_slice(&utxo_id);
@@ -395,6 +401,15 @@ fn extract_number(json: &str, field: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+fn required_number(json: &str, field: &str) -> Result<u64, String> {
+    extract_number(json, field).ok_or_else(|| format!("response missing required {field} field"))
+}
+
+fn required_u32(json: &str, field: &str) -> Result<u32, String> {
+    let value = required_number(json, field)?;
+    u32::try_from(value).map_err(|_| format!("response field {field} exceeds u32"))
+}
+
 fn extract_hex_string(json: &str, field: &str) -> Option<Vec<u8>> {
     let key = format!("\"{}\":", field);
     let pos = json.find(&key)?;
@@ -437,6 +452,38 @@ mod tests {
             parse_send_amount_spark("10.5").unwrap(),
             indra_cli::parse_indra_amount_to_spark("10.5", "--amount").unwrap()
         );
+    }
+
+    #[test]
+    fn balance_response_accepts_real_zero_and_rejects_missing_balance() {
+        assert_eq!(
+            parse_balance_response(r#"{"jsonrpc":"2.0","result":{"balance":0},"id":1}"#).unwrap(),
+            0
+        );
+
+        let err = parse_balance_response(r#"{"jsonrpc":"2.0","result":{"height":12},"id":1}"#)
+            .unwrap_err();
+        assert!(err.contains("balance"), "{err}");
+    }
+
+    #[test]
+    fn authorized_utxo_parser_accepts_empty_array_but_rejects_missing_array() {
+        let wallet =
+            spendable_wallet_from_authorized_utxos(r#"{"result":{"utxos":[]}}"#, &Wallet::new())
+                .unwrap();
+        assert_eq!(wallet.balance(), 0);
+
+        let err =
+            spendable_wallet_from_authorized_utxos(r#"{"result":{"count":0}}"#, &Wallet::new())
+                .unwrap_err();
+        assert!(err.contains("utxos array"), "{err}");
+    }
+
+    #[test]
+    fn authorized_utxo_parser_rejects_missing_required_entry_fields() {
+        let json = r#"{"result":{"utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","created_height":0,"tx_index":0,"out_index":0}]}}"#;
+        let err = spendable_wallet_from_authorized_utxos(json, &Wallet::new()).unwrap_err();
+        assert!(err.contains("amount"), "{err}");
     }
 
     #[test]

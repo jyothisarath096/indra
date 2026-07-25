@@ -139,7 +139,10 @@ fn main() {
     match query_utxos(&node_url, &address_hex, &scan_auth_proof) {
         Ok(response) => {
             println!("Node response: {}", response);
-            let discovered = parse_utxos_json(&response);
+            let discovered = parse_utxos_json(&response).unwrap_or_else(|e| {
+                eprintln!("Error parsing authorized UTXO response: {}", e);
+                std::process::exit(1);
+            });
             let genesis_blinding = derive_genesis_blinding(&hybrid_seed);
             let mut chain_id = None::<String>;
             let mut added = 0usize;
@@ -748,13 +751,13 @@ struct RpcUtxo {
     out_index: u32,
 }
 
-fn parse_utxos_json(json: &str) -> Vec<RpcUtxo> {
+fn parse_utxos_json(json: &str) -> Result<Vec<RpcUtxo>, String> {
     let Some(start) = json.find("\"utxos\":[") else {
-        return vec![];
+        return Err("authorized UTXO response missing required utxos array".to_string());
     };
     let after = &json[start + 9..];
     let Some(end) = after.find(']') else {
-        return vec![];
+        return Err("authorized UTXO response has unterminated utxos array".to_string());
     };
     let array = &after[..end];
 
@@ -763,32 +766,32 @@ fn parse_utxos_json(json: &str) -> Vec<RpcUtxo> {
     while let Some(obj_start_rel) = array[pos..].find('{') {
         let obj_start = pos + obj_start_rel;
         let Some(obj_end_rel) = array[obj_start..].find('}') else {
-            break;
+            return Err("authorized UTXO response has unterminated UTXO object".to_string());
         };
         let obj_end = obj_start + obj_end_rel + 1;
         let obj = &array[obj_start..obj_end];
         pos = obj_end;
 
         let Some(utxo_hex) = extract_json_str(obj, "utxo_id") else {
-            continue;
+            return Err("authorized UTXO entry missing required utxo_id".to_string());
         };
         let Ok(decoded) = hex::decode(utxo_hex) else {
-            continue;
+            return Err("authorized UTXO entry has invalid utxo_id hex".to_string());
         };
         if decoded.len() != 32 {
-            continue;
+            return Err("authorized UTXO entry has non-32-byte utxo_id".to_string());
         }
         let mut raw = [0u8; 32];
         raw.copy_from_slice(&decoded);
         utxos.push(RpcUtxo {
             utxo_id: indra_core::Bytes32::from(raw),
-            value: extract_json_num(obj, "amount").unwrap_or(0),
-            created_height: extract_json_num(obj, "created_height").unwrap_or(0),
-            tx_index: extract_json_num(obj, "tx_index").unwrap_or(0) as u32,
-            out_index: extract_json_num(obj, "out_index").unwrap_or(0) as u32,
+            value: required_json_num(obj, "amount")?,
+            created_height: required_json_num(obj, "created_height")?,
+            tx_index: required_json_u32(obj, "tx_index")?,
+            out_index: required_json_u32(obj, "out_index")?,
         });
     }
-    utxos
+    Ok(utxos)
 }
 
 fn extract_json_str(json: &str, key: &str) -> Option<String> {
@@ -805,6 +808,15 @@ fn extract_json_num(json: &str, key: &str) -> Option<u64> {
     let after = json[pos + needle.len()..].trim_start();
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+fn required_json_num(json: &str, key: &str) -> Result<u64, String> {
+    extract_json_num(json, key).ok_or_else(|| format!("response missing required {key} field"))
+}
+
+fn required_json_u32(json: &str, key: &str) -> Result<u32, String> {
+    let value = required_json_num(json, key)?;
+    u32::try_from(value).map_err(|_| format!("response field {key} exceeds u32"))
 }
 
 #[cfg(test)]
@@ -1538,6 +1550,41 @@ mod tests {
                 blinding,
             }
         );
+    }
+
+    #[test]
+    fn authorized_scan_parser_accepts_empty_utxo_array() {
+        let parsed = parse_utxos_json(r#"{"jsonrpc":"2.0","result":{"utxos":[]},"id":1}"#).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn authorized_scan_parser_rejects_missing_utxo_array() {
+        let err =
+            parse_utxos_json(r#"{"jsonrpc":"2.0","result":{"address":"abc"},"id":1}"#).unwrap_err();
+        assert!(err.contains("utxos array"), "{err}");
+    }
+
+    #[test]
+    fn authorized_scan_parser_rejects_missing_required_utxo_fields() {
+        let err = parse_utxos_json(
+            r#"{"jsonrpc":"2.0","result":{"utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","created_height":0,"tx_index":0,"out_index":0}]}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("amount"), "{err}");
+    }
+
+    #[test]
+    fn authorized_scan_parser_preserves_real_zero_values() {
+        let parsed = parse_utxos_json(
+            r#"{"jsonrpc":"2.0","result":{"utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","amount":0,"created_height":0,"tx_index":0,"out_index":0}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].value, 0);
+        assert_eq!(parsed[0].created_height, 0);
+        assert_eq!(parsed[0].tx_index, 0);
+        assert_eq!(parsed[0].out_index, 0);
     }
 
     #[test]
