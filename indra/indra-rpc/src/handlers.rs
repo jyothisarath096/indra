@@ -7,8 +7,9 @@ use indra_core::{
     codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
-        Bytes32 as CoreBytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SCHEMA_VERSION,
-        SCHEMA_VERSION_GENESIS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        Bytes32 as CoreBytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+        NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -20,7 +21,10 @@ use indra_core::{
     Bytes32,
 };
 use indra_crypto::PaymentPubKeyV1;
-use indra_state::{epoch::epoch_for_height, AuthTreeProof, ChainState, ProofTerminal};
+use indra_state::{
+    epoch::epoch_for_height, validator::DelegationReturnReason, AuthTreeProof, ChainState,
+    ProofTerminal,
+};
 
 use crate::{
     error::{RpcError, RpcResult},
@@ -1136,24 +1140,48 @@ fn classify_delegation_return_event(
     for event in state.chain.delegation_return_events.iter().filter(|event| {
         event.returned_height == entry.created_height && event.refund_utxo_id == entry.utxo_id
     }) {
-        let compact = derive_compact_bond_release_blinding(
-            &event.validator_id,
-            &event.delegator_id,
-            &event.bond_utxo_id,
-            event.returned_height,
-            entry.output.value_spark,
-        );
-        if commitment_matches(entry, &compact) {
-            return Some(recoverable(
-                "validator_eviction_bond_refund",
-                delegation_event_context(event, "compact_bond_release"),
-            ));
-        }
+        match event.reason {
+            DelegationReturnReason::ValidatorEvicted => {
+                let compact = derive_compact_bond_release_blinding(
+                    &event.validator_id,
+                    &event.delegator_id,
+                    &event.bond_utxo_id,
+                    event.returned_height,
+                    event.amount_spark,
+                );
+                if commitment_matches(entry, &compact) {
+                    return Some(recoverable(
+                        "validator_eviction_bond_refund",
+                        delegation_event_context(event, "compact_bond_release"),
+                    ));
+                }
 
-        return Some(unrecoverable(
-            "legacy_bond_release",
-            "legacy bond release reused the original output; the blinding is not derivable from retained state and requires local wallet history or an archive/indexer",
-        ));
+                return Some(unrecoverable(
+                    "legacy_bond_release",
+                    "legacy bond release reused the original output; the blinding is not derivable from retained state and requires local wallet history or an archive/indexer",
+                ));
+            }
+            DelegationReturnReason::UnbondingMatured => {
+                let normal = derive_normal_bond_release_blinding(
+                    &event.validator_id,
+                    &event.delegator_id,
+                    &event.bond_utxo_id,
+                    event.returned_height,
+                    event.amount_spark,
+                );
+                if commitment_matches(entry, &normal) {
+                    return Some(recoverable(
+                        "normal_bond_release",
+                        delegation_event_context(event, "normal_bond_release"),
+                    ));
+                }
+
+                return Some(unrecoverable(
+                    "normal_bond_release",
+                    "matured bond release provenance did not open this UTXO commitment",
+                ));
+            }
+        }
     }
 
     for event in state
@@ -1301,6 +1329,24 @@ fn derive_compact_bond_release_blinding(
     let mut data =
         Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
     data.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
+    data.extend_from_slice(&validator_id.0);
+    data.extend_from_slice(&delegator_id.0);
+    data.extend_from_slice(&bond_utxo_id.0);
+    data.extend_from_slice(&release_height.to_le_bytes());
+    data.extend_from_slice(&amount_spark.to_le_bytes());
+    indra_crypto::sha256(&data)
+}
+
+fn derive_normal_bond_release_blinding(
+    validator_id: &CoreBytes32,
+    delegator_id: &CoreBytes32,
+    bond_utxo_id: &CoreBytes32,
+    release_height: u64,
+    amount_spark: u64,
+) -> [u8; 32] {
+    let mut data =
+        Vec::with_capacity(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
+    data.extend_from_slice(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
     data.extend_from_slice(&validator_id.0);
     data.extend_from_slice(&delegator_id.0);
     data.extend_from_slice(&bond_utxo_id.0);
@@ -2978,6 +3024,94 @@ mod tests {
             "{reward}"
         );
         assert!(reward.contains(r#""recoverable":true"#), "{reward}");
+    }
+
+    #[test]
+    fn explain_utxo_provenance_authorized_classifies_normal_matured_release() {
+        let mut engine = block_backed_engine();
+        let height = 2;
+        let validator_id = Bytes32::from([0x49; 32]);
+        let delegator_id = Bytes32::from([0x4A; 32]);
+        let bond_utxo_id = Bytes32::from([0x4B; 32]);
+        let amount = 9_000;
+        let blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let refund_utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(amount, blinding), height, STAKING_TX_IDX, 1)
+            .unwrap();
+        engine
+            .chain
+            .delegation_return_events
+            .push(DelegationReturnEvent {
+                delegator_id,
+                validator_id,
+                bond_utxo_id,
+                amount_spark: amount,
+                reason: DelegationReturnReason::UnbondingMatured,
+                returned_epoch: 0,
+                returned_height: height,
+                refund_utxo_id,
+            });
+
+        let result = explain(&engine, refund_utxo_id);
+
+        assert!(
+            result.contains(r#""category":"normal_bond_release""#),
+            "{result}"
+        );
+        assert!(result.contains(r#""recoverable":true"#), "{result}");
+        assert!(
+            result.contains(r#""derivation":"normal_bond_release""#),
+            "{result}"
+        );
+        assert!(
+            result.contains(&format!(
+                r#""bond_utxo_id":"{}""#,
+                hex::encode(bond_utxo_id.0)
+            )),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn explain_utxo_provenance_authorized_does_not_misclassify_pre_gate_matured_release() {
+        let mut engine = block_backed_engine();
+        let height = 2;
+        let validator_id = Bytes32::from([0x4C; 32]);
+        let delegator_id = Bytes32::from([0x4D; 32]);
+        let bond_utxo_id = Bytes32::from([0x4E; 32]);
+        let amount = 9_000;
+        let blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let refund_utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(amount, blinding), height, STAKING_TX_IDX, 1)
+            .unwrap();
+
+        let result = explain(&engine, refund_utxo_id);
+
+        assert!(
+            result.contains(r#""category":"staking_protocol_output_unclassified""#),
+            "{result}"
+        );
+        assert!(result.contains(r#""recoverable":false"#), "{result}");
+        assert!(
+            !result.contains(r#""category":"normal_bond_release""#),
+            "{result}"
+        );
     }
 
     #[test]

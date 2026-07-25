@@ -16,7 +16,8 @@ use indra_core::{
     codec::Decode,
     types::{
         primitives::{
-            Bytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN,
+            Bytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN,
         },
         transaction::{OutputV1, TransactionV1},
     },
@@ -545,6 +546,20 @@ fn derive_protocol_blinding(
                 amount_spark,
             ))
         }
+        "normal_bond_release" => {
+            let validator_id = context_hex32(context, "validator_id")?;
+            let delegator_id = context_hex32(context, "delegator_id")?;
+            let bond_utxo_id = context_hex32(context, "bond_utxo_id")?;
+            let release_height = context_u64(context, "returned_height")?;
+            let amount_spark = context_u64(context, "amount_spark")?;
+            Ok(derive_normal_bond_release_blinding(
+                &validator_id,
+                &delegator_id,
+                &bond_utxo_id,
+                release_height,
+                amount_spark,
+            ))
+        }
         "slash_reporter_reward" => {
             let evidence_hash = context_hex32(context, "evidence_hash")?;
             let block_height = context_u64(context, "block_height")?;
@@ -601,6 +616,24 @@ fn derive_compact_bond_release_blinding(
     let mut data =
         Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
     data.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
+    data.extend_from_slice(validator_id);
+    data.extend_from_slice(delegator_id);
+    data.extend_from_slice(bond_utxo_id);
+    data.extend_from_slice(&release_height.to_le_bytes());
+    data.extend_from_slice(&amount_spark.to_le_bytes());
+    indra_crypto::sha256(&data)
+}
+
+fn derive_normal_bond_release_blinding(
+    validator_id: &[u8; 32],
+    delegator_id: &[u8; 32],
+    bond_utxo_id: &[u8; 32],
+    release_height: u64,
+    amount_spark: u64,
+) -> [u8; 32] {
+    let mut data =
+        Vec::with_capacity(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
+    data.extend_from_slice(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
     data.extend_from_slice(validator_id);
     data.extend_from_slice(delegator_id);
     data.extend_from_slice(bond_utxo_id);
@@ -1214,6 +1247,32 @@ mod tests {
     }
 
     #[test]
+    fn scanner_recovers_normal_bond_release_via_protocol_provenance() {
+        let validator_id = [0x34; 32];
+        let delegator_id = [0x35; 32];
+        let bond_utxo_id = [0x36; 32];
+        let height = 12;
+        let amount = 4_000_000;
+        let blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"normal_bond_release"}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            hex::encode(bond_utxo_id),
+            height,
+            amount
+        );
+
+        assert_recovered_wallet_entry("normal_bond_release", context, blinding);
+    }
+
+    #[test]
     fn scanner_recovers_slash_reporter_reward_via_protocol_provenance() {
         let evidence_hash = [0x41; 32];
         let height = 12;
@@ -1270,6 +1329,43 @@ mod tests {
             "staking_reward_claim",
             &context,
             4_000_000,
+            height,
+            indra_core::types::primitives::STAKING_TX_IDX,
+            0,
+            real_blinding,
+        );
+
+        let err = recover_protocol_provenance_from_response(&utxo, &response).unwrap_err();
+        assert!(err.contains("does not open"), "{err}");
+    }
+
+    #[test]
+    fn scanner_rejects_malformed_normal_bond_release_provenance_response() {
+        let validator_id = [0x74; 32];
+        let delegator_id = [0x75; 32];
+        let bond_utxo_id = [0x76; 32];
+        let wrong_bond_utxo_id = [0x77; 32];
+        let height = 12;
+        let amount = 4_000_000;
+        let real_blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"normal_bond_release"}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            hex::encode(wrong_bond_utxo_id),
+            height,
+            amount
+        );
+        let (utxo, response) = protocol_response(
+            "normal_bond_release",
+            &context,
+            amount,
             height,
             indra_core::types::primitives::STAKING_TX_IDX,
             0,
@@ -1487,6 +1583,51 @@ mod tests {
 
         let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0xA8);
         let (_, _, destination_pubkey) = hybrid_material(0xA9);
+        let params = TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &pubkey_hex(&destination_pubkey),
+            amount_spark: 1_000_000,
+            fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
+            wallet: &wallet,
+            hybrid_seed: sender_seed,
+            pq_sk_bytes: sender_pq_sk,
+            sender_pubkey,
+            recipient_payment_pubkey: None,
+        };
+
+        let spend = build_transaction(&params).unwrap();
+        let spend_tx = TransactionV1::decode_exact(&hex::decode(&spend.tx_hex).unwrap()).unwrap();
+        assert_eq!(spend_tx.inputs.len(), 1);
+        assert_eq!(spend_tx.inputs[0].utxo_id, utxo.utxo_id);
+    }
+
+    #[test]
+    fn recovered_normal_bond_release_utxo_is_spendable_after_wallet_scan() {
+        let validator_id = [0xB1; 32];
+        let delegator_id = [0xB2; 32];
+        let bond_utxo_id = [0xB3; 32];
+        let height = 12;
+        let amount = 4_000_000;
+        let blinding = derive_normal_bond_release_blinding(
+            &validator_id,
+            &delegator_id,
+            &bond_utxo_id,
+            height,
+            amount,
+        );
+        let context = format!(
+            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"normal_bond_release"}}"#,
+            hex::encode(validator_id),
+            hex::encode(delegator_id),
+            hex::encode(bond_utxo_id),
+            height,
+            amount
+        );
+        let (wallet, utxo) =
+            assert_recovered_wallet_entry("normal_bond_release", context, blinding);
+
+        let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0xB4);
+        let (_, _, destination_pubkey) = hybrid_material(0xB5);
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
             recipient_pubkey_hex: &pubkey_hex(&destination_pubkey),
