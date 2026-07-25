@@ -7,7 +7,7 @@ use std::{
 };
 
 use indra_cli::{
-    fetch_chain_id, reconstruct_keypair, staking::http_post, CliError, CliResult, KeysFile,
+    fetch_chain_id, reconstruct_keypair, staking::http_post, CliError, CliResult, KeysFile, Wallet,
 };
 use indra_core::{
     codec::Encode,
@@ -43,20 +43,29 @@ fn run() -> CliResult<()> {
     let keypair = reconstruct_keypair(&keys)?;
     let signer_id = signer_id_from_keys(&keys);
     let node_url = flag_value(&args, "--node").unwrap_or_else(|| "http://127.0.0.1:8545".into());
+    let wallet_path = flag_value(&args, "--wallet").unwrap_or_else(|| "wallet.json".into());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = match flag_value(&args, "--nonce") {
         Some(raw) => parse_u64(&raw, "--nonce")?,
         None => fetch_governance_nonce(&node_url, signer_id)?,
     };
 
+    let mut proposal_deposit_utxo_id = None;
     let payload = match command {
-        "propose" => GovernancePayload::Propose {
-            action: parse_governable_action(&args)?,
-            deposit_utxo_id: parse_hex32_required(&args, "--deposit-utxo")?,
-            proposer_pubkey: hybrid_pubkey_from_keypair(&keypair)?,
-            title: variable_bytes(&required_flag(&args, "--title")?, "--title")?,
-            description: variable_bytes(&required_flag(&args, "--description")?, "--description")?,
-        },
+        "propose" => {
+            let deposit_utxo_id = parse_hex32_required(&args, "--deposit-utxo")?;
+            proposal_deposit_utxo_id = Some(deposit_utxo_id);
+            GovernancePayload::Propose {
+                action: parse_governable_action(&args)?,
+                deposit_utxo_id,
+                proposer_pubkey: hybrid_pubkey_from_keypair(&keypair)?,
+                title: variable_bytes(&required_flag(&args, "--title")?, "--title")?,
+                description: variable_bytes(
+                    &required_flag(&args, "--description")?,
+                    "--description",
+                )?,
+            }
+        }
         "commit" => {
             let proposal_id = parse_hex32_required(&args, "--proposal-id")?;
             let vote = parse_vote(&required_flag(&args, "--vote")?)?;
@@ -108,11 +117,36 @@ fn run() -> CliResult<()> {
 
     let response = submit_governance_op(&node_url, &op_hex)?;
     println!("{response}");
+    if let Some(deposit_utxo_id) = proposal_deposit_utxo_id {
+        match mark_governance_deposit_spent(&wallet_path, deposit_utxo_id) {
+            Ok(true) => println!(
+                "wallet_update: marked proposal deposit UTXO {} spent in {}",
+                hex::encode(deposit_utxo_id.0),
+                wallet_path
+            ),
+            Ok(false) => eprintln!(
+                "Warning: proposal deposit UTXO {} was accepted by the node but is not tracked in {}; local wallet state was not changed",
+                hex::encode(deposit_utxo_id.0),
+                wallet_path
+            ),
+            Err(error) => eprintln!("Warning: could not update wallet {}: {}", wallet_path, error),
+        }
+    }
     println!("status_detail: accepted into local mempool and relayed; not yet confirmed on-chain");
     if has_flag(&args, "--wait") {
         wait_for_governance_confirmation(&node_url, &op, signer_id)?;
     }
     Ok(())
+}
+
+fn mark_governance_deposit_spent(wallet_path: &str, deposit_utxo_id: Bytes32) -> CliResult<bool> {
+    let mut wallet = Wallet::load(wallet_path)?;
+    if !wallet.contains(&deposit_utxo_id) {
+        return Ok(false);
+    }
+    wallet.record_accepted_transaction(&[deposit_utxo_id], None);
+    wallet.save(wallet_path)?;
+    Ok(true)
 }
 
 fn build_governance_op(
@@ -521,16 +555,17 @@ Common flags:\n\
   --keys <path>    Path to keys.json (default: keys.json)\n\
   --keys-password-file <path>  Password file for encrypted keys.json\n\
   --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n\
-	  --nonce <n>      Governance nonce override\n\
-	  --vote-nonce-store <path>  Local vote nonce store (default: beside keys.json)\n\
-	  --wait           For commit/reveal, poll until visible on-chain\n\
-	  --dry-run        Build and sign but do not submit\n\n\
+  --wallet <path>  Wallet file for proposal deposit bookkeeping (default: wallet.json)\n\
+  --nonce <n>      Governance nonce override\n\
+  --vote-nonce-store <path>  Local vote nonce store (default: beside keys.json)\n\
+  --wait           For commit/reveal, poll until visible on-chain\n\
+  --dry-run        Build and sign but do not submit\n\n\
 Propose flags:\n\
   --action <name> --value <n> --deposit-utxo <hex> --title <text> --description <text>\n\n\
 Vote flags:\n\
   --proposal-id <hex> --vote yes|no [--vote-nonce <32-byte-hex>]\n\
   Commit auto-generates and saves --vote-nonce by default; reveal reloads it.\n\
-	  Abstain by not submitting a reveal op."
+  Abstain by not submitting a reveal op."
     );
 }
 
@@ -613,5 +648,31 @@ mod tests {
         assert_eq!(validator_bool_field(&json, signer, "committed"), Some(true));
         assert_eq!(validator_bool_field(&json, signer, "revealed"), Some(true));
         assert_eq!(validator_bool_field(&json, other, "committed"), Some(false));
+    }
+
+    #[test]
+    fn accepted_governance_proposal_marks_deposit_utxo_spent() {
+        let wallet_path = std::env::temp_dir().join(format!(
+            "indra-governance-wallet-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let wallet_path_str = wallet_path.to_string_lossy().to_string();
+        let deposit_utxo_id = Bytes32::from([0xD1; 32]);
+        let other_utxo_id = Bytes32::from([0xD2; 32]);
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(deposit_utxo_id, 1_000_000, [0xA1; 32], 12, 0, 0);
+        wallet.add_utxo(other_utxo_id, 2_000_000, [0xA2; 32], 12, 0, 1);
+        wallet.save(&wallet_path_str).unwrap();
+
+        assert!(mark_governance_deposit_spent(&wallet_path_str, deposit_utxo_id).unwrap());
+
+        let updated = Wallet::load(&wallet_path_str).unwrap();
+        assert!(updated.get(&deposit_utxo_id).unwrap().spent);
+        assert!(!updated.get(&other_utxo_id).unwrap().spent);
+        assert_eq!(updated.balance(), 2_000_000);
+        assert!(updated.select_utxos(2_000_000, 1).is_err());
+
+        let _ = std::fs::remove_file(wallet_path);
     }
 }

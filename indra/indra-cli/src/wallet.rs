@@ -109,6 +109,23 @@ impl Wallet {
         }
     }
 
+    /// Mark accepted transaction inputs spent and record any pending change.
+    ///
+    /// This is local wallet bookkeeping only. It must run after a node accepts a
+    /// locally built transaction, never before submission.
+    pub fn record_accepted_transaction(
+        &mut self,
+        spent_utxo_ids: &[Bytes32],
+        pending_change: Option<PendingChange>,
+    ) {
+        for id in spent_utxo_ids {
+            self.mark_spent(id);
+        }
+        if let Some(change) = pending_change {
+            self.add_pending_change(change.output, change.blinding);
+        }
+    }
+
     /// True if the wallet already tracks this UTXO.
     pub fn contains(&self, utxo_id: &Bytes32) -> bool {
         self.entries.contains_key(utxo_id)
@@ -443,8 +460,44 @@ mod tests {
     #[test]
     fn pending_change_round_trip() {
         let mut wallet = Wallet::new();
-        let output = OutputV1 {
-            value_spark: 123_456,
+        let output = sample_output(123_456);
+        wallet.add_pending_change(output.clone(), [0x55; 32]);
+
+        let restored = Wallet::from_json(&wallet.to_json()).unwrap();
+        assert_eq!(restored.pending_change_count(), 1);
+
+        let utxo_id = UtxoSet::compute_utxo_id(&output, 7, 1, 1);
+        let mut reconciled = restored.clone();
+        assert!(reconciled.reconcile_pending_change(utxo_id, 7, 1, 1));
+        assert!(reconciled.contains(&utxo_id));
+        assert_eq!(reconciled.pending_change_count(), 0);
+    }
+
+    #[test]
+    fn accepted_transaction_bookkeeping_marks_spent_and_records_change() {
+        let spent_id = make_id(0xA1);
+        let other_id = make_id(0xA2);
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(spent_id, 700_000, [0x11; 32], 4, 0, 0);
+        wallet.add_utxo(other_id, 900_000, [0x22; 32], 4, 0, 1);
+        let change = PendingChange {
+            output: sample_output(550_000),
+            blinding: [0x33; 32],
+        };
+
+        wallet.record_accepted_transaction(&[spent_id], Some(change));
+
+        assert!(wallet.get(&spent_id).unwrap().spent);
+        assert!(!wallet.get(&other_id).unwrap().spent);
+        assert_eq!(wallet.pending_change_count(), 1);
+        assert_eq!(wallet.balance(), 900_000);
+        assert!(wallet.select_utxos(900_000, 1).is_err());
+        assert!(wallet.select_utxos(800_000, 50_000).is_ok());
+    }
+
+    fn sample_output(value_spark: u64) -> OutputV1 {
+        OutputV1 {
+            value_spark,
             commitment: indra_core::types::crypto::CommitmentV1 {
                 compressed_point: Bytes32::from([0x11; 32]),
             },
@@ -456,16 +509,6 @@ mod tests {
             range_proof: indra_core::types::primitives::VariableBytes::from_slice(&[0x44; 32])
                 .unwrap(),
             lock_height: 0,
-        };
-        wallet.add_pending_change(output.clone(), [0x55; 32]);
-
-        let restored = Wallet::from_json(&wallet.to_json()).unwrap();
-        assert_eq!(restored.pending_change_count(), 1);
-
-        let utxo_id = UtxoSet::compute_utxo_id(&output, 7, 1, 1);
-        let mut reconciled = restored.clone();
-        assert!(reconciled.reconcile_pending_change(utxo_id, 7, 1, 1));
-        assert!(reconciled.contains(&utxo_id));
-        assert_eq!(reconciled.pending_change_count(), 0);
+        }
     }
 }

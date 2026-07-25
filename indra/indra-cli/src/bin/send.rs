@@ -158,14 +158,15 @@ fn main() {
 
             // Accepted — mark inputs as spent
             let mut wallet = wallet;
-            for id in &built.spent_utxo_ids {
-                wallet.mark_spent(id);
-            }
-            if let Some(change) = built.pending_change {
-                wallet.add_pending_change(change.output.clone(), change.blinding);
+            let pending_change_value = built
+                .pending_change
+                .as_ref()
+                .map(|change| change.output.value_spark);
+            wallet.record_accepted_transaction(&built.spent_utxo_ids, built.pending_change);
+            if let Some(value_spark) = pending_change_value {
                 eprintln!(
                     "[wallet] saved pending change output: {} Spark",
-                    change.output.value_spark
+                    value_spark
                 );
             }
             wallet.save(&wallet_path).unwrap_or_else(|e| {

@@ -168,7 +168,23 @@ fn cmd_send(args: &[String]) {
         eprintln!("{}", response);
         std::process::exit(1);
     }
+    if let Err(error) = update_wallet_after_accepted_transaction(&wallet_path, local_wallet, &built)
+    {
+        eprintln!(
+            "Warning: could not update wallet {}: {}",
+            wallet_path, error
+        );
+    }
     println!("{}", built.tx_id);
+}
+
+fn update_wallet_after_accepted_transaction(
+    wallet_path: &str,
+    mut wallet: Wallet,
+    built: &indra_cli::BuiltTransaction,
+) -> indra_cli::CliResult<()> {
+    wallet.record_accepted_transaction(&built.spent_utxo_ids, built.pending_change.clone());
+    wallet.save(wallet_path)
 }
 
 fn build_auth_or_exit(rpc: &str, keys: &KeysFile, address: &str) -> String {
@@ -514,6 +530,46 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn accepted_indra_tx_send_updates_wallet_file_and_subsequent_balance() {
+        let wallet_path = std::env::temp_dir().join(format!(
+            "indra-tx-wallet-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let wallet_path_str = wallet_path.to_string_lossy().to_string();
+        let spent_id = Bytes32::from([0xC1; 32]);
+        let other_id = Bytes32::from([0xC2; 32]);
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(spent_id, 1_000_000, [0x31; 32], 9, 0, 0);
+        wallet.add_utxo(other_id, 2_000_000, [0x32; 32], 9, 0, 1);
+        wallet.save(&wallet_path_str).unwrap();
+        let built = indra_cli::BuiltTransaction {
+            tx_hex: "00".to_string(),
+            tx_id: hex::encode([0x44; 32]),
+            change_spark: 750_000,
+            recipient_blinding: [0x55; 32],
+            change_blinding: Some([0x56; 32]),
+            spent_utxo_ids: vec![spent_id],
+            pending_change: Some(indra_cli::PendingChange {
+                output: sample_output(750_000),
+                blinding: [0x56; 32],
+            }),
+        };
+
+        update_wallet_after_accepted_transaction(&wallet_path_str, wallet, &built).unwrap();
+
+        let updated = Wallet::load(&wallet_path_str).unwrap();
+        assert!(updated.get(&spent_id).unwrap().spent);
+        assert!(!updated.get(&other_id).unwrap().spent);
+        assert_eq!(updated.pending_change_count(), 1);
+        assert_eq!(updated.balance(), 2_000_000);
+        assert!(updated.select_utxos(2_000_000, 1).is_err());
+        assert!(updated.select_utxos(1_900_000, MIN_FEE_SPARK).is_ok());
+
+        let _ = std::fs::remove_file(wallet_path);
+    }
+
     fn key_material(seed_byte: u8) -> ([u8; 32], Vec<u8>, HybridPubKey) {
         let seed = [seed_byte; 32];
         let classical = ClassicalKeypair::from_seed(&seed);
@@ -546,5 +602,17 @@ mod tests {
             .iter()
             .map(|output| PedersenCommitment(output.commitment.compressed_point.0))
             .collect()
+    }
+
+    fn sample_output(value_spark: u64) -> OutputV1 {
+        OutputV1 {
+            value_spark,
+            commitment: indra_core::types::crypto::CommitmentV1 {
+                compressed_point: Bytes32::from([0x91; 32]),
+            },
+            owner_pubkey: key_material(0x91).2,
+            range_proof: VariableBytes::from_slice(&[0x92; 32]).unwrap(),
+            lock_height: 0,
+        }
     }
 }
