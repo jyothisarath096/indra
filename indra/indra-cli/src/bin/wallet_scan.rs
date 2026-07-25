@@ -10,7 +10,8 @@
 //!
 //! indra-wallet-scan --keys keys.json --wallet wallet.json \
 //!                   [--keys-password-file keys.pass] \
-//!                   --node http://127.0.0.1:8545
+//!                   --node http://127.0.0.1:8545 \
+//!                   [--show-genesis-blinding]
 
 use indra_core::{
     codec::Decode,
@@ -40,6 +41,7 @@ fn main() {
     let wallet_path = get("--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let add_utxo = get("--add-utxo"); // manual: --add-utxo <utxo_id>:<value>:<blinding>
+    let show_genesis_blinding = args.iter().any(|arg| arg == "--show-genesis-blinding");
 
     println!("INDRA Wallet Scanner");
     println!("─────────────────────────────────────────");
@@ -258,13 +260,7 @@ fn main() {
                 );
             }
 
-            println!("\nNote: UTXO values are confidential (Pedersen commitments).");
-            println!("To add a known UTXO to your wallet use:");
-            println!("  indra-wallet-scan --keys keys.json --wallet wallet.json \\");
-            println!("    --add-utxo <utxo_id>:<value_spark>:<blinding_hex>");
-            println!("\nFor genesis validators, your initial UTXO blinding is:");
-            let genesis_blinding = derive_genesis_blinding(&hybrid_seed);
-            println!("  {}", hex::encode(genesis_blinding));
+            print!("{}", scan_footer(&hybrid_seed, show_genesis_blinding));
         }
         Err(e) => {
             eprintln!("Error querying node: {}", e);
@@ -720,6 +716,27 @@ fn derive_genesis_blinding(hybrid_seed: &[u8; 32]) -> [u8; 32] {
     let classical = ClassicalKeypair::from_seed(hybrid_seed);
     let classical_pk = classical.public_key().0;
     indra_crypto::derive_genesis_utxo_blinding_from_classical_pk(&classical_pk)
+}
+
+fn scan_footer(hybrid_seed: &[u8; 32], show_genesis_blinding: bool) -> String {
+    let mut out = String::new();
+    out.push_str("\nNote: UTXO values are confidential (Pedersen commitments).\n");
+    out.push_str("To add a known UTXO to your wallet use:\n");
+    out.push_str("  indra-wallet-scan --keys keys.json --wallet wallet.json \\\n");
+    out.push_str("    --add-utxo <utxo_id>:<value_spark>:<blinding_hex>\n");
+    if show_genesis_blinding {
+        out.push_str("\nFor genesis validators, your initial UTXO blinding is:\n");
+        out.push_str(&format!(
+            "  {}\n",
+            hex::encode(derive_genesis_blinding(hybrid_seed))
+        ));
+    } else {
+        out.push_str(
+            "\nGenesis UTXOs are recovered automatically when discovered. \
+             Pass --show-genesis-blinding only for manual recovery/debugging.\n",
+        );
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -1564,6 +1581,30 @@ mod tests {
         wallet.add_pending_change(change_output, [0x83; 32]);
         assert!(wallet.reconcile_pending_change(change_id, 20, 0, 1));
         assert_eq!(wallet.get(&change_id).unwrap().blinding, [0x83; 32]);
+    }
+
+    #[test]
+    fn normal_scan_footer_does_not_print_genesis_blinding_by_default() {
+        let (seed, _, _) = hybrid_material(0x84);
+        let genesis_blinding_hex = hex::encode(derive_genesis_blinding(&seed));
+
+        let footer = scan_footer(&seed, false);
+
+        assert!(!footer.contains(&genesis_blinding_hex));
+        assert!(!footer.contains("your initial UTXO blinding is"));
+        assert!(footer.contains("Genesis UTXOs are recovered automatically"));
+        assert!(footer.contains("--show-genesis-blinding"));
+    }
+
+    #[test]
+    fn scan_footer_prints_genesis_blinding_only_when_explicitly_requested() {
+        let (seed, _, _) = hybrid_material(0x85);
+        let genesis_blinding_hex = hex::encode(derive_genesis_blinding(&seed));
+
+        let footer = scan_footer(&seed, true);
+
+        assert!(footer.contains("your initial UTXO blinding is"));
+        assert!(footer.contains(&genesis_blinding_hex));
     }
 
     #[test]
