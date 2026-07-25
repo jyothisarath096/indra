@@ -953,50 +953,7 @@ fn legacy_normal_bond_release_uses_fresh_blinding(
     bond.original_output.range_proof.is_some()
         && (bond.delegator_id != bond.validator_id
             || bond.amount_spark >= bond.original_output.value_spark)
-        && normal_bond_release_blinding_active_for_release(release_height)
-}
-
-fn normal_bond_release_blinding_active_for_release(height: u64) -> bool {
-    #[cfg(test)]
-    {
-        if let Some(override_height) =
-            NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT.with(|slot| slot.get())
-        {
-            return height >= override_height;
-        }
-    }
-
-    normal_bond_release_blinding_active(height)
-}
-
-#[cfg(test)]
-thread_local! {
-    static NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-struct NormalBondReleaseBlindingHeightOverride {
-    previous: Option<u64>,
-}
-
-#[cfg(test)]
-impl NormalBondReleaseBlindingHeightOverride {
-    fn set(height: u64) -> Self {
-        let previous = NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT.with(|slot| {
-            let previous = slot.get();
-            slot.set(Some(height));
-            previous
-        });
-        Self { previous }
-    }
-}
-
-#[cfg(test)]
-impl Drop for NormalBondReleaseBlindingHeightOverride {
-    fn drop(&mut self) {
-        NORMAL_BOND_RELEASE_BLINDING_TEST_HEIGHT.with(|slot| slot.set(self.previous));
-    }
+        && normal_bond_release_blinding_active(release_height)
 }
 
 /// Deterministic blinding for a compact stake-bond release.
@@ -1150,7 +1107,10 @@ mod tests {
             governance::GovernableAction,
             primitives::{
                 compact_bond_pubkey_omission_active, compact_stake_bond_active,
-                delegator_identity_registry_active, hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT,
+                delegator_identity_registry_active,
+                hard_forks::{
+                    GOVERNANCE_PROPOSAL_PRUNING_HEIGHT, NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
+                },
                 payment_blinding_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
                 DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS,
                 ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
@@ -1458,7 +1418,8 @@ mod tests {
         let expected = bond.original_output.to_legacy_output().unwrap();
         let state = ChainState::new_genesis();
 
-        let output = released_bond_output(&state, &bond, u64::MAX - 1).unwrap();
+        let output =
+            released_bond_output(&state, &bond, NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1).unwrap();
 
         assert_eq!(output.encode_to_vec(), expected.encode_to_vec());
     }
@@ -1468,7 +1429,7 @@ mod tests {
         let validator_id = Bytes32::from([0x84; 32]);
         let delegator_id = Bytes32::from([0x85; 32]);
         let bond = legacy_bond(0x86, validator_id, delegator_id, 1_000_000);
-        let release_height = u64::MAX;
+        let release_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
         let state = ChainState::new_genesis();
 
         let output = released_bond_output(&state, &bond, release_height).unwrap();
@@ -1511,7 +1472,7 @@ mod tests {
         let validator_id = Bytes32::from([0x87; 32]);
         let delegator_id = Bytes32::from([0x88; 32]);
         let bond = legacy_bond(0x89, validator_id, delegator_id, 1_000_000);
-        let release_height = u64::MAX;
+        let release_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
         let blinding = derive_normal_stake_bond_release_blinding(
             bond.validator_id,
             bond.delegator_id,
@@ -1542,7 +1503,7 @@ mod tests {
     fn normal_blinding_gate_does_not_change_compact_release_derivations() {
         let validator_id = Bytes32::from([0x8A; 32]);
         let delegator_id = Bytes32::from([0x8B; 32]);
-        let release_height = u64::MAX;
+        let release_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
         let compact = compact_bond(0x8C, validator_id, delegator_id, 1_000_000);
         let (fully_compact, owner_pubkey) =
             fully_compact_bond(0x8D, validator_id, delegator_id, 750_000);
@@ -1586,17 +1547,31 @@ mod tests {
             let pre_gate = legacy_bond(0x93, validator_id, delegator_id, 1_000_000);
             let post_gate = legacy_bond(0x94, validator_id, delegator_id, 1_000_000);
 
-            let old_output = released_bond_output(&state, &pre_gate, u64::MAX - 1).unwrap();
+            let old_output =
+                released_bond_output(&state, &pre_gate, NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1)
+                    .unwrap();
             state
                 .utxos
-                .insert(old_output, u64::MAX - 1, STAKING_TX_IDX, 1)
+                .insert(
+                    old_output,
+                    NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1,
+                    STAKING_TX_IDX,
+                    1,
+                )
                 .unwrap();
-            let new_output = released_bond_output(&state, &post_gate, u64::MAX).unwrap();
+            let new_output =
+                released_bond_output(&state, &post_gate, NORMAL_BOND_RELEASE_BLINDING_HEIGHT)
+                    .unwrap();
             state
                 .utxos
-                .insert(new_output, u64::MAX, STAKING_TX_IDX, 2)
+                .insert(
+                    new_output,
+                    NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
+                    STAKING_TX_IDX,
+                    2,
+                )
                 .unwrap();
-            state.height = u64::MAX;
+            state.height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
             state
         }
 
@@ -1608,14 +1583,13 @@ mod tests {
 
     #[test]
     fn normal_release_capstone_lifecycle_crosses_test_configured_gate() {
-        let activation_height = 176_100;
-        let _guard = NormalBondReleaseBlindingHeightOverride::set(activation_height);
-        let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS - 1;
-        let post_epoch = activation_height / EPOCH_DURATION_BLOCKS;
+        let activation_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
+        let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS;
+        let post_epoch = pre_epoch + 1;
         let pre_height = pre_epoch * EPOCH_DURATION_BLOCKS;
         let post_height = post_epoch * EPOCH_DURATION_BLOCKS;
         assert!(pre_height < activation_height);
-        assert_eq!(post_height, activation_height);
+        assert!(post_height >= activation_height);
         assert!(compact_stake_bond_active(post_height));
         assert!(compact_bond_pubkey_omission_active(post_height));
         assert!(delegator_identity_registry_active(post_height));
@@ -1692,12 +1666,13 @@ mod tests {
     #[test]
     fn normal_release_capstone_replay_mixed_bond_shapes_across_active_gates() {
         fn replay() -> ChainState {
-            let activation_height = 176_100;
-            let _guard = NormalBondReleaseBlindingHeightOverride::set(activation_height);
-            let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS - 1;
-            let post_epoch = activation_height / EPOCH_DURATION_BLOCKS;
+            let activation_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
+            let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS;
+            let post_epoch = pre_epoch + 1;
             let pre_height = pre_epoch * EPOCH_DURATION_BLOCKS;
             let post_height = post_epoch * EPOCH_DURATION_BLOCKS;
+            assert!(pre_height < activation_height);
+            assert!(post_height >= activation_height);
             assert!(compact_stake_bond_active(pre_height));
             assert!(compact_bond_pubkey_omission_active(pre_height));
             assert!(delegator_identity_registry_active(pre_height));
@@ -1752,8 +1727,8 @@ mod tests {
         assert_eq!(a.encode_to_vec(), b.encode_to_vec());
         assert_eq!(compute_state_root(&a), compute_state_root(&b));
         assert_eq!(
-            a.state_commitment_v2_root(176_100),
-            b.state_commitment_v2_root(176_100)
+            a.state_commitment_v2_root(NORMAL_BOND_RELEASE_BLINDING_HEIGHT),
+            b.state_commitment_v2_root(NORMAL_BOND_RELEASE_BLINDING_HEIGHT)
         );
     }
 

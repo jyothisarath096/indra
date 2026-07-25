@@ -592,17 +592,16 @@ pub mod hard_forks {
 
     /// Normal stake-bond releases derive fresh deterministic blinding factors.
     ///
-    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
-    /// coordinated deployment, comfortably ahead of the live chain tip at that
-    /// time. Before this height, normal legacy stake-bond releases continue to
-    /// reuse their original stored output bytes exactly as before. At/after this
-    /// height, normal releases may create fresh deterministic release outputs.
+    /// Testnet activation height for deterministic normal stake-bond release
+    /// blindings. Before this height, normal legacy stake-bond releases continue
+    /// to reuse their original stored output bytes exactly as before. At/after
+    /// this height, normal releases may create fresh deterministic release outputs.
     ///
     /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
     /// no per-chain-ID differentiation. Before building mainnet genesis, this
-    /// MUST be deliberately reset to the correct mainnet value. Leaving
-    /// `u64::MAX` here means this rule never activates on that network.
-    pub const NORMAL_BOND_RELEASE_BLINDING_HEIGHT: u64 = u64::MAX;
+    /// MUST be deliberately reset to the correct mainnet value. Do not silently
+    /// reuse this testnet activation height for mainnet.
+    pub const NORMAL_BOND_RELEASE_BLINDING_HEIGHT: u64 = 186_500;
 
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
@@ -1244,8 +1243,12 @@ mod tests {
             NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
             b"INDRA-normal-stake-bond-release-v1"
         );
-        assert_eq!(NORMAL_BOND_RELEASE_BLINDING_HEIGHT, u64::MAX);
-        assert!(!normal_bond_release_blinding_active(u64::MAX - 1));
-        assert!(normal_bond_release_blinding_active(u64::MAX));
+        assert_eq!(NORMAL_BOND_RELEASE_BLINDING_HEIGHT, 186_500);
+        assert!(!normal_bond_release_blinding_active(
+            NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1
+        ));
+        assert!(normal_bond_release_blinding_active(
+            NORMAL_BOND_RELEASE_BLINDING_HEIGHT
+        ));
     }
 }
