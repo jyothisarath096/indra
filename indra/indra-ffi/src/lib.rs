@@ -87,11 +87,17 @@ pub(crate) unsafe fn bounded_cstr(ptr: *const c_char) -> Result<String, IndraErr
 #[cfg(test)]
 mod handle_tests {
     use super::*;
+    use indra_cli::{build_transaction, TxParams, Wallet};
     use indra_core::{
         codec::Decode,
         types::{
+            block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+            crypto::HybridPubKey,
             governance::{GovernanceOpV2, GovernancePayload},
-            primitives::{Bytes32, DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES},
+            primitives::{
+                block_protocol_version_for_height, Bytes32, ProtocolVersion, VariableBytes,
+                DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+            },
             staking::{StakingOp, StakingOpBody},
             transaction::TransactionV1,
         },
@@ -99,7 +105,7 @@ mod handle_tests {
     use indra_crypto::{
         verify_opening, PaymentKeypairV1, PaymentPubKeyV1, PedersenCommitment, PedersenOpening,
     };
-    use indra_state::{apply_staking_op, ChainState};
+    use indra_state::{apply_block, apply_staking_op, ChainState};
     use std::{
         ffi::{CStr, CString},
         fs,
@@ -109,6 +115,7 @@ mod handle_tests {
     };
 
     const OK: i32 = IndraError::Ok as i32;
+    const INVALID_PARAM: i32 = IndraError::InvalidParam as i32;
     const INVALID_HANDLE: i32 = IndraError::InvalidHandle as i32;
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -302,7 +309,7 @@ mod handle_tests {
     }
 
     #[test]
-    fn build_tx_with_handle_matches_legacy_builder_output_shape() {
+    fn build_tx_v4_with_handle_matches_legacy_builder_output_shape() {
         let _guard = test_lock();
         let (handle, public) = handle_from_seed([0x33; 32]);
         let utxo = IndraUtxoEntry {
@@ -314,16 +321,21 @@ mod handle_tests {
             out_index: 0,
             spent: 0,
         };
-        let params = IndraTxParamsV2 {
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let params = IndraTxParamsV4 {
             recipient_classical_pk: public.classical_pk.as_ptr(),
+            recipient_pq_pk: public.pq_pk.as_ptr(),
+            recipient_pq_pk_len: public.pq_pk.len(),
             amount_spark: 1_000_000,
             fee_spark: 50_000,
             utxos: &utxo,
             utxo_count: 1,
             sender_handle: handle,
+            recipient_payment_pubkey: std::ptr::null(),
+            chain_id: chain.as_ptr(),
         };
         let mut result = IndraTxResult::zeroed();
-        let code = unsafe { indra_build_tx_with_handle(&params, &mut result) };
+        let code = unsafe { indra_build_tx_v4_with_handle(&params, &mut result) };
         assert_eq!(code, OK);
         assert!(!result.tx_bytes.is_null());
         assert!(result.tx_bytes_len > 0);
@@ -386,6 +398,49 @@ mod handle_tests {
         }
     }
 
+    fn hybrid_pubkey(public: &IndraPublicKeyInfo) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical_pk),
+            pq_pk: VariableBytes::from_slice(&public.pq_pk).unwrap(),
+        }
+    }
+
+    fn pubkey_hex(public: &IndraPublicKeyInfo) -> String {
+        format!(
+            "{}:{}",
+            hex::encode(public.classical_pk),
+            hex::encode(public.pq_pk)
+        )
+    }
+
+    fn block_with_tx(state: &ChainState, tx: TransactionV1) -> BlockV1 {
+        let height = state.height + 1;
+        BlockV1 {
+            header: BlockHeaderV1 {
+                protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
+                height,
+                prev_hash: state.tip_hash,
+                timestamp: 1_700_000_000 + height,
+                state_root: Bytes32::ZERO,
+                validator_set_root: Bytes32::ZERO,
+                mempool_set_root: Bytes32::ZERO,
+                value_hash: Bytes32::ZERO,
+                base_fee: state.base_fee,
+                proposer_round: 0,
+                polc_round: NO_POLC_ROUND,
+                proposer_vrf_output: Bytes32::ZERO,
+                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                election_result_hash: None,
+            },
+            transactions: vec![tx],
+            slashing_evidence: Vec::new(),
+            governance_ops: Vec::new(),
+            staking_ops: Vec::new(),
+            vrf_reveals: Vec::new(),
+        }
+    }
+
     #[test]
     fn build_tx_with_payment_pubkey_ffi_produces_v2_note_and_change_none_slot() {
         let _guard = test_lock();
@@ -403,8 +458,10 @@ mod handle_tests {
         );
         let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
         let utxo = funded_utxo();
-        let params = IndraTxParamsV3 {
+        let params = IndraTxParamsV4 {
             recipient_classical_pk: recipient_public.classical_pk.as_ptr(),
+            recipient_pq_pk: recipient_public.pq_pk.as_ptr(),
+            recipient_pq_pk_len: recipient_public.pq_pk.len(),
             amount_spark: 1_000_000,
             fee_spark: 50_000,
             utxos: &utxo,
@@ -415,7 +472,7 @@ mod handle_tests {
         };
         let mut result = IndraTxResult::zeroed();
 
-        let code = unsafe { indra_build_tx_with_payment_with_handle(&params, &mut result) };
+        let code = unsafe { indra_build_tx_v4_with_handle(&params, &mut result) };
 
         assert_eq!(code, OK);
         let tx = unsafe { decode_tx_result(&result) };
@@ -430,12 +487,94 @@ mod handle_tests {
     }
 
     #[test]
-    fn build_tx_without_payment_pubkey_ffi_preserves_fallback_behavior() {
+    fn build_tx_v4_uses_real_recipient_hybrid_pubkey() {
         let _guard = test_lock();
-        let (sender_handle, sender_public) = handle_from_seed([0x75; 32]);
+        let (sender_handle, _sender_public) = handle_from_seed([0x7A; 32]);
+        let (_recipient_handle, recipient_public) = handle_from_seed([0x7B; 32]);
         let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
         let utxo = funded_utxo();
-        let params = IndraTxParamsV3 {
+        let params = IndraTxParamsV4 {
+            recipient_classical_pk: recipient_public.classical_pk.as_ptr(),
+            recipient_pq_pk: recipient_public.pq_pk.as_ptr(),
+            recipient_pq_pk_len: recipient_public.pq_pk.len(),
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: &utxo,
+            utxo_count: 1,
+            sender_handle,
+            recipient_payment_pubkey: std::ptr::null(),
+            chain_id: chain.as_ptr(),
+        };
+        let mut result = IndraTxResult::zeroed();
+
+        assert_eq!(
+            unsafe { indra_build_tx_v4_with_handle(&params, &mut result) },
+            OK
+        );
+        let tx = unsafe { decode_tx_result(&result) };
+
+        assert_eq!(
+            tx.outputs[0].owner_pubkey.classical_pk.0,
+            recipient_public.classical_pk
+        );
+        assert_eq!(
+            tx.outputs[0].owner_pubkey.pq_pk.as_slice(),
+            recipient_public.pq_pk.as_slice()
+        );
+        assert_ne!(
+            tx.outputs[0].owner_pubkey.pq_pk.as_slice(),
+            &[0u8; PQ_PK_BYTES]
+        );
+        unsafe {
+            indra_free_bytes(result.tx_bytes, result.tx_bytes_len);
+            indra_free_usize(result.spent_indices, result.spent_count);
+        }
+    }
+
+    #[test]
+    fn build_tx_v4_rejects_all_zero_recipient_pq_pubkey() {
+        let _guard = test_lock();
+        let (sender_handle, _sender_public) = handle_from_seed([0x7C; 32]);
+        let (_recipient_handle, recipient_public) = handle_from_seed([0x7D; 32]);
+        let zero_pq = [0u8; PQ_PK_BYTES];
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let utxo = funded_utxo();
+        let params = IndraTxParamsV4 {
+            recipient_classical_pk: recipient_public.classical_pk.as_ptr(),
+            recipient_pq_pk: zero_pq.as_ptr(),
+            recipient_pq_pk_len: zero_pq.len(),
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: &utxo,
+            utxo_count: 1,
+            sender_handle,
+            recipient_payment_pubkey: std::ptr::null(),
+            chain_id: chain.as_ptr(),
+        };
+        let mut result = IndraTxResult::zeroed();
+
+        assert_eq!(
+            unsafe { indra_build_tx_v4_with_handle(&params, &mut result) },
+            IndraError::InvalidParam.code()
+        );
+        assert!(result.tx_bytes.is_null());
+    }
+
+    #[test]
+    fn legacy_classical_only_ffi_tx_builders_fail_loudly() {
+        let _guard = test_lock();
+        let (sender_handle, sender_public) = handle_from_seed([0x7E; 32]);
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let utxo = funded_utxo();
+        let params_v2 = IndraTxParamsV2 {
+            recipient_classical_pk: sender_public.classical_pk.as_ptr(),
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: &utxo,
+            utxo_count: 1,
+            sender_handle,
+        };
+        let params_v3 = IndraTxParamsV3 {
             recipient_classical_pk: sender_public.classical_pk.as_ptr(),
             amount_spark: 1_000_000,
             fee_spark: 50_000,
@@ -447,7 +586,39 @@ mod handle_tests {
         };
         let mut result = IndraTxResult::zeroed();
 
-        let code = unsafe { indra_build_tx_with_payment_with_handle(&params, &mut result) };
+        assert_eq!(
+            unsafe { indra_build_tx_with_handle(&params_v2, &mut result) },
+            INVALID_PARAM
+        );
+        assert!(result.tx_bytes.is_null());
+        assert_eq!(
+            unsafe { indra_build_tx_with_payment_with_handle(&params_v3, &mut result) },
+            INVALID_PARAM
+        );
+        assert!(result.tx_bytes.is_null());
+    }
+
+    #[test]
+    fn build_tx_without_payment_pubkey_ffi_preserves_fallback_behavior() {
+        let _guard = test_lock();
+        let (sender_handle, sender_public) = handle_from_seed([0x75; 32]);
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let utxo = funded_utxo();
+        let params = IndraTxParamsV4 {
+            recipient_classical_pk: sender_public.classical_pk.as_ptr(),
+            recipient_pq_pk: sender_public.pq_pk.as_ptr(),
+            recipient_pq_pk_len: sender_public.pq_pk.len(),
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: &utxo,
+            utxo_count: 1,
+            sender_handle,
+            recipient_payment_pubkey: std::ptr::null(),
+            chain_id: chain.as_ptr(),
+        };
+        let mut result = IndraTxResult::zeroed();
+
+        let code = unsafe { indra_build_tx_v4_with_handle(&params, &mut result) };
 
         assert_eq!(code, OK);
         let tx = unsafe { decode_tx_result(&result) };
@@ -476,8 +647,10 @@ mod handle_tests {
         let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
         let utxo = funded_utxo();
         let amount = 1_000_000;
-        let params = IndraTxParamsV3 {
+        let params = IndraTxParamsV4 {
             recipient_classical_pk: recipient_public.classical_pk.as_ptr(),
+            recipient_pq_pk: recipient_public.pq_pk.as_ptr(),
+            recipient_pq_pk_len: recipient_public.pq_pk.len(),
             amount_spark: amount,
             fee_spark: 50_000,
             utxos: &utxo,
@@ -488,7 +661,7 @@ mod handle_tests {
         };
         let mut result = IndraTxResult::zeroed();
         assert_eq!(
-            unsafe { indra_build_tx_with_payment_with_handle(&params, &mut result) },
+            unsafe { indra_build_tx_v4_with_handle(&params, &mut result) },
             OK
         );
         let tx = unsafe { decode_tx_result(&result) };
@@ -544,6 +717,89 @@ mod handle_tests {
             OK
         );
         assert_eq!(recovered_raw, recovered);
+        unsafe {
+            indra_free_bytes(result.tx_bytes, result.tx_bytes_len);
+            indra_free_usize(result.spent_indices, result.spent_count);
+        }
+    }
+
+    #[test]
+    fn ffi_recipient_output_is_spendable_by_real_hybrid_recipient() {
+        let _guard = test_lock();
+        let (sender_handle, sender_public) = handle_from_seed([0x78; 32]);
+        let (recipient_handle, recipient_public) = handle_from_seed([0x79; 32]);
+        let mut recipient_payment_pubkey = [0u8; PAYMENT_PUBKEY_V1_BYTES];
+        assert_eq!(
+            unsafe {
+                crate::payment::indra_key_handle_payment_pubkey(
+                    recipient_handle,
+                    recipient_payment_pubkey.as_mut_ptr(),
+                )
+            },
+            OK
+        );
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let utxo = funded_utxo();
+        let amount = 1_000_000;
+        let params = IndraTxParamsV4 {
+            recipient_classical_pk: recipient_public.classical_pk.as_ptr(),
+            recipient_pq_pk: recipient_public.pq_pk.as_ptr(),
+            recipient_pq_pk_len: recipient_public.pq_pk.len(),
+            amount_spark: amount,
+            fee_spark: 50_000,
+            utxos: &utxo,
+            utxo_count: 1,
+            sender_handle,
+            recipient_payment_pubkey: recipient_payment_pubkey.as_ptr(),
+            chain_id: chain.as_ptr(),
+        };
+        let mut result = IndraTxResult::zeroed();
+        assert_eq!(
+            unsafe { indra_build_tx_v4_with_handle(&params, &mut result) },
+            OK
+        );
+        let tx = unsafe { decode_tx_result(&result) };
+        let note = tx.payment_notes[0].as_ref().unwrap().encode();
+        let mut recovered_blinding = [0u8; BYTES32_LEN];
+        assert_eq!(
+            unsafe {
+                crate::payment::indra_recover_payment_blinding_with_handle(
+                    recipient_handle,
+                    note.as_ptr(),
+                    chain.as_ptr(),
+                    0,
+                    amount,
+                    0,
+                    recovered_blinding.as_mut_ptr(),
+                )
+            },
+            OK
+        );
+
+        let mut state = ChainState::new_genesis();
+        let received_utxo_id = state.utxos.insert(tx.outputs[0].clone(), 0, 0, 0).unwrap();
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(received_utxo_id, amount, recovered_blinding, 0, 0, 0);
+        let recipient_signing = handles::signing_material(recipient_handle).unwrap();
+        let destination = pubkey_hex(&sender_public);
+        let built_spend = build_transaction(&TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &destination,
+            amount_spark: 500_000,
+            fee_spark: 50_000,
+            wallet: &wallet,
+            hybrid_seed: recipient_signing.classical_seed(),
+            pq_sk_bytes: recipient_signing.pq_sk().to_vec(),
+            sender_pubkey: hybrid_pubkey(&recipient_public),
+            recipient_payment_pubkey: None,
+        })
+        .unwrap();
+        let spend_tx =
+            TransactionV1::decode_exact(&hex::decode(&built_spend.tx_hex).unwrap()).unwrap();
+        let block = block_with_tx(&state, spend_tx);
+
+        apply_block(&mut state, &block, 0).unwrap();
+        assert!(state.utxos.get(&received_utxo_id).is_none());
         unsafe {
             indra_free_bytes(result.tx_bytes, result.tx_bytes_len);
             indra_free_usize(result.spent_indices, result.spent_count);
@@ -819,6 +1075,26 @@ pub struct IndraTxParamsV2 {
 #[derive(Clone, Copy)]
 pub struct IndraTxParamsV3 {
     pub recipient_classical_pk: *const u8,
+    pub amount_spark: u64,
+    pub fee_spark: u64,
+    pub utxos: *const IndraUtxoEntry,
+    pub utxo_count: usize,
+    pub sender_handle: IndraKeyHandle,
+    /// Null means preserve legacy random-blinding behavior. Non-null must
+    /// reference `INDRA_PAYMENT_PUBKEY_V1_BYTES` readable bytes.
+    pub recipient_payment_pubkey: *const u8,
+    /// Chain id used in payment-note KDF and transaction signing.
+    pub chain_id: *const c_char,
+}
+
+/// FFI transaction builder input parameters with a full hybrid recipient key.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IndraTxParamsV4 {
+    pub recipient_classical_pk: *const u8,
+    /// Points to the recipient's encoded ML-DSA-87 public key bytes.
+    pub recipient_pq_pk: *const u8,
+    pub recipient_pq_pk_len: usize,
     pub amount_spark: u64,
     pub fee_spark: u64,
     pub utxos: *const IndraUtxoEntry,
@@ -1199,6 +1475,7 @@ pub unsafe extern "C" fn indra_build_tx(
             wallet::build_wallet_context(sender_classical_seed, sender_pq_pk, utxos)?;
         let built = match tx::build(
             recipient_classical_pk,
+            &[0u8; PQ_PK_BYTES],
             params_ref.amount_spark,
             params_ref.fee_spark,
             sender_classical_seed,
@@ -1288,6 +1565,7 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
             wallet::build_wallet_context(sender_classical_seed, &signing.public.pq_pk, utxos)?;
         let built = match tx::build(
             recipient_classical_pk,
+            &[0u8; PQ_PK_BYTES],
             params_ref.amount_spark,
             params_ref.fee_spark,
             sender_classical_seed,
@@ -1395,6 +1673,122 @@ pub unsafe extern "C" fn indra_build_tx_with_payment_with_handle(
             wallet::build_wallet_context(sender_classical_seed, &signing.public.pq_pk, utxos)?;
         let built = match tx::build_with_payment(
             recipient_classical_pk,
+            &[0u8; PQ_PK_BYTES],
+            params_ref.amount_spark,
+            params_ref.fee_spark,
+            sender_classical_seed,
+            &sender_pq_sk,
+            &chain_id,
+            recipient_payment_pubkey,
+            wallet_context,
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                sender_classical_seed.fill(0);
+                sender_pq_sk.fill(0);
+                return Err(error);
+            }
+        };
+        sender_classical_seed.fill(0);
+        sender_pq_sk.fill(0);
+
+        let tx_id = built.tx_id;
+        let change_spark = built.change_spark;
+        let change_blinding = built.change_blinding;
+
+        let tx_bytes_len = built.tx_bytes.len();
+        let tx_bytes_ptr = Box::into_raw(built.tx_bytes) as *mut u8;
+        let spent_count = built.spent_indices.len();
+        let spent_ptr = Box::into_raw(built.spent_indices) as *mut usize;
+
+        *out = IndraTxResult {
+            tx_id,
+            tx_bytes: tx_bytes_ptr,
+            tx_bytes_len,
+            change_spark,
+            change_blinding,
+            spent_indices: spent_ptr,
+            spent_count,
+        };
+
+        Ok::<(), IndraError>(())
+    }) {
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+/// Build and sign a transaction using an opaque key handle, full hybrid
+/// recipient key, and optional recipient payment key.
+///
+/// # Safety
+///
+/// `params` and `out` must be valid non-null pointers. `recipient_classical_pk`
+/// must reference `INDRA_CLASSICAL_PK_BYTES` readable bytes. `recipient_pq_pk`
+/// must reference `recipient_pq_pk_len` readable bytes, and the length must be
+/// `INDRA_PQ_PK_BYTES`. If `recipient_payment_pubkey` is non-null, it must
+/// reference `INDRA_PAYMENT_PUBKEY_V1_BYTES` readable bytes. `chain_id` must be
+/// a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn indra_build_tx_v4_with_handle(
+    params: *const IndraTxParamsV4,
+    out: *mut IndraTxResult,
+) -> i32 {
+    if params.is_null() || out.is_null() {
+        return IndraError::NullPointer.code();
+    }
+
+    *out = IndraTxResult::zeroed();
+
+    match catch_unwind(|| {
+        let params_ref = &*params;
+        if params_ref.utxo_count > MAX_UTXO_COUNT || params_ref.recipient_pq_pk_len != PQ_PK_BYTES {
+            return Err(IndraError::InvalidParam);
+        }
+        if params_ref.recipient_classical_pk.is_null()
+            || params_ref.recipient_pq_pk.is_null()
+            || params_ref.chain_id.is_null()
+            || (params_ref.utxo_count > 0 && params_ref.utxos.is_null())
+        {
+            return Err(IndraError::NullPointer);
+        }
+
+        let mut recipient_classical_pk = [0u8; CLASSICAL_PK_BYTES];
+        recipient_classical_pk.copy_from_slice(std::slice::from_raw_parts(
+            params_ref.recipient_classical_pk,
+            CLASSICAL_PK_BYTES,
+        ));
+        let recipient_pq_pk =
+            std::slice::from_raw_parts(params_ref.recipient_pq_pk, params_ref.recipient_pq_pk_len);
+
+        let recipient_payment_pubkey = if params_ref.recipient_payment_pubkey.is_null() {
+            None
+        } else {
+            Some(
+                indra_crypto::PaymentPubKeyV1::decode(std::slice::from_raw_parts(
+                    params_ref.recipient_payment_pubkey,
+                    PAYMENT_PUBKEY_V1_BYTES,
+                ))
+                .map_err(|_| IndraError::InvalidParam)?,
+            )
+        };
+        let chain_id = bounded_cstr(params_ref.chain_id)?;
+
+        let utxos = if params_ref.utxo_count == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(params_ref.utxos, params_ref.utxo_count)
+        };
+
+        let signing = handles::signing_material(params_ref.sender_handle)?;
+        let mut sender_classical_seed = signing.classical_seed();
+        let mut sender_pq_sk = signing.pq_sk();
+        let wallet_context =
+            wallet::build_wallet_context(sender_classical_seed, &signing.public.pq_pk, utxos)?;
+        let built = match tx::build_with_payment(
+            recipient_classical_pk,
+            recipient_pq_pk,
             params_ref.amount_spark,
             params_ref.fee_spark,
             sender_classical_seed,

@@ -82,6 +82,20 @@ typedef struct {
 } IndraTxParamsV3;
 
 typedef struct {
+    const uint8_t* recipient_classical_pk;
+    const uint8_t* recipient_pq_pk;
+    size_t         recipient_pq_pk_len;
+    uint64_t       amount_spark;
+    uint64_t       fee_spark;
+    const IndraUtxoEntry* utxos;
+    size_t         utxo_count;
+    IndraKeyHandle sender_handle;
+    /* Nullable. When non-null, points to INDRA_PAYMENT_PUBKEY_V1_BYTES bytes. */
+    const uint8_t* recipient_payment_pubkey;
+    const char*    chain_id;
+} IndraTxParamsV4;
+
+typedef struct {
     uint8_t  tx_id[INDRA_TX_ID_BYTES];
     uint8_t* tx_bytes;
     size_t   tx_bytes_len;
@@ -147,6 +161,11 @@ int32_t indra_build_tx_with_handle(
 
 int32_t indra_build_tx_with_payment_with_handle(
     const IndraTxParamsV3* params,
+    IndraTxResult* out
+);
+
+int32_t indra_build_tx_v4_with_handle(
+    const IndraTxParamsV4* params,
     IndraTxResult* out
 );
 

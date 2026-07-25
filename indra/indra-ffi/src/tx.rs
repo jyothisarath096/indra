@@ -2,7 +2,7 @@ use indra_cli::{build_transaction, TxParams};
 use indra_core::{codec::Decode, types::transaction::TransactionV1};
 use indra_crypto::PaymentPubKeyV1;
 
-use crate::{errors::IndraError, wallet::WalletContext};
+use crate::{errors::IndraError, wallet::WalletContext, PQ_PK_BYTES};
 
 /// Owned transaction result before transferring heap ownership over FFI.
 pub struct BuiltTxOwned {
@@ -16,6 +16,7 @@ pub struct BuiltTxOwned {
 /// Build and sign an INDRA transaction from safe Rust inputs.
 pub fn build(
     recipient_classical_pk: [u8; 32],
+    recipient_pq_pk: &[u8],
     amount_spark: u64,
     fee_spark: u64,
     sender_classical_seed: [u8; 32],
@@ -24,6 +25,7 @@ pub fn build(
 ) -> Result<BuiltTxOwned, IndraError> {
     build_with_payment(
         recipient_classical_pk,
+        recipient_pq_pk,
         amount_spark,
         fee_spark,
         sender_classical_seed,
@@ -37,6 +39,7 @@ pub fn build(
 /// Build and sign an INDRA transaction, optionally deriving a payment note.
 pub fn build_with_payment(
     recipient_classical_pk: [u8; 32],
+    recipient_pq_pk: &[u8],
     amount_spark: u64,
     fee_spark: u64,
     sender_classical_seed: [u8; 32],
@@ -45,7 +48,14 @@ pub fn build_with_payment(
     recipient_payment_pubkey: Option<PaymentPubKeyV1>,
     wallet_context: WalletContext,
 ) -> Result<BuiltTxOwned, IndraError> {
-    let recipient_pubkey_hex = hex::encode(recipient_classical_pk);
+    if recipient_pq_pk.len() != PQ_PK_BYTES || recipient_pq_pk.iter().all(|&byte| byte == 0) {
+        return Err(IndraError::InvalidParam);
+    }
+    let recipient_pubkey_hex = format!(
+        "{}:{}",
+        hex::encode(recipient_classical_pk),
+        hex::encode(recipient_pq_pk)
+    );
     let mut params = TxParams {
         chain_id,
         recipient_pubkey_hex: &recipient_pubkey_hex,

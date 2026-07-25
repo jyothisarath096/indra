@@ -541,9 +541,12 @@ fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey
 
 /// Parse a hex-encoded hybrid public key.
 fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
-    // Format: classical_pk_hex:pq_pk_hex (split by colon)
-    // OR: just classical_pk_hex (32 bytes, pq_pk zeroed for now)
     let parts: Vec<&str> = hex_str.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(CliError::Transaction(
+            "recipient pubkey must be full hybrid format classical_pk_hex:pq_pk_hex".into(),
+        ));
+    }
 
     let classical_bytes = hex::decode(parts[0])
         .map_err(|_| CliError::InvalidHex("bad classical pubkey hex".into()))?;
@@ -558,11 +561,13 @@ fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
     let mut classical_arr = [0u8; 32];
     classical_arr.copy_from_slice(&classical_bytes);
 
-    let pq_bytes = if parts.len() == 2 {
-        hex::decode(parts[1]).map_err(|_| CliError::InvalidHex("bad pq pubkey hex".into()))?
-    } else {
-        vec![0u8; 2592] // zeroed pq key — not recommended for mainnet
-    };
+    let pq_bytes =
+        hex::decode(parts[1]).map_err(|_| CliError::InvalidHex("bad pq pubkey hex".into()))?;
+    if pq_bytes.iter().all(|&byte| byte == 0) {
+        return Err(CliError::Transaction(
+            "recipient pq pubkey must not be all zero".into(),
+        ));
+    }
 
     Ok(HybridPubKey {
         classical_pk: Bytes32::from(classical_arr),
@@ -630,6 +635,14 @@ mod tests {
         TransactionV1::decode_exact(&bytes).unwrap()
     }
 
+    fn pubkey_hex(pubkey: &HybridPubKey) -> String {
+        format!(
+            "{}:{}",
+            hex::encode(pubkey.classical_pk.0),
+            hex::encode(pubkey.pq_pk.as_slice())
+        )
+    }
+
     fn direct_blinding_oracle(
         note: &PaymentBlindingNoteV1,
         x_secret: [u8; 32],
@@ -666,7 +679,7 @@ mod tests {
     #[test]
     fn build_basic_transaction() {
         let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = hex::encode(spk.classical_pk.0);
+        let recipient_hex = pubkey_hex(&spk);
 
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
@@ -685,6 +698,60 @@ mod tests {
         assert_eq!(result.tx_id.len(), 64);
         assert_eq!(result.change_spark, 8_950_000);
         assert_eq!(result.spent_utxo_ids.len(), 1);
+    }
+
+    #[test]
+    fn build_transaction_rejects_classical_only_recipient_pubkey() {
+        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
+        let recipient_hex = hex::encode(spk.classical_pk.0);
+
+        let result = build_transaction(&TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &recipient_hex,
+            amount_spark: 1_000_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &wallet,
+            hybrid_seed: seed,
+            pq_sk_bytes: pq_sk,
+            sender_pubkey: spk,
+            recipient_payment_pubkey: None,
+        });
+        let Err(err) = result else {
+            panic!("classical-only recipient pubkey unexpectedly succeeded");
+        };
+
+        assert!(err
+            .to_string()
+            .contains("recipient pubkey must be full hybrid format"));
+    }
+
+    #[test]
+    fn build_transaction_rejects_all_zero_recipient_pq_pubkey() {
+        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
+        let recipient_hex = format!(
+            "{}:{}",
+            hex::encode(spk.classical_pk.0),
+            hex::encode([0u8; 2592])
+        );
+
+        let result = build_transaction(&TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_pubkey_hex: &recipient_hex,
+            amount_spark: 1_000_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &wallet,
+            hybrid_seed: seed,
+            pq_sk_bytes: pq_sk,
+            sender_pubkey: spk,
+            recipient_payment_pubkey: None,
+        });
+        let Err(err) = result else {
+            panic!("all-zero recipient pq pubkey unexpectedly succeeded");
+        };
+
+        assert!(err
+            .to_string()
+            .contains("recipient pq pubkey must not be all zero"));
     }
 
     #[test]
@@ -751,7 +818,7 @@ mod tests {
     #[test]
     fn build_transaction_without_payment_key_preserves_legacy_shape() {
         let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = hex::encode(spk.classical_pk.0);
+        let recipient_hex = pubkey_hex(&spk);
 
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
@@ -877,7 +944,7 @@ mod tests {
     #[test]
     fn insufficient_balance_errors() {
         let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = hex::encode(spk.classical_pk.0);
+        let recipient_hex = pubkey_hex(&spk);
 
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
@@ -897,7 +964,7 @@ mod tests {
     #[test]
     fn dust_amount_rejected() {
         let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = hex::encode(spk.classical_pk.0);
+        let recipient_hex = pubkey_hex(&spk);
 
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
