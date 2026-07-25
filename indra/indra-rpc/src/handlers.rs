@@ -1816,6 +1816,7 @@ fn get_delegation_return_events(params: &[String], state: &NodeState<'_>) -> Rpc
     {
         let reason = match event.reason {
             indra_state::validator::DelegationReturnReason::ValidatorEvicted => "ValidatorEvicted",
+            indra_state::validator::DelegationReturnReason::UnbondingMatured => "UnbondingMatured",
         };
         events.push(format!(
             r#"{{"delegator_id":"{}","validator_id":"{}","bond_utxo_id":"{}","amount_spark":{},"reason":"{}","returned_epoch":{},"returned_height":{},"refund_utxo_id":"{}"}}"#,

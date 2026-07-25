@@ -36,18 +36,21 @@ pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDA
 const STAKE_BOND_COMPACT_MARKER: u8 = u8::MAX;
 const STAKE_BOND_FULLY_COMPACT_MARKER: u8 = u8::MAX - 1;
 
-/// Why a stake bond was returned outside the normal claim/undelegation flow.
+/// Why a stake bond principal was returned to a spendable UTXO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationReturnReason {
     /// Validator was evicted from the bounded registry by a higher-stake
     /// registration; all associated bonds were returned immediately.
     ValidatorEvicted,
+    /// A normally unbonding stake bond reached its release epoch.
+    UnbondingMatured,
 }
 
 impl Encode for DelegationReturnReason {
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             Self::ValidatorEvicted => 1u8.encode(buf),
+            Self::UnbondingMatured => 2u8.encode(buf),
         }
     }
 
@@ -60,6 +63,7 @@ impl Decode for DelegationReturnReason {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         match u8::decode(r)? {
             1 => Ok(Self::ValidatorEvicted),
+            2 => Ok(Self::UnbondingMatured),
             _ => Err(IndraError::InvariantViolation {
                 message: "invalid delegation return reason",
             }),

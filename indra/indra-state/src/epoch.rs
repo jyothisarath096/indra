@@ -42,7 +42,7 @@ use crate::{
     },
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
     identity::resolve_bond_owner_pubkey,
-    validator::ValidatorStatus,
+    validator::{DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
 };
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
@@ -866,12 +866,24 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
         if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
             let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
             let output = released_bond_output(state, &bond, release_height)?;
-            state
+            let refund_utxo_id = state
                 .utxos
                 .insert(output, release_height, STAKING_TX_IDX, output_index)
                 .map_err(|_| crate::error::StateError::InvariantViolation {
                     message: "UTXO ID collision in staking bond release",
                 })?;
+            if normal_bond_release_blinding_active(release_height) {
+                state.push_delegation_return_event(DelegationReturnEvent {
+                    delegator_id: bond.delegator_id,
+                    validator_id: bond.validator_id,
+                    bond_utxo_id: bond.utxo_id,
+                    amount_spark: bond.amount_spark,
+                    reason: DelegationReturnReason::UnbondingMatured,
+                    returned_epoch: current_epoch,
+                    returned_height: release_height,
+                    refund_utxo_id,
+                });
+            }
         }
     }
     Ok(())
@@ -1087,8 +1099,8 @@ mod tests {
                 hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT, Bytes32, VariableBytes,
                 COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
                 ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, SLASH_LIVENESS_BPS,
-                SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
+                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS,
+                SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
         },
@@ -1537,6 +1549,126 @@ mod tests {
         let b = replay();
         assert_eq!(a.encode_to_vec(), b.encode_to_vec());
         assert_eq!(compute_state_root(&a), compute_state_root(&b));
+    }
+
+    #[test]
+    fn post_gate_matured_bond_release_records_return_event() {
+        let current_epoch = u64::MAX;
+        let release_height = u64::MAX;
+        let validator_id = Bytes32::from([0x95; 32]);
+        let delegator_id = Bytes32::from([0x96; 32]);
+        let mut bond = legacy_bond(0x97, validator_id, delegator_id, 1_000_000);
+        bond.unbonding_end_epoch = Some(current_epoch);
+        let bond_utxo_id = bond.utxo_id;
+        let amount_spark = bond.amount_spark;
+        let mut state = ChainState::new_genesis();
+        state.staked_bonds.insert(bond_utxo_id, bond);
+
+        release_unbonded_bonds(&mut state, current_epoch).unwrap();
+
+        assert_eq!(state.delegation_return_events.len(), 1);
+        let event = &state.delegation_return_events[0];
+        assert_eq!(event.validator_id, validator_id);
+        assert_eq!(event.delegator_id, delegator_id);
+        assert_eq!(event.bond_utxo_id, bond_utxo_id);
+        assert_eq!(event.amount_spark, amount_spark);
+        assert_eq!(event.reason, DelegationReturnReason::UnbondingMatured);
+        assert_eq!(event.returned_epoch, current_epoch);
+        assert_eq!(event.returned_height, release_height);
+        assert!(state.utxos.contains(&event.refund_utxo_id));
+    }
+
+    #[test]
+    fn pre_gate_matured_bond_release_records_no_return_event() {
+        let current_epoch = 1;
+        let validator_id = Bytes32::from([0x98; 32]);
+        let delegator_id = Bytes32::from([0x99; 32]);
+        let mut bond = legacy_bond(0x9A, validator_id, delegator_id, 1_000_000);
+        bond.unbonding_end_epoch = Some(current_epoch);
+        let mut state = ChainState::new_genesis();
+        state.staked_bonds.insert(bond.utxo_id, bond);
+
+        release_unbonded_bonds(&mut state, current_epoch).unwrap();
+
+        assert!(state.delegation_return_events.is_empty());
+    }
+
+    #[test]
+    fn matured_bond_release_events_follow_bounded_retention() {
+        let mut state = ChainState::new_genesis();
+        for i in 0..MAX_DELEGATION_RETURN_EVENTS {
+            state.push_delegation_return_event(DelegationReturnEvent {
+                delegator_id: Bytes32::from([0xA0; 32]),
+                validator_id: Bytes32::from([0xA1; 32]),
+                bond_utxo_id: Bytes32::from([(i % 251) as u8; 32]),
+                amount_spark: 1,
+                reason: DelegationReturnReason::ValidatorEvicted,
+                returned_epoch: i as u64,
+                returned_height: i as u64,
+                refund_utxo_id: Bytes32::from([0xA2; 32]),
+            });
+        }
+        let current_epoch = u64::MAX;
+        let mut bond = legacy_bond(
+            0x9B,
+            Bytes32::from([0x9C; 32]),
+            Bytes32::from([0x9D; 32]),
+            1_000_000,
+        );
+        bond.unbonding_end_epoch = Some(current_epoch);
+        let bond_utxo_id = bond.utxo_id;
+        state.staked_bonds.insert(bond_utxo_id, bond);
+
+        release_unbonded_bonds(&mut state, current_epoch).unwrap();
+
+        assert_eq!(
+            state.delegation_return_events.len(),
+            MAX_DELEGATION_RETURN_EVENTS
+        );
+        assert_eq!(
+            state
+                .delegation_return_events
+                .last()
+                .map(|event| event.reason),
+            Some(DelegationReturnReason::UnbondingMatured)
+        );
+        assert_eq!(
+            state
+                .delegation_return_events
+                .last()
+                .map(|event| event.bond_utxo_id),
+            Some(bond_utxo_id)
+        );
+        assert_eq!(
+            state
+                .delegation_return_events
+                .first()
+                .map(|event| event.returned_epoch),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn matured_bond_release_event_rolls_back_with_epoch_scope() {
+        let current_epoch = u64::MAX;
+        let validator_id = Bytes32::from([0x9E; 32]);
+        let delegator_id = Bytes32::from([0x9F; 32]);
+        let mut bond = legacy_bond(0xA4, validator_id, delegator_id, 1_000_000);
+        bond.unbonding_end_epoch = Some(current_epoch);
+        let mut state = ChainState::new_genesis();
+        state.staked_bonds.insert(bond.utxo_id, bond);
+        state.rebuild_state_commitment_v2(current_epoch);
+        let original = state.clone();
+        let original_root = state.state_commitment_v2_root(current_epoch);
+
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, current_epoch);
+            txn.snapshot_epoch_scope();
+            release_unbonded_bonds(txn.state_mut(), current_epoch).unwrap();
+        }
+
+        assert_eq!(state, original);
+        assert_eq!(state.state_commitment_v2_root(current_epoch), original_root);
     }
 
     #[test]
