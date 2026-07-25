@@ -103,7 +103,8 @@ mod handle_tests {
         },
     };
     use indra_crypto::{
-        verify_opening, PaymentKeypairV1, PaymentPubKeyV1, PedersenCommitment, PedersenOpening,
+        derive_all_seeds, mnemonic_to_seed, verify_opening, PaymentKeypairV1, PaymentPubKeyV1,
+        PedersenCommitment, PedersenOpening,
     };
     use indra_state::{apply_block, apply_staking_op, ChainState};
     use std::{
@@ -283,6 +284,104 @@ mod handle_tests {
         let keypair = PaymentKeypairV1::decode(&keypair_bytes).unwrap();
         let pubkey = PaymentPubKeyV1::decode(&pubkey_bytes).unwrap();
         assert_eq!(keypair.public_key(), pubkey);
+    }
+
+    #[test]
+    fn ffi_seed_and_mnemonic_payment_keygen_paths_are_compatible_but_distinct() {
+        let _guard = test_lock();
+
+        let seed = [0x27; 32];
+        let seed_keys = keygen::generate_keys(seed).unwrap();
+        let compat_from_identity = indra_cli::generate_keypairs(
+            String::new(),
+            seed_keys.hybrid_seed,
+            seed_keys.bls_seed,
+            seed_keys.vrf_seed,
+        )
+        .unwrap();
+        assert_eq!(
+            seed_keys.payment_keypair,
+            compat_from_identity.payment_keypair
+        );
+        assert_eq!(
+            seed_keys.public.payment_pubkey,
+            seed_keys
+                .payment_keypair
+                .as_ref()
+                .map(PaymentKeypairV1::public_key)
+        );
+
+        let (seed_handle, _) = handle_from_seed(seed);
+        let mut seed_keypair_bytes = [0u8; PAYMENT_KEYPAIR_V1_BYTES];
+        assert_eq!(
+            unsafe {
+                crate::payment::indra_key_handle_payment_keypair(
+                    seed_handle,
+                    seed_keypair_bytes.as_mut_ptr(),
+                )
+            },
+            OK
+        );
+        assert_eq!(
+            PaymentKeypairV1::decode(&seed_keypair_bytes).unwrap(),
+            seed_keys.payment_keypair.clone().unwrap()
+        );
+
+        let phrase = keygen::new_mnemonic();
+        let mnemonic_keys = keygen::generate_keys_from_mnemonic(&phrase).unwrap();
+        let master_seed = mnemonic_to_seed(&phrase).unwrap();
+        let derived = derive_all_seeds(&master_seed);
+        let mnemonic_compat_from_identity = indra_cli::generate_keypairs(
+            String::new(),
+            derived.hybrid_seed,
+            derived.bls_seed,
+            derived.vrf_seed,
+        )
+        .unwrap();
+        assert_ne!(
+            mnemonic_keys.payment_keypair,
+            mnemonic_compat_from_identity.payment_keypair
+        );
+        assert_eq!(
+            mnemonic_keys.public.payment_pubkey,
+            mnemonic_keys
+                .payment_keypair
+                .as_ref()
+                .map(PaymentKeypairV1::public_key)
+        );
+
+        let phrase_c = CString::new(phrase).unwrap();
+        let mut mnemonic_handle = INDRA_KEY_HANDLE_INVALID;
+        let mut public = IndraPublicKeyInfo::zeroed();
+        assert_eq!(
+            unsafe {
+                indra_keygen_from_mnemonic_handle(
+                    phrase_c.as_ptr(),
+                    &mut mnemonic_handle,
+                    &mut public,
+                )
+            },
+            OK
+        );
+        let mut mnemonic_keypair_bytes = [0u8; PAYMENT_KEYPAIR_V1_BYTES];
+        assert_eq!(
+            unsafe {
+                crate::payment::indra_key_handle_payment_keypair(
+                    mnemonic_handle,
+                    mnemonic_keypair_bytes.as_mut_ptr(),
+                )
+            },
+            OK
+        );
+        assert_eq!(
+            PaymentKeypairV1::decode(&mnemonic_keypair_bytes).unwrap(),
+            mnemonic_keys.payment_keypair.clone().unwrap()
+        );
+
+        seed_keypair_bytes.fill(0);
+        mnemonic_keypair_bytes.fill(0);
+        assert_eq!(indra_destroy_key_handle(seed_handle), OK);
+        assert_eq!(indra_destroy_key_handle(mnemonic_handle), OK);
     }
 
     #[test]

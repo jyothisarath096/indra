@@ -733,7 +733,7 @@ fn timestamped_backup_path(path: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    path.with_extension(format!("plaintext-backup-{ts}.json"))
+    path.with_extension(format!("pre-payment-key-backup-{ts}.json"))
 }
 
 fn path_to_str(path: &Path) -> KeystoreResult<&str> {
@@ -1669,6 +1669,16 @@ mod tests {
             decrypt_encrypted_keys(&std::fs::read_to_string(&backup).unwrap(), b"pw").unwrap();
 
         assert!(backup.exists());
+        assert!(backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .contains("pre-payment-key-backup"));
+        assert!(!backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .contains("plaintext-backup"));
         assert_eq!(backup_keys.payment_keypair, None);
         assert_eq!(backup_keys.public.payment_pubkey, None);
         assert!(replaced.payment_keypair.is_some());

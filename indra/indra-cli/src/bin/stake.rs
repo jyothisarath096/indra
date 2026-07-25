@@ -621,7 +621,7 @@ fn staking_signer_id(keys: &KeysFile) -> CliResult<Bytes32> {
 fn payment_pubkey_from_keys(keys: &KeysFile) -> CliResult<indra_crypto::PaymentPubKeyV1> {
     let payment_keypair = keys.payment_keypair.as_ref().ok_or_else(|| {
         CliError::MissingArgument(
-            "keys.json does not contain a payment_keypair; generate/recover keys with current indra-keygen before registering a payment key"
+            "keys.json does not contain a payment_keypair; run indra-keygen add-payment-key before registering a payment key"
                 .to_string(),
         )
     })?;
@@ -851,6 +851,8 @@ mod tests {
             generate_keypairs("validator".to_string(), [0xD1; 32], [0xD2; 32], [0xD3; 32]).unwrap();
         keys.payment_keypair = None;
 
-        assert!(payment_pubkey_from_keys(&keys).is_err());
+        let err = payment_pubkey_from_keys(&keys).unwrap_err();
+        assert!(err.to_string().contains("indra-keygen add-payment-key"));
+        assert!(!err.to_string().contains("generate/recover"));
     }
 }
