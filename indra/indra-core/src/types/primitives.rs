@@ -197,8 +197,7 @@ pub const COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] =
     b"INDRA-compact-stake-bond-release-v1";
 
 /// Domain for deterministic normal stake-bond release blinding derivation.
-pub const NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] =
-    b"INDRA-normal-stake-bond-release-v1";
+pub const NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] = b"INDRA-normal-stake-bond-release-v1";
 
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 

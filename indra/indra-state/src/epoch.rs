@@ -25,7 +25,8 @@ use indra_core::{
             COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
             ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
-            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
+            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SATURATION_MIN_VALIDATORS,
+            SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -937,6 +938,29 @@ pub fn derive_compact_stake_bond_release_blinding(
     indra_crypto::sha256(&blinding_input)
 }
 
+/// Deterministic blinding for a normal stake-bond release.
+///
+/// External wallets can reproduce this as:
+/// `sha256(domain || validator_id || delegator_id || bond_utxo_id ||
+/// release_height_le || released_amount_spark_le)`.
+pub fn derive_normal_stake_bond_release_blinding(
+    validator_id: Bytes32,
+    delegator_id: Bytes32,
+    bond_utxo_id: Bytes32,
+    release_height: u64,
+    released_amount_spark: u64,
+) -> [u8; 32] {
+    let mut blinding_input =
+        Vec::with_capacity(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
+    blinding_input.extend_from_slice(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
+    blinding_input.extend_from_slice(&validator_id.0);
+    blinding_input.extend_from_slice(&delegator_id.0);
+    blinding_input.extend_from_slice(&bond_utxo_id.0);
+    blinding_input.extend_from_slice(&release_height.to_le_bytes());
+    blinding_input.extend_from_slice(&released_amount_spark.to_le_bytes());
+    indra_crypto::sha256(&blinding_input)
+}
+
 fn regenerated_bond_output(
     bond: &crate::validator::StakeBondEntry,
     state: &ChainState,
@@ -1105,6 +1129,24 @@ mod tests {
         indra_crypto::sha256(&input)
     }
 
+    fn manual_normal_release_blinding(
+        domain: &[u8],
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        bond_utxo_id: Bytes32,
+        release_height: u64,
+        released_amount_spark: u64,
+    ) -> [u8; 32] {
+        let mut input = Vec::new();
+        input.extend_from_slice(domain);
+        input.extend_from_slice(&validator_id.0);
+        input.extend_from_slice(&delegator_id.0);
+        input.extend_from_slice(&bond_utxo_id.0);
+        input.extend_from_slice(&release_height.to_le_bytes());
+        input.extend_from_slice(&released_amount_spark.to_le_bytes());
+        indra_crypto::sha256(&input)
+    }
+
     fn compact_bond(
         byte: u8,
         validator_id: Bytes32,
@@ -1143,6 +1185,167 @@ mod tests {
             20,
         );
         (bond, owner_pubkey)
+    }
+
+    #[test]
+    fn normal_release_blinding_matches_manual_kdf_oracle() {
+        let validator_id = Bytes32::from([0x11; 32]);
+        let delegator_id = Bytes32::from([0x22; 32]);
+        let bond_utxo_id = Bytes32::from([0x33; 32]);
+        let release_height = 123_456;
+        let released_amount_spark = 9_876_543;
+
+        let expected = manual_normal_release_blinding(
+            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            validator_id,
+            delegator_id,
+            bond_utxo_id,
+            release_height,
+            released_amount_spark,
+        );
+
+        assert_eq!(
+            derive_normal_stake_bond_release_blinding(
+                validator_id,
+                delegator_id,
+                bond_utxo_id,
+                release_height,
+                released_amount_spark,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn normal_release_blinding_is_domain_separated() {
+        let validator_id = Bytes32::from([0x41; 32]);
+        let delegator_id = Bytes32::from([0x42; 32]);
+        let bond_utxo_id = Bytes32::from([0x43; 32]);
+        let release_height = 42;
+        let released_amount_spark = 500_000;
+
+        let normal = derive_normal_stake_bond_release_blinding(
+            validator_id,
+            delegator_id,
+            bond_utxo_id,
+            release_height,
+            released_amount_spark,
+        );
+        let compact_domain = manual_normal_release_blinding(
+            COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            validator_id,
+            delegator_id,
+            bond_utxo_id,
+            release_height,
+            released_amount_spark,
+        );
+        let slash_domain = manual_normal_release_blinding(
+            SLASH_BOND_RELEASE_BLINDING_DOMAIN,
+            validator_id,
+            delegator_id,
+            bond_utxo_id,
+            release_height,
+            released_amount_spark,
+        );
+
+        assert_ne!(normal, compact_domain);
+        assert_ne!(normal, slash_domain);
+    }
+
+    #[test]
+    fn normal_release_blinding_is_sensitive_to_every_input() {
+        let validator_id = Bytes32::from([0x51; 32]);
+        let delegator_id = Bytes32::from([0x52; 32]);
+        let bond_utxo_id = Bytes32::from([0x53; 32]);
+        let release_height = 77;
+        let released_amount_spark = 123_000;
+        let base = derive_normal_stake_bond_release_blinding(
+            validator_id,
+            delegator_id,
+            bond_utxo_id,
+            release_height,
+            released_amount_spark,
+        );
+
+        assert_ne!(
+            base,
+            derive_normal_stake_bond_release_blinding(
+                Bytes32::from([0x61; 32]),
+                delegator_id,
+                bond_utxo_id,
+                release_height,
+                released_amount_spark,
+            )
+        );
+        assert_ne!(
+            base,
+            derive_normal_stake_bond_release_blinding(
+                validator_id,
+                Bytes32::from([0x62; 32]),
+                bond_utxo_id,
+                release_height,
+                released_amount_spark,
+            )
+        );
+        assert_ne!(
+            base,
+            derive_normal_stake_bond_release_blinding(
+                validator_id,
+                delegator_id,
+                Bytes32::from([0x63; 32]),
+                release_height,
+                released_amount_spark,
+            )
+        );
+        assert_ne!(
+            base,
+            derive_normal_stake_bond_release_blinding(
+                validator_id,
+                delegator_id,
+                bond_utxo_id,
+                release_height + 1,
+                released_amount_spark,
+            )
+        );
+        assert_ne!(
+            base,
+            derive_normal_stake_bond_release_blinding(
+                validator_id,
+                delegator_id,
+                bond_utxo_id,
+                release_height,
+                released_amount_spark + 1,
+            )
+        );
+    }
+
+    #[test]
+    fn normal_release_blinding_is_deterministic() {
+        let validator_id = Bytes32::from([0x71; 32]);
+        let delegator_id = Bytes32::from([0x72; 32]);
+        let bond_utxo_id = Bytes32::from([0x73; 32]);
+        let release_height = 987_654;
+        let released_amount_spark = 321_000;
+
+        let first = derive_normal_stake_bond_release_blinding(
+            validator_id,
+            delegator_id,
+            bond_utxo_id,
+            release_height,
+            released_amount_spark,
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                derive_normal_stake_bond_release_blinding(
+                    validator_id,
+                    delegator_id,
+                    bond_utxo_id,
+                    release_height,
+                    released_amount_spark,
+                ),
+                first
+            );
+        }
     }
 
     #[test]
