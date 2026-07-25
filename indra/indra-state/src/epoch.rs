@@ -20,12 +20,12 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, governance_proposal_pruning_active, muldiv, overflow_fix_active,
-            state_commitment_v2_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
-            COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
-            ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-            ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
-            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SATURATION_MIN_VALIDATORS,
+            bps_of, governance_proposal_pruning_active, muldiv,
+            normal_bond_release_blinding_active, overflow_fix_active, state_commitment_v2_active,
+            Bytes32, VariableBytes, BLOCKS_PER_YEAR, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+            ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+            HARD_CAP_SPARK, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SATURATION_MIN_VALIDATORS,
             SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
         },
     },
@@ -895,6 +895,22 @@ pub(crate) fn released_bond_output(
     if bond.delegator_id != bond.validator_id
         || bond.amount_spark >= bond.original_output.value_spark
     {
+        if normal_bond_release_blinding_active(release_height) {
+            return regenerated_bond_output(
+                bond,
+                state,
+                release_height,
+                derive_normal_stake_bond_release_blinding(
+                    bond.validator_id,
+                    bond.delegator_id,
+                    bond.utxo_id,
+                    release_height,
+                    bond.amount_spark,
+                ),
+                "normal stake-bond release",
+            );
+        }
+
         return bond.original_output.to_legacy_output().ok_or_else(|| {
             crate::error::StateError::InvariantViolation {
                 message: "legacy stake bond release missing stored range proof",
@@ -1187,6 +1203,24 @@ mod tests {
         (bond, owner_pubkey)
     }
 
+    fn legacy_bond(
+        byte: u8,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+    ) -> StakeBondEntry {
+        StakeBondEntry::new_for_test_with_compact_activation(
+            Bytes32::from([byte; 32]),
+            validator_id,
+            delegator_id,
+            amount_spark,
+            2,
+            dummy_output(byte),
+            9,
+            10,
+        )
+    }
+
     #[test]
     fn normal_release_blinding_matches_manual_kdf_oracle() {
         let validator_id = Bytes32::from([0x11; 32]);
@@ -1346,6 +1380,163 @@ mod tests {
                 first
             );
         }
+    }
+
+    #[test]
+    fn legacy_normal_release_before_normal_blinding_gate_is_byte_identical() {
+        let validator_id = Bytes32::from([0x81; 32]);
+        let delegator_id = Bytes32::from([0x82; 32]);
+        let bond = legacy_bond(0x83, validator_id, delegator_id, 1_000_000);
+        assert!(bond.original_output.range_proof.is_some());
+        let expected = bond.original_output.to_legacy_output().unwrap();
+        let state = ChainState::new_genesis();
+
+        let output = released_bond_output(&state, &bond, u64::MAX - 1).unwrap();
+
+        assert_eq!(output.encode_to_vec(), expected.encode_to_vec());
+    }
+
+    #[test]
+    fn legacy_normal_release_at_normal_blinding_gate_uses_new_derivation() {
+        let validator_id = Bytes32::from([0x84; 32]);
+        let delegator_id = Bytes32::from([0x85; 32]);
+        let bond = legacy_bond(0x86, validator_id, delegator_id, 1_000_000);
+        let release_height = u64::MAX;
+        let state = ChainState::new_genesis();
+
+        let output = released_bond_output(&state, &bond, release_height).unwrap();
+        let blinding = manual_normal_release_blinding(
+            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            bond.validator_id,
+            bond.delegator_id,
+            bond.utxo_id,
+            release_height,
+            bond.amount_spark,
+        );
+
+        assert_eq!(
+            blinding,
+            derive_normal_stake_bond_release_blinding(
+                bond.validator_id,
+                bond.delegator_id,
+                bond.utxo_id,
+                release_height,
+                bond.amount_spark,
+            )
+        );
+        assert_ne!(
+            output.encode_to_vec(),
+            bond.original_output
+                .to_legacy_output()
+                .unwrap()
+                .encode_to_vec()
+        );
+        assert_eq!(output.value_spark, bond.amount_spark);
+        assert_eq!(
+            Some(output.owner_pubkey.clone()),
+            bond.original_output.owner_pubkey
+        );
+        assert_eq!(output.lock_height, bond.original_output.lock_height);
+    }
+
+    #[test]
+    fn legacy_normal_release_at_normal_blinding_gate_opens_with_new_blinding() {
+        let validator_id = Bytes32::from([0x87; 32]);
+        let delegator_id = Bytes32::from([0x88; 32]);
+        let bond = legacy_bond(0x89, validator_id, delegator_id, 1_000_000);
+        let release_height = u64::MAX;
+        let blinding = derive_normal_stake_bond_release_blinding(
+            bond.validator_id,
+            bond.delegator_id,
+            bond.utxo_id,
+            release_height,
+            bond.amount_spark,
+        );
+        let state = ChainState::new_genesis();
+
+        let output = released_bond_output(&state, &bond, release_height).unwrap();
+
+        assert!(indra_crypto::verify_opening(
+            &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
+            &indra_crypto::PedersenOpening {
+                value: bond.amount_spark,
+                blinding,
+            },
+        )
+        .is_ok());
+        assert!(indra_crypto::verify_range(
+            &output.commitment.compressed_point.0,
+            output.range_proof.as_slice(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn normal_blinding_gate_does_not_change_compact_release_derivations() {
+        let validator_id = Bytes32::from([0x8A; 32]);
+        let delegator_id = Bytes32::from([0x8B; 32]);
+        let release_height = u64::MAX;
+        let compact = compact_bond(0x8C, validator_id, delegator_id, 1_000_000);
+        let (fully_compact, owner_pubkey) =
+            fully_compact_bond(0x8D, validator_id, delegator_id, 750_000);
+        let mut state = ChainState::new_genesis();
+        state
+            .delegator_identities
+            .insert(delegator_id, owner_pubkey);
+
+        for bond in [&compact, &fully_compact] {
+            let output = released_bond_output(&state, bond, release_height).unwrap();
+            let compact_blinding = derive_compact_stake_bond_release_blinding(bond, release_height);
+            let normal_blinding = derive_normal_stake_bond_release_blinding(
+                bond.validator_id,
+                bond.delegator_id,
+                bond.utxo_id,
+                release_height,
+                bond.amount_spark,
+            );
+
+            assert!(indra_crypto::verify_opening(
+                &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
+                &indra_crypto::PedersenOpening {
+                    value: bond.amount_spark,
+                    blinding: compact_blinding,
+                },
+            )
+            .is_ok());
+            assert_ne!(
+                output.commitment.compressed_point.0,
+                indra_crypto::commit(bond.amount_spark, &normal_blinding).0
+            );
+        }
+    }
+
+    #[test]
+    fn normal_blinding_gate_boundary_release_replay_is_deterministic() {
+        fn replay() -> ChainState {
+            let validator_id = Bytes32::from([0x91; 32]);
+            let delegator_id = Bytes32::from([0x92; 32]);
+            let mut state = ChainState::new_genesis();
+            let pre_gate = legacy_bond(0x93, validator_id, delegator_id, 1_000_000);
+            let post_gate = legacy_bond(0x94, validator_id, delegator_id, 1_000_000);
+
+            let old_output = released_bond_output(&state, &pre_gate, u64::MAX - 1).unwrap();
+            state
+                .utxos
+                .insert(old_output, u64::MAX - 1, STAKING_TX_IDX, 1)
+                .unwrap();
+            let new_output = released_bond_output(&state, &post_gate, u64::MAX).unwrap();
+            state
+                .utxos
+                .insert(new_output, u64::MAX, STAKING_TX_IDX, 2)
+                .unwrap();
+            state.height = u64::MAX;
+            state
+        }
+
+        let a = replay();
+        let b = replay();
+        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
+        assert_eq!(compute_state_root(&a), compute_state_root(&b));
     }
 
     #[test]
