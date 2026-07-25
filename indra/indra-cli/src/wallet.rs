@@ -9,7 +9,13 @@
 //! Wallet state is stored in a JSON file alongside keys.json.
 //! Format: wallet.json
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use indra_core::{
     codec::{Decode, Encode},
@@ -20,6 +26,8 @@ use indra_crypto::sha256;
 use indra_state::UtxoSet;
 
 use crate::error::{CliError, CliResult};
+
+const WALLET_FILE_MODE: u32 = 0o600;
 
 /// A spendable UTXO entry in the wallet.
 #[derive(Debug, Clone)]
@@ -344,7 +352,7 @@ impl Wallet {
 
     /// Save wallet to a file.
     pub fn save(&self, path: &str) -> CliResult<()> {
-        std::fs::write(path, self.to_json()).map_err(|e| CliError::Io(e.to_string()))
+        write_wallet_file_atomic(Path::new(path), &self.to_json(), || Ok(()))
     }
 
     /// Load wallet from a file, or return empty wallet if file doesn't exist.
@@ -355,6 +363,76 @@ impl Wallet {
             Err(e) => Err(CliError::Io(e.to_string())),
         }
     }
+}
+
+fn write_wallet_file_atomic<F>(path: &Path, json: &str, before_rename: F) -> CliResult<()>
+where
+    F: FnOnce() -> CliResult<()>,
+{
+    Wallet::from_json(json)?;
+    let tmp = wallet_temp_path(path);
+    let write_result = (|| -> CliResult<()> {
+        write_wallet_temp_secure(&tmp, json.as_bytes())?;
+        let written = std::fs::read_to_string(&tmp)
+            .map_err(|e| CliError::Io(format!("{}: {}", tmp.display(), e)))?;
+        Wallet::from_json(&written)?;
+        before_rename()?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| CliError::Io(format!("{} -> {}: {}", tmp.display(), path.display(), e)))?;
+        set_wallet_file_permissions(path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+fn wallet_temp_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wallet.json");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()))
+}
+
+#[cfg(unix)]
+fn write_wallet_temp_secure(path: &Path, contents: &[u8]) -> CliResult<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(WALLET_FILE_MODE)
+        .open(path)
+        .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
+    file.write_all(contents)
+        .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
+    file.sync_all()
+        .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
+    set_wallet_file_permissions(path)
+}
+
+#[cfg(not(unix))]
+fn write_wallet_temp_secure(path: &Path, contents: &[u8]) -> CliResult<()> {
+    std::fs::write(path, contents).map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))
+}
+
+fn set_wallet_file_permissions(path: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(WALLET_FILE_MODE))
+            .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
+    }
+    Ok(())
 }
 
 fn extract_array<'a>(json: &'a str, field: &str) -> Option<&'a str> {
@@ -409,6 +487,14 @@ mod tests {
         Bytes32::from([b; 32])
     }
 
+    fn temp_wallet_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "indra-wallet-{label}-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
     #[test]
     fn empty_wallet_has_zero_balance() {
         assert_eq!(Wallet::new().balance(), 0);
@@ -455,6 +541,55 @@ mod tests {
         let json = w.to_json();
         let w2 = Wallet::from_json(&json).unwrap();
         assert_eq!(w2.balance(), 999_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_save_writes_mode_0600() {
+        let path = temp_wallet_path("mode");
+        let path_str = path.to_string_lossy().to_string();
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(make_id(0xC1), 999_000, [0x42u8; 32], 5, 1, 2);
+
+        wallet.save(&path_str).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let restored = Wallet::load(&path_str).unwrap();
+        assert_eq!(restored.balance(), 999_000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wallet_atomic_write_preserves_existing_file_on_pre_rename_failure() {
+        let path = temp_wallet_path("atomic");
+        let path_str = path.to_string_lossy().to_string();
+        let mut original = Wallet::new();
+        original.add_utxo(make_id(0xD1), 1_000_000, [0x11u8; 32], 5, 1, 2);
+        original.save(&path_str).unwrap();
+        let original_json = std::fs::read_to_string(&path).unwrap();
+        let mut replacement = Wallet::new();
+        replacement.add_utxo(make_id(0xD2), 2_000_000, [0x22u8; 32], 6, 1, 2);
+
+        let err = write_wallet_file_atomic(&path, &replacement.to_json(), || {
+            Err(CliError::Io("simulated interruption before rename".into()))
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("simulated interruption"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original_json);
+        let restored = Wallet::load(&path_str).unwrap();
+        assert_eq!(restored.balance(), 1_000_000);
+        assert!(restored.contains(&make_id(0xD1)));
+        assert!(!restored.contains(&make_id(0xD2)));
+        let tmp_prefix = format!(".{}.tmp-", path.file_name().unwrap().to_string_lossy());
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&tmp_prefix))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
