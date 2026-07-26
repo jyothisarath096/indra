@@ -1024,7 +1024,7 @@ fn regenerated_bond_output(
         indra_core::types::transaction::OutputV1 {
             value_spark: bond.original_output.value_spark,
             commitment: bond.original_output.commitment,
-            owner_pubkey,
+            owner_pubkey: owner_pubkey.clone(),
             range_proof: VariableBytes::default(),
             lock_height: bond.original_output.lock_height,
         }
@@ -1033,6 +1033,7 @@ fn regenerated_bond_output(
     output.commitment = CommitmentV1 {
         compressed_point: Bytes32::from(commitment.0),
     };
+    output.owner_pubkey = owner_pubkey;
     output.range_proof = VariableBytes::from_slice(&proof)
         .map_err(|_| crate::error::StateError::InvalidStakingOp("range proof too large".into()))?;
     Ok(output)
@@ -2983,6 +2984,9 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1),
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    Bytes32::from([0x02; 32]),
+                ),
                 original_output: dummy_output(0x44).into(),
             },
         );
@@ -3006,6 +3010,9 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    Bytes32::from([0x02; 32]),
+                ),
                 original_output: dummy_output(0x45).into(),
             },
         );

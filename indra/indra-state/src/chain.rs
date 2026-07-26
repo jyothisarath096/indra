@@ -782,6 +782,9 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
+            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                Bytes32::from([0xD0 | byte; 32]),
+            ),
             original_output: test_output(byte).into(),
         }
     }
@@ -1449,6 +1452,9 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator_id,
+                ),
                 original_output: heavy_output(index).into(),
             }
         }
@@ -1573,6 +1579,9 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    id_from_index(index + 1_000_000),
+                ),
                 original_output: heavy_output(index).into(),
             }
         }

@@ -2901,6 +2901,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
+            custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
     }

@@ -579,6 +579,9 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
+            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                Bytes32::from([0xD0 | byte; 32]),
+            ),
             original_output: test_output(byte).into(),
         }
     }

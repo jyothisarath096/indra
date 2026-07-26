@@ -1327,6 +1327,9 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
+                        custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(
+                            Bytes32::from([0x66; 32]),
+                        ),
                         original_output: OutputV1 {
                             value_spark: 1_000,
                             commitment: CommitmentV1 {

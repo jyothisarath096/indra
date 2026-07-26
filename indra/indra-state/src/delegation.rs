@@ -24,12 +24,14 @@ use crate::{
     epoch::epoch_for_height,
     error::{StateError, StateResult},
     identity::{
-        resolve_and_check_identity, resolve_bond_owner_pubkey, IdentityCheckOutcome, IdentityError,
+        resolve_active_validator_cold_pubkey, resolve_and_check_identity,
+        resolve_bond_owner_pubkey, IdentityCheckOutcome, IdentityError,
     },
     validator::{
         validate_new_validator_cold_key, validate_validator_cold_key, ColdKeyStatus,
-        DelegationReturnEvent, DelegationReturnReason, StakeBondEntry, ValidatorEntry,
-        ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR,
+        DelegationReturnEvent, DelegationReturnReason, StakeBondCustodyOwner, StakeBondEntry,
+        ValidatorEntry, ValidatorStatus, MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS,
+        MAX_DELEGATORS_PER_VALIDATOR,
     },
 };
 
@@ -406,6 +408,32 @@ fn apply_enroll_validator_cold_key(
         cold_pubkey.pq_pk.as_slice(),
         1,
     )?;
+    let mut self_bond_ids: Vec<Bytes32> = state
+        .staked_bonds
+        .values()
+        .filter(|bond| bond.validator_id == validator_id && bond.delegator_id == validator_id)
+        .map(|bond| bond.utxo_id)
+        .collect();
+    self_bond_ids.sort_by_key(|id| id.0);
+    if self_bond_ids.len() > MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS {
+        return Err(StateError::InvalidStakingOp(format!(
+            "validator has {} unresolved self-bonds; atomic cold-key enrollment supports at most {}. Consolidate using SelfUnstake for the existing bonds, wait for maturity, SelfStake one consolidated UTXO, then enroll",
+            self_bond_ids.len(),
+            MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS
+        )));
+    }
+    for bond_id in self_bond_ids {
+        let Some(mut bond) = state.staked_bonds.remove(&bond_id) else {
+            return Err(StateError::InvariantViolation {
+                message: "self-bond disappeared during cold-key enrollment migration",
+            });
+        };
+        bond.custody_owner = StakeBondCustodyOwner::ValidatorColdIdentity(validator_id);
+        state.staked_bonds.insert(bond_id, bond.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_staked_bond(&bond_id, &bond);
+        }
+    }
     let mut updated = current.clone();
     updated.cold_hybrid_classical_pk = Some(validated.classical_pk);
     updated.cold_hybrid_pq_pk = Some(validated.pq_pk);
@@ -674,7 +702,7 @@ fn apply_register_validator(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_validator(&entry, current_height);
     }
-    let bond = StakeBondEntry::new(
+    let mut bond = StakeBondEntry::new(
         bond_utxo_id,
         validator_id,
         validator_id,
@@ -683,6 +711,9 @@ fn apply_register_validator(
         original_output,
         current_height,
     );
+    if validated_cold_key.is_some() {
+        bond.custody_owner = StakeBondCustodyOwner::ValidatorColdIdentity(validator_id);
+    }
     state.staked_bonds.insert(bond_utxo_id, bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &bond);
@@ -826,6 +857,27 @@ fn evict_validator_for_registry_replacement(
 }
 
 fn validator_public_key(validator: &ValidatorEntry) -> StateResult<HybridPubKey> {
+    if validator.cold_key_status == ColdKeyStatus::Active {
+        let classical_pk =
+            validator
+                .cold_hybrid_classical_pk
+                .ok_or(StateError::InvariantViolation {
+                    message: "active validator missing cold classical key during eviction payout",
+                })?;
+        let pq_pk = validator
+            .cold_hybrid_pq_pk
+            .ok_or(StateError::InvariantViolation {
+                message: "active validator missing cold PQ key during eviction payout",
+            })?;
+        return Ok(HybridPubKey {
+            classical_pk: Bytes32::from(classical_pk),
+            pq_pk: VariableBytes::from_slice(&pq_pk).map_err(|_| {
+                StateError::InvariantViolation {
+                    message: "validator cold PQ key too large during eviction payout",
+                }
+            })?,
+        });
+    }
     let classical_pk = validator
         .hybrid_classical_pk
         .ok_or(StateError::InvariantViolation {
@@ -1191,7 +1243,7 @@ fn apply_self_stake(
     let current_epoch = epoch_for_height(current_height);
     let original_output = utxo_entry.output;
     let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
-    let bond = StakeBondEntry::new(
+    let mut bond = StakeBondEntry::new(
         bond_utxo_id,
         validator_id,
         validator_id,
@@ -1200,6 +1252,13 @@ fn apply_self_stake(
         original_output,
         current_height,
     );
+    if state
+        .validators
+        .get(&validator_id)
+        .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Active)
+    {
+        bond.custody_owner = StakeBondCustodyOwner::ValidatorColdIdentity(validator_id);
+    }
     state.staked_bonds.insert(bond_utxo_id, bond.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_staked_bond(&bond_utxo_id, &bond);
@@ -1382,6 +1441,20 @@ fn apply_claim_rewards(
         .filter(|validator| validator.validator_id == delegator_id)
         .map(|validator| validator.pending_rewards);
     let claim_from_validator = delegation_claim.is_none() && validator_claim.is_some();
+    let payout_pubkey = if claim_from_validator
+        && state
+            .validators
+            .get(validator_id)
+            .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Active)
+    {
+        resolve_active_validator_cold_pubkey(state, validator_id).map_err(|_| {
+            StateError::InvariantViolation {
+                message: "active validator cold reward owner is unresolvable",
+            }
+        })?
+    } else {
+        delegator_pubkey.clone()
+    };
 
     let claimed = delegation_claim
         .or(validator_claim)
@@ -1463,7 +1536,7 @@ fn apply_claim_rewards(
         commitment: CommitmentV1 {
             compressed_point: Bytes32::from(commitment.0),
         },
-        owner_pubkey: delegator_pubkey.clone(),
+        owner_pubkey: payout_pubkey,
         range_proof: VariableBytes::from_slice(&proof)
             .map_err(|_| StateError::InvalidStakingOp("range proof too large".into()))?,
         lock_height: 0,
@@ -1701,6 +1774,7 @@ mod tests {
         chain::ChainState,
         validator::{ValidatorEntry, ValidatorStatus},
     };
+    use indra_core::codec::Encode;
     use indra_core::types::{
         crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{
@@ -5059,6 +5133,9 @@ mod tests {
                 amount_spark: stake,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
                 original_output: raw_output(stake, pubkey, (index % 200) as u8).into(),
             },
         );
@@ -5168,6 +5245,9 @@ mod tests {
                 amount_spark: DUST_LIMIT_SPARK,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator,
+                ),
                 original_output: test_output(DUST_LIMIT_SPARK, delegator_pubkey, 0x7A).into(),
             },
         );
@@ -5237,6 +5317,9 @@ mod tests {
                 amount_spark: DUST_LIMIT_SPARK,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator,
+                ),
                 original_output: test_output(DUST_LIMIT_SPARK, raw_pubkey(0x7C), 0x7C).into(),
             },
         );
@@ -5868,5 +5951,293 @@ mod tests {
         assert_eq!(enrolled.cold_key_version, 1);
         assert_eq!(enrolled.cold_nonce, 0);
         assert_eq!(first.staking_nonces.get(&enrolled.validator_id), Some(&3));
+    }
+
+    #[test]
+    #[ignore = "release-mode atomic cold-key migration cost benchmark"]
+    fn atomic_cold_key_migration_cap_cost_benchmark() {
+        use std::time::Instant;
+
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, 0x71);
+        let owner = pubkey_from_keypair(&hot);
+        for index in 0..MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let id = Bytes32::from(raw);
+            let bond = StakeBondEntry::new(
+                id,
+                validator_id,
+                validator_id,
+                DUST_LIMIT_SPARK,
+                0,
+                raw_output(DUST_LIMIT_SPARK, owner.clone(), (index % 251) as u8 + 1),
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1,
+            );
+            state.staked_bonds.insert(id, bond);
+        }
+        state.rebuild_state_commitment_v2(VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT);
+        let cold = mixed_keypair(0x72, 0x73);
+        let op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        let start = Instant::now();
+        apply_staking_op(
+            &mut state,
+            &op,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        println!(
+            "atomic_cold_key_migration bonds={} elapsed={elapsed:?}",
+            MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    fn insert_self_bonds(
+        state: &mut ChainState,
+        validator_id: Bytes32,
+        owner: &HybridPubKey,
+        count: usize,
+    ) {
+        for index in 0..count {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            raw[8] = validator_id.0[0];
+            let id = Bytes32::from(raw);
+            let bond = StakeBondEntry::new(
+                id,
+                validator_id,
+                validator_id,
+                DUST_LIMIT_SPARK,
+                0,
+                raw_output(DUST_LIMIT_SPARK, owner.clone(), (index % 251) as u8 + 1),
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1,
+            );
+            state.staked_bonds.insert(id, bond);
+        }
+    }
+
+    #[test]
+    fn enrolled_validator_migrates_realistic_self_bond_population_atomically() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, 0x74);
+        insert_self_bonds(&mut state, validator_id, &pubkey_from_keypair(&hot), 64);
+        let cold = mixed_keypair(0x75, 0x76);
+        let op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        let height = state.height;
+        apply_staking_op(&mut state, &op, &chain_id, height).unwrap();
+        assert_eq!(
+            state
+                .staked_bonds
+                .values()
+                .filter(|bond| bond.custody_owner
+                    == StakeBondCustodyOwner::ValidatorColdIdentity(validator_id))
+                .count(),
+            64
+        );
+
+        let migrated = state.staked_bonds.values().next().unwrap().clone();
+        let release = crate::epoch::released_bond_output(&state, &migrated, state.height).unwrap();
+        let expected_cold = pubkey_from_keypair(&cold);
+        assert_eq!(release.owner_pubkey, expected_cold);
+        let release_blinding =
+            crate::epoch::derive_compact_stake_bond_release_blinding(&migrated, state.height);
+        indra_crypto::verify_opening(
+            &indra_crypto::PedersenCommitment(release.commitment.compressed_point.0),
+            &indra_crypto::PedersenOpening {
+                value: release.value_spark,
+                blinding: release_blinding,
+            },
+        )
+        .unwrap();
+
+        state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK;
+        let claim = claim_rewards_op(&state, validator_id, &hot, 2);
+        let claim_height = state.height;
+        apply_staking_op(&mut state, &claim, &chain_id, claim_height).unwrap();
+        let reward = state
+            .utxos
+            .all_entries()
+            .find(|entry| entry.output.owner_pubkey == expected_cold)
+            .unwrap()
+            .output
+            .clone();
+        assert_eq!(reward.owner_pubkey, expected_cold);
+        let reward_blinding = indra_crypto::sha256(
+            &[
+                STAKING_REWARD_BLINDING_DOMAIN,
+                validator_id.0.as_slice(),
+                validator_id.0.as_slice(),
+                claim_height.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        indra_crypto::verify_opening(
+            &indra_crypto::PedersenCommitment(reward.commitment.compressed_point.0),
+            &indra_crypto::PedersenOpening {
+                value: reward.value_spark,
+                blinding: reward_blinding,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unenrolled_validator_and_ordinary_delegator_outputs_remain_legacy_owned() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0x7E);
+        state
+            .delegator_identities
+            .insert(validator_id, pubkey_from_keypair(&hot));
+        insert_self_bonds(&mut state, validator_id, &pubkey_from_keypair(&hot), 1);
+        let self_bond = state.staked_bonds.values().next().unwrap().clone();
+        let self_release = crate::epoch::released_bond_output(
+            &state,
+            &self_bond,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1,
+        )
+        .unwrap();
+        assert_eq!(self_release.owner_pubkey, pubkey_from_keypair(&hot));
+
+        let delegator = keypair(0x7F);
+        let delegator_pubkey = pubkey_from_keypair(&delegator);
+        state
+            .delegator_identities
+            .insert(pubkey_to_id(&delegator_pubkey), delegator_pubkey.clone());
+        let mut delegated = StakeBondEntry::new(
+            Bytes32::from([0x80; 32]),
+            validator_id,
+            pubkey_to_id(&delegator_pubkey),
+            DUST_LIMIT_SPARK,
+            0,
+            raw_output(DUST_LIMIT_SPARK, delegator_pubkey.clone(), 0x80),
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1,
+        );
+        delegated.unbonding_end_epoch = Some(0);
+        let delegated_release = crate::epoch::released_bond_output(
+            &state,
+            &delegated,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        )
+        .unwrap();
+        assert_eq!(delegated_release.owner_pubkey, delegator_pubkey);
+        assert_eq!(
+            delegated.custody_owner,
+            StakeBondCustodyOwner::DelegatorIdentity(pubkey_to_id(&delegated_release.owner_pubkey))
+        );
+    }
+
+    #[test]
+    fn mixed_cold_and_legacy_owner_resolution_replays_deterministically() {
+        fn replay() -> Vec<Vec<u8>> {
+            let mut state = ChainState::new_genesis();
+            state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+            let (cold_id, cold_hot) = make_active_validator(&mut state, 0x81);
+            let (legacy_id, legacy_hot) = make_active_validator(&mut state, 0x82);
+            state
+                .delegator_identities
+                .insert(legacy_id, pubkey_from_keypair(&legacy_hot));
+            insert_self_bonds(&mut state, cold_id, &pubkey_from_keypair(&cold_hot), 3);
+            insert_self_bonds(&mut state, legacy_id, &pubkey_from_keypair(&legacy_hot), 2);
+            let cold = mixed_keypair(0x83, 0x84);
+            let enroll = dual_signed_enroll_op(cold_id, &cold_hot, &cold, 1, &state.chain_id);
+            let chain_id = state.chain_id.clone();
+            let height = state.height;
+            apply_staking_op(&mut state, &enroll, &chain_id, height).unwrap();
+            state
+                .staked_bonds
+                .values()
+                .map(|bond| {
+                    crate::epoch::released_bond_output(&state, bond, height)
+                        .unwrap()
+                        .encode_to_vec()
+                })
+                .collect()
+        }
+        assert_eq!(replay(), replay());
+    }
+
+    #[test]
+    fn enrollment_rejects_self_bond_count_above_atomic_cap() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, 0x77);
+        insert_self_bonds(
+            &mut state,
+            validator_id,
+            &pubkey_from_keypair(&hot),
+            MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS + 1,
+        );
+        let cold = mixed_keypair(0x78, 0x79);
+        let op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        let height = state.height;
+        let err = apply_staking_op(&mut state, &op, &chain_id, height).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("4097 unresolved self-bonds"));
+        assert!(text.contains("at most 4096"));
+        assert!(text.contains("SelfUnstake"));
+        assert!(text.contains("SelfStake one consolidated UTXO"));
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().cold_key_status,
+            ColdKeyStatus::Unenrolled
+        );
+    }
+
+    #[test]
+    fn consolidation_to_one_self_bond_allows_enrollment_after_cap_rejection() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, 0x7A);
+        insert_self_bonds(
+            &mut state,
+            validator_id,
+            &pubkey_from_keypair(&hot),
+            MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS + 1,
+        );
+        let cold = mixed_keypair(0x7B, 0x7C);
+        let rejected = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        let enrollment_height = state.height;
+        assert!(apply_staking_op(&mut state, &rejected, &chain_id, enrollment_height).is_err());
+
+        // State after existing SelfUnstake operations mature and an ordinary
+        // owner-authorized transaction consolidates their released UTXOs.
+        state.staked_bonds = crate::persistent::PersistentOrdMap::new();
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
+        let consolidated = insert_delegator_utxo(
+            &mut state,
+            pubkey_from_keypair(&hot),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0x7D,
+        );
+        let restake = signed_op(
+            StakingOpBody::SelfStake {
+                bond_utxo_id: consolidated,
+                validator_pubkey: pubkey_from_keypair(&hot),
+                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0x7D)),
+            },
+            1,
+            &hot,
+            &state.chain_id,
+        );
+        apply_staking_op(&mut state, &restake, &chain_id, enrollment_height - 1).unwrap();
+        let enrollment = dual_signed_enroll_op(validator_id, &hot, &cold, 2, &state.chain_id);
+        apply_staking_op(&mut state, &enrollment, &chain_id, enrollment_height).unwrap();
+        assert_eq!(state.staked_bonds.len(), 1);
+        assert_eq!(
+            state.staked_bonds.get(&consolidated).unwrap().custody_owner,
+            StakeBondCustodyOwner::ValidatorColdIdentity(validator_id)
+        );
     }
 }

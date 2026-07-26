@@ -4970,6 +4970,9 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
+                        custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                            Bytes32::from([0x66; 32]),
+                        ),
                         original_output: output.into(),
                     },
                 );
@@ -5047,6 +5050,9 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
+                        custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                            Bytes32::from([0x66; 32]),
+                        ),
                         original_output: output.into(),
                     },
                 );
@@ -5420,6 +5426,9 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator_id,
+                ),
                 original_output: output.clone().into(),
             },
         );
@@ -5432,6 +5441,9 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator_id,
+                ),
                 original_output: output.into(),
             },
         );
@@ -5551,6 +5563,9 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(epoch_for_height(EPOCH_DURATION_BLOCKS)),
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
                 original_output: output.into(),
             },
         );
@@ -6380,6 +6395,9 @@ mod tests {
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
                 original_output: dummy_output(0x20, owner).into(),
             },
         );
@@ -6411,6 +6429,9 @@ mod tests {
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator_id,
+                ),
                 original_output: dummy_output(0x21, owner).into(),
             },
         );
@@ -6444,6 +6465,9 @@ mod tests {
                 amount_spark: original_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
                 original_output: output_with_value(original_bond, owner, 0x22).into(),
             },
         );
@@ -6504,6 +6528,9 @@ mod tests {
                 amount_spark: active_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
                 original_output: output_with_value(active_bond, owner_active, 0x23).into(),
             },
         );
@@ -6516,6 +6543,9 @@ mod tests {
                 amount_spark: unbonding_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
                 original_output: output_with_value(unbonding_bond, owner_unbonding, 0x24).into(),
             },
         );

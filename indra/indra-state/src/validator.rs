@@ -38,6 +38,12 @@ pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDA
 
 const STAKE_BOND_COMPACT_MARKER: u8 = u8::MAX;
 const STAKE_BOND_FULLY_COMPACT_MARKER: u8 = u8::MAX - 1;
+const STAKE_BOND_CUSTODY_LEGACY_MARKER: u8 = u8::MAX - 2;
+const STAKE_BOND_CUSTODY_COMPACT_MARKER: u8 = u8::MAX - 3;
+const STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER: u8 = u8::MAX - 4;
+
+/// Maximum unresolved validator self-bonds migrated by one enrollment.
+pub const MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS: usize = 4_096;
 
 /// Why a stake bond principal was returned to a spendable UTXO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1690,8 +1696,48 @@ pub struct StakeBondEntry {
     pub bonded_epoch: u64,
     /// None while active; Some(epoch) while unbonding.
     pub unbonding_end_epoch: Option<u64>,
+    /// Consensus owner role used when protocol code recreates this bond.
+    pub custody_owner: StakeBondCustodyOwner,
     /// Original UTXO output metadata, needed to reinsert when unbonding completes.
     pub original_output: StakeBondOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Consensus identity role that owns a protocol-generated bond return.
+pub enum StakeBondCustodyOwner {
+    /// Resolve through the ordinary delegator identity registry.
+    DelegatorIdentity(Bytes32),
+    /// Resolve through the validator's currently Active cold-key record.
+    ValidatorColdIdentity(Bytes32),
+}
+
+impl Encode for StakeBondCustodyOwner {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::DelegatorIdentity(id) => {
+                0u8.encode(buf);
+                id.encode(buf);
+            }
+            Self::ValidatorColdIdentity(id) => {
+                1u8.encode(buf);
+                id.encode(buf);
+            }
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        33
+    }
+}
+
+impl Decode for StakeBondCustodyOwner {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        match u8::decode(r)? {
+            0 => Ok(Self::DelegatorIdentity(Bytes32::decode(r)?)),
+            1 => Ok(Self::ValidatorColdIdentity(Bytes32::decode(r)?)),
+            byte => Err(IndraError::InvalidBool { byte }),
+        }
+    }
 }
 
 impl Encode for StakeBondEntry {
@@ -1706,10 +1752,19 @@ impl Encode for StakeBondEntry {
         if let Some(epoch) = self.unbonding_end_epoch {
             epoch.encode(buf);
         }
+        if self.has_explicit_custody_owner() {
+            self.custody_owner.encode(buf);
+        }
         match self.encoding_marker() {
-            SCHEMA_VERSION => self.original_output.encode_legacy(buf),
-            STAKE_BOND_COMPACT_MARKER => self.original_output.encode_compact(buf),
-            STAKE_BOND_FULLY_COMPACT_MARKER => self.original_output.encode_fully_compact(buf),
+            SCHEMA_VERSION | STAKE_BOND_CUSTODY_LEGACY_MARKER => {
+                self.original_output.encode_legacy(buf)
+            }
+            STAKE_BOND_COMPACT_MARKER | STAKE_BOND_CUSTODY_COMPACT_MARKER => {
+                self.original_output.encode_compact(buf)
+            }
+            STAKE_BOND_FULLY_COMPACT_MARKER | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
+                self.original_output.encode_fully_compact(buf)
+            }
             _ => unreachable!("stake bond encoding marker is constrained"),
         }
     }
@@ -1722,10 +1777,21 @@ impl Encode for StakeBondEntry {
             + self.bonded_epoch.encoded_len()
             + 1
             + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
+            + if self.has_explicit_custody_owner() {
+                33
+            } else {
+                0
+            }
             + match self.encoding_marker() {
-                SCHEMA_VERSION => self.original_output.legacy_encoded_len(),
-                STAKE_BOND_COMPACT_MARKER => self.original_output.compact_encoded_len(),
-                STAKE_BOND_FULLY_COMPACT_MARKER => self.original_output.fully_compact_encoded_len(),
+                SCHEMA_VERSION | STAKE_BOND_CUSTODY_LEGACY_MARKER => {
+                    self.original_output.legacy_encoded_len()
+                }
+                STAKE_BOND_COMPACT_MARKER | STAKE_BOND_CUSTODY_COMPACT_MARKER => {
+                    self.original_output.compact_encoded_len()
+                }
+                STAKE_BOND_FULLY_COMPACT_MARKER | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
+                    self.original_output.fully_compact_encoded_len()
+                }
                 _ => unreachable!("stake bond encoding marker is constrained"),
             }
     }
@@ -1740,6 +1806,15 @@ impl Decode for StakeBondEntry {
             | SCHEMA_VERSION => decode_stake_bond_entry_fields(r, None),
             STAKE_BOND_COMPACT_MARKER => decode_compact_stake_bond_entry_fields(r),
             STAKE_BOND_FULLY_COMPACT_MARKER => decode_fully_compact_stake_bond_entry_fields(r),
+            STAKE_BOND_CUSTODY_LEGACY_MARKER => {
+                decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::Legacy)
+            }
+            STAKE_BOND_CUSTODY_COMPACT_MARKER => {
+                decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::Compact)
+            }
+            STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
+                decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::FullyCompact)
+            }
             other if r.remaining() == 0 => Err(unsupported_schema("StakeBondEntry", other)),
             first_byte => decode_stake_bond_entry_fields(r, Some(first_byte)),
         }
@@ -1748,17 +1823,26 @@ impl Decode for StakeBondEntry {
 
 impl StakeBondEntry {
     fn encoding_marker(&self) -> u8 {
+        let explicit = self.has_explicit_custody_owner();
         match (
             self.original_output.range_proof.is_some(),
             self.original_output.owner_pubkey.is_some(),
+            explicit,
         ) {
-            (true, true) => SCHEMA_VERSION,
-            (false, true) => STAKE_BOND_COMPACT_MARKER,
-            (false, false) => STAKE_BOND_FULLY_COMPACT_MARKER,
-            (true, false) => {
+            (true, true, false) => SCHEMA_VERSION,
+            (false, true, false) => STAKE_BOND_COMPACT_MARKER,
+            (false, false, false) => STAKE_BOND_FULLY_COMPACT_MARKER,
+            (true, true, true) => STAKE_BOND_CUSTODY_LEGACY_MARKER,
+            (false, true, true) => STAKE_BOND_CUSTODY_COMPACT_MARKER,
+            (false, false, true) => STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER,
+            (true, false, _) => {
                 panic!("stake bond cannot retain a range proof without an owner pubkey")
             }
         }
+    }
+
+    fn has_explicit_custody_owner(&self) -> bool {
+        self.custody_owner != StakeBondCustodyOwner::DelegatorIdentity(self.delegator_id)
     }
 
     /// Decode the legacy unversioned stake bond layout.
@@ -2070,10 +2154,12 @@ fn decode_stake_bond_entry_fields(
     first_byte: Option<u8>,
 ) -> IndraResult<StakeBondEntry> {
     let utxo_id = decode_bytes32_with_first(r, first_byte)?;
+    let validator_id = Bytes32::decode(r)?;
+    let delegator_id = Bytes32::decode(r)?;
     Ok(StakeBondEntry {
         utxo_id,
-        validator_id: Bytes32::decode(r)?,
-        delegator_id: Bytes32::decode(r)?,
+        validator_id,
+        delegator_id,
         amount_spark: u64::decode(r)?,
         bonded_epoch: u64::decode(r)?,
         unbonding_end_epoch: if bool::decode(r)? {
@@ -2081,15 +2167,19 @@ fn decode_stake_bond_entry_fields(
         } else {
             None
         },
+        custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
         original_output: OutputV1::decode(r)?.into(),
     })
 }
 
 fn decode_compact_stake_bond_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<StakeBondEntry> {
+    let utxo_id = Bytes32::decode(r)?;
+    let validator_id = Bytes32::decode(r)?;
+    let delegator_id = Bytes32::decode(r)?;
     Ok(StakeBondEntry {
-        utxo_id: Bytes32::decode(r)?,
-        validator_id: Bytes32::decode(r)?,
-        delegator_id: Bytes32::decode(r)?,
+        utxo_id,
+        validator_id,
+        delegator_id,
         amount_spark: u64::decode(r)?,
         bonded_epoch: u64::decode(r)?,
         unbonding_end_epoch: if bool::decode(r)? {
@@ -2097,6 +2187,7 @@ fn decode_compact_stake_bond_entry_fields(r: &mut ByteReader<'_>) -> IndraResult
         } else {
             None
         },
+        custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
         original_output: StakeBondOutput {
             value_spark: u64::decode(r)?,
             commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
@@ -2110,10 +2201,13 @@ fn decode_compact_stake_bond_entry_fields(r: &mut ByteReader<'_>) -> IndraResult
 fn decode_fully_compact_stake_bond_entry_fields(
     r: &mut ByteReader<'_>,
 ) -> IndraResult<StakeBondEntry> {
+    let utxo_id = Bytes32::decode(r)?;
+    let validator_id = Bytes32::decode(r)?;
+    let delegator_id = Bytes32::decode(r)?;
     Ok(StakeBondEntry {
-        utxo_id: Bytes32::decode(r)?,
-        validator_id: Bytes32::decode(r)?,
-        delegator_id: Bytes32::decode(r)?,
+        utxo_id,
+        validator_id,
+        delegator_id,
         amount_spark: u64::decode(r)?,
         bonded_epoch: u64::decode(r)?,
         unbonding_end_epoch: if bool::decode(r)? {
@@ -2121,6 +2215,7 @@ fn decode_fully_compact_stake_bond_entry_fields(
         } else {
             None
         },
+        custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
         original_output: StakeBondOutput {
             value_spark: u64::decode(r)?,
             commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
@@ -2128,6 +2223,56 @@ fn decode_fully_compact_stake_bond_entry_fields(
             range_proof: None,
             lock_height: u64::decode(r)?,
         },
+    })
+}
+
+enum BondOutputShape {
+    Legacy,
+    Compact,
+    FullyCompact,
+}
+
+fn decode_stake_bond_entry_fields_with_custody(
+    r: &mut ByteReader<'_>,
+    shape: BondOutputShape,
+) -> IndraResult<StakeBondEntry> {
+    let utxo_id = Bytes32::decode(r)?;
+    let validator_id = Bytes32::decode(r)?;
+    let delegator_id = Bytes32::decode(r)?;
+    let amount_spark = u64::decode(r)?;
+    let bonded_epoch = u64::decode(r)?;
+    let unbonding_end_epoch = if bool::decode(r)? {
+        Some(u64::decode(r)?)
+    } else {
+        None
+    };
+    let custody_owner = StakeBondCustodyOwner::decode(r)?;
+    let original_output = match shape {
+        BondOutputShape::Legacy => OutputV1::decode(r)?.into(),
+        BondOutputShape::Compact => StakeBondOutput {
+            value_spark: u64::decode(r)?,
+            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
+            owner_pubkey: Some(indra_core::types::crypto::HybridPubKey::decode(r)?),
+            range_proof: None,
+            lock_height: u64::decode(r)?,
+        },
+        BondOutputShape::FullyCompact => StakeBondOutput {
+            value_spark: u64::decode(r)?,
+            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
+            owner_pubkey: None,
+            range_proof: None,
+            lock_height: u64::decode(r)?,
+        },
+    };
+    Ok(StakeBondEntry {
+        utxo_id,
+        validator_id,
+        delegator_id,
+        amount_spark,
+        bonded_epoch,
+        unbonding_end_epoch,
+        custody_owner,
+        original_output,
     })
 }
 
@@ -2157,6 +2302,7 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
+            custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
     }
@@ -2183,6 +2329,7 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
+            custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
     }
@@ -2214,6 +2361,7 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
+            custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
     }

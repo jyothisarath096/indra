@@ -424,6 +424,9 @@ mod tests {
                 amount_spark: 42_000,
                 bonded_epoch: 3,
                 unbonding_end_epoch: None,
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    Bytes32::from([0xD1; 32]),
+                ),
                 original_output: dummy_output(0xD4).into(),
             },
         );
@@ -478,6 +481,9 @@ mod tests {
                     amount_spark: 1_000,
                     bonded_epoch: 0,
                     unbonding_end_epoch: None,
+                    custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                        delegator_id,
+                    ),
                     original_output: OutputV1 {
                         value_spark: 1_000,
                         commitment: CommitmentV1 {

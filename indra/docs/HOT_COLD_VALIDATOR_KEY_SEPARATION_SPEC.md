@@ -383,21 +383,33 @@ This migration changes only the eventual release owner. It does not alter:
 
 The enrollment signatures explicitly commit to this migration.
 
-If the number of self-bonds cannot fit within the protocol's bounded
-state-transition budget, enrollment uses deterministic bounded batches. In
-that case:
+Enrollment migration is always atomic. There is no `Migrating` status,
+continuation operation or batch protocol. A validator may enroll only when it
+has at most 4,096 unresolved self-bonds. The implementation constant is
+`MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS`.
 
-- the first dual-signed enrollment fixes the proposed cold pair and opens a
-  `Migrating` status;
-- only permissionless deterministic continuation operations may process the
-  next canonical batch;
-- no cold custody operation is enabled until all batches and commitment leaves
-  are migrated;
-- the cold pair cannot change during migration; and
-- finalization atomically changes status from `Migrating` to `Active`.
+Migrating one self-bond changes only its fixed-size custody-owner
+discriminator, replaces the persistent-map entry, re-encodes and hashes the
+bond leaf, and updates one incremental sparse-Merkle commitment leaf. It
+performs no per-bond signature verification, commitment opening, range-proof
+generation, UTXO creation or storage growth. The applicable optimized
+maximum-block guard is four seconds against the six-second target block time;
+the existing maximum ordinary block measured approximately 1.3 seconds on the
+development Mac. An optimized benchmark of the exact mutation and commitment
+path migrated 4,096 bonds in 40.501 milliseconds on that machine. The cap
+therefore consumes approximately one percent of the four-second guard and
+retains over sixty times the measured migration-cost headroom while allowing
+thousands of independent self-stake top-ups.
 
-No batch accepts a new signature or alternate key. Batch order is ascending
-bond UTXO ID.
+If a validator has more than 4,096 unresolved self-bonds, enrollment fails
+without changing state and reports the count, cap and remedy. During the
+enrollment interval the validator must cold-enrollment-consolidate by using the
+existing legacy-authorized `SelfUnstake` operation for every self-bond, waiting
+for all releases to mature, combining the resulting spendable UTXOs into one
+validator-owned UTXO with an ordinary transaction, and using `SelfStake` once
+to create one consolidated self-bond. It may then retry enrollment. Released
+UTXOs are not rekeyed by this process; the ordinary consolidation transaction
+is required and remains authorized by their existing owner.
 
 #### Existing unclaimed validator rewards
 

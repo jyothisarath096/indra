@@ -6,6 +6,7 @@
 
 use indra_core::types::{crypto::HybridPubKey, primitives::Bytes32};
 
+use crate::validator::{ColdKeyStatus, StakeBondCustodyOwner};
 use crate::ChainState;
 
 /// Successful identity-check result for operations that submit a full pubkey.
@@ -56,17 +57,66 @@ pub fn resolve_bond_owner_pubkey(
     bond: &crate::validator::StakeBondEntry,
     state: &ChainState,
 ) -> Result<HybridPubKey, IdentityError> {
-    if let Some(owner_pubkey) = &bond.original_output.owner_pubkey {
-        return Ok(owner_pubkey.clone());
+    match bond.custody_owner {
+        StakeBondCustodyOwner::ValidatorColdIdentity(validator_id) => {
+            return resolve_active_validator_cold_pubkey(state, &validator_id);
+        }
+        StakeBondCustodyOwner::DelegatorIdentity(delegator_id) => {
+            if let Some(owner_pubkey) = &bond.original_output.owner_pubkey {
+                return Ok(owner_pubkey.clone());
+            }
+            return state
+                .delegator_identities
+                .get(&delegator_id)
+                .cloned()
+                .ok_or(IdentityError::UnresolvableIdentity {
+                    validator_id: Some(bond.validator_id),
+                    delegator_id,
+                });
+        }
     }
-    state
-        .delegator_identities
-        .get(&bond.delegator_id)
-        .cloned()
+}
+
+pub(crate) fn resolve_active_validator_cold_pubkey(
+    state: &ChainState,
+    validator_id: &Bytes32,
+) -> Result<HybridPubKey, IdentityError> {
+    let validator =
+        state
+            .validators
+            .get(validator_id)
+            .ok_or(IdentityError::UnresolvableIdentity {
+                validator_id: Some(*validator_id),
+                delegator_id: *validator_id,
+            })?;
+    if validator.cold_key_status != ColdKeyStatus::Active {
+        return Err(IdentityError::UnresolvableIdentity {
+            validator_id: Some(*validator_id),
+            delegator_id: *validator_id,
+        });
+    }
+    let classical =
+        validator
+            .cold_hybrid_classical_pk
+            .ok_or(IdentityError::UnresolvableIdentity {
+                validator_id: Some(*validator_id),
+                delegator_id: *validator_id,
+            })?;
+    let pq = validator
+        .cold_hybrid_pq_pk
         .ok_or(IdentityError::UnresolvableIdentity {
-            validator_id: Some(bond.validator_id),
-            delegator_id: bond.delegator_id,
-        })
+            validator_id: Some(*validator_id),
+            delegator_id: *validator_id,
+        })?;
+    Ok(HybridPubKey {
+        classical_pk: Bytes32::from(classical),
+        pq_pk: indra_core::VariableBytes::from_slice(&pq).map_err(|_| {
+            IdentityError::UnresolvableIdentity {
+                validator_id: Some(*validator_id),
+                delegator_id: *validator_id,
+            }
+        })?,
+    })
 }
 
 /// Resolve and check a submitted delegator public key against existing state.
