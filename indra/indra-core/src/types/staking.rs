@@ -31,13 +31,20 @@ const TAG_SET_AUTO_DELEGATE: u8 = 8;
 const TAG_UPDATE_NETWORK_ADDRESS: u8 = 9;
 const TAG_REGISTER_PAYMENT_KEY: u8 = 10;
 const TAG_REGISTER_VALIDATOR_WITH_COLD_KEY: u8 = 11;
+const TAG_ENROLL_VALIDATOR_COLD_KEY: u8 = 12;
 
 /// Stable operation tag used inside hot/cold registration envelopes.
 pub const AUTH_TAG_REGISTER_VALIDATOR: u16 = TAG_REGISTER_VALIDATOR as u16;
+/// Stable operation tag used inside hot/cold enrollment envelopes.
+pub const AUTH_TAG_ENROLL_VALIDATOR_COLD_KEY: u16 = TAG_ENROLL_VALIDATOR_COLD_KEY as u16;
 
 const REGISTER_VALIDATOR_DUAL_AUTH_DOMAIN: &[u8] =
     b"INDRA-register-validator-dual-authorization-v1";
 const REGISTER_VALIDATOR_PAYLOAD_DOMAIN: &[u8] = b"INDRA-register-validator-payload-v1";
+const ENROLL_VALIDATOR_COLD_KEY_DUAL_AUTH_DOMAIN: &[u8] =
+    b"INDRA-enroll-validator-cold-key-dual-authorization-v1";
+const ENROLL_VALIDATOR_COLD_KEY_PAYLOAD_DOMAIN: &[u8] =
+    b"INDRA-enroll-validator-cold-key-payload-v1";
 
 /// Proof that a staking UTXO's Pedersen commitment opens to exactly
 /// `OutputV1.value_spark`.
@@ -142,6 +149,16 @@ pub enum StakingOpBody {
         /// Proposed independent cold hybrid public key.
         cold_pubkey: Option<ColdHybridPubKey>,
         /// Complete cold hybrid signature over the dual authorization message.
+        cold_signature: Option<HybridSignature>,
+    },
+
+    /// Retrofit an existing validator with its first independent cold key.
+    EnrollValidatorColdKey {
+        /// Existing validator identity derived from its registered hot key.
+        validator_id: Bytes32,
+        /// Proposed independent cold hybrid public key.
+        cold_pubkey: ColdHybridPubKey,
+        /// Complete cold hybrid proof-of-possession signature.
         cold_signature: Option<HybridSignature>,
     },
 
@@ -273,6 +290,59 @@ impl StakingOp {
         Ok(Some(message))
     }
 
+    /// Canonical byte-identical message signed by both the existing hot key
+    /// and proposed cold key for first-time cold-key enrollment.
+    pub fn enroll_validator_cold_key_dual_signing_bytes(
+        &self,
+        chain_id: &str,
+    ) -> IndraResult<Option<Vec<u8>>> {
+        let StakingOpBody::EnrollValidatorColdKey {
+            validator_id,
+            cold_pubkey,
+            ..
+        } = &self.body
+        else {
+            return Ok(None);
+        };
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(ENROLL_VALIDATOR_COLD_KEY_PAYLOAD_DOMAIN);
+        cold_pubkey.encode(&mut payload);
+        1u64.encode(&mut payload);
+
+        let hot = AuthorizationEnvelope::new_hot(
+            chain_id.as_bytes(),
+            AUTH_TAG_ENROLL_VALIDATOR_COLD_KEY,
+            *validator_id,
+            1,
+            self.nonce,
+            &payload,
+        )?;
+        let cold = AuthorizationEnvelope::new_cold(
+            chain_id.as_bytes(),
+            AUTH_TAG_ENROLL_VALIDATOR_COLD_KEY,
+            *validator_id,
+            1,
+            0,
+            &payload,
+        )?;
+        let hot_bytes = hot.signing_bytes();
+        let cold_bytes = cold.signing_bytes();
+        let mut message = Vec::with_capacity(
+            ENROLL_VALIDATOR_COLD_KEY_DUAL_AUTH_DOMAIN.len()
+                + 4
+                + hot_bytes.len()
+                + 4
+                + cold_bytes.len(),
+        );
+        message.extend_from_slice(ENROLL_VALIDATOR_COLD_KEY_DUAL_AUTH_DOMAIN);
+        (hot_bytes.len() as u32).encode(&mut message);
+        message.extend_from_slice(&hot_bytes);
+        (cold_bytes.len() as u32).encode(&mut message);
+        message.extend_from_slice(&cold_bytes);
+        Ok(Some(message))
+    }
+
     /// Enforce the height-gated shape of a validator registration extension.
     pub fn validate_register_validator_cold_extension(&self, height: u64) -> IndraResult<()> {
         let StakingOpBody::RegisterValidator {
@@ -322,7 +392,8 @@ impl StakingOp {
             } => pubkey_to_id(validator_pubkey),
             StakingOpBody::SetCommission { validator_id, .. }
             | StakingOpBody::SetAutoDelegate { validator_id, .. }
-            | StakingOpBody::UpdateNetworkAddress { validator_id, .. } => *validator_id,
+            | StakingOpBody::UpdateNetworkAddress { validator_id, .. }
+            | StakingOpBody::EnrollValidatorColdKey { validator_id, .. } => *validator_id,
             StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } => pubkey_to_id(owner_pubkey),
         }
     }
@@ -348,6 +419,19 @@ impl StakingOp {
                         min: 0,
                         max: 10_000,
                     });
+                }
+            }
+            StakingOpBody::EnrollValidatorColdKey { cold_signature, .. } => {
+                if !validator_cold_key_enrollment_active(height) {
+                    return Err(IndraError::InvalidStakingOp(
+                        "EnrollValidatorColdKey is not active before VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT"
+                            .into(),
+                    ));
+                }
+                if cold_signature.is_none() {
+                    return Err(IndraError::InvalidStakingOp(
+                        "validator cold-key enrollment requires a cold hybrid signature".into(),
+                    ));
                 }
             }
             StakingOpBody::SetCommission {
@@ -444,6 +528,19 @@ impl Encode for StakingOpBody {
                     }
                 }
             }
+            StakingOpBody::EnrollValidatorColdKey {
+                validator_id,
+                cold_pubkey,
+                cold_signature,
+            } => {
+                buf.push(TAG_ENROLL_VALIDATOR_COLD_KEY);
+                validator_id.encode(buf);
+                cold_pubkey.encode(buf);
+                cold_signature.is_some().encode(buf);
+                if let Some(signature) = cold_signature {
+                    signature.encode(buf);
+                }
+            }
             StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps,
@@ -537,6 +634,18 @@ impl Encode for StakingOpBody {
                         0
                     }
             }
+            StakingOpBody::EnrollValidatorColdKey {
+                cold_pubkey,
+                cold_signature,
+                ..
+            } => {
+                32 + cold_pubkey.encoded_len()
+                    + 1
+                    + cold_signature
+                        .as_ref()
+                        .map(Encode::encoded_len)
+                        .unwrap_or(0)
+            }
             StakingOpBody::SetCommission { .. } => 32 + 4,
             StakingOpBody::SelfStake {
                 validator_pubkey,
@@ -613,6 +722,20 @@ impl Decode for StakingOpBody {
                     validator_pubkey,
                     vrf_pk,
                     bond_proof,
+                    cold_pubkey,
+                    cold_signature,
+                })
+            }
+            TAG_ENROLL_VALIDATOR_COLD_KEY => {
+                let validator_id = Bytes32::decode(r)?;
+                let cold_pubkey = ColdHybridPubKey::decode(r)?;
+                let cold_signature = if bool::decode(r)? {
+                    Some(HybridSignature::decode(r)?)
+                } else {
+                    None
+                };
+                Ok(StakingOpBody::EnrollValidatorColdKey {
+                    validator_id,
                     cold_pubkey,
                     cold_signature,
                 })
@@ -849,6 +972,11 @@ mod tests {
                 cold_pubkey: None,
                 cold_signature: None,
             }),
+            op(StakingOpBody::EnrollValidatorColdKey {
+                validator_id: Bytes32::from([0x4Cu8; 32]),
+                cold_pubkey: dummy_cold_pubkey(),
+                cold_signature: Some(dummy_signature()),
+            }),
             op(StakingOpBody::SetCommission {
                 validator_id: Bytes32::from([5u8; 32]),
                 new_commission_bps: 1_500,
@@ -969,6 +1097,42 @@ mod tests {
             cold_signature: None,
         });
         assert!(missing.validate_structure_at_height(gate).is_err());
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_round_trip_and_height_gate() {
+        let enrollment = op(StakingOpBody::EnrollValidatorColdKey {
+            validator_id: Bytes32::from([0x61; 32]),
+            cold_pubkey: dummy_cold_pubkey(),
+            cold_signature: Some(dummy_signature()),
+        });
+        let gate = crate::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+
+        assert_eq!(
+            StakingOp::decode_exact(&enrollment.encode_to_vec()).unwrap(),
+            enrollment
+        );
+        assert!(enrollment.validate_structure_at_height(gate - 1).is_err());
+        assert!(enrollment.validate_structure_at_height(gate).is_ok());
+        assert_ne!(
+            enrollment
+                .enroll_validator_cold_key_dual_signing_bytes("indra-testnet-1")
+                .unwrap()
+                .unwrap(),
+            enrollment
+                .enroll_validator_cold_key_dual_signing_bytes("indra-other")
+                .unwrap()
+                .unwrap()
+        );
+
+        let missing_cold_signature = op(StakingOpBody::EnrollValidatorColdKey {
+            validator_id: Bytes32::from([0x62; 32]),
+            cold_pubkey: dummy_cold_pubkey(),
+            cold_signature: None,
+        });
+        assert!(missing_cold_signature
+            .validate_structure_at_height(gate)
+            .is_err());
     }
 
     #[test]

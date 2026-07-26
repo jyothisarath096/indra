@@ -27,9 +27,9 @@ use crate::{
         resolve_and_check_identity, resolve_bond_owner_pubkey, IdentityCheckOutcome, IdentityError,
     },
     validator::{
-        validate_new_validator_cold_key, ColdKeyStatus, DelegationReturnEvent,
-        DelegationReturnReason, StakeBondEntry, ValidatorEntry, ValidatorStatus,
-        MAX_DELEGATORS_PER_VALIDATOR,
+        validate_new_validator_cold_key, validate_validator_cold_key, ColdKeyStatus,
+        DelegationReturnEvent, DelegationReturnReason, StakeBondEntry, ValidatorEntry,
+        ValidatorStatus, MAX_DELEGATORS_PER_VALIDATOR,
     },
 };
 
@@ -45,6 +45,10 @@ pub fn apply_staking_op(
 ) -> StateResult<()> {
     op.validate_register_validator_cold_extension(current_height)
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
+    if matches!(op.body, StakingOpBody::EnrollValidatorColdKey { .. }) {
+        op.validate_structure_at_height(current_height)
+            .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
+    }
     apply_staking_op_with_identity_activation(
         state,
         op,
@@ -172,6 +176,65 @@ pub(crate) fn apply_staking_op_with_identity_activation(
                 )?;
             }
         }
+        StakingOpBody::EnrollValidatorColdKey {
+            validator_id,
+            cold_pubkey,
+            cold_signature,
+        } => {
+            let validator = state
+                .validators
+                .get(validator_id)
+                .ok_or(StateError::ValidatorNotFound)?;
+            if validator.cold_key_status != ColdKeyStatus::Unenrolled {
+                return Err(StateError::InvalidStakingOp(
+                    "validator cold key is already enrolled".into(),
+                ));
+            }
+            let hot_classical_pk = validator.hybrid_classical_pk.ok_or_else(|| {
+                StateError::StakingOpSignatureInvalid {
+                    reason: "validator has no classical hot key registered".into(),
+                }
+            })?;
+            let hot_pq_pk = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
+                StateError::StakingOpSignatureInvalid {
+                    reason: "validator has no PQ hot key registered".into(),
+                }
+            })?;
+            let cold_signature = cold_signature.as_ref().ok_or_else(|| {
+                StateError::InvalidStakingOp(
+                    "validator cold-key enrollment requires a cold hybrid signature".into(),
+                )
+            })?;
+            let message = op
+                .enroll_validator_cold_key_dual_signing_bytes(chain_id)
+                .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
+                .ok_or_else(|| {
+                    StateError::InvalidStakingOp(
+                        "validator cold-key enrollment authorization message is absent".into(),
+                    )
+                })?;
+            let hot_pk = hybrid_crypto_pubkey(&hot_classical_pk, hot_pq_pk)?;
+            let cold_pk = cold_pubkey
+                .to_crypto_pubkey()
+                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+            let hot_sig = op
+                .signature
+                .to_crypto_sig()
+                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+            let cold_sig = cold_signature
+                .to_crypto_sig()
+                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+            indra_crypto::verify_dual_hybrid(
+                &message,
+                Some(&hot_sig),
+                &hot_pk,
+                Some(&cold_sig),
+                &cold_pk,
+            )
+            .map_err(|err| StateError::StakingOpSignatureInvalid {
+                reason: err.to_string(),
+            })?;
+        }
         StakingOpBody::SelfStake {
             validator_pubkey, ..
         }
@@ -251,6 +314,11 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             current_height,
             identity_registry_active,
         ),
+        StakingOpBody::EnrollValidatorColdKey {
+            validator_id,
+            cold_pubkey,
+            ..
+        } => apply_enroll_validator_cold_key(state, *validator_id, cold_pubkey, current_height),
         StakingOpBody::SetCommission {
             validator_id,
             new_commission_bps,
@@ -316,15 +384,46 @@ fn apply_register_payment_key(
     Ok(())
 }
 
-fn verify_staking_sig(
-    signing_bytes: &[u8],
-    signature: &HybridSignature,
+fn apply_enroll_validator_cold_key(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    cold_pubkey: &ColdHybridPubKey,
+    current_height: u64,
+) -> StateResult<()> {
+    let current = state
+        .validators
+        .get(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+    if current.cold_key_status != ColdKeyStatus::Unenrolled {
+        return Err(StateError::InvalidStakingOp(
+            "validator cold key is already enrolled".into(),
+        ));
+    }
+    let validated = validate_validator_cold_key(
+        &state.validators,
+        &validator_id,
+        &cold_pubkey.classical_pk.0,
+        cold_pubkey.pq_pk.as_slice(),
+        1,
+    )?;
+    let mut updated = current.clone();
+    updated.cold_hybrid_classical_pk = Some(validated.classical_pk);
+    updated.cold_hybrid_pq_pk = Some(validated.pq_pk);
+    updated.cold_key_version = validated.version;
+    updated.cold_key_status = ColdKeyStatus::Active;
+    updated.cold_nonce = 0;
+    state.validators.upsert(updated.clone())?;
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_validator(&updated, current_height);
+    }
+    Ok(())
+}
+
+fn hybrid_crypto_pubkey(
     classical_pk: &[u8; 32],
     pq_pk_bytes: &[u8],
-) -> StateResult<()> {
-    use indra_crypto::{
-        verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
-    };
+) -> StateResult<indra_crypto::HybridPublicKey> {
+    use indra_crypto::{ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES};
 
     let pq_pk: [u8; PQ_PK_BYTES] =
         pq_pk_bytes
@@ -336,10 +435,21 @@ fn verify_staking_sig(
                     pq_pk_bytes.len()
                 ),
             })?;
-    let crypto_pk = HybridPublicKey {
+    Ok(HybridPublicKey {
         classical: ClassicalPublicKey(*classical_pk),
         pq: PqPublicKey(pq_pk),
-    };
+    })
+}
+
+fn verify_staking_sig(
+    signing_bytes: &[u8],
+    signature: &HybridSignature,
+    classical_pk: &[u8; 32],
+    pq_pk_bytes: &[u8],
+) -> StateResult<()> {
+    use indra_crypto::verify_hybrid;
+
+    let crypto_pk = hybrid_crypto_pubkey(classical_pk, pq_pk_bytes)?;
     let crypto_sig = signature
         .to_crypto_sig()
         .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
@@ -1816,6 +1926,39 @@ mod tests {
         op.signature = wire_signature(&hot_keypair.sign(&message).unwrap());
         let cold_signature = wire_signature(&cold_keypair.sign(&message).unwrap());
         let StakingOpBody::RegisterValidator {
+            cold_signature: slot,
+            ..
+        } = &mut op.body
+        else {
+            unreachable!()
+        };
+        *slot = Some(cold_signature);
+        op
+    }
+
+    fn dual_signed_enroll_op(
+        validator_id: Bytes32,
+        hot_keypair: &HybridKeypair,
+        cold_keypair: &HybridKeypair,
+        nonce: u64,
+        chain_id: &str,
+    ) -> StakingOp {
+        let mut op = StakingOp {
+            body: StakingOpBody::EnrollValidatorColdKey {
+                validator_id,
+                cold_pubkey: cold_pubkey_from_keypair(cold_keypair),
+                cold_signature: Some(dummy_signature()),
+            },
+            nonce,
+            signature: dummy_signature(),
+        };
+        let message = op
+            .enroll_validator_cold_key_dual_signing_bytes(chain_id)
+            .unwrap()
+            .unwrap();
+        op.signature = wire_signature(&hot_keypair.sign(&message).unwrap());
+        let cold_signature = wire_signature(&cold_keypair.sign(&message).unwrap());
+        let StakingOpBody::EnrollValidatorColdKey {
             cold_signature: slot,
             ..
         } = &mut op.body
@@ -5496,5 +5639,234 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_pre_gate_is_structurally_rejected() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0x31);
+        let cold = mixed_keypair(0x32, 0x33);
+        let op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+
+        assert!(apply_staking_op(
+            &mut state,
+            &op,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1,
+        )
+        .is_err());
+        let entry = state.validators.get(&validator_id).unwrap();
+        assert_eq!(entry.cold_key_status, ColdKeyStatus::Unenrolled);
+        assert_eq!(entry.cold_key_version, 0);
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_post_gate_succeeds_for_unenrolled_validator() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, 0x34);
+        let cold = mixed_keypair(0x35, 0x36);
+        let expected = cold.public_key();
+        let op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(
+            &mut state,
+            &op,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        )
+        .unwrap();
+
+        let entry = state.validators.get(&validator_id).unwrap();
+        assert_eq!(entry.cold_key_status, ColdKeyStatus::Active);
+        assert_eq!(entry.cold_key_version, 1);
+        assert_eq!(entry.cold_nonce, 0);
+        assert_eq!(entry.cold_hybrid_classical_pk, Some(expected.classical.0));
+        assert_eq!(entry.cold_hybrid_pq_pk, Some(expected.pq.0));
+        assert_eq!(state.staking_nonces.get(&validator_id), Some(&1));
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_rejects_unregistered_validator() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let hot = keypair(0x37);
+        let validator_id = pubkey_to_id(&pubkey_from_keypair(&hot));
+        let cold = mixed_keypair(0x38, 0x39);
+        let op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+
+        assert_eq!(
+            apply_staking_op(
+                &mut state,
+                &op,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            ),
+            Err(StateError::ValidatorNotFound)
+        );
+        assert!(state.validators.is_empty());
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_rejects_already_active_validator() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, 0x3A);
+        let existing_cold = mixed_keypair(0x3B, 0x3C).public_key();
+        {
+            let entry = state.validators.get_mut(&validator_id).unwrap();
+            entry.cold_hybrid_classical_pk = Some(existing_cold.classical.0);
+            entry.cold_hybrid_pq_pk = Some(existing_cold.pq.0);
+            entry.cold_key_version = 1;
+            entry.cold_key_status = ColdKeyStatus::Active;
+        }
+        let proposed = mixed_keypair(0x3D, 0x3E);
+        let op = dual_signed_enroll_op(validator_id, &hot, &proposed, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+
+        assert!(matches!(
+            apply_staking_op(
+                &mut state,
+                &op,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            ),
+            Err(StateError::InvalidStakingOp(reason))
+                if reason.contains("already enrolled")
+        ));
+        let entry = state.validators.get(&validator_id).unwrap();
+        assert_eq!(
+            entry.cold_hybrid_classical_pk,
+            Some(existing_cold.classical.0)
+        );
+        assert_eq!(entry.cold_hybrid_pq_pk, Some(existing_cold.pq.0));
+        assert_eq!(entry.cold_key_version, 1);
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_requires_both_complete_hybrid_signatures() {
+        for case in ["hot-only", "cold-only", "mixed-hot-slot", "mixed-cold-slot"] {
+            let mut state = ChainState::new_genesis();
+            state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+            let (validator_id, hot) = make_active_validator(&mut state, 0x40);
+            let cold = mixed_keypair(0x41, 0x42);
+            let mut op = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+            let StakingOpBody::EnrollValidatorColdKey { cold_signature, .. } = &mut op.body else {
+                unreachable!()
+            };
+            match case {
+                "hot-only" => *cold_signature = None,
+                "cold-only" => op.signature = dummy_signature(),
+                "mixed-hot-slot" => {
+                    op.signature.pq_sig = cold_signature.as_ref().unwrap().pq_sig.clone()
+                }
+                "mixed-cold-slot" => {
+                    cold_signature.as_mut().unwrap().classical_sig =
+                        op.signature.classical_sig.clone()
+                }
+                _ => unreachable!(),
+            }
+            let chain_id = state.chain_id.clone();
+
+            assert!(
+                apply_staking_op(
+                    &mut state,
+                    &op,
+                    &chain_id,
+                    VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                )
+                .is_err(),
+                "{case} enrollment must fail"
+            );
+            assert_eq!(
+                state.validators.get(&validator_id).unwrap().cold_key_status,
+                ColdKeyStatus::Unenrolled
+            );
+            assert!(state.staking_nonces.get(&validator_id).is_none());
+        }
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_rejects_cross_role_component_reuse() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (target_id, target_hot) = make_active_validator(&mut state, 0x43);
+        let (_, other_hot) = make_active_validator(&mut state, 0x44);
+        let proposed_cold = mixed_keypair(0x44, 0x45);
+        let op = dual_signed_enroll_op(target_id, &target_hot, &proposed_cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+
+        assert!(matches!(
+            apply_staking_op(
+                &mut state,
+                &op,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            ),
+            Err(StateError::DuplicateValidatorKey { .. })
+        ));
+        assert_eq!(
+            state.validators.get(&target_id).unwrap().cold_key_status,
+            ColdKeyStatus::Unenrolled
+        );
+        drop(other_hot);
+    }
+
+    #[test]
+    fn enroll_validator_cold_key_activation_boundary_replay_is_deterministic() {
+        fn replay() -> ChainState {
+            let mut state = ChainState::new_genesis();
+            let (validator_id, hot) = make_active_validator(&mut state, 0x46);
+            let commission = signed_op(
+                StakingOpBody::SetCommission {
+                    validator_id,
+                    new_commission_bps: 1_250,
+                },
+                1,
+                &hot,
+                &state.chain_id,
+            );
+            state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1;
+            let chain_id = state.chain_id.clone();
+            let pre_height = state.height;
+            apply_staking_op(&mut state, &commission, &chain_id, pre_height).unwrap();
+
+            let cold = mixed_keypair(0x47, 0x48);
+            let enrollment = dual_signed_enroll_op(validator_id, &hot, &cold, 2, &state.chain_id);
+            state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+            let enrollment_height = state.height;
+            apply_staking_op(&mut state, &enrollment, &chain_id, enrollment_height).unwrap();
+
+            let address = signed_op(
+                StakingOpBody::UpdateNetworkAddress {
+                    validator_id,
+                    network_addr: Some("203.0.113.46:30303".into()),
+                },
+                3,
+                &hot,
+                &state.chain_id,
+            );
+            apply_staking_op(&mut state, &address, &chain_id, enrollment_height).unwrap();
+            state
+        }
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::compute_state_root(&first),
+            crate::compute_state_root(&second)
+        );
+        let enrolled = first
+            .validators
+            .all_validators()
+            .find(|entry| entry.cold_key_status == ColdKeyStatus::Active)
+            .unwrap();
+        assert_eq!(enrolled.cold_key_version, 1);
+        assert_eq!(enrolled.cold_nonce, 0);
+        assert_eq!(first.staking_nonces.get(&enrolled.validator_id), Some(&3));
     }
 }
