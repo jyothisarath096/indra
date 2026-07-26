@@ -1500,6 +1500,8 @@ mod tests {
                     committed_value_spark: MINIMUM_VALIDATOR_BOND_SPARK,
                     blinding_factor: Bytes32::from([seed[0]; 32]),
                 }),
+                cold_pubkey: None,
+                cold_signature: None,
             },
             nonce,
             signature: dummy_sig(),

@@ -774,6 +774,53 @@ pub fn validate_validator_cold_key(
         .cold_key_version
         .checked_add(1)
         .ok_or_else(|| StateError::InvalidStakingOp("cold-key version overflow".to_string()))?;
+    validate_cold_key_material(
+        validators,
+        validator_id,
+        validator.hybrid_classical_pk,
+        validator.hybrid_pq_pk.as_deref(),
+        classical_bytes,
+        pq_bytes,
+        proposed_version,
+        expected_version,
+    )
+}
+
+/// Validate version-1 cold-key material for a not-yet-registered validator.
+pub fn validate_new_validator_cold_key(
+    validators: &ValidatorSet,
+    validator_id: &Bytes32,
+    proposed_hot_classical_pk: [u8; 32],
+    proposed_hot_pq_pk: &[u8],
+    classical_bytes: &[u8],
+    pq_bytes: &[u8],
+    proposed_version: u64,
+) -> StateResult<ValidatedColdKey> {
+    if validators.get(validator_id).is_some() {
+        return Err(StateError::ValidatorAlreadyRegistered);
+    }
+    validate_cold_key_material(
+        validators,
+        validator_id,
+        Some(proposed_hot_classical_pk),
+        Some(proposed_hot_pq_pk),
+        classical_bytes,
+        pq_bytes,
+        proposed_version,
+        1,
+    )
+}
+
+fn validate_cold_key_material(
+    validators: &ValidatorSet,
+    validator_id: &Bytes32,
+    target_hot_classical_pk: Option<[u8; 32]>,
+    target_hot_pq_pk: Option<&[u8]>,
+    classical_bytes: &[u8],
+    pq_bytes: &[u8],
+    proposed_version: u64,
+    expected_version: u64,
+) -> StateResult<ValidatedColdKey> {
     if proposed_version == 0 || proposed_version != expected_version {
         return Err(StateError::InvalidStakingOp(format!(
             "cold-key version must be exactly {expected_version}, got {proposed_version}"
@@ -800,6 +847,16 @@ pub fn validate_validator_cold_key(
     indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(pq_pk)).map_err(|err| {
         StateError::InvalidStakingOp(format!("malformed cold ML-DSA-87 key: {err}"))
     })?;
+    if target_hot_classical_pk == Some(classical_pk) {
+        return Err(StateError::DuplicateValidatorKey {
+            reason: "cold Ed25519 component duplicates the validator hot component".to_string(),
+        });
+    }
+    if target_hot_pq_pk.is_some_and(|hot| hot == pq_pk.as_slice()) {
+        return Err(StateError::DuplicateValidatorKey {
+            reason: "cold ML-DSA-87 component duplicates the validator hot component".to_string(),
+        });
+    }
 
     for existing in validators.all_validators() {
         if existing.validator_id != *validator_id

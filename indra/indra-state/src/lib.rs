@@ -77,7 +77,7 @@ pub use state_commitment::StateCommitmentV2;
 pub use state_root::{compute_state_root, compute_state_roots, compute_validator_set_root};
 pub use utxo::{UtxoEntry, UtxoSet};
 pub use validator::{
-    validate_validator_cold_key, ColdKeyStatus, ValidatedColdKey, ValidatorEntry, ValidatorSet,
-    ValidatorStatus,
+    validate_new_validator_cold_key, validate_validator_cold_key, ColdKeyStatus, ValidatedColdKey,
+    ValidatorEntry, ValidatorSet, ValidatorStatus,
 };
 pub use validator::{DelegationReturnEvent, DelegationReturnReason, DelegatorEntry};

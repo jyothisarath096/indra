@@ -339,6 +339,8 @@ pub fn build_register_validator_op(
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
             bond_proof: Some(bond_proof),
+            cold_pubkey: None,
+            cold_signature: None,
         },
         keypair,
         nonce,
