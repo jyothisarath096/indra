@@ -649,6 +649,11 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
         }
     }
 
@@ -685,6 +690,27 @@ mod tests {
         assert_eq!(loaded, state);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_cold_key_snapshot_roundtrips_with_unenrolled_defaults() {
+        let mut original = ChainState::new_genesis();
+        original.height = 43;
+        original.validators.upsert(test_validator()).unwrap();
+        let bytes = serialise_chain_state(&original);
+        let decoded = deserialise_chain_state(&bytes, original.height)
+            .unwrap()
+            .unwrap();
+        let validator = decoded.validators.get(&Bytes32::from([0x41; 32])).unwrap();
+        assert_eq!(validator.cold_hybrid_classical_pk, None);
+        assert_eq!(validator.cold_hybrid_pq_pk, None);
+        assert_eq!(validator.cold_key_version, 0);
+        assert_eq!(
+            validator.cold_key_status,
+            indra_state::ColdKeyStatus::Unenrolled
+        );
+        assert_eq!(validator.cold_nonce, 0);
+        assert_eq!(serialise_chain_state(&decoded), bytes);
     }
 
     #[test]
@@ -897,6 +923,11 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
             })
             .unwrap();
         state

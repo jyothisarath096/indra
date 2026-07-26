@@ -1601,7 +1601,7 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
     };
 
     Ok(format!(
-        r#"{{"validator_id":"{id}","name":"{name}","stake":{stake},"status":"{status}","epoch_joined":{epoch},"hybrid_classical_pk":"{classical_pk}","hybrid_pq_pk":"{pq_pk}"}}"#,
+        r#"{{"validator_id":"{id}","name":"{name}","stake":{stake},"status":"{status}","epoch_joined":{epoch},"hybrid_classical_pk":"{classical_pk}","hybrid_pq_pk":"{pq_pk}","cold_hybrid_classical_pk":{cold_classical_pk},"cold_hybrid_pq_pk":{cold_pq_pk},"cold_key_version":{cold_version},"cold_key_status":"{cold_status}","cold_nonce":{cold_nonce}}}"#,
         id = id_hex,
         name = validator.name,
         stake = validator.stake_spark,
@@ -1616,6 +1616,20 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
             .as_ref()
             .map(hex::encode)
             .unwrap_or_default(),
+        cold_classical_pk = validator
+            .cold_hybrid_classical_pk
+            .map(|pk| format!(r#""{}""#, hex::encode(pk)))
+            .unwrap_or_else(|| "null".to_string()),
+        cold_pq_pk = validator
+            .cold_hybrid_pq_pk
+            .map(|pk| format!(r#""{}""#, hex::encode(pk)))
+            .unwrap_or_else(|| "null".to_string()),
+        cold_version = validator.cold_key_version,
+        cold_status = match validator.cold_key_status {
+            indra_state::ColdKeyStatus::Unenrolled => "unenrolled",
+            indra_state::ColdKeyStatus::Active => "active",
+        },
+        cold_nonce = validator.cold_nonce,
     ))
 }
 
@@ -2502,7 +2516,7 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
             .map(|addr| format!(r#""{}""#, json_escape(addr)))
             .unwrap_or_else(|| "null".to_string());
         entries.push(format!(
-            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","network_addr":{}}}"#,
+            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","network_addr":{},"cold_hybrid_classical_pk":{},"cold_hybrid_pq_pk":{},"cold_key_version":{},"cold_key_status":"{}","cold_nonce":{}}}"#,
             id_hex,
             json_escape(&v.name),
             v.stake_spark,
@@ -2512,6 +2526,18 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
             v.hybrid_classical_pk.map(hex::encode).unwrap_or_default(),
             v.hybrid_pq_pk.as_ref().map(hex::encode).unwrap_or_default(),
             network_addr,
+            v.cold_hybrid_classical_pk
+                .map(|pk| format!(r#""{}""#, hex::encode(pk)))
+                .unwrap_or_else(|| "null".to_string()),
+            v.cold_hybrid_pq_pk
+                .map(|pk| format!(r#""{}""#, hex::encode(pk)))
+                .unwrap_or_else(|| "null".to_string()),
+            v.cold_key_version,
+            match v.cold_key_status {
+                indra_state::ColdKeyStatus::Unenrolled => "unenrolled",
+                indra_state::ColdKeyStatus::Active => "active",
+            },
+            v.cold_nonce,
         ));
     }
     Ok(format!(r#"{{"validators":[{}]}}"#, entries.join(",")))
@@ -3666,6 +3692,15 @@ mod tests {
                     auto_delegate_to: None,
                     network_addr: addr.map(str::to_string),
                     network_addr_last_updated_epoch: addr.map(|_| 1),
+                    cold_hybrid_classical_pk: (byte == 0x31).then_some([0x51; 32]),
+                    cold_hybrid_pq_pk: (byte == 0x31).then_some([0x52; indra_crypto::PQ_PK_BYTES]),
+                    cold_key_version: u64::from(byte == 0x31),
+                    cold_key_status: if byte == 0x31 {
+                        indra_state::ColdKeyStatus::Active
+                    } else {
+                        indra_state::ColdKeyStatus::Unenrolled
+                    },
+                    cold_nonce: if byte == 0x31 { 9 } else { 0 },
                 })
                 .unwrap();
         }
@@ -3674,6 +3709,15 @@ mod tests {
 
         assert!(result.contains(r#""network_addr":"203.0.113.31:30303""#));
         assert!(result.contains(r#""network_addr":null"#));
+        assert!(result.contains(&format!(
+            r#""cold_hybrid_classical_pk":"{}""#,
+            hex::encode([0x51; 32])
+        )));
+        assert!(result.contains(r#""cold_key_version":1"#));
+        assert!(result.contains(r#""cold_key_status":"active""#));
+        assert!(result.contains(r#""cold_nonce":9"#));
+        assert!(result.contains(r#""cold_hybrid_classical_pk":null"#));
+        assert!(result.contains(r#""cold_key_status":"unenrolled""#));
     }
 
     #[test]
@@ -3922,6 +3966,11 @@ mod tests {
                 auto_delegate_to: Some(target_id),
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
             })
             .unwrap();
         engine
@@ -3946,6 +3995,11 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
             })
             .unwrap();
         let state = NodeState::read_only(&engine);

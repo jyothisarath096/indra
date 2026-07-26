@@ -181,6 +181,11 @@ fn install_active_validator(
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
         })
         .unwrap();
     hybrid
@@ -216,6 +221,11 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
         })
         .unwrap();
     hybrid

@@ -25,9 +25,10 @@ pub use constants::{CLASSICAL_SIG_BYTES, PQ_PK_BYTES, PQ_SIG_BYTES, PQ_SK_BYTES}
 pub use error::{CryptoError, CryptoResult};
 pub use hash::{domain_hash, hash_pair, sha256};
 pub use hybrid::{
-    verify_classical, verify_dual_hybrid, verify_hybrid, verify_pq, ClassicalKeypair,
-    ClassicalPublicKey, ClassicalSignature, ColdHybridKeypair, ColdHybridPublicKey, HybridKeypair,
-    HybridPublicKey, HybridSignature, PqKeypair, PqPublicKey, PqSignature,
+    validate_classical_public_key, validate_pq_public_key, verify_classical, verify_dual_hybrid,
+    verify_hybrid, verify_pq, ClassicalKeypair, ClassicalPublicKey, ClassicalSignature,
+    ColdHybridKeypair, ColdHybridPublicKey, HybridKeypair, HybridPublicKey, HybridSignature,
+    PqKeypair, PqPublicKey, PqSignature,
 };
 pub use indra_bulletproofs::{prove_range, verify_range, BulletproofError, RANGE_PROOF_BYTES};
 pub use mnemonic::{

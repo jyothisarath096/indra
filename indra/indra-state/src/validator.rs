@@ -18,7 +18,10 @@ use indra_core::types::{
     transaction::OutputV1,
 };
 
+use crate::error::{StateError, StateResult};
 use crate::persistent::PersistentOrdMap;
+
+const VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS: u8 = SCHEMA_VERSION + 1;
 
 /// Consensus ceiling for active delegator entries under one validator.
 ///
@@ -215,6 +218,40 @@ impl Decode for ValidatorStatus {
     }
 }
 
+/// Enrollment status of a validator's independent cold authorization key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdKeyStatus {
+    /// No cold key is registered.
+    Unenrolled,
+    /// A complete cold hybrid key is registered and active.
+    Active,
+}
+
+impl Encode for ColdKeyStatus {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::Unenrolled => 0u8.encode(buf),
+            Self::Active => 1u8.encode(buf),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        1
+    }
+}
+
+impl Decode for ColdKeyStatus {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        match u8::decode(r)? {
+            0 => Ok(Self::Unenrolled),
+            1 => Ok(Self::Active),
+            _ => Err(IndraError::InvariantViolation {
+                message: "invalid cold key status discriminator",
+            }),
+        }
+    }
+}
+
 /// A single validator's entry in the validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorEntry {
@@ -260,11 +297,26 @@ pub struct ValidatorEntry {
     pub network_addr: Option<String>,
     /// Epoch in which `network_addr` was last set or cleared.
     pub network_addr_last_updated_epoch: Option<u64>,
+    /// Ed25519 component of the independent cold authorization key.
+    pub cold_hybrid_classical_pk: Option<[u8; 32]>,
+    /// ML-DSA-87 component of the independent cold authorization key.
+    pub cold_hybrid_pq_pk: Option<[u8; indra_crypto::PQ_PK_BYTES]>,
+    /// Monotonic cold-key generation; zero exactly while unenrolled.
+    pub cold_key_version: u64,
+    /// Cold-key enrollment state.
+    pub cold_key_status: ColdKeyStatus,
+    /// Replay-protection nonce for cold-authorized operations.
+    pub cold_nonce: u64,
 }
 
 impl Encode for ValidatorEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
-        SCHEMA_VERSION.encode(buf);
+        let has_cold_state = self.has_cold_key_state();
+        if has_cold_state {
+            VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS.encode(buf);
+        } else {
+            SCHEMA_VERSION.encode(buf);
+        }
         self.validator_id.encode(buf);
         let name_bytes = self.name.as_bytes();
         (name_bytes.len() as u32).encode(buf);
@@ -316,6 +368,19 @@ impl Encode for ValidatorEntry {
         if let Some(epoch) = self.network_addr_last_updated_epoch {
             epoch.encode(buf);
         }
+        if has_cold_state {
+            self.cold_hybrid_classical_pk.is_some().encode(buf);
+            if let Some(pk) = self.cold_hybrid_classical_pk {
+                buf.extend_from_slice(&pk);
+            }
+            self.cold_hybrid_pq_pk.is_some().encode(buf);
+            if let Some(pk) = self.cold_hybrid_pq_pk {
+                buf.extend_from_slice(&pk);
+            }
+            self.cold_key_version.encode(buf);
+            self.cold_key_status.encode(buf);
+            self.cold_nonce.encode(buf);
+        }
     }
 
     fn encoded_len(&self) -> usize {
@@ -358,6 +423,19 @@ impl Encode for ValidatorEntry {
                 .unwrap_or(0)
             + 1
             + self.network_addr_last_updated_epoch.map(|_| 8).unwrap_or(0)
+            + if self.has_cold_key_state() {
+                1 + self.cold_hybrid_classical_pk.map(|_| 32).unwrap_or(0)
+                    + 1
+                    + self
+                        .cold_hybrid_pq_pk
+                        .map(|_| indra_crypto::PQ_PK_BYTES)
+                        .unwrap_or(0)
+                    + 8
+                    + 1
+                    + 8
+            } else {
+                0
+            }
     }
 }
 
@@ -368,6 +446,7 @@ impl Decode for ValidatorEntry {
             SCHEMA_VERSION_GENESIS => decode_validator_entry_v1(r, None),
             SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS => decode_validator_entry_v3(r, None),
             SCHEMA_VERSION => decode_validator_entry_v4(r, None),
+            VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS => decode_validator_entry_v5(r, None),
             other if r.remaining() == 0 => Err(unsupported_schema("ValidatorEntry", other)),
             first_byte => decode_validator_entry_v1(r, Some(first_byte)),
         }
@@ -401,28 +480,35 @@ fn decode_validator_entry_v1(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, false, false, false)
+    decode_validator_entry_fields(r, first_byte, false, false, false, false)
 }
 
 fn decode_validator_entry_v2(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, false, false)
+    decode_validator_entry_fields(r, first_byte, true, false, false, false)
 }
 
 fn decode_validator_entry_v3(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, true, false)
+    decode_validator_entry_fields(r, first_byte, true, true, false, false)
 }
 
 fn decode_validator_entry_v4(
     r: &mut ByteReader<'_>,
     first_byte: Option<u8>,
 ) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, true, true)
+    decode_validator_entry_fields(r, first_byte, true, true, true, false)
+}
+
+fn decode_validator_entry_v5(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<ValidatorEntry> {
+    decode_validator_entry_fields(r, first_byte, true, true, true, true)
 }
 
 impl ValidatorEntry {
@@ -443,6 +529,7 @@ fn decode_validator_entry_fields(
     has_auto_delegate_to: bool,
     has_pending_commission: bool,
     has_network_addr: bool,
+    has_cold_keys: bool,
 ) -> IndraResult<ValidatorEntry> {
     let validator_id = decode_bytes32_with_first(r, first_byte)?;
     let name_len = u32::decode(r)? as usize;
@@ -539,6 +626,45 @@ fn decode_validator_entry_fields(
     } else {
         (None, None)
     };
+    let (
+        cold_hybrid_classical_pk,
+        cold_hybrid_pq_pk,
+        cold_key_version,
+        cold_key_status,
+        cold_nonce,
+    ) = if has_cold_keys {
+        let classical = if bool::decode(r)? {
+            Some(
+                r.read_bytes(32)?
+                    .try_into()
+                    .map_err(|_| IndraError::InvariantViolation {
+                        message: "invalid cold classical pk length in snapshot",
+                    })?,
+            )
+        } else {
+            None
+        };
+        let pq = if bool::decode(r)? {
+            Some(
+                r.read_bytes(indra_crypto::PQ_PK_BYTES)?
+                    .try_into()
+                    .map_err(|_| IndraError::InvariantViolation {
+                        message: "invalid cold PQ pk length in snapshot",
+                    })?,
+            )
+        } else {
+            None
+        };
+        (
+            classical,
+            pq,
+            u64::decode(r)?,
+            ColdKeyStatus::decode(r)?,
+            u64::decode(r)?,
+        )
+    } else {
+        (None, None, 0, ColdKeyStatus::Unenrolled, 0)
+    };
 
     Ok(ValidatorEntry {
         validator_id,
@@ -560,10 +686,43 @@ fn decode_validator_entry_fields(
         auto_delegate_to,
         network_addr,
         network_addr_last_updated_epoch,
+        cold_hybrid_classical_pk,
+        cold_hybrid_pq_pk,
+        cold_key_version,
+        cold_key_status,
+        cold_nonce,
     })
 }
 
 impl ValidatorEntry {
+    /// True when the additive cold-key serialization tail must be present.
+    pub fn has_cold_key_state(&self) -> bool {
+        self.cold_hybrid_classical_pk.is_some()
+            || self.cold_hybrid_pq_pk.is_some()
+            || self.cold_key_version != 0
+            || self.cold_key_status != ColdKeyStatus::Unenrolled
+            || self.cold_nonce != 0
+    }
+
+    /// Append the canonical cold-key projection when it is non-default.
+    pub(crate) fn append_cold_key_commitment(&self, value: &mut Vec<u8>) {
+        if !self.has_cold_key_state() {
+            return;
+        }
+        value.extend_from_slice(b"INDRA-VALIDATOR-COLD-KEY-V1");
+        value.push(u8::from(self.cold_hybrid_classical_pk.is_some()));
+        if let Some(pk) = self.cold_hybrid_classical_pk {
+            value.extend_from_slice(&pk);
+        }
+        value.push(u8::from(self.cold_hybrid_pq_pk.is_some()));
+        if let Some(pk) = self.cold_hybrid_pq_pk {
+            value.extend_from_slice(&pk);
+        }
+        value.extend_from_slice(&self.cold_key_version.to_le_bytes());
+        self.cold_key_status.encode(value);
+        value.extend_from_slice(&self.cold_nonce.to_le_bytes());
+    }
+
     /// True if this validator is currently active.
     pub fn is_active(&self) -> bool {
         matches!(self.status, ValidatorStatus::Active)
@@ -584,6 +743,105 @@ impl ValidatorEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValidatorSet {
     validators: BTreeMap<Bytes32, ValidatorEntry>,
+}
+
+/// A complete cold hybrid public key that passed registry validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedColdKey {
+    /// Validated Ed25519 component.
+    pub classical_pk: [u8; 32],
+    /// Validated ML-DSA-87 component.
+    pub pq_pk: [u8; indra_crypto::PQ_PK_BYTES],
+    /// Validated next key version.
+    pub version: u64,
+}
+
+/// Validate a proposed cold key without mutating or enrolling the registry.
+///
+/// This enforces full-pair well-formedness, strictly sequential versions, and
+/// global component-level uniqueness across both hot and cold roles.
+pub fn validate_validator_cold_key(
+    validators: &ValidatorSet,
+    validator_id: &Bytes32,
+    classical_bytes: &[u8],
+    pq_bytes: &[u8],
+    proposed_version: u64,
+) -> StateResult<ValidatedColdKey> {
+    let validator = validators.get(validator_id).ok_or_else(|| {
+        StateError::InvalidStakingOp("cold-key validator is not registered".to_string())
+    })?;
+    let expected_version = validator
+        .cold_key_version
+        .checked_add(1)
+        .ok_or_else(|| StateError::InvalidStakingOp("cold-key version overflow".to_string()))?;
+    if proposed_version == 0 || proposed_version != expected_version {
+        return Err(StateError::InvalidStakingOp(format!(
+            "cold-key version must be exactly {expected_version}, got {proposed_version}"
+        )));
+    }
+
+    let classical_pk: [u8; 32] = classical_bytes.try_into().map_err(|_| {
+        StateError::InvalidStakingOp(format!(
+            "cold Ed25519 public key must be 32 bytes, got {}",
+            classical_bytes.len()
+        ))
+    })?;
+    let pq_pk: [u8; indra_crypto::PQ_PK_BYTES] = pq_bytes.try_into().map_err(|_| {
+        StateError::InvalidStakingOp(format!(
+            "cold ML-DSA-87 public key must be {} bytes, got {}",
+            indra_crypto::PQ_PK_BYTES,
+            pq_bytes.len()
+        ))
+    })?;
+    indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(classical_pk))
+        .map_err(|err| {
+            StateError::InvalidStakingOp(format!("malformed cold Ed25519 key: {err}"))
+        })?;
+    indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(pq_pk)).map_err(|err| {
+        StateError::InvalidStakingOp(format!("malformed cold ML-DSA-87 key: {err}"))
+    })?;
+
+    for existing in validators.all_validators() {
+        if existing.validator_id != *validator_id
+            && existing.cold_hybrid_classical_pk == Some(classical_pk)
+            && existing.cold_hybrid_pq_pk == Some(pq_pk)
+        {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "cold hybrid pair already registered to another validator".to_string(),
+            });
+        }
+        if existing.hybrid_classical_pk == Some(classical_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "cold Ed25519 component duplicates a registered hot component".to_string(),
+            });
+        }
+        if existing
+            .hybrid_pq_pk
+            .as_deref()
+            .is_some_and(|hot| hot == pq_pk.as_slice())
+        {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "cold ML-DSA-87 component duplicates a registered hot component"
+                    .to_string(),
+            });
+        }
+        if existing.cold_hybrid_classical_pk == Some(classical_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "cold Ed25519 component already registered".to_string(),
+            });
+        }
+        if existing.cold_hybrid_pq_pk == Some(pq_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "cold ML-DSA-87 component already registered".to_string(),
+            });
+        }
+    }
+
+    Ok(ValidatedColdKey {
+        classical_pk,
+        pq_pk,
+        version: proposed_version,
+    })
 }
 
 impl Encode for ValidatorSet {
@@ -792,6 +1050,15 @@ impl ValidatorSet {
 mod tests {
     use super::*;
 
+    fn hybrid_components(seed: u8) -> ([u8; 32], [u8; indra_crypto::PQ_PK_BYTES]) {
+        let keypair = indra_crypto::HybridKeypair::new(
+            indra_crypto::ClassicalKeypair::from_seed(&[seed; 32]),
+            indra_crypto::PqKeypair::from_seed(&[seed.wrapping_add(1); 32]).unwrap(),
+        );
+        let public = keypair.public_key();
+        (public.classical.0, public.pq.0)
+    }
+
     fn make_validator(id_byte: u8, stake: u64, epoch: u64) -> ValidatorEntry {
         ValidatorEntry {
             validator_id: Bytes32::from([id_byte; 32]),
@@ -813,7 +1080,163 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
         }
+    }
+
+    #[test]
+    fn validator_cold_fields_roundtrip_and_unenrolled_bytes_stay_legacy() {
+        let unenrolled = make_validator(1, 10_000, 2);
+        let legacy_bytes = unenrolled.encode_to_vec();
+        assert_eq!(legacy_bytes[0], SCHEMA_VERSION);
+        assert_eq!(
+            ValidatorEntry::decode_exact(&legacy_bytes).unwrap(),
+            unenrolled
+        );
+
+        let (classical, pq) = hybrid_components(0x41);
+        let mut active = unenrolled.clone();
+        active.cold_hybrid_classical_pk = Some(classical);
+        active.cold_hybrid_pq_pk = Some(pq);
+        active.cold_key_version = 1;
+        active.cold_key_status = ColdKeyStatus::Active;
+        active.cold_nonce = 7;
+        let encoded = active.encode_to_vec();
+        assert_eq!(encoded[0], VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS);
+        assert_eq!(ValidatorEntry::decode_exact(&encoded).unwrap(), active);
+    }
+
+    #[test]
+    fn cold_registry_rejects_malformed_ed25519_keys() {
+        let mut set = ValidatorSet::new();
+        let validator = make_validator(1, 10_000, 0);
+        let id = validator.validator_id;
+        set.upsert(validator).unwrap();
+        let (_, pq) = hybrid_components(0x31);
+
+        assert!(validate_validator_cold_key(&set, &id, &[0xff; 31], &pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &id, &[0; 32], &pq, 1).is_err());
+    }
+
+    #[test]
+    fn cold_registry_rejects_wrong_ml_dsa_87_length() {
+        let mut set = ValidatorSet::new();
+        let validator = make_validator(1, 10_000, 0);
+        let id = validator.validator_id;
+        set.upsert(validator).unwrap();
+        let (classical, pq) = hybrid_components(0x32);
+
+        assert!(
+            validate_validator_cold_key(&set, &id, &classical, &pq[..pq.len() - 1], 1).is_err()
+        );
+    }
+
+    #[test]
+    fn cold_registry_rejects_component_pair_and_cross_role_reuse() {
+        let (hot_a_classical, hot_a_pq) = hybrid_components(0x11);
+        let (cold_a_classical, cold_a_pq) = hybrid_components(0x21);
+        let (fresh_classical, fresh_pq) = hybrid_components(0x31);
+        let mut a = make_validator(1, 10_000, 0);
+        a.hybrid_classical_pk = Some(hot_a_classical);
+        a.hybrid_pq_pk = Some(hot_a_pq.to_vec());
+        a.cold_hybrid_classical_pk = Some(cold_a_classical);
+        a.cold_hybrid_pq_pk = Some(cold_a_pq);
+        a.cold_key_version = 1;
+        a.cold_key_status = ColdKeyStatus::Active;
+        let mut b = make_validator(2, 10_000, 0);
+        let b_id = b.validator_id;
+        let (hot_b_classical, hot_b_pq) = hybrid_components(0x41);
+        b.hybrid_classical_pk = Some(hot_b_classical);
+        b.hybrid_pq_pk = Some(hot_b_pq.to_vec());
+        let mut set = ValidatorSet::new();
+        set.upsert(a).unwrap();
+        set.upsert(b).unwrap();
+
+        assert!(
+            validate_validator_cold_key(&set, &b_id, &cold_a_classical, &cold_a_pq, 1).is_err()
+        );
+        assert!(validate_validator_cold_key(&set, &b_id, &cold_a_classical, &fresh_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &b_id, &fresh_classical, &cold_a_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &b_id, &hot_a_classical, &fresh_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &b_id, &fresh_classical, &hot_a_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &b_id, &hot_b_classical, &fresh_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &b_id, &fresh_classical, &hot_b_pq, 1).is_err());
+    }
+
+    #[test]
+    fn cold_registry_rejects_same_pair_for_multiple_validator_ids() {
+        let (classical, pq) = hybrid_components(0x61);
+        let mut a = make_validator(1, 10_000, 0);
+        a.cold_hybrid_classical_pk = Some(classical);
+        a.cold_hybrid_pq_pk = Some(pq);
+        a.cold_key_version = 1;
+        a.cold_key_status = ColdKeyStatus::Active;
+        let b = make_validator(2, 10_000, 0);
+        let b_id = b.validator_id;
+        let mut set = ValidatorSet::new();
+        set.upsert(a).unwrap();
+        set.upsert(b).unwrap();
+
+        let err = validate_validator_cold_key(&set, &b_id, &classical, &pq, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::DuplicateValidatorKey { reason }
+                if reason.contains("pair already registered")
+        ));
+    }
+
+    #[test]
+    fn cold_registry_rejects_own_cold_component_equal_to_hot_component() {
+        let (hot_classical, hot_pq) = hybrid_components(0x71);
+        let (fresh_classical, fresh_pq) = hybrid_components(0x72);
+        let mut validator = make_validator(1, 10_000, 0);
+        validator.hybrid_classical_pk = Some(hot_classical);
+        validator.hybrid_pq_pk = Some(hot_pq.to_vec());
+        let id = validator.validator_id;
+        let mut set = ValidatorSet::new();
+        set.upsert(validator).unwrap();
+
+        assert!(validate_validator_cold_key(&set, &id, &hot_classical, &fresh_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &id, &fresh_classical, &hot_pq, 1).is_err());
+    }
+
+    #[test]
+    fn cold_registry_enforces_cross_validator_component_uniqueness() {
+        let (hot_a_classical, hot_a_pq) = hybrid_components(0x81);
+        let (fresh_classical, fresh_pq) = hybrid_components(0x82);
+        let mut a = make_validator(1, 10_000, 0);
+        a.hybrid_classical_pk = Some(hot_a_classical);
+        a.hybrid_pq_pk = Some(hot_a_pq.to_vec());
+        let b = make_validator(2, 10_000, 0);
+        let b_id = b.validator_id;
+        let mut set = ValidatorSet::new();
+        set.upsert(a).unwrap();
+        set.upsert(b).unwrap();
+
+        assert!(validate_validator_cold_key(&set, &b_id, &hot_a_classical, &fresh_pq, 1).is_err());
+        assert!(validate_validator_cold_key(&set, &b_id, &fresh_classical, &hot_a_pq, 1).is_err());
+    }
+
+    #[test]
+    fn cold_registry_requires_exact_next_nonzero_version() {
+        let mut set = ValidatorSet::new();
+        let validator = make_validator(1, 10_000, 0);
+        let id = validator.validator_id;
+        set.upsert(validator).unwrap();
+        let (classical, pq) = hybrid_components(0x51);
+
+        assert!(validate_validator_cold_key(&set, &id, &classical, &pq, 0).is_err());
+        assert!(validate_validator_cold_key(&set, &id, &classical, &pq, 2).is_err());
+        assert_eq!(
+            validate_validator_cold_key(&set, &id, &classical, &pq, 1)
+                .unwrap()
+                .version,
+            1
+        );
     }
 
     fn encode_legacy_validator_v1(validator: &ValidatorEntry) -> Vec<u8> {

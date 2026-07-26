@@ -18,7 +18,7 @@ use indra_core::types::{
     transaction::OutputV1,
 };
 use indra_crypto::{commit, derive_genesis_utxo_blinding, prove_range, sha256};
-use indra_state::ChainState;
+use indra_state::{ChainState, ColdKeyStatus};
 use rand::{rngs::StdRng, SeedableRng};
 
 const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
@@ -200,6 +200,22 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: parse_fixed_hex::<32>(v.get("cold_hybrid_classical_pk")),
+            cold_hybrid_pq_pk: parse_fixed_hex::<{ indra_crypto::PQ_PK_BYTES }>(
+                v.get("cold_hybrid_pq_pk"),
+            ),
+            cold_key_version: v
+                .get("cold_key_version")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            cold_key_status: match v.get("cold_key_status").map(String::as_str) {
+                Some("active") => ColdKeyStatus::Active,
+                _ => ColdKeyStatus::Unenrolled,
+            },
+            cold_nonce: v
+                .get("cold_nonce")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
         };
 
         let _ = state.validators.upsert(entry);

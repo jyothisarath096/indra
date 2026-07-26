@@ -3451,6 +3451,11 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
             })
             .unwrap();
         hybrid

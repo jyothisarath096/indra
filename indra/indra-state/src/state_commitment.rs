@@ -289,6 +289,7 @@ pub(crate) fn validator_value_hash(validator: &ValidatorEntry, height: u64) -> [
             value.extend_from_slice(&epoch.to_le_bytes());
         }
     }
+    validator.append_cold_key_commitment(&mut value);
     sha256(&value)
 }
 
@@ -387,6 +388,11 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
         }
     }
 
@@ -625,6 +631,30 @@ mod tests {
             ));
         }
         leaves
+    }
+
+    #[test]
+    fn validator_leaf_commits_cold_state_but_not_uncommitted_display_name() {
+        let base = validator(0x73);
+        let height = 0;
+        let base_hash = validator_value_hash(&base, height);
+
+        let mut display_only = base.clone();
+        display_only.name = "uncommitted display metadata".to_string();
+        assert_eq!(validator_value_hash(&display_only, height), base_hash);
+
+        let mut cold = base;
+        cold.cold_hybrid_classical_pk = Some([0x81; 32]);
+        cold.cold_hybrid_pq_pk = Some([0x82; indra_crypto::PQ_PK_BYTES]);
+        cold.cold_key_version = 1;
+        cold.cold_key_status = crate::validator::ColdKeyStatus::Active;
+        assert_ne!(validator_value_hash(&cold, height), base_hash);
+
+        cold.cold_nonce = 1;
+        assert_ne!(
+            validator_value_hash(&cold, height),
+            validator_value_hash(&display_only, height)
+        );
     }
 
     #[test]

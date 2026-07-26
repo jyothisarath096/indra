@@ -68,6 +68,22 @@ pub fn verify_classical(
         .map_err(|_| CryptoError::ClassicalVerifyFailed)
 }
 
+/// Validate that bytes canonically decode as an Ed25519 verifying key.
+pub fn validate_classical_public_key(pk: &ClassicalPublicKey) -> CryptoResult<()> {
+    let verifying_key =
+        VerifyingKey::from_bytes(&pk.0).map_err(|_| CryptoError::MalformedPublicKey {
+            scheme: "Ed25519",
+            actual: CLASSICAL_PK_BYTES,
+        })?;
+    if verifying_key.is_weak() {
+        return Err(CryptoError::MalformedPublicKey {
+            scheme: "Ed25519",
+            actual: CLASSICAL_PK_BYTES,
+        });
+    }
+    Ok(())
+}
+
 // ── Post-Quantum (ML-DSA-87) ─────────────────────────────────────────────────
 
 /// An ML-DSA-87 verifying key (2592 bytes).
@@ -77,6 +93,18 @@ pub struct PqPublicKey(pub [u8; PQ_PK_BYTES]);
 /// An ML-DSA-87 signature (4627 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PqSignature(pub [u8; PQ_SIG_BYTES]);
+
+/// Validate that bytes canonically decode as an ML-DSA-87 verifying key.
+pub fn validate_pq_public_key(pk: &PqPublicKey) -> CryptoResult<()> {
+    let encoded = EncodedVerifyingKey::<MlDsa87>::try_from(pk.0.as_slice()).map_err(|_| {
+        CryptoError::MalformedPublicKey {
+            scheme: "ML-DSA-87",
+            actual: pk.0.len(),
+        }
+    })?;
+    let _ = MlDsaVerifyingKey::<MlDsa87>::decode(&encoded);
+    Ok(())
+}
 
 /// An ML-DSA-87 signing keypair represented canonically by its 32-byte seed.
 #[derive(Clone)]

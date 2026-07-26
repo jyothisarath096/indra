@@ -457,6 +457,11 @@ fn apply_register_validator(
         auto_delegate_to: None,
         network_addr: None,
         network_addr_last_updated_epoch: None,
+        cold_hybrid_classical_pk: None,
+        cold_hybrid_pq_pk: None,
+        cold_key_version: 0,
+        cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+        cold_nonce: 0,
     };
     state.validators.upsert(entry.clone())?;
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
@@ -1675,6 +1680,11 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
         };
         state.validators.upsert(entry).unwrap();
     }
@@ -4674,6 +4684,11 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
             })
             .unwrap();
         state.staked_bonds.insert(
