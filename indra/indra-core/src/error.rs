@@ -193,6 +193,10 @@ pub enum IndraError {
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
 
+    /// A hot/cold authorization envelope was malformed or internally inconsistent.
+    #[error("invalid authorization envelope: {0}")]
+    InvalidAuthorizationEnvelope(String),
+
     /// Commission rate outside the protocol-allowed range.
     #[error("commission {actual} bps out of range [{min}, {max}]")]
     CommissionOutOfRange {

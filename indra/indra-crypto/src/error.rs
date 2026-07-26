@@ -13,6 +13,13 @@ pub enum CryptoError {
     #[error("ML-DSA-87 signature verification failed")]
     PqVerifyFailed,
 
+    /// A complete hot or cold hybrid signature was absent.
+    #[error("missing complete {role} hybrid signature")]
+    MissingHybridSignature {
+        /// The missing authorization role.
+        role: &'static str,
+    },
+
     /// BLS operation failed.
     #[error("BLS operation failed: {detail}")]
     BlsFailed {

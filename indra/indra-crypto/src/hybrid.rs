@@ -10,6 +10,8 @@ use ml_dsa::{
     SignatureEncoding, Signer as MlDsaSigner, SigningKey as MlDsaSigningKey,
     Verifier as MlDsaVerifier, VerifyingKey as MlDsaVerifyingKey,
 };
+use rand_core::{CryptoRng, OsRng, RngCore};
+use zeroize::Zeroize;
 
 use crate::{
     constants::{CLASSICAL_PK_BYTES, CLASSICAL_SIG_BYTES, PQ_PK_BYTES, PQ_SIG_BYTES, PQ_SK_BYTES},
@@ -215,6 +217,87 @@ impl HybridKeypair {
     }
 }
 
+/// A validator cold-storage public key.
+///
+/// This role-specific wrapper always contains one complete hybrid public key.
+/// Verification APIs consume it as a unit and never accept separate classical
+/// and post-quantum public-key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdHybridPublicKey(HybridPublicKey);
+
+impl ColdHybridPublicKey {
+    /// Wrap one complete hybrid public key as a cold-role public key.
+    pub fn from_complete_hybrid(public_key: HybridPublicKey) -> Self {
+        Self(public_key)
+    }
+
+    /// Return the complete underlying hybrid public key.
+    pub fn as_complete_hybrid(&self) -> &HybridPublicKey {
+        &self.0
+    }
+}
+
+/// A validator cold-storage keypair backed by independent Ed25519 and
+/// ML-DSA-87 entropy.
+///
+/// This type intentionally exposes no one-seed constructor. Callers must
+/// provide two independent seeds or two independent cryptographic RNG inputs.
+pub struct ColdHybridKeypair {
+    keypair: HybridKeypair,
+}
+
+impl ColdHybridKeypair {
+    /// Construct from independently sourced Ed25519 and ML-DSA-87 seeds.
+    pub fn from_independent_seeds(
+        mut classical_seed: [u8; 32],
+        mut pq_seed: [u8; 32],
+    ) -> CryptoResult<Self> {
+        let classical = ClassicalKeypair::from_seed(&classical_seed);
+        let pq = PqKeypair::from_seed(&pq_seed);
+        classical_seed.zeroize();
+        pq_seed.zeroize();
+        Ok(Self {
+            keypair: HybridKeypair::new(classical, pq?),
+        })
+    }
+
+    /// Generate using two independently supplied cryptographic RNGs.
+    ///
+    /// Requiring two RNG parameters prevents this API from deriving both
+    /// component seeds from one shared 32-byte value.
+    pub fn generate_with_rngs<RClassical, RPq>(
+        classical_rng: &mut RClassical,
+        pq_rng: &mut RPq,
+    ) -> CryptoResult<Self>
+    where
+        RClassical: CryptoRng + RngCore,
+        RPq: CryptoRng + RngCore,
+    {
+        let mut classical_seed = [0u8; 32];
+        let mut pq_seed = [0u8; 32];
+        classical_rng.fill_bytes(&mut classical_seed);
+        pq_rng.fill_bytes(&mut pq_seed);
+        Self::from_independent_seeds(classical_seed, pq_seed)
+    }
+
+    /// Generate using two independent operating-system CSPRNG reads.
+    pub fn generate() -> CryptoResult<Self> {
+        let mut classical_rng = OsRng;
+        let mut pq_rng = OsRng;
+        Self::generate_with_rngs(&mut classical_rng, &mut pq_rng)
+    }
+
+    /// Return the complete cold-role public key.
+    pub fn public_key(&self) -> ColdHybridPublicKey {
+        ColdHybridPublicKey::from_complete_hybrid(self.keypair.public_key())
+    }
+
+    /// Sign a message with both cold-key components.
+    pub fn sign(&self, message: &[u8]) -> CryptoResult<HybridSignature> {
+        self.keypair.sign(message)
+    }
+}
+
 /// Verify a hybrid signature.
 ///
 /// BOTH schemes must verify for `Ok(())` to be returned.
@@ -229,9 +312,61 @@ pub fn verify_hybrid(
     Ok(())
 }
 
+/// Verify a dual-required authorization.
+///
+/// The hot and cold signatures must each be complete hybrid signatures over
+/// the same message. The helper accepts complete public-key objects only; it
+/// has no API for receiving or recombining individual public-key components.
+pub fn verify_dual_hybrid(
+    message: &[u8],
+    hot_signature: Option<&HybridSignature>,
+    registered_hot_pair: &HybridPublicKey,
+    cold_signature: Option<&HybridSignature>,
+    registered_or_proposed_cold_pair: &ColdHybridPublicKey,
+) -> CryptoResult<()> {
+    let hot_signature = hot_signature.ok_or(CryptoError::MissingHybridSignature { role: "hot" })?;
+    let cold_signature =
+        cold_signature.ok_or(CryptoError::MissingHybridSignature { role: "cold" })?;
+
+    verify_hybrid(message, hot_signature, registered_hot_pair)?;
+    verify_hybrid(
+        message,
+        cold_signature,
+        registered_or_proposed_cold_pair.as_complete_hybrid(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand_core::{CryptoRng, Error as RandError, RngCore};
+
+    struct CountingRng {
+        byte: u8,
+        fill_calls: usize,
+    }
+
+    impl RngCore for CountingRng {
+        fn next_u32(&mut self) -> u32 {
+            u32::from(self.byte)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            u64::from(self.byte)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.fill_calls += 1;
+            dest.fill(self.byte);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for CountingRng {}
 
     fn classical_kp() -> ClassicalKeypair {
         ClassicalKeypair::from_seed(&[0x42u8; 32])
@@ -305,6 +440,100 @@ mod tests {
         let msg = b"hybrid test message";
         let sig = kp.sign(msg).unwrap();
         assert!(verify_hybrid(msg, &sig, &kp.public_key()).is_ok());
+    }
+
+    #[test]
+    fn cold_key_generation_requires_two_independent_entropy_inputs() {
+        let mut classical_rng = CountingRng {
+            byte: 0x31,
+            fill_calls: 0,
+        };
+        let mut pq_rng = CountingRng {
+            byte: 0xA7,
+            fill_calls: 0,
+        };
+
+        let generated =
+            ColdHybridKeypair::generate_with_rngs(&mut classical_rng, &mut pq_rng).unwrap();
+        let expected = ColdHybridKeypair::from_independent_seeds([0x31; 32], [0xA7; 32]).unwrap();
+
+        assert_eq!(classical_rng.fill_calls, 1);
+        assert_eq!(pq_rng.fill_calls, 1);
+        assert_eq!(generated.public_key(), expected.public_key());
+    }
+
+    #[test]
+    fn dual_verification_requires_both_complete_pairs_and_rejects_mixing() {
+        let hot = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x11; 32]),
+            PqKeypair::from_seed(&[0x12; 32]).unwrap(),
+        );
+        let cold = ColdHybridKeypair::from_independent_seeds([0x21; 32], [0x22; 32]).unwrap();
+        let message = b"INDRA dual-required authorization test";
+        let hot_signature = hot.sign(message).unwrap();
+        let cold_signature = cold.sign(message).unwrap();
+        let hot_public = hot.public_key();
+        let cold_public = cold.public_key();
+
+        assert!(verify_dual_hybrid(
+            message,
+            Some(&hot_signature),
+            &hot_public,
+            Some(&cold_signature),
+            &cold_public,
+        )
+        .is_ok());
+
+        assert_eq!(
+            verify_dual_hybrid(
+                message,
+                Some(&hot_signature),
+                &hot_public,
+                None,
+                &cold_public,
+            ),
+            Err(CryptoError::MissingHybridSignature { role: "cold" })
+        );
+        assert_eq!(
+            verify_dual_hybrid(
+                message,
+                None,
+                &hot_public,
+                Some(&cold_signature),
+                &cold_public,
+            ),
+            Err(CryptoError::MissingHybridSignature { role: "hot" })
+        );
+
+        let mixed_hot_classical_cold_pq = HybridSignature {
+            classical: hot_signature.classical.clone(),
+            pq: cold_signature.pq.clone(),
+        };
+        assert_eq!(
+            verify_dual_hybrid(
+                message,
+                Some(&mixed_hot_classical_cold_pq),
+                &hot_public,
+                Some(&cold_signature),
+                &cold_public,
+            ),
+            Err(CryptoError::PqVerifyFailed)
+        );
+
+        let mixed_cold_classical_hot_pq = HybridSignature {
+            classical: cold_signature.classical.clone(),
+            pq: hot_signature.pq.clone(),
+        };
+        assert_eq!(
+            verify_dual_hybrid(
+                message,
+                Some(&hot_signature),
+                &hot_public,
+                Some(&mixed_cold_classical_hot_pq),
+                &cold_public,
+            ),
+            Err(CryptoError::PqVerifyFailed)
+        );
     }
 
     #[test]

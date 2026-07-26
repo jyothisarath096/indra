@@ -118,6 +118,52 @@ impl HybridPubKey {
     }
 }
 
+/// Validator cold-storage public key on the wire: Ed25519 + ML-DSA-87.
+///
+/// This is role-distinct from `HybridPubKey` while preserving its exact
+/// component encodings and size checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdHybridPubKey {
+    /// Ed25519 public key (32 bytes, fixed).
+    pub classical_pk: Bytes32,
+    /// ML-DSA-87 public key (2592 bytes).
+    pub pq_pk: VariableBytes<MAX_PQ_PK_BYTES>,
+}
+
+impl Encode for ColdHybridPubKey {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.classical_pk.encode(buf);
+        self.pq_pk.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + self.pq_pk.encoded_len()
+    }
+}
+
+impl Decode for ColdHybridPubKey {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            classical_pk: Bytes32::decode(r)?,
+            pq_pk: VariableBytes::decode(r)?,
+        })
+    }
+}
+
+impl ColdHybridPubKey {
+    /// Convert the wire key into the role-specific crypto-layer representation.
+    pub fn to_crypto_pubkey(&self) -> Result<indra_crypto::ColdHybridPublicKey, String> {
+        let complete = HybridPubKey {
+            classical_pk: self.classical_pk,
+            pq_pk: self.pq_pk.clone(),
+        }
+        .to_crypto_pubkey()?;
+        Ok(indra_crypto::ColdHybridPublicKey::from_complete_hybrid(
+            complete,
+        ))
+    }
+}
+
 /// Pedersen commitment (compressed Ristretto255 point, 32 bytes).
 ///
 /// Commitment = v·G + r·H
@@ -188,6 +234,23 @@ mod tests {
             s,
             HybridSignature::decode_exact(&s.encode_to_vec()).unwrap()
         );
+    }
+
+    #[test]
+    fn cold_hybrid_pubkey_round_trip() {
+        let keypair =
+            indra_crypto::ColdHybridKeypair::from_independent_seeds([0x41; 32], [0x92; 32])
+                .unwrap();
+        let public = keypair.public_key();
+        let cold = ColdHybridPubKey {
+            classical_pk: Bytes32::from(public.as_complete_hybrid().classical.0),
+            pq_pk: VariableBytes::from_slice(&public.as_complete_hybrid().pq.0).unwrap(),
+        };
+
+        let encoded = cold.encode_to_vec();
+        assert_eq!(encoded.len(), 32 + 4 + indra_crypto::PQ_PK_BYTES);
+        assert_eq!(cold, ColdHybridPubKey::decode_exact(&encoded).unwrap());
+        assert_eq!(cold.to_crypto_pubkey().unwrap(), public);
     }
 
     #[test]

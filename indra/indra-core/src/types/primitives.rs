@@ -213,6 +213,9 @@ pub const MAX_PQ_PK_BYTES: usize = 2_592;
 /// Maximum length of a chain ID string in bytes.
 pub const MAX_CHAIN_ID_BYTES: usize = 64;
 
+/// Maximum canonical operation payload carried by an authorization envelope.
+pub const MAX_AUTHORIZATION_PAYLOAD_BYTES: usize = MAX_BLOCK_SIZE_BYTES;
+
 /// Maximum VRF proof size (bytes).
 pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
 
@@ -603,9 +606,34 @@ pub mod hard_forks {
     /// reuse this testnet activation height for mainnet.
     pub const NORMAL_BOND_RELEASE_BLINDING_HEIGHT: u64 = 186_500;
 
+    /// Validator cold-key enrollment primitives.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: Stage 1 defines only isolated primitives.
+    /// Leaving this at `u64::MAX` keeps enrollment inactive until a reviewed,
+    /// coordinated protocol stage explicitly schedules it.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this is a single global hard-fork height.
+    /// It MUST be deliberately reset to the reviewed mainnet value before
+    /// building mainnet genesis. Leaving `u64::MAX` means it never activates.
+    pub const VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT: u64 = u64::MAX;
+
+    /// Validator cold-key authority enforcement.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: enforcement remains inert until enrollment,
+    /// migration, and activation readiness have completed external review.
+    ///
+    /// MAINNET GENESIS REQUIREMENT: this is a single global hard-fork height.
+    /// It MUST be deliberately reset to the reviewed mainnet value before
+    /// building mainnet genesis. Leaving `u64::MAX` means it never activates.
+    pub const VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT: u64 = u64::MAX;
+
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
         "compact bond pubkey omission must not activate before identity registry"
+    );
+    const _: () = assert!(
+        VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT >= VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        "validator cold-key enforcement must not activate before enrollment"
     );
 }
 
@@ -712,6 +740,18 @@ pub fn compact_bond_pubkey_omission_active(height: u64) -> bool {
 #[inline]
 pub fn normal_bond_release_blinding_active(height: u64) -> bool {
     height >= hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT
+}
+
+/// Whether validator cold-key enrollment primitives are active.
+#[inline]
+pub fn validator_cold_key_enrollment_active(height: u64) -> bool {
+    height >= hard_forks::VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT
+}
+
+/// Whether validator cold-key authority enforcement is active.
+#[inline]
+pub fn validator_cold_key_enforcement_active(height: u64) -> bool {
+    height >= hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -1250,5 +1290,20 @@ mod tests {
         assert!(normal_bond_release_blinding_active(
             NORMAL_BOND_RELEASE_BLINDING_HEIGHT
         ));
+    }
+
+    #[test]
+    fn validator_cold_key_gates_are_ordered_and_inert() {
+        use hard_forks::{
+            VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT, VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        };
+
+        assert_eq!(VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT, u64::MAX);
+        assert_eq!(VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT, u64::MAX);
+        assert!(VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT >= VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT);
+        assert!(!validator_cold_key_enrollment_active(u64::MAX - 1));
+        assert!(!validator_cold_key_enforcement_active(u64::MAX - 1));
+        assert!(validator_cold_key_enrollment_active(u64::MAX));
+        assert!(validator_cold_key_enforcement_active(u64::MAX));
     }
 }

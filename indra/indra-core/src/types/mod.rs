@@ -1,5 +1,6 @@
 //! All INDRA v2 protocol data structures.
 
+pub mod authorization;
 pub mod block;
 pub mod checkpoint;
 pub mod crypto;
