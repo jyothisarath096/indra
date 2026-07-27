@@ -6,7 +6,9 @@ use indra_core::types::{
         compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
         GovernanceOpV2, GovernancePayload,
     },
-    primitives::{delegator_identity_registry_active, Bytes32},
+    primitives::{
+        delegator_identity_registry_active, validator_cold_key_enforcement_active, Bytes32,
+    },
     transaction::OutputV1,
 };
 use indra_crypto::{commit, prove_range, sha256, verify_hybrid};
@@ -42,7 +44,13 @@ pub fn apply_governance_op(
             reason: error.to_string(),
         })?;
     let identity_registry_active = delegator_identity_registry_active(current_height);
-    let cold_authorized = verify_governance_sig(state, op, chain_id, identity_registry_active)?;
+    let cold_authorized = verify_governance_sig(
+        state,
+        op,
+        chain_id,
+        identity_registry_active,
+        current_height,
+    )?;
     apply_governance_nonce(state, op, current_height, cold_authorized)?;
 
     match &op.payload {
@@ -547,6 +555,7 @@ fn verify_governance_sig(
     op: &GovernanceOpV2,
     chain_id: &str,
     identity_registry_active: bool,
+    current_height: u64,
 ) -> StateResult<bool> {
     let cold_designated = matches!(
         op.payload,
@@ -560,6 +569,17 @@ fn verify_governance_sig(
             .validators
             .get(&op.signer_id)
             .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Active);
+    if cold_designated
+        && validator_cold_key_enforcement_active(current_height)
+        && state
+            .validators
+            .get(&op.signer_id)
+            .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Unenrolled)
+    {
+        return invalid(
+            "unenrolled validator governance authority is frozen after VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT; complete EnrollValidatorColdKey",
+        );
+    }
 
     if active_cold_validator {
         let authorization = op.cold_authorization().ok_or_else(|| {
@@ -1735,6 +1755,31 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_freezes_unenrolled_validator_governance_authority() {
+        let mut state = ChainState::new_genesis();
+        let (hot_pubkey, hot) = keypair(0x47);
+        let validator_id = install_governance_validator(&mut state, &hot_pubkey);
+        let enforcement =
+            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
+        crate::epoch::enforce_validator_cold_key_enrollment(&mut state, enforcement);
+        let mut commit = GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id: validator_id,
+            nonce: 1,
+            payload: GovernancePayload::Commit {
+                proposal_id: Bytes32::from([0x48; 32]),
+                commit_hash: Bytes32::from([0x49; 32]),
+                cold_authorization: None,
+            },
+            signature: dummy_sig(),
+        };
+        sign_governance_op(&mut commit, &hot, DEFAULT_CHAIN_ID);
+        let err =
+            apply_governance_op(&mut state, &commit, 0, enforcement, DEFAULT_CHAIN_ID).unwrap_err();
+        assert!(err.to_string().contains("governance authority is frozen"));
+    }
+
+    #[test]
     fn active_validator_governance_rejects_both_hot_bypass_shapes() {
         let mut state = ChainState::new_genesis();
         let (hot_pubkey, hot_keypair) = keypair(0xD5);
@@ -1912,7 +1957,13 @@ mod tests {
         let replay = |state: &mut ChainState| {
             apply_governance_op(state, &cold_propose, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
             apply_staking_op(state, &cold_commission, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-            apply_governance_op(state, &legacy_propose, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+            let error = apply_governance_op(state, &legacy_propose, 0, u64::MAX, DEFAULT_CHAIN_ID)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::InvalidGovernanceOp { reason }
+                    if reason.contains("governance authority is frozen")
+            ));
         };
         let mut first = base.clone();
         let mut second = base;
@@ -1921,7 +1972,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.validators.get(&active_id).unwrap().cold_nonce, 2);
-        assert_eq!(first.governance.gov_nonces.get(&legacy_id), Some(&1));
+        assert!(first.governance.gov_nonces.get(&legacy_id).is_none());
         assert!(first.governance.gov_nonces.get(&active_id).is_none());
     }
 

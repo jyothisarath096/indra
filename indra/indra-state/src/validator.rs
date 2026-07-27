@@ -1001,13 +1001,20 @@ impl ValidatorSet {
 
     /// Total stake of all validators eligible for active-set selection.
     pub fn total_selectable_self_stake(&self) -> u64 {
+        self.total_selectable_self_stake_at_height(0)
+    }
+
+    /// Total self-stake eligible for selection under the rules at `height`.
+    pub fn total_selectable_self_stake_at_height(&self, height: u64) -> u64 {
+        let cold_enforced =
+            indra_core::types::primitives::validator_cold_key_enforcement_active(height);
         self.validators
             .values()
             .filter(|v| {
                 matches!(
                     v.status,
                     ValidatorStatus::Active | ValidatorStatus::Registered
-                )
+                ) && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
             })
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
@@ -1079,8 +1086,15 @@ impl ValidatorSet {
     /// replacement, which uses total stake (self + delegated) only as a
     /// housekeeping rule for deciding which persisted validator entry gets a
     /// scarce registry slot when the registry is full.
-    pub fn select_active_set(&mut self, _delegations: &DelegationMap, total_staked_spark: u64) {
+    pub fn select_active_set(
+        &mut self,
+        _delegations: &DelegationMap,
+        total_staked_spark: u64,
+        height: u64,
+    ) {
         let max_active = max_active_validators(total_staked_spark);
+        let cold_enforced =
+            indra_core::types::primitives::validator_cold_key_enforcement_active(height);
         let mut candidates: Vec<(Bytes32, u64)> = self
             .validators
             .values()
@@ -1088,7 +1102,7 @@ impl ValidatorSet {
                 matches!(
                     v.status,
                     ValidatorStatus::Active | ValidatorStatus::Registered
-                )
+                ) && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
             })
             .map(|v| (v.validator_id, v.stake_spark))
             .collect();
@@ -1521,7 +1535,7 @@ mod tests {
         vs.upsert(make_validator(0x03, 100, 0)).unwrap();
 
         let delegations = DelegationMap::new();
-        vs.select_active_set(&delegations, 0);
+        vs.select_active_set(&delegations, 0, 0);
 
         assert!(matches!(
             vs.get(&Bytes32::from([0x01; 32])).unwrap().status,
@@ -1556,7 +1570,7 @@ mod tests {
             .add_delegation(low_self_id, Bytes32::from([0xAA; 32]), 1_000_000_000, 0)
             .unwrap();
 
-        vs.select_active_set(&delegations, 0);
+        vs.select_active_set(&delegations, 0, 0);
 
         assert!(
             matches!(

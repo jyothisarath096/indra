@@ -9,10 +9,11 @@ use indra_core::types::{
     primitives::{
         delegator_identity_registry_active, payment_blinding_active,
         registered_validator_cap_active, staking_commitment_proof_required,
-        validator_cold_key_enrollment_active, validator_network_address_active, Bytes32,
-        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK, MAX_VALIDATORS,
-        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        validator_cold_key_enforcement_active, validator_cold_key_enrollment_active,
+        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
+        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -90,6 +91,17 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             .validators
             .get(&signer_id)
             .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Active);
+    if cold_designated
+        && validator_cold_key_enforcement_active(current_height)
+        && state
+            .validators
+            .get(&signer_id)
+            .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Unenrolled)
+    {
+        return Err(StateError::InvalidStakingOp(
+            "unenrolled validator custody is frozen after VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT; complete EnrollValidatorColdKey".into(),
+        ));
+    }
 
     if active_cold_validator {
         let authorization = op.cold_authorization().ok_or_else(|| {
@@ -1050,6 +1062,16 @@ fn evict_validator_for_registry_replacement(
         .get(&validator_id)
         .cloned()
         .ok_or(StateError::ValidatorNotFound)?;
+    if validator_cold_key_enforcement_active(current_height)
+        && validator.cold_key_status == ColdKeyStatus::Unenrolled
+    {
+        return Err(StateError::InvalidStakingOp(
+            "cannot evict an unenrolled validator after \
+             VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT: validator custody is frozen until \
+             EnrollValidatorColdKey completes"
+                .into(),
+        ));
+    }
     let delegators = state.delegations.take_delegators(&validator_id);
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         for entry in &delegators {
@@ -2082,7 +2104,10 @@ mod tests {
     use indra_core::types::{
         crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{
-            hard_forks::{PAYMENT_BLINDING_HEIGHT, VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT},
+            hard_forks::{
+                PAYMENT_BLINDING_HEIGHT, VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            },
             VariableBytes,
         },
         transaction::OutputV1,
@@ -2446,6 +2471,16 @@ mod tests {
         let rotate = dual_signed_rotate_op(validator_id, &old, &replacement, 1, 1, &chain_id);
         apply_staking_op(&mut state, &rotate, &chain_id, height).unwrap();
         (state, old, replacement)
+    }
+
+    fn activate_cold_for_test(state: &mut ChainState, validator_id: Bytes32, cold: &HybridKeypair) {
+        let public = cold.public_key();
+        let validator = state.validators.get_mut(&validator_id).unwrap();
+        validator.cold_hybrid_classical_pk = Some(public.classical.0);
+        validator.cold_hybrid_pq_pk = Some(public.pq.0);
+        validator.cold_key_version = 1;
+        validator.cold_key_status = ColdKeyStatus::Active;
+        validator.cold_nonce = 0;
     }
 
     fn make_active_validator(state: &mut ChainState, seed: u8) -> (Bytes32, HybridKeypair) {
@@ -5715,6 +5750,38 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_prevents_registry_eviction_from_bypassing_frozen_custody() {
+        let mut state = ChainState::new_genesis();
+        let validator_id =
+            insert_registry_entry_for_cap_test(&mut state, 0, MINIMUM_VALIDATOR_BOND_SPARK);
+        let validator = state.validators.get_mut(&validator_id).unwrap();
+        validator.status = ValidatorStatus::Registered;
+        validator.pending_rewards = DUST_LIMIT_SPARK;
+        let bond_count = state.staked_bonds.len();
+
+        let error = evict_validator_for_registry_replacement(
+            &mut state,
+            validator_id,
+            0,
+            VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::InvalidStakingOp(reason)
+                if reason.contains("custody is frozen")
+                    && reason.contains("EnrollValidatorColdKey")
+        ));
+        assert!(state.validators.get(&validator_id).is_some());
+        assert_eq!(state.staked_bonds.len(), bond_count);
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().pending_rewards,
+            DUST_LIMIT_SPARK
+        );
+        assert!(state.delegation_return_events.is_empty());
+    }
+
+    #[test]
     fn validator_eviction_pays_claimable_rewards_and_burns_dust_rewards() {
         let mut state = ChainState::new_genesis();
         let lowest_id = fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
@@ -6919,7 +6986,7 @@ mod tests {
                 &mut state,
                 &operation,
                 &chain_id,
-                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT - 1,
             )
             .unwrap();
         }
@@ -7030,18 +7097,22 @@ mod tests {
                 &state.chain_id,
             );
             let chain_id = state.chain_id.clone();
-            apply_staking_op(
+            let error = apply_staking_op(
                 &mut state,
                 &legacy_commission,
                 &chain_id,
-                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
             )
-            .unwrap();
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::InvalidStakingOp(reason) if reason.contains("custody is frozen")
+            ));
             apply_staking_op(
                 &mut state,
                 &claim,
                 &chain_id,
-                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
             )
             .unwrap();
             state
@@ -7210,5 +7281,165 @@ mod tests {
         let err = apply_staking_op(&mut state, &register, &chain_id, height).unwrap_err();
         assert!(err.to_string().contains("permanently retired"));
         drop(retired);
+    }
+
+    #[test]
+    fn enforcement_leaves_enrolled_validator_active_and_cold_authorized() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0xC0);
+        let cold = mixed_keypair(0xC1, 0xC2);
+        activate_cold_for_test(&mut state, validator_id, &cold);
+        crate::epoch::enforce_validator_cold_key_enrollment(
+            &mut state,
+            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+        );
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().status,
+            ValidatorStatus::Active
+        );
+        let op = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_100,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                }),
+            },
+            &cold,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(
+            &mut state,
+            &op,
+            &chain_id,
+            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enforcement_demotes_and_freezes_unenrolled_then_late_enrollment_requalifies() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0xC3);
+        state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .pending_rewards = 50_000;
+        let enforcement =
+            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
+        crate::epoch::enforce_validator_cold_key_enrollment(&mut state, enforcement);
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().status,
+            ValidatorStatus::Registered
+        );
+
+        let legacy = signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_200,
+                cold_authorization: None,
+            },
+            1,
+            &hot,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        let err = apply_staking_op(&mut state, &legacy, &chain_id, enforcement).unwrap_err();
+        assert!(err.to_string().contains("custody is frozen"));
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().pending_rewards,
+            50_000
+        );
+
+        let cold_v1 = mixed_keypair(0xC4, 0xC5);
+        let enroll = dual_signed_enroll_op(validator_id, &hot, &cold_v1, 1, &chain_id);
+        apply_staking_op(&mut state, &enroll, &chain_id, enforcement).unwrap();
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().status,
+            ValidatorStatus::Registered
+        );
+        state
+            .validators
+            .select_active_set(&state.delegations, 0, enforcement);
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().status,
+            ValidatorStatus::Active
+        );
+
+        let cold_op = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_300,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                }),
+            },
+            &cold_v1,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &cold_op, &chain_id, enforcement).unwrap();
+        let cold_v2 = mixed_keypair(0xC6, 0xC7);
+        let rotate = dual_signed_rotate_op(validator_id, &cold_v1, &cold_v2, 1, 2, &chain_id);
+        apply_staking_op(&mut state, &rotate, &chain_id, enforcement).unwrap();
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .cold_key_version,
+            2
+        );
+    }
+
+    #[test]
+    fn enforcement_mixed_enrollment_replay_is_deterministic() {
+        fn replay() -> ChainState {
+            let mut state = ChainState::new_genesis();
+            let (enrolled_id, _) = make_active_validator(&mut state, 0xD8);
+            let enrolled_cold = mixed_keypair(0xD9, 0xDA);
+            activate_cold_for_test(&mut state, enrolled_id, &enrolled_cold);
+            let (late_id, late_hot) = make_active_validator(&mut state, 0xDB);
+            let enforcement =
+                indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
+            crate::epoch::enforce_validator_cold_key_enrollment(&mut state, enforcement);
+            assert_eq!(
+                state.validators.get(&late_id).unwrap().status,
+                ValidatorStatus::Registered
+            );
+            let chain_id = state.chain_id.clone();
+            let enrolled_op = cold_signed_op(
+                StakingOpBody::SetCommission {
+                    validator_id: enrolled_id,
+                    new_commission_bps: 1_050,
+                    cold_authorization: Some(
+                        indra_core::types::staking::ColdStakingAuthorization {
+                            cold_key_version: 1,
+                            cold_nonce: 1,
+                        },
+                    ),
+                },
+                &enrolled_cold,
+                &chain_id,
+            );
+            apply_staking_op(&mut state, &enrolled_op, &chain_id, enforcement).unwrap();
+            let late_cold = mixed_keypair(0xDC, 0xDD);
+            let enrollment = dual_signed_enroll_op(late_id, &late_hot, &late_cold, 1, &chain_id);
+            apply_staking_op(&mut state, &enrollment, &chain_id, enforcement).unwrap();
+            state
+                .validators
+                .select_active_set(&state.delegations, 0, enforcement);
+            state
+        }
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::compute_state_root(&first),
+            crate::compute_state_root(&second)
+        );
     }
 }

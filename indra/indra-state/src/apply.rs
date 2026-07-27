@@ -617,8 +617,13 @@ fn apply_block_inner(
 
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
+    validate_block_header(txn.state(), block)?;
+    if indra_core::types::primitives::validator_cold_key_enforcement_active(block.header.height) {
+        txn.snapshot_validator_activity_scope();
+        crate::epoch::enforce_validator_cold_key_enrollment(txn.state_mut(), block.header.height);
+        txn.after_mutation()?;
+    }
     let state = txn.state();
-    validate_block_header(state, block)?;
 
     if block.staking_ops.len() > MAX_STAKING_OPS_PER_BLOCK {
         return Err(StateError::TooManyStakingOps {
@@ -3698,6 +3703,46 @@ mod tests {
         assert!(!first_replay
             .delegator_identities
             .contains_key(&pre_validator_id));
+    }
+
+    #[test]
+    fn cold_enforcement_height_block_demotes_only_unenrolled_and_replays_deterministically() {
+        let enforcement =
+            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
+        let mut initial = ChainState::new_genesis();
+        initial.height = enforcement - 1;
+        let (_, _, enrolled_id) = install_governance_validator(&mut initial, [0x61; 32], 2_000);
+        let (_, _, unenrolled_id) = install_governance_validator(&mut initial, [0x62; 32], 1_000);
+        let cold = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x63; 32]),
+            PqKeypair::from_seed(&[0x64; 32]).unwrap(),
+        );
+        let public = cold.public_key();
+        let enrolled = initial.validators.get_mut(&enrolled_id).unwrap();
+        enrolled.cold_hybrid_classical_pk = Some(public.classical.0);
+        enrolled.cold_hybrid_pq_pk = Some(public.pq.0);
+        enrolled.cold_key_version = 1;
+        enrolled.cold_key_status = crate::validator::ColdKeyStatus::Active;
+
+        let block = empty_block_at(&initial, enforcement, 0);
+        let mut first = initial.clone();
+        let mut second = initial;
+        apply_block(&mut first, &block, 0).unwrap();
+        apply_block(&mut second, &block, 0).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::compute_state_root(&first),
+            crate::compute_state_root(&second)
+        );
+        assert_eq!(
+            first.validators.get(&enrolled_id).unwrap().status,
+            ValidatorStatus::Active
+        );
+        assert_eq!(
+            first.validators.get(&unenrolled_id).unwrap().status,
+            ValidatorStatus::Registered
+        );
     }
 
     #[test]

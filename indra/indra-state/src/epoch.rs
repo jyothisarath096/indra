@@ -22,10 +22,11 @@ use indra_core::{
         primitives::{
             bps_of, governance_proposal_pruning_active, muldiv,
             normal_bond_release_blinding_active, overflow_fix_active, state_commitment_v2_active,
-            Bytes32, VariableBytes, BLOCKS_PER_YEAR, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-            ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-            HARD_CAP_SPARK, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SATURATION_MIN_VALIDATORS,
+            validator_cold_key_enforcement_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
+            COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
+            ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
+            ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
+            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SATURATION_MIN_VALIDATORS,
             SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
         },
     },
@@ -42,7 +43,7 @@ use crate::{
     },
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
     identity::resolve_bond_owner_pubkey,
-    validator::{DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
+    validator::{ColdKeyStatus, DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
 };
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
@@ -75,6 +76,7 @@ pub fn apply_epoch_transition_at_height(
     timestamp_secs: u64,
     height: u64,
 ) -> StateResult<EpochRecord> {
+    enforce_validator_cold_key_enrollment(state, height);
     // DETERMINISM NOTE: timestamp_secs is stored ONLY in EpochRecord
     // and does NOT affect ChainState mutations. State root is computed
     // from ChainState only. EpochRecord is stored separately in EpochStore.
@@ -97,7 +99,9 @@ pub fn apply_epoch_transition_at_height(
     // Active-set size and ranking use the same self-stake model as consensus
     // voting weight and reward weight. Delegations affect reward splitting,
     // but do not increase proposer/voter/election weight in this protocol.
-    let total_staked = state.validators.total_selectable_self_stake();
+    let total_staked = state
+        .validators
+        .total_selectable_self_stake_at_height(height);
     let fee_pool_before = state.fee_reward_pool;
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
@@ -110,7 +114,7 @@ pub fn apply_epoch_transition_at_height(
 
     state
         .validators
-        .select_active_set(&state.delegations, total_staked);
+        .select_active_set(&state.delegations, total_staked, height);
     apply_pending_commission_changes(state, current_epoch);
 
     let virtual_delegations = apply_auto_delegations(state, current_epoch);
@@ -134,7 +138,7 @@ pub fn apply_epoch_transition_at_height(
     remove_auto_delegations(state, &virtual_delegations, current_epoch, height);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
-    release_unbonded_bonds(state, current_epoch)?;
+    release_unbonded_bonds_at_height(state, current_epoch, height)?;
     let (liveness_slashed, liveness_penalty_count) =
         apply_liveness_penalties(state, current_epoch, height);
 
@@ -195,6 +199,37 @@ pub fn apply_epoch_transition_at_height(
         state.rebuild_state_commitment_v2(height);
     }
     Ok(record)
+}
+
+/// Apply the deterministic enforcement-height demotion. This is idempotent so
+/// replay and snapshot restoration cannot retain or recreate an unenrolled
+/// Active validator after enforcement.
+pub(crate) fn enforce_validator_cold_key_enrollment(state: &mut ChainState, height: u64) {
+    if !validator_cold_key_enforcement_active(height) {
+        return;
+    }
+    let changed: Vec<Bytes32> = state
+        .validators
+        .all_validators()
+        .filter(|validator| {
+            validator.status == ValidatorStatus::Active
+                && validator.cold_key_status == ColdKeyStatus::Unenrolled
+        })
+        .map(|validator| validator.validator_id)
+        .collect();
+    for validator_id in &changed {
+        if let Some(validator) = state.validators.get_mut(validator_id) {
+            validator.status = ValidatorStatus::Registered;
+        }
+    }
+    if let Some(mut commitment) = state.state_commitment_v2.take() {
+        for validator_id in changed {
+            if let Some(validator) = state.validators.get(&validator_id) {
+                commitment.put_validator(validator, height);
+            }
+        }
+        state.state_commitment_v2 = Some(commitment);
+    }
 }
 
 fn apply_pending_commission_changes(state: &mut ChainState, current_epoch: u64) {
@@ -848,20 +883,42 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
     }
 }
 
+#[cfg(test)]
 fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateResult<()> {
+    release_unbonded_bonds_at_height(
+        state,
+        current_epoch,
+        current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS),
+    )
+}
+
+fn release_unbonded_bonds_at_height(
+    state: &mut ChainState,
+    current_epoch: u64,
+    release_height: u64,
+) -> StateResult<()> {
     let mut to_release: Vec<Bytes32> = state
         .staked_bonds
         .values()
         .filter(|bond| {
-            bond.unbonding_end_epoch
+            let matured = bond
+                .unbonding_end_epoch
                 .map(|end| end <= current_epoch)
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let frozen_unenrolled_self_bond = validator_cold_key_enforcement_active(release_height)
+                && bond.validator_id == bond.delegator_id
+                && state
+                    .validators
+                    .get(&bond.validator_id)
+                    .is_some_and(|validator| {
+                        validator.cold_key_status == ColdKeyStatus::Unenrolled
+                    });
+            matured && !frozen_unenrolled_self_bond
         })
         .map(|bond| bond.utxo_id)
         .collect();
     to_release.sort_by_key(|id| id.0);
 
-    let release_height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
     for (idx, utxo_id) in to_release.into_iter().enumerate() {
         if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
             let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
@@ -1252,6 +1309,31 @@ mod tests {
             9,
             10,
         )
+    }
+
+    #[test]
+    fn enforcement_freezes_unenrolled_self_bond_release_and_pending_rewards() {
+        let enforcement =
+            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
+        let validator_id = Bytes32::from([0x0E; 32]);
+        let mut validator = make_validator(0x0E, 1_000_000);
+        validator.pending_rewards = 75_000;
+        let mut bond = legacy_bond(0x0F, validator_id, validator_id, 1_000_000);
+        bond.unbonding_end_epoch = Some(1);
+        let bond_id = bond.utxo_id;
+        let mut state = ChainState::new_genesis();
+        state.validators.upsert(validator).unwrap();
+        state.staked_bonds.insert(bond_id, bond);
+
+        enforce_validator_cold_key_enrollment(&mut state, enforcement);
+        release_unbonded_bonds_at_height(&mut state, 1, enforcement).unwrap();
+
+        assert!(state.staked_bonds.contains_key(&bond_id));
+        assert!(state.utxos.is_empty());
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert_eq!(validator.status, ValidatorStatus::Registered);
+        assert_eq!(validator.pending_rewards, 75_000);
+        assert_eq!(validator.stake_spark, 1_000_000);
     }
 
     #[test]
