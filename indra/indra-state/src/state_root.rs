@@ -202,6 +202,27 @@ pub(crate) fn compute_legacy_validator_set_root_at_height(
         leaves.push((key, sha256(&hash.0)));
     }
 
+    for component in &state.retired_cold_classical_components {
+        let mut key = Vec::with_capacity(34);
+        key.push(0x09);
+        key.push(0);
+        key.extend_from_slice(component);
+        let mut value = Vec::with_capacity(33);
+        value.push(0);
+        value.extend_from_slice(component);
+        leaves.push((key, sha256(&value)));
+    }
+    for component in &state.retired_cold_pq_components {
+        let mut key = Vec::with_capacity(2 + component.len());
+        key.push(0x09);
+        key.push(1);
+        key.extend_from_slice(component);
+        let mut value = Vec::with_capacity(1 + component.len());
+        value.push(1);
+        value.extend_from_slice(component);
+        leaves.push((key, sha256(&value)));
+    }
+
     if registered_validator_cap_active(height) {
         for event in &state.delegation_return_events {
             let mut key = Vec::with_capacity(1 + 32 + 32 + 8);

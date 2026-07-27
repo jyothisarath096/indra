@@ -52,6 +52,8 @@ enum UndoEntry {
     DelegatorIdentities(PersistentOrdMap<Bytes32, HybridPubKey>),
     #[allow(dead_code)]
     PaymentIdentities(PersistentOrdMap<Bytes32, PaymentPubKeyV1>),
+    RetiredColdClassical(PersistentOrdSet<[u8; 32]>),
+    RetiredColdPq(PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>),
     Governance(GovernanceState),
     Utxos(UtxoSet),
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
@@ -80,6 +82,7 @@ pub(crate) struct StateTxn<'a> {
     delegator_identities_recorded: bool,
     #[allow(dead_code)]
     payment_identities_recorded: bool,
+    retired_cold_components_recorded: bool,
     governance_recorded: bool,
     utxos_recorded: bool,
     delegation_return_events_recorded: bool,
@@ -102,6 +105,7 @@ impl<'a> StateTxn<'a> {
             slash_hashes_recorded: false,
             delegator_identities_recorded: false,
             payment_identities_recorded: false,
+            retired_cold_components_recorded: false,
             governance_recorded: false,
             utxos_recorded: false,
             delegation_return_events_recorded: false,
@@ -162,6 +166,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_staking_nonces();
         self.snapshot_utxos();
         self.snapshot_delegation_return_events();
+        self.snapshot_retired_cold_components();
         self.record_scalars();
         self.mark_commitment_touched();
     }
@@ -368,6 +373,18 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    fn snapshot_retired_cold_components(&mut self) {
+        if !self.retired_cold_components_recorded {
+            self.undo.push(UndoEntry::RetiredColdClassical(
+                self.state.retired_cold_classical_components.clone(),
+            ));
+            self.undo.push(UndoEntry::RetiredColdPq(
+                self.state.retired_cold_pq_components.clone(),
+            ));
+            self.retired_cold_components_recorded = true;
+        }
+    }
+
     fn snapshot_governance(&mut self) {
         if !self.governance_recorded {
             let snapshot = measure_undo_recording(|| self.state.governance.clone());
@@ -435,6 +452,12 @@ impl<'a> StateTxn<'a> {
                 }
                 UndoEntry::PaymentIdentities(identities) => {
                     self.state.payment_identities = identities;
+                }
+                UndoEntry::RetiredColdClassical(components) => {
+                    self.state.retired_cold_classical_components = components;
+                }
+                UndoEntry::RetiredColdPq(components) => {
+                    self.state.retired_cold_pq_components = components;
                 }
                 UndoEntry::Governance(governance) => self.state.governance = governance,
                 UndoEntry::Utxos(utxos) => self.state.utxos = utxos,

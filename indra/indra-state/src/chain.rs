@@ -109,6 +109,12 @@ pub struct ChainState {
     /// Canonical payment key-exchange public key for each payment owner identity.
     pub payment_identities: PersistentOrdMap<Bytes32, PaymentPubKeyV1>,
 
+    /// Permanently retired cold Ed25519 public-key components.
+    pub retired_cold_classical_components: PersistentOrdSet<[u8; 32]>,
+
+    /// Permanently retired cold ML-DSA-87 public-key components.
+    pub retired_cold_pq_components: PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
+
     /// Hashes of applied slash evidence — prevents double-slash.
     /// Key: SHA-256(encode(SlashEvidenceV1))
     pub applied_slash_hashes: PersistentOrdSet<Bytes32>,
@@ -179,11 +185,23 @@ impl Encode for ChainState {
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
         encode_delegation_return_events(&self.delegation_return_events, buf);
-        if !self.delegator_identities.is_empty() || !self.payment_identities.is_empty() {
+        let retired_present = !self.retired_cold_classical_components.is_empty()
+            || !self.retired_cold_pq_components.is_empty();
+        if !self.delegator_identities.is_empty()
+            || !self.payment_identities.is_empty()
+            || retired_present
+        {
             encode_delegator_identity_registry(&self.delegator_identities, buf);
         }
-        if !self.payment_identities.is_empty() {
+        if !self.payment_identities.is_empty() || retired_present {
             encode_payment_identity_registry(&self.payment_identities, buf);
+        }
+        if retired_present {
+            encode_retired_cold_components(
+                &self.retired_cold_classical_components,
+                &self.retired_cold_pq_components,
+                buf,
+            );
         }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
@@ -209,16 +227,27 @@ impl Encode for ChainState {
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
             + delegation_return_events_encoded_len(&self.delegation_return_events)
-            + if self.delegator_identities.is_empty() && self.payment_identities.is_empty() {
+            + if self.delegator_identities.is_empty()
+                && self.payment_identities.is_empty()
+                && self.retired_cold_classical_components.is_empty()
+                && self.retired_cold_pq_components.is_empty()
+            {
                 0
             } else {
                 delegator_identity_registry_encoded_len(&self.delegator_identities)
             }
-            + if self.payment_identities.is_empty() {
+            + if self.payment_identities.is_empty()
+                && self.retired_cold_classical_components.is_empty()
+                && self.retired_cold_pq_components.is_empty()
+            {
                 0
             } else {
                 payment_identity_registry_encoded_len(&self.payment_identities)
             }
+            + retired_cold_components_encoded_len(
+                &self.retired_cold_classical_components,
+                &self.retired_cold_pq_components,
+            )
     }
 }
 
@@ -257,6 +286,11 @@ impl Decode for ChainState {
         } else {
             PersistentOrdMap::new()
         };
+        let (retired_cold_classical_components, retired_cold_pq_components) = if r.remaining() > 0 {
+            decode_retired_cold_components(r)?
+        } else {
+            (PersistentOrdSet::new(), PersistentOrdSet::new())
+        };
         Ok(Self {
             chain_id,
             height,
@@ -274,6 +308,8 @@ impl Decode for ChainState {
             staking_nonces,
             delegator_identities,
             payment_identities,
+            retired_cold_classical_components,
+            retired_cold_pq_components,
             applied_slash_hashes,
             governance,
             delegation_return_events,
@@ -307,6 +343,8 @@ impl ChainState {
             staking_nonces: PersistentOrdMap::new(),
             delegator_identities: PersistentOrdMap::new(),
             payment_identities: PersistentOrdMap::new(),
+            retired_cold_classical_components: PersistentOrdSet::new(),
+            retired_cold_pq_components: PersistentOrdSet::new(),
             applied_slash_hashes: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -340,6 +378,8 @@ impl ChainState {
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
             payment_identities: PersistentOrdMap::new(),
+            retired_cold_classical_components: PersistentOrdSet::new(),
+            retired_cold_pq_components: PersistentOrdSet::new(),
             applied_slash_hashes: if r.remaining() > 0 {
                 decode_hash_set(r, "snapshot.applied_slash_hashes")?
             } else {
@@ -377,6 +417,8 @@ impl ChainState {
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
             payment_identities: PersistentOrdMap::new(),
+            retired_cold_classical_components: PersistentOrdSet::new(),
+            retired_cold_pq_components: PersistentOrdSet::new(),
             applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
             governance: GovernanceState::new(),
             delegation_return_events: Vec::new(),
@@ -691,6 +733,63 @@ fn validate_payment_identity_count(count: usize) -> IndraResult<()> {
         });
     }
     Ok(())
+}
+
+fn encode_retired_cold_components(
+    classical: &PersistentOrdSet<[u8; 32]>,
+    pq: &PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
+    buf: &mut Vec<u8>,
+) {
+    (classical.len() as u32).encode(buf);
+    for component in classical {
+        buf.extend_from_slice(component);
+    }
+    (pq.len() as u32).encode(buf);
+    for component in pq {
+        buf.extend_from_slice(component);
+    }
+}
+
+fn retired_cold_components_encoded_len(
+    classical: &PersistentOrdSet<[u8; 32]>,
+    pq: &PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
+) -> usize {
+    if classical.is_empty() && pq.is_empty() {
+        0
+    } else {
+        8 + classical.len() * 32 + pq.len() * indra_crypto::PQ_PK_BYTES
+    }
+}
+
+fn decode_retired_cold_components(
+    r: &mut ByteReader<'_>,
+) -> IndraResult<(
+    PersistentOrdSet<[u8; 32]>,
+    PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
+)> {
+    let classical_count = u32::decode(r)? as usize;
+    let mut classical = PersistentOrdSet::new();
+    for _ in 0..classical_count {
+        let component = r.read_bytes32()?;
+        if !classical.insert(component) {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.retired_cold_classical_components",
+            });
+        }
+    }
+    let pq_count = u32::decode(r)? as usize;
+    let mut pq = PersistentOrdSet::new();
+    for _ in 0..pq_count {
+        let bytes = r.read_bytes(indra_crypto::PQ_PK_BYTES)?;
+        let mut component = [0u8; indra_crypto::PQ_PK_BYTES];
+        component.copy_from_slice(bytes);
+        if !pq.insert(component) {
+            return Err(IndraError::DuplicateEntries {
+                field: "snapshot.retired_cold_pq_components",
+            });
+        }
+    }
+    Ok((classical, pq))
 }
 
 #[cfg(test)]

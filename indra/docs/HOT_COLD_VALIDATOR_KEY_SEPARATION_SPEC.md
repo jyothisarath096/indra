@@ -600,6 +600,18 @@ key.
 
 The hot key cannot authorize, cancel, veto or accelerate rotation.
 
+Every superseded cold public-key component is permanently retired. The
+canonical state records the old Ed25519 component and old ML-DSA-87 component
+individually, in separate component-level sets, as part of the same atomic
+transition that activates the replacement pair. A retired component MUST be
+rejected if later proposed by any validator in any role, including as a hot
+component during registration or as a cold component during registration,
+enrollment or rotation. Retirement has no expiry, pruning rule or reuse
+exception. Rotation is a compromise-response mechanism: permitting a
+superseded component to become authoritative again would let an attacker who
+retained the compromised private material recover authority merely by waiting
+for re-registration.
+
 After rotation:
 
 - all unresolved validator self-bonds resolve to the new current cold pair at

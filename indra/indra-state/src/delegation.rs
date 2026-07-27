@@ -71,6 +71,10 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         ));
     }
 
+    if matches!(op.body, StakingOpBody::RotateValidatorColdKey { .. }) {
+        return verify_and_apply_rotate_validator_cold_key(state, op, chain_id, current_height);
+    }
+
     let signer_id = op.signer_id();
     let cold_designated = matches!(
         op.body,
@@ -358,6 +362,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         | StakingOpBody::SelfUnstake { .. }
         | StakingOpBody::SetAutoDelegate { .. }
         | StakingOpBody::RegisterPaymentKey { .. } => {}
+        StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     }
 
     let result = match &op.body {
@@ -467,6 +472,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             payment_pubkey,
             ..
         } => apply_register_payment_key(state, owner_pubkey, payment_pubkey),
+        StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     };
 
     result?;
@@ -522,6 +528,11 @@ fn apply_enroll_validator_cold_key(
             "validator cold key is already enrolled".into(),
         ));
     }
+    validate_cold_components_not_retired(
+        state,
+        &cold_pubkey.classical_pk.0,
+        cold_pubkey.pq_pk.as_slice(),
+    )?;
     let validated = validate_validator_cold_key(
         &state.validators,
         &validator_id,
@@ -563,6 +574,148 @@ fn apply_enroll_validator_cold_key(
     updated.cold_nonce = 0;
     state.validators.upsert(updated.clone())?;
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_validator(&updated, current_height);
+    }
+    Ok(())
+}
+
+fn validate_cold_components_not_retired(
+    state: &ChainState,
+    classical: &[u8; 32],
+    pq: &[u8],
+) -> StateResult<()> {
+    if state.retired_cold_classical_components.contains(classical) {
+        return Err(StateError::InvalidStakingOp(
+            "proposed Ed25519 component is permanently retired".into(),
+        ));
+    }
+    if pq.len() == indra_crypto::PQ_PK_BYTES {
+        let mut component = [0u8; indra_crypto::PQ_PK_BYTES];
+        component.copy_from_slice(pq);
+        if state.retired_cold_pq_components.contains(&component) {
+            return Err(StateError::InvalidStakingOp(
+                "proposed ML-DSA-87 component is permanently retired".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_and_apply_rotate_validator_cold_key(
+    state: &mut ChainState,
+    op: &StakingOp,
+    chain_id: &str,
+    current_height: u64,
+) -> StateResult<()> {
+    let StakingOpBody::RotateValidatorColdKey {
+        validator_id,
+        current_cold_key_version,
+        new_cold_key_version,
+        current_cold_nonce,
+        new_cold_pubkey,
+        new_cold_signature,
+    } = &op.body
+    else {
+        unreachable!()
+    };
+    let current = state
+        .validators
+        .get(validator_id)
+        .ok_or(StateError::ValidatorNotFound)?
+        .clone();
+    if current.cold_key_status != ColdKeyStatus::Active {
+        return Err(StateError::InvalidStakingOp(
+            "RotateValidatorColdKey requires an Active cold key; use enrollment instead".into(),
+        ));
+    }
+    if *current_cold_key_version != current.cold_key_version
+        || current_cold_key_version.checked_add(1) != Some(*new_cold_key_version)
+    {
+        return Err(StateError::InvalidStakingOp(
+            "cold-key rotation version mismatch".into(),
+        ));
+    }
+    let expected_nonce = current
+        .cold_nonce
+        .checked_add(1)
+        .ok_or_else(|| StateError::InvalidStakingOp("validator cold nonce exhausted".into()))?;
+    if *current_cold_nonce != expected_nonce {
+        return Err(StateError::StakingNonceInvalid {
+            expected: expected_nonce,
+            got: *current_cold_nonce,
+        });
+    }
+    validate_cold_components_not_retired(
+        state,
+        &new_cold_pubkey.classical_pk.0,
+        new_cold_pubkey.pq_pk.as_slice(),
+    )?;
+    let validated = validate_validator_cold_key(
+        &state.validators,
+        validator_id,
+        &new_cold_pubkey.classical_pk.0,
+        new_cold_pubkey.pq_pk.as_slice(),
+        *new_cold_key_version,
+    )?;
+    let old_classical =
+        current
+            .cold_hybrid_classical_pk
+            .ok_or_else(|| StateError::StakingOpSignatureInvalid {
+                reason: "Active validator has no current Ed25519 cold component".into(),
+            })?;
+    let old_pq = current.cold_hybrid_pq_pk.as_ref().ok_or_else(|| {
+        StateError::StakingOpSignatureInvalid {
+            reason: "Active validator has no current ML-DSA-87 cold component".into(),
+        }
+    })?;
+    let new_signature = new_cold_signature.as_ref().ok_or_else(|| {
+        StateError::InvalidStakingOp(
+            "cold-key rotation requires the proposed new key signature".into(),
+        )
+    })?;
+    let message = op
+        .rotate_validator_cold_key_dual_signing_bytes(chain_id)
+        .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
+        .ok_or_else(|| {
+            StateError::InvalidStakingOp("cold-key rotation authorization message is absent".into())
+        })?;
+    let current_pk = hybrid_crypto_pubkey(&old_classical, old_pq)?;
+    let proposed_pk = new_cold_pubkey
+        .to_crypto_pubkey()
+        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+    let current_sig = op
+        .signature
+        .to_crypto_sig()
+        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+    let proposed_sig = new_signature
+        .to_crypto_sig()
+        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+    indra_crypto::verify_dual_hybrid(
+        &message,
+        Some(&current_sig),
+        &current_pk,
+        Some(&proposed_sig),
+        &proposed_pk,
+    )
+    .map_err(|err| StateError::StakingOpSignatureInvalid {
+        reason: err.to_string(),
+    })?;
+
+    let mut retired_pq = [0u8; indra_crypto::PQ_PK_BYTES];
+    retired_pq.copy_from_slice(old_pq);
+    state
+        .retired_cold_classical_components
+        .insert(old_classical);
+    state.retired_cold_pq_components.insert(retired_pq);
+    let mut updated = current;
+    updated.cold_hybrid_classical_pk = Some(validated.classical_pk);
+    updated.cold_hybrid_pq_pk = Some(validated.pq_pk);
+    updated.cold_key_version = validated.version;
+    updated.cold_nonce = 0;
+    state.validators.upsert(updated.clone())?;
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_retired_cold_component(0, &old_classical);
+        commitment.put_retired_cold_component(1, &retired_pq);
         commitment.put_validator(&updated, current_height);
     }
     Ok(())
@@ -677,12 +830,22 @@ fn apply_register_validator(
     if identity_registry_active {
         check_validator_identity_registry_if_present(state, &validator_id, validator_pubkey)?;
     }
+    validate_cold_components_not_retired(
+        state,
+        &validator_pubkey.classical_pk.0,
+        validator_pubkey.pq_pk.as_slice(),
+    )?;
     let validated_cold_key = if validator_cold_key_enrollment_active(current_height) {
         let cold_pubkey = cold_pubkey.ok_or_else(|| {
             StateError::InvalidStakingOp(
                 "validator registration requires a cold hybrid public key".into(),
             )
         })?;
+        validate_cold_components_not_retired(
+            state,
+            &cold_pubkey.classical_pk.0,
+            cold_pubkey.pq_pk.as_slice(),
+        )?;
         Some(validate_new_validator_cold_key(
             &state.validators,
             &validator_id,
@@ -706,6 +869,16 @@ fn apply_register_validator(
         if existing.hybrid_pq_pk.as_deref() == Some(new_pq_pk) {
             return Err(StateError::DuplicateValidatorKey {
                 reason: "hybrid_pq_pk already registered".into(),
+            });
+        }
+        if existing.cold_hybrid_classical_pk == Some(new_classical_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "hot hybrid_classical_pk reuses an active cold component".into(),
+            });
+        }
+        if existing.cold_hybrid_pq_pk.as_ref().map(|pk| pk.as_slice()) == Some(new_pq_pk) {
+            return Err(StateError::DuplicateValidatorKey {
+                reason: "hot hybrid_pq_pk reuses an active cold component".into(),
             });
         }
         if existing.vrf_pk == Some(vrf_pk) {
@@ -2222,6 +2395,57 @@ mod tests {
         };
         *slot = Some(cold_signature);
         op
+    }
+
+    fn dual_signed_rotate_op(
+        validator_id: Bytes32,
+        current: &HybridKeypair,
+        proposed: &HybridKeypair,
+        current_version: u64,
+        current_nonce: u64,
+        chain_id: &str,
+    ) -> StakingOp {
+        let mut op = StakingOp {
+            body: StakingOpBody::RotateValidatorColdKey {
+                validator_id,
+                current_cold_key_version: current_version,
+                new_cold_key_version: current_version + 1,
+                current_cold_nonce: current_nonce,
+                new_cold_pubkey: cold_pubkey_from_keypair(proposed),
+                new_cold_signature: Some(dummy_signature()),
+            },
+            nonce: 0,
+            signature: dummy_signature(),
+        };
+        let message = op
+            .rotate_validator_cold_key_dual_signing_bytes(chain_id)
+            .unwrap()
+            .unwrap();
+        op.signature = wire_signature(&current.sign(&message).unwrap());
+        let proposed_signature = wire_signature(&proposed.sign(&message).unwrap());
+        let StakingOpBody::RotateValidatorColdKey {
+            new_cold_signature, ..
+        } = &mut op.body
+        else {
+            unreachable!()
+        };
+        *new_cold_signature = Some(proposed_signature);
+        op
+    }
+
+    fn state_with_retired_cold_pair(seed: u8) -> (ChainState, HybridKeypair, HybridKeypair) {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, seed);
+        let old = mixed_keypair(seed.wrapping_add(1), seed.wrapping_add(2));
+        let replacement = mixed_keypair(seed.wrapping_add(3), seed.wrapping_add(4));
+        let chain_id = state.chain_id.clone();
+        let height = state.height;
+        let enroll = dual_signed_enroll_op(validator_id, &hot, &old, 1, &chain_id);
+        apply_staking_op(&mut state, &enroll, &chain_id, height).unwrap();
+        let rotate = dual_signed_rotate_op(validator_id, &old, &replacement, 1, 1, &chain_id);
+        apply_staking_op(&mut state, &rotate, &chain_id, height).unwrap();
+        (state, old, replacement)
     }
 
     fn make_active_validator(state: &mut ChainState, seed: u8) -> (Bytes32, HybridKeypair) {
@@ -6829,5 +7053,162 @@ mod tests {
             crate::compute_state_root(&first),
             crate::compute_state_root(&second)
         );
+    }
+
+    #[test]
+    fn rotate_validator_cold_key_is_atomic_and_permanently_retires_components() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let height = state.height;
+        let (validator_id, hot) = make_active_validator(&mut state, 0xD0);
+        let cold_v1 = mixed_keypair(0xD1, 0xD2);
+        let chain_id = state.chain_id.clone();
+        let enroll = dual_signed_enroll_op(validator_id, &hot, &cold_v1, 1, &chain_id);
+        apply_staking_op(&mut state, &enroll, &chain_id, height).unwrap();
+        let cold_v2 = mixed_keypair(0xD3, 0xD4);
+        let rotate = dual_signed_rotate_op(validator_id, &cold_v1, &cold_v2, 1, 1, &chain_id);
+        apply_staking_op(&mut state, &rotate, &chain_id, height).unwrap();
+        let entry = state.validators.get(&validator_id).unwrap();
+        assert_eq!(entry.cold_key_version, 2);
+        assert_eq!(entry.cold_nonce, 0);
+        assert_eq!(
+            entry.cold_hybrid_classical_pk,
+            Some(cold_v2.public_key().classical.0)
+        );
+        assert!(state
+            .retired_cold_classical_components
+            .contains(&cold_v1.public_key().classical.0));
+        assert!(state
+            .retired_cold_pq_components
+            .contains(&cold_v1.public_key().pq.0));
+
+        let reuse = dual_signed_rotate_op(validator_id, &cold_v2, &cold_v1, 2, 1, &chain_id);
+        let err = apply_staking_op(&mut state, &reuse, &chain_id, height).unwrap_err();
+        assert!(err.to_string().contains("permanently retired"));
+
+        let new_key_op = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_200,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 1,
+                }),
+            },
+            &cold_v2,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &new_key_op, &chain_id, height).unwrap();
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 1);
+
+        let old_key_op = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_300,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 2,
+                }),
+            },
+            &cold_v1,
+            &chain_id,
+        );
+        assert!(apply_staking_op(&mut state, &old_key_op, &chain_id, height).is_err());
+    }
+
+    #[test]
+    fn competing_rotations_are_first_commit_wins() {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let height = state.height;
+        let (validator_id, hot) = make_active_validator(&mut state, 0xE0);
+        let current = mixed_keypair(0xE1, 0xE2);
+        let chain_id = state.chain_id.clone();
+        let enroll = dual_signed_enroll_op(validator_id, &hot, &current, 1, &chain_id);
+        apply_staking_op(&mut state, &enroll, &chain_id, height).unwrap();
+        let a = mixed_keypair(0xE3, 0xE4);
+        let b = mixed_keypair(0xE5, 0xE6);
+        let first = dual_signed_rotate_op(validator_id, &current, &a, 1, 1, &chain_id);
+        let second = dual_signed_rotate_op(validator_id, &current, &b, 1, 1, &chain_id);
+        apply_staking_op(&mut state, &first, &chain_id, height).unwrap();
+        assert!(apply_staking_op(&mut state, &second, &chain_id, height).is_err());
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .cold_hybrid_classical_pk,
+            Some(a.public_key().classical.0)
+        );
+    }
+
+    #[test]
+    fn different_validator_enrollment_and_rotation_reject_retired_components() {
+        let (mut state, retired, _) = state_with_retired_cold_pair(0x80);
+        let chain_id = state.chain_id.clone();
+        let height = state.height;
+
+        let (other_id, other_hot) = make_active_validator(&mut state, 0x90);
+        let reused_classical = mixed_keypair(0x81, 0x91);
+        let enroll = dual_signed_enroll_op(other_id, &other_hot, &reused_classical, 1, &chain_id);
+        let err = apply_staking_op(&mut state, &enroll, &chain_id, height).unwrap_err();
+        assert!(err.to_string().contains("permanently retired"));
+
+        let fresh = mixed_keypair(0x92, 0x93);
+        let enroll = dual_signed_enroll_op(other_id, &other_hot, &fresh, 1, &chain_id);
+        apply_staking_op(&mut state, &enroll, &chain_id, height).unwrap();
+        let reused_pq = mixed_keypair(0x94, 0x82);
+        let rotate = dual_signed_rotate_op(other_id, &fresh, &reused_pq, 1, 1, &chain_id);
+        let err = apply_staking_op(&mut state, &rotate, &chain_id, height).unwrap_err();
+        assert!(err.to_string().contains("permanently retired"));
+        drop(retired);
+    }
+
+    #[test]
+    fn register_validator_rejects_retired_component_in_hot_or_cold_role() {
+        let (mut state, retired, _) = state_with_retired_cold_pair(0xA0);
+        let chain_id = state.chain_id.clone();
+        let height = state.height;
+
+        let hot_reusing_retired_classical = mixed_keypair(0xA1, 0xB0);
+        let fresh_cold = mixed_keypair(0xB1, 0xB2);
+        let bond = insert_delegator_utxo(
+            &mut state,
+            pubkey_from_keypair(&fresh_cold),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xB3,
+        );
+        let register = dual_signed_register_op(
+            bond,
+            &hot_reusing_retired_classical,
+            &fresh_cold,
+            1,
+            &chain_id,
+            [0xB4; 32],
+            0xB3,
+        );
+        let err = apply_staking_op(&mut state, &register, &chain_id, height).unwrap_err();
+        assert!(err.to_string().contains("permanently retired"));
+
+        let fresh_hot = mixed_keypair(0xB5, 0xB6);
+        let cold_reusing_retired_pq = mixed_keypair(0xB7, 0xA2);
+        let bond = insert_delegator_utxo(
+            &mut state,
+            pubkey_from_keypair(&cold_reusing_retired_pq),
+            MINIMUM_VALIDATOR_BOND_SPARK,
+            0xB8,
+        );
+        let register = dual_signed_register_op(
+            bond,
+            &fresh_hot,
+            &cold_reusing_retired_pq,
+            1,
+            &chain_id,
+            [0xB9; 32],
+            0xB8,
+        );
+        let err = apply_staking_op(&mut state, &register, &chain_id, height).unwrap_err();
+        assert!(err.to_string().contains("permanently retired"));
+        drop(retired);
     }
 }

@@ -38,6 +38,7 @@ const TAG_COLD_SELF_STAKE: u8 = 15;
 const TAG_COLD_SELF_UNSTAKE: u8 = 16;
 const TAG_COLD_SET_AUTO_DELEGATE: u8 = 17;
 const TAG_COLD_REGISTER_PAYMENT_KEY: u8 = 18;
+const TAG_ROTATE_VALIDATOR_COLD_KEY: u8 = 23;
 
 /// Stable operation tag used inside hot/cold registration envelopes.
 pub const AUTH_TAG_REGISTER_VALIDATOR: u16 = TAG_REGISTER_VALIDATOR as u16;
@@ -55,6 +56,8 @@ pub const AUTH_TAG_COLD_SELF_UNSTAKE: u16 = TAG_COLD_SELF_UNSTAKE as u16;
 pub const AUTH_TAG_COLD_SET_AUTO_DELEGATE: u16 = TAG_COLD_SET_AUTO_DELEGATE as u16;
 /// Stable envelope tag for cold validator payment-key registration.
 pub const AUTH_TAG_COLD_REGISTER_PAYMENT_KEY: u16 = TAG_COLD_REGISTER_PAYMENT_KEY as u16;
+/// Stable envelope tag for validator cold-key rotation.
+pub const AUTH_TAG_ROTATE_VALIDATOR_COLD_KEY: u16 = TAG_ROTATE_VALIDATOR_COLD_KEY as u16;
 
 const REGISTER_VALIDATOR_DUAL_AUTH_DOMAIN: &[u8] =
     b"INDRA-register-validator-dual-authorization-v1";
@@ -63,6 +66,10 @@ const ENROLL_VALIDATOR_COLD_KEY_DUAL_AUTH_DOMAIN: &[u8] =
     b"INDRA-enroll-validator-cold-key-dual-authorization-v1";
 const ENROLL_VALIDATOR_COLD_KEY_PAYLOAD_DOMAIN: &[u8] =
     b"INDRA-enroll-validator-cold-key-payload-v1";
+const ROTATE_VALIDATOR_COLD_KEY_DUAL_AUTH_DOMAIN: &[u8] =
+    b"INDRA-rotate-validator-cold-key-dual-authorization-v1";
+const ROTATE_VALIDATOR_COLD_KEY_PAYLOAD_DOMAIN: &[u8] =
+    b"INDRA-rotate-validator-cold-key-payload-v1";
 
 /// Proof that a staking UTXO's Pedersen commitment opens to exactly
 /// `OutputV1.value_spark`.
@@ -209,6 +216,22 @@ pub enum StakingOpBody {
         cold_pubkey: ColdHybridPubKey,
         /// Complete cold hybrid proof-of-possession signature.
         cold_signature: Option<HybridSignature>,
+    },
+
+    /// Atomically replace an Active validator's cold hybrid key.
+    RotateValidatorColdKey {
+        /// Existing validator identity.
+        validator_id: Bytes32,
+        /// Currently registered cold-key version.
+        current_cold_key_version: u64,
+        /// Next version, exactly current + 1.
+        new_cold_key_version: u64,
+        /// Next nonce in the current version's cold-role namespace.
+        current_cold_nonce: u64,
+        /// Proposed independent replacement cold hybrid public key.
+        new_cold_pubkey: ColdHybridPubKey,
+        /// Complete proof-of-possession signature by the proposed new key.
+        new_cold_signature: Option<HybridSignature>,
     },
 
     /// Update a validator's commission rate.
@@ -381,6 +404,14 @@ impl StakingOp {
             | StakingOpBody::RegisterPaymentKey {
                 cold_authorization, ..
             } => *cold_authorization,
+            StakingOpBody::RotateValidatorColdKey {
+                current_cold_key_version,
+                current_cold_nonce,
+                ..
+            } => Some(ColdStakingAuthorization {
+                cold_key_version: *current_cold_key_version,
+                cold_nonce: *current_cold_nonce,
+            }),
             _ => None,
         }
     }
@@ -497,6 +528,56 @@ impl StakingOp {
         Ok(Some(message))
     }
 
+    /// Canonical byte-identical message signed by both the current and proposed
+    /// cold hybrid pairs for an atomic rotation.
+    pub fn rotate_validator_cold_key_dual_signing_bytes(
+        &self,
+        chain_id: &str,
+    ) -> IndraResult<Option<Vec<u8>>> {
+        let StakingOpBody::RotateValidatorColdKey {
+            validator_id,
+            current_cold_key_version,
+            new_cold_key_version,
+            current_cold_nonce,
+            new_cold_pubkey,
+            ..
+        } = &self.body
+        else {
+            return Ok(None);
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(ROTATE_VALIDATOR_COLD_KEY_PAYLOAD_DOMAIN);
+        current_cold_key_version.encode(&mut payload);
+        new_cold_key_version.encode(&mut payload);
+        current_cold_nonce.encode(&mut payload);
+        new_cold_pubkey.encode(&mut payload);
+        let current = AuthorizationEnvelope::new_cold(
+            chain_id.as_bytes(),
+            AUTH_TAG_ROTATE_VALIDATOR_COLD_KEY,
+            *validator_id,
+            *current_cold_key_version,
+            *current_cold_nonce,
+            &payload,
+        )?;
+        let proposed = AuthorizationEnvelope::new_cold(
+            chain_id.as_bytes(),
+            AUTH_TAG_ROTATE_VALIDATOR_COLD_KEY,
+            *validator_id,
+            *new_cold_key_version,
+            0,
+            &payload,
+        )?;
+        let current_bytes = current.signing_bytes();
+        let proposed_bytes = proposed.signing_bytes();
+        let mut message = Vec::new();
+        message.extend_from_slice(ROTATE_VALIDATOR_COLD_KEY_DUAL_AUTH_DOMAIN);
+        (current_bytes.len() as u32).encode(&mut message);
+        message.extend_from_slice(&current_bytes);
+        (proposed_bytes.len() as u32).encode(&mut message);
+        message.extend_from_slice(&proposed_bytes);
+        Ok(Some(message))
+    }
+
     /// Enforce the height-gated shape of a validator registration extension.
     pub fn validate_register_validator_cold_extension(&self, height: u64) -> IndraResult<()> {
         let StakingOpBody::RegisterValidator {
@@ -547,7 +628,8 @@ impl StakingOp {
             StakingOpBody::SetCommission { validator_id, .. }
             | StakingOpBody::SetAutoDelegate { validator_id, .. }
             | StakingOpBody::UpdateNetworkAddress { validator_id, .. }
-            | StakingOpBody::EnrollValidatorColdKey { validator_id, .. } => *validator_id,
+            | StakingOpBody::EnrollValidatorColdKey { validator_id, .. }
+            | StakingOpBody::RotateValidatorColdKey { validator_id, .. } => *validator_id,
             StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } => pubkey_to_id(owner_pubkey),
         }
     }
@@ -604,6 +686,34 @@ impl StakingOp {
                 if cold_signature.is_none() {
                     return Err(IndraError::InvalidStakingOp(
                         "validator cold-key enrollment requires a cold hybrid signature".into(),
+                    ));
+                }
+            }
+            StakingOpBody::RotateValidatorColdKey {
+                current_cold_key_version,
+                new_cold_key_version,
+                current_cold_nonce,
+                new_cold_signature,
+                ..
+            } => {
+                if !validator_cold_key_enrollment_active(height) {
+                    return Err(IndraError::InvalidStakingOp(
+                        "RotateValidatorColdKey is not active before VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT".into(),
+                    ));
+                }
+                if self.nonce != 0
+                    || *current_cold_key_version == 0
+                    || *current_cold_nonce == 0
+                    || current_cold_key_version.checked_add(1) != Some(*new_cold_key_version)
+                {
+                    return Err(IndraError::InvalidStakingOp(
+                        "cold-key rotation requires outer nonce zero, a nonzero current version/nonce, and next version current+1".into(),
+                    ));
+                }
+                if new_cold_signature.is_none() {
+                    return Err(IndraError::InvalidStakingOp(
+                        "validator cold-key rotation requires the proposed new key signature"
+                            .into(),
                     ));
                 }
             }
@@ -719,6 +829,25 @@ impl Encode for StakingOpBody {
                 cold_pubkey.encode(buf);
                 cold_signature.is_some().encode(buf);
                 if let Some(signature) = cold_signature {
+                    signature.encode(buf);
+                }
+            }
+            StakingOpBody::RotateValidatorColdKey {
+                validator_id,
+                current_cold_key_version,
+                new_cold_key_version,
+                current_cold_nonce,
+                new_cold_pubkey,
+                new_cold_signature,
+            } => {
+                buf.push(TAG_ROTATE_VALIDATOR_COLD_KEY);
+                validator_id.encode(buf);
+                current_cold_key_version.encode(buf);
+                new_cold_key_version.encode(buf);
+                current_cold_nonce.encode(buf);
+                new_cold_pubkey.encode(buf);
+                new_cold_signature.is_some().encode(buf);
+                if let Some(signature) = new_cold_signature {
                     signature.encode(buf);
                 }
             }
@@ -875,6 +1004,21 @@ impl Encode for StakingOpBody {
                         .map(Encode::encoded_len)
                         .unwrap_or(0)
             }
+            StakingOpBody::RotateValidatorColdKey {
+                new_cold_pubkey,
+                new_cold_signature,
+                ..
+            } => {
+                32 + 8
+                    + 8
+                    + 8
+                    + new_cold_pubkey.encoded_len()
+                    + 1
+                    + new_cold_signature
+                        .as_ref()
+                        .map(Encode::encoded_len)
+                        .unwrap_or(0)
+            }
             StakingOpBody::SetCommission {
                 cold_authorization, ..
             } => {
@@ -1008,6 +1152,26 @@ impl Decode for StakingOpBody {
                     validator_id,
                     cold_pubkey,
                     cold_signature,
+                })
+            }
+            TAG_ROTATE_VALIDATOR_COLD_KEY => {
+                let validator_id = Bytes32::decode(r)?;
+                let current_cold_key_version = u64::decode(r)?;
+                let new_cold_key_version = u64::decode(r)?;
+                let current_cold_nonce = u64::decode(r)?;
+                let new_cold_pubkey = ColdHybridPubKey::decode(r)?;
+                let new_cold_signature = if bool::decode(r)? {
+                    Some(HybridSignature::decode(r)?)
+                } else {
+                    None
+                };
+                Ok(StakingOpBody::RotateValidatorColdKey {
+                    validator_id,
+                    current_cold_key_version,
+                    new_cold_key_version,
+                    current_cold_nonce,
+                    new_cold_pubkey,
+                    new_cold_signature,
                 })
             }
             TAG_SET_COMMISSION => Ok(StakingOpBody::SetCommission {

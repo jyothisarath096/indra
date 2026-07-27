@@ -38,6 +38,7 @@ const DOMAIN_SLASH_HASH: u8 = 0x05;
 const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
 const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
 const DOMAIN_PAYMENT_IDENTITY: u8 = 0x08;
+const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +86,18 @@ impl StateCommitmentV2 {
             leaves.push((
                 payment_identity_key(owner_id),
                 payment_identity_value_hash(owner_id, pubkey),
+            ));
+        }
+        for component in &state.retired_cold_classical_components {
+            leaves.push((
+                retired_cold_component_key(0, component),
+                retired_cold_component_value_hash(0, component),
+            ));
+        }
+        for component in &state.retired_cold_pq_components {
+            leaves.push((
+                retired_cold_component_key(1, component),
+                retired_cold_component_value_hash(1, component),
             ));
         }
         if registered_validator_cap_active(height) {
@@ -190,6 +203,14 @@ impl StateCommitmentV2 {
             payment_identity_value_hash(owner_id, pubkey),
         );
     }
+
+    /// Permanently commit one retired cold public-key component.
+    pub fn put_retired_cold_component(&mut self, kind: u8, component: &[u8]) {
+        self.tree.insert(
+            retired_cold_component_key(kind, component),
+            retired_cold_component_value_hash(kind, component),
+        );
+    }
 }
 
 pub(crate) fn validator_key(validator_id: &Bytes32) -> [u8; 32] {
@@ -229,6 +250,20 @@ pub(crate) fn delegator_identity_key(delegator_id: &Bytes32) -> [u8; 32] {
 
 pub(crate) fn payment_identity_key(owner_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_PAYMENT_IDENTITY, &owner_id.0)
+}
+
+fn retired_cold_component_key(kind: u8, component: &[u8]) -> [u8; 32] {
+    let mut raw = Vec::with_capacity(1 + component.len());
+    raw.push(kind);
+    raw.extend_from_slice(component);
+    derive_key(DOMAIN_RETIRED_COLD_COMPONENT, &raw)
+}
+
+fn retired_cold_component_value_hash(kind: u8, component: &[u8]) -> [u8; 32] {
+    let mut value = Vec::with_capacity(1 + component.len());
+    value.push(kind);
+    value.extend_from_slice(component);
+    sha256(&value)
 }
 
 fn derive_key(domain: u8, raw_key: &[u8]) -> [u8; 32] {
@@ -943,6 +978,7 @@ mod tests {
             ("delegation_return_event", DOMAIN_DELEGATION_RETURN_EVENT),
             ("delegator_identity", DOMAIN_DELEGATOR_IDENTITY),
             ("payment_identity", DOMAIN_PAYMENT_IDENTITY),
+            ("retired_cold_component", DOMAIN_RETIRED_COLD_COMPONENT),
         ];
         let mut seen = std::collections::BTreeMap::new();
         for (name, domain) in domains {
@@ -952,7 +988,7 @@ mod tests {
                 "StateCommitmentV2 domain byte collision at 0x{domain:02x}"
             );
         }
-        assert_eq!(DOMAIN_PAYMENT_IDENTITY, 0x08);
+        assert_eq!(DOMAIN_RETIRED_COLD_COMPONENT, 0x09);
     }
 
     #[test]

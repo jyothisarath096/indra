@@ -879,7 +879,7 @@ mod tests {
     use indra_core::{
         codec::Encode,
         types::{
-            crypto::{CommitmentV1, HybridSignature},
+            crypto::{ColdHybridPubKey, CommitmentV1, HybridSignature},
             governance::{ColdGovernanceAuthorization, GovernableAction, GovernanceActionType},
             primitives::{
                 VariableBytes, DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
@@ -1009,6 +1009,52 @@ mod tests {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
         };
+    }
+
+    fn rotate_cold_key_op(
+        validator_id: Bytes32,
+        current: &HybridKeypair,
+        proposed: &HybridKeypair,
+        current_version: u64,
+        current_nonce: u64,
+    ) -> StakingOp {
+        let public = proposed.public_key();
+        let mut op = StakingOp {
+            body: StakingOpBody::RotateValidatorColdKey {
+                validator_id,
+                current_cold_key_version: current_version,
+                new_cold_key_version: current_version + 1,
+                current_cold_nonce: current_nonce,
+                new_cold_pubkey: ColdHybridPubKey {
+                    classical_pk: Bytes32::from(public.classical.0),
+                    pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+                },
+                new_cold_signature: Some(dummy_sig()),
+            },
+            nonce: 0,
+            signature: dummy_sig(),
+        };
+        let message = op
+            .rotate_validator_cold_key_dual_signing_bytes(DEFAULT_CHAIN_ID)
+            .unwrap()
+            .unwrap();
+        let current_signature = current.sign(&message).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&current_signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&current_signature.pq.0).unwrap(),
+        };
+        let proposed_signature = proposed.sign(&message).unwrap();
+        let StakingOpBody::RotateValidatorColdKey {
+            new_cold_signature, ..
+        } = &mut op.body
+        else {
+            unreachable!()
+        };
+        *new_cold_signature = Some(HybridSignature {
+            classical_sig: VariableBytes::from_slice(&proposed_signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&proposed_signature.pq.0).unwrap(),
+        });
+        op
     }
 
     fn install_governance_validator(state: &mut ChainState, pubkey: &HybridPubKey) -> Bytes32 {
@@ -1473,6 +1519,217 @@ mod tests {
             ProposalPhase::Cancelled
         );
         assert!(state.governance.proposals[&vote_proposal_id]
+            .reveals
+            .contains_key(&validator_id));
+    }
+
+    #[test]
+    fn governance_commit_before_rotation_reveals_under_new_cold_version() {
+        let mut state = ChainState::new_genesis();
+        let (hot_pubkey, _) = keypair(0x70);
+        let validator_id = install_governance_validator(&mut state, &hot_pubkey);
+        let (_, cold_v1) = mixed_keypair(0x71, 0x72);
+        activate_cold_key(&mut state, validator_id, &cold_v1);
+
+        let proposal_id = Bytes32::from([0x73; 32]);
+        let reveal_nonce = Bytes32::from([0x74; 32]);
+        let vote = 1;
+        let commit_hash =
+            governance_vote_commit_hash(proposal_id, validator_id, vote, reveal_nonce);
+        let mut proposal = proposal_record(
+            proposal_id,
+            hot_pubkey,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            ProposalPhase::Commit,
+        );
+        proposal.proposer_id = validator_id;
+        proposal.snapshot1 = Some(crate::governance::GovernanceSnapshot {
+            weights: [(validator_id, 1_000)].into_iter().collect(),
+            total_stake: 1_000,
+        });
+        state.governance.proposals.insert(proposal_id, proposal);
+
+        let mut commit = GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id: validator_id,
+            nonce: 0,
+            payload: GovernancePayload::Commit {
+                proposal_id,
+                commit_hash,
+                cold_authorization: Some(ColdGovernanceAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                }),
+            },
+            signature: dummy_sig(),
+        };
+        sign_cold_governance_op(&mut commit, &cold_v1, DEFAULT_CHAIN_ID);
+        apply_governance_op(&mut state, &commit, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+
+        let (_, cold_v2) = mixed_keypair(0x75, 0x76);
+        let rotation = rotate_cold_key_op(validator_id, &cold_v1, &cold_v2, 1, 2);
+        apply_staking_op(&mut state, &rotation, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+        state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap()
+            .phase = ProposalPhase::Reveal;
+
+        let mut reveal = GovernanceOpV2 {
+            action_type: GovernanceActionType::RevealVote,
+            signer_id: validator_id,
+            nonce: 0,
+            payload: GovernancePayload::Reveal {
+                proposal_id,
+                vote,
+                nonce: reveal_nonce,
+                cold_authorization: Some(ColdGovernanceAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 1,
+                }),
+            },
+            signature: dummy_sig(),
+        };
+        sign_cold_governance_op(&mut reveal, &cold_v2, DEFAULT_CHAIN_ID);
+        apply_governance_op(&mut state, &reveal, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+
+        assert!(state.governance.proposals[&proposal_id]
+            .reveals
+            .contains_key(&validator_id));
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert_eq!(validator.cold_key_version, 2);
+        assert_eq!(validator.cold_nonce, 1);
+    }
+
+    #[test]
+    fn rotation_with_cold_staking_and_governance_replays_deterministically() {
+        let mut base = ChainState::new_genesis();
+        let (hot_pubkey, _) = keypair(0x40);
+        let validator_id = install_governance_validator(&mut base, &hot_pubkey);
+        let (_, cold_v1) = mixed_keypair(0x41, 0x42);
+        activate_cold_key(&mut base, validator_id, &cold_v1);
+
+        let proposal_id = Bytes32::from([0x43; 32]);
+        let reveal_nonce = Bytes32::from([0x44; 32]);
+        let vote = 1;
+        let mut proposal = proposal_record(
+            proposal_id,
+            hot_pubkey,
+            GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            ProposalPhase::Commit,
+        );
+        proposal.proposer_id = validator_id;
+        proposal.snapshot1 = Some(crate::governance::GovernanceSnapshot {
+            weights: [(validator_id, 1_000)].into_iter().collect(),
+            total_stake: 1_000,
+        });
+        base.governance.proposals.insert(proposal_id, proposal);
+
+        let mut commission_v1 = StakingOp {
+            body: StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 900,
+                cold_authorization: Some(ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                }),
+            },
+            nonce: 0,
+            signature: dummy_sig(),
+        };
+        sign_cold_staking_op(&mut commission_v1, &cold_v1, DEFAULT_CHAIN_ID);
+
+        let mut commit = GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id: validator_id,
+            nonce: 0,
+            payload: GovernancePayload::Commit {
+                proposal_id,
+                commit_hash: governance_vote_commit_hash(
+                    proposal_id,
+                    validator_id,
+                    vote,
+                    reveal_nonce,
+                ),
+                cold_authorization: Some(ColdGovernanceAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 2,
+                }),
+            },
+            signature: dummy_sig(),
+        };
+        sign_cold_governance_op(&mut commit, &cold_v1, DEFAULT_CHAIN_ID);
+
+        let (_, cold_v2) = mixed_keypair(0x45, 0x46);
+        let rotation = rotate_cold_key_op(validator_id, &cold_v1, &cold_v2, 1, 3);
+        let mut reveal = GovernanceOpV2 {
+            action_type: GovernanceActionType::RevealVote,
+            signer_id: validator_id,
+            nonce: 0,
+            payload: GovernancePayload::Reveal {
+                proposal_id,
+                vote,
+                nonce: reveal_nonce,
+                cold_authorization: Some(ColdGovernanceAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 1,
+                }),
+            },
+            signature: dummy_sig(),
+        };
+        sign_cold_governance_op(&mut reveal, &cold_v2, DEFAULT_CHAIN_ID);
+        let mut commission_v2 = StakingOp {
+            body: StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 950,
+                cold_authorization: Some(ColdStakingAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 2,
+                }),
+            },
+            nonce: 0,
+            signature: dummy_sig(),
+        };
+        sign_cold_staking_op(&mut commission_v2, &cold_v2, DEFAULT_CHAIN_ID);
+
+        let replay = |state: &mut ChainState| {
+            apply_staking_op(state, &commission_v1, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+            apply_governance_op(state, &commit, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+            apply_staking_op(state, &rotation, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+            state
+                .governance
+                .proposals
+                .get_mut(&proposal_id)
+                .unwrap()
+                .phase = ProposalPhase::Reveal;
+            apply_governance_op(state, &reveal, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+            apply_staking_op(state, &commission_v2, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+        };
+        let mut first = base.clone();
+        let mut second = base;
+        replay(&mut first);
+        replay(&mut second);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::compute_state_root(&first),
+            crate::compute_state_root(&second)
+        );
+        assert_eq!(
+            first
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .cold_key_version,
+            2
+        );
+        assert_eq!(first.validators.get(&validator_id).unwrap().cold_nonce, 2);
+        assert!(first.governance.proposals[&proposal_id]
             .reveals
             .contains_key(&validator_id));
     }
