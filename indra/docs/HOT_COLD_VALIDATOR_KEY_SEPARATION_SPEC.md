@@ -204,6 +204,39 @@ operation nonce. A rotation consumes the current cold nonce and atomically
 resets the new version's nonce to zero. The first ordinary operation under the
 new version uses nonce 1.
 
+#### 2.3.1 Cold-only staking-operation wire extension
+
+The cold-only staking operations `SelfStake`, `SelfUnstake`, validator
+`ClaimRewards`, `SetCommission`, `SetAutoDelegate`, and validator
+`RegisterPaymentKey` use the additive wire-extension pattern established by
+`RegisterValidator`. Each operation retains its legacy tag and byte-identical
+legacy encoding when no cold authorization is present. A cold-authorized form
+uses a distinct operation-specific tag and appends:
+
+```text
+cold_key_version: u64
+cold_nonce: u64
+```
+
+The existing outer `StakingOp.nonce` remains physically present for backward
+compatibility and MUST equal zero in every cold-authorized form. It has no
+replay-protection meaning in that form. The extension's `cold_nonce` is the
+only nonce checked and consumed, and successful application updates only the
+validator record's `cold_nonce`, not the legacy staking-nonce namespace.
+
+The existing outer `StakingOp.signature` contains the one complete cold hybrid
+signature. It signs a canonical `AuthorizationEnvelope::new_cold` whose
+payload is the complete encoded cold-form operation body followed by the
+zero-valued outer nonce. The envelope repeats and therefore cryptographically
+binds the operation-specific tag, validator identity, cold-key version and
+cold nonce. No signature bytes are included in the payload.
+
+The six cold-form wire tags and authorization-envelope tags are stable and
+distinct. Decoders MUST reject unknown, truncated or malformed forms. An
+unenrolled validator and an ordinary delegator MUST use the legacy form; an
+Active validator MUST use the cold form for every operation designated above.
+There is no hot-signature fallback for an Active validator.
+
 ### 2.4 Initial validator registration
 
 The registration payload contains:

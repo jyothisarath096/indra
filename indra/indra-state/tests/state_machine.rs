@@ -706,6 +706,7 @@ fn test_self_stake_full_lifecycle() {
                 committed_value_spark: bond_value,
                 blinding_factor: Bytes32::from([0x40; 32]),
             }),
+            cold_authorization: None,
         },
         1,
         &validator_keypair,
@@ -729,6 +730,7 @@ fn test_self_stake_full_lifecycle() {
         StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey,
+            cold_authorization: None,
         },
         2,
         &validator_keypair,
@@ -777,6 +779,7 @@ fn test_auto_delegate_full_lifecycle() {
         StakingOpBody::SetAutoDelegate {
             validator_id: inactive_id,
             target_validator_id: target_id,
+            cold_authorization: None,
         },
         1,
         &inactive_keypair,
@@ -802,6 +805,7 @@ fn test_auto_delegate_full_lifecycle() {
         StakingOpBody::ClaimRewards {
             validator_id: inactive_id,
             delegator_pubkey: inactive_pubkey,
+            cold_authorization: None,
         },
         2,
         &inactive_keypair,
@@ -839,6 +843,7 @@ fn test_self_stake_slash_reduces_bond_amount() {
                 committed_value_spark: bond_value,
                 blinding_factor: Bytes32::from([0x50; 32]),
             }),
+            cold_authorization: None,
         },
         1,
         &validator_keypair,

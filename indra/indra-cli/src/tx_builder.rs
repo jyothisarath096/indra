@@ -315,6 +315,7 @@ pub fn build_self_stake_op(
             bond_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
             bond_proof: Some(bond_proof),
+            cold_authorization: None,
         },
         validator_keypair,
         nonce,
@@ -359,6 +360,7 @@ pub fn build_register_payment_key_op(
         StakingOpBody::RegisterPaymentKey {
             owner_pubkey: hybrid_pubkey_from_keypair(owner_keypair)?,
             payment_pubkey,
+            cold_authorization: None,
         },
         owner_keypair,
         nonce,
@@ -419,6 +421,7 @@ pub fn build_claim_rewards_op(
         StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
+            cold_authorization: None,
         },
         delegator_keypair,
         nonce,
@@ -438,6 +441,7 @@ pub fn build_set_commission_op(
         StakingOpBody::SetCommission {
             validator_id,
             new_commission_bps,
+            cold_authorization: None,
         },
         keypair,
         nonce,
@@ -458,6 +462,7 @@ pub fn build_set_auto_delegate_op(
         StakingOpBody::SetAutoDelegate {
             validator_id,
             target_validator_id,
+            cold_authorization: None,
         },
         keypair,
         nonce,
@@ -498,6 +503,7 @@ pub fn build_self_unstake_op(
         StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
+            cold_authorization: None,
         },
         validator_keypair,
         nonce,
@@ -1003,7 +1009,8 @@ mod tests {
             StakingOpBody::SelfStake {
                 bond_utxo_id: id,
                 validator_pubkey,
-                bond_proof
+                bond_proof,
+                ..
             } if id == bond_utxo_id
                 && validator_pubkey.classical_pk == spk.classical_pk
                 && bond_proof == Some(proof)
@@ -1129,6 +1136,7 @@ mod tests {
             StakingOpBody::SetCommission {
                 validator_id: v,
                 new_commission_bps: 1_500,
+                ..
             } if v == validator_id
         ));
     }
@@ -1153,6 +1161,7 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id: v,
                 target_validator_id: t,
+                ..
             } if v == validator_id && t == target_validator_id
         ));
     }
@@ -1170,6 +1179,7 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id: v,
                 target_validator_id: Bytes32::ZERO,
+                ..
             } if v == validator_id
         ));
     }

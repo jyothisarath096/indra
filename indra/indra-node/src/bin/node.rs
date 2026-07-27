@@ -4266,6 +4266,7 @@ mod tests {
                     pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0x33; 32])
                         .unwrap(),
                 },
+                cold_authorization: None,
             },
             nonce,
             signature: dummy_hybrid_sig(),

@@ -45,12 +45,8 @@ pub fn apply_staking_op(
     chain_id: &str,
     current_height: u64,
 ) -> StateResult<()> {
-    op.validate_register_validator_cold_extension(current_height)
+    op.validate_structure_at_height(current_height)
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    if matches!(op.body, StakingOpBody::EnrollValidatorColdKey { .. }) {
-        op.validate_structure_at_height(current_height)
-            .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    }
     apply_staking_op_with_identity_activation(
         state,
         op,
@@ -76,19 +72,110 @@ pub(crate) fn apply_staking_op_with_identity_activation(
     }
 
     let signer_id = op.signer_id();
-    let expected_nonce = state.staking_nonces.get(&signer_id).copied().unwrap_or(0) + 1;
-    if op.nonce != expected_nonce {
-        return Err(StateError::StakingNonceInvalid {
-            expected: expected_nonce,
-            got: op.nonce,
-        });
+    let cold_designated = matches!(
+        op.body,
+        StakingOpBody::ClaimRewards { .. }
+            | StakingOpBody::SetCommission { .. }
+            | StakingOpBody::SelfStake { .. }
+            | StakingOpBody::SelfUnstake { .. }
+            | StakingOpBody::SetAutoDelegate { .. }
+            | StakingOpBody::RegisterPaymentKey { .. }
+    );
+    let active_cold_validator = cold_designated
+        && state
+            .validators
+            .get(&signer_id)
+            .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Active);
+
+    if active_cold_validator {
+        let authorization = op.cold_authorization().ok_or_else(|| {
+            StateError::InvalidStakingOp(
+                "active validator cold-designated operation requires cold authorization; hot fallback is prohibited"
+                    .into(),
+            )
+        })?;
+        if op.nonce != 0 {
+            return Err(StateError::InvalidStakingOp(
+                "cold-authorized staking operation outer nonce must be zero".into(),
+            ));
+        }
+        let validator = state
+            .validators
+            .get(&signer_id)
+            .ok_or(StateError::ValidatorNotFound)?;
+        if authorization.cold_key_version != validator.cold_key_version {
+            return Err(StateError::InvalidStakingOp(format!(
+                "cold-key version mismatch: expected {}, got {}",
+                validator.cold_key_version, authorization.cold_key_version
+            )));
+        }
+        let expected_cold_nonce = validator
+            .cold_nonce
+            .checked_add(1)
+            .ok_or_else(|| StateError::InvalidStakingOp("validator cold nonce exhausted".into()))?;
+        if authorization.cold_nonce != expected_cold_nonce {
+            return Err(StateError::StakingNonceInvalid {
+                expected: expected_cold_nonce,
+                got: authorization.cold_nonce,
+            });
+        }
+        let cold_signing_bytes = op
+            .cold_authorization_signing_bytes(chain_id)
+            .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
+            .ok_or_else(|| {
+                StateError::InvalidStakingOp(
+                    "active validator operation is missing canonical cold authorization".into(),
+                )
+            })?;
+        let cold_classical = validator.cold_hybrid_classical_pk.ok_or_else(|| {
+            StateError::StakingOpSignatureInvalid {
+                reason: "active validator has no classical cold key registered".into(),
+            }
+        })?;
+        let cold_pq = validator.cold_hybrid_pq_pk.as_ref().ok_or_else(|| {
+            StateError::StakingOpSignatureInvalid {
+                reason: "active validator has no PQ cold key registered".into(),
+            }
+        })?;
+        verify_staking_sig(&cold_signing_bytes, &op.signature, &cold_classical, cold_pq)?;
+    } else {
+        if op.cold_authorization().is_some() {
+            return Err(StateError::InvalidStakingOp(
+                "cold authorization is valid only for an Active validator".into(),
+            ));
+        }
+        let expected_nonce = state.staking_nonces.get(&signer_id).copied().unwrap_or(0) + 1;
+        if op.nonce != expected_nonce {
+            return Err(StateError::StakingNonceInvalid {
+                expected: expected_nonce,
+                got: op.nonce,
+            });
+        }
     }
 
     let signing_bytes = op.signing_bytes(chain_id);
     match &op.body {
         StakingOpBody::SetCommission { validator_id, .. }
         | StakingOpBody::SetAutoDelegate { validator_id, .. }
-        | StakingOpBody::UpdateNetworkAddress { validator_id, .. } => {
+            if !active_cold_validator =>
+        {
+            let validator = state
+                .validators
+                .get(validator_id)
+                .ok_or(StateError::ValidatorNotFound)?;
+            let classical_pk = validator.hybrid_classical_pk.ok_or_else(|| {
+                StateError::StakingOpSignatureInvalid {
+                    reason: "validator has no classical key registered".into(),
+                }
+            })?;
+            let pq_pk = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
+                StateError::StakingOpSignatureInvalid {
+                    reason: "validator has no PQ key registered".into(),
+                }
+            })?;
+            verify_staking_sig(&signing_bytes, &op.signature, &classical_pk, pq_pk)?;
+        }
+        StakingOpBody::UpdateNetworkAddress { validator_id, .. } => {
             let validator = state
                 .validators
                 .get(validator_id)
@@ -110,10 +197,17 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         }
         | StakingOpBody::Undelegate {
             delegator_pubkey, ..
-        }
-        | StakingOpBody::ClaimRewards {
-            delegator_pubkey, ..
         } => {
+            verify_staking_sig(
+                &signing_bytes,
+                &op.signature,
+                &delegator_pubkey.classical_pk.0,
+                delegator_pubkey.pq_pk.as_slice(),
+            )?;
+        }
+        StakingOpBody::ClaimRewards {
+            delegator_pubkey, ..
+        } if !active_cold_validator => {
             verify_staking_sig(
                 &signing_bytes,
                 &op.signature,
@@ -242,7 +336,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         }
         | StakingOpBody::SelfUnstake {
             validator_pubkey, ..
-        } => {
+        } if !active_cold_validator => {
             verify_staking_sig(
                 &signing_bytes,
                 &op.signature,
@@ -250,7 +344,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
                 validator_pubkey.pq_pk.as_slice(),
             )?;
         }
-        StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } => {
+        StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } if !active_cold_validator => {
             verify_staking_sig(
                 &signing_bytes,
                 &op.signature,
@@ -258,6 +352,12 @@ pub(crate) fn apply_staking_op_with_identity_activation(
                 owner_pubkey.pq_pk.as_slice(),
             )?;
         }
+        StakingOpBody::ClaimRewards { .. }
+        | StakingOpBody::SetCommission { .. }
+        | StakingOpBody::SelfStake { .. }
+        | StakingOpBody::SelfUnstake { .. }
+        | StakingOpBody::SetAutoDelegate { .. }
+        | StakingOpBody::RegisterPaymentKey { .. } => {}
     }
 
     let result = match &op.body {
@@ -290,6 +390,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey,
+            ..
         } => apply_claim_rewards(
             state,
             validator_id,
@@ -324,10 +425,12 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::SetCommission {
             validator_id,
             new_commission_bps,
+            ..
         } => apply_set_commission(state, validator_id, *new_commission_bps, current_height),
         StakingOpBody::SetAutoDelegate {
             validator_id,
             target_validator_id,
+            ..
         } => apply_set_auto_delegate(state, *validator_id, *target_validator_id, current_height),
         StakingOpBody::UpdateNetworkAddress {
             validator_id,
@@ -339,6 +442,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             bond_utxo_id,
             validator_pubkey,
             bond_proof,
+            ..
         } => apply_self_stake(
             state,
             *bond_utxo_id,
@@ -350,6 +454,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey,
+            ..
         } => apply_self_unstake(
             state,
             *bond_utxo_id,
@@ -360,13 +465,29 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::RegisterPaymentKey {
             owner_pubkey,
             payment_pubkey,
+            ..
         } => apply_register_payment_key(state, owner_pubkey, payment_pubkey),
     };
 
     result?;
-    state.staking_nonces.insert(signer_id, op.nonce);
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_staking_nonce(&signer_id, op.nonce);
+    if active_cold_validator {
+        let cold_nonce = op
+            .cold_authorization()
+            .expect("active cold authorization was verified")
+            .cold_nonce;
+        let validator = state
+            .validators
+            .get_mut(&signer_id)
+            .ok_or(StateError::ValidatorNotFound)?;
+        validator.cold_nonce = cold_nonce;
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_validator(validator, current_height);
+        }
+    } else {
+        state.staking_nonces.insert(signer_id, op.nonce);
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_staking_nonce(&signer_id, op.nonce);
+        }
     }
     Ok(())
 }
@@ -1219,11 +1340,21 @@ fn apply_self_stake(
         .get(&bond_utxo_id)
         .ok_or(StateError::UnknownUtxo)?
         .clone();
-    let utxo_owner_id = pubkey_to_id(&utxo_entry.output.owner_pubkey);
-    if utxo_owner_id != validator_id {
-        return Err(StateError::InvalidStakingOp(
-            "UTXO does not belong to the validator".into(),
-        ));
+    if validator.cold_key_status == ColdKeyStatus::Active {
+        let cold_owner = resolve_active_validator_cold_pubkey(state, &validator_id)
+            .map_err(identity_error_to_state_error)?;
+        if utxo_entry.output.owner_pubkey != cold_owner {
+            return Err(StateError::InvalidStakingOp(
+                "self-stake UTXO is not owned by the validator's active cold key".into(),
+            ));
+        }
+    } else {
+        let utxo_owner_id = pubkey_to_id(&utxo_entry.output.owner_pubkey);
+        if utxo_owner_id != validator_id {
+            return Err(StateError::InvalidStakingOp(
+                "UTXO does not belong to the validator".into(),
+            ));
+        }
     }
     require_and_validate_bond_proof(current_height, &utxo_entry.output, bond_proof)?;
 
@@ -1971,6 +2102,56 @@ mod tests {
         op
     }
 
+    fn cold_signed_op(
+        body: StakingOpBody,
+        cold_keypair: &HybridKeypair,
+        chain_id: &str,
+    ) -> StakingOp {
+        let mut op = StakingOp {
+            body,
+            nonce: 0,
+            signature: dummy_signature(),
+        };
+        let message = op
+            .cold_authorization_signing_bytes(chain_id)
+            .unwrap()
+            .expect("cold-form operation");
+        op.signature = wire_signature(&cold_keypair.sign(&message).unwrap());
+        op
+    }
+
+    fn cold_auth(nonce: u64) -> Option<indra_core::types::staking::ColdStakingAuthorization> {
+        Some(indra_core::types::staking::ColdStakingAuthorization {
+            cold_key_version: 1,
+            cold_nonce: nonce,
+        })
+    }
+
+    fn set_cold_auth(body: &mut StakingOpBody, nonce: u64) {
+        let slot = match body {
+            StakingOpBody::ClaimRewards {
+                cold_authorization, ..
+            }
+            | StakingOpBody::SetCommission {
+                cold_authorization, ..
+            }
+            | StakingOpBody::SelfStake {
+                cold_authorization, ..
+            }
+            | StakingOpBody::SelfUnstake {
+                cold_authorization, ..
+            }
+            | StakingOpBody::SetAutoDelegate {
+                cold_authorization, ..
+            }
+            | StakingOpBody::RegisterPaymentKey {
+                cold_authorization, ..
+            } => cold_authorization,
+            _ => panic!("not a cold-designated staking body"),
+        };
+        *slot = cold_auth(nonce);
+    }
+
     fn dual_signed_register_op(
         bond_utxo_id: Bytes32,
         hot_keypair: &HybridKeypair,
@@ -2212,6 +2393,7 @@ mod tests {
             StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey: pubkey_from_keypair(delegator_keypair),
+                cold_authorization: None,
             },
             nonce,
             delegator_keypair,
@@ -2231,6 +2413,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: pubkey_from_keypair(validator_keypair),
                 bond_proof: Some(bond_proof),
+                cold_authorization: None,
             },
             nonce,
             validator_keypair,
@@ -2248,6 +2431,7 @@ mod tests {
             StakingOpBody::SelfUnstake {
                 bond_utxo_id,
                 validator_pubkey: pubkey_from_keypair(validator_keypair),
+                cold_authorization: None,
             },
             nonce,
             validator_keypair,
@@ -2266,6 +2450,7 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id,
                 target_validator_id,
+                cold_authorization: None,
             },
             nonce,
             validator_keypair,
@@ -2284,6 +2469,7 @@ mod tests {
             StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps,
+                cold_authorization: None,
             },
             nonce,
             validator_keypair,
@@ -2614,6 +2800,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: pubkey_from_keypair(&validator_keypair),
                 bond_proof: Some(bond_proof(1_000_000, 0x23)),
+                cold_authorization: None,
             },
             1,
             &validator_keypair,
@@ -3135,6 +3322,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: attacker_pubkey,
                 bond_proof: Some(bond_proof(2_000_000, 0x51)),
+                cold_authorization: None,
             },
             1,
             &attacker_keypair,
@@ -3167,6 +3355,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: attacker_pubkey,
                 bond_proof: Some(bond_proof(2_000_000, 0x54)),
+                cold_authorization: None,
             },
             1,
             &attacker_keypair,
@@ -3265,6 +3454,7 @@ mod tests {
             StakingOpBody::SelfUnstake {
                 bond_utxo_id,
                 validator_pubkey: attacker_pubkey,
+                cold_authorization: None,
             },
             2,
             &attacker_keypair,
@@ -3294,6 +3484,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: pubkey,
                 bond_proof: None,
+                cold_authorization: None,
             },
             1,
             &validator_keypair,
@@ -3318,6 +3509,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: pubkey,
                 bond_proof: Some(bond_proof(2_000_000, 0x3D)),
+                cold_authorization: None,
             },
             1,
             &validator_keypair,
@@ -3418,6 +3610,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey: pubkey,
                 bond_proof: Some(bond_proof(2_000_000, 0x36)),
+                cold_authorization: None,
             },
             1,
             &wrong_keypair,
@@ -3653,6 +3846,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey: payment_pubkey(0x42),
+                cold_authorization: None,
             },
             1,
             &owner_keypair,
@@ -3683,6 +3877,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey: payment_pubkey.clone(),
+                cold_authorization: None,
             },
             1,
             &owner_keypair,
@@ -3714,6 +3909,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey: payment_pubkey(0x47),
+                cold_authorization: None,
             },
             1,
             &wrong_keypair,
@@ -3737,6 +3933,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey,
+                cold_authorization: None,
             },
             1,
             &owner_keypair,
@@ -3767,6 +3964,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey: owner_pubkey.clone(),
                 payment_pubkey: first_pubkey,
+                cold_authorization: None,
             },
             1,
             &owner_keypair,
@@ -3776,6 +3974,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey: second_pubkey.clone(),
+                cold_authorization: None,
             },
             2,
             &owner_keypair,
@@ -3812,6 +4011,7 @@ mod tests {
             StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey: payment_pubkey(0x4E),
+                cold_authorization: None,
             },
             1,
             &owner_keypair,
@@ -3856,6 +4056,7 @@ mod tests {
             StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey,
+                cold_authorization: None,
             },
             1,
             &delegator_keypair,
@@ -3888,6 +4089,7 @@ mod tests {
             StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey,
+                cold_authorization: None,
             },
             1,
             &delegator_keypair,
@@ -3928,6 +4130,7 @@ mod tests {
             StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey,
+                cold_authorization: None,
             },
             1,
             &delegator_keypair,
@@ -5907,6 +6110,7 @@ mod tests {
                 StakingOpBody::SetCommission {
                     validator_id,
                     new_commission_bps: 1_250,
+                    cold_authorization: None,
                 },
                 1,
                 &hot,
@@ -6062,7 +6266,15 @@ mod tests {
             .get_mut(&validator_id)
             .unwrap()
             .pending_rewards = DUST_LIMIT_SPARK;
-        let claim = claim_rewards_op(&state, validator_id, &hot, 2);
+        let claim = cold_signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey: pubkey_from_keypair(&hot),
+                cold_authorization: cold_auth(1),
+            },
+            &cold,
+            &state.chain_id,
+        );
         let claim_height = state.height;
         apply_staking_op(&mut state, &claim, &chain_id, claim_height).unwrap();
         let reward = state
@@ -6226,6 +6438,7 @@ mod tests {
                 bond_utxo_id: consolidated,
                 validator_pubkey: pubkey_from_keypair(&hot),
                 bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0x7D)),
+                cold_authorization: None,
             },
             1,
             &hot,
@@ -6238,6 +6451,383 @@ mod tests {
         assert_eq!(
             state.staked_bonds.get(&consolidated).unwrap().custody_owner,
             StakeBondCustodyOwner::ValidatorColdIdentity(validator_id)
+        );
+    }
+
+    fn enrolled_authority_fixture(
+        hot_seed: u8,
+        cold_classical_seed: u8,
+        cold_pq_seed: u8,
+    ) -> (ChainState, Bytes32, HybridKeypair, HybridKeypair) {
+        let mut state = ChainState::new_genesis();
+        state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+        let (validator_id, hot) = make_active_validator(&mut state, hot_seed);
+        let cold = mixed_keypair(cold_classical_seed, cold_pq_seed);
+        let enroll = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(
+            &mut state,
+            &enroll,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        )
+        .unwrap();
+        (state, validator_id, hot, cold)
+    }
+
+    fn six_cold_operations(
+        state: &mut ChainState,
+        validator_id: Bytes32,
+        hot: &HybridKeypair,
+        cold: &HybridKeypair,
+        seed: u8,
+    ) {
+        state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK;
+        let hot_pubkey = pubkey_from_keypair(hot);
+        let cold_pubkey = pubkey_from_keypair(cold);
+        let self_stake_utxo = insert_delegator_utxo(state, cold_pubkey, DUST_LIMIT_SPARK, seed);
+        let operations = vec![
+            cold_signed_op(
+                StakingOpBody::ClaimRewards {
+                    validator_id,
+                    delegator_pubkey: hot_pubkey.clone(),
+                    cold_authorization: cold_auth(1),
+                },
+                cold,
+                &state.chain_id,
+            ),
+            cold_signed_op(
+                StakingOpBody::SetCommission {
+                    validator_id,
+                    new_commission_bps: 1_234,
+                    cold_authorization: cold_auth(2),
+                },
+                cold,
+                &state.chain_id,
+            ),
+            cold_signed_op(
+                StakingOpBody::SetAutoDelegate {
+                    validator_id,
+                    target_validator_id: Bytes32::ZERO,
+                    cold_authorization: cold_auth(3),
+                },
+                cold,
+                &state.chain_id,
+            ),
+            cold_signed_op(
+                StakingOpBody::RegisterPaymentKey {
+                    owner_pubkey: hot_pubkey.clone(),
+                    payment_pubkey: payment_pubkey(seed),
+                    cold_authorization: cold_auth(4),
+                },
+                cold,
+                &state.chain_id,
+            ),
+            cold_signed_op(
+                StakingOpBody::SelfStake {
+                    bond_utxo_id: self_stake_utxo,
+                    validator_pubkey: hot_pubkey.clone(),
+                    bond_proof: Some(bond_proof(DUST_LIMIT_SPARK, seed)),
+                    cold_authorization: cold_auth(5),
+                },
+                cold,
+                &state.chain_id,
+            ),
+            cold_signed_op(
+                StakingOpBody::SelfUnstake {
+                    bond_utxo_id: self_stake_utxo,
+                    validator_pubkey: hot_pubkey,
+                    cold_authorization: cold_auth(6),
+                },
+                cold,
+                &state.chain_id,
+            ),
+        ];
+        let chain_id = state.chain_id.clone();
+        for operation in operations {
+            apply_staking_op(
+                state,
+                &operation,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 6);
+        assert_eq!(state.staking_nonces.get(&validator_id), Some(&1));
+    }
+
+    #[test]
+    fn enrolled_validator_all_six_cold_only_operations_succeed() {
+        let (mut state, validator_id, hot, cold) = enrolled_authority_fixture(0x91, 0x92, 0x93);
+        six_cold_operations(&mut state, validator_id, &hot, &cold, 0x94);
+    }
+
+    #[test]
+    fn enrolled_validator_all_six_reject_hot_signatures_without_fallback() {
+        let (state, validator_id, hot, _) = enrolled_authority_fixture(0x95, 0x96, 0x97);
+        let hot_pubkey = pubkey_from_keypair(&hot);
+        let bodies = vec![
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey: hot_pubkey.clone(),
+                cold_authorization: None,
+            },
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_111,
+                cold_authorization: None,
+            },
+            StakingOpBody::SetAutoDelegate {
+                validator_id,
+                target_validator_id: Bytes32::ZERO,
+                cold_authorization: None,
+            },
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey: hot_pubkey.clone(),
+                payment_pubkey: payment_pubkey(0x98),
+                cold_authorization: None,
+            },
+            StakingOpBody::SelfStake {
+                bond_utxo_id: Bytes32::from([0x99; 32]),
+                validator_pubkey: hot_pubkey.clone(),
+                bond_proof: Some(bond_proof(DUST_LIMIT_SPARK, 0x99)),
+                cold_authorization: None,
+            },
+            StakingOpBody::SelfUnstake {
+                bond_utxo_id: Bytes32::from([0x9A; 32]),
+                validator_pubkey: hot_pubkey,
+                cold_authorization: None,
+            },
+        ];
+        for body in bodies {
+            let mut candidate = state.clone();
+            let hot_only = signed_op(body.clone(), 2, &hot, &candidate.chain_id);
+            let chain_id = candidate.chain_id.clone();
+            assert!(matches!(
+                apply_staking_op(
+                    &mut candidate,
+                    &hot_only,
+                    &chain_id,
+                    VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                ),
+                Err(StateError::InvalidStakingOp(reason))
+                    if reason.contains("hot fallback is prohibited")
+            ));
+            assert_eq!(
+                candidate.validators.get(&validator_id).unwrap().cold_nonce,
+                0
+            );
+            assert_eq!(candidate.staking_nonces.get(&validator_id), Some(&1));
+
+            let mut cold_form_body = body;
+            set_cold_auth(&mut cold_form_body, 1);
+            let hot_in_cold_slot = cold_signed_op(cold_form_body, &hot, &candidate.chain_id);
+            assert!(matches!(
+                apply_staking_op(
+                    &mut candidate,
+                    &hot_in_cold_slot,
+                    &chain_id,
+                    VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                ),
+                Err(StateError::StakingOpSignatureInvalid { .. })
+            ));
+            assert_eq!(
+                candidate.validators.get(&validator_id).unwrap().cold_nonce,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn unenrolled_validator_all_six_legacy_hot_operations_still_succeed() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0x9B);
+        let hot_pubkey = pubkey_from_keypair(&hot);
+        state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .pending_rewards = DUST_LIMIT_SPARK;
+        let self_stake_utxo =
+            insert_delegator_utxo(&mut state, hot_pubkey.clone(), DUST_LIMIT_SPARK, 0x9C);
+        let bodies = vec![
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey: hot_pubkey.clone(),
+                cold_authorization: None,
+            },
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_222,
+                cold_authorization: None,
+            },
+            StakingOpBody::SetAutoDelegate {
+                validator_id,
+                target_validator_id: Bytes32::ZERO,
+                cold_authorization: None,
+            },
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey: hot_pubkey.clone(),
+                payment_pubkey: payment_pubkey(0x9D),
+                cold_authorization: None,
+            },
+            StakingOpBody::SelfStake {
+                bond_utxo_id: self_stake_utxo,
+                validator_pubkey: hot_pubkey.clone(),
+                bond_proof: Some(bond_proof(DUST_LIMIT_SPARK, 0x9C)),
+                cold_authorization: None,
+            },
+            StakingOpBody::SelfUnstake {
+                bond_utxo_id: self_stake_utxo,
+                validator_pubkey: hot_pubkey,
+                cold_authorization: None,
+            },
+        ];
+        let chain_id = state.chain_id.clone();
+        for (index, body) in bodies.into_iter().enumerate() {
+            let operation = signed_op(body, index as u64 + 1, &hot, &chain_id);
+            apply_staking_op(
+                &mut state,
+                &operation,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.staking_nonces.get(&validator_id), Some(&6));
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
+    }
+
+    #[test]
+    fn delegator_claim_and_payment_registration_ignore_validator_cold_status() {
+        let (mut state, validator_id, _, _) = enrolled_authority_fixture(0xA1, 0xA2, 0xA3);
+        let delegator = keypair(0xA4);
+        let delegator_pubkey = pubkey_from_keypair(&delegator);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey.clone());
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
+            .unwrap();
+        state
+            .delegations
+            .update_delegator(&validator_id, &delegator_id, |entry| {
+                entry.pending_rewards = DUST_LIMIT_SPARK;
+            })
+            .unwrap();
+        let claim = signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey: delegator_pubkey.clone(),
+                cold_authorization: None,
+            },
+            1,
+            &delegator,
+            &state.chain_id,
+        );
+        let payment = signed_op(
+            StakingOpBody::RegisterPaymentKey {
+                owner_pubkey: delegator_pubkey,
+                payment_pubkey: payment_pubkey(0xA5),
+                cold_authorization: None,
+            },
+            2,
+            &delegator,
+            &state.chain_id,
+        );
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(
+            &mut state,
+            &claim,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        )
+        .unwrap();
+        apply_staking_op(
+            &mut state,
+            &payment,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        )
+        .unwrap();
+        assert_eq!(state.staking_nonces.get(&delegator_id), Some(&2));
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
+    }
+
+    #[test]
+    fn mixed_hot_cold_and_delegator_authority_replay_is_deterministic() {
+        fn replay() -> ChainState {
+            let (mut state, enrolled_id, enrolled_hot, enrolled_cold) =
+                enrolled_authority_fixture(0xA6, 0xA7, 0xA8);
+            six_cold_operations(&mut state, enrolled_id, &enrolled_hot, &enrolled_cold, 0xA9);
+
+            let (legacy_id, legacy_hot) = make_active_validator(&mut state, 0xAA);
+            let legacy_commission = signed_op(
+                StakingOpBody::SetCommission {
+                    validator_id: legacy_id,
+                    new_commission_bps: 1_333,
+                    cold_authorization: None,
+                },
+                1,
+                &legacy_hot,
+                &state.chain_id,
+            );
+            let delegator = keypair(0xAB);
+            let delegator_pubkey = pubkey_from_keypair(&delegator);
+            let delegator_id = pubkey_to_id(&delegator_pubkey);
+            state
+                .delegator_identities
+                .insert(delegator_id, delegator_pubkey.clone());
+            state
+                .delegations
+                .add_delegation(enrolled_id, delegator_id, 1_000_000, 0)
+                .unwrap();
+            state
+                .delegations
+                .update_delegator(&enrolled_id, &delegator_id, |entry| {
+                    entry.pending_rewards = DUST_LIMIT_SPARK;
+                })
+                .unwrap();
+            let claim = signed_op(
+                StakingOpBody::ClaimRewards {
+                    validator_id: enrolled_id,
+                    delegator_pubkey,
+                    cold_authorization: None,
+                },
+                1,
+                &delegator,
+                &state.chain_id,
+            );
+            let chain_id = state.chain_id.clone();
+            apply_staking_op(
+                &mut state,
+                &legacy_commission,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            )
+            .unwrap();
+            apply_staking_op(
+                &mut state,
+                &claim,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            )
+            .unwrap();
+            state
+        }
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::compute_state_root(&first),
+            crate::compute_state_root(&second)
         );
     }
 }

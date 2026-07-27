@@ -1265,6 +1265,7 @@ mod tests {
             body: StakingOpBody::RegisterPaymentKey {
                 owner_pubkey: staking_pubkey_from_keypair(owner_keypair),
                 payment_pubkey,
+                cold_authorization: None,
             },
             nonce,
             signature: dummy_sig(),
@@ -1575,6 +1576,7 @@ mod tests {
             body: StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey,
+                cold_authorization: None,
             },
             nonce,
             signature: dummy_sig(),
@@ -1606,6 +1608,7 @@ mod tests {
                 bond_utxo_id,
                 validator_pubkey,
                 bond_proof,
+                cold_authorization: None,
             },
             nonce,
             signature: dummy_sig(),

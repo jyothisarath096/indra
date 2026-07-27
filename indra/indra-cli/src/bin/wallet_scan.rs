@@ -1441,6 +1441,7 @@ mod tests {
             body: StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey: owner,
+                cold_authorization: None,
             },
             nonce: 1,
             signature: dummy_signature(0x84),

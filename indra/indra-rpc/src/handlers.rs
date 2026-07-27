@@ -1108,6 +1108,7 @@ fn classify_staking_provenance(
         if let StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey,
+            ..
         } = &op.body
         {
             let delegator_id = staking_pubkey_to_id(delegator_pubkey);
@@ -2941,6 +2942,7 @@ mod tests {
                 body: StakingOpBody::ClaimRewards {
                     validator_id,
                     delegator_pubkey,
+                    cold_authorization: None,
                 },
                 nonce: 1,
                 signature: dummy_signature(0x31),
@@ -2975,6 +2977,7 @@ mod tests {
                 body: StakingOpBody::ClaimRewards {
                     validator_id,
                     delegator_pubkey,
+                    cold_authorization: None,
                 },
                 nonce: 1,
                 signature: dummy_signature(0x32),
@@ -3632,6 +3635,7 @@ mod tests {
             body: StakingOpBody::RegisterPaymentKey {
                 owner_pubkey,
                 payment_pubkey: payment_pubkey.clone(),
+                cold_authorization: None,
             },
             nonce: 1,
             signature: HybridSignature {

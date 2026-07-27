@@ -139,6 +139,7 @@ fn self_stake_op(
             bond_utxo_id,
             validator_pubkey,
             bond_proof,
+            cold_authorization: None,
         },
         nonce,
         signature: dummy_sig(),
@@ -158,6 +159,7 @@ fn self_unstake_op(
         body: StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey,
+            cold_authorization: None,
         },
         nonce,
         signature: dummy_sig(),

@@ -954,6 +954,7 @@ mod tests {
                     classical_pk: Bytes32::from([0x32; 32]),
                     pq_pk: VariableBytes::from_slice(&[0x33; 32]).unwrap(),
                 },
+                cold_authorization: None,
             },
             nonce: 7,
             signature: dummy_sig(),

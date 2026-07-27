@@ -261,17 +261,20 @@ impl NodeEngine {
         op.validate_structure()
             .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
         let signer_id = op.signer_id();
-        let nonce = op.nonce;
+        let cold_authorization = op.cold_authorization();
         let mut scratch = self.state.clone();
         let chain_id = self.state.chain_id.clone();
         let validation_height = self.state.height.saturating_add(1);
         apply_staking_op(&mut scratch, &op, &chain_id, validation_height)
             .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
-        if self
-            .staking_mempool
-            .iter()
-            .any(|existing| existing.signer_id() == signer_id && existing.nonce == nonce)
-        {
+        if self.staking_mempool.iter().any(|existing| {
+            existing.signer_id() == signer_id
+                && match (existing.cold_authorization(), cold_authorization) {
+                    (Some(existing), Some(submitted)) => existing == submitted,
+                    (None, None) => existing.nonce == op.nonce,
+                    _ => false,
+                }
+        }) {
             return Err(NodeError::InvalidStakingOp(
                 "duplicate staking op nonce".into(),
             ));
@@ -412,9 +415,17 @@ impl NodeEngine {
     pub fn evict_committed_staking_ops(&mut self, committed_ops: &[StakingOp]) {
         for op in committed_ops {
             let signer_id = op.signer_id();
-            let nonce = op.nonce;
-            self.staking_mempool
-                .retain(|existing| !(existing.signer_id() == signer_id && existing.nonce == nonce));
+            let cold_authorization = op.cold_authorization();
+            self.staking_mempool.retain(|existing| {
+                if existing.signer_id() != signer_id {
+                    return true;
+                }
+                !match (existing.cold_authorization(), cold_authorization) {
+                    (Some(existing), Some(committed)) => existing == committed,
+                    (None, None) => existing.nonce == op.nonce,
+                    _ => false,
+                }
+            });
         }
     }
 
@@ -1216,6 +1227,7 @@ mod tests {
             body: StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps,
+                cold_authorization: None,
             },
             nonce,
             signature: dummy_signature(),
