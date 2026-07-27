@@ -969,6 +969,7 @@ mod tests {
             payload: GovernancePayload::Commit {
                 proposal_id: Bytes32::from([0x42; 32]),
                 commit_hash: Bytes32::from([0x43; 32]),
+                cold_authorization: None,
             },
             signature: dummy_sig(),
         }

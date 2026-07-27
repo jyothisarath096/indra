@@ -4280,6 +4280,7 @@ mod tests {
             nonce,
             payload: indra_core::types::governance::GovernancePayload::Cancel {
                 proposal_id: indra_core::Bytes32::from([0x42; 32]),
+                cold_authorization: None,
             },
             signature: dummy_hybrid_sig(),
         }

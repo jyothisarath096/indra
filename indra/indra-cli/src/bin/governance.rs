@@ -64,6 +64,7 @@ fn run() -> CliResult<()> {
                     &required_flag(&args, "--description")?,
                     "--description",
                 )?,
+                cold_authorization: None,
             }
         }
         "commit" => {
@@ -73,6 +74,7 @@ fn run() -> CliResult<()> {
             GovernancePayload::Commit {
                 proposal_id,
                 commit_hash: governance_vote_commit_hash(proposal_id, signer_id, vote, vote_nonce),
+                cold_authorization: None,
             }
         }
         "reveal" => {
@@ -81,6 +83,7 @@ fn run() -> CliResult<()> {
                 proposal_id,
                 vote: parse_vote(&required_flag(&args, "--vote")?)?,
                 nonce: vote_nonce_for_reveal(&args, &keys_path, proposal_id, signer_id)?,
+                cold_authorization: None,
             }
         }
         "redelegate" => GovernancePayload::Redelegate {
@@ -94,6 +97,7 @@ fn run() -> CliResult<()> {
         },
         "cancel" => GovernancePayload::Cancel {
             proposal_id: parse_hex32_required(&args, "--proposal-id")?,
+            cold_authorization: None,
         },
         _ => {
             print_help();

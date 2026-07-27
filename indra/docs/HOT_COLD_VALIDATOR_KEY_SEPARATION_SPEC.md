@@ -237,6 +237,38 @@ unenrolled validator and an ordinary delegator MUST use the legacy form; an
 Active validator MUST use the cold form for every operation designated above.
 There is no hot-signature fallback for an Active validator.
 
+#### 2.3.2 Cold-only governance-operation wire extension
+
+The validator governance operations `Propose`, `Commit`, `Reveal`, and `Cancel`
+use the same additive wire-extension and nonce rules as Section 2.3.1. Their
+cold-form wire and authorization-envelope tags are respectively 19, 20, 21,
+and 22, continuing the global tag sequence after the staking cold forms. Each
+cold form appends:
+
+```text
+cold_key_version: u64
+cold_nonce: u64
+```
+
+The existing outer `GovernanceOpV2.nonce` MUST equal zero in a cold form and
+has no replay-protection meaning there. The extension consumes the same
+validator-record `cold_nonce` namespace used by cold staking operations.
+`GovernanceOpV2.signature` contains one complete cold hybrid signature over a
+canonical `AuthorizationEnvelope::new_cold`. Its payload is the complete
+encoded cold-form governance payload followed by the zero-valued outer nonce;
+signature bytes are excluded.
+
+Legacy encodings remain byte-identical when the extension is absent. An Active
+validator MUST use the cold form for `Propose`, `Commit`, `Reveal`, and
+`Cancel`, with no hot fallback. An Unenrolled validator MUST use the legacy
+hot-only form.
+
+`Execute` has no cold form and remains hot-only for every validator status.
+`Redelegate` has no validator cold form: its signer is exclusively an ordinary
+delegator, resolved from active delegated stake and authorized by that
+delegator's existing full hybrid custody identity key. Validator cold-key
+enrollment cannot alter Redelegate encoding, nonce handling, or authority.
+
 ### 2.4 Initial validator registration
 
 The registration payload contains:

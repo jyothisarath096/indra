@@ -1351,6 +1351,7 @@ mod tests {
             proposer_pubkey,
             title: VariableBytes::from_slice(b"txn oracle").unwrap(),
             description: VariableBytes::from_slice(b"state txn governance test").unwrap(),
+            cold_authorization: None,
         };
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::ProposeChange,
@@ -1373,6 +1374,7 @@ mod tests {
         let payload = GovernancePayload::Commit {
             proposal_id,
             commit_hash,
+            cold_authorization: None,
         };
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::CommitVote,
@@ -1397,6 +1399,7 @@ mod tests {
             proposal_id,
             vote,
             nonce: vote_nonce,
+            cold_authorization: None,
         };
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::RevealVote,
@@ -1459,7 +1462,10 @@ mod tests {
         proposal_id: Bytes32,
         nonce: u64,
     ) -> GovernanceOpV2 {
-        let payload = GovernancePayload::Cancel { proposal_id };
+        let payload = GovernancePayload::Cancel {
+            proposal_id,
+            cold_authorization: None,
+        };
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::CancelProposal,
             signer_id,

@@ -3349,6 +3349,7 @@ mod tests {
                     proposer_pubkey: owner.clone(),
                     title: VariableBytes::from_slice(b"title").unwrap(),
                     description: VariableBytes::from_slice(b"description").unwrap(),
+                    cold_authorization: None,
                 },
                 signature: dummy_signature(0x72),
             });

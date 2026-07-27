@@ -292,15 +292,18 @@ impl NodeEngine {
     /// Add a governance operation to the pending pool.
     pub fn add_governance_op(&mut self, op: GovernanceOpV2) -> NodeResult<()> {
         let signer_id = op.signer_id;
-        let nonce = op.nonce;
+        let cold_authorization = op.cold_authorization();
         let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
         validate_governance_op(&self.state, &op, current_epoch, &self.state.chain_id)
             .map_err(|error| NodeError::InvalidGovernanceOp(error.to_string()))?;
-        if self
-            .governance_mempool
-            .iter()
-            .any(|existing| existing.signer_id == signer_id && existing.nonce == nonce)
-        {
+        if self.governance_mempool.iter().any(|existing| {
+            existing.signer_id == signer_id
+                && match (existing.cold_authorization(), cold_authorization) {
+                    (Some(existing), Some(submitted)) => existing == submitted,
+                    (None, None) => existing.nonce == op.nonce,
+                    _ => false,
+                }
+        }) {
             return Err(NodeError::InvalidGovernanceOp(
                 "duplicate governance op nonce".into(),
             ));
@@ -433,9 +436,17 @@ impl NodeEngine {
     pub fn evict_committed_governance_ops(&mut self, committed_ops: &[GovernanceOpV2]) {
         for op in committed_ops {
             let signer_id = op.signer_id;
-            let nonce = op.nonce;
-            self.governance_mempool
-                .retain(|existing| !(existing.signer_id == signer_id && existing.nonce == nonce));
+            let cold_authorization = op.cold_authorization();
+            self.governance_mempool.retain(|existing| {
+                if existing.signer_id != signer_id {
+                    return true;
+                }
+                !match (existing.cold_authorization(), cold_authorization) {
+                    (Some(existing), Some(committed)) => existing == committed,
+                    (None, None) => existing.nonce == op.nonce,
+                    _ => false,
+                }
+            });
         }
     }
 
@@ -1098,8 +1109,8 @@ mod tests {
     use indra_core::codec::Encode;
     use indra_core::types::crypto::{HybridPubKey, HybridSignature};
     use indra_core::types::governance::{
-        governance_signing_domain, GovernableAction, GovernanceActionType, GovernanceOpV2,
-        GovernancePayload,
+        governance_signing_domain, ColdGovernanceAuthorization, GovernableAction,
+        GovernanceActionType, GovernanceOpV2, GovernancePayload,
     };
     use indra_core::types::primitives::{
         DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
@@ -1260,6 +1271,18 @@ mod tests {
         };
     }
 
+    fn sign_cold_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair) {
+        let bytes = op
+            .cold_authorization_signing_bytes(DEFAULT_CHAIN_ID)
+            .unwrap()
+            .unwrap();
+        let sig = keypair.sign(&bytes).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
     fn governance_deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
         OutputV1 {
             value_spark,
@@ -1300,6 +1323,7 @@ mod tests {
             proposer_pubkey,
             title: VariableBytes::from_slice(b"test").unwrap(),
             description: VariableBytes::from_slice(b"test").unwrap(),
+            cold_authorization: None,
         };
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::ProposeChange,
@@ -1309,6 +1333,59 @@ mod tests {
             signature: dummy_signature(),
         };
         sign_governance_op(&mut op, keypair);
+        op
+    }
+
+    fn valid_cold_governance_propose_op(
+        engine: &mut NodeEngine,
+        hot_keypair: &HybridKeypair,
+        cold_keypair: &HybridKeypair,
+        cold_nonce: u64,
+    ) -> GovernanceOpV2 {
+        let signer_id = Bytes32::from(indra_crypto::sha256(&hot_keypair.public_key().classical.0));
+        let cold_public = cold_keypair.public_key();
+        let cold_pubkey = HybridPubKey {
+            classical_pk: Bytes32::from(cold_public.classical.0),
+            pq_pk: VariableBytes::from_slice(&cold_public.pq.0).unwrap(),
+        };
+        let validator = engine.state.validators.get_mut(&signer_id).unwrap();
+        validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
+        validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
+        validator.cold_key_version = 1;
+        validator.cold_key_status = indra_state::ColdKeyStatus::Active;
+        let deposit_utxo_id = engine
+            .state
+            .utxos
+            .insert(
+                governance_deposit_output(
+                    cold_pubkey.clone(),
+                    engine.state.governance.params.proposal_deposit_spark,
+                ),
+                0,
+                cold_nonce as u32,
+                0,
+            )
+            .unwrap();
+        let mut op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ProposeChange,
+            signer_id,
+            nonce: 0,
+            payload: GovernancePayload::Propose {
+                action: GovernableAction::SetMinDelegationSpark {
+                    value: DUST_LIMIT_SPARK,
+                },
+                deposit_utxo_id,
+                proposer_pubkey: cold_pubkey,
+                title: VariableBytes::from_slice(b"cold test").unwrap(),
+                description: VariableBytes::from_slice(b"cold test").unwrap(),
+                cold_authorization: Some(ColdGovernanceAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce,
+                }),
+            },
+            signature: dummy_signature(),
+        };
+        sign_cold_governance_op(&mut op, cold_keypair);
         op
     }
 
@@ -2100,6 +2177,7 @@ mod tests {
             payload: GovernancePayload::Commit {
                 proposal_id: Bytes32::from([0x99; 32]),
                 commit_hash: Bytes32::from([0x44; 32]),
+                cold_authorization: None,
             },
             signature: dummy_signature(),
         };
@@ -2125,6 +2203,44 @@ mod tests {
         engine.add_governance_op(op.clone()).unwrap();
 
         assert_eq!(engine.governance_mempool, vec![op]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_mempool_deduplicates_and_evicts_by_cold_role_nonce() {
+        let dir = temp_dir("governance_cold_role_nonce");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        engine.state.height = u64::MAX;
+        let hot = install_active_validator(&mut engine, [0x73; 32], "cold-gov");
+        let cold = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x74; 32]),
+            PqKeypair::from_seed(&[0x75; 32]).unwrap(),
+        );
+        let op1 = valid_cold_governance_propose_op(&mut engine, &hot, &cold, 1);
+
+        engine.add_governance_op(op1.clone()).unwrap();
+        assert!(matches!(
+            engine.add_governance_op(op1.clone()),
+            Err(NodeError::InvalidGovernanceOp(reason))
+                if reason.contains("duplicate governance op nonce")
+        ));
+
+        let mut op2 = op1.clone();
+        if let GovernancePayload::Propose {
+            cold_authorization, ..
+        } = &mut op2.payload
+        {
+            *cold_authorization = Some(ColdGovernanceAuthorization {
+                cold_key_version: 1,
+                cold_nonce: 2,
+            });
+        }
+        sign_cold_governance_op(&mut op2, &cold);
+        engine.governance_mempool.push(op2.clone());
+        engine.evict_committed_governance_ops(&[op1]);
+        assert_eq!(engine.governance_mempool, vec![op2]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

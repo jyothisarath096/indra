@@ -5,12 +5,57 @@ use crate::{
     error::{IndraError, IndraResult},
     ssz::sha256,
     types::{
+        authorization::AuthorizationEnvelope,
         crypto::{HybridPubKey, HybridSignature},
         primitives::{
-            Bytes32, VariableBytes, SCHEMA_VERSION, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+            validator_cold_key_enrollment_active, Bytes32, VariableBytes, SCHEMA_VERSION,
+            SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
         },
     },
 };
+
+const TAG_COLD_PROPOSE: u8 = 19;
+const TAG_COLD_COMMIT: u8 = 20;
+const TAG_COLD_REVEAL: u8 = 21;
+const TAG_COLD_CANCEL: u8 = 22;
+
+/// Stable authorization-envelope tag for cold governance proposals.
+pub const AUTH_TAG_COLD_PROPOSE: u16 = TAG_COLD_PROPOSE as u16;
+/// Stable authorization-envelope tag for cold governance vote commitments.
+pub const AUTH_TAG_COLD_COMMIT: u16 = TAG_COLD_COMMIT as u16;
+/// Stable authorization-envelope tag for cold governance vote reveals.
+pub const AUTH_TAG_COLD_REVEAL: u16 = TAG_COLD_REVEAL as u16;
+/// Stable authorization-envelope tag for cold governance cancellation.
+pub const AUTH_TAG_COLD_CANCEL: u16 = TAG_COLD_CANCEL as u16;
+
+/// Versioned replay metadata attached only to cold-authorized governance forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdGovernanceAuthorization {
+    /// Registered cold-key version that must authorize the operation.
+    pub cold_key_version: u64,
+    /// Next nonce in the shared validator cold-role nonce namespace.
+    pub cold_nonce: u64,
+}
+
+impl Encode for ColdGovernanceAuthorization {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.cold_key_version.encode(buf);
+        self.cold_nonce.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        16
+    }
+}
+
+impl Decode for ColdGovernanceAuthorization {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            cold_key_version: u64::decode(r)?,
+            cold_nonce: u64::decode(r)?,
+        })
+    }
+}
 
 /// Governance action discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +312,8 @@ pub enum GovernancePayload {
         title: VariableBytes<128>,
         /// Description.
         description: VariableBytes<1024>,
+        /// Present only for an enrolled validator.
+        cold_authorization: Option<ColdGovernanceAuthorization>,
     },
     /// Vote commitment.
     Commit {
@@ -276,6 +323,8 @@ pub enum GovernancePayload {
         ///
         /// See [`governance_vote_commit_hash`] for the exact preimage.
         commit_hash: Bytes32,
+        /// Present only for an enrolled validator.
+        cold_authorization: Option<ColdGovernanceAuthorization>,
     },
     /// Vote reveal.
     Reveal {
@@ -285,6 +334,8 @@ pub enum GovernancePayload {
         vote: u8,
         /// Commit nonce.
         nonce: Bytes32,
+        /// Present only for an enrolled validator.
+        cold_authorization: Option<ColdGovernanceAuthorization>,
     },
     /// Weight-only redelegation.
     Redelegate {
@@ -306,6 +357,8 @@ pub enum GovernancePayload {
     Cancel {
         /// Proposal id.
         proposal_id: Bytes32,
+        /// Present only for an enrolled validator.
+        cold_authorization: Option<ColdGovernanceAuthorization>,
     },
 }
 
@@ -332,31 +385,55 @@ impl Encode for GovernancePayload {
                 proposer_pubkey,
                 title,
                 description,
+                cold_authorization,
             } => {
-                0u8.encode(buf);
+                if cold_authorization.is_some() {
+                    TAG_COLD_PROPOSE.encode(buf);
+                } else {
+                    0u8.encode(buf);
+                }
                 action.encode(buf);
                 deposit_utxo_id.encode(buf);
                 proposer_pubkey.encode(buf);
                 title.encode(buf);
                 description.encode(buf);
+                if let Some(authorization) = cold_authorization {
+                    authorization.encode(buf);
+                }
             }
             Self::Commit {
                 proposal_id,
                 commit_hash,
+                cold_authorization,
             } => {
-                1u8.encode(buf);
+                if cold_authorization.is_some() {
+                    TAG_COLD_COMMIT.encode(buf);
+                } else {
+                    1u8.encode(buf);
+                }
                 proposal_id.encode(buf);
                 commit_hash.encode(buf);
+                if let Some(authorization) = cold_authorization {
+                    authorization.encode(buf);
+                }
             }
             Self::Reveal {
                 proposal_id,
                 vote,
                 nonce,
+                cold_authorization,
             } => {
-                2u8.encode(buf);
+                if cold_authorization.is_some() {
+                    TAG_COLD_REVEAL.encode(buf);
+                } else {
+                    2u8.encode(buf);
+                }
                 proposal_id.encode(buf);
                 vote.encode(buf);
                 nonce.encode(buf);
+                if let Some(authorization) = cold_authorization {
+                    authorization.encode(buf);
+                }
             }
             Self::Redelegate {
                 proposal_id,
@@ -374,9 +451,19 @@ impl Encode for GovernancePayload {
                 4u8.encode(buf);
                 proposal_id.encode(buf);
             }
-            Self::Cancel { proposal_id } => {
-                5u8.encode(buf);
+            Self::Cancel {
+                proposal_id,
+                cold_authorization,
+            } => {
+                if cold_authorization.is_some() {
+                    TAG_COLD_CANCEL.encode(buf);
+                } else {
+                    5u8.encode(buf);
+                }
                 proposal_id.encode(buf);
+                if let Some(authorization) = cold_authorization {
+                    authorization.encode(buf);
+                }
             }
         }
     }
@@ -389,17 +476,26 @@ impl Encode for GovernancePayload {
                 proposer_pubkey,
                 title,
                 description,
+                cold_authorization,
             } => {
                 action.encoded_len()
                     + deposit_utxo_id.encoded_len()
                     + proposer_pubkey.encoded_len()
                     + title.encoded_len()
                     + description.encoded_len()
+                    + cold_authorization.as_ref().map_or(0, Encode::encoded_len)
             }
-            Self::Commit { .. } => 64,
-            Self::Reveal { .. } => 65,
+            Self::Commit {
+                cold_authorization, ..
+            } => 64 + cold_authorization.as_ref().map_or(0, Encode::encoded_len),
+            Self::Reveal {
+                cold_authorization, ..
+            } => 65 + cold_authorization.as_ref().map_or(0, Encode::encoded_len),
             Self::Redelegate { .. } => 104,
-            Self::Execute { .. } | Self::Cancel { .. } => 32,
+            Self::Execute { .. } => 32,
+            Self::Cancel {
+                cold_authorization, ..
+            } => 32 + cold_authorization.as_ref().map_or(0, Encode::encoded_len),
         }
     }
 }
@@ -413,15 +509,18 @@ impl Decode for GovernancePayload {
                 proposer_pubkey: HybridPubKey::decode(r)?,
                 title: VariableBytes::decode(r)?,
                 description: VariableBytes::decode(r)?,
+                cold_authorization: None,
             }),
             1 => Ok(Self::Commit {
                 proposal_id: Bytes32::decode(r)?,
                 commit_hash: Bytes32::decode(r)?,
+                cold_authorization: None,
             }),
             2 => Ok(Self::Reveal {
                 proposal_id: Bytes32::decode(r)?,
                 vote: u8::decode(r)?,
                 nonce: Bytes32::decode(r)?,
+                cold_authorization: None,
             }),
             3 => Ok(Self::Redelegate {
                 proposal_id: Bytes32::decode(r)?,
@@ -434,6 +533,30 @@ impl Decode for GovernancePayload {
             }),
             5 => Ok(Self::Cancel {
                 proposal_id: Bytes32::decode(r)?,
+                cold_authorization: None,
+            }),
+            TAG_COLD_PROPOSE => Ok(Self::Propose {
+                action: GovernableAction::decode(r)?,
+                deposit_utxo_id: Bytes32::decode(r)?,
+                proposer_pubkey: HybridPubKey::decode(r)?,
+                title: VariableBytes::decode(r)?,
+                description: VariableBytes::decode(r)?,
+                cold_authorization: Some(ColdGovernanceAuthorization::decode(r)?),
+            }),
+            TAG_COLD_COMMIT => Ok(Self::Commit {
+                proposal_id: Bytes32::decode(r)?,
+                commit_hash: Bytes32::decode(r)?,
+                cold_authorization: Some(ColdGovernanceAuthorization::decode(r)?),
+            }),
+            TAG_COLD_REVEAL => Ok(Self::Reveal {
+                proposal_id: Bytes32::decode(r)?,
+                vote: u8::decode(r)?,
+                nonce: Bytes32::decode(r)?,
+                cold_authorization: Some(ColdGovernanceAuthorization::decode(r)?),
+            }),
+            TAG_COLD_CANCEL => Ok(Self::Cancel {
+                proposal_id: Bytes32::decode(r)?,
+                cold_authorization: Some(ColdGovernanceAuthorization::decode(r)?),
             }),
             b => Err(IndraError::InvalidBool { byte: b }),
         }
@@ -453,6 +576,91 @@ pub struct GovernanceOpV2 {
     pub payload: GovernancePayload,
     /// Hybrid signature.
     pub signature: HybridSignature,
+}
+
+impl GovernanceOpV2 {
+    /// Return cold replay metadata for a cold-authorized validator operation.
+    pub fn cold_authorization(&self) -> Option<ColdGovernanceAuthorization> {
+        match &self.payload {
+            GovernancePayload::Propose {
+                cold_authorization, ..
+            }
+            | GovernancePayload::Commit {
+                cold_authorization, ..
+            }
+            | GovernancePayload::Reveal {
+                cold_authorization, ..
+            }
+            | GovernancePayload::Cancel {
+                cold_authorization, ..
+            } => *cold_authorization,
+            GovernancePayload::Redelegate { .. } | GovernancePayload::Execute { .. } => None,
+        }
+    }
+
+    /// Construct the canonical cold-role authorization envelope bytes.
+    pub fn cold_authorization_signing_bytes(&self, chain_id: &str) -> IndraResult<Option<Vec<u8>>> {
+        let Some(authorization) = self.cold_authorization() else {
+            return Ok(None);
+        };
+        if self.nonce != 0 {
+            return Err(IndraError::InvariantViolation {
+                message: "cold-authorized governance op outer nonce must be zero",
+            });
+        }
+        let operation_tag = match &self.payload {
+            GovernancePayload::Propose { .. } => AUTH_TAG_COLD_PROPOSE,
+            GovernancePayload::Commit { .. } => AUTH_TAG_COLD_COMMIT,
+            GovernancePayload::Reveal { .. } => AUTH_TAG_COLD_REVEAL,
+            GovernancePayload::Cancel { .. } => AUTH_TAG_COLD_CANCEL,
+            GovernancePayload::Redelegate { .. } | GovernancePayload::Execute { .. } => {
+                return Err(IndraError::InvariantViolation {
+                    message: "governance payload cannot carry cold authorization",
+                });
+            }
+        };
+        let mut payload = self.payload.encode_to_vec();
+        self.nonce.encode(&mut payload);
+        Ok(Some(
+            AuthorizationEnvelope::new_cold(
+                chain_id.as_bytes(),
+                operation_tag,
+                self.signer_id,
+                authorization.cold_key_version,
+                authorization.cold_nonce,
+                &payload,
+            )?
+            .signing_bytes(),
+        ))
+    }
+
+    /// Enforce the enrollment-gated structural split between legacy and cold forms.
+    pub fn validate_structure_at_height(&self, height: u64) -> IndraResult<()> {
+        if self.payload.action_type() != self.action_type {
+            return Err(IndraError::InvariantViolation {
+                message: "governance payload/action type mismatch",
+            });
+        }
+        if let Some(authorization) = self.cold_authorization() {
+            if !validator_cold_key_enrollment_active(height) {
+                return Err(IndraError::InvariantViolation {
+                    message:
+                        "cold-authorized governance op is unavailable before enrollment height",
+                });
+            }
+            if self.nonce != 0 {
+                return Err(IndraError::InvariantViolation {
+                    message: "cold-authorized governance op outer nonce must be zero",
+                });
+            }
+            if authorization.cold_key_version == 0 || authorization.cold_nonce == 0 {
+                return Err(IndraError::InvariantViolation {
+                    message: "cold authorization requires non-zero key version and nonce",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Encode for GovernanceOpV2 {
@@ -590,6 +798,7 @@ mod tests {
                 proposer_pubkey: dummy_pubkey(),
                 title: VariableBytes::from_slice(b"title").unwrap(),
                 description: VariableBytes::from_slice(b"description").unwrap(),
+                cold_authorization: None,
             },
             signature: dummy_sig(),
         };
@@ -597,6 +806,67 @@ mod tests {
             op,
             GovernanceOpV2::decode_exact(&op.encode_to_vec()).unwrap()
         );
+    }
+
+    #[test]
+    fn cold_governance_wire_round_trip_preserves_legacy_bytes() {
+        let legacy = GovernancePayload::Commit {
+            proposal_id: Bytes32::from([0x11; 32]),
+            commit_hash: Bytes32::from([0x22; 32]),
+            cold_authorization: None,
+        };
+        let mut expected_legacy = vec![1u8];
+        expected_legacy.extend_from_slice(&[0x11; 32]);
+        expected_legacy.extend_from_slice(&[0x22; 32]);
+        assert_eq!(legacy.encode_to_vec(), expected_legacy);
+
+        let cold = GovernancePayload::Commit {
+            proposal_id: Bytes32::from([0x11; 32]),
+            commit_hash: Bytes32::from([0x22; 32]),
+            cold_authorization: Some(ColdGovernanceAuthorization {
+                cold_key_version: 7,
+                cold_nonce: 9,
+            }),
+        };
+        assert_eq!(cold.encode_to_vec()[0], TAG_COLD_COMMIT);
+        assert_eq!(
+            GovernancePayload::decode_exact(&cold.encode_to_vec()).unwrap(),
+            cold
+        );
+        assert_ne!(cold.encode_to_vec(), legacy.encode_to_vec());
+    }
+
+    #[test]
+    fn cold_governance_envelope_binds_role_metadata_and_outer_nonce() {
+        let op = GovernanceOpV2 {
+            action_type: GovernanceActionType::CommitVote,
+            signer_id: Bytes32::from([0x33; 32]),
+            nonce: 0,
+            payload: GovernancePayload::Commit {
+                proposal_id: Bytes32::from([0x44; 32]),
+                commit_hash: Bytes32::from([0x55; 32]),
+                cold_authorization: Some(ColdGovernanceAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 6,
+                }),
+            },
+            signature: dummy_sig(),
+        };
+        let bytes = op
+            .cold_authorization_signing_bytes("indra-testnet-1")
+            .unwrap()
+            .unwrap();
+        let envelope = AuthorizationEnvelope::decode_exact(&bytes).unwrap();
+        assert_eq!(envelope.operation_tag(), AUTH_TAG_COLD_COMMIT);
+        assert_eq!(envelope.identity_id(), op.signer_id);
+        assert_eq!(envelope.authority_key_version(), 2);
+        assert_eq!(envelope.role_nonce(), 6);
+
+        let mut malformed = op.clone();
+        malformed.nonce = 1;
+        assert!(malformed
+            .cold_authorization_signing_bytes("indra-testnet-1")
+            .is_err());
     }
 
     #[test]

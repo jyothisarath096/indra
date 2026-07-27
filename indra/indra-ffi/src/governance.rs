@@ -279,6 +279,7 @@ pub unsafe extern "C" fn indra_build_governance_propose(
                     .map_err(|_| IndraError::InvalidParam)?,
                 description: VariableBytes::from_slice(description_str.as_bytes())
                     .map_err(|_| IndraError::InvalidParam)?,
+                cold_authorization: None,
             })
         },
     )
@@ -322,6 +323,7 @@ pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
                     .map_err(|_| IndraError::InvalidParam)?,
                 description: VariableBytes::from_slice(description_str.as_bytes())
                     .map_err(|_| IndraError::InvalidParam)?,
+                cold_authorization: None,
             })
         },
     )
@@ -397,6 +399,7 @@ pub unsafe extern "C" fn indra_build_governance_commit(
             Ok(GovernancePayload::Commit {
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
                 commit_hash: commitment,
+                cold_authorization: None,
             })
         },
     )
@@ -433,6 +436,7 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
             Ok(GovernancePayload::Commit {
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
                 commit_hash: commitment,
+                cold_authorization: None,
             })
         },
     )
@@ -477,6 +481,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal(
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
                 vote: wire_vote(vote)?,
                 nonce: Bytes32::from(read_bytes32(reveal_nonce)),
+                cold_authorization: None,
             })
         },
     )
@@ -509,6 +514,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
                 vote: wire_vote(vote)?,
                 nonce: Bytes32::from(read_bytes32(reveal_nonce)),
+                cold_authorization: None,
             })
         },
     )
@@ -697,6 +703,7 @@ pub unsafe extern "C" fn indra_build_governance_cancel(
         |_| {
             Ok(GovernancePayload::Cancel {
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+                cold_authorization: None,
             })
         },
     )
@@ -725,6 +732,7 @@ pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
         |_| {
             Ok(GovernancePayload::Cancel {
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
+                cold_authorization: None,
             })
         },
     )
