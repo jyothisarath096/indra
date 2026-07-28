@@ -170,6 +170,10 @@ pub enum StateError {
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
 
+    /// Canonical consensus-snapshot construction or retention failed.
+    #[error("invalid consensus snapshot state: {0}")]
+    InvalidConsensusSnapshot(String),
+
     /// A bond-producing staking op omitted the required commitment proof.
     #[error("staking bond proof required")]
     BondProofRequired,

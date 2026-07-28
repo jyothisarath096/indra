@@ -811,6 +811,21 @@ fn apply_block_inner(
     update_last_active_epoch_from_block_qc(txn.state_mut(), block);
     txn.after_mutation()?;
 
+    // Snapshot rotation is deliberately last: it must observe the fully
+    // settled post-boundary validator state after reselection, rewards,
+    // releases, liveness penalties, and QC activity accounting.
+    if is_epoch_boundary(txn.state().height) {
+        let boundary_height = txn.state().height;
+        txn.state_mut()
+            .create_consensus_snapshot_after_boundary(boundary_height)?;
+        if indra_core::types::primitives::consensus_snapshot_active(
+            boundary_height.saturating_add(1),
+        ) {
+            txn.state_mut().rebuild_state_commitment_v2(boundary_height);
+        }
+        txn.after_mutation()?;
+    }
+
     Ok(epoch_record)
 }
 
@@ -1507,7 +1522,7 @@ mod tests {
                 commission_bps: 1_000,
                 bond_utxo_id,
                 validator_pubkey,
-                vrf_pk: seed,
+                vrf_pk: indra_crypto::VrfKeypair::from_seed(&seed).public_key(),
                 bond_proof: Some(indra_core::types::staking::StakingBondProof {
                     committed_value_spark: MINIMUM_VALIDATOR_BOND_SPARK,
                     blinding_factor: Bytes32::from([seed[0]; 32]),
@@ -1671,7 +1686,7 @@ mod tests {
                 name: "slash-validator".into(),
                 hybrid_classical_pk: Some(public.classical.0),
                 hybrid_pq_pk: Some(public.pq.0.to_vec()),
-                vrf_pk: Some(seed),
+                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
                 stake_spark: stake,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -5514,6 +5529,50 @@ mod tests {
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
+    }
+
+    #[test]
+    fn consensus_snapshot_is_built_from_fully_settled_boundary_state() {
+        let (mut state, incumbent_id, _) = slash_validator_state(
+            [0x81; 32],
+            2 * indra_core::types::primitives::MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        );
+        state.height = EPOCH_DURATION_BLOCKS - 1;
+        let (register_a, registered_a) = signed_register_validator_op(&mut state, [0x82; 32], 1);
+        let (register_b, registered_b) = signed_register_validator_op(&mut state, [0x83; 32], 1);
+
+        let mut boundary = make_block(&state, vec![]);
+        boundary.staking_ops = vec![register_a, register_b];
+        apply_block(&mut state, &boundary, 0).unwrap();
+        assert_eq!(state.height, EPOCH_DURATION_BLOCKS);
+
+        // The production gate is intentionally inert, so invoke the same
+        // ungated rotation primitive to inspect the accepted post-transition
+        // state selected by this realistic boundary.
+        state
+            .rotate_consensus_snapshot_after_boundary(EPOCH_DURATION_BLOCKS)
+            .unwrap();
+        let snapshot = state.consensus_snapshots.last().unwrap();
+        let final_active: Vec<_> = state
+            .validators
+            .active_validators()
+            .map(|validator| (validator.validator_id, validator.stake_spark))
+            .collect();
+        let snapshotted: Vec<_> = snapshot
+            .entries()
+            .iter()
+            .map(|entry| (entry.validator_id, entry.consensus_weight_spark))
+            .collect();
+
+        assert_eq!(snapshot.source_boundary_height, EPOCH_DURATION_BLOCKS);
+        assert_eq!(
+            snapshot.activation_height,
+            EPOCH_DURATION_BLOCKS.saturating_add(1)
+        );
+        assert_eq!(snapshotted, final_active);
+        assert!(snapshotted.iter().any(|(id, _)| *id == incumbent_id));
+        assert!(snapshotted.iter().any(|(id, _)| *id == registered_a));
+        assert!(snapshotted.iter().any(|(id, _)| *id == registered_b));
     }
 
     #[test]

@@ -9,7 +9,10 @@
 use std::time::{Duration, Instant};
 
 use indra_core::{
-    types::{primitives::state_commitment_v2_active, transaction::OutputV1},
+    types::{
+        consensus_snapshot::ConsensusSnapshot, primitives::state_commitment_v2_active,
+        transaction::OutputV1,
+    },
     Bytes32,
 };
 
@@ -57,6 +60,7 @@ enum UndoEntry {
     Governance(GovernanceState),
     Utxos(UtxoSet),
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
+    ConsensusSnapshots(Vec<ConsensusSnapshot>),
 }
 
 #[cfg(test)]
@@ -86,6 +90,7 @@ pub(crate) struct StateTxn<'a> {
     governance_recorded: bool,
     utxos_recorded: bool,
     delegation_return_events_recorded: bool,
+    consensus_snapshots_recorded: bool,
     commitment_touched: bool,
 }
 
@@ -109,6 +114,7 @@ impl<'a> StateTxn<'a> {
             governance_recorded: false,
             utxos_recorded: false,
             delegation_return_events_recorded: false,
+            consensus_snapshots_recorded: false,
             commitment_touched: false,
         }
     }
@@ -213,6 +219,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_governance();
         self.snapshot_utxos();
         self.snapshot_delegation_return_events();
+        self.snapshot_consensus_snapshots();
         self.record_scalars();
         self.mark_commitment_touched();
     }
@@ -409,6 +416,14 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    fn snapshot_consensus_snapshots(&mut self) {
+        if !self.consensus_snapshots_recorded {
+            let snapshot = self.state.consensus_snapshots.clone();
+            self.undo.push(UndoEntry::ConsensusSnapshots(snapshot));
+            self.consensus_snapshots_recorded = true;
+        }
+    }
+
     fn rollback(&mut self) {
         #[cfg(test)]
         let rollback_start = Instant::now();
@@ -463,6 +478,9 @@ impl<'a> StateTxn<'a> {
                 UndoEntry::Utxos(utxos) => self.state.utxos = utxos,
                 UndoEntry::DelegationReturnEvents(events) => {
                     self.state.delegation_return_events = events;
+                }
+                UndoEntry::ConsensusSnapshots(snapshots) => {
+                    self.state.consensus_snapshots = snapshots;
                 }
             }
         }

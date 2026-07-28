@@ -16,8 +16,12 @@
 use indra_core::{
     codec::Encode,
     types::{
+        consensus_snapshot::ConsensusSnapshot,
         crypto::HybridPubKey,
-        primitives::{registered_validator_cap_active, validator_network_address_active, Bytes32},
+        primitives::{
+            consensus_snapshot_active, registered_validator_cap_active,
+            validator_network_address_active, Bytes32,
+        },
     },
 };
 use indra_crypto::{sha256, PaymentPubKeyV1};
@@ -39,6 +43,7 @@ const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
 const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
 const DOMAIN_PAYMENT_IDENTITY: u8 = 0x08;
 const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
+const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,6 +110,14 @@ impl StateCommitmentV2 {
                 leaves.push((
                     delegation_return_event_key(event),
                     delegation_return_event_value_hash(event),
+                ));
+            }
+        }
+        if consensus_snapshot_active(height) {
+            for snapshot in &state.consensus_snapshots {
+                leaves.push((
+                    consensus_snapshot_key(snapshot.activation_height),
+                    consensus_snapshot_value_hash(snapshot),
                 ));
             }
         }
@@ -259,6 +272,14 @@ fn retired_cold_component_key(kind: u8, component: &[u8]) -> [u8; 32] {
     derive_key(DOMAIN_RETIRED_COLD_COMPONENT, &raw)
 }
 
+fn consensus_snapshot_key(activation_height: u64) -> [u8; 32] {
+    derive_key(DOMAIN_CONSENSUS_SNAPSHOT, &activation_height.to_le_bytes())
+}
+
+fn consensus_snapshot_value_hash(snapshot: &ConsensusSnapshot) -> [u8; 32] {
+    sha256(&snapshot.encode_to_vec())
+}
+
 fn retired_cold_component_value_hash(kind: u8, component: &[u8]) -> [u8; 32] {
     let mut value = Vec::with_capacity(1 + component.len());
     value.push(kind);
@@ -389,6 +410,7 @@ mod tests {
     use indra_core::{
         codec::{Decode, Encode},
         types::{
+            consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::{CommitmentV1, HybridPubKey},
             transaction::OutputV1,
         },
@@ -429,6 +451,70 @@ mod tests {
             cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
             cold_nonce: 0,
         }
+    }
+
+    fn consensus_snapshot(
+        activation_height: u64,
+        source_boundary_height: u64,
+        weight: u64,
+    ) -> ConsensusSnapshot {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[0xA1; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[0xA2; 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xA3; 32]);
+        ConsensusSnapshot::new(
+            activation_height,
+            source_boundary_height,
+            vec![ConsensusSnapshotEntry::new(
+                id(0xA0),
+                weight,
+                public.classical.0,
+                public.pq.0,
+                vrf.public_key(),
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn consensus_snapshot_leaf_is_content_sensitive_and_domain_separated() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        state.height = height;
+        state.consensus_snapshots = vec![
+            consensus_snapshot(1, 0, 1_000_000_000),
+            consensus_snapshot(301, 300, 2_000_000_000),
+        ];
+        let baseline = StateCommitmentV2::from_state(&state, height).root();
+
+        let mut changed_previous = state.clone();
+        changed_previous.consensus_snapshots[0] = consensus_snapshot(1, 0, 1_000_000_001);
+        assert_ne!(
+            StateCommitmentV2::from_state(&changed_previous, height).root(),
+            baseline
+        );
+        let mut changed_current = state.clone();
+        changed_current.consensus_snapshots[1] = consensus_snapshot(301, 300, 2_000_000_001);
+        assert_ne!(
+            StateCommitmentV2::from_state(&changed_current, height).root(),
+            baseline
+        );
+
+        let mut unrelated = state.clone();
+        unrelated.epoch_fees_burned = 99;
+        unrelated.epoch_slashed_spark = 88;
+        unrelated.epoch_slash_event_count = 7;
+        assert_eq!(
+            StateCommitmentV2::from_state(&unrelated, height).root(),
+            baseline
+        );
+
+        assert_ne!(
+            consensus_snapshot_key(1),
+            validator_key(&id(1)),
+            "snapshot and validator leaf domains must not collide"
+        );
     }
 
     fn output(owner: u8, value: u64) -> OutputV1 {
@@ -979,6 +1065,7 @@ mod tests {
             ("delegator_identity", DOMAIN_DELEGATOR_IDENTITY),
             ("payment_identity", DOMAIN_PAYMENT_IDENTITY),
             ("retired_cold_component", DOMAIN_RETIRED_COLD_COMPONENT),
+            ("consensus_snapshot", DOMAIN_CONSENSUS_SNAPSHOT),
         ];
         let mut seen = std::collections::BTreeMap::new();
         for (name, domain) in domains {
@@ -988,7 +1075,7 @@ mod tests {
                 "StateCommitmentV2 domain byte collision at 0x{domain:02x}"
             );
         }
-        assert_eq!(DOMAIN_RETIRED_COLD_COMPONENT, 0x09);
+        assert_eq!(DOMAIN_CONSENSUS_SNAPSHOT, 0x0A);
     }
 
     #[test]

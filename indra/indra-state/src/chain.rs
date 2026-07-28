@@ -3,14 +3,16 @@
 //! This is everything a node needs to validate the next block.
 //! It is the input and output of `apply_block`.
 
-use indra_core::codec::{ByteReader, Decode, Encode};
+use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
+use indra_core::types::consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 use indra_core::types::crypto::HybridPubKey;
 use indra_crypto::PaymentPubKeyV1;
 
 use indra_core::types::primitives::{
-    state_commitment_v2_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, GENESIS_SUPPLY_SPARK,
-    INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
+    consensus_snapshot_active, state_commitment_v2_active, Bytes32, VariableBytes,
+    DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
+    MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
 };
 
 use crate::{
@@ -93,6 +95,14 @@ pub struct ChainState {
 
     /// Current validator set.
     pub validators: ValidatorSet,
+
+    /// Canonical ascending-by-activation pair of versioned consensus snapshots.
+    ///
+    /// Once active, this contains the snapshot authoritative for the next
+    /// consensus height and its immediately preceding snapshot when one exists.
+    /// The bounded ordered vector supports Stage 3's greatest-activation-height
+    /// lookup without introducing a separately mutable index.
+    pub consensus_snapshots: Vec<ConsensusSnapshot>,
 
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
@@ -187,21 +197,26 @@ impl Encode for ChainState {
         encode_delegation_return_events(&self.delegation_return_events, buf);
         let retired_present = !self.retired_cold_classical_components.is_empty()
             || !self.retired_cold_pq_components.is_empty();
+        let snapshot_present = consensus_snapshot_active(self.height);
         if !self.delegator_identities.is_empty()
             || !self.payment_identities.is_empty()
             || retired_present
+            || snapshot_present
         {
             encode_delegator_identity_registry(&self.delegator_identities, buf);
         }
-        if !self.payment_identities.is_empty() || retired_present {
+        if !self.payment_identities.is_empty() || retired_present || snapshot_present {
             encode_payment_identity_registry(&self.payment_identities, buf);
         }
-        if retired_present {
+        if retired_present || snapshot_present {
             encode_retired_cold_components(
                 &self.retired_cold_classical_components,
                 &self.retired_cold_pq_components,
                 buf,
             );
+        }
+        if consensus_snapshot_active(self.height) {
+            encode_list(&self.consensus_snapshots, buf);
         }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
@@ -231,6 +246,7 @@ impl Encode for ChainState {
                 && self.payment_identities.is_empty()
                 && self.retired_cold_classical_components.is_empty()
                 && self.retired_cold_pq_components.is_empty()
+                && !consensus_snapshot_active(self.height)
             {
                 0
             } else {
@@ -239,15 +255,26 @@ impl Encode for ChainState {
             + if self.payment_identities.is_empty()
                 && self.retired_cold_classical_components.is_empty()
                 && self.retired_cold_pq_components.is_empty()
+                && !consensus_snapshot_active(self.height)
             {
                 0
             } else {
                 payment_identity_registry_encoded_len(&self.payment_identities)
             }
-            + retired_cold_components_encoded_len(
-                &self.retired_cold_classical_components,
-                &self.retired_cold_pq_components,
-            )
+            + if consensus_snapshot_active(self.height) {
+                8 + self.retired_cold_classical_components.len() * 32
+                    + self.retired_cold_pq_components.len() * indra_crypto::PQ_PK_BYTES
+            } else {
+                retired_cold_components_encoded_len(
+                    &self.retired_cold_classical_components,
+                    &self.retired_cold_pq_components,
+                )
+            }
+            + if consensus_snapshot_active(self.height) {
+                list_encoded_len(&self.consensus_snapshots)
+            } else {
+                0
+            }
     }
 }
 
@@ -291,6 +318,13 @@ impl Decode for ChainState {
         } else {
             (PersistentOrdSet::new(), PersistentOrdSet::new())
         };
+        let consensus_snapshots = if consensus_snapshot_active(height) {
+            let snapshots = decode_list(r, 2, "chain_state.consensus_snapshots")?;
+            validate_consensus_snapshot_collection(&snapshots, height)?;
+            snapshots
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             chain_id,
             height,
@@ -303,6 +337,7 @@ impl Decode for ChainState {
             utxos,
             nullifiers,
             validators,
+            consensus_snapshots,
             delegations,
             staked_bonds,
             staking_nonces,
@@ -338,6 +373,7 @@ impl ChainState {
             utxos: UtxoSet::new(),
             nullifiers: NullifierSet::new(),
             validators: ValidatorSet::new(),
+            consensus_snapshots: Vec::new(),
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
@@ -373,6 +409,7 @@ impl ChainState {
             utxos: UtxoSet::decode_legacy_at_height(r, height)?,
             nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode_legacy(r, schema_version)?,
+            consensus_snapshots: Vec::new(),
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map_legacy(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -412,6 +449,7 @@ impl ChainState {
             utxos: UtxoSet::decode_at_height(r, height)?,
             nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode(r)?,
+            consensus_snapshots: Vec::new(),
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -432,7 +470,11 @@ impl ChainState {
     /// Ensure the derived StateCommitmentV2 cache exists when the V2 root rule
     /// is active at `height`.
     pub fn ensure_state_commitment_v2(&mut self, height: u64) {
-        if state_commitment_v2_active(height) && self.state_commitment_v2.is_none() {
+        let crossing_snapshot_gate =
+            consensus_snapshot_active(height) && !consensus_snapshot_active(self.height);
+        if state_commitment_v2_active(height)
+            && (self.state_commitment_v2.is_none() || crossing_snapshot_gate)
+        {
             self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
         }
     }
@@ -449,6 +491,149 @@ impl ChainState {
             .as_ref()
             .map(StateCommitmentV2::root)
             .unwrap_or_else(|| StateCommitmentV2::from_state(self, height).root())
+    }
+
+    /// Build the immutable snapshot selected by the current final registry state.
+    pub fn build_consensus_snapshot(
+        &self,
+        activation_height: u64,
+        source_boundary_height: u64,
+    ) -> crate::error::StateResult<ConsensusSnapshot> {
+        if activation_height != source_boundary_height.saturating_add(1) {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "activation height must equal source boundary height plus one".to_string(),
+            ));
+        }
+        let mut entries = Vec::new();
+        for validator in self.validators.active_validators() {
+            let classical_vote_pk = validator.hybrid_classical_pk.ok_or_else(|| {
+                crate::error::StateError::InvalidConsensusSnapshot(format!(
+                    "active validator {} has no Ed25519 vote key",
+                    validator.validator_id
+                ))
+            })?;
+            let pq_bytes = validator.hybrid_pq_pk.as_ref().ok_or_else(|| {
+                crate::error::StateError::InvalidConsensusSnapshot(format!(
+                    "active validator {} has no ML-DSA-87 vote key",
+                    validator.validator_id
+                ))
+            })?;
+            let pq_vote_pk: [u8; indra_crypto::PQ_PK_BYTES] =
+                pq_bytes.as_slice().try_into().map_err(|_| {
+                    crate::error::StateError::InvalidConsensusSnapshot(format!(
+                        "active validator {} has malformed ML-DSA-87 vote key",
+                        validator.validator_id
+                    ))
+                })?;
+            let vrf_pk = validator.vrf_pk.ok_or_else(|| {
+                crate::error::StateError::InvalidConsensusSnapshot(format!(
+                    "active validator {} has no VRF key",
+                    validator.validator_id
+                ))
+            })?;
+            entries.push(
+                ConsensusSnapshotEntry::new(
+                    validator.validator_id,
+                    validator.stake_spark,
+                    classical_vote_pk,
+                    pq_vote_pk,
+                    vrf_pk,
+                )
+                .map_err(|error| {
+                    crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+                })?,
+            );
+        }
+        entries.sort_by_key(|entry| entry.validator_id.0);
+        ConsensusSnapshot::new(activation_height, source_boundary_height, entries)
+            .map_err(|error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()))
+    }
+
+    /// Build the Section 3.3 snapshot for a chain whose snapshot gate is height 1.
+    pub fn build_genesis_consensus_snapshot(&self) -> crate::error::StateResult<ConsensusSnapshot> {
+        self.build_consensus_snapshot(1, 0)
+    }
+
+    /// Install the genesis snapshot when the global gate is configured at height 1.
+    pub fn initialize_genesis_consensus_snapshot(&mut self) -> crate::error::StateResult<()> {
+        if !consensus_snapshot_active(1) {
+            return Ok(());
+        }
+        if self.height != 0 || !self.consensus_snapshots.is_empty() {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "genesis snapshot initialization requires pristine height-zero snapshot state"
+                    .to_string(),
+            ));
+        }
+        let snapshot = self.build_genesis_consensus_snapshot()?;
+        self.install_consensus_snapshot(snapshot)?;
+        if state_commitment_v2_active(1) {
+            self.rebuild_state_commitment_v2(1);
+        }
+        Ok(())
+    }
+
+    /// Create, rotate, and deterministically prune after a settled boundary.
+    pub(crate) fn create_consensus_snapshot_after_boundary(
+        &mut self,
+        boundary_height: u64,
+    ) -> crate::error::StateResult<()> {
+        if boundary_height == 0
+            || boundary_height % EPOCH_DURATION_BLOCKS != 0
+            || self.height != boundary_height
+        {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "snapshot creation requires the fully applied epoch-boundary state".to_string(),
+            ));
+        }
+        let activation_height = boundary_height.checked_add(1).ok_or_else(|| {
+            crate::error::StateError::InvalidConsensusSnapshot(
+                "snapshot activation height overflow".to_string(),
+            )
+        })?;
+        if !consensus_snapshot_active(activation_height) {
+            return Ok(());
+        }
+        self.rotate_consensus_snapshot_after_boundary(boundary_height)
+    }
+
+    pub(crate) fn rotate_consensus_snapshot_after_boundary(
+        &mut self,
+        boundary_height: u64,
+    ) -> crate::error::StateResult<()> {
+        let activation_height = boundary_height.checked_add(1).ok_or_else(|| {
+            crate::error::StateError::InvalidConsensusSnapshot(
+                "snapshot activation height overflow".to_string(),
+            )
+        })?;
+        let snapshot = self.build_consensus_snapshot(activation_height, boundary_height)?;
+        self.install_consensus_snapshot(snapshot)
+    }
+
+    fn install_consensus_snapshot(
+        &mut self,
+        snapshot: ConsensusSnapshot,
+    ) -> crate::error::StateResult<()> {
+        snapshot.validate().map_err(|error| {
+            crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+        })?;
+        if self
+            .consensus_snapshots
+            .iter()
+            .any(|existing| existing.activation_height == snapshot.activation_height)
+        {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "duplicate consensus snapshot activation height".to_string(),
+            ));
+        }
+        self.consensus_snapshots.push(snapshot);
+        self.consensus_snapshots
+            .sort_by_key(|snapshot| snapshot.activation_height);
+        let excess = self.consensus_snapshots.len().saturating_sub(2);
+        if excess > 0 {
+            self.consensus_snapshots.drain(0..excess);
+        }
+        Ok(())
     }
 
     /// Current epoch number (0-indexed).
@@ -481,6 +666,43 @@ impl ChainState {
             }
         }
     }
+}
+
+fn validate_consensus_snapshot_collection(
+    snapshots: &[ConsensusSnapshot],
+    state_height: u64,
+) -> IndraResult<()> {
+    if snapshots.is_empty() {
+        return Err(IndraError::InvalidConsensusSnapshot(
+            "post-gate ChainState has no consensus snapshot".to_string(),
+        ));
+    }
+    if snapshots.len() > 2 {
+        return Err(IndraError::LengthExceeded {
+            field: "chain_state.consensus_snapshots",
+            max: 2,
+            actual: snapshots.len(),
+        });
+    }
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        snapshot.validate()?;
+        if index > 0 && snapshots[index - 1].activation_height >= snapshot.activation_height {
+            return Err(IndraError::InvalidConsensusSnapshot(
+                "snapshot activation heights are not strictly ascending".to_string(),
+            ));
+        }
+    }
+    let next_height = state_height.saturating_add(1);
+    if snapshots
+        .last()
+        .map(|snapshot| snapshot.activation_height > next_height)
+        .unwrap_or(true)
+    {
+        return Err(IndraError::InvalidConsensusSnapshot(
+            "latest snapshot activates after the next consensus height".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn encode_hash_set(hashes: &PersistentOrdSet<Bytes32>, buf: &mut Vec<u8>) {
@@ -795,6 +1017,7 @@ fn decode_retired_cold_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ValidatorEntry;
     use std::collections::{BTreeMap, HashSet};
 
     use indra_core::{
@@ -811,6 +1034,52 @@ mod tests {
     };
     use indra_crypto::{PaymentKeypairV1, PAYMENT_VERSION_V1};
 
+    fn snapshot_validator(id_byte: u8, key_seed: u8, stake: u64) -> ValidatorEntry {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[key_seed; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[key_seed.wrapping_add(1); 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        let vrf = indra_crypto::VrfKeypair::from_seed(&[key_seed.wrapping_add(2); 32]);
+        ValidatorEntry {
+            validator_id: Bytes32::from([id_byte; 32]),
+            name: format!("snapshot-validator-{id_byte}"),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
+            vrf_pk: Some(vrf.public_key()),
+            stake_spark: stake,
+            status: crate::validator::ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: 1,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: None,
+            cold_hybrid_pq_pk: None,
+            cold_key_version: 0,
+            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+            cold_nonce: 0,
+        }
+    }
+
+    fn snapshot_state() -> ChainState {
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(snapshot_validator(1, 11, 2_000_000_000))
+            .unwrap();
+        state
+            .validators
+            .upsert(snapshot_validator(2, 21, 3_000_000_000))
+            .unwrap();
+        state
+    }
+
     #[test]
     fn genesis_state_is_correct() {
         let state = ChainState::new_genesis();
@@ -824,6 +1093,91 @@ mod tests {
         assert!(state.utxos.is_empty());
         assert!(state.nullifiers.is_empty());
         assert!(state.validators.is_empty());
+        assert!(state.consensus_snapshots.is_empty());
+    }
+
+    #[test]
+    fn consensus_snapshot_storage_round_trips_with_exact_two_retained() {
+        let mut state = snapshot_state();
+        state.rotate_consensus_snapshot_after_boundary(300).unwrap();
+        state
+            .validators
+            .get_mut(&Bytes32::from([1; 32]))
+            .unwrap()
+            .stake_spark += 1;
+        state.rotate_consensus_snapshot_after_boundary(600).unwrap();
+        state.rotate_consensus_snapshot_after_boundary(900).unwrap();
+        state.height = u64::MAX;
+
+        assert_eq!(state.consensus_snapshots.len(), 2);
+        assert_eq!(state.consensus_snapshots[0].activation_height, 601);
+        assert_eq!(state.consensus_snapshots[1].activation_height, 901);
+
+        let bytes = state.encode_to_vec();
+        assert_eq!(bytes.len(), state.encoded_len());
+        let decoded = ChainState::decode_exact(&bytes).unwrap();
+        assert_eq!(decoded.consensus_snapshots, state.consensus_snapshots);
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn genesis_consensus_snapshot_uses_active_genesis_set_at_height_one() {
+        let state = snapshot_state();
+        let snapshot = state.build_genesis_consensus_snapshot().unwrap();
+        assert_eq!(snapshot.activation_height, 1);
+        assert_eq!(snapshot.source_boundary_height, 0);
+        assert_eq!(snapshot.entries().len(), 2);
+        assert_eq!(snapshot.entries()[0].validator_id, Bytes32::from([1; 32]));
+        assert_eq!(snapshot.entries()[1].validator_id, Bytes32::from([2; 32]));
+        assert_eq!(snapshot.total_weight_spark, 5_000_000_000);
+    }
+
+    #[test]
+    fn consensus_snapshot_pruning_is_deterministic_across_boundaries() {
+        fn execute() -> ChainState {
+            let mut state = snapshot_state();
+            for boundary in [300, 600, 900, 1_200] {
+                state
+                    .rotate_consensus_snapshot_after_boundary(boundary)
+                    .unwrap();
+            }
+            state
+        }
+
+        let first = execute();
+        let second = execute();
+        assert_eq!(first.consensus_snapshots, second.consensus_snapshots);
+        assert_eq!(
+            first
+                .consensus_snapshots
+                .iter()
+                .map(|snapshot| snapshot.activation_height)
+                .collect::<Vec<_>>(),
+            vec![901, 1_201]
+        );
+    }
+
+    #[test]
+    fn pre_gate_chain_state_bytes_and_roots_ignore_snapshot_field() {
+        let baseline = snapshot_state();
+        let mut with_staged_snapshot = baseline.clone();
+        with_staged_snapshot
+            .consensus_snapshots
+            .push(baseline.build_genesis_consensus_snapshot().unwrap());
+
+        assert!(!consensus_snapshot_active(baseline.height));
+        assert_eq!(
+            baseline.encode_to_vec(),
+            with_staged_snapshot.encode_to_vec()
+        );
+        assert_eq!(
+            crate::state_root::compute_state_root(&baseline),
+            crate::state_root::compute_state_root(&with_staged_snapshot)
+        );
+        assert!(ChainState::decode_exact(&baseline.encode_to_vec())
+            .unwrap()
+            .consensus_snapshots
+            .is_empty());
     }
 
     #[test]
