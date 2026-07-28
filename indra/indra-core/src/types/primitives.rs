@@ -608,14 +608,14 @@ pub mod hard_forks {
 
     /// Validator cold-key enrollment primitives.
     ///
-    /// INTENTIONALLY UNSCHEDULED: Stage 1 defines only isolated primitives.
-    /// Leaving this at `u64::MAX` keeps enrollment inactive until a reviewed,
-    /// coordinated protocol stage explicitly schedules it.
+    /// TESTNET ACTIVATION: validator cold-key enrollment activates at height
+    /// 209,500. Enforcement remains independently unscheduled until every
+    /// active testnet validator has completed and confirmed enrollment.
     ///
     /// MAINNET GENESIS REQUIREMENT: this is a single global hard-fork height.
     /// It MUST be deliberately reset to the reviewed mainnet value before
-    /// building mainnet genesis. Leaving `u64::MAX` means it never activates.
-    pub const VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT: u64 = u64::MAX;
+    /// building mainnet genesis. Do not reuse this testnet activation height.
+    pub const VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT: u64 = 209_500;
 
     /// Validator cold-key authority enforcement.
     ///
@@ -1294,20 +1294,24 @@ mod tests {
     }
 
     #[test]
-    fn validator_cold_key_gates_are_ordered_and_inert() {
+    fn validator_cold_key_enrollment_is_scheduled_and_enforcement_is_inert() {
         use hard_forks::{
             VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT, VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
         };
 
-        assert_eq!(VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT, u64::MAX);
+        assert_eq!(VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT, 209_500);
         assert_eq!(VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT, u64::MAX);
         assert!(
             VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT == u64::MAX
                 || VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT > VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT
         );
-        assert!(!validator_cold_key_enrollment_active(u64::MAX - 1));
+        assert!(!validator_cold_key_enrollment_active(
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1
+        ));
+        assert!(validator_cold_key_enrollment_active(
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT
+        ));
         assert!(!validator_cold_key_enforcement_active(u64::MAX - 1));
-        assert!(validator_cold_key_enrollment_active(u64::MAX));
         assert!(validator_cold_key_enforcement_active(u64::MAX));
     }
 }
