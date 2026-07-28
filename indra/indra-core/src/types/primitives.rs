@@ -627,6 +627,13 @@ pub mod hard_forks {
     /// building mainnet genesis. Leaving `u64::MAX` means it never activates.
     pub const VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT: u64 = u64::MAX;
 
+    /// Versioned consensus-weight snapshots.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this consensus-critical repair remains inert
+    /// until its complete consumer wiring and external review gates pass. A
+    /// real activation MUST be the first height after an epoch boundary.
+    pub const CONSENSUS_SNAPSHOT_HEIGHT: u64 = u64::MAX;
+
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
         "compact bond pubkey omission must not activate before identity registry"
@@ -636,6 +643,21 @@ pub mod hard_forks {
             || VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT > VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
         "scheduled validator cold-key enforcement must activate strictly after enrollment"
     );
+    const _: () = assert!(
+        super::consensus_snapshot_height_is_aligned(CONSENSUS_SNAPSHOT_HEIGHT),
+        "consensus snapshot activation must be the first height after an epoch boundary"
+    );
+}
+
+/// Whether a proposed consensus-snapshot gate is inert or epoch-aligned.
+pub const fn consensus_snapshot_height_is_aligned(height: u64) -> bool {
+    height == u64::MAX || (height > 0 && (height - 1) % EPOCH_DURATION_BLOCKS == 0)
+}
+
+/// Whether versioned consensus snapshots govern `height`.
+#[inline]
+pub fn consensus_snapshot_active(height: u64) -> bool {
+    height >= hard_forks::CONSENSUS_SNAPSHOT_HEIGHT
 }
 
 /// Whether proportional arithmetic uses the overflow-safe implementation.

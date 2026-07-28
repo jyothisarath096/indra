@@ -3,6 +3,7 @@
 pub mod authorization;
 pub mod block;
 pub mod checkpoint;
+pub mod consensus_snapshot;
 pub mod crypto;
 pub mod epoch_record;
 pub mod governance;
@@ -16,4 +17,5 @@ pub mod vote;
 pub mod vote_signing;
 pub mod vrf_election;
 
+pub use consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 pub use epoch_record::EpochRecord;

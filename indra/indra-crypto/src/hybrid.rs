@@ -96,6 +96,15 @@ pub struct PqSignature(pub [u8; PQ_SIG_BYTES]);
 
 /// Validate that bytes canonically decode as an ML-DSA-87 verifying key.
 pub fn validate_pq_public_key(pk: &PqPublicKey) -> CryptoResult<()> {
+    // The fixed-width wire type cannot represent absence directly. Reject the
+    // all-zero sentinel explicitly before asking the ML-DSA parser to decode;
+    // the parser's API accepts every correctly sized byte array.
+    if pk.0.iter().all(|byte| *byte == 0) {
+        return Err(CryptoError::MalformedPublicKey {
+            scheme: "ML-DSA-87",
+            actual: pk.0.len(),
+        });
+    }
     let encoded = EncodedVerifyingKey::<MlDsa87>::try_from(pk.0.as_slice()).map_err(|_| {
         CryptoError::MalformedPublicKey {
             scheme: "ML-DSA-87",

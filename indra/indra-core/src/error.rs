@@ -53,6 +53,10 @@ pub enum IndraError {
         format: u8,
     },
 
+    /// A versioned consensus snapshot failed canonical validation.
+    #[error("invalid consensus snapshot: {0}")]
+    InvalidConsensusSnapshot(String),
+
     /// Unsupported persisted-struct schema version.
     #[error(
         "unsupported schema version {version} for {struct_name} (max supported {max_supported})"

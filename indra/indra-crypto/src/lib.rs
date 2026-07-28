@@ -43,7 +43,7 @@ pub use payment::{
     PAYMENT_PUBKEY_V1_ENCODED_LEN, PAYMENT_VERSION_V1,
 };
 pub use pedersen::{commit, verify_opening, PedersenCommitment, PedersenOpening};
-pub use vrf::{vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};
+pub use vrf::{validate_vrf_public_key, vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};
 
 /// Derive the deterministic blinding factor for a genesis validator UTXO.
 ///

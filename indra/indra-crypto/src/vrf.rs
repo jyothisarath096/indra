@@ -53,6 +53,24 @@ pub struct VrfKeypair {
     pub public_key: [u8; 32],
 }
 
+/// Validate that bytes canonically decode as a non-identity Ristretto VRF key.
+pub fn validate_vrf_public_key(public_key: &[u8; 32]) -> CryptoResult<()> {
+    let point =
+        CompressedRistretto(*public_key)
+            .decompress()
+            .ok_or(CryptoError::MalformedPublicKey {
+                scheme: "ECVRF-RISTRETTO255",
+                actual: public_key.len(),
+            })?;
+    if point == RistrettoPoint::default() {
+        return Err(CryptoError::MalformedPublicKey {
+            scheme: "ECVRF-RISTRETTO255",
+            actual: public_key.len(),
+        });
+    }
+    Ok(())
+}
+
 impl VrfKeypair {
     /// Create from a 32-byte seed.
     ///
