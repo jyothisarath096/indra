@@ -57,7 +57,7 @@ pub use apply::{apply_block, project_block_for_roots, ProjectedBlockRoots};
 pub use chain::ChainState;
 pub use delegation::apply_staking_op;
 pub use epoch::apply_epoch_transition;
-pub use error::{StateError, StateResult};
+pub use error::{ConsensusSnapshotLookupError, StateError, StateResult};
 pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
 pub use governance_apply::apply_governance_op;

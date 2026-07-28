@@ -2,6 +2,38 @@
 
 use thiserror::Error;
 
+/// Definitive failures from height-derived consensus-snapshot resolution.
+///
+/// Callers either receive the one canonical snapshot for the requested
+/// governed height or an error; this type carries no fallback value.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum ConsensusSnapshotLookupError {
+    /// Snapshot lookup was incorrectly requested for a legacy height.
+    #[error(
+        "consensus snapshot lookup requested for pre-gate height {height}; snapshot gate is {gate_height}"
+    )]
+    PreGateHeight {
+        /// Requested consensus height.
+        height: u64,
+        /// Global activation height.
+        gate_height: u64,
+    },
+
+    /// Retained snapshot state was malformed or non-canonical.
+    #[error("invalid retained consensus snapshots: {reason}")]
+    InvalidRetainedState {
+        /// Precise invariant failure.
+        reason: String,
+    },
+
+    /// No retained activation covers a governed consensus height.
+    #[error("no retained consensus snapshot governs height {height}")]
+    NoSnapshotForHeight {
+        /// Governed consensus height that could not be resolved.
+        height: u64,
+    },
+}
+
 /// All errors that can occur during state transitions.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StateError {

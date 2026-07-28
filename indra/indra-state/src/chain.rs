@@ -9,6 +9,7 @@ use indra_core::types::consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshot
 use indra_core::types::crypto::HybridPubKey;
 use indra_crypto::PaymentPubKeyV1;
 
+use indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT;
 use indra_core::types::primitives::{
     consensus_snapshot_active, state_commitment_v2_active, Bytes32, VariableBytes,
     DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -493,6 +494,39 @@ impl ChainState {
             .unwrap_or_else(|| StateCommitmentV2::from_state(self, height).root())
     }
 
+    /// Resolve the one authoritative snapshot for a governed consensus height.
+    ///
+    /// This is exactly the retained snapshot with the greatest activation
+    /// height not greater than `height`. Pre-gate callers receive an explicit
+    /// error and must remain on the separate legacy consensus path.
+    pub fn snapshot_for_consensus_height(
+        &self,
+        height: u64,
+    ) -> Result<&ConsensusSnapshot, crate::error::ConsensusSnapshotLookupError> {
+        self.snapshot_for_consensus_height_at_gate(height, CONSENSUS_SNAPSHOT_HEIGHT)
+    }
+
+    fn snapshot_for_consensus_height_at_gate(
+        &self,
+        height: u64,
+        gate_height: u64,
+    ) -> Result<&ConsensusSnapshot, crate::error::ConsensusSnapshotLookupError> {
+        use crate::error::ConsensusSnapshotLookupError;
+
+        if height < gate_height {
+            return Err(ConsensusSnapshotLookupError::PreGateHeight {
+                height,
+                gate_height,
+            });
+        }
+        validate_retained_consensus_snapshots_for_lookup(&self.consensus_snapshots)?;
+        self.consensus_snapshots
+            .iter()
+            .rev()
+            .find(|snapshot| snapshot.activation_height <= height)
+            .ok_or(ConsensusSnapshotLookupError::NoSnapshotForHeight { height })
+    }
+
     /// Build the immutable snapshot selected by the current final registry state.
     pub fn build_consensus_snapshot(
         &self,
@@ -701,6 +735,48 @@ fn validate_consensus_snapshot_collection(
         return Err(IndraError::InvalidConsensusSnapshot(
             "latest snapshot activates after the next consensus height".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_retained_consensus_snapshots_for_lookup(
+    snapshots: &[ConsensusSnapshot],
+) -> Result<(), crate::error::ConsensusSnapshotLookupError> {
+    use crate::error::ConsensusSnapshotLookupError;
+
+    if snapshots.is_empty() {
+        return Err(ConsensusSnapshotLookupError::InvalidRetainedState {
+            reason: "snapshot collection is empty".to_string(),
+        });
+    }
+    if snapshots.len() > 2 {
+        return Err(ConsensusSnapshotLookupError::InvalidRetainedState {
+            reason: "snapshot collection exceeds the two-snapshot retention bound".to_string(),
+        });
+    }
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        snapshot.validate().map_err(|error| {
+            ConsensusSnapshotLookupError::InvalidRetainedState {
+                reason: error.to_string(),
+            }
+        })?;
+        let expected_activation =
+            snapshot
+                .source_boundary_height
+                .checked_add(1)
+                .ok_or_else(|| ConsensusSnapshotLookupError::InvalidRetainedState {
+                    reason: "snapshot source-boundary height overflows activation".to_string(),
+                })?;
+        if snapshot.activation_height != expected_activation {
+            return Err(ConsensusSnapshotLookupError::InvalidRetainedState {
+                reason: "activation height is not source boundary height plus one".to_string(),
+            });
+        }
+        if index > 0 && snapshots[index - 1].activation_height >= snapshot.activation_height {
+            return Err(ConsensusSnapshotLookupError::InvalidRetainedState {
+                reason: "activation heights are duplicate or not strictly ascending".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -1118,6 +1194,127 @@ mod tests {
         let decoded = ChainState::decode_exact(&bytes).unwrap();
         assert_eq!(decoded.consensus_snapshots, state.consensus_snapshots);
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn snapshot_lookup_uses_exact_greatest_activation_not_greater_than_height() {
+        let mut state = snapshot_state();
+        state.rotate_consensus_snapshot_after_boundary(600).unwrap();
+        state.rotate_consensus_snapshot_after_boundary(900).unwrap();
+
+        for height in [601, 700, 900] {
+            assert_eq!(
+                state
+                    .snapshot_for_consensus_height_at_gate(height, 601)
+                    .unwrap()
+                    .activation_height,
+                601
+            );
+        }
+        for height in [901, 1_000, u64::MAX] {
+            assert_eq!(
+                state
+                    .snapshot_for_consensus_height_at_gate(height, 601)
+                    .unwrap()
+                    .activation_height,
+                901
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_lookup_boundary_qc_300_uses_old_and_301_uses_new() {
+        let mut state = snapshot_state();
+        state
+            .consensus_snapshots
+            .push(state.build_genesis_consensus_snapshot().unwrap());
+        state.rotate_consensus_snapshot_after_boundary(300).unwrap();
+
+        assert_eq!(
+            state
+                .snapshot_for_consensus_height_at_gate(300, 1)
+                .unwrap()
+                .activation_height,
+            1
+        );
+        assert_eq!(
+            state
+                .snapshot_for_consensus_height_at_gate(301, 1)
+                .unwrap()
+                .activation_height,
+            301
+        );
+    }
+
+    #[test]
+    fn snapshot_lookup_fails_closed_for_invalid_or_uncovered_state() {
+        use crate::error::ConsensusSnapshotLookupError;
+
+        let mut duplicate = snapshot_state();
+        duplicate
+            .rotate_consensus_snapshot_after_boundary(600)
+            .unwrap();
+        duplicate
+            .consensus_snapshots
+            .push(duplicate.consensus_snapshots[0].clone());
+        assert!(matches!(
+            duplicate.snapshot_for_consensus_height_at_gate(601, 601),
+            Err(ConsensusSnapshotLookupError::InvalidRetainedState { .. })
+        ));
+
+        let mut uncovered = snapshot_state();
+        uncovered
+            .rotate_consensus_snapshot_after_boundary(900)
+            .unwrap();
+        assert_eq!(
+            uncovered.snapshot_for_consensus_height_at_gate(601, 601),
+            Err(ConsensusSnapshotLookupError::NoSnapshotForHeight { height: 601 })
+        );
+
+        let empty = snapshot_state();
+        assert!(matches!(
+            empty.snapshot_for_consensus_height_at_gate(601, 601),
+            Err(ConsensusSnapshotLookupError::InvalidRetainedState { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_lookup_api_returns_definitive_result_without_fallback_value() {
+        fn compile_time_api_shape(
+            state: &ChainState,
+            height: u64,
+        ) -> Result<&ConsensusSnapshot, crate::error::ConsensusSnapshotLookupError> {
+            state.snapshot_for_consensus_height(height)
+        }
+
+        let state = snapshot_state();
+        let result = compile_time_api_shape(&state, 0);
+        assert!(result.is_err());
+        assert!(state.validators.active_count() > 0);
+        // A populated live validator registry neither changes the error nor
+        // appears anywhere in the lookup return type.
+    }
+
+    #[test]
+    fn snapshot_lookup_explicitly_rejects_pre_gate_heights() {
+        use crate::error::ConsensusSnapshotLookupError;
+
+        let mut state = snapshot_state();
+        state.rotate_consensus_snapshot_after_boundary(600).unwrap();
+        assert_eq!(
+            state.snapshot_for_consensus_height_at_gate(600, 601),
+            Err(ConsensusSnapshotLookupError::PreGateHeight {
+                height: 600,
+                gate_height: 601,
+            })
+        );
+        assert_eq!(
+            state.snapshot_for_consensus_height(0),
+            Err(ConsensusSnapshotLookupError::PreGateHeight {
+                height: 0,
+                gate_height: CONSENSUS_SNAPSHOT_HEIGHT,
+            })
+        );
     }
 
     #[test]
