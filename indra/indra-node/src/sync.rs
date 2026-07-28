@@ -22,8 +22,8 @@ use indra_consensus::{
 use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
 use indra_core::types::primitives::{
-    bps_of, reveal_set_commitment_active, vrf_commit_reveal_election_active, Bytes32,
-    CONSENSUS_QUORUM_BPS, MAX_VRF_EMPTY_REVEAL_ROUNDS,
+    bps_of, consensus_snapshot_active, reveal_set_commitment_active,
+    vrf_commit_reveal_election_active, Bytes32, CONSENSUS_QUORUM_BPS, MAX_VRF_EMPTY_REVEAL_ROUNDS,
 };
 use indra_core::types::vrf_election::{compute_reveal_set_commitment, VrfElectionResult};
 use indra_core::EpochRecord;
@@ -668,6 +668,11 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
         });
     }
 
+    if consensus_snapshot_active(qc.height) {
+        let snapshot = state.snapshot_for_consensus_height(qc.height)?;
+        return crate::engine::NodeEngine::verify_qc_with_snapshot(&qc, snapshot, &state.chain_id);
+    }
+
     let mut active_validators: Vec<_> = state.validators.active_validators().collect();
     active_validators.sort_by_key(|validator| validator.validator_id.0);
 
@@ -696,9 +701,13 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
             ),
         });
     }
-
-    let total_stake = state.validators.total_active_stake();
-    verify_qc_strict(&qc, &validators, total_stake, &state.chain_id).map_err(NodeError::Consensus)
+    verify_qc_strict(
+        &qc,
+        &validators,
+        state.validators.total_active_stake(),
+        &state.chain_id,
+    )
+    .map_err(NodeError::Consensus)
 }
 
 pub(crate) struct VerifiedBlockProjection {

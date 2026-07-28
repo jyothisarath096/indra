@@ -672,16 +672,14 @@ impl ConsensusDriver {
                             reason: format!("cached last_qc_bytes are not decodable: {err}"),
                         }
                     })?;
-                let validators = self.engine.qc_validators();
-                let total_stake = self.engine.state.validators.total_active_stake();
-                verify_qc(&qc, &validators, total_stake, &self.engine.state.chain_id).map_err(
-                    |err| NodeError::BlockInvalid {
+                self.engine
+                    .verify_qc_for_height(&qc)
+                    .map_err(|err| NodeError::BlockInvalid {
                         height,
                         reason: format!(
                             "last_qc_bytes from {source} failed QC verification: {err}"
                         ),
-                    },
-                )?;
+                    })?;
 
                 let current_digest = Self::qc_bytes_digest(&self.last_qc_bytes);
                 let incoming_digest = Self::qc_bytes_digest(&qc_bytes);
@@ -2761,7 +2759,19 @@ impl ConsensusDriver {
             return vec![DriverAction::None];
         };
 
-        let qc_validators = self.engine.qc_validators();
+        let (qc_validators, qc_total_weight) = match self.engine.qc_authority_for_height(height) {
+            Ok(authority) => authority,
+            Err(error) => {
+                eprintln!(
+                        "[commit] cannot finalize {} at height={} round={}: failed to resolve QC authority: {}",
+                        hex::encode(&block_hash.0[..4]),
+                        height,
+                        round,
+                        error,
+                    );
+                return vec![DriverAction::None];
+            }
+        };
         if qc_validators.len() != self.registered_voters.len() {
             eprintln!(
                 "[commit] cannot finalize {} at height={} round={} because QC validator set is incomplete",
@@ -2770,6 +2780,29 @@ impl ConsensusDriver {
                 round,
             );
             return vec![DriverAction::None];
+        }
+        if consensus_snapshot_active(height) {
+            let adapters_match =
+                self.registered_voters
+                    .iter()
+                    .zip(&qc_validators)
+                    .all(|(voter, validator)| {
+                        voter.validator_id == validator.validator_id
+                            && voter.classical_pk == validator.classical_pk
+                            && voter.pq_pk == validator.pq_pk
+                            && voter.stake == validator.stake
+                    });
+            let voter_total = self
+                .registered_voters
+                .iter()
+                .map(|voter| voter.stake)
+                .fold(0u64, u64::saturating_add);
+            if !adapters_match || voter_total != qc_total_weight {
+                eprintln!(
+                    "[commit] cannot finalize at height={height}: vote collector and QC authority do not describe the same snapshot"
+                );
+                return vec![DriverAction::None];
+            }
         }
 
         let Some(quorum_vote_values) =
@@ -2808,6 +2841,19 @@ impl ConsensusDriver {
                 return vec![DriverAction::None];
             }
         };
+        if consensus_snapshot_active(height) {
+            if let Err(error) = verify_qc(
+                &qc,
+                &qc_validators,
+                qc_total_weight,
+                &self.engine.state.chain_id,
+            ) {
+                eprintln!(
+                    "[commit] locally built QC failed verification under S({height}): {error}"
+                );
+                return vec![DriverAction::None];
+            }
+        }
         if vrf_commit_reveal_election_active(height)
             && block.header.election_result_hash != qc.election_result_hash
         {
@@ -3139,9 +3185,7 @@ impl ConsensusDriver {
             return vec![];
         }
 
-        let validators = self.engine.qc_validators();
-        let total_stake = self.engine.state.validators.total_active_stake();
-        if let Err(err) = verify_qc(&qc, &validators, total_stake, &self.engine.state.chain_id) {
+        if let Err(err) = self.engine.verify_qc_for_height(&qc) {
             eprintln!(
                 "[driver] WARNING: received invalid QC from {} at height {}: {}",
                 from, height, err,

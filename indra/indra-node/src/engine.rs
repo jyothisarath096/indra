@@ -18,7 +18,7 @@ use indra_consensus::{
     mempool::Mempool,
     producer::{produce_block, BlockTemplate},
     proposer::{compute_proposer_vrf, elect_proposer, ProposerElection},
-    qc::QcValidator,
+    qc::{verify_qc, verify_qc_strict, QcValidator},
     vote::{produce_vote_with_election_result, RegisteredVoter},
 };
 use indra_core::codec::{ByteReader, Decode};
@@ -861,6 +861,60 @@ impl NodeEngine {
                 })
             })
             .collect()
+    }
+
+    /// Build canonical QC signer metadata from the snapshot governing `height`.
+    pub fn qc_validators_for_height(height: u64, snapshot: &ConsensusSnapshot) -> Vec<QcValidator> {
+        debug_assert!(snapshot.activation_height <= height);
+        snapshot
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| QcValidator {
+                validator_id: entry.validator_id,
+                position,
+                pq_pk: entry.pq_vote_pk.to_vec(),
+                classical_pk: entry.classical_vote_pk,
+                stake: entry.consensus_weight_spark,
+            })
+            .collect()
+    }
+
+    /// Resolve validators and total weight for the height being certified.
+    ///
+    /// Pre-gate behavior deliberately remains the original live-state adapter.
+    pub fn qc_authority_for_height(&self, height: u64) -> NodeResult<(Vec<QcValidator>, u64)> {
+        if !consensus_snapshot_active(height) {
+            return Ok((
+                self.qc_validators(),
+                self.state.validators.total_active_stake(),
+            ));
+        }
+        let snapshot = self.state.snapshot_for_consensus_height(height)?;
+        Ok((
+            Self::qc_validators_for_height(height, snapshot),
+            snapshot.total_weight_spark,
+        ))
+    }
+
+    /// Verify a QC against the authority frozen for its own certified height.
+    pub fn verify_qc_for_height(
+        &self,
+        qc: &indra_core::types::qc::QuorumCertificateV1,
+    ) -> NodeResult<()> {
+        let (validators, total_weight) = self.qc_authority_for_height(qc.height)?;
+        verify_qc(qc, &validators, total_weight, &self.state.chain_id).map_err(NodeError::Consensus)
+    }
+
+    /// Strictly verify a QC using one already-resolved immutable snapshot.
+    pub(crate) fn verify_qc_with_snapshot(
+        qc: &indra_core::types::qc::QuorumCertificateV1,
+        snapshot: &ConsensusSnapshot,
+        chain_id: &str,
+    ) -> NodeResult<()> {
+        let validators = Self::qc_validators_for_height(qc.height, snapshot);
+        verify_qc_strict(qc, &validators, snapshot.total_weight_spark, chain_id)
+            .map_err(NodeError::Consensus)
     }
 
     /// Sign a consensus vote with this node's validator keypair.
@@ -1709,6 +1763,186 @@ mod tests {
             decision,
             indra_consensus::vote::VoteDecision::QuorumReached { .. }
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn qc_from_test_signers(
+        height: u64,
+        block_hash: Bytes32,
+        snapshot: &ConsensusSnapshot,
+        signers: &[&HybridKeypair],
+    ) -> indra_core::types::qc::QuorumCertificateV1 {
+        let validators = NodeEngine::qc_validators_for_height(height, snapshot);
+        let votes: Vec<_> = signers
+            .iter()
+            .map(|signer| {
+                let validator_id =
+                    Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+                produce_vote(
+                    height,
+                    0,
+                    VoteStep::Precommit,
+                    block_hash,
+                    validator_id,
+                    DEFAULT_CHAIN_ID,
+                    signer,
+                )
+                .unwrap()
+            })
+            .collect();
+        build_qc(
+            height,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &validators,
+            votes.iter().collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn genuine_pre_stake_change_qc_remains_verifiable_under_certified_height_snapshot() {
+        let dir = temp_dir("qc_liveness_attack_reproduction");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let a = install_active_validator(&mut engine, [0x51; 32], "a");
+        let b = install_active_validator(&mut engine, [0x52; 32], "b");
+        let c = install_active_validator(&mut engine, [0x53; 32], "c");
+        let a_id = Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0));
+        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
+        let c_id = Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0));
+        engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 40;
+        engine.state.validators.get_mut(&b_id).unwrap().stake_spark = 30;
+        engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 30;
+        let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let block_hash = Bytes32::from([0xA1; 32]);
+        let qc = qc_from_test_signers(1, block_hash, &snapshot, &[&a, &b]);
+
+        // Block H commits C's SelfStake after A+B formed the genuine QC for H.
+        engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 140;
+        assert!(verify_qc_strict(
+            &qc,
+            &engine.qc_validators(),
+            engine.state.validators.total_active_stake(),
+            DEFAULT_CHAIN_ID,
+        )
+        .is_err());
+        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_block_inflation_cannot_turn_single_signer_into_snapshot_quorum() {
+        let dir = temp_dir("qc_safety_attack_reproduction");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let a = install_active_validator(&mut engine, [0x61; 32], "a");
+        let b = install_active_validator(&mut engine, [0x62; 32], "b");
+        let c = install_active_validator(&mut engine, [0x63; 32], "c");
+        let a_id = Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0));
+        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
+        let c_id = Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0));
+        engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 20;
+        engine.state.validators.get_mut(&b_id).unwrap().stake_spark = 40;
+        engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 40;
+        let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let qc = qc_from_test_signers(1, Bytes32::from([0xA2; 32]), &snapshot, &[&a]);
+
+        engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 200;
+        assert!(verify_qc_strict(
+            &qc,
+            &engine.qc_validators(),
+            engine.state.validators.total_active_stake(),
+            DEFAULT_CHAIN_ID,
+        )
+        .is_ok());
+        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vote_collection_qc_construction_and_verification_share_one_snapshot() {
+        let dir = temp_dir("qc_vote_snapshot_consistency");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let signer = install_active_validator(&mut engine, [0x71; 32], "a");
+        let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let voters = NodeEngine::registered_voters_for_height(1, &snapshot);
+        let validators = NodeEngine::qc_validators_for_height(1, &snapshot);
+
+        assert_eq!(voters.len(), validators.len());
+        for (voter, validator) in voters.iter().zip(&validators) {
+            assert_eq!(voter.validator_id, validator.validator_id);
+            assert_eq!(voter.classical_pk, validator.classical_pk);
+            assert_eq!(voter.pq_pk, validator.pq_pk);
+            assert_eq!(voter.stake, validator.stake);
+        }
+        assert_eq!(
+            voters.iter().map(|voter| voter.stake).sum::<u64>(),
+            snapshot.total_weight_spark
+        );
+        let qc = qc_from_test_signers(1, Bytes32::from([0xA3; 32]), &snapshot, &[&signer]);
+        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_gate_qc_authority_is_unchanged_live_registry_adapter() {
+        let dir = temp_dir("legacy_qc_authority");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        install_active_validator(&mut engine, [0x72; 32], "legacy");
+        let (actual, total) = engine.qc_authority_for_height(1).unwrap();
+        let expected = engine.qc_validators();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.validator_id, expected.validator_id);
+            assert_eq!(actual.position, expected.position);
+            assert_eq!(actual.pq_pk, expected.pq_pk);
+            assert_eq!(actual.classical_pk, expected.classical_pk);
+            assert_eq!(actual.stake, expected.stake);
+        }
+        assert_eq!(total, engine.state.validators.total_active_stake());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governed_qc_verification_fails_closed_without_snapshot() {
+        let dir = temp_dir("missing_qc_snapshot");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let signer = install_active_validator(&mut engine, [0x73; 32], "missing");
+        let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let qc = qc_from_test_signers(u64::MAX, Bytes32::from([0xA4; 32]), &snapshot, &[&signer]);
+        assert!(matches!(
+            engine.verify_qc_for_height(&qc),
+            Err(NodeError::ConsensusSnapshotLookup(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qc_formation_and_verification_replay_across_snapshot_boundary() {
+        let dir = temp_dir("qc_snapshot_boundary_replay");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let signer = install_active_validator(&mut engine, [0x74; 32], "boundary");
+        let old_snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let id = old_snapshot.entries()[0].validator_id;
+        engine.state.validators.get_mut(&id).unwrap().stake_spark += 500;
+        let new_snapshot = engine.state.build_consensus_snapshot(301, 300).unwrap();
+
+        let replay = || {
+            let qc300 =
+                qc_from_test_signers(300, Bytes32::from([0x30; 32]), &old_snapshot, &[&signer]);
+            let qc301 =
+                qc_from_test_signers(301, Bytes32::from([0x31; 32]), &new_snapshot, &[&signer]);
+            NodeEngine::verify_qc_with_snapshot(&qc300, &old_snapshot, DEFAULT_CHAIN_ID).unwrap();
+            NodeEngine::verify_qc_with_snapshot(&qc301, &new_snapshot, DEFAULT_CHAIN_ID).unwrap();
+            (qc300.encode_to_vec(), qc301.encode_to_vec())
+        };
+        assert_eq!(replay(), replay());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
