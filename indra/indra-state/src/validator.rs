@@ -12,8 +12,8 @@ use indra_core::types::{
         compact_bond_pubkey_omission_active, compact_stake_bond_active, max_active_validators,
         muldiv, overflow_fix_active, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
         MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
-        MAX_VALIDATOR_NETWORK_ADDR_LEN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
-        SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+        MAX_VALIDATOR_NETWORK_ADDR_LEN, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION,
+        SCHEMA_VERSION_GENESIS, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
     },
     transaction::OutputV1,
 };
@@ -1014,7 +1014,8 @@ impl ValidatorSet {
                 matches!(
                     v.status,
                     ValidatorStatus::Active | ValidatorStatus::Registered
-                ) && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
+                ) && v.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK
+                    && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
             })
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
@@ -1102,7 +1103,8 @@ impl ValidatorSet {
                 matches!(
                     v.status,
                     ValidatorStatus::Active | ValidatorStatus::Registered
-                ) && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
+                ) && v.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK
+                    && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
             })
             .map(|v| (v.validator_id, v.stake_spark))
             .collect();
@@ -1528,11 +1530,21 @@ mod tests {
     #[test]
     fn select_active_set_promotes_top_ranked_validators() {
         let mut vs = ValidatorSet::new();
-        let mut waiting = make_validator(0x01, 500, 0);
+        let mut waiting = make_validator(0x01, MINIMUM_ACTIVE_SELF_STAKE_SPARK + 500, 0);
         waiting.status = ValidatorStatus::Registered;
         vs.upsert(waiting).unwrap();
-        vs.upsert(make_validator(0x02, 300, 0)).unwrap();
-        vs.upsert(make_validator(0x03, 100, 0)).unwrap();
+        vs.upsert(make_validator(
+            0x02,
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK + 300,
+            0,
+        ))
+        .unwrap();
+        vs.upsert(make_validator(
+            0x03,
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK + 100,
+            0,
+        ))
+        .unwrap();
 
         let delegations = DelegationMap::new();
         vs.select_active_set(&delegations, 0, 0);
@@ -1552,18 +1564,58 @@ mod tests {
     }
 
     #[test]
+    fn select_active_set_excludes_below_minimum_with_spare_capacity() {
+        let mut vs = ValidatorSet::new();
+        let under_minimum_id = Bytes32::from([0x01; 32]);
+        let mut under_minimum = make_validator(0x01, MINIMUM_ACTIVE_SELF_STAKE_SPARK - 1, 0);
+        under_minimum.status = ValidatorStatus::Registered;
+        vs.upsert(under_minimum).unwrap();
+
+        let delegations = DelegationMap::new();
+        vs.select_active_set(&delegations, MINIMUM_ACTIVE_SELF_STAKE_SPARK - 1, 0);
+
+        assert_eq!(vs.active_count(), 0);
+        assert!(matches!(
+            vs.get(&under_minimum_id).unwrap().status,
+            ValidatorStatus::Registered
+        ));
+    }
+
+    #[test]
+    fn select_active_set_includes_candidate_at_minimum_with_spare_capacity() {
+        let mut vs = ValidatorSet::new();
+        let minimum_id = Bytes32::from([0x02; 32]);
+        let mut at_minimum = make_validator(0x02, MINIMUM_ACTIVE_SELF_STAKE_SPARK, 0);
+        at_minimum.status = ValidatorStatus::Registered;
+        vs.upsert(at_minimum).unwrap();
+
+        let delegations = DelegationMap::new();
+        vs.select_active_set(&delegations, MINIMUM_ACTIVE_SELF_STAKE_SPARK, 0);
+
+        assert_eq!(vs.active_count(), 1);
+        assert!(matches!(
+            vs.get(&minimum_id).unwrap().status,
+            ValidatorStatus::Active
+        ));
+    }
+
+    #[test]
     fn select_active_set_uses_self_stake_not_delegations() {
         let mut vs = ValidatorSet::new();
         let mut delegations = DelegationMap::new();
 
         for seed in 1u8..=20 {
-            let mut validator = make_validator(seed, 1_000 + seed as u64, 0);
+            let mut validator = make_validator(
+                seed,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK + 1_000 + seed as u64,
+                0,
+            );
             validator.status = ValidatorStatus::Registered;
             vs.upsert(validator).unwrap();
         }
 
         let low_self_id = Bytes32::from([0xFE; 32]);
-        let mut low_self = make_validator(0xFE, 1, 0);
+        let mut low_self = make_validator(0xFE, MINIMUM_ACTIVE_SELF_STAKE_SPARK - 1, 0);
         low_self.status = ValidatorStatus::Registered;
         vs.upsert(low_self).unwrap();
         delegations

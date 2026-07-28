@@ -26,8 +26,8 @@ use indra_core::{
             COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
             ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
-            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SATURATION_MIN_VALIDATORS,
-            SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -1125,6 +1125,9 @@ fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64, height: 
             };
             if let Some(v) = state.validators.get_mut(&validator_id) {
                 v.stake_spark = v.stake_spark.saturating_sub(penalty);
+                if v.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK {
+                    v.status = ValidatorStatus::Registered;
+                }
             }
             state.total_supply = state.total_supply.saturating_sub(penalty);
             total_slashed = total_slashed.saturating_add(penalty);
@@ -1172,7 +1175,8 @@ mod tests {
                 payment_blinding_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
                 DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS,
                 ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
-                ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS, SLASH_LIVENESS_BPS,
+                ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
                 SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
@@ -2788,39 +2792,65 @@ mod tests {
     #[test]
     fn liveness_penalty_applied_after_threshold() {
         let mut state = crate::chain::ChainState::new_genesis();
-        let validator = make_validator(0x91, 1_000_000);
+        let initial_stake = MINIMUM_ACTIVE_SELF_STAKE_SPARK + 2_000_000;
+        let validator = make_validator(0x91, initial_stake);
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
         apply_epoch_transition(&mut state, 3, 0).unwrap();
+        let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
-            999_000
+            initial_stake - expected_penalty
+        );
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().status,
+            ValidatorStatus::Active
         );
     }
 
     #[test]
     fn liveness_no_penalty_within_threshold() {
         let mut state = crate::chain::ChainState::new_genesis();
-        let validator = make_validator(0x92, 1_000_000);
+        let initial_stake = MINIMUM_ACTIVE_SELF_STAKE_SPARK + 2_000_000;
+        let validator = make_validator(0x92, initial_stake);
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
         apply_epoch_transition(&mut state, 2, 0).unwrap();
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
-            1_000_000
+            initial_stake
         );
     }
 
     #[test]
     fn liveness_penalty_burns_supply() {
         let mut state = crate::chain::ChainState::new_genesis();
+        let initial_stake = MINIMUM_ACTIVE_SELF_STAKE_SPARK + 2_000_000;
         state
             .validators
-            .upsert(make_validator(0x93, 1_000_000))
+            .upsert(make_validator(0x93, initial_stake))
             .unwrap();
         let supply_before = state.total_supply;
         apply_epoch_transition(&mut state, 3, 0).unwrap();
-        assert_eq!(state.total_supply, supply_before - 1_000);
+        let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
+        assert_eq!(state.total_supply, supply_before - expected_penalty);
+    }
+
+    #[test]
+    fn liveness_penalty_demotes_when_self_stake_crosses_below_minimum() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let initial_stake = MINIMUM_ACTIVE_SELF_STAKE_SPARK + 500_000;
+        let validator = make_validator(0x94, initial_stake);
+        let validator_id = validator.validator_id;
+        state.validators.upsert(validator).unwrap();
+
+        apply_epoch_transition(&mut state, 3, 0).unwrap();
+
+        let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
+        let validator = state.validators.get(&validator_id).unwrap();
+        assert_eq!(validator.stake_spark, initial_stake - expected_penalty);
+        assert!(validator.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK);
+        assert_eq!(validator.status, ValidatorStatus::Registered);
     }
 
     #[test]
@@ -2885,10 +2915,65 @@ mod tests {
     }
 
     #[test]
+    fn minimum_active_stake_reselection_and_liveness_are_replay_deterministic() {
+        let mut steady = make_validator(0xA1, MINIMUM_ACTIVE_SELF_STAKE_SPARK + 5_000_000);
+        steady.status = ValidatorStatus::Registered;
+        steady.last_active_epoch = 3;
+
+        let mut below = make_validator(0xA2, MINIMUM_ACTIVE_SELF_STAKE_SPARK - 1);
+        below.status = ValidatorStatus::Registered;
+        below.last_active_epoch = 3;
+
+        let penalized_initial_stake = MINIMUM_ACTIVE_SELF_STAKE_SPARK + 500_000;
+        let penalized = make_validator(0xA3, penalized_initial_stake);
+
+        let validators = [steady, below, penalized];
+        let mut forward = crate::chain::ChainState::new_genesis();
+        let mut reverse = crate::chain::ChainState::new_genesis();
+        for validator in validators.iter().cloned() {
+            forward.validators.upsert(validator).unwrap();
+        }
+        for validator in validators.iter().cloned().rev() {
+            reverse.validators.upsert(validator).unwrap();
+        }
+
+        apply_epoch_transition(&mut forward, 3, 0).unwrap();
+        apply_epoch_transition(&mut reverse, 3, 0).unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(compute_state_root(&forward), compute_state_root(&reverse));
+        assert_eq!(
+            forward
+                .validators
+                .get(&Bytes32::from([0xA1; 32]))
+                .unwrap()
+                .status,
+            ValidatorStatus::Active
+        );
+        assert_eq!(
+            forward
+                .validators
+                .get(&Bytes32::from([0xA2; 32]))
+                .unwrap()
+                .status,
+            ValidatorStatus::Registered
+        );
+        assert_eq!(
+            forward
+                .validators
+                .get(&Bytes32::from([0xA3; 32]))
+                .unwrap()
+                .status,
+            ValidatorStatus::Registered
+        );
+    }
+
+    #[test]
     fn auto_delegation_routes_rewards_when_not_in_active_set() {
         let mut state = crate::chain::ChainState::new_genesis();
         for i in 1..=21u8 {
-            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
+            let mut validator =
+                make_validator(i, (22u64 - i as u64) * MINIMUM_ACTIVE_SELF_STAKE_SPARK);
             if i == 21 {
                 validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
             }
@@ -2916,7 +3001,8 @@ mod tests {
     fn auto_delegation_skipped_if_target_not_active() {
         let mut state = crate::chain::ChainState::new_genesis();
         for i in 1..=22u8 {
-            let mut validator = make_validator(i, (23u64 - i as u64) * 1_000_000);
+            let mut validator =
+                make_validator(i, (23u64 - i as u64) * MINIMUM_ACTIVE_SELF_STAKE_SPARK);
             if i == 22 {
                 validator.auto_delegate_to = Some(Bytes32::from([0x15; 32]));
             }
@@ -2941,7 +3027,8 @@ mod tests {
     fn auto_delegation_does_not_affect_active_set_selection() {
         let mut state = crate::chain::ChainState::new_genesis();
         for i in 1..=22u8 {
-            let mut validator = make_validator(i, (23u64 - i as u64) * 1_000_000);
+            let mut validator =
+                make_validator(i, (23u64 - i as u64) * MINIMUM_ACTIVE_SELF_STAKE_SPARK);
             if i == 22 {
                 validator.auto_delegate_to = Some(Bytes32::from([0x15; 32]));
             }
@@ -2972,7 +3059,8 @@ mod tests {
     fn auto_delegation_virtual_entry_not_in_state_root_after_transition() {
         let mut state = crate::chain::ChainState::new_genesis();
         for i in 1..=21u8 {
-            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
+            let mut validator =
+                make_validator(i, (22u64 - i as u64) * MINIMUM_ACTIVE_SELF_STAKE_SPARK);
             if i == 21 {
                 validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
             }

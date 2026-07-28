@@ -903,6 +903,7 @@ mod tests {
             governance::{ColdGovernanceAuthorization, GovernableAction, GovernanceActionType},
             primitives::{
                 VariableBytes, DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
             },
             staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         },
@@ -1130,7 +1131,7 @@ mod tests {
                 hybrid_classical_pk: Some(pubkey.classical_pk.0),
                 hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
                 vrf_pk: Some([validator_id.0[0]; 32]),
-                stake_spark: 1_000,
+                stake_spark: MINIMUM_ACTIVE_SELF_STAKE_SPARK,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
