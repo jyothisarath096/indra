@@ -936,8 +936,10 @@ certification.
 - [ ] Confirm all fallback ends at enforcement height.
 - [ ] Confirm unenrolled active validators are deterministically demoted.
 - [ ] Confirm frozen custody remains accounted, slashable and not burned.
-- [ ] Confirm deterministic batched bond migration is bounded and resumable.
-- [ ] Confirm enrollment cannot change the chosen cold pair mid-migration.
+- [ ] Confirm atomic bond migration enforces
+      `MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS` before any state mutation.
+- [ ] Confirm over-cap enrollment fails atomically with the documented
+      SelfUnstake/maturity/consolidated-SelfStake remedy.
 - [ ] Confirm historical blocks remain verifiable under historical rules.
 - [ ] Rehearse mixed old/new nodes and prove unsupported nodes fail visibly.
 - [ ] Rehearse snapshot restore before, during and after both heights.

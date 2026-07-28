@@ -7442,4 +7442,285 @@ mod tests {
             crate::compute_state_root(&second)
         );
     }
+
+    #[test]
+    fn hot_cold_capstone_adversarial_sequence_is_atomic_and_noncontaminating() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0xE0);
+        let cold_v1 = mixed_keypair(0xE1, 0xE2);
+        let chain_id = state.chain_id.clone();
+        let enroll = dual_signed_enroll_op(validator_id, &hot, &cold_v1, 1, &chain_id);
+        apply_staking_op(&mut state, &enroll, &chain_id, u64::MAX).unwrap();
+
+        let mut legitimate = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_010,
+                cold_authorization: cold_auth(1),
+            },
+            &cold_v1,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &legitimate, &chain_id, u64::MAX).unwrap();
+
+        let assert_rejected_without_mutation = |state: &mut ChainState, operation: &StakingOp| {
+            let before = state.clone();
+            assert!(apply_staking_op(state, operation, &chain_id, u64::MAX).is_err());
+            assert_eq!(*state, before);
+        };
+
+        let hot_fallback = signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_020,
+                cold_authorization: None,
+            },
+            2,
+            &hot,
+            &chain_id,
+        );
+        assert_rejected_without_mutation(&mut state, &hot_fallback);
+
+        let wrong_version = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_030,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 2,
+                }),
+            },
+            &cold_v1,
+            &chain_id,
+        );
+        assert_rejected_without_mutation(&mut state, &wrong_version);
+
+        let wrong_nonce = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_040,
+                cold_authorization: cold_auth(3),
+            },
+            &cold_v1,
+            &chain_id,
+        );
+        assert_rejected_without_mutation(&mut state, &wrong_nonce);
+
+        let attacker = mixed_keypair(0xE3, 0xE4);
+        legitimate.body = StakingOpBody::SetCommission {
+            validator_id,
+            new_commission_bps: 1_050,
+            cold_authorization: cold_auth(2),
+        };
+        let message = legitimate
+            .cold_authorization_signing_bytes(&chain_id)
+            .unwrap()
+            .unwrap();
+        let valid_signature = cold_v1.sign(&message).unwrap();
+        let attacker_signature = attacker.sign(&message).unwrap();
+        legitimate.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&valid_signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&attacker_signature.pq.0).unwrap(),
+        };
+        assert_rejected_without_mutation(&mut state, &legitimate);
+
+        let cold_v2 = mixed_keypair(0xE5, 0xE6);
+        let rotate = dual_signed_rotate_op(validator_id, &cold_v1, &cold_v2, 1, 2, &chain_id);
+        apply_staking_op(&mut state, &rotate, &chain_id, u64::MAX).unwrap();
+
+        let old_key_fallback = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_060,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 3,
+                }),
+            },
+            &cold_v1,
+            &chain_id,
+        );
+        assert_rejected_without_mutation(&mut state, &old_key_fallback);
+
+        let reuse_retired =
+            dual_signed_rotate_op(validator_id, &cold_v2, &cold_v1, 2, 1, &chain_id);
+        assert_rejected_without_mutation(&mut state, &reuse_retired);
+
+        let (frozen_id, frozen_hot) = make_active_validator(&mut state, 0xE7);
+        crate::epoch::enforce_validator_cold_key_enrollment(&mut state, u64::MAX);
+        let frozen_attempt = signed_op(
+            StakingOpBody::SetCommission {
+                validator_id: frozen_id,
+                new_commission_bps: 1_070,
+                cold_authorization: None,
+            },
+            1,
+            &frozen_hot,
+            &chain_id,
+        );
+        assert_rejected_without_mutation(&mut state, &frozen_attempt);
+
+        let legitimate_v2 = cold_signed_op(
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_080,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 2,
+                    cold_nonce: 1,
+                }),
+            },
+            &cold_v2,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &legitimate_v2, &chain_id, u64::MAX).unwrap();
+
+        let mut pre_gate = ChainState::new_genesis();
+        let (pre_id, pre_hot) = make_active_validator(&mut pre_gate, 0xE8);
+        let pre_cold = mixed_keypair(0xE9, 0xEA);
+        let pre_chain_id = pre_gate.chain_id.clone();
+        let pre_enroll = dual_signed_enroll_op(pre_id, &pre_hot, &pre_cold, 1, &pre_chain_id);
+        let before = pre_gate.clone();
+        assert!(apply_staking_op(
+            &mut pre_gate,
+            &pre_enroll,
+            &pre_chain_id,
+            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT - 1,
+        )
+        .is_err());
+        assert_eq!(pre_gate, before);
+    }
+
+    #[test]
+    fn hot_cold_capstone_six_gate_state_transcript_replays_byte_identically() {
+        fn replay() -> Vec<(u64, Vec<u8>, Bytes32)> {
+            use indra_core::types::primitives::hard_forks::{
+                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT, DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
+                NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
+            };
+
+            let mut transcript = Vec::new();
+            let mut state = ChainState::new_genesis();
+            let (validator_id, hot) = make_active_validator(&mut state, 0xB0);
+            let delegator = keypair(0xB1);
+            let delegator_pubkey = pubkey_from_keypair(&delegator);
+            let delegator_id = pubkey_to_id(&delegator_pubkey);
+
+            state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
+            state
+                .delegator_identities
+                .insert(delegator_id, delegator_pubkey.clone());
+            state
+                .delegations
+                .add_delegation(validator_id, delegator_id, DUST_LIMIT_SPARK, 0)
+                .unwrap();
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
+
+            state.height = COMPACT_BOND_PUBKEY_OMISSION_HEIGHT;
+            let compact_bond_id = Bytes32::from([0xB2; 32]);
+            state.staked_bonds.insert(
+                compact_bond_id,
+                StakeBondEntry {
+                    utxo_id: compact_bond_id,
+                    validator_id,
+                    delegator_id,
+                    amount_spark: DUST_LIMIT_SPARK,
+                    bonded_epoch: 0,
+                    unbonding_end_epoch: Some(1),
+                    custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
+                    original_output: test_output(DUST_LIMIT_SPARK, delegator_pubkey, 0xB2).into(),
+                },
+            );
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
+
+            state.height = PAYMENT_BLINDING_HEIGHT;
+            state
+                .payment_identities
+                .insert(delegator_id, payment_pubkey(0xB3));
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
+
+            state.height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
+            crate::epoch::release_unbonded_bonds_at_height(
+                &mut state,
+                1,
+                NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
+            )
+            .unwrap();
+            assert!(!state.staked_bonds.contains_key(&compact_bond_id));
+            assert!(state
+                .delegation_return_events
+                .iter()
+                .any(|event| event.bond_utxo_id == compact_bond_id));
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
+
+            state.height = VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT;
+            let cold = mixed_keypair(0xB5, 0xB6);
+            let chain_id = state.chain_id.clone();
+            let enroll = dual_signed_enroll_op(validator_id, &hot, &cold, 1, &chain_id);
+            apply_staking_op(
+                &mut state,
+                &enroll,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+            )
+            .unwrap();
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
+
+            let (unenrolled_id, _) = make_active_validator(&mut state, 0xB7);
+            state.height = VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
+            crate::epoch::enforce_validator_cold_key_enrollment(
+                &mut state,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+            );
+            assert_eq!(
+                state.validators.get(&unenrolled_id).unwrap().status,
+                ValidatorStatus::Registered
+            );
+            assert_eq!(
+                state.validators.get(&validator_id).unwrap().status,
+                ValidatorStatus::Active
+            );
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
+            transcript
+        }
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 6);
+        assert_eq!(
+            first.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            vec![
+                indra_core::types::primitives::hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
+                indra_core::types::primitives::hard_forks::COMPACT_BOND_PUBKEY_OMISSION_HEIGHT,
+                PAYMENT_BLINDING_HEIGHT,
+                indra_core::types::primitives::hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
+                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+            ]
+        );
+    }
 }

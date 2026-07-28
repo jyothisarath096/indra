@@ -632,8 +632,9 @@ pub mod hard_forks {
         "compact bond pubkey omission must not activate before identity registry"
     );
     const _: () = assert!(
-        VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT >= VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
-        "validator cold-key enforcement must not activate before enrollment"
+        VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT == u64::MAX
+            || VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT > VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+        "scheduled validator cold-key enforcement must activate strictly after enrollment"
     );
 }
 
@@ -1300,7 +1301,10 @@ mod tests {
 
         assert_eq!(VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT, u64::MAX);
         assert_eq!(VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT, u64::MAX);
-        assert!(VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT >= VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT);
+        assert!(
+            VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT == u64::MAX
+                || VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT > VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT
+        );
         assert!(!validator_cold_key_enrollment_active(u64::MAX - 1));
         assert!(!validator_cold_key_enforcement_active(u64::MAX - 1));
         assert!(validator_cold_key_enrollment_active(u64::MAX));

@@ -892,7 +892,7 @@ fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateRe
     )
 }
 
-fn release_unbonded_bonds_at_height(
+pub(crate) fn release_unbonded_bonds_at_height(
     state: &mut ChainState,
     current_epoch: u64,
     release_height: u64,
