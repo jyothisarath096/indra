@@ -26,14 +26,15 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
     primitives::{
-        reveal_set_commitment_active, vrf_commit_reveal_election_active, Bytes32, VariableBytes,
-        MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-        MAX_VRF_PROOF_BYTES,
+        consensus_snapshot_active, reveal_set_commitment_active, vrf_commit_reveal_election_active,
+        Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+        MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
     slashing::SlashEvidenceV1,
     staking::StakingOp,
     vote::VoteStep,
     vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
+    ConsensusSnapshot,
 };
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
@@ -797,6 +798,52 @@ impl NodeEngine {
             .collect()
     }
 
+    /// Build the immutable voter list for `height` from its resolved snapshot.
+    ///
+    /// The caller must pass `S(height)`, resolved by the authoritative
+    /// height-derived lookup. `height` remains explicit so post-gate adapters
+    /// cannot hide which consensus height they are serving.
+    pub fn registered_voters_for_height(
+        height: u64,
+        snapshot: &ConsensusSnapshot,
+    ) -> Vec<RegisteredVoter> {
+        debug_assert!(snapshot.activation_height <= height);
+        snapshot
+            .entries()
+            .iter()
+            .map(|entry| RegisteredVoter {
+                validator_id: entry.validator_id,
+                classical_pk: entry.classical_vote_pk,
+                pq_pk: entry.pq_vote_pk.to_vec(),
+                stake: entry.consensus_weight_spark,
+            })
+            .collect()
+    }
+
+    /// Resolve the voter authority for one consensus height.
+    ///
+    /// Legacy heights preserve the original live-registry adapter exactly.
+    /// Governed heights fail closed if their canonical snapshot is unavailable.
+    pub fn voters_for_consensus_height(&self, height: u64) -> NodeResult<Vec<RegisteredVoter>> {
+        if !consensus_snapshot_active(height) {
+            return Ok(self.registered_voters());
+        }
+        let snapshot = self.state.snapshot_for_consensus_height(height)?;
+        Ok(Self::registered_voters_for_height(height, snapshot))
+    }
+
+    /// Whether the local validator has consensus authority at `height`.
+    pub fn voter_authorized_for_height(
+        &self,
+        height: u64,
+        validator_id: Bytes32,
+    ) -> NodeResult<bool> {
+        Ok(self
+            .voters_for_consensus_height(height)?
+            .iter()
+            .any(|voter| voter.validator_id == validator_id))
+    }
+
     /// Build the QC validator list for the current epoch.
     pub fn qc_validators(&self) -> Vec<QcValidator> {
         let mut active: Vec<_> = self.state.validators.active_validators().collect();
@@ -1178,6 +1225,16 @@ mod tests {
         hybrid
     }
 
+    fn assert_same_voters(left: &[RegisteredVoter], right: &[RegisteredVoter]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.validator_id, right.validator_id);
+            assert_eq!(left.classical_pk, right.classical_pk);
+            assert_eq!(left.pq_pk, right.pq_pk);
+            assert_eq!(left.stake, right.stake);
+        }
+    }
+
     fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32]) -> String {
         std::fs::create_dir_all(dir).unwrap();
         let classical = ClassicalKeypair::from_seed(&seed);
@@ -1524,6 +1581,134 @@ mod tests {
         let engine = NodeEngine::init(config).unwrap();
         assert_eq!(engine.height(), 0);
         assert!(engine.validator_id().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_gate_voters_use_snapshot_weight_not_mutated_live_stake() {
+        let dir = temp_dir("snapshot_voter_weight");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        install_active_validator(&mut engine, [0x42; 32], "snapshot-voter");
+        let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let validator_id = snapshot.entries()[0].validator_id;
+        let frozen_weight = snapshot.entries()[0].consensus_weight_spark;
+
+        engine
+            .state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .stake_spark = frozen_weight + 777;
+
+        let voters = NodeEngine::registered_voters_for_height(1, &snapshot);
+        assert_eq!(voters[0].stake, frozen_weight);
+        assert_eq!(
+            engine
+                .registered_voters()
+                .into_iter()
+                .find(|voter| voter.validator_id == validator_id)
+                .unwrap()
+                .stake,
+            frozen_weight + 777
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_gate_voter_adapter_is_unchanged_live_registry_path() {
+        let dir = temp_dir("legacy_voter_adapter");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        install_active_validator(&mut engine, [0x43; 32], "legacy-voter");
+
+        assert_same_voters(
+            &engine.voters_for_consensus_height(1).unwrap(),
+            &engine.registered_voters(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_height_round_adapters_remain_identical_after_live_mutation() {
+        let dir = temp_dir("same_height_snapshot_voters");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        install_active_validator(&mut engine, [0x44; 32], "round-voter");
+        let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let round_zero_voters = NodeEngine::registered_voters_for_height(1, &snapshot);
+
+        let validator_id = snapshot.entries()[0].validator_id;
+        engine
+            .state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .stake_spark += 999;
+        let round_one_voters = NodeEngine::registered_voters_for_height(1, &snapshot);
+
+        assert_same_voters(&round_zero_voters, &round_one_voters);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_boundary_vote_adapters_replay_deterministically() {
+        let dir = temp_dir("snapshot_voter_boundary_replay");
+        let config = NodeConfig::local_test(dir.clone());
+        let mut engine = NodeEngine::init(config).unwrap();
+        let signer = install_active_validator(&mut engine, [0x45; 32], "replay-voter");
+        let old_snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
+        let validator_id = old_snapshot.entries()[0].validator_id;
+        engine
+            .state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .stake_spark += 300;
+        let new_snapshot = engine.state.build_consensus_snapshot(301, 300).unwrap();
+        assert_ne!(
+            old_snapshot.entries()[0].consensus_weight_spark,
+            new_snapshot.entries()[0].consensus_weight_spark
+        );
+
+        let replay = || {
+            [300u64, 301]
+                .into_iter()
+                .map(|height| {
+                    let snapshot = if height == 300 {
+                        &old_snapshot
+                    } else {
+                        &new_snapshot
+                    };
+                    let voters = NodeEngine::registered_voters_for_height(height, snapshot);
+                    let vote = produce_vote(
+                        height,
+                        0,
+                        VoteStep::Prevote,
+                        Bytes32::from([height as u8; 32]),
+                        validator_id,
+                        DEFAULT_CHAIN_ID,
+                        &signer,
+                    )
+                    .unwrap();
+                    let mut collector = indra_consensus::vote::VoteCollector::new(
+                        height,
+                        0,
+                        VoteStep::Prevote,
+                        DEFAULT_CHAIN_ID.to_string(),
+                        voters,
+                    );
+                    collector.add_vote(vote).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
+        assert!(first.iter().all(|decision| matches!(
+            decision,
+            indra_consensus::vote::VoteDecision::QuorumReached { .. }
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

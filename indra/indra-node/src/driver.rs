@@ -23,10 +23,10 @@ use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
     crypto::HybridSignature,
     primitives::{
-        bps_of, reveal_set_commitment_active, vrf_commit_reveal_election_active, Bytes32,
-        VariableBytes, CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
-        MAX_VRF_EMPTY_REVEAL_ROUNDS, MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS,
-        VRF_ELECTION_SETTLE_MS, VRF_REVEAL_WINDOW_MS,
+        bps_of, consensus_snapshot_active, reveal_set_commitment_active,
+        vrf_commit_reveal_election_active, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS,
+        MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VRF_EMPTY_REVEAL_ROUNDS,
+        MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS, VRF_ELECTION_SETTLE_MS, VRF_REVEAL_WINDOW_MS,
     },
     qc::QuorumCertificateV1,
     transaction::TransactionV1,
@@ -472,7 +472,18 @@ impl ConsensusDriver {
 
     /// Refresh the registered voter set from the engine state.
     pub fn refresh_registered_voters(&mut self) {
-        self.set_voters(self.engine.registered_voters());
+        let height = self.next_height();
+        match self.engine.voters_for_consensus_height(height) {
+            Ok(voters) => self.set_voters(voters),
+            Err(error) => {
+                eprintln!(
+                    "[vote] CRITICAL: failed to resolve voter authority for height {height}: {error}"
+                );
+                // Fail closed: an empty voter set cannot authorize or form
+                // quorum, and no live-registry fallback is attempted.
+                self.set_voters(Vec::new());
+            }
+        }
     }
 
     /// Return the serialised QC to place in the next proposal header.
@@ -2065,6 +2076,26 @@ impl ConsensusDriver {
         let Some(local_validator_id) = self.engine.validator_id() else {
             return vec![];
         };
+        if consensus_snapshot_active(height) {
+            match self
+                .engine
+                .voter_authorized_for_height(height, local_validator_id)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "[vote] refusing local vote at height={height}: validator is not a member of the governing consensus authority"
+                    );
+                    return vec![];
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[vote] CRITICAL: refusing local vote at height={height}: failed to resolve consensus authority: {error}"
+                    );
+                    return vec![DriverAction::None];
+                }
+            }
+        }
         if self.collector_has_vote_from(height, round, step, local_validator_id) {
             return vec![];
         }
@@ -3490,6 +3521,41 @@ mod tests {
         let engine = NodeEngine::init(config).unwrap();
         let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
         (ConsensusDriver::new(engine, vote_safety), dir)
+    }
+
+    #[test]
+    fn local_vote_authorization_uses_snapshot_membership_after_registry_demotion() {
+        let seed = [0xA5u8; 32];
+        let (mut driver, dir) = local_driver(seed, "snapshot_local_vote_authority");
+        let local_id = driver.engine.validator_id().unwrap();
+        let snapshot = driver
+            .engine
+            .state
+            .build_genesis_consensus_snapshot()
+            .unwrap();
+        assert!(snapshot
+            .entries()
+            .iter()
+            .any(|entry| entry.validator_id == local_id));
+        driver.engine.state.consensus_snapshots.push(snapshot);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local_id)
+            .unwrap()
+            .status = ValidatorStatus::Registered;
+
+        assert!(driver
+            .engine
+            .voter_authorized_for_height(u64::MAX, local_id)
+            .unwrap());
+        let actions =
+            driver.sign_and_record_local_vote(u64::MAX, 0, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVote(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn signed_vrf_pair(
@@ -5740,6 +5806,13 @@ mod tests {
         let b = install_active_validator(&mut driver, seed_b, "b");
         let c = install_active_validator(&mut driver, seed_c, "c");
         let _d = install_active_validator(&mut driver, seed_d, "d");
+        driver.engine.state.consensus_snapshots.push(
+            driver
+                .engine
+                .state
+                .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+                .unwrap(),
+        );
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xA5; 32]);

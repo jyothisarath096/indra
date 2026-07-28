@@ -13,6 +13,10 @@ pub enum NodeError {
     #[error("state error: {0}")]
     State(#[from] indra_state::StateError),
 
+    /// Consensus snapshot lookup failed closed.
+    #[error("consensus snapshot lookup error: {0}")]
+    ConsensusSnapshotLookup(#[from] indra_state::ConsensusSnapshotLookupError),
+
     /// A staking operation was rejected before entering the local mempool.
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
