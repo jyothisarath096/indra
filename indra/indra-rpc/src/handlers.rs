@@ -342,6 +342,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorIdentityDebug", RpcMethodAccess::Admin),
     ("indra_getStakeBondDebug", RpcMethodAccess::Admin),
+    ("indra_getConsensusSnapshots", RpcMethodAccess::Admin),
     ("indra_getEpochInfo", RpcMethodAccess::ReadOnly),
     ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
     ("indra_getEpochHistory", RpcMethodAccess::ReadOnly),
@@ -478,6 +479,7 @@ pub fn dispatch_with_admin(
         "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
         "indra_getDelegatorIdentityDebug" => Ready(get_delegator_identity_debug(params, state)),
         "indra_getStakeBondDebug" => Ready(get_stake_bond_debug(params, state)),
+        "indra_getConsensusSnapshots" => Ready(get_consensus_snapshots(state)),
         "indra_getEpochInfo" => Ready(get_epoch_info(state)),
         "indra_getEpochRecord" => Ready(get_epoch_record(params, state)),
         "indra_getEpochHistory" => Ready(get_epoch_history(params, state)),
@@ -2066,6 +2068,52 @@ fn get_stake_bond_debug(params: &[String], state: &NodeState<'_>) -> RpcResult<S
     ))
 }
 
+/// `indra_getConsensusSnapshots` — admin-only retained consensus authority summary.
+fn get_consensus_snapshots(state: &NodeState<'_>) -> RpcResult<String> {
+    fn snapshot_json(
+        snapshot: Option<&indra_core::types::consensus_snapshot::ConsensusSnapshot>,
+    ) -> String {
+        snapshot.map_or_else(
+            || "null".to_string(),
+            |snapshot| {
+                format!(
+                    r#"{{"activation_height":{},"source_boundary_height":{},"snapshot_root":"{}","member_count":{},"total_weight_spark":{}}}"#,
+                    snapshot.activation_height,
+                    snapshot.source_boundary_height,
+                    hex::encode(snapshot.snapshot_root.0),
+                    snapshot.entries().len(),
+                    snapshot.total_weight_spark,
+                )
+            },
+        )
+    }
+
+    let current = state.chain.consensus_snapshots.last();
+    let previous = state
+        .chain
+        .consensus_snapshots
+        .len()
+        .checked_sub(2)
+        .and_then(|index| state.chain.consensus_snapshots.get(index));
+    let epoch_length = indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+    let next_boundary_height = state
+        .chain
+        .height
+        .checked_div(epoch_length)
+        .unwrap_or_default()
+        .saturating_add(1)
+        .saturating_mul(epoch_length);
+
+    Ok(format!(
+        r#"{{"state_height":{},"next_consensus_height":{},"next_scheduled_boundary_height":{},"current":{},"previous":{}}}"#,
+        state.chain.height,
+        state.chain.height.saturating_add(1),
+        next_boundary_height,
+        snapshot_json(current),
+        snapshot_json(previous),
+    ))
+}
+
 /// `indra_getEpochInfo` — returns current epoch details.
 fn get_epoch_info(state: &NodeState<'_>) -> RpcResult<String> {
     use indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
@@ -2696,6 +2744,7 @@ mod tests {
     use indra_core::{
         types::{
             block::{BlockHeaderV1, BlockV1},
+            consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::{HybridPubKey, HybridSignature},
             governance::{
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
@@ -2709,7 +2758,9 @@ mod tests {
         },
         Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1, PqKeypair};
+    use indra_crypto::{
+        sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1, PqKeypair, VrfKeypair,
+    };
     use indra_state::{
         apply_staking_op,
         governance::{ProposalPhase, ProposalRecord},
@@ -3943,6 +3994,74 @@ mod tests {
             admin,
             DispatchResult::Ready(Ok(result)) if result.contains(r#""compact":false"#)
         ));
+    }
+
+    #[test]
+    fn consensus_snapshot_observability_is_admin_gated_and_reports_retained_authority() {
+        let mut engine = make_state("consensus-snapshot-admin");
+        let classical = ClassicalKeypair::from_seed(&[0xA1; 32]);
+        let pq = PqKeypair::from_seed(&[0xA2; 32]).unwrap();
+        let public = HybridKeypair::new(classical, pq).public_key();
+        let vrf = VrfKeypair::from_seed(&[0xA3; 32]);
+        let entry = |weight| {
+            ConsensusSnapshotEntry::new(
+                Bytes32::from([0xA0; 32]),
+                weight,
+                public.classical.0,
+                public.pq.0,
+                vrf.public_key(),
+            )
+            .unwrap()
+        };
+        let previous = ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)]).unwrap();
+        let current = ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)]).unwrap();
+        let previous_root = hex::encode(previous.snapshot_root.0);
+        let current_root = hex::encode(current.snapshot_root.0);
+        engine.height = 950;
+        engine.consensus_snapshots = vec![previous, current];
+        let state = NodeState::read_only(&engine);
+
+        assert!(matches!(
+            dispatch_with_admin(
+                "indra_getConsensusSnapshots",
+                &[],
+                &state,
+                RpcMode::ReadOnly,
+                true,
+                true,
+            ),
+            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
+        ));
+        assert!(matches!(
+            dispatch_with_admin(
+                "indra_getConsensusSnapshots",
+                &[],
+                &state,
+                RpcMode::Full,
+                false,
+                false,
+            ),
+            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
+        ));
+
+        let result = dispatch_with_admin(
+            "indra_getConsensusSnapshots",
+            &[],
+            &state,
+            RpcMode::Full,
+            true,
+            true,
+        );
+        let DispatchResult::Ready(Ok(json)) = result else {
+            panic!("admin snapshot query must succeed");
+        };
+        assert!(json.contains(r#""activation_height":901"#));
+        assert!(json.contains(r#""activation_height":601"#));
+        assert!(json.contains(&current_root));
+        assert!(json.contains(&previous_root));
+        assert!(json.contains(r#""member_count":1"#));
+        assert!(json.contains(r#""total_weight_spark":3000000000"#));
+        assert!(json.contains(r#""next_scheduled_boundary_height":1200"#));
     }
 
     #[test]

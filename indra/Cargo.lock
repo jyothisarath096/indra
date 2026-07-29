@@ -1042,6 +1042,7 @@ name = "indra-storage"
 version = "0.1.0"
 dependencies = [
  "indra-core",
+ "indra-crypto",
  "indra-state",
  "thiserror 1.0.69",
 ]

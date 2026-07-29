@@ -593,7 +593,11 @@ mod tests {
     use crate::validator::DelegatorEntry;
     use indra_core::{
         codec::Encode,
-        types::{crypto::HybridPubKey, primitives::VariableBytes},
+        types::{
+            consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
+            crypto::HybridPubKey,
+            primitives::VariableBytes,
+        },
         CommitmentV1,
     };
 
@@ -670,6 +674,53 @@ mod tests {
             .staking_nonces
             .get(&Bytes32::from([0x22; 32]))
             .is_none());
+    }
+
+    #[test]
+    fn epoch_scope_rollback_restores_consensus_snapshot_rotation() {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[0xE1; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[0xE2; 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xE3; 32]);
+        let snapshot = |activation_height, boundary_height, weight| {
+            ConsensusSnapshot::new(
+                activation_height,
+                boundary_height,
+                vec![ConsensusSnapshotEntry::new(
+                    Bytes32::from([0xE0; 32]),
+                    weight,
+                    public.classical.0,
+                    public.pq.0,
+                    vrf.public_key(),
+                )
+                .unwrap()],
+            )
+            .unwrap()
+        };
+        let mut state = ChainState::new_genesis();
+        state.height = u64::MAX;
+        state.consensus_snapshots = vec![
+            snapshot(601, 600, 2_000_000_000),
+            snapshot(901, 900, 3_000_000_000),
+        ];
+        state.rebuild_state_commitment_v2(state.height);
+        let original = state.clone();
+
+        set_fail_after_mutation(Some(1));
+        {
+            let mut txn = StateTxn::begin(&mut state, u64::MAX);
+            txn.snapshot_epoch_scope();
+            txn.state_mut().consensus_snapshots = vec![
+                snapshot(901, 900, 3_000_000_000),
+                snapshot(1201, 1200, 4_000_000_000),
+            ];
+            assert!(txn.after_mutation().is_err());
+        }
+        set_fail_after_mutation(None);
+
+        assert_eq!(state.consensus_snapshots, original.consensus_snapshots);
+        assert_eq!(state.state_commitment_v2, original.state_commitment_v2);
+        assert_eq!(state, original);
     }
 
     #[test]

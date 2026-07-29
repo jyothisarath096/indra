@@ -13,4 +13,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 indra-core   = { path = "../indra-core" }
+indra-crypto = { path = "../indra-crypto" }
 indra-state  = { path = "../indra-state" }

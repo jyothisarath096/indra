@@ -595,9 +595,12 @@ fn validate_snapshot_state(
 mod tests {
     use super::*;
     use indra_core::{
-        types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         types::primitives::{
             hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES,
+        },
+        types::{
+            block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+            consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
         },
         Bytes32, ProtocolVersion, VariableBytes,
     };
@@ -689,6 +692,46 @@ mod tests {
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded, state);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_exact_retained_consensus_snapshots() {
+        let dir = temp_dir("consensus_snapshot_restore");
+        let store = StateStore::open(&dir).unwrap();
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[0xC1; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[0xC2; 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xC3; 32]);
+        let entry = |weight| {
+            ConsensusSnapshotEntry::new(
+                Bytes32::from([0xC0; 32]),
+                weight,
+                public.classical.0,
+                public.pq.0,
+                vrf.public_key(),
+            )
+            .unwrap()
+        };
+
+        let mut continuous = ChainState::new_genesis();
+        continuous.height = u64::MAX;
+        continuous.tip_hash = Bytes32::from([0xCF; 32]);
+        continuous.consensus_snapshots = vec![
+            ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)]).unwrap(),
+            ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)]).unwrap(),
+        ];
+        continuous.rebuild_state_commitment_v2(continuous.height);
+        let expected_bytes = serialise_chain_state(&continuous);
+        let expected_roots = compute_state_roots(&continuous);
+
+        store.save(&continuous).unwrap();
+        let restored = store.load_latest().unwrap().unwrap();
+
+        assert_eq!(restored.consensus_snapshots.len(), 2);
+        assert_eq!(restored.consensus_snapshots, continuous.consensus_snapshots);
+        assert_eq!(serialise_chain_state(&restored), expected_bytes);
+        assert_eq!(compute_state_roots(&restored), expected_roots);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

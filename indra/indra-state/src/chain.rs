@@ -1355,6 +1355,130 @@ mod tests {
     }
 
     #[test]
+    fn full_consensus_snapshot_replay_matches_independent_reference() {
+        let mut reference = snapshot_state();
+        reference
+            .validators
+            .upsert(snapshot_validator(3, 31, 3_000_000_000))
+            .unwrap();
+        reference
+            .validators
+            .get_mut(&Bytes32::from([1; 32]))
+            .unwrap()
+            .stake_spark = 4_000_000_000;
+        reference
+            .rotate_consensus_snapshot_after_boundary(300)
+            .unwrap();
+
+        // Scenario A as a legitimate historical operation: C gains stake after
+        // the old authority was fixed. The snapshot governing that interval
+        // must remain byte-for-byte unchanged.
+        let first_root = reference.consensus_snapshots[0].snapshot_root;
+        reference
+            .validators
+            .get_mut(&Bytes32::from([3; 32]))
+            .unwrap()
+            .stake_spark = 14_000_000_000;
+        assert_eq!(reference.consensus_snapshots[0].snapshot_root, first_root);
+
+        // Change membership before the next boundary.
+        reference
+            .validators
+            .get_mut(&Bytes32::from([2; 32]))
+            .unwrap()
+            .status = crate::validator::ValidatorStatus::Registered;
+        reference
+            .validators
+            .upsert(snapshot_validator(4, 41, 5_000_000_000))
+            .unwrap();
+        reference
+            .rotate_consensus_snapshot_after_boundary(600)
+            .unwrap();
+
+        // Scenario B as a legitimate historical operation: A inflates stake
+        // within the interval, but cannot rewrite the already-active snapshot.
+        let second_root = reference.consensus_snapshots[1].snapshot_root;
+        reference
+            .validators
+            .get_mut(&Bytes32::from([1; 32]))
+            .unwrap()
+            .stake_spark = 20_000_000_000;
+        assert_eq!(reference.consensus_snapshots[1].snapshot_root, second_root);
+        reference
+            .validators
+            .get_mut(&Bytes32::from([3; 32]))
+            .unwrap()
+            .status = crate::validator::ValidatorStatus::Registered;
+        reference
+            .rotate_consensus_snapshot_after_boundary(900)
+            .unwrap();
+        reference.height = u64::MAX;
+        reference.tip_hash = Bytes32::from([0xF0; 32]);
+        reference.rebuild_state_commitment_v2(reference.height);
+
+        // Independently replay the same historical event transcript from
+        // genesis rather than cloning the reference state.
+        let mut replayed = snapshot_state();
+        replayed
+            .validators
+            .upsert(snapshot_validator(3, 31, 3_000_000_000))
+            .unwrap();
+        enum Event {
+            Stake(u8, u64),
+            Status(u8, crate::validator::ValidatorStatus),
+            Add(ValidatorEntry),
+            Boundary(u64),
+        }
+        let events = vec![
+            Event::Stake(1, 4_000_000_000),
+            Event::Boundary(300),
+            Event::Stake(3, 14_000_000_000),
+            Event::Status(2, crate::validator::ValidatorStatus::Registered),
+            Event::Add(snapshot_validator(4, 41, 5_000_000_000)),
+            Event::Boundary(600),
+            Event::Stake(1, 20_000_000_000),
+            Event::Status(3, crate::validator::ValidatorStatus::Registered),
+            Event::Boundary(900),
+        ];
+        for event in events {
+            match event {
+                Event::Stake(id, stake) => {
+                    replayed
+                        .validators
+                        .get_mut(&Bytes32::from([id; 32]))
+                        .unwrap()
+                        .stake_spark = stake;
+                }
+                Event::Status(id, status) => {
+                    replayed
+                        .validators
+                        .get_mut(&Bytes32::from([id; 32]))
+                        .unwrap()
+                        .status = status;
+                }
+                Event::Add(validator) => replayed.validators.upsert(validator).unwrap(),
+                Event::Boundary(height) => {
+                    replayed
+                        .rotate_consensus_snapshot_after_boundary(height)
+                        .unwrap();
+                }
+            }
+        }
+        replayed.height = u64::MAX;
+        replayed.tip_hash = Bytes32::from([0xF0; 32]);
+        replayed.rebuild_state_commitment_v2(replayed.height);
+
+        assert_eq!(reference.consensus_snapshots.len(), 2);
+        assert_eq!(reference.consensus_snapshots, replayed.consensus_snapshots);
+        assert_eq!(reference.encode_to_vec(), replayed.encode_to_vec());
+        assert_eq!(
+            crate::compute_state_root(&reference),
+            crate::compute_state_root(&replayed)
+        );
+        assert_eq!(reference, replayed);
+    }
+
+    #[test]
     fn pre_gate_chain_state_bytes_and_roots_ignore_snapshot_field() {
         let baseline = snapshot_state();
         let mut with_staged_snapshot = baseline.clone();
