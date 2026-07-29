@@ -162,6 +162,12 @@ struct LocalVrfRoundState {
     vrf_proof: Vec<u8>,
 }
 
+struct VrfConsensusAuthority {
+    election: ProposerElection,
+    weights: BTreeMap<Bytes32, u64>,
+    total_weight: u64,
+}
+
 /// An inbound event for the driver to process.
 #[derive(Debug)]
 pub enum DriverEvent {
@@ -987,43 +993,101 @@ impl ConsensusDriver {
         }
     }
 
+    fn vrf_consensus_authority(
+        &self,
+        height: u64,
+        round: u32,
+    ) -> NodeResult<VrfConsensusAuthority> {
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
+        if consensus_snapshot_active(height) {
+            let snapshot = self.engine.state.snapshot_for_consensus_height(height)?;
+            return Ok(Self::vrf_authority_from_snapshot(
+                height, round, epoch_seed, snapshot,
+            ));
+        }
+
+        let election = self.active_vrf_candidates(height, round);
+        let weights = self
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .map(|validator| (validator.validator_id, validator.stake_spark))
+            .collect();
+        let total_weight = self
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .map(|validator| validator.stake_spark)
+            .fold(0u64, u64::saturating_add);
+        Ok(VrfConsensusAuthority {
+            election,
+            weights,
+            total_weight,
+        })
+    }
+
+    fn vrf_authority_from_snapshot(
+        height: u64,
+        round: u32,
+        epoch_seed: Bytes32,
+        snapshot: &indra_core::types::consensus_snapshot::ConsensusSnapshot,
+    ) -> VrfConsensusAuthority {
+        let candidates = snapshot
+            .entries()
+            .iter()
+            .map(|entry| ProposerCandidate {
+                validator_id: entry.validator_id,
+                vrf_pubkey: entry.vrf_pk,
+                verified_vrf_output: None,
+                stake: entry.consensus_weight_spark,
+            })
+            .collect();
+        let weights = snapshot
+            .entries()
+            .iter()
+            .map(|entry| (entry.validator_id, entry.consensus_weight_spark))
+            .collect();
+        VrfConsensusAuthority {
+            election: ProposerElection {
+                epoch_seed,
+                height,
+                round,
+                candidates,
+            },
+            weights,
+            total_weight: snapshot.total_weight_spark,
+        }
+    }
+
     fn vrf_input_for(&self, height: u64, round: u32) -> [u8; 32] {
         let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
         compute_vrf_input(&epoch_seed.0, height, round)
     }
 
-    fn total_active_stake(&self) -> u64 {
-        self.engine
-            .state
-            .validators
-            .active_validators()
-            .map(|validator| validator.stake_spark)
-            .fold(0u64, |a, b| a.saturating_add(b))
+    fn revealed_stake(&self, state: &VrfRoundState, authority: &VrfConsensusAuthority) -> u64 {
+        state.reveals.keys().fold(0u64, |total, id| {
+            total.saturating_add(authority.weights.get(id).copied().unwrap_or_default())
+        })
     }
 
-    fn revealed_stake(&self, state: &VrfRoundState) -> u64 {
-        state
-            .reveals
-            .keys()
-            .filter_map(|id| self.engine.state.validators.get(id))
-            .map(|validator| validator.stake_spark)
-            .fold(0u64, |a, b| a.saturating_add(b))
+    fn quorum_stake_reached(authority: &VrfConsensusAuthority, stake: u64) -> bool {
+        authority.total_weight > 0 && stake >= bps_of(authority.total_weight, CONSENSUS_QUORUM_BPS)
     }
 
-    fn quorum_stake_reached(&self, stake: u64) -> bool {
-        let total = self.total_active_stake();
-        total > 0 && stake >= bps_of(total, CONSENSUS_QUORUM_BPS)
-    }
-
-    fn missing_reveal_validator_ids(&self, state: &VrfRoundState) -> Vec<Bytes32> {
-        self.engine
-            .state
-            .validators
-            .active_validators()
-            .filter(|validator| validator.vrf_pk.is_some())
-            .filter_map(|validator| {
-                (!state.reveals.contains_key(&validator.validator_id))
-                    .then_some(validator.validator_id)
+    fn missing_reveal_validator_ids(
+        &self,
+        state: &VrfRoundState,
+        authority: &VrfConsensusAuthority,
+    ) -> Vec<Bytes32> {
+        authority
+            .election
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                (!state.reveals.contains_key(&candidate.validator_id))
+                    .then_some(candidate.validator_id)
             })
             .collect()
     }
@@ -1051,15 +1115,18 @@ impl ConsensusDriver {
         let Some(state) = self.vrf_states.get(slot).and_then(|state| state.as_ref()) else {
             return vec![];
         };
+        let Ok(authority) = self.vrf_consensus_authority(state.height, state.round) else {
+            return vec![DriverAction::None];
+        };
         if !reveal_set_commitment_active(state.height)
-            || self.quorum_stake_reached(self.revealed_stake(state))
+            || Self::quorum_stake_reached(&authority, self.revealed_stake(state, &authority))
         {
             return vec![];
         }
 
         let height = state.height;
         let round = state.round;
-        let mut missing_validator_ids = self.missing_reveal_validator_ids(state);
+        let mut missing_validator_ids = self.missing_reveal_validator_ids(state, &authority);
         missing_validator_ids.sort_by_key(|id| id.0);
         if missing_validator_ids.is_empty() {
             return vec![];
@@ -1096,7 +1163,23 @@ impl ConsensusDriver {
         })
     }
 
-    fn validator_hybrid_public_key(&self, validator_id: &Bytes32) -> Option<HybridPublicKey> {
+    fn validator_hybrid_public_key(
+        &self,
+        height: u64,
+        validator_id: &Bytes32,
+    ) -> Option<HybridPublicKey> {
+        if consensus_snapshot_active(height) {
+            let snapshot = self
+                .engine
+                .state
+                .snapshot_for_consensus_height(height)
+                .ok()?;
+            let (_, entry) = snapshot.entry_with_position(validator_id)?;
+            return Some(HybridPublicKey {
+                classical: ClassicalPublicKey(entry.classical_vote_pk),
+                pq: PqPublicKey(entry.pq_vote_pk.clone()),
+            });
+        }
         let validator = self.engine.state.validators.get(validator_id)?;
         let classical = validator.hybrid_classical_pk?;
         let pq_vec = validator.hybrid_pq_pk.as_ref()?;
@@ -1107,7 +1190,21 @@ impl ConsensusDriver {
         })
     }
 
-    fn validator_vrf_pk_matches(&self, validator_id: &Bytes32, vrf_pubkey: &[u8; 32]) -> bool {
+    fn validator_vrf_pk_matches(
+        &self,
+        height: u64,
+        validator_id: &Bytes32,
+        vrf_pubkey: &[u8; 32],
+    ) -> bool {
+        if consensus_snapshot_active(height) {
+            return self
+                .engine
+                .state
+                .snapshot_for_consensus_height(height)
+                .ok()
+                .and_then(|snapshot| snapshot.entry_with_position(validator_id))
+                .is_some_and(|(_, entry)| entry.vrf_pk == *vrf_pubkey);
+        }
         self.engine
             .state
             .validators
@@ -1123,7 +1220,7 @@ impl ConsensusDriver {
     }
 
     fn verify_commit_signature(&self, commit: &VrfCommit) -> bool {
-        let Some(pk) = self.validator_hybrid_public_key(&commit.validator_id) else {
+        let Some(pk) = self.validator_hybrid_public_key(commit.height, &commit.validator_id) else {
             return false;
         };
         let Ok(sig) = commit.signature.to_crypto_sig() else {
@@ -1133,7 +1230,7 @@ impl ConsensusDriver {
     }
 
     fn verify_reveal_signature(&self, reveal: &VrfReveal) -> bool {
-        let Some(pk) = self.validator_hybrid_public_key(&reveal.validator_id) else {
+        let Some(pk) = self.validator_hybrid_public_key(reveal.height, &reveal.validator_id) else {
             return false;
         };
         let Ok(sig) = reveal.signature.to_crypto_sig() else {
@@ -1150,7 +1247,7 @@ impl ConsensusDriver {
         let vrf_keypair = self.engine.local_vrf_keypair()?;
         let hybrid_keypair = self.engine.local_hybrid_keypair()?;
         let vrf_pubkey = vrf_keypair.public_key();
-        let election = self.active_vrf_candidates(height, round);
+        let election = self.vrf_consensus_authority(height, round).ok()?.election;
         if !election.candidates.iter().any(|candidate| {
             candidate.validator_id == validator_id && candidate.vrf_pubkey == vrf_pubkey
         }) {
@@ -1222,7 +1319,11 @@ impl ConsensusDriver {
 
     fn validate_vrf_reveal(&self, reveal: &VrfReveal) -> bool {
         if reveal.chain_id_hash != chain_id_hash(&self.engine.state.chain_id)
-            || !self.validator_vrf_pk_matches(&reveal.validator_id, &reveal.vrf_pubkey)
+            || !self.validator_vrf_pk_matches(
+                reveal.height,
+                &reveal.validator_id,
+                &reveal.vrf_pubkey,
+            )
             || !self.verify_reveal_signature(reveal)
         {
             return false;
@@ -1353,19 +1454,28 @@ impl ConsensusDriver {
         let Some(slot) = self.vrf_slot_index(height, round) else {
             return actions;
         };
+        let authority = match self.vrf_consensus_authority(height, round) {
+            Ok(authority) => authority,
+            Err(error) => {
+                eprintln!(
+                    "[vrf] failed closed resolving consensus authority for height={height} round={round}: {error}"
+                );
+                return vec![DriverAction::None];
+            }
+        };
         let open_reveal = self
             .vrf_states
             .get(slot)
             .and_then(|state| state.as_ref())
             .is_some_and(|state| {
                 state.phase == VrfRoundPhase::Commit
-                    && (self.quorum_stake_reached(
-                        state
-                            .commits
-                            .keys()
-                            .filter_map(|id| self.engine.state.validators.get(id))
-                            .map(|validator| validator.stake_spark)
-                            .fold(0u64, |a, b| a.saturating_add(b)),
+                    && (Self::quorum_stake_reached(
+                        &authority,
+                        state.commits.keys().fold(0u64, |total, id| {
+                            total.saturating_add(
+                                authority.weights.get(id).copied().unwrap_or_default(),
+                            )
+                        }),
                     ) || state.commit_started_at.elapsed().as_millis()
                         >= VRF_COMMIT_WINDOW_MS as u128)
             });
@@ -1384,10 +1494,12 @@ impl ConsensusDriver {
             .is_some_and(|state| {
                 state.election_result.is_none()
                     && state.phase == VrfRoundPhase::Reveal
-                    && (self.quorum_stake_reached(self.revealed_stake(state))
-                        || state.reveal_started_at.is_some_and(|t| {
-                            t.elapsed().as_millis() >= VRF_REVEAL_WINDOW_MS as u128
-                        }))
+                    && (Self::quorum_stake_reached(
+                        &authority,
+                        self.revealed_stake(state, &authority),
+                    ) || state
+                        .reveal_started_at
+                        .is_some_and(|t| t.elapsed().as_millis() >= VRF_REVEAL_WINDOW_MS as u128))
             });
         if should_compute {
             if let Some(result) = self.compute_and_store_vrf_election(slot) {
@@ -1418,15 +1530,18 @@ impl ConsensusDriver {
         };
         let state_height = state.height;
         let state_round = state.round;
-        let election = self.active_vrf_candidates(state.height, state.round);
+        let authority = self
+            .vrf_consensus_authority(state.height, state.round)
+            .ok()?;
+        let election = &authority.election;
         let revealed: BTreeMap<Bytes32, Bytes32> = state
             .reveals
             .iter()
             .map(|(id, reveal)| (*id, reveal.vrf_output))
             .collect();
         if reveal_set_commitment_active(state_height) {
-            let revealed_stake = self.revealed_stake(state);
-            if !self.quorum_stake_reached(revealed_stake) {
+            let revealed_stake = self.revealed_stake(state, &authority);
+            if !Self::quorum_stake_reached(&authority, revealed_stake) {
                 let counted_key = (state_height, state_round);
                 if self.last_insufficient_reveal_round_counted != Some(counted_key) {
                     self.consecutive_empty_reveal_rounds =
@@ -1438,7 +1553,7 @@ impl ConsensusDriver {
                     state_height,
                     state_round,
                     revealed_stake,
-                    self.total_active_stake(),
+                    authority.total_weight,
                     CONSENSUS_QUORUM_BPS,
                     self.consecutive_empty_reveal_rounds,
                     MAX_VRF_EMPTY_REVEAL_ROUNDS,
@@ -2381,8 +2496,17 @@ impl ConsensusDriver {
             && proposal_height == self.next_height()
             && proposal_round == self.current_round
         {
-            let election = self.active_vrf_candidates(proposal_height, proposal_round);
-            actions.extend(self.ensure_vrf_election_for_round(&election));
+            match self.vrf_consensus_authority(proposal_height, proposal_round) {
+                Ok(authority) => {
+                    actions.extend(self.ensure_vrf_election_for_round(&authority.election))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[vrf] failed closed resolving proposer authority for height={proposal_height}: {error}"
+                    );
+                    actions.push(DriverAction::None);
+                }
+            }
         }
         actions.extend(self.maybe_prevote_current_round_proposal());
         actions
@@ -2520,15 +2644,30 @@ impl ConsensusDriver {
         }
 
         let target_hash = block.header.election_result_hash?;
-        let stake_by_validator: BTreeMap<Bytes32, u64> = self
-            .registered_voters
+        let (qc_validators, total_stake) = self
+            .engine
+            .qc_authority_for_height(block.header.height)
+            .ok()?;
+        let stake_by_validator: BTreeMap<Bytes32, u64> = qc_validators
             .iter()
-            .map(|voter| (voter.validator_id, voter.stake))
+            .map(|validator| (validator.validator_id, validator.stake))
             .collect();
-        let total_stake = self
-            .registered_voters
-            .iter()
-            .fold(0u64, |total, voter| total.saturating_add(voter.stake));
+        if consensus_snapshot_active(block.header.height) {
+            let collector_matches_height_authority = self
+                .registered_voters
+                .iter()
+                .zip(&qc_validators)
+                .all(|(voter, validator)| {
+                    voter.validator_id == validator.validator_id
+                        && voter.stake == validator.stake
+                        && voter.classical_pk == validator.classical_pk
+                        && voter.pq_pk == validator.pq_pk
+                })
+                && self.registered_voters.len() == qc_validators.len();
+            if !collector_matches_height_authority {
+                return None;
+            }
+        }
         let threshold = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
         let matching: Vec<VoteV1> = votes
             .into_iter()
@@ -3001,7 +3140,7 @@ impl ConsensusDriver {
         let Some(slot) = self.vrf_slot_index(commit.height, commit.round) else {
             return vec![DriverAction::None];
         };
-        if !self.validator_vrf_pk_matches(&commit.validator_id, &commit.vrf_pubkey) {
+        if !self.validator_vrf_pk_matches(commit.height, &commit.validator_id, &commit.vrf_pubkey) {
             return vec![DriverAction::DisconnectInvalidConsensusPeer {
                 from,
                 validator_id: commit.validator_id,
@@ -3567,6 +3706,15 @@ mod tests {
         (ConsensusDriver::new(engine, vote_safety), dir)
     }
 
+    fn install_test_snapshot_at_inert_gate(driver: &mut ConsensusDriver) {
+        let snapshot = driver
+            .engine
+            .state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        driver.engine.state.consensus_snapshots.push(snapshot);
+    }
+
     #[test]
     fn local_vote_authorization_uses_snapshot_membership_after_registry_demotion() {
         let seed = [0xA5u8; 32];
@@ -3599,6 +3747,209 @@ mod tests {
         assert!(actions
             .iter()
             .any(|action| matches!(action, DriverAction::BroadcastVote(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposer_authority_uses_snapshot_weights_not_live_registry() {
+        let (mut driver, dir) = local_driver([0xB1; 32], "snapshot_proposer_weight");
+        let local_id = driver.engine.validator_id().unwrap();
+        let snapshot = driver
+            .engine
+            .state
+            .build_genesis_consensus_snapshot()
+            .unwrap();
+        let frozen = snapshot
+            .entry_with_position(&local_id)
+            .unwrap()
+            .1
+            .consensus_weight_spark;
+        driver.engine.state.consensus_snapshots.push(snapshot);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local_id)
+            .unwrap()
+            .stake_spark = frozen + 999;
+
+        let authority = driver.vrf_consensus_authority(u64::MAX, 0).unwrap();
+        assert_eq!(authority.election.candidates[0].stake, frozen);
+        assert_eq!(authority.total_weight, frozen);
+        assert_ne!(
+            authority.election.candidates[0].stake,
+            driver
+                .engine
+                .state
+                .validators
+                .get(&local_id)
+                .unwrap()
+                .stake_spark
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vrf_quorum_uses_snapshot_weights_and_total() {
+        let local_seed = [0xB2; 32];
+        let (mut driver, dir) = local_driver(local_seed, "snapshot_vrf_quorum");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, [0xB3; 32], "b");
+        let c = install_active_validator(&mut driver, [0xB4; 32], "c");
+        let local_id = validator_id_for(&local);
+        let b_id = validator_id_for(&b);
+        let c_id = validator_id_for(&c);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local_id)
+            .unwrap()
+            .stake_spark = 40;
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&b_id)
+            .unwrap()
+            .stake_spark = 30;
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&c_id)
+            .unwrap()
+            .stake_spark = 30;
+        let snapshot = driver
+            .engine
+            .state
+            .build_genesis_consensus_snapshot()
+            .unwrap();
+        driver.engine.state.consensus_snapshots.push(snapshot);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&c_id)
+            .unwrap()
+            .stake_spark = 300;
+
+        let authority = driver.vrf_consensus_authority(u64::MAX, 0).unwrap();
+        let revealed = authority.weights[&local_id] + authority.weights[&b_id];
+        assert_eq!(authority.total_weight, 100);
+        assert!(ConsensusDriver::quorum_stake_reached(&authority, revealed));
+        assert!(revealed < bps_of(370, CONSENSUS_QUORUM_BPS));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposer_vrf_vote_and_qc_authority_are_snapshot_identical() {
+        let (driver, dir) = local_driver([0xB5; 32], "snapshot_cross_authority");
+        let snapshot = driver
+            .engine
+            .state
+            .build_genesis_consensus_snapshot()
+            .unwrap();
+        let epoch_seed = Bytes32::from([0x55; 32]);
+        let vrf = ConsensusDriver::vrf_authority_from_snapshot(301, 2, epoch_seed, &snapshot);
+        let voters = NodeEngine::registered_voters_for_height(301, &snapshot);
+        let qc = NodeEngine::qc_validators_for_height(301, &snapshot);
+
+        assert_eq!(vrf.election.candidates.len(), voters.len());
+        assert_eq!(voters.len(), qc.len());
+        for ((candidate, voter), validator) in vrf.election.candidates.iter().zip(&voters).zip(&qc)
+        {
+            assert_eq!(candidate.validator_id, voter.validator_id);
+            assert_eq!(voter.validator_id, validator.validator_id);
+            assert_eq!(candidate.stake, voter.stake);
+            assert_eq!(voter.stake, validator.stake);
+            assert_eq!(
+                candidate.vrf_pubkey,
+                snapshot.entries()[validator.position].vrf_pk
+            );
+        }
+        assert_eq!(vrf.total_weight, snapshot.total_weight_spark);
+        assert_eq!(
+            voters.iter().map(|voter| voter.stake).sum::<u64>(),
+            snapshot.total_weight_spark
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_gate_proposer_and_vrf_authority_match_legacy_adapter() {
+        let (driver, dir) = local_driver([0xB6; 32], "legacy_vrf_authority");
+        let legacy = driver.active_vrf_candidates(1, 3);
+        let authority = driver.vrf_consensus_authority(1, 3).unwrap();
+        assert_eq!(legacy.candidates.len(), authority.election.candidates.len());
+        for (legacy, actual) in legacy.candidates.iter().zip(&authority.election.candidates) {
+            assert_eq!(legacy.validator_id, actual.validator_id);
+            assert_eq!(legacy.vrf_pubkey, actual.vrf_pubkey);
+            assert_eq!(legacy.stake, actual.stake);
+        }
+        assert_eq!(
+            authority.total_weight,
+            legacy
+                .candidates
+                .iter()
+                .map(|candidate| candidate.stake)
+                .sum::<u64>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governed_proposer_and_vrf_quorum_fail_closed_without_snapshot() {
+        let (driver, dir) = local_driver([0xB7; 32], "missing_vrf_snapshot");
+        assert!(matches!(
+            driver.vrf_consensus_authority(u64::MAX, 0),
+            Err(NodeError::ConsensusSnapshotLookup(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposer_and_vrf_quorum_replay_across_snapshot_boundary() {
+        let (mut driver, dir) = local_driver([0xB8; 32], "vrf_boundary_replay");
+        let old_snapshot = driver
+            .engine
+            .state
+            .build_genesis_consensus_snapshot()
+            .unwrap();
+        let id = old_snapshot.entries()[0].validator_id;
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&id)
+            .unwrap()
+            .stake_spark += 500;
+        let new_snapshot = driver
+            .engine
+            .state
+            .build_consensus_snapshot(301, 300)
+            .unwrap();
+        let replay = || {
+            let old = ConsensusDriver::vrf_authority_from_snapshot(
+                300,
+                0,
+                Bytes32::from([0x80; 32]),
+                &old_snapshot,
+            );
+            let new = ConsensusDriver::vrf_authority_from_snapshot(
+                301,
+                0,
+                Bytes32::from([0x81; 32]),
+                &new_snapshot,
+            );
+            (
+                indra_consensus::proposer::elect_proposer(&old.election, 300).unwrap(),
+                ConsensusDriver::quorum_stake_reached(&old, old.weights.values().copied().sum()),
+                indra_consensus::proposer::elect_proposer(&new.election, 301).unwrap(),
+                ConsensusDriver::quorum_stake_reached(&new, new.weights.values().copied().sum()),
+            )
+        };
+        assert_eq!(replay(), replay());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6292,6 +6643,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xEE; 32]);
@@ -6329,6 +6681,7 @@ mod tests {
         let b = install_active_validator(&mut driver, seed_b, "b");
         let c = install_active_validator(&mut driver, seed_c, "c");
         let d = install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
 
         let height = u64::MAX;
@@ -6372,6 +6725,7 @@ mod tests {
         for (idx, seed) in seeds.iter().enumerate() {
             install_active_validator(&mut driver, *seed, &format!("v{idx}"));
         }
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0x91; 32]);
@@ -6461,6 +6815,7 @@ mod tests {
         for (idx, seed) in seeds.iter().enumerate() {
             install_active_validator(&mut driver, *seed, &format!("v{idx}"));
         }
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0x95; 32]);
@@ -6547,6 +6902,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xC1; 32]);
@@ -6599,6 +6955,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xC5; 32]);
@@ -6656,6 +7013,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
 
         let height = u64::MAX;
@@ -6698,6 +7056,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xCD; 32]);
@@ -6754,6 +7113,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
 
         let height = u64::MAX;
@@ -6815,6 +7175,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xEF; 32]);
@@ -6879,6 +7240,7 @@ mod tests {
         let b = install_active_validator(&mut driver, seed_b, "b");
         let c = install_active_validator(&mut driver, seed_c, "c");
         let d = install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xE5; 32]);
