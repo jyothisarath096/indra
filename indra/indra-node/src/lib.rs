@@ -30,6 +30,7 @@
 
 pub mod config;
 pub mod config_file;
+mod consensus_authority;
 pub mod discovery;
 pub mod driver;
 pub mod engine;

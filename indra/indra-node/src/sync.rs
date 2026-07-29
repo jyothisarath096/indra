@@ -33,6 +33,7 @@ use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_storage::{BlockStore, StateStore};
 
 use crate::{
+    consensus_authority::{vrf_authority_from_snapshot, VrfConsensusAuthority},
     error::{NodeError, NodeResult},
     state_root::compute_state_roots,
 };
@@ -348,38 +349,44 @@ fn verify_proposer_vrf_key_ownership(
         });
     }
 
-    let candidates: Vec<ProposerCandidate> = state
-        .validators
-        .active_validators()
-        .filter_map(|validator| {
-            validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
-                validator_id: validator.validator_id,
-                vrf_pubkey: vrf_pk,
-                verified_vrf_output: None,
-                stake: validator.stake_spark,
-            })
-        })
-        .collect();
-
-    if candidates.len() != state.validators.active_count() {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "VRF verification impossible at height {} round {}: {} validators have VRF keys but {} are active",
-                block.header.height,
-                block.header.proposer_round,
-                candidates.len(),
-                state.validators.active_count(),
-            ),
-        });
-    }
-
     // Bind VRF verification to the block's declared parent hash so the
     // verifier uses the same epoch seed the proposer saw when building
     // this header, even if the local node's mutable state has moved.
     let epoch_seed = indra_core::types::primitives::Bytes32::from(indra_crypto::sha256(
         &block.header.prev_hash.0,
     ));
+    let candidates = if let Some(authority) =
+        snapshot_vrf_authority_for_block(block, state, epoch_seed)?
+    {
+        authority.election.candidates
+    } else {
+        let candidates: Vec<ProposerCandidate> = state
+            .validators
+            .active_validators()
+            .filter_map(|validator| {
+                validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
+                    validator_id: validator.validator_id,
+                    vrf_pubkey: vrf_pk,
+                    verified_vrf_output: None,
+                    stake: validator.stake_spark,
+                })
+            })
+            .collect();
+
+        if candidates.len() != state.validators.active_count() {
+            return Err(NodeError::BlockInvalid {
+                height: block.header.height,
+                reason: format!(
+                    "VRF verification impossible at height {} round {}: {} validators have VRF keys but {} are active",
+                    block.header.height,
+                    block.header.proposer_round,
+                    candidates.len(),
+                    state.validators.active_count(),
+                ),
+            });
+        }
+        candidates
+    };
     let vrf_input = compute_vrf_input(
         &epoch_seed.0,
         block.header.height,
@@ -406,6 +413,23 @@ fn verify_proposer_vrf_key_ownership(
     }
 
     Ok((matching_candidates[0].validator_id, candidates, epoch_seed))
+}
+
+fn snapshot_vrf_authority_for_block(
+    block: &BlockV1,
+    state: &ChainState,
+    epoch_seed: Bytes32,
+) -> NodeResult<Option<VrfConsensusAuthority>> {
+    if !consensus_snapshot_active(block.header.height) {
+        return Ok(None);
+    }
+    let snapshot = state.snapshot_for_consensus_height(block.header.height)?;
+    Ok(Some(vrf_authority_from_snapshot(
+        block.header.height,
+        block.header.proposer_round,
+        epoch_seed,
+        snapshot,
+    )))
 }
 
 fn verify_commit_reveal_proposer_result(
@@ -493,6 +517,7 @@ pub(crate) fn verify_reveal_set_evidence(
     let mut revealed_outputs = std::collections::BTreeMap::new();
     let mut revealed_stake = 0u64;
     let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
+    let snapshot_authority = snapshot_vrf_authority_for_block(block, state, epoch_seed)?;
     let vrf_input = compute_vrf_input(
         &epoch_seed.0,
         block.header.height,
@@ -508,32 +533,52 @@ pub(crate) fn verify_reveal_set_evidence(
         }
         last_id = Some(evidence.validator_id);
 
-        let Some(validator) = state.validators.get(&evidence.validator_id) else {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: format!(
-                    "vrf reveal evidence references unknown validator {}",
-                    hex::encode(&evidence.validator_id.0[..4]),
-                ),
-            });
-        };
-        if !validator.is_active() {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: format!(
-                    "vrf reveal evidence references inactive validator {}",
-                    hex::encode(&evidence.validator_id.0[..4]),
-                ),
-            });
-        }
-        let Some(vrf_pk) = validator.vrf_pk else {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: format!(
-                    "vrf reveal evidence validator {} has no registered VRF key",
-                    hex::encode(&evidence.validator_id.0[..4]),
-                ),
-            });
+        let (vrf_pk, weight) = if let Some(authority) = snapshot_authority.as_ref() {
+            let Some(candidate) = authority
+                .election
+                .candidates
+                .iter()
+                .find(|candidate| candidate.validator_id == evidence.validator_id)
+            else {
+                return Err(NodeError::BlockInvalid {
+                    height: block.header.height,
+                    reason: format!(
+                        "vrf reveal evidence references validator {} outside S({})",
+                        hex::encode(&evidence.validator_id.0[..4]),
+                        block.header.height,
+                    ),
+                });
+            };
+            (candidate.vrf_pubkey, candidate.stake)
+        } else {
+            let Some(validator) = state.validators.get(&evidence.validator_id) else {
+                return Err(NodeError::BlockInvalid {
+                    height: block.header.height,
+                    reason: format!(
+                        "vrf reveal evidence references unknown validator {}",
+                        hex::encode(&evidence.validator_id.0[..4]),
+                    ),
+                });
+            };
+            if !validator.is_active() {
+                return Err(NodeError::BlockInvalid {
+                    height: block.header.height,
+                    reason: format!(
+                        "vrf reveal evidence references inactive validator {}",
+                        hex::encode(&evidence.validator_id.0[..4]),
+                    ),
+                });
+            }
+            let Some(vrf_pk) = validator.vrf_pk else {
+                return Err(NodeError::BlockInvalid {
+                    height: block.header.height,
+                    reason: format!(
+                        "vrf reveal evidence validator {} has no registered VRF key",
+                        hex::encode(&evidence.validator_id.0[..4]),
+                    ),
+                });
+            };
+            (vrf_pk, validator.stake_spark)
         };
         let output = VrfOutput(evidence.vrf_output.0);
         let proof = VrfProof(evidence.vrf_proof.as_slice().to_vec());
@@ -545,37 +590,42 @@ pub(crate) fn verify_reveal_set_evidence(
             ),
         })?;
 
-        revealed_stake = revealed_stake.saturating_add(validator.stake_spark);
+        revealed_stake = revealed_stake.saturating_add(weight);
         revealed_outputs.insert(evidence.validator_id, evidence.vrf_output);
     }
 
-    let candidates: Vec<_> = state
-        .validators
-        .active_validators()
-        .filter_map(|validator| {
-            validator.vrf_pk.map(|vrf_pubkey| ProposerCandidate {
-                validator_id: validator.validator_id,
-                vrf_pubkey,
-                verified_vrf_output: None,
-                stake: validator.stake_spark,
+    let (election, total_stake) = if let Some(authority) = snapshot_authority {
+        (authority.election, authority.total_weight)
+    } else {
+        let candidates: Vec<_> = state
+            .validators
+            .active_validators()
+            .filter_map(|validator| {
+                validator.vrf_pk.map(|vrf_pubkey| ProposerCandidate {
+                    validator_id: validator.validator_id,
+                    vrf_pubkey,
+                    verified_vrf_output: None,
+                    stake: validator.stake_spark,
+                })
             })
-        })
-        .collect();
-    if candidates.len() != state.validators.active_count() {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: "reveal-set election impossible: not every active validator has a VRF key"
-                .into(),
-        });
-    }
-    let election = ProposerElection {
-        epoch_seed,
-        height: block.header.height,
-        round: block.header.proposer_round,
-        candidates,
+            .collect();
+        if candidates.len() != state.validators.active_count() {
+            return Err(NodeError::BlockInvalid {
+                height: block.header.height,
+                reason: "reveal-set election impossible: not every active validator has a VRF key"
+                    .into(),
+            });
+        }
+        (
+            ProposerElection {
+                epoch_seed,
+                height: block.header.height,
+                round: block.header.proposer_round,
+                candidates,
+            },
+            state.validators.total_active_stake(),
+        )
     };
-
-    let total_stake = state.validators.total_active_stake();
     if total_stake == 0 || revealed_stake < bps_of(total_stake, CONSENSUS_QUORUM_BPS) {
         if block.vrf_reveals.is_empty() {
             let mut fallback =
@@ -668,9 +718,17 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
         });
     }
 
+    verify_sync_qc(&qc, state, block.header.height)
+}
+
+fn verify_sync_qc(
+    qc: &indra_core::types::qc::QuorumCertificateV1,
+    state: &ChainState,
+    importing_height: u64,
+) -> NodeResult<()> {
     if consensus_snapshot_active(qc.height) {
         let snapshot = state.snapshot_for_consensus_height(qc.height)?;
-        return crate::engine::NodeEngine::verify_qc_with_snapshot(&qc, snapshot, &state.chain_id);
+        return crate::engine::NodeEngine::verify_qc_with_snapshot(qc, snapshot, &state.chain_id);
     }
 
     let mut active_validators: Vec<_> = state.validators.active_validators().collect();
@@ -692,17 +750,17 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
 
     if validators.len() != state.validators.active_count() {
         return Err(NodeError::BlockInvalid {
-            height: block.header.height,
+            height: importing_height,
             reason: format!(
                 "QC verification impossible at height {}: {} validators have verification keys but {} are active",
-                block.header.height,
+                importing_height,
                 validators.len(),
                 state.validators.active_count(),
             ),
         });
     }
     verify_qc_strict(
-        &qc,
+        qc,
         &validators,
         state.validators.total_active_stake(),
         &state.chain_id,
@@ -905,6 +963,13 @@ mod tests {
             round,
             candidates,
         }
+    }
+
+    fn install_test_snapshot_at_inert_gate(state: &mut ChainState) {
+        let snapshot = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        state.consensus_snapshots.push(snapshot);
     }
 
     fn elect_with_verified_output_for_seed(
@@ -1115,6 +1180,41 @@ mod tests {
         )
         .unwrap();
         qc.encode_to_vec()
+    }
+
+    fn qc_from_test_signers(
+        height: u64,
+        block_hash: Bytes32,
+        snapshot: &indra_core::types::consensus_snapshot::ConsensusSnapshot,
+        signers: &[&HybridKeypair],
+    ) -> QuorumCertificateV1 {
+        let validators = crate::engine::NodeEngine::qc_validators_for_height(height, snapshot);
+        let votes: Vec<_> = signers
+            .iter()
+            .map(|signer| {
+                let validator_id =
+                    Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+                produce_vote(
+                    height,
+                    0,
+                    VoteStep::Precommit,
+                    block_hash,
+                    validator_id,
+                    DEFAULT_CHAIN_ID,
+                    signer,
+                )
+                .unwrap()
+            })
+            .collect();
+        build_qc(
+            height,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            &validators,
+            votes.iter().collect(),
+        )
+        .unwrap()
     }
 
     fn make_block(state: &ChainState) -> BlockV1 {
@@ -2032,6 +2132,163 @@ mod tests {
     }
 
     #[test]
+    fn sync_proposer_verification_matches_live_snapshot_authority() {
+        let mut state = ChainState::new_genesis();
+        let mut ids = Vec::new();
+        for seed in [0xA1, 0xA2, 0xA3, 0xA4] {
+            ids.push(install_active_validator(&mut state, seed, 10_000, true, true).0);
+        }
+        install_test_snapshot_at_inert_gate(&mut state);
+        let block = make_reveal_set_block(&state, &[0xA1, 0xA2, 0xA3, 0xA4], &[0xA1, 0xA2, 0xA3]);
+        let snapshot = state.snapshot_for_consensus_height(u64::MAX).unwrap();
+        let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
+        let live_authority = vrf_authority_from_snapshot(
+            block.header.height,
+            block.header.proposer_round,
+            epoch_seed,
+            snapshot,
+        );
+
+        state.validators.get_mut(&ids[0]).unwrap().stake_spark = 1_000_000;
+        state.validators.get_mut(&ids[1]).unwrap().status = ValidatorStatus::Registered;
+
+        let (_, sync_candidates, _) = verify_proposer_vrf_key_ownership(&block, &state).unwrap();
+        assert_eq!(
+            sync_candidates.len(),
+            live_authority.election.candidates.len()
+        );
+        for (sync, live) in sync_candidates
+            .iter()
+            .zip(&live_authority.election.candidates)
+        {
+            assert_eq!(sync.validator_id, live.validator_id);
+            assert_eq!(sync.vrf_pubkey, live.vrf_pubkey);
+            assert_eq!(sync.stake, live.stake);
+        }
+        assert!(verify_proposer_vrf(&block, &state).is_ok());
+    }
+
+    #[test]
+    fn sync_reveal_verification_matches_live_snapshot_quorum() {
+        let mut state = ChainState::new_genesis();
+        let mut ids = Vec::new();
+        for seed in [0xA5, 0xA6, 0xA7, 0xA8] {
+            ids.push(install_active_validator(&mut state, seed, 10_000, true, true).0);
+        }
+        install_test_snapshot_at_inert_gate(&mut state);
+        let block = make_reveal_set_block(&state, &[0xA5, 0xA6, 0xA7, 0xA8], &[0xA5, 0xA6, 0xA7]);
+        let expected = block.header.election_result_hash;
+
+        state.validators.get_mut(&ids[0]).unwrap().stake_spark = 1;
+        state.validators.get_mut(&ids[1]).unwrap().stake_spark = 1;
+        state.validators.get_mut(&ids[2]).unwrap().status = ValidatorStatus::Registered;
+        state.validators.get_mut(&ids[3]).unwrap().stake_spark = 10_000_000;
+
+        let result = verify_reveal_set_evidence(&block, &state).unwrap();
+        assert_eq!(Some(result.hash()), expected);
+    }
+
+    #[test]
+    fn syncing_node_rejects_post_block_weight_inflation_qc_attack() {
+        let mut state = ChainState::new_genesis();
+        let (a_id, a) = install_active_validator(&mut state, 0xB1, 20, true, true);
+        install_active_validator(&mut state, 0xB2, 40, true, true);
+        install_active_validator(&mut state, 0xB3, 40, true, true);
+        install_test_snapshot_at_inert_gate(&mut state);
+        let snapshot = state.snapshot_for_consensus_height(u64::MAX).unwrap();
+        let qc = qc_from_test_signers(u64::MAX, Bytes32::from([0xB4; 32]), snapshot, &[&a]);
+
+        state.validators.get_mut(&a_id).unwrap().stake_spark = 200;
+        assert!(verify_qc_strict(
+            &qc,
+            &{
+                let mut validators: Vec<_> = state.validators.active_validators().collect();
+                validators.sort_by_key(|validator| validator.validator_id.0);
+                validators
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, validator)| QcValidator {
+                        validator_id: validator.validator_id,
+                        position,
+                        pq_pk: validator.hybrid_pq_pk.clone().unwrap(),
+                        classical_pk: validator.hybrid_classical_pk.unwrap(),
+                        stake: validator.stake_spark,
+                    })
+                    .collect::<Vec<_>>()
+            },
+            state.validators.total_active_stake(),
+            DEFAULT_CHAIN_ID,
+        )
+        .is_ok());
+        assert!(verify_sync_qc(&qc, &state, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn pre_gate_sync_proposer_and_reveal_behavior_is_unchanged() {
+        let mut state = ChainState::new_genesis();
+        install_active_validator(&mut state, 0xB5, 10_000, true, true);
+        let block = make_strict_block(&state, 0xB5, 0, vec![]);
+        let expected = build_election(&state, 1, 0);
+
+        let (_, candidates, epoch_seed) =
+            verify_proposer_vrf_key_ownership(&block, &state).unwrap();
+        assert_eq!(candidates.len(), expected.candidates.len());
+        for (actual, expected) in candidates.iter().zip(&expected.candidates) {
+            assert_eq!(actual.validator_id, expected.validator_id);
+            assert_eq!(actual.vrf_pubkey, expected.vrf_pubkey);
+            assert_eq!(actual.stake, expected.stake);
+        }
+        assert_eq!(epoch_seed, expected.epoch_seed);
+        assert!(verify_proposer_vrf(&block, &state).is_ok());
+    }
+
+    #[test]
+    fn governed_sync_verification_fails_closed_without_snapshot() {
+        let mut state = ChainState::new_genesis();
+        for seed in [0xB6, 0xB7, 0xB8, 0xB9] {
+            install_active_validator(&mut state, seed, 10_000, true, true);
+        }
+        let block = make_reveal_set_block(&state, &[0xB6, 0xB7, 0xB8, 0xB9], &[0xB6, 0xB7, 0xB8]);
+
+        assert!(matches!(
+            verify_proposer_vrf(&block, &state),
+            Err(NodeError::ConsensusSnapshotLookup(_))
+        ));
+        assert!(matches!(
+            verify_reveal_set_evidence(&block, &state),
+            Err(NodeError::ConsensusSnapshotLookup(_))
+        ));
+    }
+
+    #[test]
+    fn sync_replay_matches_live_across_snapshot_activation_boundary() {
+        let mut canonical = ChainState::new_genesis();
+        let mut ids = Vec::new();
+        for seed in [0xBA, 0xBB, 0xBC, 0xBD] {
+            ids.push(install_active_validator(&mut canonical, seed, 10_000, true, true).0);
+        }
+        let pre_gate = make_strict_block(&canonical, 0xBA, 0, vec![]);
+        install_test_snapshot_at_inert_gate(&mut canonical);
+        let post_gate =
+            make_reveal_set_block(&canonical, &[0xBA, 0xBB, 0xBC, 0xBD], &[0xBA, 0xBB, 0xBC]);
+
+        let mut live_state = canonical.clone();
+        let mut sync_state = canonical.clone();
+        live_state.validators.get_mut(&ids[0]).unwrap().stake_spark = 50_000;
+        sync_state.validators.get_mut(&ids[1]).unwrap().status = ValidatorStatus::Registered;
+
+        assert_eq!(
+            verify_proposer_vrf(&pre_gate, &live_state).is_ok(),
+            verify_proposer_vrf(&pre_gate, &sync_state).is_ok()
+        );
+        let live_result = verify_reveal_set_evidence(&post_gate, &live_state).unwrap();
+        let sync_result = verify_reveal_set_evidence(&post_gate, &sync_state).unwrap();
+        assert_eq!(live_result, sync_result);
+        assert!(verify_proposer_vrf(&post_gate, &live_state).is_ok());
+        assert!(verify_proposer_vrf(&post_gate, &sync_state).is_ok());
+    }
+
+    #[test]
     fn strict_valid_block_with_vrf_qc_and_state_root_passes() {
         let mut state = ChainState::new_genesis();
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x31, 10_000, true, true);
@@ -2080,6 +2337,7 @@ mod tests {
         for seed in [0x51, 0x52, 0x53, 0x54] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let block = make_reveal_set_block(&state, &[0x51, 0x52, 0x53, 0x54], &[0x51]);
         let err = verify_reveal_set_evidence(&block, &state).unwrap_err();
@@ -2101,6 +2359,7 @@ mod tests {
         for seed in [0x55, 0x56, 0x57, 0x58] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
         let block = make_reveal_set_block_at_round(
@@ -2127,6 +2386,7 @@ mod tests {
         for seed in [0x59, 0x5A, 0x5B, 0x5C] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let block =
             make_reveal_set_block_at_round(&state, u64::MAX, 0, &[0x59, 0x5A, 0x5B, 0x5C], &[]);
@@ -2149,6 +2409,7 @@ mod tests {
         for seed in [0x5D, 0x5E, 0x5F, 0x60] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
         let block = make_reveal_set_block_at_round(
@@ -2170,6 +2431,7 @@ mod tests {
         for seed in [0x65, 0x66, 0x67, 0x68] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
         let block = make_reveal_set_block_at_round(
@@ -2191,6 +2453,7 @@ mod tests {
         for seed in [0x61, 0x62, 0x63, 0x64] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let block = make_reveal_set_block(&state, &[0x61, 0x62, 0x63, 0x64], &[0x61, 0x62, 0x63]);
 
@@ -2209,6 +2472,7 @@ mod tests {
         for seed in [0x71, 0x72, 0x73, 0x74] {
             install_active_validator(&mut state, seed, 10_000, true, true);
         }
+        install_test_snapshot_at_inert_gate(&mut state);
 
         let specified =
             make_reveal_set_block(&state, &[0x71, 0x72, 0x73, 0x74], &[0x71, 0x72, 0x73]);
@@ -2237,6 +2501,7 @@ mod tests {
         );
         assert!(verify_proposer_vrf(&pre_activation, &state).is_ok());
 
+        install_test_snapshot_at_inert_gate(&mut state);
         let post_activation = make_reveal_set_block(&state, &[0x81], &[0x81]);
         assert_eq!(
             post_activation.header.protocol_version,

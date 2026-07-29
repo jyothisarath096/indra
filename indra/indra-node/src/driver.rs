@@ -43,6 +43,7 @@ use indra_crypto::{
 use indra_storage::{VoteSafetyLoadResult, VoteSafetyStore};
 
 use crate::{
+    consensus_authority::{vrf_authority_from_snapshot, VrfConsensusAuthority},
     engine::NodeEngine,
     error::{NodeError, NodeResult},
     slash::{SlashDetector, SlashEvidence},
@@ -160,12 +161,6 @@ impl VrfRoundState {
 struct LocalVrfRoundState {
     vrf_output: Bytes32,
     vrf_proof: Vec<u8>,
-}
-
-struct VrfConsensusAuthority {
-    election: ProposerElection,
-    weights: BTreeMap<Bytes32, u64>,
-    total_weight: u64,
 }
 
 /// An inbound event for the driver to process.
@@ -1001,7 +996,7 @@ impl ConsensusDriver {
         let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
         if consensus_snapshot_active(height) {
             let snapshot = self.engine.state.snapshot_for_consensus_height(height)?;
-            return Ok(Self::vrf_authority_from_snapshot(
+            return Ok(vrf_authority_from_snapshot(
                 height, round, epoch_seed, snapshot,
             ));
         }
@@ -1026,39 +1021,6 @@ impl ConsensusDriver {
             weights,
             total_weight,
         })
-    }
-
-    fn vrf_authority_from_snapshot(
-        height: u64,
-        round: u32,
-        epoch_seed: Bytes32,
-        snapshot: &indra_core::types::consensus_snapshot::ConsensusSnapshot,
-    ) -> VrfConsensusAuthority {
-        let candidates = snapshot
-            .entries()
-            .iter()
-            .map(|entry| ProposerCandidate {
-                validator_id: entry.validator_id,
-                vrf_pubkey: entry.vrf_pk,
-                verified_vrf_output: None,
-                stake: entry.consensus_weight_spark,
-            })
-            .collect();
-        let weights = snapshot
-            .entries()
-            .iter()
-            .map(|entry| (entry.validator_id, entry.consensus_weight_spark))
-            .collect();
-        VrfConsensusAuthority {
-            election: ProposerElection {
-                epoch_seed,
-                height,
-                round,
-                candidates,
-            },
-            weights,
-            total_weight: snapshot.total_weight_spark,
-        }
     }
 
     fn vrf_input_for(&self, height: u64, round: u32) -> [u8; 32] {
@@ -3851,7 +3813,7 @@ mod tests {
             .build_genesis_consensus_snapshot()
             .unwrap();
         let epoch_seed = Bytes32::from([0x55; 32]);
-        let vrf = ConsensusDriver::vrf_authority_from_snapshot(301, 2, epoch_seed, &snapshot);
+        let vrf = vrf_authority_from_snapshot(301, 2, epoch_seed, &snapshot);
         let voters = NodeEngine::registered_voters_for_height(301, &snapshot);
         let qc = NodeEngine::qc_validators_for_height(301, &snapshot);
 
@@ -3930,18 +3892,8 @@ mod tests {
             .build_consensus_snapshot(301, 300)
             .unwrap();
         let replay = || {
-            let old = ConsensusDriver::vrf_authority_from_snapshot(
-                300,
-                0,
-                Bytes32::from([0x80; 32]),
-                &old_snapshot,
-            );
-            let new = ConsensusDriver::vrf_authority_from_snapshot(
-                301,
-                0,
-                Bytes32::from([0x81; 32]),
-                &new_snapshot,
-            );
+            let old = vrf_authority_from_snapshot(300, 0, Bytes32::from([0x80; 32]), &old_snapshot);
+            let new = vrf_authority_from_snapshot(301, 0, Bytes32::from([0x81; 32]), &new_snapshot);
             (
                 indra_consensus::proposer::elect_proposer(&old.election, 300).unwrap(),
                 ConsensusDriver::quorum_stake_reached(&old, old.weights.values().copied().sum()),
@@ -7311,6 +7263,7 @@ mod tests {
         install_active_validator(&mut driver, seed_b, "b");
         install_active_validator(&mut driver, seed_c, "c");
         install_active_validator(&mut driver, seed_d, "d");
+        install_test_snapshot_at_inert_gate(&mut driver);
         driver.refresh_registered_voters();
         driver.engine.state.height = u64::MAX - 1;
         driver.engine.state.tip_hash = Bytes32::from([0xE8; 32]);
