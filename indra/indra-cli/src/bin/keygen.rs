@@ -23,6 +23,10 @@ fn main() {
         cmd_add_payment_key(&args[2..]);
         return;
     }
+    if args.get(1).map(String::as_str) == Some("cold") {
+        cmd_cold(&args[2..]);
+        return;
+    }
 
     let output = args
         .iter()
@@ -330,6 +334,39 @@ fn cmd_add_payment_key(args: &[String]) {
     }
 }
 
+fn cmd_cold(args: &[String]) {
+    let output = get(args, "--output").unwrap_or_else(|| "validator-cold-keys.json".to_string());
+    let plaintext_unsafe = args.iter().any(|arg| arg == "--plaintext-unsafe");
+    let force = args.iter().any(|arg| arg == "--force");
+    let password = if plaintext_unsafe {
+        eprintln!("WARNING: writing plaintext cold keys because --plaintext-unsafe was supplied.");
+        None
+    } else {
+        Some(
+            keygen_password_source_slice(args)
+                .resolve(true)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to read cold-keystore password: {}", e);
+                    std::process::exit(1);
+                }),
+        )
+    };
+    let keys = indra_cli::generate_cold_keys_file(
+        std::path::Path::new(&output),
+        password.as_ref().map(|value| value.as_bytes()),
+        force,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to generate cold keys: {}", e);
+        std::process::exit(1);
+    });
+    println!("INDRA validator cold key generated");
+    println!("Output:       {}", output);
+    println!("Classical PK: {}", hex::encode(keys.classical_pk));
+    println!("PQ PK:        {}", hex::encode(keys.pq_pk));
+    println!("Hot keys.json was not read or modified.");
+}
+
 fn get(args: &[String], flag: &str) -> Option<String> {
     get_ref(args, flag).map(ToString::to_string)
 }
@@ -361,7 +398,7 @@ fn keygen_password_source_slice(args: &[String]) -> indra_cli::PasswordSource<'_
 
 fn print_help() {
     println!(
-        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json\n  indra-keygen add-payment-key --keys keys.json [--keys-password-file path] [--out new-file.json | --replace] [--force]"
+        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path | --plaintext-unsafe] [--force]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json\n  indra-keygen add-payment-key --keys keys.json [--keys-password-file path] [--out new-file.json | --replace] [--force]"
     );
 }
 

@@ -4,8 +4,10 @@ use indra_cli::{
     build_claim_rewards_op, build_delegate_op, build_register_validator_op,
     build_set_commission_op, build_undelegate_op, generate_from_passphrase, generate_keypairs,
     genesis_cmd::{build_genesis_config, entry_from_keys},
+    load_cold_keys,
     query::rpc_call,
     tx_builder::{build_self_stake_op, build_self_unstake_op},
+    PasswordSource,
 };
 use indra_core::{
     codec::Decode,
@@ -18,6 +20,7 @@ use indra_core::{
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_node::{NodeConfig, NodeEngine};
 use std::path::PathBuf;
+use std::process::Command;
 
 fn temp_dir(suffix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -102,6 +105,71 @@ fn keys_json_is_valid_structure() {
     ] {
         assert!(json.contains(field), "missing: {field}");
     }
+}
+
+#[test]
+fn keygen_cold_cli_encrypts_preserves_hot_file_and_requires_force_to_overwrite() {
+    let dir = temp_dir("cold-command");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hot_path = dir.join("keys.json");
+    let cold_path = dir.join("validator-cold-keys.json");
+    let password_path = dir.join("cold-password.txt");
+    let hot_contents = b"existing-hot-key-file-must-not-change";
+    std::fs::write(&hot_path, hot_contents).unwrap();
+    std::fs::write(&password_path, b"test-cold-password\n").unwrap();
+
+    let first = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "--output",
+            cold_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stdout = String::from_utf8(first.stdout).unwrap();
+    assert!(stdout.contains("Classical PK:"));
+    assert!(stdout.contains("PQ PK:"));
+    assert_eq!(std::fs::read(&hot_path).unwrap(), hot_contents);
+    let loaded = load_cold_keys(
+        cold_path.to_str().unwrap(),
+        PasswordSource::File {
+            path: &password_path,
+            reject_permissive: false,
+        },
+    )
+    .unwrap();
+    assert!(stdout.contains(&hex::encode(loaded.classical_pk)));
+    assert!(stdout.contains(&hex::encode(&loaded.pq_pk)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&cold_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let before = std::fs::read(&cold_path).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "--output",
+            cold_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert_eq!(std::fs::read(&cold_path).unwrap(), before);
+    assert_eq!(std::fs::read(&hot_path).unwrap(), hot_contents);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ── Genesis tests ─────────────────────────────────────────────────────────────

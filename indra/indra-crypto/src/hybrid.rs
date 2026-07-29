@@ -319,9 +319,20 @@ impl ColdHybridKeypair {
 
     /// Generate using two independent operating-system CSPRNG reads.
     pub fn generate() -> CryptoResult<Self> {
+        Self::generate_exportable().map(|(keypair, _, _)| keypair)
+    }
+
+    /// Generate with two independent operating-system CSPRNG reads and return
+    /// the component seeds for encrypted cold-keystore persistence.
+    pub fn generate_exportable() -> CryptoResult<(Self, [u8; 32], [u8; 32])> {
         let mut classical_rng = OsRng;
         let mut pq_rng = OsRng;
-        Self::generate_with_rngs(&mut classical_rng, &mut pq_rng)
+        let mut classical_seed = [0u8; 32];
+        let mut pq_seed = [0u8; 32];
+        classical_rng.fill_bytes(&mut classical_seed);
+        pq_rng.fill_bytes(&mut pq_seed);
+        let keypair = Self::from_independent_seeds(classical_seed, pq_seed)?;
+        Ok((keypair, classical_seed, pq_seed))
     }
 
     /// Return the complete cold-role public key.

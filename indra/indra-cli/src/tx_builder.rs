@@ -13,7 +13,7 @@ use curve25519_dalek::scalar::Scalar;
 use indra_core::{
     codec::Encode,
     types::{
-        crypto::{CommitmentV1, HybridPubKey, HybridSignature},
+        crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
@@ -23,7 +23,7 @@ use indra_core::{
     },
 };
 use indra_crypto::{
-    hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+    hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
     pedersen::commit,
     sender_derive_payment_blinding_v1, sha256, PaymentPubKeyV1,
 };
@@ -511,6 +511,67 @@ pub fn build_self_unstake_op(
     )
 }
 
+/// Build the canonical first-time validator cold-key enrollment operation.
+pub fn build_enroll_validator_cold_key_op(
+    validator_id: Bytes32,
+    hot_keypair: &HybridKeypair,
+    cold_keypair: &ColdHybridKeypair,
+    nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    let cold_public = cold_keypair.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
+    let cold_pubkey = ColdHybridPubKey {
+        classical_pk: Bytes32::from(cold_public.classical.0),
+        pq_pk: VariableBytes::from_slice(&cold_public.pq.0)
+            .map_err(|_| CliError::Transaction("cold PQ public key too large".into()))?,
+    };
+    let mut op = StakingOp {
+        body: StakingOpBody::EnrollValidatorColdKey {
+            validator_id,
+            cold_pubkey,
+            cold_signature: None,
+        },
+        nonce,
+        signature: dummy_signature()?,
+    };
+    let message = op
+        .enroll_validator_cold_key_dual_signing_bytes(chain_id)
+        .map_err(|e| CliError::Transaction(e.to_string()))?
+        .ok_or_else(|| CliError::Transaction("missing enrollment signing message".into()))?;
+    let hot_signature = hot_keypair
+        .sign(&message)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let cold_signature = cold_keypair
+        .sign(&message)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    op.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&hot_signature.classical.0)
+            .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
+        pq_sig: VariableBytes::from_slice(&hot_signature.pq.0)
+            .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
+    };
+    if let StakingOpBody::EnrollValidatorColdKey {
+        cold_signature: slot,
+        ..
+    } = &mut op.body
+    {
+        *slot = Some(HybridSignature {
+            classical_sig: VariableBytes::from_slice(&cold_signature.classical.0)
+                .map_err(|_| CliError::Transaction("cold classical sig too large".into()))?,
+            pq_sig: VariableBytes::from_slice(&cold_signature.pq.0)
+                .map_err(|_| CliError::Transaction("cold pq sig too large".into()))?,
+        });
+    }
+    op.validate_structure()
+        .map_err(|e| CliError::Transaction(e.to_string()))?;
+    let op_bytes = op.encode_to_vec();
+    Ok(BuiltStakingOp {
+        op_hex: hex::encode(&op_bytes),
+        op_id: hex::encode(sha256(&op_bytes)),
+    })
+}
+
 fn build_signed_staking_op(
     body: StakingOpBody,
     keypair: &HybridKeypair,
@@ -603,6 +664,10 @@ mod tests {
     use indra_core::types::primitives::{Bytes32, DEFAULT_CHAIN_ID};
     use indra_core::types::transaction::TransactionV1;
     use indra_crypto::{
+        hybrid::{
+            verify_hybrid, ClassicalSignature, HybridSignature as CryptoHybridSignature,
+            PqSignature,
+        },
         payment_x25519_shared_secret, recipient_derive_payment_blinding_v1, PaymentBlindingNoteV1,
         PaymentKeypairV1, PAYMENT_BLINDING_CONTEXT_V1,
     };
@@ -1362,5 +1427,66 @@ mod tests {
                 .any(|b| *b != 0));
             assert!(op.signature.pq_sig.as_slice().iter().any(|b| *b != 0));
         }
+    }
+
+    #[test]
+    fn enroll_cold_key_uses_canonical_message_and_complete_dual_signatures() {
+        let hot_keypair = test_keypair(0xE1);
+        let cold_keypair =
+            ColdHybridKeypair::from_independent_seeds([0xE2; 32], [0xE3; 32]).unwrap();
+        let validator_id = Bytes32::from(sha256(&hot_keypair.public_key().classical.0));
+        let built = build_enroll_validator_cold_key_op(
+            validator_id,
+            &hot_keypair,
+            &cold_keypair,
+            42,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        let op = decode_built(&built);
+        let message = op
+            .enroll_validator_cold_key_dual_signing_bytes(DEFAULT_CHAIN_ID)
+            .unwrap()
+            .unwrap();
+        let hot_signature = CryptoHybridSignature {
+            classical: ClassicalSignature(
+                op.signature.classical_sig.as_slice().try_into().unwrap(),
+            ),
+            pq: PqSignature(op.signature.pq_sig.as_slice().try_into().unwrap()),
+        };
+        let (encoded_cold_pubkey, encoded_cold_signature) = match &op.body {
+            StakingOpBody::EnrollValidatorColdKey {
+                validator_id: encoded_validator_id,
+                cold_pubkey,
+                cold_signature: Some(cold_signature),
+            } => {
+                assert_eq!(*encoded_validator_id, validator_id);
+                (cold_pubkey, cold_signature)
+            }
+            _ => panic!("expected complete cold-key enrollment body"),
+        };
+        let expected_cold_public = cold_keypair.public_key();
+        let expected_cold_public = expected_cold_public.as_complete_hybrid();
+        assert_eq!(
+            encoded_cold_pubkey.classical_pk.0,
+            expected_cold_public.classical.0
+        );
+        assert_eq!(
+            encoded_cold_pubkey.pq_pk.as_slice(),
+            expected_cold_public.pq.0
+        );
+        let cold_signature = CryptoHybridSignature {
+            classical: ClassicalSignature(
+                encoded_cold_signature
+                    .classical_sig
+                    .as_slice()
+                    .try_into()
+                    .unwrap(),
+            ),
+            pq: PqSignature(encoded_cold_signature.pq_sig.as_slice().try_into().unwrap()),
+        };
+        verify_hybrid(&message, &hot_signature, &hot_keypair.public_key()).unwrap();
+        verify_hybrid(&message, &cold_signature, &expected_cold_public).unwrap();
+        assert_eq!(op.nonce, 42);
     }
 }

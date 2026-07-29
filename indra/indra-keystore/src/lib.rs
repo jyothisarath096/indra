@@ -18,7 +18,7 @@ use chacha20poly1305::{
 use indra_crypto::{
     bls::BlsKeypair,
     derive_all_seeds, generate_mnemonic,
-    hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+    hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
     mnemonic_to_seed, sha256, PaymentKeypairV1, PaymentPubKeyV1, VrfKeypair,
 };
 use rand::RngCore;
@@ -31,6 +31,10 @@ pub const KEY_FILE_MODE: u32 = 0o600;
 pub const KEYSTORE_FORMAT: &str = "indra-keystore";
 /// Current encrypted keystore format version.
 pub const KEYSTORE_VERSION: u8 = 1;
+/// Dedicated cold-keystore top-level format marker.
+pub const COLD_KEYSTORE_FORMAT: &str = "indra-cold-keystore";
+/// Current cold-keystore format version.
+pub const COLD_KEYSTORE_VERSION: u8 = 1;
 /// Argon2id memory cost in KiB.
 pub const ARGON2_MEMORY_KIB: u32 = 65_536;
 /// Argon2id iteration count.
@@ -109,6 +113,49 @@ pub struct KeysFile {
     pub pq_sk: Vec<u8>,
     /// Optional payment key-exchange private keypair (keep secret).
     pub payment_keypair: Option<PaymentKeypairV1>,
+}
+
+/// Dedicated validator cold-key material. It contains no hot identity fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdKeysFile {
+    /// Ed25519 seed.
+    pub classical_seed: [u8; 32],
+    /// ML-DSA-87 seed.
+    pub pq_seed: [u8; 32],
+    /// Ed25519 public key.
+    pub classical_pk: [u8; 32],
+    /// ML-DSA-87 public key.
+    pub pq_pk: Vec<u8>,
+}
+
+impl ColdKeysFile {
+    /// Generate through the role-specific independent-entropy primitive.
+    pub fn generate() -> KeystoreResult<Self> {
+        let (keypair, classical_seed, pq_seed) = ColdHybridKeypair::generate_exportable()
+            .map_err(|e| KeystoreError::Crypto(e.to_string()))?;
+        let public = keypair.public_key();
+        let public = public.as_complete_hybrid();
+        Ok(Self {
+            classical_seed,
+            pq_seed,
+            classical_pk: public.classical.0,
+            pq_pk: public.pq.0.to_vec(),
+        })
+    }
+
+    /// Reconstruct and verify the complete cold hybrid keypair.
+    pub fn reconstruct(&self) -> KeystoreResult<ColdHybridKeypair> {
+        let keypair = ColdHybridKeypair::from_independent_seeds(self.classical_seed, self.pq_seed)
+            .map_err(|e| KeystoreError::Crypto(e.to_string()))?;
+        let public = keypair.public_key();
+        let public = public.as_complete_hybrid();
+        if public.classical.0 != self.classical_pk || public.pq.0.as_slice() != self.pq_pk {
+            return Err(KeystoreError::Crypto(
+                "cold keystore public metadata does not match private seeds".into(),
+            ));
+        }
+        Ok(keypair)
+    }
 }
 
 /// Byte-for-byte identity material snapshot used by payment-key retrofit checks.
@@ -574,6 +621,105 @@ pub fn write_keys_secure(path: &str, contents: &str) -> KeystoreResult<()> {
     write_secret_file_secure(path, contents.as_bytes())
 }
 
+/// Encrypt a dedicated cold-key file with the standard keystore KDF/cipher.
+pub fn encrypt_cold_keys(keys: &ColdKeysFile, password: &[u8]) -> KeystoreResult<String> {
+    let mut salt = [0u8; ARGON2_SALT_BYTES];
+    let mut nonce = [0u8; CHACHA_NONCE_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let public = ColdPublicJson {
+        classical_pk: hex::encode(keys.classical_pk),
+        pq_pk: hex::encode(&keys.pq_pk),
+    };
+    let mut container = ColdEncryptedContainer::new(public, salt, nonce);
+    let aad = container.associated_data()?;
+    let private = ColdPrivateJson {
+        classical_seed: hex::encode(keys.classical_seed),
+        pq_seed: hex::encode(keys.pq_seed),
+    };
+    let plaintext =
+        serde_json::to_vec(&private).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+    container.crypto.cipher.ciphertext =
+        hex::encode(encrypt_payload(password, &salt, &nonce, &aad, &plaintext)?);
+    serde_json::to_string_pretty(&container).map_err(|e| KeystoreError::Parse(e.to_string()))
+}
+
+/// Decrypt and verify a dedicated cold-key file.
+pub fn decrypt_cold_keys(json: &str, password: &[u8]) -> KeystoreResult<ColdKeysFile> {
+    let container: ColdEncryptedContainer =
+        serde_json::from_str(json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+    container.validate()?;
+    let aad = container.associated_data()?;
+    let salt = decode_hex_fixed::<ARGON2_SALT_BYTES>(&container.crypto.kdf.params.salt, "salt")?;
+    let nonce =
+        decode_hex_fixed::<CHACHA_NONCE_BYTES>(&container.crypto.cipher.params.nonce, "nonce")?;
+    let ciphertext = decode_hex(&container.crypto.cipher.ciphertext, "ciphertext")?;
+    let plaintext = decrypt_payload(password, &salt, &nonce, &aad, &ciphertext)?;
+    let private: ColdPrivateJson =
+        serde_json::from_slice(&plaintext).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+    let keys = ColdKeysFile {
+        classical_seed: decode_hex_fixed::<32>(&private.classical_seed, "classical_seed")?,
+        pq_seed: decode_hex_fixed::<32>(&private.pq_seed, "pq_seed")?,
+        classical_pk: decode_hex_fixed::<32>(&container.public.classical_pk, "classical_pk")?,
+        pq_pk: decode_hex(&container.public.pq_pk, "pq_pk")?,
+    };
+    keys.reconstruct()?;
+    Ok(keys)
+}
+
+/// Load a dedicated encrypted cold-key file.
+pub fn load_cold_keys(path: &str, source: PasswordSource<'_>) -> KeystoreResult<ColdKeysFile> {
+    warn_if_key_file_permissive(path);
+    let json =
+        std::fs::read_to_string(path).map_err(|e| KeystoreError::Io(format!("{}: {}", path, e)))?;
+    if serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|value| value.get("private").cloned())
+        .is_some()
+    {
+        let container: ColdPlaintextContainer =
+            serde_json::from_str(&json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+        if container.format != COLD_KEYSTORE_FORMAT || container.version != COLD_KEYSTORE_VERSION {
+            return Err(KeystoreError::Parse("invalid cold keystore format".into()));
+        }
+        let keys = ColdKeysFile {
+            classical_seed: decode_hex_fixed::<32>(
+                &container.private.classical_seed,
+                "classical_seed",
+            )?,
+            pq_seed: decode_hex_fixed::<32>(&container.private.pq_seed, "pq_seed")?,
+            classical_pk: decode_hex_fixed::<32>(&container.public.classical_pk, "classical_pk")?,
+            pq_pk: decode_hex(&container.public.pq_pk, "pq_pk")?,
+        };
+        keys.reconstruct()?;
+        return Ok(keys);
+    }
+    let password = source.resolve(false)?;
+    decrypt_cold_keys(&json, password.as_bytes())
+}
+
+/// Generate and securely write a new dedicated cold-key file.
+pub fn generate_cold_keys_file(
+    path: &Path,
+    password: Option<&[u8]>,
+    force: bool,
+) -> KeystoreResult<ColdKeysFile> {
+    if path.exists() && !force {
+        return Err(KeystoreError::Io(format!(
+            "{} already exists; pass --force to overwrite",
+            path.display()
+        )));
+    }
+    let keys = ColdKeysFile::generate()?;
+    let contents = match password {
+        Some(password) => encrypt_cold_keys(&keys, password)?,
+        None => serde_json::to_string_pretty(&ColdPlaintextContainer::from(&keys))
+            .map_err(|e| KeystoreError::Parse(e.to_string()))?,
+    };
+    write_keys_secure(path_to_str(path)?, &contents)?;
+    Ok(keys)
+}
+
 /// Write encrypted contents to a temporary file, verify decryption, back up the
 /// original plaintext, and atomically replace it.
 pub fn encrypt_plaintext_keys_replace(
@@ -955,6 +1101,126 @@ impl EncryptedContainer {
 struct CryptoJson {
     kdf: KdfJson,
     cipher: CipherJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ColdPublicJson {
+    classical_pk: String,
+    pq_pk: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ColdPrivateJson {
+    classical_seed: String,
+    pq_seed: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ColdPlaintextContainer {
+    format: String,
+    version: u8,
+    public: ColdPublicJson,
+    private: ColdPrivateJson,
+}
+
+impl From<&ColdKeysFile> for ColdPlaintextContainer {
+    fn from(keys: &ColdKeysFile) -> Self {
+        Self {
+            format: COLD_KEYSTORE_FORMAT.to_string(),
+            version: COLD_KEYSTORE_VERSION,
+            public: ColdPublicJson {
+                classical_pk: hex::encode(keys.classical_pk),
+                pq_pk: hex::encode(&keys.pq_pk),
+            },
+            private: ColdPrivateJson {
+                classical_seed: hex::encode(keys.classical_seed),
+                pq_seed: hex::encode(keys.pq_seed),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ColdEncryptedContainer {
+    format: String,
+    version: u8,
+    public: ColdPublicJson,
+    crypto: CryptoJson,
+}
+
+impl ColdEncryptedContainer {
+    fn new(
+        public: ColdPublicJson,
+        salt: [u8; ARGON2_SALT_BYTES],
+        nonce: [u8; CHACHA_NONCE_BYTES],
+    ) -> Self {
+        Self {
+            format: COLD_KEYSTORE_FORMAT.to_string(),
+            version: COLD_KEYSTORE_VERSION,
+            public,
+            crypto: CryptoJson {
+                kdf: KdfJson {
+                    function: "argon2id".into(),
+                    params: KdfParamsJson {
+                        version: 19,
+                        memory_kib: ARGON2_MEMORY_KIB,
+                        iterations: ARGON2_ITERATIONS,
+                        parallelism: ARGON2_PARALLELISM,
+                        salt: hex::encode(salt),
+                    },
+                },
+                cipher: CipherJson {
+                    function: "chacha20-poly1305".into(),
+                    params: CipherParamsJson {
+                        nonce: hex::encode(nonce),
+                    },
+                    ciphertext: String::new(),
+                },
+            },
+        }
+    }
+
+    fn associated_data(&self) -> KeystoreResult<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Aad<'a> {
+            format: &'a str,
+            version: u8,
+            public: &'a ColdPublicJson,
+            kdf: &'a KdfJson,
+            cipher_function: &'a str,
+            cipher_params: &'a CipherParamsJson,
+        }
+        serde_json::to_vec(&Aad {
+            format: &self.format,
+            version: self.version,
+            public: &self.public,
+            kdf: &self.crypto.kdf,
+            cipher_function: &self.crypto.cipher.function,
+            cipher_params: &self.crypto.cipher.params,
+        })
+        .map_err(|e| KeystoreError::Parse(e.to_string()))
+    }
+
+    fn validate(&self) -> KeystoreResult<()> {
+        if self.format != COLD_KEYSTORE_FORMAT {
+            return Err(KeystoreError::Parse("not an INDRA cold keystore".into()));
+        }
+        if self.version != COLD_KEYSTORE_VERSION {
+            return Err(KeystoreError::UnsupportedVersion(self.version as u64));
+        }
+        if self.crypto.kdf.function != "argon2id"
+            || self.crypto.kdf.params.version != 19
+            || self.crypto.kdf.params.memory_kib != ARGON2_MEMORY_KIB
+            || self.crypto.kdf.params.iterations != ARGON2_ITERATIONS
+            || self.crypto.kdf.params.parallelism != ARGON2_PARALLELISM
+            || self.crypto.cipher.function != "chacha20-poly1305"
+        {
+            return Err(KeystoreError::Parse(
+                "unsupported cold-keystore crypto parameters".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1401,6 +1667,45 @@ mod tests {
             encrypt_plaintext_keys_with_params(&keys, b"correct horse", [7; 32], [8; 12]).unwrap();
         let recovered = decrypt_encrypted_keys(&json, b"correct horse").unwrap();
         assert_eq!(recovered, keys);
+    }
+
+    #[test]
+    fn cold_key_file_is_encrypted_independent_secure_and_does_not_touch_hot_keys() {
+        let dir = test_dir("cold-key-generate");
+        let hot_path = dir.join("keys.json");
+        let cold_path = dir.join("validator-cold-keys.json");
+        let hot_bytes = b"existing-hot-identity-must-remain-byte-identical";
+        write_secret_file_secure(hot_path.to_str().unwrap(), hot_bytes).unwrap();
+        let generated = generate_cold_keys_file(&cold_path, Some(b"cold-password"), false).unwrap();
+        assert_eq!(std::fs::read(&hot_path).unwrap(), hot_bytes);
+        let json = std::fs::read_to_string(&cold_path).unwrap();
+        assert!(json.contains(COLD_KEYSTORE_FORMAT));
+        assert!(!json.contains(&hex::encode(generated.classical_seed)));
+        let recovered = decrypt_cold_keys(&json, b"cold-password").unwrap();
+        assert_eq!(recovered, generated);
+        assert_ne!(generated.classical_seed, generated.pq_seed);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&cold_path).unwrap().permissions().mode() & 0o777,
+                KEY_FILE_MODE
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cold_key_file_refuses_overwrite_without_force() {
+        let dir = test_dir("cold-key-overwrite");
+        let path = dir.join("validator-cold-keys.json");
+        let first = generate_cold_keys_file(&path, Some(b"pw"), false).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(generate_cold_keys_file(&path, Some(b"pw"), false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let replacement = generate_cold_keys_file(&path, Some(b"pw"), true).unwrap();
+        assert_ne!(replacement.classical_pk, first.classical_pk);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn legacy_stage5_encrypted_keys_json(keys: &KeysFile, password: &[u8]) -> String {
