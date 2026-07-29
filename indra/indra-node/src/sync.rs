@@ -2224,6 +2224,146 @@ mod tests {
     }
 
     #[test]
+    fn consensus_snapshot_capstone_blocks_both_original_qc_attacks_end_to_end() {
+        use indra_consensus::vote::{VoteCollector, VoteDecision};
+
+        let mut state = ChainState::new_genesis();
+        let (a_id, a) = install_active_validator(&mut state, 0xC1, 40, true, true);
+        let (_, b) = install_active_validator(&mut state, 0xC2, 30, true, true);
+        let (c_id, _) = install_active_validator(&mut state, 0xC3, 30, true, true);
+        install_test_snapshot_at_inert_gate(&mut state);
+        let snapshot = state
+            .snapshot_for_consensus_height(u64::MAX)
+            .unwrap()
+            .clone();
+
+        // One governed-height authority feeds the real vote collector, QC
+        // construction adapter, live verifier, and sync verifier.
+        let block_h_hash = Bytes32::from([0xD1; 32]);
+        let voters = crate::engine::NodeEngine::registered_voters_for_height(u64::MAX, &snapshot);
+        let mut collector = VoteCollector::new(
+            u64::MAX,
+            0,
+            VoteStep::Precommit,
+            DEFAULT_CHAIN_ID.to_string(),
+            voters,
+        );
+        let a_vote = produce_vote(
+            u64::MAX,
+            0,
+            VoteStep::Precommit,
+            block_h_hash,
+            a_id,
+            DEFAULT_CHAIN_ID,
+            &a,
+        )
+        .unwrap();
+        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
+        let b_vote = produce_vote(
+            u64::MAX,
+            0,
+            VoteStep::Precommit,
+            block_h_hash,
+            b_id,
+            DEFAULT_CHAIN_ID,
+            &b,
+        )
+        .unwrap();
+        assert!(matches!(
+            collector.add_vote(a_vote.clone()).unwrap(),
+            VoteDecision::Waiting
+        ));
+        assert!(matches!(
+            collector.add_vote(b_vote.clone()).unwrap(),
+            VoteDecision::QuorumReached { .. }
+        ));
+        let qc_h = build_qc(
+            u64::MAX,
+            0,
+            block_h_hash,
+            DEFAULT_CHAIN_ID,
+            &crate::engine::NodeEngine::qc_validators_for_height(u64::MAX, &snapshot),
+            vec![&a_vote, &b_vote],
+        )
+        .unwrap();
+
+        // Original liveness attack: H commits C's stake increase. The legacy
+        // post-H interpretation rejects the genuine A+B QC, while both final
+        // governed verification paths continue to accept it under S(H).
+        state.validators.get_mut(&c_id).unwrap().stake_spark = 140;
+        let mut live_validators: Vec<_> = state.validators.active_validators().collect();
+        live_validators.sort_by_key(|validator| validator.validator_id.0);
+        let live_qc_validators = live_validators
+            .iter()
+            .enumerate()
+            .map(|(position, validator)| QcValidator {
+                validator_id: validator.validator_id,
+                position,
+                pq_pk: validator.hybrid_pq_pk.clone().unwrap(),
+                classical_pk: validator.hybrid_classical_pk.unwrap(),
+                stake: validator.stake_spark,
+            })
+            .collect::<Vec<_>>();
+        assert!(verify_qc_strict(
+            &qc_h,
+            &live_qc_validators,
+            state.validators.total_active_stake(),
+            DEFAULT_CHAIN_ID,
+        )
+        .is_err());
+        assert!(crate::engine::NodeEngine::verify_qc_with_snapshot(
+            &qc_h,
+            &snapshot,
+            DEFAULT_CHAIN_ID,
+        )
+        .is_ok());
+        assert!(verify_sync_qc(&qc_h, &state, u64::MAX).is_ok());
+
+        // Original safety attack: A's increase appears committed after the
+        // certified block, and A presents a single-signer QC. The legacy
+        // post-block interpretation accepts it, but the real live and sync
+        // governed paths both reject it under the unchanged S(H).
+        state.validators.get_mut(&a_id).unwrap().stake_spark = 500;
+        let forged = qc_from_test_signers(u64::MAX, Bytes32::from([0xD2; 32]), &snapshot, &[&a]);
+        let mut inflated_validators: Vec<_> = state.validators.active_validators().collect();
+        inflated_validators.sort_by_key(|validator| validator.validator_id.0);
+        let inflated_qc_validators = inflated_validators
+            .iter()
+            .enumerate()
+            .map(|(position, validator)| QcValidator {
+                validator_id: validator.validator_id,
+                position,
+                pq_pk: validator.hybrid_pq_pk.clone().unwrap(),
+                classical_pk: validator.hybrid_classical_pk.unwrap(),
+                stake: validator.stake_spark,
+            })
+            .collect::<Vec<_>>();
+        assert!(verify_qc_strict(
+            &forged,
+            &inflated_qc_validators,
+            state.validators.total_active_stake(),
+            DEFAULT_CHAIN_ID,
+        )
+        .is_ok());
+        assert!(crate::engine::NodeEngine::verify_qc_with_snapshot(
+            &forged,
+            &snapshot,
+            DEFAULT_CHAIN_ID,
+        )
+        .is_err());
+        assert!(verify_sync_qc(&forged, &state, u64::MAX).is_err());
+
+        // Neither committed mutation may rewrite the retained authority.
+        assert_eq!(
+            state
+                .snapshot_for_consensus_height(u64::MAX)
+                .unwrap()
+                .snapshot_root,
+            snapshot.snapshot_root
+        );
+    }
+
+    #[test]
     fn pre_gate_sync_proposer_and_reveal_behavior_is_unchanged() {
         let mut state = ChainState::new_genesis();
         install_active_validator(&mut state, 0xB5, 10_000, true, true);

@@ -3905,6 +3905,190 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn consensus_snapshot_capstone_multi_epoch_authority_lifecycle_is_consistent() {
+        let local_seed = [0xC0; 32];
+        let (mut driver, dir) = local_driver(local_seed, "snapshot_lifecycle_capstone");
+        let local = install_active_validator(&mut driver, local_seed, "local");
+        let b = install_active_validator(&mut driver, [0xC1; 32], "b");
+        let c = install_active_validator(&mut driver, [0xC2; 32], "c");
+        let local_id = validator_id_for(&local);
+        let b_id = validator_id_for(&b);
+        let c_id = validator_id_for(&c);
+        for (id, stake) in [(local_id, 40), (b_id, 30), (c_id, 30)] {
+            driver
+                .engine
+                .state
+                .validators
+                .get_mut(&id)
+                .unwrap()
+                .stake_spark = stake;
+        }
+
+        let genesis = driver
+            .engine
+            .state
+            .build_genesis_consensus_snapshot()
+            .unwrap();
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&c_id)
+            .unwrap()
+            .stake_spark = 60;
+        let at_301 = driver
+            .engine
+            .state
+            .build_consensus_snapshot(301, 300)
+            .unwrap();
+
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&b_id)
+            .unwrap()
+            .status = ValidatorStatus::Registered;
+        let d = install_active_validator(&mut driver, [0xC3; 32], "d");
+        let d_id = validator_id_for(&d);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&d_id)
+            .unwrap()
+            .stake_spark = 50;
+        let at_601 = driver
+            .engine
+            .state
+            .build_consensus_snapshot(601, 600)
+            .unwrap();
+
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local_id)
+            .unwrap()
+            .stake_spark = 80;
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&c_id)
+            .unwrap()
+            .status = ValidatorStatus::Registered;
+        let at_901 = driver
+            .engine
+            .state
+            .build_consensus_snapshot(901, 900)
+            .unwrap();
+        driver.engine.state.consensus_snapshots = vec![at_601.clone(), at_901.clone()];
+
+        let signers = vec![(local_id, local), (b_id, b), (c_id, c), (d_id, d)];
+        let snapshots = [(1, genesis), (301, at_301), (601, at_601), (901, at_901)];
+        let run = || {
+            snapshots
+                .iter()
+                .map(|(height, snapshot)| {
+                    let voters = NodeEngine::registered_voters_for_height(*height, snapshot);
+                    let validators = NodeEngine::qc_validators_for_height(*height, snapshot);
+                    let authority = vrf_authority_from_snapshot(
+                        *height,
+                        0,
+                        Bytes32::from([(*height % 251) as u8; 32]),
+                        snapshot,
+                    );
+                    assert_eq!(voters.len(), validators.len());
+                    assert_eq!(validators.len(), authority.election.candidates.len());
+                    for ((voter, validator), candidate) in voters
+                        .iter()
+                        .zip(&validators)
+                        .zip(&authority.election.candidates)
+                    {
+                        assert_eq!(voter.validator_id, validator.validator_id);
+                        assert_eq!(validator.validator_id, candidate.validator_id);
+                        assert_eq!(voter.stake, validator.stake);
+                        assert_eq!(validator.stake, candidate.stake);
+                    }
+                    assert_eq!(authority.total_weight, snapshot.total_weight_spark);
+                    assert!(ConsensusDriver::quorum_stake_reached(
+                        &authority,
+                        authority.weights.values().copied().sum()
+                    ));
+
+                    let block_hash = Bytes32::from([(*height % 239) as u8; 32]);
+                    let votes = signers
+                        .iter()
+                        .filter(|(id, _)| snapshot.entry_with_position(id).is_some())
+                        .map(|(id, signer)| {
+                            indra_consensus::vote::produce_vote(
+                                *height,
+                                0,
+                                VoteStep::Precommit,
+                                block_hash,
+                                *id,
+                                DEFAULT_CHAIN_ID,
+                                signer,
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut collector = VoteCollector::new(
+                        *height,
+                        0,
+                        VoteStep::Precommit,
+                        DEFAULT_CHAIN_ID.to_string(),
+                        voters,
+                    );
+                    for vote in &votes {
+                        collector.add_vote(vote.clone()).unwrap();
+                    }
+                    let qc = indra_consensus::qc::build_qc(
+                        *height,
+                        0,
+                        block_hash,
+                        DEFAULT_CHAIN_ID,
+                        &validators,
+                        votes.iter().collect(),
+                    )
+                    .unwrap();
+                    NodeEngine::verify_qc_with_snapshot(&qc, snapshot, DEFAULT_CHAIN_ID).unwrap();
+                    (
+                        snapshot.snapshot_root,
+                        indra_consensus::proposer::elect_proposer(&authority.election, *height)
+                            .unwrap(),
+                        qc.encode_to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(),
+            run(),
+            "live and replay transcripts must be identical"
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|(_, snapshot)| snapshot.activation_height)
+                .collect::<Vec<_>>(),
+            vec![1, 301, 601, 901]
+        );
+        assert_eq!(
+            driver
+                .engine
+                .state
+                .consensus_snapshots
+                .iter()
+                .map(|snapshot| snapshot.activation_height)
+                .collect::<Vec<_>>(),
+            vec![601, 901]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn signed_vrf_pair(
         driver: &ConsensusDriver,
         seed: [u8; 32],

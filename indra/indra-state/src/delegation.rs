@@ -7591,11 +7591,11 @@ mod tests {
     }
 
     #[test]
-    fn hot_cold_capstone_six_gate_state_transcript_replays_byte_identically() {
+    fn consensus_snapshot_capstone_mixed_gate_state_transcript_replays_byte_identically() {
         fn replay() -> Vec<(u64, Vec<u8>, Bytes32)> {
             use indra_core::types::primitives::hard_forks::{
-                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT, DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-                NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
+                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT, CONSENSUS_SNAPSHOT_HEIGHT,
+                DELEGATOR_IDENTITY_REGISTRY_HEIGHT, NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
             };
 
             let mut transcript = Vec::new();
@@ -7704,13 +7704,31 @@ mod tests {
                 state.encode_to_vec(),
                 crate::compute_state_root(&state),
             ));
+
+            // The snapshot gate remains production-inert. For this transcript,
+            // u64::MAX is the explicit test activation height. Cold enforcement
+            // settles policy first at the same unscheduled height; snapshot
+            // construction then freezes the fully-settled Active authority.
+            assert_eq!(CONSENSUS_SNAPSHOT_HEIGHT, u64::MAX);
+            state.validators.get_mut(&validator_id).unwrap().vrf_pk =
+                Some(indra_crypto::VrfKeypair::from_seed(&[0xB8; 32]).public_key());
+            let snapshot = state
+                .build_consensus_snapshot(CONSENSUS_SNAPSHOT_HEIGHT, CONSENSUS_SNAPSHOT_HEIGHT - 1)
+                .unwrap();
+            state.consensus_snapshots = vec![snapshot];
+            state.rebuild_state_commitment_v2(CONSENSUS_SNAPSHOT_HEIGHT);
+            transcript.push((
+                state.height,
+                state.encode_to_vec(),
+                crate::compute_state_root(&state),
+            ));
             transcript
         }
 
         let first = replay();
         let second = replay();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 6);
+        assert_eq!(first.len(), 7);
         assert_eq!(
             first.iter().map(|entry| entry.0).collect::<Vec<_>>(),
             vec![
@@ -7720,6 +7738,7 @@ mod tests {
                 indra_core::types::primitives::hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
                 VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
                 VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+                indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
             ]
         );
     }
