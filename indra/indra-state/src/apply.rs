@@ -304,6 +304,10 @@ fn apply_slash_at_height_with_accounting(
             slash_amount
         };
         v.stake_spark = v.stake_spark.saturating_sub(stake_slash);
+        // Equivocation slashing is prospective-only by policy. Rewards already
+        // credited to `pending_rewards` are never clawed back retroactively;
+        // the penalty is the immediate stake reduction here plus permanent
+        // exclusion from future reward eligibility through `Slashed` status.
         v.status = ValidatorStatus::Slashed;
         updated_validator = Some(v.clone());
     }

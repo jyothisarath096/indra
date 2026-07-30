@@ -115,7 +115,6 @@ pub fn apply_epoch_transition_at_height(
     state
         .validators
         .select_active_set(&state.delegations, total_staked, height);
-    apply_pending_commission_changes(state, current_epoch);
 
     let virtual_delegations = apply_auto_delegations(state, current_epoch);
 
@@ -136,6 +135,10 @@ pub fn apply_epoch_transition_at_height(
     distribute_fee_rewards(state, current_epoch, height);
     let fee_rewards_distributed = fee_pool_before.saturating_sub(state.fee_reward_pool);
     remove_auto_delegations(state, &virtual_delegations, current_epoch, height);
+    // This boundary pays the epoch that just elapsed. Activate a due
+    // commission only after both reward sources and virtual auto-delegation
+    // accounting have used the rate that governed that elapsed epoch.
+    apply_pending_commission_changes(state, current_epoch);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds_at_height(state, current_epoch, height)?;
@@ -2644,6 +2647,119 @@ mod tests {
         assert_eq!(after_effective.commission_bps, 1_500);
         assert_eq!(after_effective.pending_commission_bps, None);
         assert_eq!(after_effective.pending_commission_effective_epoch, None);
+    }
+
+    #[test]
+    fn activating_commission_applies_only_to_next_epoch_reward() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let mut validator = make_validator(0xC5, MINIMUM_ACTIVE_SELF_STAKE_SPARK.saturating_mul(2));
+        let validator_id = validator.validator_id;
+        validator.commission_bps = 1_000;
+        validator.pending_commission_bps = Some(2_000);
+        validator.pending_commission_effective_epoch = Some(COMMISSION_CHANGE_DELAY_EPOCHS);
+        state.validators.upsert(validator).unwrap();
+        let delegator_id = Bytes32::from([0xD5; 32]);
+        state
+            .delegations
+            .add_delegation(
+                validator_id,
+                delegator_id,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+                0,
+            )
+            .unwrap();
+
+        let activation_epoch = COMMISSION_CHANGE_DELAY_EPOCHS;
+        let activation_height = activation_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+        let reward_at_activation =
+            block_reward_at_height(activation_height).saturating_mul(EPOCH_DURATION_BLOCKS);
+        let fee_reward_at_activation = 10_000;
+        state.fee_reward_pool = fee_reward_at_activation;
+        apply_epoch_transition(&mut state, activation_epoch, 0).unwrap();
+
+        let validator_after_activation = state.validators.get(&validator_id).unwrap();
+        assert_eq!(validator_after_activation.commission_bps, 2_000);
+        let validator_rewards_after_activation = validator_after_activation.pending_rewards;
+        assert_eq!(
+            validator_rewards_after_activation,
+            bps_of(reward_at_activation, 1_000)
+                .saturating_add(bps_of(fee_reward_at_activation, 1_000)),
+            "the activation boundary must pay the elapsed epoch at the old rate"
+        );
+        let delegator_after_activation = state
+            .delegations
+            .get_delegator_reward(&validator_id, &delegator_id);
+        assert_eq!(
+            delegator_after_activation,
+            reward_at_activation
+                .saturating_sub(bps_of(reward_at_activation, 1_000))
+                .saturating_add(
+                    fee_reward_at_activation
+                        .saturating_sub(bps_of(fee_reward_at_activation, 1_000)),
+                )
+        );
+
+        let next_epoch = activation_epoch.saturating_add(1);
+        let next_height = next_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+        let next_reward = block_reward_at_height(next_height).saturating_mul(EPOCH_DURATION_BLOCKS);
+        let next_fee_reward = 20_000;
+        state.fee_reward_pool = next_fee_reward;
+        apply_epoch_transition(&mut state, next_epoch, 0).unwrap();
+
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .pending_rewards
+                .saturating_sub(validator_rewards_after_activation),
+            bps_of(next_reward, 2_000).saturating_add(bps_of(next_fee_reward, 2_000)),
+            "the next epoch reward must use the newly activated rate"
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id)
+                .saturating_sub(delegator_after_activation),
+            next_reward
+                .saturating_sub(bps_of(next_reward, 2_000))
+                .saturating_add(next_fee_reward.saturating_sub(bps_of(next_fee_reward, 2_000)))
+        );
+    }
+
+    #[test]
+    fn boundary_without_pending_commission_uses_current_rate() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let mut validator = make_validator(0xC6, MINIMUM_ACTIVE_SELF_STAKE_SPARK.saturating_mul(2));
+        let validator_id = validator.validator_id;
+        validator.commission_bps = 1_250;
+        state.validators.upsert(validator).unwrap();
+        let delegator_id = Bytes32::from([0xD6; 32]);
+        state
+            .delegations
+            .add_delegation(
+                validator_id,
+                delegator_id,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+                0,
+            )
+            .unwrap();
+
+        let epoch = 1;
+        let height = epoch * EPOCH_DURATION_BLOCKS;
+        let reward = block_reward_at_height(height).saturating_mul(EPOCH_DURATION_BLOCKS);
+        apply_epoch_transition(&mut state, epoch, 0).unwrap();
+
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().pending_rewards,
+            bps_of(reward, 1_250)
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id),
+            reward.saturating_sub(bps_of(reward, 1_250))
+        );
     }
 
     #[test]
