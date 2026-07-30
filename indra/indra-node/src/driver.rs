@@ -1026,6 +1026,18 @@ impl ConsensusDriver {
         })
     }
 
+    /// Build the canonical proposer election authority for one height and round.
+    ///
+    /// Legacy heights use the live active validator set. Snapshot-governed
+    /// heights use the consensus snapshot authoritative for `height`.
+    pub fn proposer_election_for_height(
+        &self,
+        height: u64,
+        round: u32,
+    ) -> NodeResult<ProposerElection> {
+        Ok(self.vrf_consensus_authority(height, round)?.election)
+    }
+
     fn vrf_input_for(&self, height: u64, round: u32) -> [u8; 32] {
         let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
         compute_vrf_input(&epoch_seed.0, height, round)

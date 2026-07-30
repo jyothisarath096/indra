@@ -130,6 +130,14 @@ enum ProposalMode {
     Reproposal,
 }
 
+fn proposer_election_for_slot(
+    driver: &ConsensusDriver,
+    height: u64,
+    round: u32,
+) -> indra_node::NodeResult<indra_consensus::proposer::ProposerElection> {
+    driver.proposer_election_for_height(height, round)
+}
+
 #[derive(Clone)]
 struct NetworkBridge {
     handle: PeerManagerHandle,
@@ -2351,60 +2359,43 @@ fn main() {
                         RoundPhase::Propose => {
                             let (should_propose, next_height, proposal_round, vrf_actions) = {
                                 let mut d = driver.lock().unwrap();
-                                let epoch_seed = indra_core::types::primitives::Bytes32::from(
-                                    indra_crypto::sha256(&d.engine.state.tip_hash.0),
-                                );
                                 let height = d.engine.state.height + 1;
                                 let round = d.current_round();
-                                let candidates: Vec<indra_consensus::proposer::ProposerCandidate> =
-                                    d.engine
-                                        .state
-                                        .validators
-                                        .active_validators()
-                                        .filter_map(|v| {
-                                            v.vrf_pk.map(|vrf_pk| {
-                                                indra_consensus::proposer::ProposerCandidate {
-                                                    validator_id: v.validator_id,
-                                                    vrf_pubkey: vrf_pk,
-                                                    verified_vrf_output: None,
-                                                    stake: v.stake_spark,
-                                                }
-                                            })
-                                        })
-                                        .collect();
-
-                                if candidates.is_empty() {
-                                    (
+                                match proposer_election_for_slot(&d, height, round) {
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[consensus] proposal eligibility unavailable at height={} round={}: {}",
+                                            height, round, error,
+                                        );
+                                        (false, height, round, Vec::new())
+                                    }
+                                    Ok(election) if election.candidates.is_empty() => (
                                         d.can_propose()
                                             && d.engine.config.bootstrap_peers.is_empty(),
                                         height,
                                         round,
                                         Vec::new(),
-                                    )
-                                } else {
-                                    let election = indra_consensus::proposer::ProposerElection {
-                                        epoch_seed,
-                                        height,
-                                        round,
-                                        candidates,
-                                    };
-                                    let vrf_actions = d.ensure_vrf_election_for_round(&election);
-                                    let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
-                                    let election_result = if active {
-                                        d.vrf_election_result(height, round)
-                                    } else {
-                                        None
-                                    };
-                                    let should = if active {
-                                        d.can_propose()
-                                            && election_result.is_some_and(|result| {
-                                                Some(result.elected_validator_id)
-                                                    == d.engine.validator_id()
-                                            })
-                                    } else {
-                                        d.can_propose() && d.engine.is_proposer(&election)
-                                    };
-                                    (should, height, round, vrf_actions)
+                                    ),
+                                    Ok(election) => {
+                                        let vrf_actions =
+                                            d.ensure_vrf_election_for_round(&election);
+                                        let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
+                                        let election_result = if active {
+                                            d.vrf_election_result(height, round)
+                                        } else {
+                                            None
+                                        };
+                                        let should = if active {
+                                            d.can_propose()
+                                                && election_result.is_some_and(|result| {
+                                                    Some(result.elected_validator_id)
+                                                        == d.engine.validator_id()
+                                                })
+                                        } else {
+                                            d.can_propose() && d.engine.is_proposer(&election)
+                                        };
+                                        (should, height, round, vrf_actions)
+                                    }
                                 }
                             };
                             if !vrf_actions.is_empty() {
@@ -2482,9 +2473,6 @@ fn main() {
 
                                 let proposal = {
                                     let mut d = driver.lock().unwrap();
-                                    let epoch_seed = indra_core::types::primitives::Bytes32::from(
-                                        indra_crypto::sha256(&d.engine.state.tip_hash.0),
-                                    );
                                     let height = d.engine.state.height + 1;
                                     let round = d.current_round();
                                     if height != next_height || round != proposal_round {
@@ -2494,31 +2482,18 @@ fn main() {
                                         );
                                         None
                                     } else {
-                                        let candidates: Vec<
-                                            indra_consensus::proposer::ProposerCandidate,
-                                        > = d
-                                            .engine
-                                            .state
-                                            .validators
-                                            .active_validators()
-                                            .filter_map(|v| {
-                                                v.vrf_pk.map(|vrf_pk| {
-                                                    indra_consensus::proposer::ProposerCandidate {
-                                                        validator_id: v.validator_id,
-                                                        vrf_pubkey: vrf_pk,
-                                                        verified_vrf_output: None,
-                                                        stake: v.stake_spark,
-                                                    }
-                                                })
-                                            })
-                                            .collect();
-                                        let election =
-                                            indra_consensus::proposer::ProposerElection {
-                                                epoch_seed,
-                                                height,
-                                                round,
-                                                candidates,
-                                            };
+                                        let election = match proposer_election_for_slot(
+                                            &d, height, round,
+                                        ) {
+                                            Ok(election) => election,
+                                            Err(error) => {
+                                                eprintln!(
+                                                        "[consensus] proposal construction authority unavailable at height={} round={}: {}",
+                                                        height, round, error,
+                                                    );
+                                                continue;
+                                            }
+                                        };
                                         let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
                                         let election_result = if active {
                                             d.vrf_election_result(height, round)
@@ -4248,6 +4223,154 @@ fn send_http(stream: &std::net::TcpStream, cors: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proposer_test_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "indra_node_proposer_authority_{}_{}",
+            suffix,
+            std::process::id()
+        ));
+        let mut config = NodeConfig::local_test(dir.clone());
+        let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&seed);
+        let pq = indra_crypto::hybrid::PqKeypair::from_seed(&seed).unwrap();
+        let vrf = indra_crypto::VrfKeypair::from_seed(&seed);
+        let genesis_path = dir.join("genesis.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &genesis_path,
+            format!(
+                "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+                hex::encode(indra_crypto::sha256(&classical.public_key().0)),
+                hex::encode(classical.public_key().0),
+                hex::encode(pq.public_key().0),
+                hex::encode(vrf.public_key()),
+            ),
+        )
+        .unwrap();
+        config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+        config.validator_seed = Some(seed);
+        config.vrf_seed = Some(seed);
+        config.pq_pk = Some(pq.public_key().0.to_vec());
+        config.pq_sk = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config).unwrap();
+        let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
+        (ConsensusDriver::new(engine, vote_safety), dir)
+    }
+
+    fn add_active_proposer_candidate(
+        driver: &mut ConsensusDriver,
+        seed: [u8; 32],
+    ) -> indra_core::Bytes32 {
+        let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&seed);
+        let pq = indra_crypto::hybrid::PqKeypair::from_seed(&seed).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        let validator_id = indra_core::Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        driver
+            .engine
+            .state
+            .validators
+            .upsert(indra_state::ValidatorEntry {
+                validator_id,
+                name: "live-only".to_string(),
+                hybrid_classical_pk: Some(public.classical.0),
+                hybrid_pq_pk: Some(public.pq.0.to_vec()),
+                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+                stake_spark: 9_000_000,
+                status: indra_state::ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
+            })
+            .unwrap();
+        validator_id
+    }
+
+    fn assert_same_election(
+        left: &indra_consensus::proposer::ProposerElection,
+        right: &indra_consensus::proposer::ProposerElection,
+    ) {
+        assert_eq!(left.epoch_seed, right.epoch_seed);
+        assert_eq!(left.height, right.height);
+        assert_eq!(left.round, right.round);
+        assert_eq!(left.candidates.len(), right.candidates.len());
+        for (left, right) in left.candidates.iter().zip(&right.candidates) {
+            assert_eq!(left.validator_id, right.validator_id);
+            assert_eq!(left.vrf_pubkey, right.vrf_pubkey);
+            assert_eq!(left.verified_vrf_output, right.verified_vrf_output);
+            assert_eq!(left.stake, right.stake);
+        }
+    }
+
+    #[test]
+    fn top_level_proposer_authority_uses_snapshot_and_matches_driver() {
+        let (mut driver, dir) = proposer_test_driver([0xD1; 32], "snapshot");
+        let local_id = driver.engine.validator_id().unwrap();
+        let snapshot = driver
+            .engine
+            .state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        driver.engine.state.consensus_snapshots.push(snapshot);
+        driver.engine.state.height = u64::MAX - 1;
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local_id)
+            .unwrap()
+            .status = indra_state::ValidatorStatus::Registered;
+        let live_only_id = add_active_proposer_candidate(&mut driver, [0xD2; 32]);
+
+        let decision_election = proposer_election_for_slot(&driver, u64::MAX, 7).unwrap();
+        let construction_election = proposer_election_for_slot(&driver, u64::MAX, 7).unwrap();
+        let driver_election = driver.proposer_election_for_height(u64::MAX, 7).unwrap();
+
+        assert_same_election(&decision_election, &construction_election);
+        assert_same_election(&decision_election, &driver_election);
+        assert_eq!(decision_election.candidates.len(), 1);
+        assert_eq!(decision_election.candidates[0].validator_id, local_id);
+        assert!(!decision_election
+            .candidates
+            .iter()
+            .any(|candidate| candidate.validator_id == live_only_id));
+        assert!(
+            driver.engine.is_proposer(&decision_election),
+            "snapshot-authorized local validator must remain able to propose"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn top_level_proposer_authority_preserves_legacy_live_candidates() {
+        let (mut driver, dir) = proposer_test_driver([0xD3; 32], "legacy");
+        let live_id = add_active_proposer_candidate(&mut driver, [0xD4; 32]);
+        let election = proposer_election_for_slot(&driver, 1, 3).unwrap();
+
+        assert!(election
+            .candidates
+            .iter()
+            .any(|candidate| candidate.validator_id == live_id));
+        assert_same_election(
+            &election,
+            &driver.proposer_election_for_height(1, 3).unwrap(),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn dummy_hybrid_sig() -> indra_core::types::crypto::HybridSignature {
         indra_core::types::crypto::HybridSignature {
