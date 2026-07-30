@@ -21,10 +21,12 @@ use indra_core::{
     },
     Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
-use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::{
+    commit, prove_range, ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair,
+};
 use indra_state::{
     apply::apply_slash, apply_block, compute_state_root, epoch::apply_epoch_transition,
-    utxo::UtxoSet, ChainState, ValidatorEntry, ValidatorStatus,
+    utxo::UtxoSet, ChainState, ColdKeyStatus, ValidatorEntry, ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -749,6 +751,20 @@ fn test_self_stake_full_lifecycle() {
             .unbonding_end_epoch,
         Some(UNBONDING_PERIOD_EPOCHS)
     );
+
+    // The real 21-day unbonding period matures at height 302,400, after cold-key
+    // enforcement. Model enrollment during that long unbonding window so this
+    // test covers normal self-stake release rather than the separately-tested
+    // unenrolled-custody freeze. The height-1/2 operations above intentionally
+    // remain legacy hot-authorized operations.
+    let cold_keypair = ColdHybridKeypair::from_independent_seeds([0x42; 32], [0x43; 32]).unwrap();
+    let cold_public = cold_keypair.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
+    let validator = state.validators.get_mut(&validator_id).unwrap();
+    validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
+    validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
+    validator.cold_key_version = 1;
+    validator.cold_key_status = ColdKeyStatus::Active;
 
     apply_epoch_transition(&mut state, UNBONDING_PERIOD_EPOCHS, 0).unwrap();
     assert!(!state.staked_bonds.contains_key(&bond_utxo_id));

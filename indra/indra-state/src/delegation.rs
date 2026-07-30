@@ -7707,8 +7707,9 @@ mod tests {
 
             // The snapshot gate remains production-inert. For this transcript,
             // u64::MAX is the explicit test activation height. Cold enforcement
-            // settles policy first at the same unscheduled height; snapshot
-            // construction then freezes the fully-settled Active authority.
+            // has already settled policy at its real testnet height; snapshot
+            // construction then freezes the fully-settled Active authority
+            // without advancing the transcript's current state height.
             assert_eq!(CONSENSUS_SNAPSHOT_HEIGHT, u64::MAX);
             state.validators.get_mut(&validator_id).unwrap().vrf_pk =
                 Some(indra_crypto::VrfKeypair::from_seed(&[0xB8; 32]).public_key());
@@ -7738,7 +7739,7 @@ mod tests {
                 indra_core::types::primitives::hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
                 VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
                 VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
-                indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
             ]
         );
     }
