@@ -47,7 +47,10 @@ use crate::{
     engine::NodeEngine,
     error::{NodeError, NodeResult},
     slash::{SlashDetector, SlashEvidence},
-    sync::{verify_block_qc, verify_proposer_vrf, verify_reveal_set_evidence, SyncState},
+    sync::{
+        proposer_verification_required, verify_block_qc, verify_proposer_vrf,
+        verify_reveal_set_evidence, SyncState,
+    },
 };
 
 fn now_ms() -> u128 {
@@ -2321,16 +2324,14 @@ impl ConsensusDriver {
         _from: Option<SocketAddr>,
         block: BlockV1,
     ) -> Vec<DriverAction> {
-        if self.engine.state.validators.active_count() > 0
-            && (block.header.proposer_vrf_output != Bytes32::ZERO
-                || !block.header.proposer_vrf_proof.as_slice().is_empty())
-            && verify_proposer_vrf(&block, &self.engine.state).is_err()
-        {
+        let height = block.header.height;
+        if let Err(error) = self.verify_live_proposal_proposer(&block) {
             eprintln!(
-                "[vote] rejecting proposal {} at height={} round={} because it does not verify as the elected proposer block",
+                "[vote] rejecting proposal {} at height={} round={} because proposer verification failed: {}",
                 hex::encode(&block.header.block_hash().0[..4]),
-                block.header.height,
+                height,
                 block.header.proposer_round,
+                error,
             );
             return vec![DriverAction::None];
         }
@@ -2656,6 +2657,17 @@ impl ConsensusDriver {
             );
             None
         }
+    }
+
+    fn verify_live_proposal_proposer(&self, block: &BlockV1) -> NodeResult<()> {
+        let height = block.header.height;
+        let proposer_material_present = block.header.proposer_vrf_output != Bytes32::ZERO
+            || !block.header.proposer_vrf_proof.as_slice().is_empty();
+        let required = proposer_verification_required(&self.engine.state, height)?;
+        if required && (consensus_snapshot_active(height) || proposer_material_present) {
+            verify_proposer_vrf(block, &self.engine.state)?;
+        }
+        Ok(())
     }
 
     fn record_vote_passive(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
@@ -3675,6 +3687,79 @@ mod tests {
             .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
             .unwrap();
         driver.engine.state.consensus_snapshots.push(snapshot);
+    }
+
+    #[test]
+    fn live_proposal_guard_uses_snapshot_when_live_active_set_is_empty() {
+        let seed = [0xA3u8; 32];
+        let (mut driver, dir) = local_driver(seed, "snapshot_live_proposer_guard");
+        install_test_snapshot_at_inert_gate(&mut driver);
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.tip_hash = Bytes32::from([0xA3; 32]);
+        let (_, reveal) = signed_vrf_pair(&driver, seed, u64::MAX, 0, DEFAULT_CHAIN_ID);
+        let valid = reveal_set_block_from_reveals(&driver, &[seed], std::slice::from_ref(&reveal));
+
+        assert!(driver.verify_live_proposal_proposer(&valid).is_ok());
+
+        for validator_id in driver
+            .engine
+            .state
+            .validators
+            .active_validators()
+            .map(|validator| validator.validator_id)
+            .collect::<Vec<_>>()
+        {
+            driver
+                .engine
+                .state
+                .validators
+                .get_mut(&validator_id)
+                .unwrap()
+                .status = ValidatorStatus::Registered;
+        }
+        assert_eq!(driver.engine.state.validators.active_count(), 0);
+        assert!(
+            driver.verify_live_proposal_proposer(&valid).is_ok(),
+            "snapshot-authorized proposer must still verify after live demotion"
+        );
+
+        let mut invalid = valid;
+        invalid.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xA5; 32]).unwrap();
+        assert!(
+            driver.verify_live_proposal_proposer(&invalid).is_err(),
+            "invalid proposer proof must be checked, not skipped, when S(height) is nonempty"
+        );
+
+        driver.engine.state.consensus_snapshots.clear();
+        assert!(matches!(
+            driver.verify_live_proposal_proposer(&invalid),
+            Err(NodeError::ConsensusSnapshotLookup(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_proposal_guard_preserves_pre_gate_empty_live_set_skip() {
+        let seed = [0xA4u8; 32];
+        let (mut driver, dir) = local_driver(seed, "legacy_live_proposer_guard");
+        let mut block = make_strict_block(&driver, seed, 0, Vec::new());
+        let local_id = driver.engine.validator_id().unwrap();
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local_id)
+            .unwrap()
+            .status = ValidatorStatus::Registered;
+        block.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xA6; 32]).unwrap();
+
+        assert!(!consensus_snapshot_active(block.header.height));
+        assert_eq!(driver.engine.state.validators.active_count(), 0);
+        assert!(
+            driver.verify_live_proposal_proposer(&block).is_ok(),
+            "legacy live-empty guard behavior must remain unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

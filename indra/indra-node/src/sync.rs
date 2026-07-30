@@ -258,9 +258,7 @@ fn validate_and_apply_imported_block(
 ) -> NodeResult<Option<EpochRecord>> {
     let height = block.header.height;
 
-    if state.validators.active_count() > 0 {
-        verify_proposer_vrf(block, state)?;
-    }
+    verify_imported_block_proposer(block, state)?;
 
     if height > 1 {
         verify_block_qc(block, state)?;
@@ -295,6 +293,26 @@ fn validate_and_apply_imported_block(
     mempool.evict_invalid(state);
 
     Ok(epoch_record)
+}
+
+/// Whether proposer verification is required for one consensus height.
+///
+/// Legacy heights preserve the original live-registry condition. Governed
+/// heights resolve their canonical snapshot and fail closed if lookup fails;
+/// live registry status must never suppress verification for snapshot members.
+pub(crate) fn proposer_verification_required(state: &ChainState, height: u64) -> NodeResult<bool> {
+    if !consensus_snapshot_active(height) {
+        return Ok(state.validators.active_count() > 0);
+    }
+    let snapshot = state.snapshot_for_consensus_height(height)?;
+    Ok(!snapshot.entries().is_empty())
+}
+
+fn verify_imported_block_proposer(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+    if proposer_verification_required(state, block.header.height)? {
+        verify_proposer_vrf(block, state)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
@@ -2382,6 +2400,61 @@ mod tests {
         }
         assert_eq!(epoch_seed, expected.epoch_seed);
         assert!(verify_proposer_vrf(&block, &state).is_ok());
+    }
+
+    #[test]
+    fn sync_import_guard_uses_snapshot_when_live_active_set_is_empty() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = install_active_validator(&mut state, 0xBE, 10_000, true, true);
+        install_test_snapshot_at_inert_gate(&mut state);
+        let valid = make_reveal_set_block(&state, &[0xBE], &[0xBE]);
+
+        assert!(verify_imported_block_proposer(&valid, &state).is_ok());
+
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
+        assert_eq!(state.validators.active_count(), 0);
+        assert!(
+            verify_imported_block_proposer(&valid, &state).is_ok(),
+            "sync must verify the snapshot-authorized proposer despite live demotion"
+        );
+
+        let mut invalid = valid;
+        invalid.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xBF; 32]).unwrap();
+        assert!(
+            verify_imported_block_proposer(&invalid, &state).is_err(),
+            "sync must catch an invalid proposer proof instead of skipping verification"
+        );
+    }
+
+    #[test]
+    fn sync_import_guard_fails_closed_when_governed_snapshot_is_missing() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = install_active_validator(&mut state, 0xC0, 10_000, true, true);
+        let block = make_reveal_set_block(&state, &[0xC0], &[0xC0]);
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
+        assert_eq!(state.validators.active_count(), 0);
+
+        assert!(matches!(
+            verify_imported_block_proposer(&block, &state),
+            Err(NodeError::ConsensusSnapshotLookup(_))
+        ));
+    }
+
+    #[test]
+    fn sync_import_guard_preserves_pre_gate_behavior() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = install_active_validator(&mut state, 0xC1, 10_000, true, true);
+        let valid = make_strict_block(&state, 0xC1, 0, vec![]);
+        assert!(verify_imported_block_proposer(&valid, &state).is_ok());
+
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
+        let mut invalid = valid;
+        invalid.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xC2; 32]).unwrap();
+        assert!(!consensus_snapshot_active(invalid.header.height));
+        assert!(
+            verify_imported_block_proposer(&invalid, &state).is_ok(),
+            "legacy sync path must retain its live-empty verification skip"
+        );
     }
 
     #[test]
