@@ -475,8 +475,9 @@ pub mod hard_forks {
     /// coordinated deployment, comfortably ahead of the live chain tip at that
     /// time. Before this height, a full validator registry rejects new
     /// registrations exactly as before. At/after this height, a higher
-    /// total-stake registration may synchronously evict the lowest total-stake
-    /// registered validator to preserve the hard cap without first-come bias.
+    /// self-stake registration may synchronously evict the lowest-self-stake
+    /// evictable registered validator to preserve the hard cap without
+    /// first-come bias.
     ///
     /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
     /// deliberately for mainnet genesis. Leaving `u64::MAX` here means this rule

@@ -948,14 +948,16 @@ fn apply_register_validator(
                 message: "validator set at maximum capacity",
             });
         }
-        let (lowest_id, lowest_total) =
-            lowest_ranked_registry_validator(state).ok_or(StateError::InvariantViolation {
-                message: "validator set full but no evictable validator found",
-            })?;
-        if amount_spark <= lowest_total {
+        let (lowest_id, lowest_self_stake) =
+            lowest_ranked_registry_validator(state, current_height).ok_or(
+                StateError::InvariantViolation {
+                    message: "validator set full but no evictable validator found",
+                },
+            )?;
+        if amount_spark <= lowest_self_stake {
             return Err(StateError::InvalidStakingOp(format!(
-                "validator registry at capacity; new total stake {} does not exceed lowest registered total stake {}",
-                amount_spark, lowest_total
+                "validator registry at capacity; new self-stake {} does not exceed lowest evictable registered self-stake {}",
+                amount_spark, lowest_self_stake
             )));
         }
         evict_validator_for_registry_replacement(state, lowest_id, current_epoch, current_height)?;
@@ -1030,7 +1032,17 @@ fn apply_register_validator(
     Ok(())
 }
 
-fn lowest_ranked_registry_validator(state: &ChainState) -> Option<(Bytes32, u64)> {
+/// Return the lowest-self-stake registry entry that may be synchronously evicted.
+///
+/// Equal-stake ordering is the inverse of active-set preference: active-set
+/// selection prefers the lower validator ID, so replacement evicts the higher
+/// validator ID. Once cold-key enforcement is active, unenrolled entries are
+/// skipped rather than terminating the search because their custody is frozen.
+fn lowest_ranked_registry_validator(
+    state: &ChainState,
+    current_height: u64,
+) -> Option<(Bytes32, u64)> {
+    let cold_enforced = validator_cold_key_enforcement_active(current_height);
     state
         .validators
         .all_validators()
@@ -1038,16 +1050,11 @@ fn lowest_ranked_registry_validator(state: &ChainState) -> Option<(Bytes32, u64)
             matches!(
                 validator.status,
                 ValidatorStatus::Active | ValidatorStatus::Registered
-            )
+            ) && (!cold_enforced || validator.cold_key_status != ColdKeyStatus::Unenrolled)
         })
-        .map(|validator| {
-            let total = validator
-                .stake_spark
-                .saturating_add(state.delegations.total_delegated(&validator.validator_id));
-            (validator.validator_id, total)
-        })
-        .min_by(|(id_a, total_a), (id_b, total_b)| {
-            total_a.cmp(total_b).then_with(|| id_b.0.cmp(&id_a.0))
+        .map(|validator| (validator.validator_id, validator.stake_spark))
+        .min_by(|(id_a, stake_a), (id_b, stake_b)| {
+            stake_a.cmp(stake_b).then_with(|| id_b.0.cmp(&id_a.0))
         })
 }
 
@@ -5618,6 +5625,14 @@ mod tests {
         lowest_id
     }
 
+    fn mark_cap_registry_entry_cold_active(state: &mut ChainState, validator_id: Bytes32) {
+        let validator = state.validators.get_mut(&validator_id).unwrap();
+        validator.cold_hybrid_classical_pk = validator.hybrid_classical_pk;
+        validator.cold_hybrid_pq_pk = Some([validator_id.0[0]; indra_crypto::PQ_PK_BYTES]);
+        validator.cold_key_version = 1;
+        validator.cold_key_status = ColdKeyStatus::Active;
+    }
+
     fn registration_op_with_bond(
         state: &mut ChainState,
         seed: u8,
@@ -5644,6 +5659,53 @@ mod tests {
         (op, bond_utxo_id)
     }
 
+    fn registration_op_with_cold_bond(
+        state: &mut ChainState,
+        hot_seed: u8,
+        cold_classical_seed: u8,
+        cold_pq_seed: u8,
+        bond_seed: u8,
+    ) -> (StakingOp, Bytes32, Bytes32) {
+        let hot = keypair(hot_seed);
+        let cold = mixed_keypair(cold_classical_seed, cold_pq_seed);
+        let cold_owner = pubkey_from_keypair(&cold);
+        let bond_utxo_id =
+            insert_delegator_utxo(state, cold_owner, MINIMUM_VALIDATOR_BOND_SPARK, bond_seed);
+        let validator_id = pubkey_to_id(&pubkey_from_keypair(&hot));
+        let op = dual_signed_register_op(
+            bond_utxo_id,
+            &hot,
+            &cold,
+            1,
+            &state.chain_id,
+            [bond_seed.wrapping_add(1); 32],
+            bond_seed,
+        );
+        (op, bond_utxo_id, validator_id)
+    }
+
+    fn full_registry_fallback_fixture(
+    ) -> (ChainState, StakingOp, Bytes32, Bytes32, Bytes32, Bytes32) {
+        let mut state = ChainState::new_genesis();
+        let lowest_stake =
+            MINIMUM_VALIDATOR_BOND_SPARK.saturating_sub(DUST_LIMIT_SPARK.saturating_mul(20));
+        let frozen_lowest = fill_registry_to_cap(&mut state, lowest_stake);
+        let next_evictable = raw_id(0x44, 1);
+        for index in 1..MAX_VALIDATORS {
+            mark_cap_registry_entry_cold_active(&mut state, raw_id(0x44, index));
+        }
+        let (op, new_bond, new_validator) =
+            registration_op_with_cold_bond(&mut state, 0xE1, 0xE2, 0xE3, 0xE4);
+        (
+            state,
+            op,
+            frozen_lowest,
+            next_evictable,
+            new_validator,
+            new_bond,
+        )
+    }
+
     #[test]
     fn registration_at_cap_pre_activation_rejects_unchanged() {
         let mut state = ChainState::new_genesis();
@@ -5666,7 +5728,137 @@ mod tests {
     }
 
     #[test]
-    fn registration_at_cap_post_activation_rejects_if_not_higher_total_stake() {
+    fn registry_eviction_ranking_uses_self_stake_not_delegated_stake() {
+        let mut state = ChainState::new_genesis();
+        let lower_self =
+            insert_registry_entry_for_cap_test(&mut state, 0, MINIMUM_VALIDATOR_BOND_SPARK);
+        let higher_self = insert_registry_entry_for_cap_test(
+            &mut state,
+            1,
+            MINIMUM_VALIDATOR_BOND_SPARK + DUST_LIMIT_SPARK,
+        );
+        state
+            .delegations
+            .add_delegation(
+                lower_self,
+                raw_id(0x91, 0),
+                MINIMUM_VALIDATOR_BOND_SPARK.saturating_mul(100),
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            state
+                .delegations
+                .total_delegated(&lower_self)
+                .saturating_add(MINIMUM_VALIDATOR_BOND_SPARK)
+                > MINIMUM_VALIDATOR_BOND_SPARK + DUST_LIMIT_SPARK,
+            "test setup must make total-stake ranking disagree with self-stake ranking"
+        );
+        assert_eq!(
+            lowest_ranked_registry_validator(
+                &state,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT.saturating_sub(1),
+            ),
+            Some((lower_self, MINIMUM_VALIDATOR_BOND_SPARK))
+        );
+        assert_ne!(lower_self, higher_self);
+
+        state.validators.get_mut(&higher_self).unwrap().stake_spark = MINIMUM_VALIDATOR_BOND_SPARK;
+        assert_eq!(
+            lowest_ranked_registry_validator(
+                &state,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT.saturating_sub(1),
+            ),
+            Some((higher_self, MINIMUM_VALIDATOR_BOND_SPARK)),
+            "equal self-stake must evict the higher validator ID, the inverse of active-set preference"
+        );
+    }
+
+    #[test]
+    fn registry_eviction_skips_frozen_lowest_and_uses_next_evictable_candidate() {
+        let (mut state, op, frozen_lowest, next_evictable, new_validator, new_bond) =
+            full_registry_fallback_fixture();
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(
+            &mut state,
+            &op,
+            &chain_id,
+            VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+        )
+        .unwrap();
+
+        assert_eq!(state.validators.len(), MAX_VALIDATORS);
+        assert!(
+            state.validators.get(&frozen_lowest).is_some(),
+            "unenrolled validator custody must remain frozen"
+        );
+        assert!(
+            state.validators.get(&next_evictable).is_none(),
+            "replacement must fall through to the next-lowest evictable self-stake"
+        );
+        assert!(state.validators.get(&new_validator).is_some());
+        assert!(state.staked_bonds.contains_key(&new_bond));
+    }
+
+    #[test]
+    fn registry_eviction_rejects_clearly_when_every_candidate_is_frozen() {
+        let mut state = ChainState::new_genesis();
+        fill_registry_to_cap(
+            &mut state,
+            MINIMUM_VALIDATOR_BOND_SPARK.saturating_sub(DUST_LIMIT_SPARK),
+        );
+        let (op, bond_utxo_id, _) =
+            registration_op_with_cold_bond(&mut state, 0xE5, 0xE6, 0xE7, 0xE8);
+        let chain_id = state.chain_id.clone();
+
+        assert_eq!(
+            apply_staking_op(
+                &mut state,
+                &op,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+            ),
+            Err(StateError::InvariantViolation {
+                message: "validator set full but no evictable validator found",
+            })
+        );
+        assert_eq!(state.validators.len(), MAX_VALIDATORS);
+        assert!(state.utxos.contains(&bond_utxo_id));
+    }
+
+    #[test]
+    fn registry_eviction_fallback_replays_byte_identically() {
+        let (state, op, frozen_lowest, next_evictable, new_validator, _) =
+            full_registry_fallback_fixture();
+        let chain_id = state.chain_id.clone();
+
+        let replay = |mut replay_state: ChainState| {
+            apply_staking_op(
+                &mut replay_state,
+                &op,
+                &chain_id,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
+            )
+            .unwrap();
+            replay_state
+        };
+        let replay_a = replay(state.clone());
+        let replay_b = replay(state);
+
+        assert_eq!(replay_a.encode_to_vec(), replay_b.encode_to_vec());
+        assert_eq!(
+            crate::state_root::compute_state_roots(&replay_a),
+            crate::state_root::compute_state_roots(&replay_b)
+        );
+        assert!(replay_a.validators.get(&frozen_lowest).is_some());
+        assert!(replay_a.validators.get(&next_evictable).is_none());
+        assert!(replay_a.validators.get(&new_validator).is_some());
+    }
+
+    #[test]
+    fn registration_at_cap_post_activation_rejects_if_not_higher_self_stake() {
         let mut state = ChainState::new_genesis();
         fill_registry_to_cap(&mut state, MINIMUM_VALIDATOR_BOND_SPARK);
         let (op, bond_utxo_id) =

@@ -1083,10 +1083,9 @@ impl ValidatorSet {
     /// `validator.stake_spark` only, so active-set selection must use the same
     /// self-stake model. Delegated stake affects delegator reward splitting,
     /// but it does not increase validator selection weight in the current
-    /// protocol. This is deliberately distinct from registered-registry
-    /// replacement, which uses total stake (self + delegated) only as a
-    /// housekeeping rule for deciding which persisted validator entry gets a
-    /// scarce registry slot when the registry is full.
+    /// protocol. Full-registry replacement uses the same self-stake ranking
+    /// model when deciding which persisted validator entry gets a scarce
+    /// registry slot.
     pub fn select_active_set(
         &mut self,
         _delegations: &DelegationMap,
