@@ -4201,7 +4201,7 @@ mod tests {
         let mut block = BlockV1 {
             header: BlockHeaderV1 {
                 protocol_version: ProtocolVersion(
-                    indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                    indra_core::types::primitives::block_protocol_version_for_height(height),
                 ),
                 height,
                 prev_hash: driver.engine.state.tip_hash,

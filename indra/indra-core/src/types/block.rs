@@ -261,6 +261,7 @@ impl BlockV1 {
 mod tests {
     use super::*;
     use crate::codec::Decode;
+    use crate::types::primitives::BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT;
 
     fn dummy_header() -> BlockHeaderV1 {
         BlockHeaderV1 {
@@ -405,6 +406,37 @@ mod tests {
         assert!(
             BlockV1::decode_exact(&bytes).is_err(),
             "post-activation block protocol version must not decode without the reveal evidence body field"
+        );
+    }
+
+    #[test]
+    fn reveal_only_binary_rejects_consensus_snapshot_version_at_header_decode() {
+        fn decode_as_reveal_only_binary(bytes: &[u8]) -> crate::error::IndraResult<()> {
+            let mut reader = ByteReader::new(bytes);
+            let version = reader.read_u16_le()?;
+            if version != crate::types::primitives::PROTOCOL_VERSION
+                && version != BLOCK_PROTOCOL_VERSION_REVEAL_SET
+            {
+                return Err(crate::error::IndraError::UnsupportedVersion { version });
+            }
+            Ok(())
+        }
+
+        let mut header = dummy_header();
+        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT);
+        let bytes = header.encode_to_vec();
+
+        assert_eq!(
+            decode_as_reveal_only_binary(&bytes),
+            Err(crate::error::IndraError::UnsupportedVersion {
+                version: BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
+            }),
+            "the pre-snapshot binary's strict version allow-list must reject cleanly at header decode"
+        );
+        assert_eq!(
+            BlockHeaderV1::decode_exact(&bytes).unwrap(),
+            header,
+            "the upgraded binary must decode the same version-3 header"
         );
     }
 }

@@ -647,6 +647,11 @@ pub mod hard_forks {
         super::consensus_snapshot_height_is_aligned(CONSENSUS_SNAPSHOT_HEIGHT),
         "consensus snapshot activation must be the first height after an epoch boundary"
     );
+    const _: () = assert!(
+        CONSENSUS_SNAPSHOT_HEIGHT == u64::MAX
+            || CONSENSUS_SNAPSHOT_HEIGHT > REVEAL_SET_COMMITMENT_HEIGHT,
+        "consensus snapshot protocol version must activate after the reveal-set protocol version"
+    );
 }
 
 /// Whether a proposed consensus-snapshot gate is inert or epoch-aligned.
@@ -971,14 +976,36 @@ pub const TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES: u16 = 2;
 /// accepting post-activation blocks while ignoring the new body evidence field.
 pub const BLOCK_PROTOCOL_VERSION_REVEAL_SET: u16 = 2;
 
-/// Protocol version required for a block at the supplied height.
-#[inline]
-pub fn block_protocol_version_for_height(height: u64) -> u16 {
-    if reveal_set_commitment_active(height) {
+/// Block protocol version used at/after CONSENSUS_SNAPSHOT_HEIGHT.
+///
+/// This version does not add another block field: it explicitly identifies the
+/// height-derived consensus-authority and state-root rules introduced by
+/// versioned consensus snapshots. Binaries that only understand versions 1 and
+/// 2 reject version 3 while decoding the block header.
+pub const BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT: u16 = 3;
+
+const fn block_protocol_version_for_height_at_gates(
+    height: u64,
+    reveal_set_height: u64,
+    consensus_snapshot_height: u64,
+) -> u16 {
+    if height >= consensus_snapshot_height {
+        BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
+    } else if height >= reveal_set_height {
         BLOCK_PROTOCOL_VERSION_REVEAL_SET
     } else {
         PROTOCOL_VERSION
     }
+}
+
+/// Protocol version required for a block at the supplied height.
+#[inline]
+pub fn block_protocol_version_for_height(height: u64) -> u16 {
+    block_protocol_version_for_height_at_gates(
+        height,
+        hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
+        hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
+    )
 }
 
 /// Current schema version for all persisted structs.
@@ -1149,6 +1176,7 @@ impl ProtocolVersion {
         self.0 == PROTOCOL_VERSION
             || self.0 == TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
             || self.0 == BLOCK_PROTOCOL_VERSION_REVEAL_SET
+            || self.0 == BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
     }
 }
 
@@ -1167,6 +1195,7 @@ impl Decode for ProtocolVersion {
         if v != PROTOCOL_VERSION
             && v != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
             && v != BLOCK_PROTOCOL_VERSION_REVEAL_SET
+            && v != BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
         {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
@@ -1217,6 +1246,65 @@ mod tests {
     fn protocol_version_wrong_version_rejected() {
         let bad = 99u16.to_le_bytes();
         assert!(ProtocolVersion::decode_exact(&bad).is_err());
+    }
+
+    #[test]
+    fn block_protocol_versions_cross_reveal_and_snapshot_gates_in_order() {
+        const REVEAL_GATE: u64 = 100;
+        const SNAPSHOT_GATE: u64 = 301;
+
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(99, REVEAL_GATE, SNAPSHOT_GATE),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(100, REVEAL_GATE, SNAPSHOT_GATE),
+            BLOCK_PROTOCOL_VERSION_REVEAL_SET
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(300, REVEAL_GATE, SNAPSHOT_GATE),
+            BLOCK_PROTOCOL_VERSION_REVEAL_SET
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(301, REVEAL_GATE, SNAPSHOT_GATE),
+            BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(u64::MAX, REVEAL_GATE, SNAPSHOT_GATE),
+            BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
+        );
+    }
+
+    #[test]
+    fn inert_snapshot_gate_preserves_every_reachable_pre_gate_version() {
+        for height in [
+            0,
+            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT.saturating_sub(1),
+            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
+            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT.saturating_add(1),
+            u64::MAX - 1,
+        ] {
+            let expected = if reveal_set_commitment_active(height) {
+                BLOCK_PROTOCOL_VERSION_REVEAL_SET
+            } else {
+                PROTOCOL_VERSION
+            };
+            assert_eq!(block_protocol_version_for_height(height), expected);
+        }
+        assert_eq!(
+            block_protocol_version_for_height(u64::MAX),
+            BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
+        );
+    }
+
+    #[test]
+    fn consensus_snapshot_block_protocol_version_round_trips() {
+        let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT);
+        assert!(version.is_supported());
+        assert_eq!(
+            ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),
+            version
+        );
     }
 
     #[test]

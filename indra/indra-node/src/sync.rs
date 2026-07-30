@@ -1111,7 +1111,9 @@ mod tests {
 
         let mut block = BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET),
+                protocol_version: ProtocolVersion(
+                    indra_core::types::primitives::block_protocol_version_for_height(height),
+                ),
                 height,
                 prev_hash: state.tip_hash,
                 timestamp: 1_800_000_000,
@@ -2645,7 +2647,9 @@ mod tests {
         let post_activation = make_reveal_set_block(&state, &[0x81], &[0x81]);
         assert_eq!(
             post_activation.header.protocol_version,
-            ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET)
+            ProtocolVersion(
+                indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
+            )
         );
         assert!(verify_reveal_set_evidence(&post_activation, &state).is_ok());
     }

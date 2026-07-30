@@ -1137,7 +1137,9 @@ mod tests {
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
     };
-    use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorSet, ValidatorStatus};
+    use crate::validator::{
+        ColdKeyStatus, StakeBondEntry, ValidatorEntry, ValidatorSet, ValidatorStatus,
+    };
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         codec::Encode,
@@ -1149,6 +1151,7 @@ mod tests {
             },
             primitives::{
                 hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
+                BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
                 DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
                 MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
@@ -5429,6 +5432,73 @@ mod tests {
             "block validity must reject unrecognized protocol versions before applying state"
         );
         assert_eq!(state.height, 0);
+    }
+
+    #[test]
+    fn snapshot_protocol_transition_rejects_v2_accepts_v3_and_replays_deterministically() {
+        fn state_before_inert_gate() -> ChainState {
+            let mut state = ChainState::new_genesis();
+            let (_, _, validator_id) =
+                install_governance_validator(&mut state, [0xD3; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+            let validator = state.validators.get_mut(&validator_id).unwrap();
+            validator.vrf_pk = Some(indra_crypto::VrfKeypair::from_seed(&[0xD3; 32]).public_key());
+            validator.cold_hybrid_classical_pk = validator.hybrid_classical_pk;
+            validator.cold_hybrid_pq_pk = Some(
+                validator
+                    .hybrid_pq_pk
+                    .as_deref()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+            validator.cold_key_version = 1;
+            validator.cold_key_status = ColdKeyStatus::Active;
+            let snapshot = state
+                .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+                .unwrap();
+            state.consensus_snapshots.push(snapshot);
+            state.height = u64::MAX - 2;
+            state.tip_hash = Bytes32::from([0xD2; 32]);
+            state
+        }
+
+        fn replay(mut state: ChainState) -> ChainState {
+            let pre_gate = make_block_at_height(&state, vec![], u64::MAX - 1, 1_900_000_000);
+            assert_eq!(
+                pre_gate.header.protocol_version,
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET)
+            );
+            apply_block(&mut state, &pre_gate, 0).unwrap();
+
+            let post_gate = make_block_at_height(&state, vec![], u64::MAX, 1_900_000_001);
+            assert_eq!(
+                post_gate.header.protocol_version,
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT)
+            );
+
+            let mut rejected = state.clone();
+            let mut stale_version = post_gate.clone();
+            stale_version.header.protocol_version =
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET);
+            assert_eq!(
+                apply_block(&mut rejected, &stale_version, 0),
+                Err(StateError::UnsupportedVersion {
+                    version: BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                })
+            );
+            assert_same_consensus_state(&rejected, &state);
+
+            apply_block(&mut state, &post_gate, 0).unwrap();
+            assert_eq!(state.height, u64::MAX);
+            assert_eq!(state.consensus_snapshots.len(), 1);
+            assert_eq!(state.consensus_snapshots[0].activation_height, u64::MAX);
+            state
+        }
+
+        let initial = state_before_inert_gate();
+        let replay_a = replay(initial.clone());
+        let replay_b = replay(initial);
+        assert_same_consensus_state(&replay_a, &replay_b);
     }
 
     #[test]
