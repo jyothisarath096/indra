@@ -700,6 +700,17 @@ fn insert_on_chain_validator_network_addrs(
     accepted
 }
 
+fn on_chain_validator_network_addrs_for_height(
+    engine: &NodeEngine,
+    consensus_height: u64,
+) -> indra_node::NodeResult<Vec<String>> {
+    Ok(engine
+        .network_authority_for_height(consensus_height)?
+        .into_iter()
+        .filter_map(|member| member.network_addr)
+        .collect())
+}
+
 fn choose_proposal_mode(
     should_propose: bool,
     valid_reproposal_available: bool,
@@ -729,54 +740,52 @@ fn proposal_failure_backoff_active(
     })
 }
 
-fn build_handshake_config(engine: &NodeEngine) -> Option<HandshakeConfig> {
-    let my_validator_id = engine.validator_id()?;
+fn build_handshake_config(engine: &NodeEngine) -> indra_node::NodeResult<Option<HandshakeConfig>> {
+    let Some(my_validator_id) = engine.validator_id() else {
+        return Ok(None);
+    };
     let pq_keypair = match (
         engine.config.pq_pk.as_deref(),
         engine.config.pq_sk.as_deref(),
     ) {
-        (Some(pk), Some(sk)) => PqKeypair::from_bytes(pk, sk).ok()?,
-        _ => return None,
+        (Some(pk), Some(sk)) => match PqKeypair::from_bytes(pk, sk) {
+            Ok(keypair) => keypair,
+            Err(_) => return Ok(None),
+        },
+        _ => return Ok(None),
     };
 
-    let known_validators = engine
-        .state
-        .validators
-        .active_validators()
-        .filter_map(|validator| {
+    let consensus_height = engine.state.height.saturating_add(1);
+    let authority = engine.network_authority_for_height(consensus_height)?;
+
+    let known_validators = authority
+        .iter()
+        .filter_map(|member| {
             let pq_pk: [u8; indra_crypto::PQ_PK_BYTES] =
-                validator.hybrid_pq_pk.as_deref()?.try_into().ok()?;
-            Some((validator.validator_id, PqPublicKey(pq_pk)))
+                member.hybrid_pq_pk.as_deref()?.try_into().ok()?;
+            Some((member.validator_id, PqPublicKey(pq_pk)))
         })
         .collect::<Vec<_>>();
-    let relay_validator_keys = engine
-        .state
-        .validators
-        .active_validators()
-        .filter_map(|validator| {
+    let relay_validator_keys = authority
+        .iter()
+        .filter_map(|member| {
             Some(RelayValidatorKey {
-                validator_id: validator.validator_id,
-                hybrid_classical_pk: validator.hybrid_classical_pk?,
-                hybrid_pq_pk: validator.hybrid_pq_pk.clone()?,
-                vrf_pk: validator.vrf_pk,
+                validator_id: member.validator_id,
+                hybrid_classical_pk: member.hybrid_classical_pk?,
+                hybrid_pq_pk: member.hybrid_pq_pk.clone()?,
+                vrf_pk: member.vrf_pk,
             })
         })
         .collect::<Vec<_>>();
 
-    Some(HandshakeConfig {
+    Ok(Some(HandshakeConfig {
         my_validator_id,
         my_signing_key: pq_keypair,
         chain_id: engine.state.chain_id.clone(),
         known_validators,
         relay_validator_keys,
         timeout: Duration::from_secs(10),
-    })
-}
-
-fn refresh_handshake_config(engine: &NodeEngine, config: &Arc<RwLock<HandshakeConfig>>) {
-    if let Some(new_config) = build_handshake_config(engine) {
-        *config.write().unwrap() = new_config;
-    }
+    }))
 }
 
 fn refresh_handshake_and_relay_config(
@@ -784,8 +793,25 @@ fn refresh_handshake_and_relay_config(
     config: &Arc<RwLock<HandshakeConfig>>,
     gossip: &Arc<NetworkBridge>,
 ) {
-    refresh_handshake_config(engine, config);
-    gossip.update_relay_validator_keys(&config.read().unwrap());
+    match build_handshake_config(engine) {
+        Ok(Some(new_config)) => {
+            *config.write().unwrap() = new_config;
+            gossip.update_relay_validator_keys(&config.read().unwrap());
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // Snapshot lookup is authoritative post-gate. Clear remote
+            // authorization rather than retaining stale or live-state keys.
+            let mut current = config.write().unwrap();
+            current.known_validators.clear();
+            current.relay_validator_keys.clear();
+            drop(current);
+            gossip.update_relay_validator_keys(&config.read().unwrap());
+            eprintln!(
+                "[p2p] failed to resolve snapshot networking authority; remote authentication and consensus relay disabled: {error}"
+            );
+        }
+    }
 }
 
 fn start_network_runtime(
@@ -1860,6 +1886,7 @@ fn main() {
     driver_state.refresh_registered_voters();
     let startup_qc_request = driver_state.request_qc_if_needed();
     let handshake_config = build_handshake_config(&driver_state.engine)
+        .unwrap_or_else(|error| panic!("failed to resolve P2P validator authority: {error}"))
         .map(|config| Arc::new(RwLock::new(config)))
         .unwrap_or_else(|| panic!("authenticated transport requires validator networking keys"));
     let driver = driver_state;
@@ -2780,14 +2807,19 @@ fn main() {
         }
 
         if validator_network_address_active(height) {
-            let on_chain_addrs: Vec<String> = {
+            let on_chain_addrs = {
                 let d = driver.lock().unwrap();
-                d.engine
-                    .state
-                    .validators
-                    .active_validators()
-                    .filter_map(|validator| validator.network_addr.clone())
-                    .collect()
+                let consensus_height = d.height().saturating_add(1);
+                match on_chain_validator_network_addrs_for_height(&d.engine, consensus_height) {
+                    Ok(addrs) => addrs,
+                    Err(error) => {
+                        eprintln!(
+                            "[discovery] failed to resolve snapshot authority for height {}: {}; skipping on-chain validator discovery for this cycle",
+                            consensus_height, error
+                        );
+                        Vec::new()
+                    }
+                }
             };
             if !on_chain_addrs.is_empty() {
                 let local_validator_id = handshake_config.read().unwrap().my_validator_id;
@@ -4368,6 +4400,163 @@ mod tests {
         assert_same_election(
             &election,
             &driver.proposer_election_for_height(1, 3).unwrap(),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshot_network_authority_drives_handshake_relay_and_discovery() {
+        let (mut driver, dir) = proposer_test_driver([0xE1; 32], "network_snapshot");
+        let snapshot_member = driver.engine.validator_id().unwrap();
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&snapshot_member)
+            .unwrap()
+            .network_addr = Some("203.0.113.61:30303".to_string());
+        let snapshot = driver
+            .engine
+            .state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        driver.engine.state.consensus_snapshots.push(snapshot);
+        driver.engine.state.height = u64::MAX - 1;
+
+        // Steady state: live and snapshot membership agree.
+        let steady = build_handshake_config(&driver.engine).unwrap().unwrap();
+        assert!(steady
+            .known_validators
+            .iter()
+            .any(|(id, _)| *id == snapshot_member));
+        assert!(steady
+            .relay_validator_keys
+            .iter()
+            .any(|member| member.validator_id == snapshot_member));
+
+        // Diverge live policy state after S(height) was frozen.
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&snapshot_member)
+            .unwrap()
+            .status = indra_state::ValidatorStatus::Registered;
+        let live_only = add_active_proposer_candidate(&mut driver, [0xE2; 32]);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&live_only)
+            .unwrap()
+            .network_addr = Some("203.0.113.62:30303".to_string());
+
+        let config = build_handshake_config(&driver.engine).unwrap().unwrap();
+        assert!(config
+            .known_validators
+            .iter()
+            .any(|(id, _)| *id == snapshot_member));
+        assert!(!config
+            .known_validators
+            .iter()
+            .any(|(id, _)| *id == live_only));
+        assert!(config
+            .relay_validator_keys
+            .iter()
+            .any(|member| member.validator_id == snapshot_member));
+        assert!(!config
+            .relay_validator_keys
+            .iter()
+            .any(|member| member.validator_id == live_only));
+
+        let addrs = on_chain_validator_network_addrs_for_height(&driver.engine, u64::MAX).unwrap();
+        assert_eq!(addrs, vec!["203.0.113.61:30303".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removed_snapshot_member_remains_authorized_but_has_no_discovery_address() {
+        let (mut driver, dir) = proposer_test_driver([0xE3; 32], "network_removed");
+        let snapshot_member = driver.engine.validator_id().unwrap();
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&snapshot_member)
+            .unwrap()
+            .network_addr = Some("203.0.113.63:30303".to_string());
+        let snapshot = driver
+            .engine
+            .state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        driver.engine.state.consensus_snapshots.push(snapshot);
+        driver.engine.state.height = u64::MAX - 1;
+        driver.engine.state.validators.remove(&snapshot_member);
+
+        let config = build_handshake_config(&driver.engine).unwrap().unwrap();
+        assert!(config
+            .known_validators
+            .iter()
+            .any(|(id, _)| *id == snapshot_member));
+        assert!(config
+            .relay_validator_keys
+            .iter()
+            .any(|member| member.validator_id == snapshot_member));
+        assert!(
+            on_chain_validator_network_addrs_for_height(&driver.engine, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_network_authority_remains_live_active_only() {
+        let (mut driver, dir) = proposer_test_driver([0xE4; 32], "network_legacy");
+        let local = driver.engine.validator_id().unwrap();
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local)
+            .unwrap()
+            .network_addr = Some("203.0.113.64:30303".to_string());
+        let live = add_active_proposer_candidate(&mut driver, [0xE5; 32]);
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&live)
+            .unwrap()
+            .network_addr = Some("203.0.113.65:30303".to_string());
+
+        let config = build_handshake_config(&driver.engine).unwrap().unwrap();
+        assert!(config.known_validators.iter().any(|(id, _)| *id == local));
+        assert!(config.known_validators.iter().any(|(id, _)| *id == live));
+        let mut addrs = on_chain_validator_network_addrs_for_height(&driver.engine, 1).unwrap();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "203.0.113.64:30303".to_string(),
+                "203.0.113.65:30303".to_string()
+            ]
+        );
+
+        driver
+            .engine
+            .state
+            .validators
+            .get_mut(&local)
+            .unwrap()
+            .status = indra_state::ValidatorStatus::Registered;
+        let config = build_handshake_config(&driver.engine).unwrap().unwrap();
+        assert!(!config.known_validators.iter().any(|(id, _)| *id == local));
+        assert!(
+            !on_chain_validator_network_addrs_for_height(&driver.engine, 1)
+                .unwrap()
+                .contains(&"203.0.113.64:30303".to_string())
         );
         let _ = std::fs::remove_dir_all(dir);
     }

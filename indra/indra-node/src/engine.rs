@@ -90,6 +90,26 @@ pub struct NodeEngine {
     validator_id: Option<Bytes32>,
 }
 
+/// Validator authority used by authenticated transport, relay checks, and
+/// on-chain peer discovery for one consensus height.
+///
+/// Membership and consensus keys are snapshot-authoritative after the
+/// consensus-snapshot gate. `network_addr` remains live metadata because it is
+/// deliberately mutable and is not committed into `ConsensusSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAuthorityMember {
+    /// Validator identity authorized for the requested consensus height.
+    pub validator_id: Bytes32,
+    /// Ed25519 consensus verification key, when present on the legacy path.
+    pub hybrid_classical_pk: Option<[u8; 32]>,
+    /// ML-DSA-87 consensus/transport verification key.
+    pub hybrid_pq_pk: Option<Vec<u8>>,
+    /// VRF verification key, when present on the legacy path.
+    pub vrf_pk: Option<[u8; 32]>,
+    /// Current live network address for this authorized member, if available.
+    pub network_addr: Option<String>,
+}
+
 impl NodeEngine {
     /// Initialise a node from its configuration.
     pub fn init(config: NodeConfig) -> NodeResult<Self> {
@@ -842,6 +862,50 @@ impl NodeEngine {
             .voters_for_consensus_height(height)?
             .iter()
             .any(|voter| voter.validator_id == validator_id))
+    }
+
+    /// Resolve networking authority for one consensus height.
+    ///
+    /// Legacy heights preserve the original live-Active membership and key
+    /// source. Snapshot-governed heights fail closed on lookup failure, take
+    /// membership and keys from `S(height)`, and join only mutable address
+    /// metadata from the live registry. A removed snapshot member therefore
+    /// remains authenticated but has no on-chain discovery address.
+    pub fn network_authority_for_height(
+        &self,
+        height: u64,
+    ) -> NodeResult<Vec<NetworkAuthorityMember>> {
+        if !consensus_snapshot_active(height) {
+            let mut active: Vec<_> = self.state.validators.active_validators().collect();
+            active.sort_by_key(|validator| validator.validator_id.0);
+            return Ok(active
+                .into_iter()
+                .map(|validator| NetworkAuthorityMember {
+                    validator_id: validator.validator_id,
+                    hybrid_classical_pk: validator.hybrid_classical_pk,
+                    hybrid_pq_pk: validator.hybrid_pq_pk.clone(),
+                    vrf_pk: validator.vrf_pk,
+                    network_addr: validator.network_addr.clone(),
+                })
+                .collect());
+        }
+
+        let snapshot = self.state.snapshot_for_consensus_height(height)?;
+        Ok(snapshot
+            .entries()
+            .iter()
+            .map(|entry| NetworkAuthorityMember {
+                validator_id: entry.validator_id,
+                hybrid_classical_pk: Some(entry.classical_vote_pk),
+                hybrid_pq_pk: Some(entry.pq_vote_pk.to_vec()),
+                vrf_pk: Some(entry.vrf_pk),
+                network_addr: self
+                    .state
+                    .validators
+                    .get(&entry.validator_id)
+                    .and_then(|validator| validator.network_addr.clone()),
+            })
+            .collect())
     }
 
     /// Build the QC validator list for the current epoch.
