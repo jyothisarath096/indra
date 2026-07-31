@@ -9,6 +9,7 @@ pub mod epoch_record;
 pub mod governance;
 pub mod primitives;
 pub mod qc;
+pub mod reward_economic_snapshot;
 pub mod slash_detector;
 pub mod slashing;
 pub mod staking;
@@ -19,3 +20,6 @@ pub mod vrf_election;
 
 pub use consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 pub use epoch_record::EpochRecord;
+pub use reward_economic_snapshot::{
+    RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
+};

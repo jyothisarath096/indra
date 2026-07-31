@@ -57,6 +57,10 @@ pub enum IndraError {
     #[error("invalid consensus snapshot: {0}")]
     InvalidConsensusSnapshot(String),
 
+    /// A versioned reward-economic snapshot failed canonical validation.
+    #[error("invalid reward economic snapshot: {0}")]
+    InvalidRewardEconomicSnapshot(String),
+
     /// Unsupported persisted-struct schema version.
     #[error(
         "unsupported schema version {version} for {struct_name} (max supported {max_supported})"

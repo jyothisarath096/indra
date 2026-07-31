@@ -215,6 +215,10 @@ pub enum StateError {
     #[error("invalid consensus snapshot state: {0}")]
     InvalidConsensusSnapshot(String),
 
+    /// Reward-economic snapshot state or pairing is malformed.
+    #[error("invalid reward economic snapshot: {0}")]
+    InvalidRewardEconomicSnapshot(String),
+
     /// A bond-producing staking op omitted the required commitment proof.
     #[error("staking bond proof required")]
     BondProofRequired,

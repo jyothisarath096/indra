@@ -1044,9 +1044,9 @@ pub const BLOCK_PROTOCOL_VERSION_REVEAL_SET: u16 = 2;
 /// Block protocol version used at/after CONSENSUS_SNAPSHOT_HEIGHT.
 ///
 /// This version does not add another block field: it explicitly identifies the
-/// height-derived consensus-authority and state-root rules introduced by
-/// versioned consensus snapshots. Binaries that only understand versions 1 and
-/// 2 reject version 3 while decoding the block header.
+/// height-derived consensus-authority, paired reward-economic authority, and
+/// state-root rules introduced by versioned snapshots. Binaries that only
+/// understand versions 1 and 2 reject version 3 while decoding the block header.
 pub const BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT: u16 = 3;
 
 /// Block protocol version used at/after SELF_UNSTAKE_HEIGHT_PRECISION_HEIGHT.

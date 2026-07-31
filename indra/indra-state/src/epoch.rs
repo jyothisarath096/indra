@@ -217,10 +217,16 @@ fn apply_epoch_transition_at_gate(
     if delegator_bond_accounting_active(height) {
         reconcile_all_delegators_from_bonds(state);
     }
-    let virtual_delegations = apply_auto_delegations(state, current_epoch);
+    let virtual_delegations = if reward_economic_snapshot_active(height) {
+        // Post-gate, auto-delegation was frozen into the epoch-start economic
+        // snapshot and must not be recalculated from mutable boundary state.
+        Vec::new()
+    } else {
+        apply_auto_delegations(state, current_epoch)
+    };
 
     let supply_before = state.total_supply;
-    distribute_block_rewards(state, epoch_block_reward, current_epoch, height);
+    distribute_block_rewards(state, epoch_block_reward, current_epoch, height)?;
 
     assert!(
         state.total_supply <= HARD_CAP_SPARK,
@@ -233,7 +239,7 @@ fn apply_epoch_transition_at_gate(
         "supply changed during epoch transition"
     );
 
-    distribute_fee_rewards(state, current_epoch, height);
+    distribute_fee_rewards(state, current_epoch, height)?;
     let fee_rewards_distributed = fee_pool_before.saturating_sub(state.fee_reward_pool);
     remove_auto_delegations(state, &virtual_delegations, current_epoch, height);
     // This boundary pays the epoch that just elapsed. Activate a due
@@ -869,13 +875,22 @@ fn distribute_block_rewards(
     epoch_block_reward: u64,
     current_epoch: u64,
     height: u64,
-) {
+) -> crate::error::StateResult<()> {
+    if reward_economic_snapshot_active(height) {
+        return distribute_snapshot_rewards(
+            state,
+            epoch_block_reward,
+            current_epoch,
+            height,
+            SnapshotRewardSource::Block,
+        );
+    }
     // Rewards are weighted by active validator self-stake, matching consensus
     // voting weight and active-set selection. Delegations only split a
     // validator's already-earned reward pool between validator and delegators.
     let total_stake = state.validators.total_active_stake();
     if total_stake == 0 || epoch_block_reward == 0 {
-        return;
+        return Ok(());
     }
 
     let mut active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
@@ -941,18 +956,41 @@ fn distribute_block_rewards(
     // explicit and auditable.
     let reward_remainder = epoch_block_reward.saturating_sub(distributed);
     state.treasury_balance = state.treasury_balance.saturating_add(reward_remainder);
+    Ok(())
 }
 
-fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u64) {
+fn distribute_fee_rewards(
+    state: &mut ChainState,
+    current_epoch: u64,
+    height: u64,
+) -> crate::error::StateResult<()> {
+    if reward_economic_snapshot_active(height) {
+        let fee_pool = state.fee_reward_pool;
+        if fee_pool == 0 {
+            return Ok(());
+        }
+        state.fee_reward_pool = 0;
+        let result = distribute_snapshot_rewards(
+            state,
+            fee_pool,
+            current_epoch,
+            height,
+            SnapshotRewardSource::Fee,
+        );
+        if result.is_err() {
+            state.fee_reward_pool = fee_pool;
+        }
+        return result;
+    }
     let fee_pool = state.fee_reward_pool;
     if fee_pool == 0 {
-        return;
+        return Ok(());
     }
 
     // Fee rewards use the same self-stake weighting as block rewards.
     let total_stake = state.validators.total_active_stake();
     if total_stake == 0 {
-        return;
+        return Ok(());
     }
 
     state.fee_reward_pool = 0;
@@ -1001,6 +1039,146 @@ fn distribute_fee_rewards(state: &mut ChainState, current_epoch: u64, height: u6
 
     let remainder = fee_pool.saturating_sub(distributed);
     state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotRewardSource {
+    Block,
+    Fee,
+}
+
+fn distribute_snapshot_rewards(
+    state: &mut ChainState,
+    pool: u64,
+    current_epoch: u64,
+    height: u64,
+    source: SnapshotRewardSource,
+) -> crate::error::StateResult<()> {
+    use crate::error::StateError;
+
+    if pool == 0 {
+        return Ok(());
+    }
+    // Clone the immutable basis so reward credits can mutate their canonical
+    // destinations without borrowing authority from mutable live state.
+    let (consensus, economic) = state.reward_economic_snapshot_for_height(height)?;
+    let consensus = consensus.clone();
+    let economic = economic.clone();
+    let total_stake = consensus.total_weight_spark;
+    if total_stake == 0 {
+        return Err(StateError::InvalidRewardEconomicSnapshot(
+            "paired consensus snapshot has zero total weight".to_string(),
+        ));
+    }
+    let validator_count = consensus.entries().len() as u64;
+    let mut distributed = 0u64;
+
+    for member in consensus.entries() {
+        let economic_entry = economic.validator(&member.validator_id).ok_or_else(|| {
+            StateError::InvalidRewardEconomicSnapshot(
+                "paired economic validator entry is missing".to_string(),
+            )
+        })?;
+        let raw = proportional_reward(pool, member.consensus_weight_spark, total_stake, height);
+        let validator_pool = match source {
+            SnapshotRewardSource::Block => saturation_adjusted_reward(
+                raw,
+                member.consensus_weight_spark,
+                total_stake,
+                validator_count,
+                height,
+            ),
+            SnapshotRewardSource::Fee => raw,
+        };
+        let delegated = economic_entry.total_active_delegated_spark;
+        if delegated == 0 {
+            let validator = state
+                .validators
+                .get_mut(&member.validator_id)
+                .ok_or_else(|| {
+                    StateError::InvalidRewardEconomicSnapshot(
+                        "rewarded validator destination is missing".to_string(),
+                    )
+                })?;
+            validator.pending_rewards = validator.pending_rewards.saturating_add(validator_pool);
+            validator.rewards_last_epoch = current_epoch;
+            distributed = distributed.saturating_add(validator_pool);
+            continue;
+        }
+
+        let commission = bps_of(validator_pool, economic_entry.commission_bps);
+        let delegator_pool = validator_pool.saturating_sub(commission);
+        let validator = state
+            .validators
+            .get_mut(&member.validator_id)
+            .ok_or_else(|| {
+                StateError::InvalidRewardEconomicSnapshot(
+                    "rewarded validator destination is missing".to_string(),
+                )
+            })?;
+        validator.pending_rewards = validator.pending_rewards.saturating_add(commission);
+        validator.rewards_last_epoch = current_epoch;
+        distributed = distributed.saturating_add(commission);
+
+        let mut delegated_distributed = 0u64;
+        for delegator in economic_entry.delegators() {
+            let combined = delegator
+                .total_active_principal_spark()
+                .map_err(|error| StateError::InvalidRewardEconomicSnapshot(error.to_string()))?;
+            let identity_reward = muldiv(delegator_pool, combined, delegated);
+            let auto_reward = if delegator.auto_delegated_principal_spark == 0 {
+                0
+            } else {
+                muldiv(
+                    identity_reward,
+                    delegator.auto_delegated_principal_spark,
+                    combined,
+                )
+            };
+            let bonded_reward = identity_reward.saturating_sub(auto_reward);
+
+            if bonded_reward > 0 {
+                state
+                    .delegations
+                    .update_delegator(&member.validator_id, &delegator.delegator_id, |entry| {
+                        entry.pending_rewards = entry.pending_rewards.saturating_add(bonded_reward);
+                        entry.rewards_last_epoch = current_epoch;
+                    })
+                    .ok_or_else(|| {
+                        StateError::InvalidRewardEconomicSnapshot(
+                            "frozen bonded delegator destination is missing".to_string(),
+                        )
+                    })?;
+            }
+            if auto_reward > 0 {
+                let source_validator = state
+                    .validators
+                    .get_mut(&delegator.delegator_id)
+                    .ok_or_else(|| {
+                        StateError::InvalidRewardEconomicSnapshot(
+                            "frozen auto-delegation validator destination is missing".to_string(),
+                        )
+                    })?;
+                source_validator.pending_rewards =
+                    source_validator.pending_rewards.saturating_add(auto_reward);
+                source_validator.rewards_last_epoch = current_epoch;
+            }
+            delegated_distributed = delegated_distributed.saturating_add(identity_reward);
+        }
+        distributed = distributed.saturating_add(delegated_distributed);
+    }
+
+    let remainder = pool.saturating_sub(distributed);
+    match source {
+        SnapshotRewardSource::Block => {
+            state.treasury_balance = state.treasury_balance.saturating_add(remainder)
+        }
+        SnapshotRewardSource::Fee => {
+            state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder)
+        }
+    }
+    Ok(())
 }
 
 fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
@@ -1309,6 +1487,17 @@ pub fn epoch_for_height(height: u64) -> u64 {
     height / EPOCH_DURATION_BLOCKS
 }
 
+fn reward_economic_snapshot_active_at_gate(height: u64, gate_height: u64) -> bool {
+    height >= gate_height
+}
+
+fn reward_economic_snapshot_active(height: u64) -> bool {
+    reward_economic_snapshot_active_at_gate(
+        height,
+        indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,6 +1558,27 @@ mod tests {
         }
     }
 
+    fn make_snapshot_validator(id_byte: u8, stake: u64) -> ValidatorEntry {
+        let mut validator = make_validator(id_byte, stake);
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[id_byte; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[id_byte.wrapping_add(1); 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        validator.hybrid_classical_pk = Some(public.classical.0);
+        validator.hybrid_pq_pk = Some(public.pq.0.to_vec());
+        validator.vrf_pk =
+            Some(indra_crypto::VrfKeypair::from_seed(&[id_byte.wrapping_add(2); 32]).public_key());
+        validator
+    }
+
+    fn install_reward_basis(state: &mut ChainState) {
+        let consensus = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        let economic = state.build_reward_economic_snapshot(&consensus).unwrap();
+        state.consensus_snapshots = vec![consensus];
+        state.reward_economic_snapshot = Some(economic);
+    }
+
     fn dummy_output(byte: u8) -> OutputV1 {
         OutputV1 {
             value_spark: 1_000_000,
@@ -1412,6 +1622,169 @@ mod tests {
         assert!(EpochTransitionContext::new(0, 0).is_err());
         assert!(EpochTransitionContext::new(299, 298).is_err());
         assert!(EpochTransitionContext::new(300, 298).is_err());
+    }
+
+    #[test]
+    fn reward_snapshot_pays_frozen_alice_bob_not_boundary_time_bob_carol() {
+        let target_id = Bytes32::from([1; 32]);
+        let alice = Bytes32::from([0xA1; 32]);
+        let bob = Bytes32::from([0xB1; 32]);
+        let carol = Bytes32::from([0xC1; 32]);
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(make_snapshot_validator(1, 1_000_000_000))
+            .unwrap();
+        state
+            .delegations
+            .add_delegation(target_id, alice, 60, 0)
+            .unwrap();
+        state
+            .delegations
+            .add_delegation(target_id, bob, 40, 0)
+            .unwrap();
+        let alice_bond = compact_bond(0x31, target_id, alice, 60);
+        let bob_bond = compact_bond(0x32, target_id, bob, 40);
+        state.staked_bonds.insert(alice_bond.utxo_id, alice_bond);
+        state.staked_bonds.insert(bob_bond.utxo_id, bob_bond);
+        install_reward_basis(&mut state);
+
+        // Boundary-time live state now says Bob=40 and Carol=100. The frozen
+        // epoch-start basis must remain Alice=60 and Bob=40.
+        state
+            .delegations
+            .update_delegator(&target_id, &alice, |entry| {
+                entry.staked_spark = 0;
+                entry.unbonding_end_epoch = Some(1008);
+            })
+            .unwrap();
+        state
+            .delegations
+            .add_delegation(target_id, carol, 100, 1)
+            .unwrap();
+        let carol_bond = compact_bond(0x33, target_id, carol, 100);
+        state.staked_bonds.insert(carol_bond.utxo_id, carol_bond);
+
+        distribute_block_rewards(&mut state, 1_000, 1, u64::MAX).unwrap();
+        assert_eq!(
+            state.delegations.get_delegator_reward(&target_id, &alice),
+            540
+        );
+        assert_eq!(
+            state.delegations.get_delegator_reward(&target_id, &bob),
+            360
+        );
+        assert_eq!(
+            state.delegations.get_delegator_reward(&target_id, &carol),
+            0
+        );
+        assert_eq!(
+            state.validators.get(&target_id).unwrap().pending_rewards,
+            100
+        );
+
+        state.fee_reward_pool = 1_000;
+        distribute_fee_rewards(&mut state, 1, u64::MAX).unwrap();
+        assert_eq!(
+            state.delegations.get_delegator_reward(&target_id, &alice),
+            1_080
+        );
+        assert_eq!(
+            state.delegations.get_delegator_reward(&target_id, &bob),
+            720
+        );
+        assert_eq!(
+            state.delegations.get_delegator_reward(&target_id, &carol),
+            0
+        );
+        assert_eq!(
+            state.validators.get(&target_id).unwrap().pending_rewards,
+            200
+        );
+    }
+
+    #[test]
+    fn reward_snapshot_freezes_and_separates_auto_delegation_destination() {
+        let target_id = Bytes32::from([1; 32]);
+        let source_id = Bytes32::from([2; 32]);
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(make_snapshot_validator(1, 1_000_000_000))
+            .unwrap();
+        let mut source = make_snapshot_validator(2, 40);
+        source.status = ValidatorStatus::Registered;
+        source.auto_delegate_to = Some(target_id);
+        state.validators.upsert(source).unwrap();
+        state
+            .delegations
+            .add_delegation(target_id, source_id, 60, 0)
+            .unwrap();
+        let real_bond = compact_bond(0x34, target_id, source_id, 60);
+        state.staked_bonds.insert(real_bond.utxo_id, real_bond);
+        install_reward_basis(&mut state);
+
+        let frozen = state
+            .reward_economic_snapshot
+            .as_ref()
+            .unwrap()
+            .validator(&target_id)
+            .unwrap()
+            .delegators()[0]
+            .clone();
+        assert_eq!(frozen.bonded_active_principal_spark, 60);
+        assert_eq!(frozen.auto_delegated_principal_spark, 40);
+
+        // A mutable payout-time setting/stake change cannot alter frozen auto principal.
+        let source = state.validators.get_mut(&source_id).unwrap();
+        source.stake_spark = 400;
+        source.auto_delegate_to = None;
+        distribute_block_rewards(&mut state, 1_000, 1, u64::MAX).unwrap();
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&target_id, &source_id),
+            540
+        );
+        assert_eq!(
+            state.validators.get(&source_id).unwrap().pending_rewards,
+            360
+        );
+        assert_eq!(
+            state.validators.get(&target_id).unwrap().pending_rewards,
+            100
+        );
+    }
+
+    #[test]
+    fn reward_snapshot_pairing_missing_or_mismatched_fails_closed() {
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(make_snapshot_validator(1, 1_000_000_000))
+            .unwrap();
+        let consensus = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        state.consensus_snapshots = vec![consensus];
+        assert!(distribute_block_rewards(&mut state, 1_000, 1, u64::MAX).is_err());
+
+        let other = state
+            .build_consensus_snapshot(u64::MAX - 1, u64::MAX - 2)
+            .unwrap();
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&other).unwrap());
+        assert!(distribute_block_rewards(&mut state, 1_000, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn first_snapshot_gate_boundary_is_legacy_then_next_boundary_is_frozen() {
+        let synthetic_gate = 301u64;
+        assert!(!reward_economic_snapshot_active_at_gate(
+            300,
+            synthetic_gate
+        ));
+        assert!(reward_economic_snapshot_active_at_gate(600, synthetic_gate));
     }
 
     #[test]
@@ -2862,7 +3235,7 @@ mod tests {
             .add_delegation(id_b, delegator_id, 1_000_000, 0)
             .unwrap();
 
-        distribute_block_rewards(&mut state, 2_000, 1, 0);
+        distribute_block_rewards(&mut state, 2_000, 1, 0).unwrap();
 
         assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 1_000);
         assert_eq!(
@@ -3089,7 +3462,7 @@ mod tests {
             .add_delegation(validator_id, delegator_id, 1_000, 0)
             .unwrap();
 
-        distribute_block_rewards(&mut state, 1_000, 1, 0);
+        distribute_block_rewards(&mut state, 1_000, 1, 0).unwrap();
 
         assert_eq!(
             state.validators.get(&validator_id).unwrap().pending_rewards,
@@ -3135,7 +3508,7 @@ mod tests {
         assert_eq!(entry.staked_spark, 60);
         assert_eq!(entry.unbonding_end_epoch, None);
 
-        distribute_block_rewards(&mut state, 1_000, 1, 0);
+        distribute_block_rewards(&mut state, 1_000, 1, 0).unwrap();
         assert_eq!(
             state
                 .delegations
@@ -3148,7 +3521,7 @@ mod tests {
         );
 
         state.fee_reward_pool = 1_000;
-        distribute_fee_rewards(&mut state, 1, 0);
+        distribute_fee_rewards(&mut state, 1, 0).unwrap();
         assert_eq!(
             state
                 .delegations
@@ -3191,7 +3564,7 @@ mod tests {
         state.validators.upsert(validator_b).unwrap();
         let treasury_before = state.treasury_balance;
 
-        distribute_block_rewards(&mut state, 101, 1, 0);
+        distribute_block_rewards(&mut state, 101, 1, 0).unwrap();
 
         let reward_a = state.validators.get(&id_a).unwrap().pending_rewards;
         let reward_b = state.validators.get(&id_b).unwrap().pending_rewards;
@@ -3211,7 +3584,7 @@ mod tests {
         state.validators.upsert(validator_b).unwrap();
         state.fee_reward_pool = 101;
 
-        distribute_fee_rewards(&mut state, 1, 0);
+        distribute_fee_rewards(&mut state, 1, 0).unwrap();
 
         assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 50);
         assert_eq!(state.validators.get(&id_b).unwrap().pending_rewards, 50);
@@ -3230,8 +3603,8 @@ mod tests {
             .unwrap();
         full_block_state.validators.upsert(validator).unwrap();
 
-        distribute_block_rewards(&mut empty_block_state, 1_000, 1, 0);
-        distribute_block_rewards(&mut full_block_state, 1_000, 1, 0);
+        distribute_block_rewards(&mut empty_block_state, 1_000, 1, 0).unwrap();
+        distribute_block_rewards(&mut full_block_state, 1_000, 1, 0).unwrap();
 
         assert_eq!(
             empty_block_state

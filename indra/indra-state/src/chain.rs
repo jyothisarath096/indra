@@ -7,6 +7,9 @@ use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, 
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 use indra_core::types::crypto::HybridPubKey;
+use indra_core::types::reward_economic_snapshot::{
+    RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
+};
 use indra_crypto::PaymentPubKeyV1;
 
 use indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT;
@@ -104,6 +107,9 @@ pub struct ChainState {
     /// The bounded ordered vector supports Stage 3's greatest-activation-height
     /// lookup without introducing a separately mutable index.
     pub consensus_snapshots: Vec<ConsensusSnapshot>,
+
+    /// Epoch-start commission/delegation basis paired with consensus authority.
+    pub reward_economic_snapshot: Option<RewardEconomicSnapshot>,
 
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
@@ -218,6 +224,10 @@ impl Encode for ChainState {
         }
         if consensus_snapshot_active(self.height) {
             encode_list(&self.consensus_snapshots, buf);
+            self.reward_economic_snapshot.is_some().encode(buf);
+            if let Some(snapshot) = &self.reward_economic_snapshot {
+                snapshot.encode(buf);
+            }
         }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
@@ -273,6 +283,12 @@ impl Encode for ChainState {
             }
             + if consensus_snapshot_active(self.height) {
                 list_encoded_len(&self.consensus_snapshots)
+                    + 1
+                    + self
+                        .reward_economic_snapshot
+                        .as_ref()
+                        .map(Encode::encoded_len)
+                        .unwrap_or(0)
             } else {
                 0
             }
@@ -326,6 +342,20 @@ impl Decode for ChainState {
         } else {
             Vec::new()
         };
+        let reward_economic_snapshot = if consensus_snapshot_active(height) {
+            if bool::decode(r)? {
+                Some(RewardEconomicSnapshot::decode(r)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        validate_reward_economic_pairing(
+            &consensus_snapshots,
+            reward_economic_snapshot.as_ref(),
+            height,
+        )?;
         Ok(Self {
             chain_id,
             height,
@@ -339,6 +369,7 @@ impl Decode for ChainState {
             nullifiers,
             validators,
             consensus_snapshots,
+            reward_economic_snapshot,
             delegations,
             staked_bonds,
             staking_nonces,
@@ -385,6 +416,7 @@ impl ChainState {
             nullifiers: NullifierSet::new(),
             validators: ValidatorSet::new(),
             consensus_snapshots: Vec::new(),
+            reward_economic_snapshot: None,
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
@@ -421,6 +453,7 @@ impl ChainState {
             nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode_legacy(r, schema_version)?,
             consensus_snapshots: Vec::new(),
+            reward_economic_snapshot: None,
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map_legacy(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -461,6 +494,7 @@ impl ChainState {
             nullifiers: NullifierSet::decode_at_height(r, height)?,
             validators: ValidatorSet::decode(r)?,
             consensus_snapshots: Vec::new(),
+            reward_economic_snapshot: None,
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -598,6 +632,113 @@ impl ChainState {
         self.build_consensus_snapshot(1, 0)
     }
 
+    /// Build the epoch-start reward basis paired exactly with `consensus_snapshot`.
+    pub fn build_reward_economic_snapshot(
+        &self,
+        consensus_snapshot: &ConsensusSnapshot,
+    ) -> crate::error::StateResult<RewardEconomicSnapshot> {
+        use std::collections::BTreeMap;
+
+        let mut principals: BTreeMap<Bytes32, BTreeMap<Bytes32, (u64, u64)>> = BTreeMap::new();
+        for member in consensus_snapshot.entries() {
+            principals.insert(member.validator_id, BTreeMap::new());
+        }
+
+        // Real delegation is derived only from authoritative active bond records.
+        for bond in self.staked_bonds.values().filter(|bond| {
+            bond.validator_id != bond.delegator_id && bond.unbonding_end_epoch.is_none()
+        }) {
+            if let Some(delegators) = principals.get_mut(&bond.validator_id) {
+                let (bonded, _) = delegators.entry(bond.delegator_id).or_default();
+                *bonded = bonded.checked_add(bond.amount_spark).ok_or_else(|| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(
+                        "bonded delegator principal overflows u64".to_string(),
+                    )
+                })?;
+            }
+        }
+
+        // Virtual auto-delegation is frozen separately because it is credited
+        // to ValidatorEntry.pending_rewards, never DelegatorEntry.pending_rewards.
+        for source in self.validators.all_validators().filter(|validator| {
+            matches!(
+                validator.status,
+                crate::validator::ValidatorStatus::Registered
+            ) && validator.auto_delegate_to.is_some()
+                && validator.stake_spark > 0
+        }) {
+            let target_id = source.auto_delegate_to.expect("filter checked target");
+            if let Some(delegators) = principals.get_mut(&target_id) {
+                let (_, auto) = delegators.entry(source.validator_id).or_default();
+                *auto = auto.checked_add(source.stake_spark).ok_or_else(|| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(
+                        "auto-delegated principal overflows u64".to_string(),
+                    )
+                })?;
+            }
+        }
+
+        let frozen_bound = self.governance.params.max_commission_bps;
+        let mut validators = Vec::with_capacity(consensus_snapshot.entries().len());
+        for member in consensus_snapshot.entries() {
+            let validator = self.validators.get(&member.validator_id).ok_or_else(|| {
+                crate::error::StateError::InvalidRewardEconomicSnapshot(format!(
+                    "consensus member {} missing from validator registry",
+                    member.validator_id
+                ))
+            })?;
+            let delegators = principals
+                .remove(&member.validator_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(delegator_id, (bonded, auto))| {
+                    RewardEconomicDelegatorEntry::new(delegator_id, bonded, auto).map_err(|error| {
+                        crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            validators.push(
+                RewardEconomicValidatorEntry::new(
+                    member.validator_id,
+                    validator.commission_bps,
+                    delegators,
+                    frozen_bound,
+                )
+                .map_err(|error| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+                })?,
+            );
+        }
+        RewardEconomicSnapshot::new(
+            consensus_snapshot.activation_height,
+            consensus_snapshot.source_boundary_height,
+            frozen_bound,
+            validators,
+        )
+        .map_err(|error| crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string()))
+    }
+
+    /// Resolve exactly paired consensus and reward authority for `height`.
+    pub fn reward_economic_snapshot_for_height(
+        &self,
+        height: u64,
+    ) -> crate::error::StateResult<(&ConsensusSnapshot, &RewardEconomicSnapshot)> {
+        let consensus = self
+            .snapshot_for_consensus_height(height)
+            .map_err(|error| {
+                crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+            })?;
+        let economic = self.reward_economic_snapshot.as_ref().ok_or_else(|| {
+            crate::error::StateError::InvalidRewardEconomicSnapshot(
+                "missing reward economic snapshot".to_string(),
+            )
+        })?;
+        validate_reward_economic_membership(consensus, economic).map_err(|error| {
+            crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+        })?;
+        Ok((consensus, economic))
+    }
+
     /// Install the genesis snapshot when the global gate is configured at height 1.
     pub fn initialize_genesis_consensus_snapshot(&mut self) -> crate::error::StateResult<()> {
         if !consensus_snapshot_active(1) {
@@ -610,7 +751,9 @@ impl ChainState {
             ));
         }
         let snapshot = self.build_genesis_consensus_snapshot()?;
+        let economic = self.build_reward_economic_snapshot(&snapshot)?;
         self.install_consensus_snapshot(snapshot)?;
+        self.reward_economic_snapshot = Some(economic);
         if state_commitment_v2_active(1) {
             self.rebuild_state_commitment_v2(1);
         }
@@ -651,7 +794,10 @@ impl ChainState {
             )
         })?;
         let snapshot = self.build_consensus_snapshot(activation_height, boundary_height)?;
-        self.install_consensus_snapshot(snapshot)
+        let economic = self.build_reward_economic_snapshot(&snapshot)?;
+        self.install_consensus_snapshot(snapshot)?;
+        self.reward_economic_snapshot = Some(economic);
+        Ok(())
     }
 
     fn install_consensus_snapshot(
@@ -710,6 +856,51 @@ impl ChainState {
             }
         }
     }
+}
+
+fn validate_reward_economic_membership(
+    consensus: &ConsensusSnapshot,
+    economic: &RewardEconomicSnapshot,
+) -> IndraResult<()> {
+    economic.validate()?;
+    if consensus.activation_height != economic.activation_height
+        || consensus.source_boundary_height != economic.source_boundary_height
+        || consensus.entries().len() != economic.validators().len()
+        || consensus
+            .entries()
+            .iter()
+            .zip(economic.validators())
+            .any(|(consensus, economic)| consensus.validator_id != economic.validator_id)
+    {
+        return Err(IndraError::InvalidRewardEconomicSnapshot(
+            "economic snapshot is not exactly paired with consensus membership".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reward_economic_pairing(
+    consensus_snapshots: &[ConsensusSnapshot],
+    economic: Option<&RewardEconomicSnapshot>,
+    height: u64,
+) -> IndraResult<()> {
+    if !consensus_snapshot_active(height) {
+        return Ok(());
+    }
+    let economic = economic.ok_or_else(|| {
+        IndraError::InvalidRewardEconomicSnapshot(
+            "post-gate state is missing its reward economic snapshot".to_string(),
+        )
+    })?;
+    let consensus = consensus_snapshots
+        .iter()
+        .find(|snapshot| snapshot.activation_height == economic.activation_height)
+        .ok_or_else(|| {
+            IndraError::InvalidRewardEconomicSnapshot(
+                "no retained consensus snapshot has the economic activation height".to_string(),
+            )
+        })?;
+    validate_reward_economic_membership(consensus, economic)
 }
 
 fn validate_consensus_snapshot_collection(
@@ -1198,11 +1389,23 @@ mod tests {
         assert_eq!(state.consensus_snapshots.len(), 2);
         assert_eq!(state.consensus_snapshots[0].activation_height, 601);
         assert_eq!(state.consensus_snapshots[1].activation_height, 901);
+        assert_eq!(
+            state
+                .reward_economic_snapshot
+                .as_ref()
+                .unwrap()
+                .activation_height,
+            901
+        );
 
         let bytes = state.encode_to_vec();
         assert_eq!(bytes.len(), state.encoded_len());
         let decoded = ChainState::decode_exact(&bytes).unwrap();
         assert_eq!(decoded.consensus_snapshots, state.consensus_snapshots);
+        assert_eq!(
+            decoded.reward_economic_snapshot,
+            state.reward_economic_snapshot
+        );
         assert_eq!(decoded, state);
     }
 
@@ -1480,6 +1683,10 @@ mod tests {
 
         assert_eq!(reference.consensus_snapshots.len(), 2);
         assert_eq!(reference.consensus_snapshots, replayed.consensus_snapshots);
+        assert_eq!(
+            reference.reward_economic_snapshot,
+            replayed.reward_economic_snapshot
+        );
         assert_eq!(reference.encode_to_vec(), replayed.encode_to_vec());
         assert_eq!(
             crate::compute_state_root(&reference),
@@ -1495,6 +1702,11 @@ mod tests {
         with_staged_snapshot
             .consensus_snapshots
             .push(baseline.build_genesis_consensus_snapshot().unwrap());
+        with_staged_snapshot.reward_economic_snapshot = Some(
+            baseline
+                .build_reward_economic_snapshot(&with_staged_snapshot.consensus_snapshots[0])
+                .unwrap(),
+        );
 
         assert!(!consensus_snapshot_active(baseline.height));
         assert_eq!(
@@ -1509,6 +1721,10 @@ mod tests {
             .unwrap()
             .consensus_snapshots
             .is_empty());
+        assert!(ChainState::decode_exact(&baseline.encode_to_vec())
+            .unwrap()
+            .reward_economic_snapshot
+            .is_none());
     }
 
     #[test]

@@ -5884,6 +5884,24 @@ mod tests {
             EPOCH_DURATION_BLOCKS.saturating_add(1)
         );
         assert_eq!(snapshotted, final_active);
+        let economic = state.reward_economic_snapshot.as_ref().unwrap();
+        assert_eq!(economic.activation_height, snapshot.activation_height);
+        assert_eq!(
+            economic.source_boundary_height,
+            snapshot.source_boundary_height
+        );
+        assert_eq!(
+            economic
+                .validators()
+                .iter()
+                .map(|entry| entry.validator_id)
+                .collect::<Vec<_>>(),
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| entry.validator_id)
+                .collect::<Vec<_>>()
+        );
         assert!(snapshotted.iter().any(|(id, _)| *id == incumbent_id));
         assert!(snapshotted.iter().any(|(id, _)| *id == registered_a));
         assert!(snapshotted.iter().any(|(id, _)| *id == registered_b));

@@ -22,6 +22,7 @@ use indra_core::{
             consensus_snapshot_active, registered_validator_cap_active,
             validator_network_address_active, Bytes32,
         },
+        reward_economic_snapshot::RewardEconomicSnapshot,
     },
 };
 use indra_crypto::{sha256, PaymentPubKeyV1};
@@ -44,6 +45,7 @@ const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
 const DOMAIN_PAYMENT_IDENTITY: u8 = 0x08;
 const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
 const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
+const DOMAIN_REWARD_ECONOMIC_SNAPSHOT: u8 = 0x0B;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,6 +120,12 @@ impl StateCommitmentV2 {
                 leaves.push((
                     consensus_snapshot_key(snapshot.activation_height),
                     consensus_snapshot_value_hash(snapshot),
+                ));
+            }
+            if let Some(snapshot) = &state.reward_economic_snapshot {
+                leaves.push((
+                    reward_economic_snapshot_key(snapshot.activation_height),
+                    reward_economic_snapshot_value_hash(snapshot),
                 ));
             }
         }
@@ -280,6 +288,17 @@ fn consensus_snapshot_value_hash(snapshot: &ConsensusSnapshot) -> [u8; 32] {
     sha256(&snapshot.encode_to_vec())
 }
 
+fn reward_economic_snapshot_key(activation_height: u64) -> [u8; 32] {
+    derive_key(
+        DOMAIN_REWARD_ECONOMIC_SNAPSHOT,
+        &activation_height.to_le_bytes(),
+    )
+}
+
+fn reward_economic_snapshot_value_hash(snapshot: &RewardEconomicSnapshot) -> [u8; 32] {
+    sha256(&snapshot.encode_to_vec())
+}
+
 fn retired_cold_component_value_hash(kind: u8, component: &[u8]) -> [u8; 32] {
     let mut value = Vec::with_capacity(1 + component.len());
     value.push(kind);
@@ -413,6 +432,7 @@ mod tests {
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::{CommitmentV1, HybridPubKey},
             primitives::UNBONDING_PERIOD_EPOCHS,
+            reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
             transaction::OutputV1,
         },
         VariableBytes,
@@ -515,6 +535,49 @@ mod tests {
             consensus_snapshot_key(1),
             validator_key(&id(1)),
             "snapshot and validator leaf domains must not collide"
+        );
+    }
+
+    #[test]
+    fn reward_economic_snapshot_leaf_is_content_sensitive_and_domain_separated() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        state.height = height;
+        state.reward_economic_snapshot = Some(
+            RewardEconomicSnapshot::new(
+                301,
+                300,
+                2_000,
+                vec![RewardEconomicValidatorEntry::new(id(0xA0), 1_000, vec![], 2_000).unwrap()],
+            )
+            .unwrap(),
+        );
+        let baseline = StateCommitmentV2::from_state(&state, height).root();
+
+        let mut changed = state.clone();
+        changed.reward_economic_snapshot = Some(
+            RewardEconomicSnapshot::new(
+                301,
+                300,
+                2_000,
+                vec![RewardEconomicValidatorEntry::new(id(0xA0), 1_001, vec![], 2_000).unwrap()],
+            )
+            .unwrap(),
+        );
+        assert_ne!(
+            StateCommitmentV2::from_state(&changed, height).root(),
+            baseline
+        );
+
+        let mut unrelated = state.clone();
+        unrelated.epoch_fees_burned = 99;
+        assert_eq!(
+            StateCommitmentV2::from_state(&unrelated, height).root(),
+            baseline
+        );
+        assert_ne!(
+            reward_economic_snapshot_key(301),
+            consensus_snapshot_key(301)
         );
     }
 

@@ -601,6 +601,7 @@ mod tests {
         types::{
             block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
+            reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
         },
         Bytes32, ProtocolVersion, VariableBytes,
     };
@@ -721,6 +722,21 @@ mod tests {
             ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)]).unwrap(),
             ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)]).unwrap(),
         ];
+        continuous.reward_economic_snapshot = Some(
+            RewardEconomicSnapshot::new(
+                901,
+                900,
+                10_000,
+                vec![RewardEconomicValidatorEntry::new(
+                    Bytes32::from([0xC0; 32]),
+                    0,
+                    vec![],
+                    10_000,
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        );
         continuous.rebuild_state_commitment_v2(continuous.height);
         let expected_bytes = serialise_chain_state(&continuous);
         let expected_roots = compute_state_roots(&continuous);
@@ -730,6 +746,10 @@ mod tests {
 
         assert_eq!(restored.consensus_snapshots.len(), 2);
         assert_eq!(restored.consensus_snapshots, continuous.consensus_snapshots);
+        assert_eq!(
+            restored.reward_economic_snapshot,
+            continuous.reward_economic_snapshot
+        );
         assert_eq!(serialise_chain_state(&restored), expected_bytes);
         assert_eq!(compute_state_roots(&restored), expected_roots);
         let _ = std::fs::remove_dir_all(&dir);

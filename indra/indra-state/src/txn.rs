@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use indra_core::{
     types::{
         consensus_snapshot::ConsensusSnapshot, primitives::state_commitment_v2_active,
-        transaction::OutputV1,
+        reward_economic_snapshot::RewardEconomicSnapshot, transaction::OutputV1,
     },
     Bytes32,
 };
@@ -61,6 +61,7 @@ enum UndoEntry {
     Utxos(UtxoSet),
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
     ConsensusSnapshots(Vec<ConsensusSnapshot>),
+    RewardEconomicSnapshot(Option<RewardEconomicSnapshot>),
 }
 
 #[cfg(test)]
@@ -91,6 +92,7 @@ pub(crate) struct StateTxn<'a> {
     utxos_recorded: bool,
     delegation_return_events_recorded: bool,
     consensus_snapshots_recorded: bool,
+    reward_economic_snapshot_recorded: bool,
     commitment_touched: bool,
 }
 
@@ -115,6 +117,7 @@ impl<'a> StateTxn<'a> {
             utxos_recorded: false,
             delegation_return_events_recorded: false,
             consensus_snapshots_recorded: false,
+            reward_economic_snapshot_recorded: false,
             commitment_touched: false,
         }
     }
@@ -220,6 +223,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_utxos();
         self.snapshot_delegation_return_events();
         self.snapshot_consensus_snapshots();
+        self.snapshot_reward_economic_snapshot();
         self.record_scalars();
         self.mark_commitment_touched();
     }
@@ -424,6 +428,15 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    fn snapshot_reward_economic_snapshot(&mut self) {
+        if !self.reward_economic_snapshot_recorded {
+            self.undo.push(UndoEntry::RewardEconomicSnapshot(
+                self.state.reward_economic_snapshot.clone(),
+            ));
+            self.reward_economic_snapshot_recorded = true;
+        }
+    }
+
     fn rollback(&mut self) {
         #[cfg(test)]
         let rollback_start = Instant::now();
@@ -481,6 +494,9 @@ impl<'a> StateTxn<'a> {
                 }
                 UndoEntry::ConsensusSnapshots(snapshots) => {
                     self.state.consensus_snapshots = snapshots;
+                }
+                UndoEntry::RewardEconomicSnapshot(snapshot) => {
+                    self.state.reward_economic_snapshot = snapshot;
                 }
             }
         }
@@ -597,6 +613,7 @@ mod tests {
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::HybridPubKey,
             primitives::VariableBytes,
+            reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
         },
         CommitmentV1,
     };
@@ -738,6 +755,21 @@ mod tests {
             snapshot(601, 600, 2_000_000_000),
             snapshot(901, 900, 3_000_000_000),
         ];
+        state.reward_economic_snapshot = Some(
+            RewardEconomicSnapshot::new(
+                901,
+                900,
+                2_000,
+                vec![RewardEconomicValidatorEntry::new(
+                    Bytes32::from([0xE0; 32]),
+                    1_000,
+                    vec![],
+                    2_000,
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        );
         state.rebuild_state_commitment_v2(state.height);
         let original = state.clone();
 
@@ -749,6 +781,7 @@ mod tests {
                 snapshot(901, 900, 3_000_000_000),
                 snapshot(1201, 1200, 4_000_000_000),
             ];
+            txn.state_mut().reward_economic_snapshot = None;
             assert!(txn.after_mutation().is_err());
         }
         set_fail_after_mutation(None);
