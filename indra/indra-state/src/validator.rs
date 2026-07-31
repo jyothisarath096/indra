@@ -3297,6 +3297,78 @@ impl DelegationMap {
         Ok(())
     }
 
+    /// Apply a bond-local undelegation while keeping this aggregate entry equal
+    /// to the sum of the delegator's still-active bonds.
+    pub fn begin_undelegate_from_bonds(
+        &mut self,
+        validator_id: &Bytes32,
+        delegator_id: &Bytes32,
+        active_stake_spark: u64,
+        unbonding_end_epoch: u64,
+    ) -> Result<(), &'static str> {
+        let mut entries = self
+            .delegators
+            .get(validator_id)
+            .cloned()
+            .ok_or("validator has no delegators")?;
+        let position = self
+            .delegator_position(validator_id, delegator_id)
+            .ok_or("delegator not found")?;
+        let entry = entries.get_mut(position).ok_or("delegator not found")?;
+        if &entry.delegator_id != delegator_id {
+            return Err("delegator index mismatch");
+        }
+        entry.staked_spark = active_stake_spark;
+        // This legacy field now describes a fully-unbonding aggregate only.
+        // Mixed active/unbonding lifecycle is authoritative in StakeBondEntry.
+        entry.unbonding_end_epoch = (active_stake_spark == 0).then_some(unbonding_end_epoch);
+        self.delegators.insert(*validator_id, entries);
+        Ok(())
+    }
+
+    /// Reconcile one aggregate entry from its authoritative bond records.
+    ///
+    /// Entries with claimable rewards remain after their final bond matures so
+    /// the owner can still claim them. Empty, reward-free entries are removed.
+    pub fn reconcile_from_bonds(
+        &mut self,
+        validator_id: &Bytes32,
+        delegator_id: &Bytes32,
+        active_stake_spark: u64,
+        latest_unbonding_end_epoch: Option<u64>,
+        has_any_bond: bool,
+    ) {
+        let Some(mut entries) = self.delegators.get(validator_id).cloned() else {
+            return;
+        };
+        let Some(position) = self.delegator_position(validator_id, delegator_id) else {
+            return;
+        };
+        let Some(entry) = entries.get_mut(position) else {
+            return;
+        };
+        if &entry.delegator_id != delegator_id {
+            return;
+        }
+        entry.staked_spark = active_stake_spark;
+        entry.unbonding_end_epoch = if active_stake_spark > 0 {
+            None
+        } else {
+            latest_unbonding_end_epoch
+        };
+        let remove = !has_any_bond && entry.pending_rewards == 0;
+        if remove {
+            entries.remove(position);
+        }
+        if entries.is_empty() {
+            self.delegators.remove(validator_id);
+            self.remove_index_for_validator(validator_id);
+        } else {
+            self.update_index_for_validator(validator_id, &entries);
+            self.delegators.insert(*validator_id, entries);
+        }
+    }
+
     /// Release delegators whose unbonding period has ended.
     /// Returns the total Spark to be returned to delegators.
     pub fn release_unbonded(&mut self, current_epoch: u64) -> u64 {

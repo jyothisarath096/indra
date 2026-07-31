@@ -7,11 +7,12 @@
 use indra_core::types::{
     crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        delegator_identity_registry_active, payment_blinding_active,
-        registered_validator_cap_active, staking_commitment_proof_required,
-        validator_cold_key_enforcement_active, validator_cold_key_enrollment_active,
-        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
-        DUST_LIMIT_SPARK, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        delegator_bond_accounting_active, delegator_identity_registry_active,
+        live_bond_count_cap_active, payment_blinding_active, registered_validator_cap_active,
+        staking_commitment_proof_required, validator_cold_key_enforcement_active,
+        validator_cold_key_enrollment_active, validator_network_address_active, Bytes32,
+        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
+        MAX_LIVE_BONDS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
         MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
         STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
@@ -391,6 +392,8 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             bond_proof.as_ref(),
             current_height,
             identity_registry_active,
+            delegator_bond_accounting_active(current_height),
+            live_bond_count_cap_active(current_height).then_some(MAX_LIVE_BONDS_PER_VALIDATOR),
         ),
         StakingOpBody::Undelegate {
             validator_id,
@@ -403,6 +406,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             delegator_pubkey,
             current_height,
             identity_registry_active,
+            delegator_bond_accounting_active(current_height),
         ),
         StakingOpBody::ClaimRewards {
             validator_id,
@@ -467,6 +471,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             bond_proof.as_ref(),
             current_height,
             identity_registry_active,
+            live_bond_count_cap_active(current_height).then_some(MAX_LIVE_BONDS_PER_VALIDATOR),
         ),
         StakingOpBody::SelfUnstake {
             bond_utxo_id,
@@ -1273,6 +1278,34 @@ fn payout_or_burn_pending_reward(
 ///
 /// The delegator's stake is added to the validator's delegation pool.
 /// Rewards accrue from the next epoch boundary.
+fn enforce_validator_bond_capacity(
+    state: &ChainState,
+    validator_id: &Bytes32,
+    cap: Option<usize>,
+) -> StateResult<()> {
+    let Some(cap) = cap else {
+        return Ok(());
+    };
+    let count = state
+        .staked_bonds
+        .values()
+        .filter(|bond| bond.validator_id == *validator_id)
+        .take(cap)
+        .count();
+    if validator_bond_capacity_reached(count, cap) {
+        return Err(StateError::ValidatorBondCountAtMaximum {
+            validator_id: *validator_id,
+            max: cap,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn validator_bond_capacity_reached(count: usize, cap: usize) -> bool {
+    count >= cap
+}
+
 fn apply_delegate(
     state: &mut ChainState,
     validator_id: &Bytes32,
@@ -1281,6 +1314,8 @@ fn apply_delegate(
     bond_proof: Option<&StakingBondProof>,
     current_height: u64,
     identity_registry_active: bool,
+    bond_accounting_active: bool,
+    bond_count_cap: Option<usize>,
 ) -> StateResult<()> {
     let validator = state
         .validators
@@ -1292,6 +1327,7 @@ fn apply_delegate(
     ) {
         return Err(StateError::ValidatorNotActive);
     }
+    enforce_validator_bond_capacity(state, validator_id, bond_count_cap)?;
     let min_delegation = validator
         .min_delegation_spark
         .max(state.governance.params.min_delegation_spark);
@@ -1370,6 +1406,9 @@ fn apply_delegate(
         .delegations
         .add_delegation(*validator_id, delegator_id, amount_spark, current_epoch)
         .map_err(|reason| StateError::InvalidStakingOp(reason.into()))?;
+    if bond_accounting_active {
+        reconcile_delegator_from_bonds(state, validator_id, &delegator_id);
+    }
     if let (Some(commitment), Some(delegator)) = (
         state.state_commitment_v2.as_mut(),
         state
@@ -1424,6 +1463,7 @@ fn apply_undelegate(
     delegator_pubkey: &HybridPubKey,
     current_height: u64,
     identity_registry_active: bool,
+    bond_accounting_active: bool,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
 
@@ -1479,10 +1519,23 @@ fn apply_undelegate(
         commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
     }
 
-    state
-        .delegations
-        .begin_undelegate(validator_id, &delegator_id, amount_spark, unbonding_end)
-        .map_err(|e| StateError::InvalidStakingOp(e.into()))?;
+    if bond_accounting_active {
+        let active_stake_spark = active_delegated_bond_stake(state, validator_id, &delegator_id);
+        state
+            .delegations
+            .begin_undelegate_from_bonds(
+                validator_id,
+                &delegator_id,
+                active_stake_spark,
+                unbonding_end,
+            )
+            .map_err(|e| StateError::InvalidStakingOp(e.into()))?;
+    } else {
+        state
+            .delegations
+            .begin_undelegate(validator_id, &delegator_id, amount_spark, unbonding_end)
+            .map_err(|e| StateError::InvalidStakingOp(e.into()))?;
+    }
     if let (Some(commitment), Some(delegator)) = (
         state.state_commitment_v2.as_mut(),
         state
@@ -1507,6 +1560,66 @@ fn apply_undelegate(
     Ok(())
 }
 
+pub(crate) fn active_delegated_bond_stake(
+    state: &ChainState,
+    validator_id: &Bytes32,
+    delegator_id: &Bytes32,
+) -> u64 {
+    state
+        .staked_bonds
+        .values()
+        .filter(|bond| {
+            bond.validator_id == *validator_id
+                && bond.delegator_id == *delegator_id
+                && bond.validator_id != bond.delegator_id
+                && bond.unbonding_end_epoch.is_none()
+        })
+        .fold(0u64, |sum, bond| sum.saturating_add(bond.amount_spark))
+}
+
+pub(crate) fn reconcile_delegator_from_bonds(
+    state: &mut ChainState,
+    validator_id: &Bytes32,
+    delegator_id: &Bytes32,
+) {
+    let mut active = 0u64;
+    let mut latest_unbonding_end = None;
+    let mut has_any = false;
+    for bond in state.staked_bonds.values().filter(|bond| {
+        bond.validator_id == *validator_id
+            && bond.delegator_id == *delegator_id
+            && bond.validator_id != bond.delegator_id
+    }) {
+        has_any = true;
+        match bond.unbonding_end_epoch {
+            None => active = active.saturating_add(bond.amount_spark),
+            Some(end) => {
+                latest_unbonding_end =
+                    Some(latest_unbonding_end.map_or(end, |old: u64| old.max(end)))
+            }
+        }
+    }
+    state.delegations.reconcile_from_bonds(
+        validator_id,
+        delegator_id,
+        active,
+        latest_unbonding_end,
+        has_any,
+    );
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        if let Some(entry) = state
+            .delegations
+            .get_delegators(validator_id)
+            .iter()
+            .find(|entry| entry.delegator_id == *delegator_id)
+        {
+            commitment.put_delegator(validator_id, entry);
+        } else {
+            commitment.delete_delegator(validator_id, delegator_id);
+        }
+    }
+}
+
 /// Bond a validator-owned UTXO as validator self-stake.
 fn apply_self_stake(
     state: &mut ChainState,
@@ -1515,6 +1628,7 @@ fn apply_self_stake(
     bond_proof: Option<&StakingBondProof>,
     current_height: u64,
     identity_registry_active: bool,
+    bond_count_cap: Option<usize>,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
     let validator = state
@@ -1530,6 +1644,7 @@ fn apply_self_stake(
     ) {
         return Err(StateError::ValidatorNotActive);
     }
+    enforce_validator_bond_capacity(state, &validator_id, bond_count_cap)?;
 
     if state.staked_bonds.contains_key(&bond_utxo_id) {
         return Err(StateError::InvalidStakingOp(
@@ -3204,6 +3319,324 @@ mod tests {
             Some(UNBONDING_PERIOD_EPOCHS)
         );
         assert_eq!(state.delegations.total_delegated(&validator_id), 0);
+    }
+
+    #[test]
+    fn per_bond_accounting_preserves_active_remainder_and_allows_later_exit() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x81);
+        let delegator_keypair = keypair(0x82);
+        let pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&pubkey);
+        let bond_60 = insert_delegator_utxo(&mut state, pubkey.clone(), 60_000_000, 0x83);
+        let bond_40 = insert_delegator_utxo(&mut state, pubkey.clone(), 40_000_000, 0x84);
+        let chain_id = state.chain_id.clone();
+        for (nonce, bond) in [(1, bond_60), (2, bond_40)] {
+            let op = delegate_op(&state, validator_id, bond, &delegator_keypair, nonce);
+            apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+        }
+
+        apply_undelegate(&mut state, &validator_id, bond_40, &pubkey, 2, false, true).unwrap();
+        let entry = state
+            .delegations
+            .get_delegators(&validator_id)
+            .iter()
+            .find(|entry| entry.delegator_id == delegator_id)
+            .unwrap();
+        assert_eq!(entry.staked_spark, 60_000_000);
+        assert_eq!(entry.unbonding_end_epoch, None);
+        assert_eq!(state.delegations.total_delegated(&validator_id), 60_000_000);
+
+        // A fresh bond is aggregated as active rather than inheriting a stale
+        // lifecycle flag from the independently-unbonding bond.
+        let bond_20 = insert_delegator_utxo(&mut state, pubkey.clone(), 20_000_000, 0x85);
+        let op = delegate_op(&state, validator_id, bond_20, &delegator_keypair, 3);
+        let StakingOpBody::Delegate {
+            bond_proof,
+            delegator_pubkey,
+            ..
+        } = &op.body
+        else {
+            unreachable!()
+        };
+        apply_delegate(
+            &mut state,
+            &validator_id,
+            bond_20,
+            delegator_pubkey,
+            bond_proof.as_ref(),
+            3,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            active_delegated_bond_stake(&state, &validator_id, &delegator_id),
+            80_000_000
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get_delegators(&validator_id)
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .unwrap()
+                .unbonding_end_epoch,
+            None
+        );
+
+        // The original still-active bond can independently begin unbonding.
+        apply_undelegate(&mut state, &validator_id, bond_60, &pubkey, 4, false, true).unwrap();
+        assert_eq!(
+            active_delegated_bond_stake(&state, &validator_id, &delegator_id),
+            20_000_000
+        );
+    }
+
+    #[test]
+    fn live_bond_cap_counts_every_category_and_rejects_bond_creation_atomically() {
+        assert_eq!(MAX_LIVE_BONDS_PER_VALIDATOR, 104_096);
+        assert!(!validator_bond_capacity_reached(
+            104_095,
+            MAX_LIVE_BONDS_PER_VALIDATOR
+        ));
+        assert!(validator_bond_capacity_reached(
+            104_096,
+            MAX_LIVE_BONDS_PER_VALIDATOR
+        ));
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x91);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let delegator_keypair = keypair(0x92);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+
+        for (seed, self_bond, unbonding) in [
+            (0x93, true, false),
+            (0x94, true, true),
+            (0x95, false, false),
+            (0x96, false, true),
+        ] {
+            let owner = if self_bond {
+                validator_pubkey.clone()
+            } else {
+                delegator_pubkey.clone()
+            };
+            let id = Bytes32::from([seed; 32]);
+            let mut bond = StakeBondEntry::new_for_test_with_compact_activation(
+                id,
+                validator_id,
+                if self_bond {
+                    validator_id
+                } else {
+                    delegator_id
+                },
+                1_000_000,
+                0,
+                test_output(1_000_000, owner, seed),
+                0,
+                u64::MAX,
+            );
+            if unbonding {
+                bond.unbonding_end_epoch = Some(UNBONDING_PERIOD_EPOCHS);
+            }
+            state.staked_bonds.insert(id, bond);
+        }
+        assert!(matches!(
+            enforce_validator_bond_capacity(&state, &validator_id, Some(4)),
+            Err(StateError::ValidatorBondCountAtMaximum { max: 4, .. })
+        ));
+
+        let delegate_utxo =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x97);
+        let delegate = delegate_op(&state, validator_id, delegate_utxo, &delegator_keypair, 1);
+        let before_delegate = state.clone();
+        let StakingOpBody::Delegate { bond_proof, .. } = &delegate.body else {
+            unreachable!()
+        };
+        let delegate_bond_proof = bond_proof.clone();
+        assert!(matches!(
+            apply_delegate(
+                &mut state,
+                &validator_id,
+                delegate_utxo,
+                &delegator_pubkey,
+                bond_proof.as_ref(),
+                1,
+                false,
+                true,
+                Some(4),
+            ),
+            Err(StateError::ValidatorBondCountAtMaximum { max: 4, .. })
+        ));
+        assert_eq!(state, before_delegate);
+
+        let self_utxo =
+            insert_delegator_utxo(&mut state, validator_pubkey.clone(), 1_000_000, 0x98);
+        let self_stake = self_stake_op(&state, self_utxo, &validator_keypair, 1);
+        let before_self_stake = state.clone();
+        let StakingOpBody::SelfStake { bond_proof, .. } = &self_stake.body else {
+            unreachable!()
+        };
+        assert!(matches!(
+            apply_self_stake(
+                &mut state,
+                self_utxo,
+                &validator_pubkey,
+                bond_proof.as_ref(),
+                1,
+                false,
+                Some(4),
+            ),
+            Err(StateError::ValidatorBondCountAtMaximum { max: 4, .. })
+        ));
+        assert_eq!(state, before_self_stake);
+
+        // The same full population remains unrestricted before activation.
+        apply_delegate(
+            &mut state,
+            &validator_id,
+            delegate_utxo,
+            &delegator_pubkey,
+            delegate_bond_proof.as_ref(),
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!state.utxos.contains(&delegate_utxo));
+    }
+
+    #[test]
+    fn live_bond_cap_does_not_block_exit_or_maturity_paths() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xA1);
+        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let delegator_keypair = keypair(0xA2);
+        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+
+        let delegated_bond =
+            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0xA3);
+        let delegate = delegate_op(&state, validator_id, delegated_bond, &delegator_keypair, 1);
+        let StakingOpBody::Delegate { bond_proof, .. } = &delegate.body else {
+            unreachable!()
+        };
+        apply_delegate(
+            &mut state,
+            &validator_id,
+            delegated_bond,
+            &delegator_pubkey,
+            bond_proof.as_ref(),
+            1,
+            false,
+            true,
+            Some(2),
+        )
+        .unwrap();
+
+        let self_bond =
+            insert_delegator_utxo(&mut state, validator_pubkey.clone(), 1_000_000, 0xA4);
+        let self_stake = self_stake_op(&state, self_bond, &validator_keypair, 1);
+        let StakingOpBody::SelfStake { bond_proof, .. } = &self_stake.body else {
+            unreachable!()
+        };
+        apply_self_stake(
+            &mut state,
+            self_bond,
+            &validator_pubkey,
+            bond_proof.as_ref(),
+            1,
+            false,
+            Some(2),
+        )
+        .unwrap();
+        assert!(matches!(
+            enforce_validator_bond_capacity(&state, &validator_id, Some(2)),
+            Err(StateError::ValidatorBondCountAtMaximum { max: 2, .. })
+        ));
+
+        // The cap is creation-only: both exit paths remain available at the
+        // limit and normal maturity removes the records so capacity recovers.
+        apply_undelegate(
+            &mut state,
+            &validator_id,
+            delegated_bond,
+            &delegator_pubkey,
+            2,
+            false,
+            true,
+        )
+        .unwrap();
+        apply_self_unstake(&mut state, self_bond, &validator_pubkey, 2, false).unwrap();
+        crate::epoch::release_unbonded_bonds_at_height(&mut state, UNBONDING_PERIOD_EPOCHS, 2)
+            .unwrap();
+        assert!(!state.staked_bonds.contains_key(&delegated_bond));
+        assert!(!state.staked_bonds.contains_key(&self_bond));
+        assert!(enforce_validator_bond_capacity(&state, &validator_id, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn live_bond_cap_replay_is_deterministic_across_activation_modes() {
+        fn replay() -> (Vec<u8>, Bytes32) {
+            let mut state = ChainState::new_genesis();
+            let (validator_id, _) = make_active_validator(&mut state, 0xB1);
+            let delegator_keypair = keypair(0xB2);
+            let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
+
+            // Legacy/pre-gate mode permits creation without consulting a cap.
+            for (nonce, seed) in [(1, 0xB3), (2, 0xB4)] {
+                let bond =
+                    insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, seed);
+                let op = delegate_op(&state, validator_id, bond, &delegator_keypair, nonce);
+                let StakingOpBody::Delegate { bond_proof, .. } = &op.body else {
+                    unreachable!()
+                };
+                apply_delegate(
+                    &mut state,
+                    &validator_id,
+                    bond,
+                    &delegator_pubkey,
+                    bond_proof.as_ref(),
+                    nonce,
+                    false,
+                    true,
+                    None,
+                )
+                .unwrap();
+            }
+
+            // Post-gate mode deterministically rejects the next creation when
+            // the test-sized limit is reached, without altering consensus state.
+            let rejected_bond =
+                insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0xB5);
+            let rejected = delegate_op(&state, validator_id, rejected_bond, &delegator_keypair, 3);
+            let before = state.clone();
+            let StakingOpBody::Delegate { bond_proof, .. } = &rejected.body else {
+                unreachable!()
+            };
+            assert!(matches!(
+                apply_delegate(
+                    &mut state,
+                    &validator_id,
+                    rejected_bond,
+                    &delegator_pubkey,
+                    bond_proof.as_ref(),
+                    3,
+                    false,
+                    true,
+                    Some(2),
+                ),
+                Err(StateError::ValidatorBondCountAtMaximum { max: 2, .. })
+            ));
+            assert_eq!(state, before);
+            (state.encode_to_vec(), crate::compute_state_root(&state))
+        }
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(first, second);
     }
 
     #[test]

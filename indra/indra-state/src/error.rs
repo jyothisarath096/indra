@@ -202,6 +202,15 @@ pub enum StateError {
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
 
+    /// A bond-producing operation would exceed one validator's live-bond cap.
+    #[error("validator {validator_id} already has the maximum {max} live stake bonds")]
+    ValidatorBondCountAtMaximum {
+        /// Validator whose bond population is full.
+        validator_id: indra_core::Bytes32,
+        /// Consensus cap in force.
+        max: usize,
+    },
+
     /// Canonical consensus-snapshot construction or retention failed.
     #[error("invalid consensus snapshot state: {0}")]
     InvalidConsensusSnapshot(String),

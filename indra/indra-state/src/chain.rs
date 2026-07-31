@@ -358,6 +358,16 @@ impl Decode for ChainState {
 }
 
 impl ChainState {
+    /// Sum active delegated principal from authoritative bond records.
+    pub fn total_active_delegated_bond_stake(&self) -> u64 {
+        self.staked_bonds
+            .values()
+            .filter(|bond| {
+                bond.validator_id != bond.delegator_id && bond.unbonding_end_epoch.is_none()
+            })
+            .fold(0u64, |sum, bond| sum.saturating_add(bond.amount_spark))
+    }
+
     /// Create the genesis state (before any block has been applied).
     ///
     /// This is the canonical starting point for every INDRA node.

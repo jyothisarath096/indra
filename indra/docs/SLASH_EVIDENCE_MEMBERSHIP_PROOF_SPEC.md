@@ -1,4 +1,4 @@
-# Slash-Evidence Membership Proofs
+# Slash-Evidence Membership Proofs and Eviction Tombstones
 
 ## Status and security boundary
 
@@ -21,12 +21,15 @@ The repair adds:
 2. a bounded canonical history of those roots for the existing 500-epoch
    evidence window; and
 3. a proof-carrying slash-evidence format whose signatures are verified using
-   the historical snapshot entry proven by the evidence.
+   the historical snapshot entry proven by the evidence; and
+4. a separate, bounded evicted-validator tombstone collection that preserves
+   slashable bond custody and release metadata after full-registry eviction
+   without consuming a live `ValidatorSet` slot.
 
 This changes slash-evidence validity, block encoding, canonical state, state
 roots, replay, and checkpoint restore. Passing ordinary tests does not make an
 implementation production-ready. Real activation is prohibited until all
-review gates in Section 10 have passed.
+review gates in Section 11 have passed.
 
 Normative terms **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used in their
 usual protocol-specification sense.
@@ -273,7 +276,7 @@ byte. The authoritative root format is derived only from protocol height:
 slash_membership_root_version_for_height(activation_height)
 ```
 
-Version 1 applies at and after the activation gate in Section 8. A future root
+Version 1 applies at and after the activation gate in Section 9. A future root
 algorithm requires its own height-gated protocol version. Local configuration,
 RPC input, or a proof-supplied version MUST NOT select the root algorithm.
 
@@ -652,17 +655,17 @@ stake rules.
 Historical eligibility and signature verification MUST no longer require the
 validator to be currently Active, Registered, or keyed identically.
 
-**UNRESOLVED IMPLEMENTATION/POLICY DEPENDENCY:** Existing slash application
-still requires current economic records and slashable bonds. Registry eviction
-or other lifecycle removal may leave no current penalty target even though a
-historical membership proof is valid. This specification does not invent
-historical bond retention or recreate an evicted validator. Independent review
-must enumerate those lifecycle cases before implementation is considered
-complete.
+For a validator still present in `ValidatorSet`, current economic records remain
+the penalty target. For a validator removed by a post-activation full-registry
+eviction, Section 7's tombstone and retained `StakeBondEntry` records are the
+penalty target. Absence from both locations MUST fail closed. A membership proof
+proves historical authority; it does not create stake that canonical state no
+longer retains.
 
 ## 6. Coexistence with full consensus snapshots
 
-The two structures have distinct purposes and retention:
+The snapshot and membership-root structures have distinct purposes and
+retention:
 
 ```text
 consensus_snapshots
@@ -680,6 +683,18 @@ They MUST be separate `ChainState` collections and separate state-commitment
 domains. Increasing full-snapshot retention is explicitly not part of this
 design.
 
+Section 7 adds a third, separate collection:
+
+```text
+evicted_validator_tombstones
+    identity, custody, eviction timing, and bond references
+    authoritative only for post-eviction economic targeting and release
+    retained until both evidence expiry and final bond maturity
+```
+
+Tombstones do not replace either snapshot collection and cannot answer
+historical membership on their own.
+
 At root creation, both records originate from the same validated full snapshot.
 Tests MUST prove that:
 
@@ -694,9 +709,487 @@ A membership root cannot supply vote weights, bitfield positions, totals, or
 full candidate sets to live consensus. No consensus consumer may use the root
 history as a fallback when full snapshot lookup fails.
 
-## 7. Bootstrap and pre-activation evidence
+## 7. Evicted-validator tombstones and retained bond custody
 
-### 7.1 Gate alignment and dependency
+### 7.1 Existing eviction defect and design objective
+
+When the live registry is full, current replacement logic selects an evictable
+validator, pays pending rewards, removes its delegation records, removes every
+associated `StakeBondEntry`, creates immediately spendable refund outputs, and
+then deletes the `ValidatorEntry`
+(`indra-state/src/delegation.rs:945-963`,
+`indra-state/src/delegation.rs:1061-1178`). It does this without respecting
+each bond's `unbonding_end_epoch`. Later evidence then fails because slash
+application begins with a live-registry lookup
+(`indra-state/src/apply.rs:141-170`).
+
+The live `ValidatorSet` is canonically capped at `MAX_VALIDATORS = 1,500`, and
+the cap includes all retained lifecycle entries
+(`indra-core/src/types/primitives.rs:29`,
+`indra-state/src/validator.rs:755-758`,
+`indra-state/src/validator.rs:1047-1056`). Keeping an evicted validator as
+`ValidatorStatus::Exited` would therefore fail to free the slot. Excluding such
+entries from the cap would instead make the registry unbounded. Tombstones MUST
+be a separate canonical collection and MUST NOT count toward the 1,500 live
+registry entries.
+
+The post-activation eviction transition has four objectives:
+
+1. remove the victim from the live registry so the new validator can register;
+2. retain all bond principal under its existing canonical bond IDs;
+3. preserve enough identity, historical-key, custody, and timing data to apply
+   valid delayed slash evidence and later release each bond; and
+4. keep the new collection explicitly bounded under adversarial replacement
+   churn.
+
+### 7.2 Canonical structures
+
+Canonical chain state gains:
+
+```text
+EvictedValidatorTombstoneV1
+    format_version: u8 = 1
+    validator_id: Bytes32
+    eviction_height: u64
+    eviction_epoch: u64
+    last_classical_vote_pk: [u8; 32]
+    last_pq_vote_pk: [u8; 2592]
+    last_vrf_pk: [u8; 32]
+    cold_custody:
+        None
+        or {
+            classical_pk: [u8; 32]
+            pq_pk: [u8; 2592]
+            key_version: u64
+        }
+    retained_bonds: ordered list<EvictedBondReferenceV1>
+
+EvictedBondReferenceV1
+    bond_utxo_id: Bytes32
+    delegator_id: Bytes32
+    unbonding_end_epoch: u64
+
+ChainState
+    evicted_validator_tombstones:
+        ordered map<validator_id, EvictedValidatorTombstoneV1>
+```
+
+`eviction_epoch` MUST equal `epoch_for_height(eviction_height)`. Tombstones are
+keyed by `validator_id`, encoded in ascending validator-ID order, and MUST be
+unique. Bond references are encoded in ascending `bond_utxo_id` order, with no
+duplicates.
+
+The vote and VRF keys are the last complete, validated hot consensus-key set
+held by the removed `ValidatorEntry`. They preserve an auditable identity/key
+record but are not authoritative for a proof-governed infraction: Section 5.2
+still verifies the evidence signatures against the keys inside the membership
+proof for the infraction height. This distinction is necessary if a future
+key-rotation protocol permits the eviction-time key set to differ from the set
+that governed an older height.
+
+`cold_custody` is required when any retained self-bond has
+`StakeBondCustodyOwner::ValidatorColdIdentity`. Today that role resolves
+through the live validator entry when protocol code recreates a released output
+(`indra-state/src/validator.rs:1790-1818`,
+`indra-state/src/epoch.rs:1047-1085`). Deleting the entry without preserving
+the active cold public key would make a normally matured self-bond
+unreleasable. A tombstone MUST reject:
+
+- a missing or malformed hot consensus key;
+- a retained cold-owned bond without a complete active cold custody key;
+- a cold key version inconsistent with the evicted entry;
+- an empty retained-bond list;
+- a bond reference whose `validator_id` does not equal the tombstone ID;
+- a reference whose end epoch differs from its canonical `StakeBondEntry`;
+- duplicate bond IDs within or across tombstones; or
+- any count above the bounds in Section 7.6.
+
+The tombstone deliberately does not duplicate principal, original output,
+unbonding precision, or custody-owner fields. The existing canonical
+`staked_bonds: map<bond_utxo_id, StakeBondEntry>` remains the sole source of
+truth for those values (`indra-state/src/chain.rs:112-113`,
+`indra-state/src/validator.rs:1770-1798`). The tombstone is a bounded ownership
+index and historical validator record. Every referenced bond MUST exist in
+`staked_bonds`, and every retained bond for an absent evicted validator MUST
+have exactly one tombstone reference.
+
+### 7.3 Atomic eviction transition
+
+At a post-activation full-registry replacement, validation MUST complete before
+any state mutation:
+
+1. select the victim under the existing replacement ranking and custody rules;
+2. validate the victim's complete hot keys and any required cold custody keys;
+3. collect all associated bonds in ascending UTXO-ID order;
+4. determine each bond's post-eviction unbonding end epoch;
+5. prove that adding one tombstone and all references remains within the hard
+   bounds;
+6. settle pending validator/delegator rewards under the existing policy; and
+7. validate every resulting bond/tombstone cross-reference.
+
+The atomic mutation then:
+
+1. removes the victim's live delegation and validator records;
+2. for every associated bond that is not already unbonding, begins unbonding at
+   `eviction_height` and sets:
+
+   ```text
+   unbonding_end_epoch =
+       epoch_for_height(eviction_height) + UNBONDING_PERIOD_EPOCHS
+   ```
+
+   using the bond's existing legacy-epoch or height-precise encoding rules;
+3. leaves every already-unbonding bond's existing start precision and
+   `unbonding_end_epoch` unchanged;
+4. inserts one tombstone referencing the resulting bonds;
+5. removes the live validator entry, freeing exactly one `ValidatorSet` slot;
+   and
+6. registers the replacement validator.
+
+No bond principal is converted to a spendable UTXO during eviction.
+`DelegationReturnReason::ValidatorEvicted`, whose current comment promises an
+immediate return (`indra-state/src/validator.rs:55-64`), MUST NOT be emitted by
+the post-gate path. A matured release continues to use
+`DelegationReturnReason::UnbondingMatured`.
+
+**DESIGN JUDGMENT — REQUIRES ECONOMIC AND STATE-MACHINE REVIEW:** An active
+bond has no pre-existing maturity schedule. This specification treats eviction
+as the event that starts its ordinary 1,008-epoch unbonding period. An
+already-unbonding bond keeps its earlier schedule. Immediately releasing active
+bonds recreates the defect; restarting the clock for already-unbonding bonds
+would extend a lock that was already promised. External review MUST confirm
+this asymmetric rule.
+
+The whole replacement MUST be transactional. Failure to create or commit the
+tombstone, update every bond, or insert the replacement validator MUST restore
+the exact pre-eviction registry, bonds, delegations, rewards, UTXOs,
+commitments, and event log.
+
+### 7.4 Historical authority and the already-exited distinction
+
+For proof-governed evidence at infraction height `H` against a validator absent
+from the live registry, slash validation MUST require all of:
+
+1. a unique tombstone for `validator_id`;
+2. `H <= tombstone.eviction_height`;
+3. the authoritative membership root record for `H`;
+4. a valid membership proof for the same validator ID in `S(H)`;
+5. both vote signatures valid under the keys in that proven entry;
+6. the ordinary equivocation, chain-ID, duplicate, and 500-epoch window rules;
+   and
+7. at least one canonical self-bond reference that remains slashable under the
+   existing height-aware bond predicate.
+
+The non-strict height comparison is intentional. An eviction applied while
+processing block `E` changes post-`E` economic state, while `S(E)` may still
+authorize the validator for consensus at height `E`. Membership in `S(H)` is
+the decisive historical-authority proof; the tombstone's eviction height
+prevents a tombstone from being used for an alleged later infraction.
+
+A validator that fully exited before `H` cannot satisfy the membership proof
+for `S(H)`. This is the cryptographic distinction current
+`ValidatorStatus::Exited` rejection cannot make. The live-registry `Exited`
+rule remains unchanged for legacy evidence and for entries not removed through
+the gated tombstone transition.
+
+The tombstone's eviction-time hot keys MUST NOT override proof keys or permit a
+legacy evidence item to masquerade as proof-governed evidence. For infractions
+before the membership-proof gate, Section 8.3's legacy rules remain in force;
+an eviction tombstone alone does not prove pre-gate authority.
+
+On a valid tombstone-targeted slash:
+
+- slash amount and reporter/burn accounting use the existing policy;
+- only retained self-bonds selected by the existing slashability predicate are
+  reduced;
+- delegated principal is not made slashable by this design;
+- the global applied-evidence hash is inserted as today;
+- the tombstone remains until its ordinary pruning conditions are met; and
+- later maturity releases the reduced principal.
+
+There is no live `ValidatorEntry` to mark `Slashed`. Absence from the live
+registry already permanently excludes the evicted identity from active-set and
+reward eligibility while the tombstone exists. Re-registration under the same
+validator ID MUST be rejected until the tombstone is pruned, preventing a new
+live identity from aliasing a retained penalty target.
+
+### 7.5 Bond custody, maturity, and release
+
+Retained principal continues to live in the existing `staked_bonds` map. This
+preserves `StakeBondEntry.original_output`, amount, custody role, precise
+unbonding metadata, existing bond encoding, and the existing staked-bond
+commitment leaf. It avoids a second principal-bearing store and makes
+double-release structurally detectable.
+
+The normal maturity scan currently visits all `staked_bonds`, selects entries
+whose `unbonding_end_epoch <= current_epoch`, recreates their outputs, and
+removes them (`indra-state/src/epoch.rs:1003-1042`). The post-gate release path
+MUST additionally:
+
+1. resolve validator cold custody from the tombstone when the live validator
+   lookup is absent;
+2. create the release output under the same height-gated blinding and output
+   rules used for non-evicted bonds;
+3. remove the canonical `StakeBondEntry`;
+4. remove the matching tombstone reference in the same atomic transition; and
+5. emit the ordinary matured-return event where that event is otherwise
+   required.
+
+A referenced bond MUST never be released before its own
+`unbonding_end_epoch`. Slashing MUST never reset or accelerate that epoch.
+Deleting a tombstone while it still contains a bond reference is forbidden.
+Deleting a bond without deleting its reference, or deleting a reference without
+releasing/slashing the corresponding bond as specified, is an invariant error.
+
+Because `SLASH_EVIDENCE_WINDOW_EPOCHS = 500` is less than
+`UNBONDING_PERIOD_EPOCHS = 1008`, a bond whose unbonding begins at eviction
+remains locked throughout every admissible evidence epoch. An already-unbonding
+self-bond is slashable only when its recorded start is not earlier than the
+infraction under the existing legacy/height-precise predicate. This preserves
+the security relationship without extending unrelated delegator locks.
+
+### 7.6 Hard bounds, retention, and full behavior
+
+Introduce fixed consensus constants:
+
+```text
+MAX_EVICTED_VALIDATOR_TOMBSTONES = MAX_VALIDATORS = 1,500
+
+MAX_EVICTED_BOND_REFERENCES =
+    MAX_STAKED_BONDS_DECODE
+```
+
+The first is a semantic write and decode cap. The second is an aggregate cap
+across all tombstones, not a per-tombstone allocation. It cannot exceed the
+already finite canonical staked-bond decode ceiling:
+
+```text
+MAX_STAKED_BONDS_DECODE =
+    MAX_VALIDATORS * MAX_DELEGATORS_PER_VALIDATOR
+```
+
+(`indra-state/src/chain.rs:32-41`,
+`indra-state/src/validator.rs:32-38`). This ceiling is very large
+(150,000,000 references at current constants), so implementation review SHOULD
+consider a smaller operational write cap derived from measured legitimate
+bond multiplicity. It MUST NOT select a smaller consensus cap without a
+separate explicit decision and migration analysis.
+
+For tombstone `T`, define:
+
+```text
+evidence_retention_end_epoch(T) =
+    epoch_for_height(T.eviction_height)
+    + SLASH_EVIDENCE_WINDOW_EPOCHS
+
+bonds_empty(T) = T.retained_bonds.is_empty()
+```
+
+Pruning is allowed only after all evidence in the current block has been
+processed and only when:
+
+```text
+current_epoch > evidence_retention_end_epoch(T)
+and bonds_empty(T)
+```
+
+In the ordinary case, newly unbonding bonds keep the tombstone alive for 1,008
+epochs, longer than the 501-record membership-root horizon. That is safe:
+membership roots are needed only while new evidence can be admitted; the
+tombstone remains afterward solely to release locked principal. Tombstones
+therefore do not piggyback on the 501-root collection and do not share its
+retention length.
+
+Prunable tombstones are removed in deterministic ascending order of:
+
+```text
+(eviction_height, validator_id)
+```
+
+before testing capacity for a new eviction. A non-prunable tombstone MUST NEVER
+be removed merely because the count cap is reached.
+
+If an eviction-requiring registration would exceed either hard bound after all
+eligible pruning, the registration MUST fail with a dedicated deterministic
+capacity error. It MUST NOT:
+
+- refund bonds early;
+- delete the oldest protected tombstone;
+- reuse a tombstone key;
+- omit some bond references;
+- fall back to current eviction behavior; or
+- register the newcomer without atomically removing a live victim.
+
+**DESIGN JUDGMENT — REQUIRES AVAILABILITY/DoS REVIEW:** A bounded state cannot
+also permit unlimited adversarial eviction churn. This specification chooses
+economic safety and deterministic backpressure: at tombstone capacity, a new
+registration that requires eviction is rejected until a tombstone becomes
+prunable. Tombstones never consume live-registry slots, so every successful
+post-gate eviction still frees a 1,500-entry slot; however, the separate safety
+cap can temporarily stop further replacements. Any design promising unlimited
+replacement would require a different bounded accumulator or externalized
+custody construction and is not specified here.
+
+### 7.7 Encoding, commitments, replay, and rollback
+
+**DESIGN JUDGMENT — REQUIRES DOMAIN-INVENTORY REVIEW:** Tombstones use a
+dedicated `StateCommitmentV2` domain distinct from validator, bond, consensus
+snapshot, and slash-membership-root domains:
+
+```text
+DOMAIN_EVICTED_VALIDATOR_TOMBSTONE = next_unassigned_domain
+
+leaf_key = derive_key(
+    DOMAIN_EVICTED_VALIDATOR_TOMBSTONE,
+    tombstone.validator_id
+)
+
+leaf_value_hash = H(
+    "INDRA-EVICTED-VALIDATOR-TOMBSTONE-v1" ||
+    EvictedValidatorTombstoneV1.encode(tombstone)
+)
+```
+
+The existing inventory currently ends at consensus snapshots at `0x0A`;
+Section 3.5 provisionally reserves `0x0B` for slash-membership roots
+(`indra-state/src/state_commitment.rs:32-45`). The implementation MUST inventory
+the then-current tree and assign a collision-free value; this specification
+does not hard-code `0x0C` against concurrent work.
+
+Canonical encoding MUST include:
+
+- an explicit collection marker/version;
+- a bounded tombstone count;
+- ascending validator IDs;
+- each tombstone's exact fields;
+- a bounded aggregate bond-reference count; and
+- ascending bond IDs within each record.
+
+Decode and checkpoint restore MUST validate all key material, ordering, count,
+epoch/height, bond existence, bond ownership, custody, and end-epoch
+invariants before accepting state. Unknown tombstone versions fail closed.
+
+Both state-root systems MUST bind the collection. `StateCommitmentV2` uses the
+dedicated leaves above. The legacy/full state-root projection MUST include the
+same canonical tombstone encoding under its own unambiguous collection
+placement. Existing `StakeBondEntry` leaves continue to bind principal and
+bond-local maturity independently.
+
+The collection and every coupled mutation MUST be included in:
+
+- canonical `ChainState` encoding and encoded length;
+- schema decode and pre-gate defaulting;
+- incremental and full state-root reconstruction;
+- projected block application;
+- failed-block and failed-operation rollback;
+- checkpoint save/restore;
+- full replay and archive replay; and
+- differential live-versus-sync tests.
+
+Rollback snapshots must cover the live validator/delegation removal,
+`staked_bonds`, tombstone map, UTXOs, pending rewards, delegation-return events,
+applied slash hashes, supply accounting, and both commitment systems as one
+atomic unit.
+
+### 7.8 Activation and migration
+
+Tombstone retention and membership-proof enforcement MUST share
+`SLASH_MEMBERSHIP_PROOF_HEIGHT = G` and
+`BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP`.
+
+This is an atomic security dependency, not merely deployment convenience:
+
+- membership proofs without tombstone retention still allow an evicted
+  offender's economic target to disappear; and
+- tombstones without membership proofs cannot safely distinguish authority at
+  the infraction height from an identity that had already exited.
+
+Below `G`, eviction bytes and behavior remain byte-identical: no tombstone
+collection is encoded, and historical replay retains the existing immediate
+refund/removal behavior. At and after `G`, every full-registry eviction uses
+the tombstone path. Snapshot/checkpoint decoding supplies an empty tombstone
+map for pre-gate state.
+
+There is no bulk migration:
+
+- validators present at `G` remain ordinary live entries;
+- existing bonds remain in their current formats;
+- a tombstone is created only if a post-`G` eviction occurs; and
+- validators evicted before `G` cannot be reconstructed or retroactively
+  slashed through this mechanism.
+
+Proof-governed evidence for `H >= G` may target a post-`G` tombstone. Legacy
+evidence for `H < G` follows Section 8.3 and MUST NOT acquire historical
+eligibility merely from the new tombstone. External review must test the
+entire transitional legacy tail.
+
+A separate tombstone gate would create an interval in which one half of the
+security invariant is active without the other. This specification rejects
+that split. If implementation sequencing requires separate enrollment and
+enforcement heights, the document MUST be revised and independently reviewed
+before either height is chosen.
+
+### 7.9 Required review additions
+
+Section 11's four gates apply to this section. In addition, reviewers MUST
+cover:
+
+1. **Custody and accounting:** no early release, double release, lost release,
+   principal duplication, supply drift, reporter overpayment, or slash of
+   delegated principal.
+2. **Lifecycle authority:** live, unbonding, evicted, re-registration, already
+   exited, already slashed, and key-rotation cases around the exact infraction
+   and eviction heights.
+3. **Bounds and denial of service:** maximum tombstones, aggregate bond
+   references, repeated replacement churn, capacity rejection, decode limits,
+   and deterministic pruning.
+4. **Atomicity:** injected failure after every eviction, slash, release, and
+   replacement mutation, with byte-identical rollback.
+5. **Replay and migration:** pre-gate byte identity, mixed legacy/proof
+   evidence, live/sync/checkpoint equivalence, and cross-binary rejection.
+6. **Operational soak:** delayed evidence against an evicted validator,
+   maturity before and after tombstone evidence expiry, restart during retained
+   custody, and cap-pressure behavior.
+
+No real activation may proceed if review cannot establish that the
+500-versus-1,008 security relationship still holds through eviction.
+
+### 7.10 Honest limitations and unresolved decisions
+
+This design deliberately does not:
+
+1. recover validators or bonds already evicted before `G`;
+2. make delegated principal slashable;
+3. provide the archive/indexer service needed to construct historical
+   membership proofs;
+4. support unlimited eviction churn;
+5. define a future consensus-key rotation history beyond using proof keys as
+   authority;
+6. change pending-reward policy at eviction;
+7. change ordinary `Exited` lifecycle semantics; or
+8. turn tombstones into a general historical validator query API.
+
+The following judgments require explicit approval before implementation:
+
+1. active bonds begin a fresh ordinary unbonding period at eviction, while
+   already-unbonding bonds retain their existing end epoch;
+2. eviction-time cold custody keys are retained because current self-bond
+   release resolution otherwise depends on the deleted live entry;
+3. tombstones are capped at 1,500 and aggregate references at the existing
+   staked-bond decode ceiling;
+4. safe capacity exhaustion rejects further eviction-requiring registrations;
+5. same-height `H == eviction_height` evidence is allowed when membership in
+   `S(H)` is proven;
+6. re-registration under a tombstoned validator ID is forbidden;
+7. tombstones and membership proofs share one gate/protocol version; and
+8. the commitment uses a newly inventoried domain rather than sharing the
+   validator or bond leaf.
+
+These are protocol decisions, not descriptions of current behavior.
+
+## 8. Bootstrap and pre-activation evidence
+
+### 8.1 Gate alignment and dependency
 
 Introduce:
 
@@ -714,7 +1207,7 @@ CONSENSUS_SNAPSHOT_HEIGHT <= G
 The snapshot mechanism must already be active and proven stable. `G` is the
 first height governed by a newly selected snapshot `S(G)`.
 
-### 7.2 Bootstrap root
+### 8.2 Bootstrap root
 
 At parent boundary `B = G - 1`, state already contains and commits the full
 bootstrap snapshot `S(G)`. Pre-gate canonical root-history fields remain
@@ -739,7 +1232,7 @@ this special bootstrap but add a second gate. External reviewers may require
 that alternative; implementation MUST NOT guess if review rejects the
 single-gate bootstrap.
 
-### 7.3 Pre-activation infractions
+### 8.3 Pre-activation infractions
 
 There is no deterministic way for ordinary pruned nodes to backfill 500 prior
 membership roots from parent state at `G`. Archive replay could reconstruct
@@ -762,9 +1255,9 @@ This is a deliberate design judgment. A policy that rejects all newly
 submitted pre-`G` evidence at activation would effectively reset the evidence
 window and requires a separate explicit decision; it is not selected here.
 
-## 8. Protocol migration and compatibility
+## 9. Protocol migration and compatibility
 
-### 8.1 Block protocol version
+### 9.1 Block protocol version
 
 Activation MUST add a new block protocol version:
 
@@ -781,20 +1274,24 @@ evidence list as V1.
 The containing block height and declared protocol version MUST agree. A local
 flag cannot enable or disable proof enforcement.
 
-### 8.2 Pre-gate byte identity
+### 9.2 Pre-gate byte identity
 
 Below `G`:
 
 - block protocol version is unchanged;
 - block bodies retain untagged `SlashEvidenceV1`;
 - `ChainState` omits `slash_membership_roots`;
+- `ChainState` omits `evicted_validator_tombstones`;
+- full-registry eviction retains its legacy immediate-refund behavior;
 - state roots omit membership-root leaves;
+- state roots omit tombstone leaves;
 - replay produces byte-identical historical blocks and state; and
-- snapshot-file decoding supplies an empty pre-activation root collection.
+- snapshot-file decoding supplies empty pre-activation root and tombstone
+  collections.
 
 At and after `G`, block and state bytes intentionally change.
 
-### 8.3 Projection, sync, and mempool behavior
+### 9.3 Projection, sync, and mempool behavior
 
 Live proposal validation, block projection, sync import, full replay, and
 checkpoint continuation MUST use the same height-derived evidence rule and
@@ -811,18 +1308,19 @@ Pending evidence pools MUST:
 Proof unavailability means the item cannot be proposed; it does not authorize a
 validation bypass.
 
-### 8.4 Checkpoint and sync requirements
+### 9.4 Checkpoint and sync requirements
 
-A post-gate checkpoint MUST contain the exact canonical rolling root history.
-Restore MUST validate ordering, root versions by activation height, maximum
-retention, pruning eligibility, and consistency with any retained full
-snapshots.
+A post-gate checkpoint MUST contain the exact canonical rolling root history
+and tombstone collection. Restore MUST validate root ordering, root versions by
+activation height, maximum retention, pruning eligibility, consistency with
+any retained full snapshots, tombstone bounds, key/custody validity, and every
+tombstone-to-bond cross-reference.
 
 Sequential sync regenerates roots at each boundary. A checkpoint lacking a
 required nonexpired root MUST be rejected rather than repaired from a peer or
 current registry.
 
-## 9. Downgrade and regression prohibitions
+## 10. Downgrade and regression prohibitions
 
 After activation:
 
@@ -845,9 +1343,19 @@ After activation:
 10. The historical snapshot weight in the proof MUST NOT replace current
     slashable-bond accounting.
 11. The two-snapshot consensus lookup MUST NOT consume compact root records.
-12. Pre-gate blocks and states MUST remain byte-identical under replay.
+12. A post-gate eviction MUST NEVER refund or delete a bond before its own
+    `unbonding_end_epoch`.
+13. A tombstone MUST NEVER be pruned while it retains a bond or while evidence
+    about a pre-eviction governed height remains admissible.
+14. Tombstone-cap pressure MUST NEVER select an unsafe fallback, partial
+    tombstone, or early release.
+15. Proof-governed evidence against an evicted validator MUST NEVER use the
+    tombstone's eviction-time keys instead of the proven historical keys.
+16. A tombstone and its referenced bonds MUST NEVER disagree about validator
+    identity, bond ID, custody, or maturity.
+17. Pre-gate blocks and states MUST remain byte-identical under replay.
 
-## 10. Required external review and activation gates
+## 11. Required external review and activation gates
 
 Real activation requires all four gates. These are minimum requirements, not
 optional recommendations.
@@ -862,8 +1370,9 @@ structures and consensus protocol migrations must review:
 - proof orientation and exact-depth checks;
 - resistance to leaf/padding, tree-size, and cross-snapshot substitution;
 - root-history selection and pruning;
+- tombstone identity binding and exact-height eviction ordering;
 - legacy-tail semantics; and
-- the single-gate bootstrap.
+- the single-gate bootstrap and atomic tombstone activation.
 
 Review must include independent test vectors for 1, 4, 20, 50, 100, and 200
 members.
@@ -878,6 +1387,8 @@ An independent audit must cover:
 - `StateCommitmentV2` domain inventory and incremental updates;
 - transaction rollback and failed-block atomicity;
 - boundary root creation and pruning order;
+- tombstone/bond encoding, bounds, custody resolution, maturity, and pruning;
+- eviction, slash, release, and replacement atomicity;
 - live, projected, sync, replay, and restored-checkpoint equivalence;
 - use of proven historical keys;
 - evidence-pool and archive/indexer proof generation; and
@@ -892,6 +1403,10 @@ Tests must include:
   entry field, and padding;
 - a current registry key differing from the historical proven key;
 - validator currently demoted, slashed, exited, evicted, or absent;
+- eviction before, at, and after the alleged infraction height;
+- active and already-unbonding bonds at eviction;
+- tombstone and bond-reference cap exhaustion;
+- injected rollback failure at every eviction/slash/release mutation;
 - evidence at the first and last valid window epoch;
 - pruning immediately after expiry;
 - boundary and activation-height evidence;
@@ -911,20 +1426,26 @@ Only after Gates 1-3:
 - exercise immediate and delayed evidence across multiple root rotations;
 - restart and sync both archive and pruned nodes;
 - verify root-history pruning after synthetic accelerated-window tests;
+- exercise retained-bond maturity and delayed slashing through eviction;
+- exercise deterministic registration rejection under tombstone-cap pressure;
 - soak for a deliberately chosen period; and
 - conduct an explicit go/no-go review.
 
 Mainnet requires a separately reviewed activation height and cannot inherit a
 testnet constant accidentally.
 
-## 11. Complexity, costs, and implementation staging
+## 12. Complexity, costs, and implementation staging
 
-### 11.1 Cost summary
+### 12.1 Cost summary
 
 - Canonical root history: exactly 20,044 bytes at 501 records.
 - Membership proof: 2,717–2,973 bytes.
 - Typical proof-carrying evidence: approximately 12.3–12.6 KB.
 - Maximum additional proof bytes for three slash items: 8,919 bytes.
+- Tombstone base encoding: 2,710 bytes without cold custody or 5,342 bytes
+  with cold custody, plus 72 bytes per retained bond reference.
+- 1,500 cold-custody tombstones with no bond references: 8,013,004 bytes
+  (7.64 MiB), including the four-byte outer count.
 
 These replace the roughly 257 MiB maximum-set canonical cost of retaining 500
 full 200-validator snapshots.
@@ -942,7 +1463,17 @@ This refines “hundreds of MB” to 257.65 MiB at the active-set ceiling and
 shows that even the current four-validator set would otherwise consume
 5.18 MiB canonically.
 
-### 11.2 Relative implementation size
+The tombstone collection's principal remains in the already-counted
+`staked_bonds` map; the figures above are index/key overhead, not duplicated
+stake outputs. The inherited aggregate ceiling of 150,000,000 references has a
+theoretical reference-only encoding cost of 10,800,000,000 bytes
+(10.06 GiB). That is a finite fail-closed ceiling, not an acceptable operating
+target. The smaller write-cap question in Section 7.6 is therefore a material
+state-growth judgment that external review must resolve before implementation,
+and these numbers refine the earlier investigation's root-history-only cost
+estimate.
+
+### 12.2 Relative implementation size
 
 This is smaller in consumer breadth than the versioned consensus-snapshot arc:
 it does not change voting, QCs, proposer election, or VRF quorum.
@@ -955,29 +1486,36 @@ It is nevertheless a medium-to-large consensus migration because it changes:
 - canonical state and state roots;
 - snapshot/checkpoint schema;
 - epoch-boundary retention;
+- validator replacement, retained custody, bond maturity, and release;
 - replay and sync; and
 - proof-generation operations.
 
-It is likely comparable to a substantial portion of the hot/cold arc, but more
-concentrated in state-machine and authenticated-data-structure risk.
+With the tombstone portion included, this is a large consensus migration. It is
+still narrower than the versioned consensus-snapshot arc in live-consensus
+consumer breadth, but is comparable to the hot/cold arc in custody and
+state-machine surface and adds authenticated-data-structure risk on top.
 
-### 11.3 Suggested implementation stages
+### 12.3 Suggested implementation stages
 
 This document does not authorize implementation. If later authorized, a safe
 stage breakdown is:
 
 1. isolated root/proof primitives and independent vectors;
 2. canonical root-history state and retention;
-3. V2 evidence/block encoding behind inert gates;
-4. slash validation using proven historical keys;
-5. proof generation and archive/indexer RPC;
-6. replay, restore, sync, and rollback integration;
-7. adversarial capstone and external review remediation; and
-8. separate activation-height decision.
+3. isolated tombstone/bond-reference encoding, bounds, and invariants;
+4. atomic eviction, retained custody, maturity, and rollback behind the inert
+   shared gate;
+5. V2 evidence/block encoding behind that gate;
+6. slash validation using proven historical keys and live-or-tombstone
+   economic targets;
+7. proof generation and archive/indexer RPC;
+8. replay, restore, sync, checkpoint, and rollback integration;
+9. adversarial capstone and external review remediation; and
+10. separate activation-height decision.
 
-## 12. Honest limitations and decisions still required
+## 13. Honest limitations and decisions still required
 
-### 12.1 Resolved by this specification
+### 13.1 Resolved by this specification
 
 This specification resolves:
 
@@ -988,16 +1526,19 @@ This specification resolves:
 - height-derived lookup;
 - pre/post-gate wire handling;
 - no-backfill legacy-tail behavior;
-- bootstrap timing; and
+- bootstrap timing;
+- post-activation full-registry eviction retention and historical economic
+  targeting; and
 - minimum review gates.
 
-### 12.2 Explicit limitations
+### 13.2 Explicit limitations
 
 It does not solve:
 
-1. **Historical economic-record availability.** A valid membership proof does
-   not guarantee that the current registry and bond state still contain a
-   slashable target.
+1. **Other historical economic-record loss.** Tombstones solve
+   post-activation full-registry eviction only. A valid proof still cannot
+   recreate records lost through a different, unmodeled lifecycle path or
+   before activation.
 2. **Proof availability.** Delayed submitters need archive/indexer support that
    does not exist today. Verification is trustless; proof construction is not
    yet operationally supplied.
@@ -1014,8 +1555,14 @@ It does not solve:
    not create a general historical consensus-query service.
 8. **Root algorithm agility without a fork.** A future tree version requires a
    new height-gated protocol transition.
+9. **Tombstone capacity.** Sustained adversarial replacement can exhaust the
+   separate tombstone cap and temporarily reject new eviction-requiring
+   registrations.
+10. **Large inherited bond ceiling.** The existing 150,000,000-bond decode
+    ceiling is finite but too large to be treated as an operational tombstone
+    target; a lower reviewed write cap remains a pre-implementation decision.
 
-### 12.3 Decisions requiring confirmation before implementation
+### 13.3 Decisions requiring confirmation before implementation
 
 The following are deliberate design judgments rather than behavior inherited
 from current code and MUST be explicitly approved after external review:
@@ -1027,8 +1574,13 @@ from current code and MUST be explicitly approved after external review:
 4. single-gate bootstrap derived from committed `S(G)`;
 5. legacy handling for pre-activation infractions until their windows expire;
 6. public/archive proof-generation API and retention obligations; and
-7. policy when historical membership is proven but current slashable economic
-   records are absent.
+7. the tombstone structure, forced-unbonding rule, cold custody retention,
+   exact-height authority rule, re-registration prohibition, and shared gate;
+8. tombstone count and aggregate bond-reference caps, including whether a
+   smaller explicit write cap replaces the inherited decode ceiling;
+9. deterministic rejection when protected tombstone capacity is exhausted;
+   and
+10. a newly inventoried tombstone commitment domain.
 
 No implementation should begin by silently choosing different answers to these
 items. Any change requires an updated specification and review.

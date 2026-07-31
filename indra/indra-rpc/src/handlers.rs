@@ -7,9 +7,9 @@ use indra_core::{
     codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
-        Bytes32 as CoreBytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-        NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        delegator_bond_accounting_active, Bytes32 as CoreBytes32,
+        COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+        SCHEMA_VERSION, SCHEMA_VERSION_GENESIS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -568,10 +568,13 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let s = &state.chain;
     let tip = hex::encode(s.tip_hash.0);
     let active_validators = s.validators.active_count();
-    let total_staked_spark = s
-        .validators
-        .total_selectable_self_stake()
-        .saturating_add(s.delegations.total_staked());
+    let total_staked_spark = s.validators.total_selectable_self_stake().saturating_add(
+        if delegator_bond_accounting_active(s.height) {
+            s.total_active_delegated_bond_stake()
+        } else {
+            s.delegations.total_staked()
+        },
+    );
     let max_active_validators =
         indra_core::types::primitives::max_active_validators(total_staked_spark);
     let effective_min_stake_spark = s
@@ -1750,14 +1753,35 @@ fn get_delegations(params: &[String], state: &NodeState<'_>) -> RpcResult<String
         .get_delegators(&validator_id)
         .iter()
         .map(|entry| {
-            format!(
-                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{}}}"#,
-                hex::encode(entry.delegator_id.0),
-                entry.staked_spark,
-                entry.pending_rewards,
-                if entry.unbonding_end_epoch.is_some() { "true" } else { "false" },
-                entry.unbonding_end_epoch.unwrap_or(0),
-            )
+            let (staked_spark, active_bonds, unbonding_bonds) =
+                rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
+            let precise = delegator_bond_accounting_active(state.chain.height);
+            let unbonding = if precise {
+                active_bonds == 0 && unbonding_bonds > 0
+            } else {
+                entry.unbonding_end_epoch.is_some()
+            };
+            if precise {
+                format!(
+                    r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                    hex::encode(entry.delegator_id.0),
+                    staked_spark,
+                    entry.pending_rewards,
+                    if unbonding { "true" } else { "false" },
+                    entry.unbonding_end_epoch.unwrap_or(0),
+                    active_bonds,
+                    unbonding_bonds,
+                )
+            } else {
+                format!(
+                    r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{}}}"#,
+                    hex::encode(entry.delegator_id.0),
+                    entry.staked_spark,
+                    entry.pending_rewards,
+                    if entry.unbonding_end_epoch.is_some() { "true" } else { "false" },
+                    entry.unbonding_end_epoch.unwrap_or(0),
+                )
+            }
         })
         .collect();
     let bonds: Vec<String> = state
@@ -1807,13 +1831,24 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 .get(validator_id)
                 .map(|validator| (validator.name.clone(), validator.commission_bps))
                 .unwrap_or_else(|| ("unknown".to_string(), 1_000));
-            let unbonding = entry.unbonding_end_epoch.is_some();
+            let (active_stake, active_bonds, unbonding_bonds) =
+                rpc_delegator_bond_status(state.chain, validator_id, &entry.delegator_id);
+            let precise = delegator_bond_accounting_active(state.chain.height);
+            let unbonding = if precise {
+                active_bonds == 0 && unbonding_bonds > 0
+            } else {
+                entry.unbonding_end_epoch.is_some()
+            };
             let unbonding_end = entry
                 .unbonding_end_epoch
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "null".to_string());
 
-            total_staked = total_staked.saturating_add(entry.staked_spark);
+            total_staked = total_staked.saturating_add(if precise {
+                active_stake
+            } else {
+                entry.staked_spark
+            });
             total_rewards = total_rewards.saturating_add(entry.pending_rewards);
             if unbonding {
                 unbonding_positions = unbonding_positions.saturating_add(1);
@@ -1821,17 +1856,33 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 active_positions = active_positions.saturating_add(1);
             }
 
-            positions.push(format!(
-                r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{}}}"#,
-                hex::encode(validator_id.0),
-                validator_name,
-                entry.staked_spark,
-                entry.pending_rewards,
-                entry.rewards_last_epoch,
-                if unbonding { "true" } else { "false" },
-                unbonding_end,
-                commission_bps,
-            ));
+            positions.push(if precise {
+                format!(
+                    r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                    hex::encode(validator_id.0),
+                    validator_name,
+                    active_stake,
+                    entry.pending_rewards,
+                    entry.rewards_last_epoch,
+                    if unbonding { "true" } else { "false" },
+                    unbonding_end,
+                    commission_bps,
+                    active_bonds,
+                    unbonding_bonds,
+                )
+            } else {
+                format!(
+                    r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{}}}"#,
+                    hex::encode(validator_id.0),
+                    validator_name,
+                    entry.staked_spark,
+                    entry.pending_rewards,
+                    entry.rewards_last_epoch,
+                    if unbonding { "true" } else { "false" },
+                    unbonding_end,
+                    commission_bps,
+                )
+            });
         }
     }
 
@@ -1844,6 +1895,32 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
         active_positions,
         unbonding_positions,
     ))
+}
+
+fn rpc_delegator_bond_status(
+    state: &ChainState,
+    validator_id: &Bytes32,
+    delegator_id: &Bytes32,
+) -> (u64, u64, u64) {
+    state
+        .staked_bonds
+        .values()
+        .filter(|bond| {
+            bond.validator_id == *validator_id
+                && bond.delegator_id == *delegator_id
+                && bond.validator_id != bond.delegator_id
+        })
+        .fold((0u64, 0u64, 0u64), |(stake, active, unbonding), bond| {
+            if bond.unbonding_end_epoch.is_none() {
+                (
+                    stake.saturating_add(bond.amount_spark),
+                    active.saturating_add(1),
+                    unbonding,
+                )
+            } else {
+                (stake, active, unbonding.saturating_add(1))
+            }
+        })
 }
 
 /// `indra_getDelegationReturnEvents` — returns automatic principal-return events for a delegator.
@@ -1963,22 +2040,47 @@ fn get_validator_delegators(params: &[String], state: &NodeState<'_>) -> RpcResu
         .iter()
         .take(1_000)
     {
-        let unbonding = entry.unbonding_end_epoch.is_some();
+        let (active_stake, active_bonds, unbonding_bonds) =
+            rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
+        let precise = delegator_bond_accounting_active(state.chain.height);
+        let unbonding = if precise {
+            active_bonds == 0 && unbonding_bonds > 0
+        } else {
+            entry.unbonding_end_epoch.is_some()
+        };
         let unbonding_end = entry
             .unbonding_end_epoch
             .map(|epoch| epoch.to_string())
             .unwrap_or_else(|| "null".to_string());
-        total_delegated = total_delegated.saturating_add(entry.staked_spark);
+        total_delegated = total_delegated.saturating_add(if precise {
+            active_stake
+        } else {
+            entry.staked_spark
+        });
         total_rewards = total_rewards.saturating_add(entry.pending_rewards);
-        delegators.push(format!(
-            r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{}}}"#,
-            hex::encode(entry.delegator_id.0),
-            entry.staked_spark,
-            entry.pending_rewards,
-            if unbonding { "true" } else { "false" },
-            unbonding_end,
-            entry.rewards_last_epoch,
-        ));
+        delegators.push(if precise {
+            format!(
+                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                hex::encode(entry.delegator_id.0),
+                active_stake,
+                entry.pending_rewards,
+                if unbonding { "true" } else { "false" },
+                unbonding_end,
+                entry.rewards_last_epoch,
+                active_bonds,
+                unbonding_bonds,
+            )
+        } else {
+            format!(
+                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{}}}"#,
+                hex::encode(entry.delegator_id.0),
+                entry.staked_spark,
+                entry.pending_rewards,
+                if unbonding { "true" } else { "false" },
+                unbonding_end,
+                entry.rewards_last_epoch,
+            )
+        });
     }
 
     Ok(format!(
@@ -2129,7 +2231,11 @@ fn get_epoch_info(state: &NodeState<'_>) -> RpcResult<String> {
         .chain
         .validators
         .total_selectable_self_stake()
-        .saturating_add(state.chain.delegations.total_staked());
+        .saturating_add(if delegator_bond_accounting_active(state.chain.height) {
+            state.chain.total_active_delegated_bond_stake()
+        } else {
+            state.chain.delegations.total_staked()
+        });
     let phase = indra_core::types::primitives::validator_set_phase(total_staked);
     let max_validators = indra_core::types::primitives::max_active_validators(total_staked);
     Ok(format!(
@@ -2957,6 +3063,26 @@ mod tests {
             custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
+    }
+
+    #[test]
+    fn rpc_bond_status_reports_mixed_position_from_individual_bonds() {
+        let mut chain = ChainState::new_genesis();
+        chain.height = u64::MAX;
+        let mut active = test_bond(0x91, false);
+        active.amount_spark = 60;
+        let mut exiting = test_bond(0x92, false);
+        exiting.validator_id = active.validator_id;
+        exiting.delegator_id = active.delegator_id;
+        exiting.amount_spark = 40;
+        exiting.unbonding_end_epoch = Some(1008);
+        chain.staked_bonds.insert(active.utxo_id, active.clone());
+        chain.staked_bonds.insert(exiting.utxo_id, exiting);
+
+        assert_eq!(
+            rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id,),
+            (60, 1, 1)
+        );
     }
 
     fn block_backed_engine() -> BlockBackedEngine {

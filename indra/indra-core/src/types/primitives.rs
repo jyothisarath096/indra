@@ -28,6 +28,9 @@ pub const EPOCH_DURATION_BLOCKS: u64 = 300;
 /// registration cost cannot create unbounded state every node must sync.
 pub const MAX_VALIDATORS: usize = 1_500;
 
+/// Maximum live stake-bond records associated with one validator.
+pub const MAX_LIVE_BONDS_PER_VALIDATOR: usize = 104_096;
+
 /// Maximum delegation-return events retained in consensus state.
 ///
 /// This is a fixed rolling log for operator visibility after forced validator
@@ -649,6 +652,20 @@ pub mod hard_forks {
     /// context only after review and an explicit network activation decision.
     pub const EPOCH_TRANSITION_CONTEXT_HEIGHT: u64 = u64::MAX;
 
+    /// Per-bond delegation lifecycle accounting.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this repairs aggregate delegation accounting
+    /// for delegators with multiple independently-unbonding stake bonds. It
+    /// changes reward credits and governance validity, so activation requires
+    /// a coordinated protocol upgrade.
+    pub const DELEGATOR_BOND_ACCOUNTING_HEIGHT: u64 = u64::MAX;
+
+    /// Per-validator live bond-count cap.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: once activated, new Delegate and SelfStake
+    /// operations cannot create a 104,097th bond for one validator.
+    pub const LIVE_BOND_COUNT_CAP_HEIGHT: u64 = u64::MAX;
+
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
         "compact bond pubkey omission must not activate before identity registry"
@@ -687,6 +704,18 @@ pub const fn epoch_transition_context_height_is_aligned(height: u64) -> bool {
 #[inline]
 pub fn epoch_transition_context_active(height: u64) -> bool {
     height >= hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT
+}
+
+/// Whether per-bond delegation lifecycle accounting governs `height`.
+#[inline]
+pub fn delegator_bond_accounting_active(height: u64) -> bool {
+    height >= hard_forks::DELEGATOR_BOND_ACCOUNTING_HEIGHT
+}
+
+/// Whether the per-validator live bond-count cap governs `height`.
+#[inline]
+pub fn live_bond_count_cap_active(height: u64) -> bool {
+    height >= hard_forks::LIVE_BOND_COUNT_CAP_HEIGHT
 }
 
 /// Whether versioned consensus snapshots govern `height`.
@@ -1033,14 +1062,46 @@ pub const BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT: u16 = 4;
 /// governance-attribution, epoch-record, and reward-rate semantics.
 pub const BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT: u16 = 5;
 
-const fn block_protocol_version_for_height_at_gates(
+/// Block protocol version used at/after DELEGATOR_BOND_ACCOUNTING_HEIGHT.
+pub const BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING: u16 = 6;
+
+/// Block protocol version used at/after LIVE_BOND_COUNT_CAP_HEIGHT.
+pub const BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP: u16 = 7;
+
+const fn block_protocol_version_for_height_at_gates_with_live_bond_cap(
     height: u64,
     reveal_set_height: u64,
     consensus_snapshot_height: u64,
     self_unstake_height_precision_height: u64,
     epoch_transition_context_height: u64,
+    delegator_bond_accounting_height: u64,
+    live_bond_count_cap_height: u64,
 ) -> u16 {
-    if height >= epoch_transition_context_height {
+    if height >= live_bond_count_cap_height {
+        BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+    } else {
+        block_protocol_version_for_height_at_gates_with_bond_accounting(
+            height,
+            reveal_set_height,
+            consensus_snapshot_height,
+            self_unstake_height_precision_height,
+            epoch_transition_context_height,
+            delegator_bond_accounting_height,
+        )
+    }
+}
+
+const fn block_protocol_version_for_height_at_gates_with_bond_accounting(
+    height: u64,
+    reveal_set_height: u64,
+    consensus_snapshot_height: u64,
+    self_unstake_height_precision_height: u64,
+    epoch_transition_context_height: u64,
+    delegator_bond_accounting_height: u64,
+) -> u16 {
+    if height >= delegator_bond_accounting_height {
+        BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
+    } else if height >= epoch_transition_context_height {
         BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
     } else if height >= self_unstake_height_precision_height {
         BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
@@ -1053,15 +1114,35 @@ const fn block_protocol_version_for_height_at_gates(
     }
 }
 
+#[cfg(test)]
+const fn block_protocol_version_for_height_at_gates(
+    height: u64,
+    reveal_set_height: u64,
+    consensus_snapshot_height: u64,
+    self_unstake_height_precision_height: u64,
+    epoch_transition_context_height: u64,
+) -> u16 {
+    block_protocol_version_for_height_at_gates_with_bond_accounting(
+        height,
+        reveal_set_height,
+        consensus_snapshot_height,
+        self_unstake_height_precision_height,
+        epoch_transition_context_height,
+        u64::MAX,
+    )
+}
+
 /// Protocol version required for a block at the supplied height.
 #[inline]
 pub fn block_protocol_version_for_height(height: u64) -> u16 {
-    block_protocol_version_for_height_at_gates(
+    block_protocol_version_for_height_at_gates_with_live_bond_cap(
         height,
         hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
         hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
         hard_forks::SELF_UNSTAKE_HEIGHT_PRECISION_HEIGHT,
         hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
+        hard_forks::DELEGATOR_BOND_ACCOUNTING_HEIGHT,
+        hard_forks::LIVE_BOND_COUNT_CAP_HEIGHT,
     )
 }
 
@@ -1236,6 +1317,8 @@ impl ProtocolVersion {
             || self.0 == BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
             || self.0 == BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
             || self.0 == BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+            || self.0 == BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
+            || self.0 == BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
     }
 }
 
@@ -1257,6 +1340,8 @@ impl Decode for ProtocolVersion {
             && v != BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
             && v != BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
             && v != BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+            && v != BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
+            && v != BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
         {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
@@ -1404,6 +1489,53 @@ mod tests {
     }
 
     #[test]
+    fn delegator_bond_accounting_v6_is_highest_applicable_version() {
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_bond_accounting(
+                600, 100, 200, 300, 400, 600,
+            ),
+            BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_bond_accounting(
+                599, 100, 200, 300, 400, 600,
+            ),
+            BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+        );
+    }
+
+    #[test]
+    fn live_bond_cap_v7_is_highest_applicable_version() {
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_live_bond_cap(
+                700, 100, 200, 300, 400, 600, 700,
+            ),
+            BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_live_bond_cap(
+                699, 100, 200, 300, 400, 600, 700,
+            ),
+            BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
+        );
+        // Independent inert gates may later be scheduled in either order.
+        // Once v7 applies it remains the highest understood version even if
+        // the independently activated v6 behavior starts at a later height.
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_live_bond_cap(
+                500, 100, 200, 300, 400, 600, 500,
+            ),
+            BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_live_bond_cap(
+                600, 100, 200, 300, 400, 600, 500,
+            ),
+            BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+        );
+    }
+
+    #[test]
     fn epoch_transition_gate_alignment_accepts_only_boundaries_or_inert() {
         assert!(epoch_transition_context_height_is_aligned(u64::MAX));
         assert!(epoch_transition_context_height_is_aligned(300));
@@ -1430,7 +1562,7 @@ mod tests {
         }
         assert_eq!(
             block_protocol_version_for_height(u64::MAX),
-            BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+            BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
         );
     }
 
@@ -1457,6 +1589,26 @@ mod tests {
     #[test]
     fn epoch_transition_context_block_protocol_version_round_trips() {
         let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT);
+        assert!(version.is_supported());
+        assert_eq!(
+            ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),
+            version
+        );
+    }
+
+    #[test]
+    fn delegator_bond_accounting_block_protocol_version_round_trips() {
+        let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING);
+        assert!(version.is_supported());
+        assert_eq!(
+            ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),
+            version
+        );
+    }
+
+    #[test]
+    fn live_bond_count_cap_block_protocol_version_round_trips() {
+        let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP);
         assert!(version.is_supported());
         assert_eq!(
             ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),

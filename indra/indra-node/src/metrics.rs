@@ -287,10 +287,13 @@ impl MetricsSnapshot {
         sync_target: u64,
     ) -> Self {
         let s = &engine.state;
-        let total_staked = s
-            .validators
-            .total_selectable_self_stake()
-            .saturating_add(s.delegations.total_staked());
+        let total_staked = s.validators.total_selectable_self_stake().saturating_add(
+            if indra_core::types::primitives::delegator_bond_accounting_active(s.height) {
+                s.total_active_delegated_bond_stake()
+            } else {
+                s.delegations.total_staked()
+            },
+        );
         let validator_id_hex = engine
             .validator_id()
             .map(|id| hex::encode(&id.0[..4]))

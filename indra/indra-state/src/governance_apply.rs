@@ -7,7 +7,8 @@ use indra_core::types::{
         GovernanceOpV2, GovernancePayload,
     },
     primitives::{
-        delegator_identity_registry_active, validator_cold_key_enforcement_active, Bytes32,
+        delegator_bond_accounting_active, delegator_identity_registry_active,
+        validator_cold_key_enforcement_active, Bytes32,
     },
     transaction::OutputV1,
 };
@@ -15,6 +16,7 @@ use indra_crypto::{commit, prove_range, sha256, verify_hybrid};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
+    delegation::active_delegated_bond_stake,
     error::{StateError, StateResult},
     governance::{
         GovernableParams, GovernanceRedelegation, GovernanceState, ProposalPhase, ProposalRecord,
@@ -97,6 +99,7 @@ pub fn apply_governance_op(
             to_validator,
             *amount_spark,
             identity_registry_active,
+            current_height,
         ),
         GovernancePayload::Execute { proposal_id } => {
             apply_execute(state, current_epoch, current_height, proposal_id)
@@ -363,6 +366,7 @@ fn apply_redelegate(
     to_validator: &Bytes32,
     amount_spark: u64,
     identity_registry_active: bool,
+    current_height: u64,
 ) -> StateResult<()> {
     if amount_spark == 0 {
         return invalid("redelegation amount cannot be zero");
@@ -400,9 +404,20 @@ fn apply_redelegate(
         .delegations
         .get_delegators(from_validator)
         .iter()
-        .find(|entry| entry.delegator_id == op.signer_id && entry.unbonding_end_epoch.is_none())
+        .find(|entry| {
+            entry.delegator_id == op.signer_id
+                && (!delegator_bond_accounting_active(current_height)
+                    || active_delegated_bond_stake(state, from_validator, &op.signer_id) > 0)
+                && (delegator_bond_accounting_active(current_height)
+                    || entry.unbonding_end_epoch.is_none())
+        })
         .ok_or(StateError::DelegatorNotFound)?;
-    if amount_spark > entry.staked_spark {
+    let active_stake = if delegator_bond_accounting_active(current_height) {
+        active_delegated_bond_stake(state, from_validator, &op.signer_id)
+    } else {
+        entry.staked_spark
+    };
+    if amount_spark > active_stake {
         return invalid("redelegation exceeds active delegated stake");
     }
     let proposal = state
@@ -2359,6 +2374,76 @@ mod tests {
                 if reason.contains("delegator identity is unresolvable")
         ));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn per_bond_redelegation_accepts_genuinely_active_remainder() {
+        let mut state = ChainState::new_genesis();
+        let from_validator = Bytes32::from([0xC1; 32]);
+        let to_validator = Bytes32::from([0xC2; 32]);
+        let proposal_id = Bytes32::from([0xC3; 32]);
+        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
+        let (delegator_pubkey, delegator_keypair) = keypair(0xC4);
+        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        install_legacy_redelegation_bond(
+            &mut state,
+            Bytes32::from([0xC5; 32]),
+            from_validator,
+            delegator_id,
+            delegator_pubkey.clone(),
+            60,
+            0xC5,
+        );
+        install_legacy_redelegation_bond(
+            &mut state,
+            Bytes32::from([0xC6; 32]),
+            from_validator,
+            delegator_id,
+            delegator_pubkey,
+            40,
+            0xC6,
+        );
+        let exiting_id = Bytes32::from([0xC6; 32]);
+        let mut exiting = state.staked_bonds.get(&exiting_id).unwrap().clone();
+        exiting.unbonding_end_epoch = Some(1008);
+        state.staked_bonds.insert(exiting_id, exiting);
+        state
+            .delegations
+            .update_delegator(&from_validator, &delegator_id, |entry| {
+                entry.staked_spark = 60;
+                entry.unbonding_end_epoch = Some(1008);
+            });
+        let op = redelegate_op(
+            delegator_id,
+            &delegator_keypair,
+            proposal_id,
+            from_validator,
+            to_validator,
+            50,
+            1,
+        );
+
+        apply_redelegate(
+            &mut state,
+            &op,
+            &proposal_id,
+            &from_validator,
+            &to_validator,
+            50,
+            false,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .governance
+                .proposals
+                .get(&proposal_id)
+                .unwrap()
+                .redelegations
+                .len(),
+            1
+        );
     }
 
     #[test]

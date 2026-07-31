@@ -2720,12 +2720,12 @@ mod tests {
 
         install_test_snapshot_at_inert_gate(&mut state);
         let post_activation = make_reveal_set_block(&state, &[0x81], &[0x81]);
-        // This synthetic u64::MAX height activates both currently-inert gates,
-        // so the highest applicable block protocol version is version 5.
+        // This synthetic u64::MAX height activates every currently-inert gate,
+        // so the highest applicable block protocol version is version 7.
         assert_eq!(
             post_activation.header.protocol_version,
             ProtocolVersion(
-                indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+                indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
             )
         );
         assert!(verify_reveal_set_evidence(&post_activation, &state).is_ok());

@@ -1267,7 +1267,7 @@ mod tests {
             primitives::{
                 hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
                 BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
-                BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
                 DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
                 MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
@@ -5715,7 +5715,7 @@ mod tests {
             let post_gate = make_block_at_height(&state, vec![], u64::MAX, 1_900_000_001);
             assert_eq!(
                 post_gate.header.protocol_version,
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT)
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP)
             );
 
             let mut rejected = state.clone();

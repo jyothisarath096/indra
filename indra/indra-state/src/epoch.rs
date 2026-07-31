@@ -20,7 +20,7 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, governance_proposal_pruning_active, muldiv,
+            bps_of, delegator_bond_accounting_active, governance_proposal_pruning_active, muldiv,
             normal_bond_release_blinding_active, overflow_fix_active, state_commitment_v2_active,
             validator_cold_key_enforcement_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
             COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
@@ -36,6 +36,7 @@ use rand::SeedableRng;
 
 use crate::{
     chain::ChainState,
+    delegation::reconcile_delegator_from_bonds,
     error::StateResult,
     governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
@@ -213,6 +214,9 @@ fn apply_epoch_transition_at_gate(
         .validators
         .select_active_set(&state.delegations, total_staked, height);
 
+    if delegator_bond_accounting_active(height) {
+        reconcile_all_delegators_from_bonds(state);
+    }
     let virtual_delegations = apply_auto_delegations(state, current_epoch);
 
     let supply_before = state.total_supply;
@@ -302,6 +306,22 @@ fn apply_epoch_transition_at_gate(
         state.rebuild_state_commitment_v2(height);
     }
     Ok(record)
+}
+
+fn reconcile_all_delegators_from_bonds(state: &mut ChainState) {
+    let positions: Vec<(Bytes32, Bytes32)> = state
+        .delegations
+        .all_delegators()
+        .flat_map(|(validator_id, entries)| {
+            entries
+                .iter()
+                .map(|entry| (*validator_id, entry.delegator_id))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for (validator_id, delegator_id) in positions {
+        reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
+    }
 }
 
 fn block_rewards_for_inclusive_range(start_height: u64, end_height: u64) -> u64 {
@@ -583,7 +603,21 @@ pub fn take_governance_snapshot(state: &ChainState) -> GovernanceSnapshot {
             validator.status,
             ValidatorStatus::Active | ValidatorStatus::Registered
         ) {
-            let delegated = state.delegations.total_delegated(&validator.validator_id);
+            let delegated = if delegator_bond_accounting_active(state.height) {
+                state
+                    .delegations
+                    .get_delegators(&validator.validator_id)
+                    .iter()
+                    .fold(0u64, |sum, entry| {
+                        sum.saturating_add(crate::delegation::active_delegated_bond_stake(
+                            state,
+                            &validator.validator_id,
+                            &entry.delegator_id,
+                        ))
+                    })
+            } else {
+                state.delegations.total_delegated(&validator.validator_id)
+            };
             let weight = validator.stake_spark.saturating_add(delegated);
             if weight > 0 {
                 weights.insert(validator.validator_id, weight);
@@ -1006,6 +1040,7 @@ pub(crate) fn release_unbonded_bonds_at_height(
     current_epoch: u64,
     release_height: u64,
 ) -> StateResult<()> {
+    let precise_accounting = delegator_bond_accounting_active(release_height);
     let mut to_release: Vec<Bytes32> = state
         .staked_bonds
         .values()
@@ -1028,8 +1063,12 @@ pub(crate) fn release_unbonded_bonds_at_height(
         .collect();
     to_release.sort_by_key(|id| id.0);
 
+    let mut affected_delegators = Vec::new();
     for (idx, utxo_id) in to_release.into_iter().enumerate() {
         if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
+            if precise_accounting && bond.validator_id != bond.delegator_id {
+                affected_delegators.push((bond.validator_id, bond.delegator_id));
+            }
             let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
             let output = released_bond_output(state, &bond, release_height)?;
             let refund_utxo_id = state
@@ -1050,6 +1089,14 @@ pub(crate) fn release_unbonded_bonds_at_height(
                     refund_utxo_id,
                 });
             }
+        }
+    }
+    if precise_accounting {
+        affected_delegators
+            .sort_by_key(|(validator_id, delegator_id)| (validator_id.0, delegator_id.0));
+        affected_delegators.dedup();
+        for (validator_id, delegator_id) in affected_delegators {
+            reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
         }
     }
     Ok(())
@@ -3059,6 +3106,78 @@ mod tests {
                 .pending_rewards,
             900
         );
+    }
+
+    #[test]
+    fn partial_bond_exit_keeps_sixty_unit_active_remainder_rewarded() {
+        let mut state = ChainState::new_genesis();
+        let mut validator = make_validator(0xD7, 1_000);
+        validator.commission_bps = 1_000;
+        let validator_id = validator.validator_id;
+        state.validators.upsert(validator).unwrap();
+        let delegator_id = Bytes32::from([0xD8; 32]);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 100, 0)
+            .unwrap();
+        let active = compact_bond(0xD9, validator_id, delegator_id, 60);
+        let mut exiting = compact_bond(0xDA, validator_id, delegator_id, 40);
+        exiting.unbonding_end_epoch = Some(1008);
+        state.staked_bonds.insert(active.utxo_id, active);
+        state.staked_bonds.insert(exiting.utxo_id, exiting);
+
+        reconcile_all_delegators_from_bonds(&mut state);
+        let entry = state
+            .delegations
+            .get_delegators(&validator_id)
+            .first()
+            .unwrap();
+        assert_eq!(entry.staked_spark, 60);
+        assert_eq!(entry.unbonding_end_epoch, None);
+
+        distribute_block_rewards(&mut state, 1_000, 1, 0);
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id),
+            900
+        );
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().pending_rewards,
+            100
+        );
+
+        state.fee_reward_pool = 1_000;
+        distribute_fee_rewards(&mut state, 1, 0);
+        assert_eq!(
+            state
+                .delegations
+                .get_delegator_reward(&validator_id, &delegator_id),
+            1_800
+        );
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().pending_rewards,
+            200
+        );
+    }
+
+    #[test]
+    fn precise_accounting_removes_empty_aggregate_after_final_bond_matures() {
+        let mut state = ChainState::new_genesis();
+        let validator_id = Bytes32::from([0xE1; 32]);
+        let delegator_id = Bytes32::from([0xE2; 32]);
+        state
+            .delegations
+            .add_delegation(validator_id, delegator_id, 40, 0)
+            .unwrap();
+        let mut bond = compact_bond(0xE3, validator_id, delegator_id, 40);
+        bond.unbonding_end_epoch = Some(1);
+        state.staked_bonds.insert(bond.utxo_id, bond);
+
+        release_unbonded_bonds_at_height(&mut state, 1, u64::MAX).unwrap();
+
+        assert!(state.staked_bonds.is_empty());
+        assert!(state.delegations.get_delegators(&validator_id).is_empty());
     }
 
     #[test]
