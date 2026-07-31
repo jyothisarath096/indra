@@ -70,6 +70,7 @@ use crate::{
     fee::compute_next_base_fee,
     governance_apply::apply_governance_op,
     txn::StateTxn,
+    validator::{StakeBondEntry, StakeBondUnbondingPrecision},
 };
 
 /// Roots and value commitment produced by temporarily projecting a block.
@@ -85,6 +86,39 @@ pub struct ProjectedBlockRoots {
     pub total_supply: u64,
     /// Epoch record produced by the projected block, if it crosses an epoch boundary.
     pub epoch_record: Option<EpochRecord>,
+}
+
+/// Decide whether a self-bond backed authority at the infraction height.
+fn self_bond_is_slashable_at_height(
+    bond: &StakeBondEntry,
+    infraction_height: u64,
+) -> StateResult<bool> {
+    bond.validate_unbonding_precision()
+        .map_err(|_| StateError::InvariantViolation {
+            message: "malformed stake-bond unbonding precision",
+        })?;
+    match (bond.unbonding_end_epoch, bond.unbonding_precision) {
+        (None, _) => Ok(true),
+        (Some(end_epoch), StakeBondUnbondingPrecision::LegacyEpochOnly) => {
+            let infraction_epoch = epoch_for_height(infraction_height);
+            let unbonding_start_epoch = end_epoch.saturating_sub(UNBONDING_PERIOD_EPOCHS);
+            Ok(unbonding_start_epoch >= infraction_epoch)
+        }
+        (
+            Some(_),
+            StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: Some(unbonding_start_height),
+            },
+        ) => Ok(unbonding_start_height >= infraction_height),
+        (
+            Some(_),
+            StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: None,
+            },
+        ) => Err(StateError::InvariantViolation {
+            message: "height-precise unbonding bond is missing its start height".into(),
+        }),
+    }
 }
 
 /// Apply slash evidence to chain state.
@@ -241,23 +275,15 @@ fn apply_slash_at_height_with_accounting(
         }
     };
 
-    let bond_ids: Vec<Bytes32> = state
-        .staked_bonds
-        .values()
-        .filter(|bond| {
-            if bond.validator_id != validator_id || bond.delegator_id != validator_id {
-                return false;
-            }
-            match bond.unbonding_end_epoch {
-                None => true,
-                Some(end_epoch) => {
-                    let unbonding_start = end_epoch.saturating_sub(UNBONDING_PERIOD_EPOCHS);
-                    unbonding_start > infraction_epoch
-                }
-            }
-        })
-        .map(|bond| bond.utxo_id)
-        .collect();
+    let mut bond_ids = Vec::new();
+    for bond in state.staked_bonds.values() {
+        if bond.validator_id == validator_id
+            && bond.delegator_id == validator_id
+            && self_bond_is_slashable_at_height(bond, evidence.vote_1.height)?
+        {
+            bond_ids.push(bond.utxo_id);
+        }
+    }
     let slashable_bond_stake = bond_ids.iter().fold(0u64, |acc, bond_id| {
         acc.saturating_add(
             state
@@ -1156,10 +1182,11 @@ mod tests {
             primitives::{
                 hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
                 BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
-                DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
-                MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-                MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+                BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK,
+                EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
+                MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK,
+                MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_BOND_SPARK,
+                SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
                 TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
@@ -5046,6 +5073,7 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
+                        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                         custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                             Bytes32::from([0x66; 32]),
                         ),
@@ -5126,6 +5154,7 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
+                        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                         custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                             Bytes32::from([0x66; 32]),
                         ),
@@ -5439,7 +5468,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_protocol_transition_rejects_v2_accepts_v3_and_replays_deterministically() {
+    fn snapshot_and_height_precision_protocol_transition_rejects_stale_version_and_replays() {
         fn state_before_inert_gate() -> ChainState {
             let mut state = ChainState::new_genesis();
             let (_, _, validator_id) =
@@ -5477,17 +5506,17 @@ mod tests {
             let post_gate = make_block_at_height(&state, vec![], u64::MAX, 1_900_000_001);
             assert_eq!(
                 post_gate.header.protocol_version,
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT)
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT)
             );
 
             let mut rejected = state.clone();
             let mut stale_version = post_gate.clone();
             stale_version.header.protocol_version =
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET);
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT);
             assert_eq!(
                 apply_block(&mut rejected, &stale_version, 0),
                 Err(StateError::UnsupportedVersion {
-                    version: BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                    version: BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
                 })
             );
             assert_same_consensus_state(&rejected, &state);
@@ -5569,6 +5598,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
@@ -5584,6 +5614,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
@@ -5750,6 +5781,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(epoch_for_height(EPOCH_DURATION_BLOCKS)),
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     validator_id,
                 ),
@@ -6582,6 +6614,7 @@ mod tests {
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     validator_id,
                 ),
@@ -6616,6 +6649,7 @@ mod tests {
                 amount_spark: 200_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
@@ -6652,6 +6686,7 @@ mod tests {
                 amount_spark: original_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     validator_id,
                 ),
@@ -6676,6 +6711,87 @@ mod tests {
             "unbonding self-bond must remain slashable for pre-unbonding equivocation"
         );
         assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 50_000);
+    }
+
+    #[test]
+    fn height_precise_same_epoch_unstake_after_infraction_is_monetarily_slashed() {
+        let original_bond = 1_000_000u64;
+        let (mut state, validator_id, keypair) = slash_validator_state([0xA1; 32], 0);
+        let bond_id = Bytes32::from([0xD1; 32]);
+        let (owner, _) = make_test_keypair([0xA2; 32]);
+        state.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry {
+                utxo_id: bond_id,
+                validator_id,
+                delegator_id: validator_id,
+                amount_spark: original_bond,
+                bonded_epoch: 0,
+                unbonding_end_epoch: Some(UNBONDING_PERIOD_EPOCHS),
+                unbonding_precision: StakeBondUnbondingPrecision::HeightPrecise {
+                    unbonding_start_height: Some(8),
+                },
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    validator_id,
+                ),
+                original_output: output_with_value(original_bond, owner, 0x31).into(),
+            },
+        );
+        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        apply_slash_at_height(&mut state, &evidence, &chain_id, 9, None).unwrap();
+        assert_eq!(
+            state.staked_bonds.get(&bond_id).unwrap().amount_spark,
+            950_000
+        );
+    }
+
+    #[test]
+    fn slash_predicate_uses_height_for_precise_bonds_and_epoch_for_legacy_bonds() {
+        let (owner, _) = make_test_keypair([0xA3; 32]);
+        let base = StakeBondEntry {
+            utxo_id: Bytes32::from([0xD2; 32]),
+            validator_id: Bytes32::from([0xA4; 32]),
+            delegator_id: Bytes32::from([0xA4; 32]),
+            amount_spark: 1_000,
+            bonded_epoch: 0,
+            unbonding_end_epoch: Some(UNBONDING_PERIOD_EPOCHS),
+            unbonding_precision: StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: Some(7),
+            },
+            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                Bytes32::from([0xA4; 32]),
+            ),
+            original_output: output_with_value(1_000, owner, 0x32).into(),
+        };
+        assert!(!self_bond_is_slashable_at_height(&base, 8).unwrap());
+
+        let mut exact = base.clone();
+        exact.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
+            unbonding_start_height: Some(8),
+        };
+        assert!(self_bond_is_slashable_at_height(&exact, 8).unwrap());
+
+        let mut legacy_same_epoch = base.clone();
+        legacy_same_epoch.unbonding_precision = StakeBondUnbondingPrecision::LegacyEpochOnly;
+        assert!(self_bond_is_slashable_at_height(&legacy_same_epoch, 8).unwrap());
+
+        let later_epoch_height = EPOCH_DURATION_BLOCKS + 7;
+        let mut later_precise = base.clone();
+        later_precise.unbonding_end_epoch = Some(1 + UNBONDING_PERIOD_EPOCHS);
+        later_precise.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
+            unbonding_start_height: Some(later_epoch_height),
+        };
+        assert!(self_bond_is_slashable_at_height(&later_precise, 8).unwrap());
+        let mut later_legacy = later_precise.clone();
+        later_legacy.unbonding_precision = StakeBondUnbondingPrecision::LegacyEpochOnly;
+        assert!(self_bond_is_slashable_at_height(&later_legacy, 8).unwrap());
+
+        let infraction_in_epoch_one = EPOCH_DURATION_BLOCKS + 7;
+        assert!(!self_bond_is_slashable_at_height(&base, infraction_in_epoch_one).unwrap());
+        assert!(
+            !self_bond_is_slashable_at_height(&legacy_same_epoch, infraction_in_epoch_one).unwrap()
+        );
     }
 
     #[test]
@@ -6715,6 +6831,7 @@ mod tests {
                 amount_spark: active_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     validator_id,
                 ),
@@ -6730,6 +6847,7 @@ mod tests {
                 amount_spark: unbonding_bond,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
+                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     validator_id,
                 ),

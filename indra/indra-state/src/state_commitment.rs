@@ -412,6 +412,7 @@ mod tests {
         types::{
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::{CommitmentV1, HybridPubKey},
+            primitives::UNBONDING_PERIOD_EPOCHS,
             transaction::OutputV1,
         },
         VariableBytes,
@@ -540,6 +541,7 @@ mod tests {
             amount_spark: 7_000,
             bonded_epoch: 3,
             unbonding_end_epoch: None,
+            unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
             custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output: output(0xAA, 7_000).into(),
         }
@@ -1256,6 +1258,38 @@ mod tests {
         assert_eq!(
             state.state_commitment_v2_root(height),
             legacy_state_commitment_v2_root(&state, height)
+        );
+    }
+
+    #[test]
+    fn height_precise_bond_incremental_root_matches_rebuild_before_and_after_unstake() {
+        let height = 100;
+        let bond_id = id(0xE4);
+        let mut precise = bond(bond_id, id(0xE5), id(0xE5));
+        precise.unbonding_precision =
+            crate::validator::StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: None,
+            };
+        let mut state = ChainState::new_genesis();
+        state.staked_bonds.insert(bond_id, precise.clone());
+        state.rebuild_state_commitment_v2(height);
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            StateCommitmentV2::from_state(&state, height).root()
+        );
+
+        precise
+            .begin_unbonding(height, UNBONDING_PERIOD_EPOCHS)
+            .unwrap();
+        state.staked_bonds.insert(bond_id, precise.clone());
+        state
+            .state_commitment_v2
+            .as_mut()
+            .unwrap()
+            .put_staked_bond(&bond_id, &precise);
+        assert_eq!(
+            state.state_commitment_v2_root(height),
+            StateCommitmentV2::from_state(&state, height).root()
         );
     }
 

@@ -78,6 +78,7 @@ pub use state_root::{compute_state_root, compute_state_roots, compute_validator_
 pub use utxo::{UtxoEntry, UtxoSet};
 pub use validator::{
     validate_new_validator_cold_key, validate_validator_cold_key, ColdKeyStatus,
-    StakeBondCustodyOwner, ValidatedColdKey, ValidatorEntry, ValidatorSet, ValidatorStatus,
+    StakeBondCustodyOwner, StakeBondUnbondingPrecision, ValidatedColdKey, ValidatorEntry,
+    ValidatorSet, ValidatorStatus,
 };
 pub use validator::{DelegationReturnEvent, DelegationReturnReason, DelegatorEntry};

@@ -1456,6 +1456,8 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
+                        unbonding_precision:
+                            indra_state::StakeBondUnbondingPrecision::LegacyEpochOnly,
                         custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(
                             Bytes32::from([0x66; 32]),
                         ),
@@ -2718,10 +2720,12 @@ mod tests {
 
         install_test_snapshot_at_inert_gate(&mut state);
         let post_activation = make_reveal_set_block(&state, &[0x81], &[0x81]);
+        // This synthetic u64::MAX height activates both currently-inert gates,
+        // so the highest applicable block protocol version is version 4.
         assert_eq!(
             post_activation.header.protocol_version,
             ProtocolVersion(
-                indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
+                indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
             )
         );
         assert!(verify_reveal_set_evidence(&post_activation, &state).is_ok());

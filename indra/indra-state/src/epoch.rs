@@ -3270,6 +3270,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1),
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     Bytes32::from([0x02; 32]),
                 ),
@@ -3296,6 +3297,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     Bytes32::from([0x02; 32]),
                 ),

@@ -1556,6 +1556,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
+            unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
             custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                 Bytes32::from([0xD0 | byte; 32]),
             ),
@@ -1674,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_legacy_range_compact_and_fully_compact_staked_bonds_encode_decode_and_root() {
+    fn mixed_legacy_and_height_precise_bond_map_checkpoint_round_trip_is_deterministic() {
         let mut state = ChainState::new_genesis();
         let legacy = StakeBondEntry::new_for_test_with_compact_activation(
             Bytes32::from([0x21; 32]),
@@ -1707,6 +1708,21 @@ mod tests {
             10,
             20,
         );
+        let mut height_precise = StakeBondEntry::new_for_test_with_all_activations(
+            Bytes32::from([0x24; 32]),
+            Bytes32::from([0xA4; 32]),
+            Bytes32::from([0xD4; 32]),
+            1_000_000,
+            10,
+            test_output(0x24),
+            100,
+            10,
+            20,
+            100,
+        );
+        height_precise
+            .begin_unbonding(100, indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS)
+            .unwrap();
         assert!(legacy.original_output.range_proof.is_some());
         assert!(legacy.original_output.owner_pubkey.is_some());
         assert!(compact.original_output.range_proof.is_none());
@@ -1718,10 +1734,15 @@ mod tests {
         state
             .staked_bonds
             .insert(fully_compact.utxo_id, fully_compact);
+        state
+            .staked_bonds
+            .insert(height_precise.utxo_id, height_precise);
 
         let encoded = state.encode_to_vec();
         let decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
+        let independently_decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
         assert_eq!(decoded, state);
+        assert_eq!(independently_decoded.encode_to_vec(), encoded);
         assert_eq!(
             crate::state_root::compute_state_root(&decoded),
             crate::state_root::compute_state_root(&state)
@@ -1729,6 +1750,61 @@ mod tests {
         assert_eq!(
             crate::state_commitment::StateCommitmentV2::from_state(&decoded, u64::MAX).root(),
             crate::state_commitment::StateCommitmentV2::from_state(&state, u64::MAX).root()
+        );
+    }
+
+    #[test]
+    fn independent_bond_replays_across_height_precision_gate_are_byte_identical() {
+        fn replay() -> ChainState {
+            const TEST_GATE: u64 = 100;
+            let mut state = ChainState::new_genesis();
+            let legacy = StakeBondEntry::new_for_test_with_all_activations(
+                Bytes32::from([0x31; 32]),
+                Bytes32::from([0xA1; 32]),
+                Bytes32::from([0xD1; 32]),
+                1_000_000,
+                0,
+                test_output(0x31),
+                TEST_GATE - 1,
+                u64::MAX,
+                u64::MAX,
+                TEST_GATE,
+            );
+            let mut precise = StakeBondEntry::new_for_test_with_all_activations(
+                Bytes32::from([0x32; 32]),
+                Bytes32::from([0xA2; 32]),
+                Bytes32::from([0xD2; 32]),
+                1_000_000,
+                0,
+                test_output(0x32),
+                TEST_GATE,
+                u64::MAX,
+                u64::MAX,
+                TEST_GATE,
+            );
+            precise
+                .begin_unbonding(
+                    TEST_GATE + 1,
+                    indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS,
+                )
+                .unwrap();
+            state.staked_bonds.insert(legacy.utxo_id, legacy);
+            state.staked_bonds.insert(precise.utxo_id, precise);
+            state.height = TEST_GATE + 1;
+            state.rebuild_state_commitment_v2(state.height);
+            state
+        }
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(first.encode_to_vec(), second.encode_to_vec());
+        assert_eq!(
+            crate::state_root::compute_state_root(&first),
+            crate::state_root::compute_state_root(&second)
+        );
+        assert_eq!(
+            first.state_commitment_v2_root(first.height),
+            second.state_commitment_v2_root(second.height)
         );
     }
 
@@ -2226,6 +2302,7 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
@@ -2353,6 +2430,7 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     id_from_index(index + 1_000_000),
                 ),

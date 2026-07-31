@@ -2953,6 +2953,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
+            unbonding_precision: indra_state::StakeBondUnbondingPrecision::LegacyEpochOnly,
             custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }

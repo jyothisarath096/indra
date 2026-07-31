@@ -1469,7 +1469,7 @@ fn apply_undelegate(
 
     let current_epoch = epoch_for_height(current_height);
     let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
-    bond.unbonding_end_epoch = Some(unbonding_end);
+    bond.begin_unbonding(current_height, unbonding_end)?;
     let amount_spark = bond.amount_spark;
     let updated_bond = bond.clone();
     state
@@ -1656,7 +1656,7 @@ fn apply_self_unstake(
     let current_epoch = epoch_for_height(current_height);
     let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
     let amount_spark = bond.amount_spark;
-    bond.unbonding_end_epoch = Some(unbonding_end);
+    bond.begin_unbonding(current_height, unbonding_end)?;
     let updated_bond = bond.clone();
     state
         .staked_bonds
@@ -5602,6 +5602,7 @@ mod tests {
                 amount_spark: stake,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     validator_id,
                 ),
@@ -5899,6 +5900,7 @@ mod tests {
                 amount_spark: DUST_LIMIT_SPARK,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator,
                 ),
@@ -6003,6 +6005,7 @@ mod tests {
                 amount_spark: DUST_LIMIT_SPARK,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator,
                 ),
@@ -7822,6 +7825,8 @@ mod tests {
                     amount_spark: DUST_LIMIT_SPARK,
                     bonded_epoch: 0,
                     unbonding_end_epoch: Some(1),
+                    unbonding_precision:
+                        crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                     custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
                     original_output: test_output(DUST_LIMIT_SPARK, delegator_pubkey, 0xB2).into(),
                 },

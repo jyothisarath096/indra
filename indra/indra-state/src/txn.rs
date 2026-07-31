@@ -624,6 +624,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
+            unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
             custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                 Bytes32::from([0xD0 | byte; 32]),
             ),
@@ -674,6 +675,40 @@ mod tests {
             .staking_nonces
             .get(&Bytes32::from([0x22; 32]))
             .is_none());
+    }
+
+    #[test]
+    fn rollback_restores_height_precise_bond_and_prior_commitment_root() {
+        let height = 100;
+        let mut state = ChainState::new_genesis();
+        let mut original_bond = test_bond(0x03);
+        original_bond.unbonding_precision =
+            crate::validator::StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: None,
+            };
+        let bond_id = original_bond.utxo_id;
+        state.staked_bonds.insert(bond_id, original_bond.clone());
+        state.rebuild_state_commitment_v2(height);
+        let root_before = state.state_commitment_v2_root(height);
+
+        set_fail_after_mutation(Some(1));
+        {
+            let mut txn = StateTxn::begin(&mut state, height);
+            txn.snapshot_staking_scope();
+            let mut unbonding = original_bond.clone();
+            unbonding
+                .begin_unbonding(
+                    height,
+                    indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS,
+                )
+                .unwrap();
+            txn.state_mut().staked_bonds.insert(bond_id, unbonding);
+            assert!(txn.after_mutation().is_err());
+        }
+        set_fail_after_mutation(None);
+
+        assert_eq!(state.staked_bonds.get(&bond_id), Some(&original_bond));
+        assert_eq!(state.state_commitment_v2_root(height), root_before);
     }
 
     #[test]

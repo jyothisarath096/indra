@@ -10,10 +10,11 @@ use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
         compact_bond_pubkey_omission_active, compact_stake_bond_active, max_active_validators,
-        muldiv, overflow_fix_active, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
-        MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
+        muldiv, overflow_fix_active, self_unstake_height_precision_active, Bytes32, VariableBytes,
+        DUST_LIMIT_SPARK, MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
         MAX_VALIDATOR_NETWORK_ADDR_LEN, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION,
         SCHEMA_VERSION_GENESIS, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+        UNBONDING_PERIOD_EPOCHS,
     },
     transaction::OutputV1,
 };
@@ -41,6 +42,12 @@ const STAKE_BOND_FULLY_COMPACT_MARKER: u8 = u8::MAX - 1;
 const STAKE_BOND_CUSTODY_LEGACY_MARKER: u8 = u8::MAX - 2;
 const STAKE_BOND_CUSTODY_COMPACT_MARKER: u8 = u8::MAX - 3;
 const STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER: u8 = u8::MAX - 4;
+const STAKE_BOND_HEIGHT_LEGACY_MARKER: u8 = u8::MAX - 5;
+const STAKE_BOND_HEIGHT_COMPACT_MARKER: u8 = u8::MAX - 6;
+const STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER: u8 = u8::MAX - 7;
+const STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER: u8 = u8::MAX - 8;
+const STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER: u8 = u8::MAX - 9;
+const STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER: u8 = u8::MAX - 10;
 
 /// Maximum unresolved validator self-bonds migrated by one enrollment.
 pub const MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS: usize = 4_096;
@@ -1747,7 +1754,19 @@ impl From<StakeBondOutput> for OutputV1 {
 /// Active bonds earn rewards and count toward delegation totals. Unbonding
 /// bonds are retained until their release epoch, then restored as spendable
 /// UTXOs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StakeBondUnbondingPrecision {
+    /// Bond created before height-precise unbonding activated.
+    LegacyEpochOnly,
+    /// Bond created under the height-precise encoding family.
+    HeightPrecise {
+        /// Inclusion height of the operation that began unbonding.
+        unbonding_start_height: Option<u64>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A UTXO-backed stake bond retained in canonical chain state.
 pub struct StakeBondEntry {
     /// The UTXO ID that was bonded.
     pub utxo_id: Bytes32,
@@ -1761,6 +1780,8 @@ pub struct StakeBondEntry {
     pub bonded_epoch: u64,
     /// None while active; Some(epoch) while unbonding.
     pub unbonding_end_epoch: Option<u64>,
+    /// Bond-local unbonding precision, fixed permanently at bond creation.
+    pub unbonding_precision: StakeBondUnbondingPrecision,
     /// Consensus owner role used when protocol code recreates this bond.
     pub custody_owner: StakeBondCustodyOwner,
     /// Original UTXO output metadata, needed to reinsert when unbonding completes.
@@ -1817,17 +1838,31 @@ impl Encode for StakeBondEntry {
         if let Some(epoch) = self.unbonding_end_epoch {
             epoch.encode(buf);
         }
+        if let StakeBondUnbondingPrecision::HeightPrecise {
+            unbonding_start_height,
+        } = self.unbonding_precision
+        {
+            unbonding_start_height.is_some().encode(buf);
+            if let Some(height) = unbonding_start_height {
+                height.encode(buf);
+            }
+        }
         if self.has_explicit_custody_owner() {
             self.custody_owner.encode(buf);
         }
         match self.encoding_marker() {
-            SCHEMA_VERSION | STAKE_BOND_CUSTODY_LEGACY_MARKER => {
-                self.original_output.encode_legacy(buf)
-            }
-            STAKE_BOND_COMPACT_MARKER | STAKE_BOND_CUSTODY_COMPACT_MARKER => {
-                self.original_output.encode_compact(buf)
-            }
-            STAKE_BOND_FULLY_COMPACT_MARKER | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
+            SCHEMA_VERSION
+            | STAKE_BOND_CUSTODY_LEGACY_MARKER
+            | STAKE_BOND_HEIGHT_LEGACY_MARKER
+            | STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER => self.original_output.encode_legacy(buf),
+            STAKE_BOND_COMPACT_MARKER
+            | STAKE_BOND_CUSTODY_COMPACT_MARKER
+            | STAKE_BOND_HEIGHT_COMPACT_MARKER
+            | STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER => self.original_output.encode_compact(buf),
+            STAKE_BOND_FULLY_COMPACT_MARKER
+            | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER
+            | STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER
+            | STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER => {
                 self.original_output.encode_fully_compact(buf)
             }
             _ => unreachable!("stake bond encoding marker is constrained"),
@@ -1842,19 +1877,34 @@ impl Encode for StakeBondEntry {
             + self.bonded_epoch.encoded_len()
             + 1
             + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
+            + match self.unbonding_precision {
+                StakeBondUnbondingPrecision::LegacyEpochOnly => 0,
+                StakeBondUnbondingPrecision::HeightPrecise {
+                    unbonding_start_height,
+                } => 1 + unbonding_start_height.map(|_| 8).unwrap_or(0),
+            }
             + if self.has_explicit_custody_owner() {
                 33
             } else {
                 0
             }
             + match self.encoding_marker() {
-                SCHEMA_VERSION | STAKE_BOND_CUSTODY_LEGACY_MARKER => {
+                SCHEMA_VERSION
+                | STAKE_BOND_CUSTODY_LEGACY_MARKER
+                | STAKE_BOND_HEIGHT_LEGACY_MARKER
+                | STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER => {
                     self.original_output.legacy_encoded_len()
                 }
-                STAKE_BOND_COMPACT_MARKER | STAKE_BOND_CUSTODY_COMPACT_MARKER => {
+                STAKE_BOND_COMPACT_MARKER
+                | STAKE_BOND_CUSTODY_COMPACT_MARKER
+                | STAKE_BOND_HEIGHT_COMPACT_MARKER
+                | STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER => {
                     self.original_output.compact_encoded_len()
                 }
-                STAKE_BOND_FULLY_COMPACT_MARKER | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
+                STAKE_BOND_FULLY_COMPACT_MARKER
+                | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER
+                | STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER
+                | STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER => {
                     self.original_output.fully_compact_encoded_len()
                 }
                 _ => unreachable!("stake bond encoding marker is constrained"),
@@ -1880,6 +1930,32 @@ impl Decode for StakeBondEntry {
             STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
                 decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::FullyCompact)
             }
+            STAKE_BOND_HEIGHT_LEGACY_MARKER => {
+                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Legacy, false)
+            }
+            STAKE_BOND_HEIGHT_COMPACT_MARKER => {
+                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Compact, false)
+            }
+            STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER => {
+                decode_height_precise_stake_bond_entry_fields(
+                    r,
+                    BondOutputShape::FullyCompact,
+                    false,
+                )
+            }
+            STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER => {
+                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Legacy, true)
+            }
+            STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER => {
+                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Compact, true)
+            }
+            STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER => {
+                decode_height_precise_stake_bond_entry_fields(
+                    r,
+                    BondOutputShape::FullyCompact,
+                    true,
+                )
+            }
             other if r.remaining() == 0 => Err(unsupported_schema("StakeBondEntry", other)),
             first_byte => decode_stake_bond_entry_fields(r, Some(first_byte)),
         }
@@ -1887,20 +1963,95 @@ impl Decode for StakeBondEntry {
 }
 
 impl StakeBondEntry {
+    /// Validate the bond-local relationship between unbonding height and epoch.
+    pub fn validate_unbonding_precision(&self) -> IndraResult<()> {
+        match self.unbonding_precision {
+            StakeBondUnbondingPrecision::LegacyEpochOnly => Ok(()),
+            StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height,
+            } => {
+                if self.unbonding_end_epoch.is_some() != unbonding_start_height.is_some() {
+                    return Err(IndraError::InvariantViolation {
+                        message: "height-precise stake bond must carry unbonding end epoch and start height together".into(),
+                    });
+                }
+                if let (Some(end_epoch), Some(start_height)) =
+                    (self.unbonding_end_epoch, unbonding_start_height)
+                {
+                    let expected = crate::epoch::epoch_for_height(start_height)
+                        .checked_add(UNBONDING_PERIOD_EPOCHS)
+                        .ok_or_else(|| IndraError::InvariantViolation {
+                            message: "height-precise stake bond unbonding epoch overflow".into(),
+                        })?;
+                    if end_epoch != expected {
+                        return Err(IndraError::InvariantViolation {
+                            message: "height-precise stake bond unbonding end epoch does not match start height".into(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Begin unbonding while preserving the precision chosen at bond creation.
+    pub fn begin_unbonding(
+        &mut self,
+        current_height: u64,
+        unbonding_end_epoch: u64,
+    ) -> StateResult<()> {
+        if self.unbonding_end_epoch.is_some() {
+            return Err(StateError::InvalidStakingOp(
+                "bond is already unbonding".into(),
+            ));
+        }
+        if matches!(
+            self.unbonding_precision,
+            StakeBondUnbondingPrecision::HeightPrecise { .. }
+        ) {
+            let expected = crate::epoch::epoch_for_height(current_height)
+                .checked_add(UNBONDING_PERIOD_EPOCHS)
+                .ok_or(StateError::InvariantViolation {
+                    message: "height-precise stake-bond unbonding epoch overflow",
+                })?;
+            if unbonding_end_epoch != expected {
+                return Err(StateError::InvariantViolation {
+                    message: "height-precise stake-bond unbonding end mismatch",
+                });
+            }
+            self.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: Some(current_height),
+            };
+        }
+        self.unbonding_end_epoch = Some(unbonding_end_epoch);
+        Ok(())
+    }
+
     fn encoding_marker(&self) -> u8 {
         let explicit = self.has_explicit_custody_owner();
+        let height_precise = matches!(
+            self.unbonding_precision,
+            StakeBondUnbondingPrecision::HeightPrecise { .. }
+        );
         match (
             self.original_output.range_proof.is_some(),
             self.original_output.owner_pubkey.is_some(),
             explicit,
+            height_precise,
         ) {
-            (true, true, false) => SCHEMA_VERSION,
-            (false, true, false) => STAKE_BOND_COMPACT_MARKER,
-            (false, false, false) => STAKE_BOND_FULLY_COMPACT_MARKER,
-            (true, true, true) => STAKE_BOND_CUSTODY_LEGACY_MARKER,
-            (false, true, true) => STAKE_BOND_CUSTODY_COMPACT_MARKER,
-            (false, false, true) => STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER,
-            (true, false, _) => {
+            (true, true, false, false) => SCHEMA_VERSION,
+            (false, true, false, false) => STAKE_BOND_COMPACT_MARKER,
+            (false, false, false, false) => STAKE_BOND_FULLY_COMPACT_MARKER,
+            (true, true, true, false) => STAKE_BOND_CUSTODY_LEGACY_MARKER,
+            (false, true, true, false) => STAKE_BOND_CUSTODY_COMPACT_MARKER,
+            (false, false, true, false) => STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER,
+            (true, true, false, true) => STAKE_BOND_HEIGHT_LEGACY_MARKER,
+            (false, true, false, true) => STAKE_BOND_HEIGHT_COMPACT_MARKER,
+            (false, false, false, true) => STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER,
+            (true, true, true, true) => STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER,
+            (false, true, true, true) => STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER,
+            (false, false, true, true) => STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER,
+            (true, false, _, _) => {
                 panic!("stake bond cannot retain a range proof without an owner pubkey")
             }
         }
@@ -2017,6 +2168,41 @@ mod stake_bond_entry_tests {
             .unwrap()
             .encode(&mut buf);
         bond.original_output.lock_height.encode(&mut buf);
+        buf
+    }
+
+    fn encode_existing_marker_layout_manually(bond: &StakeBondEntry, marker: u8) -> Vec<u8> {
+        let mut buf = Vec::new();
+        marker.encode(&mut buf);
+        bond.utxo_id.encode(&mut buf);
+        bond.validator_id.encode(&mut buf);
+        bond.delegator_id.encode(&mut buf);
+        bond.amount_spark.encode(&mut buf);
+        bond.bonded_epoch.encode(&mut buf);
+        bond.unbonding_end_epoch.is_some().encode(&mut buf);
+        if let Some(epoch) = bond.unbonding_end_epoch {
+            epoch.encode(&mut buf);
+        }
+        if matches!(
+            marker,
+            STAKE_BOND_CUSTODY_LEGACY_MARKER
+                | STAKE_BOND_CUSTODY_COMPACT_MARKER
+                | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER
+        ) {
+            bond.custody_owner.encode(&mut buf);
+        }
+        match marker {
+            SCHEMA_VERSION | STAKE_BOND_CUSTODY_LEGACY_MARKER => {
+                bond.original_output.encode_legacy(&mut buf)
+            }
+            STAKE_BOND_COMPACT_MARKER | STAKE_BOND_CUSTODY_COMPACT_MARKER => {
+                bond.original_output.encode_compact(&mut buf)
+            }
+            STAKE_BOND_FULLY_COMPACT_MARKER | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
+                bond.original_output.encode_fully_compact(&mut buf)
+            }
+            _ => unreachable!(),
+        }
         buf
     }
 
@@ -2212,6 +2398,166 @@ mod stake_bond_entry_tests {
         assert_eq!(first[2][0], STAKE_BOND_COMPACT_MARKER);
         assert_eq!(first[3][0], STAKE_BOND_FULLY_COMPACT_MARKER);
     }
+
+    #[test]
+    fn all_six_height_precise_bond_markers_round_trip() {
+        let cases = [
+            (false, false, STAKE_BOND_HEIGHT_LEGACY_MARKER),
+            (true, false, STAKE_BOND_HEIGHT_COMPACT_MARKER),
+            (true, true, STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER),
+            (false, false, STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER),
+            (true, false, STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER),
+            (true, true, STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER),
+        ];
+        for (index, (compact, omit_key, expected_marker)) in cases.into_iter().enumerate() {
+            let height = 100;
+            let mut bond = StakeBondEntry::new_for_test_with_all_activations(
+                Bytes32::from([0x40 + index as u8; 32]),
+                Bytes32::from([0xA0; 32]),
+                Bytes32::from([0xD0; 32]),
+                1_000,
+                0,
+                output(0x50 + index as u8, 674),
+                height,
+                if compact { height } else { height + 1 },
+                if omit_key { height } else { height + 1 },
+                height,
+            );
+            if index >= 3 {
+                bond.custody_owner =
+                    StakeBondCustodyOwner::ValidatorColdIdentity(Bytes32::from([0xCC; 32]));
+            }
+            let encoded = bond.encode_to_vec();
+            assert_eq!(encoded[0], expected_marker);
+            assert_eq!(StakeBondEntry::decode_exact(&encoded).unwrap(), bond);
+        }
+    }
+
+    #[test]
+    fn every_existing_bond_marker_remains_byte_identical() {
+        let mut cases = vec![
+            legacy_bond(0x61),
+            compact_bond(0x62),
+            fully_compact_bond(0x63),
+        ];
+        for index in 0..3 {
+            let mut explicit = cases[index].clone();
+            explicit.custody_owner =
+                StakeBondCustodyOwner::ValidatorColdIdentity(Bytes32::from([0xC0; 32]));
+            cases.push(explicit);
+        }
+        let markers = [
+            SCHEMA_VERSION,
+            STAKE_BOND_COMPACT_MARKER,
+            STAKE_BOND_FULLY_COMPACT_MARKER,
+            STAKE_BOND_CUSTODY_LEGACY_MARKER,
+            STAKE_BOND_CUSTODY_COMPACT_MARKER,
+            STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER,
+        ];
+        for (bond, marker) in cases.iter().zip(markers) {
+            assert_eq!(bond.encoding_marker(), marker);
+            assert_eq!(
+                bond.encode_to_vec(),
+                encode_existing_marker_layout_manually(bond, marker)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_height_precise_combinations_fail_closed_on_decode() {
+        let mut missing_end = StakeBondEntry::new_for_test_with_all_activations(
+            Bytes32::from([0x71; 32]),
+            Bytes32::from([0xA0; 32]),
+            Bytes32::from([0xD0; 32]),
+            1_000,
+            0,
+            output(0x71, 674),
+            100,
+            101,
+            101,
+            100,
+        );
+        missing_end.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
+            unbonding_start_height: Some(100),
+        };
+        assert!(StakeBondEntry::decode_exact(&missing_end.encode_to_vec()).is_err());
+
+        let mut wrong_end = missing_end;
+        wrong_end.unbonding_end_epoch = Some(UNBONDING_PERIOD_EPOCHS + 9);
+        assert!(StakeBondEntry::decode_exact(&wrong_end.encode_to_vec()).is_err());
+    }
+
+    #[test]
+    fn height_precision_capability_is_fixed_at_creation() {
+        let legacy = StakeBondEntry::new_for_test_with_all_activations(
+            Bytes32::from([0x72; 32]),
+            Bytes32::from([0xA0; 32]),
+            Bytes32::from([0xD0; 32]),
+            1_000,
+            0,
+            output(0x72, 674),
+            99,
+            1_000,
+            1_000,
+            100,
+        );
+        let precise = StakeBondEntry::new_for_test_with_all_activations(
+            Bytes32::from([0x73; 32]),
+            Bytes32::from([0xA0; 32]),
+            Bytes32::from([0xD0; 32]),
+            1_000,
+            0,
+            output(0x73, 674),
+            100,
+            1_000,
+            1_000,
+            100,
+        );
+        assert_eq!(
+            legacy.unbonding_precision,
+            StakeBondUnbondingPrecision::LegacyEpochOnly
+        );
+        assert_eq!(
+            precise.unbonding_precision,
+            StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: None
+            }
+        );
+    }
+
+    #[test]
+    fn begin_unbonding_populates_height_only_for_height_precise_bonds() {
+        let mut legacy = legacy_bond(0x74);
+        legacy
+            .begin_unbonding(123, UNBONDING_PERIOD_EPOCHS)
+            .unwrap();
+        assert_eq!(
+            legacy.unbonding_precision,
+            StakeBondUnbondingPrecision::LegacyEpochOnly
+        );
+
+        let mut precise = StakeBondEntry::new_for_test_with_all_activations(
+            Bytes32::from([0x75; 32]),
+            Bytes32::from([0xA0; 32]),
+            Bytes32::from([0xD0; 32]),
+            1_000,
+            0,
+            output(0x75, 674),
+            123,
+            1_000,
+            1_000,
+            100,
+        );
+        precise
+            .begin_unbonding(123, UNBONDING_PERIOD_EPOCHS)
+            .unwrap();
+        assert_eq!(
+            precise.unbonding_precision,
+            StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: Some(123)
+            }
+        );
+    }
 }
 
 fn decode_stake_bond_entry_fields(
@@ -2232,6 +2578,7 @@ fn decode_stake_bond_entry_fields(
         } else {
             None
         },
+        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
         custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
         original_output: OutputV1::decode(r)?.into(),
     })
@@ -2252,6 +2599,7 @@ fn decode_compact_stake_bond_entry_fields(r: &mut ByteReader<'_>) -> IndraResult
         } else {
             None
         },
+        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
         custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
         original_output: StakeBondOutput {
             value_spark: u64::decode(r)?,
@@ -2280,6 +2628,7 @@ fn decode_fully_compact_stake_bond_entry_fields(
         } else {
             None
         },
+        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
         custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
         original_output: StakeBondOutput {
             value_spark: u64::decode(r)?,
@@ -2336,9 +2685,69 @@ fn decode_stake_bond_entry_fields_with_custody(
         amount_spark,
         bonded_epoch,
         unbonding_end_epoch,
+        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
         custody_owner,
         original_output,
     })
+}
+
+fn decode_height_precise_stake_bond_entry_fields(
+    r: &mut ByteReader<'_>,
+    shape: BondOutputShape,
+    explicit_custody: bool,
+) -> IndraResult<StakeBondEntry> {
+    let utxo_id = Bytes32::decode(r)?;
+    let validator_id = Bytes32::decode(r)?;
+    let delegator_id = Bytes32::decode(r)?;
+    let amount_spark = u64::decode(r)?;
+    let bonded_epoch = u64::decode(r)?;
+    let unbonding_end_epoch = if bool::decode(r)? {
+        Some(u64::decode(r)?)
+    } else {
+        None
+    };
+    let unbonding_start_height = if bool::decode(r)? {
+        Some(u64::decode(r)?)
+    } else {
+        None
+    };
+    let custody_owner = if explicit_custody {
+        StakeBondCustodyOwner::decode(r)?
+    } else {
+        StakeBondCustodyOwner::DelegatorIdentity(delegator_id)
+    };
+    let original_output = match shape {
+        BondOutputShape::Legacy => OutputV1::decode(r)?.into(),
+        BondOutputShape::Compact => StakeBondOutput {
+            value_spark: u64::decode(r)?,
+            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
+            owner_pubkey: Some(indra_core::types::crypto::HybridPubKey::decode(r)?),
+            range_proof: None,
+            lock_height: u64::decode(r)?,
+        },
+        BondOutputShape::FullyCompact => StakeBondOutput {
+            value_spark: u64::decode(r)?,
+            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
+            owner_pubkey: None,
+            range_proof: None,
+            lock_height: u64::decode(r)?,
+        },
+    };
+    let bond = StakeBondEntry {
+        utxo_id,
+        validator_id,
+        delegator_id,
+        amount_spark,
+        bonded_epoch,
+        unbonding_end_epoch,
+        unbonding_precision: StakeBondUnbondingPrecision::HeightPrecise {
+            unbonding_start_height,
+        },
+        custody_owner,
+        original_output,
+    };
+    bond.validate_unbonding_precision()?;
+    Ok(bond)
 }
 
 impl StakeBondEntry {
@@ -2367,6 +2776,13 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
+            unbonding_precision: if self_unstake_height_precision_active(current_height) {
+                StakeBondUnbondingPrecision::HeightPrecise {
+                    unbonding_start_height: None,
+                }
+            } else {
+                StakeBondUnbondingPrecision::LegacyEpochOnly
+            },
             custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
@@ -2394,6 +2810,7 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
+            unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
             custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
@@ -2426,9 +2843,42 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
+            unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
             custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_all_activations(
+        utxo_id: Bytes32,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+        bonded_epoch: u64,
+        original_output: OutputV1,
+        current_height: u64,
+        compact_activation_height: u64,
+        pubkey_omission_height: u64,
+        height_precision_activation_height: u64,
+    ) -> Self {
+        let mut bond = Self::new_for_test_with_compact_and_pubkey_activation(
+            utxo_id,
+            validator_id,
+            delegator_id,
+            amount_spark,
+            bonded_epoch,
+            original_output,
+            current_height,
+            compact_activation_height,
+            pubkey_omission_height,
+        );
+        if current_height >= height_precision_activation_height {
+            bond.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
+                unbonding_start_height: None,
+            };
+        }
+        bond
     }
 }
 

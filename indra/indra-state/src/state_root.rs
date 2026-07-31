@@ -445,6 +445,7 @@ mod tests {
                 amount_spark: 42_000,
                 bonded_epoch: 3,
                 unbonding_end_epoch: None,
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     Bytes32::from([0xD1; 32]),
                 ),
@@ -502,6 +503,8 @@ mod tests {
                     amount_spark: 1_000,
                     bonded_epoch: 0,
                     unbonding_end_epoch: None,
+                    unbonding_precision:
+                        crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
                     custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                         delegator_id,
                     ),
@@ -961,5 +964,45 @@ mod tests {
         assert_ne!(compute_state_root(&a), compute_state_root(&b));
         a.chain_id = "indra-mainnet-1".to_string();
         assert_eq!(compute_state_root(&a), compute_state_root(&b));
+    }
+
+    #[test]
+    fn both_state_root_projections_commit_height_precise_unbonding_start() {
+        let bond_id = Bytes32::from([0xE8; 32]);
+        let validator_id = Bytes32::from([0xE9; 32]);
+        let delegator_id = validator_id;
+        let mut active = ChainState::new_genesis();
+        active.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry {
+                utxo_id: bond_id,
+                validator_id,
+                delegator_id,
+                amount_spark: 42_000,
+                bonded_epoch: 0,
+                unbonding_end_epoch: Some(indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS),
+                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::HeightPrecise {
+                    unbonding_start_height: Some(100),
+                },
+                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
+                    delegator_id,
+                ),
+                original_output: dummy_output(0xEA).into(),
+            },
+        );
+        let mut changed = active.clone();
+        let mut bond = changed.staked_bonds.get(&bond_id).cloned().unwrap();
+        bond.unbonding_precision = crate::validator::StakeBondUnbondingPrecision::HeightPrecise {
+            unbonding_start_height: Some(101),
+        };
+        changed.staked_bonds.insert(bond_id, bond);
+
+        assert_ne!(compute_state_root(&active), compute_state_root(&changed));
+        assert_ne!(
+            crate::state_commitment::StateCommitmentV2::from_state(&active, 100).root(),
+            crate::state_commitment::StateCommitmentV2::from_state(&changed, 100).root()
+        );
+        let unchanged = active.clone();
+        assert_eq!(compute_state_root(&active), compute_state_root(&unchanged));
     }
 }
