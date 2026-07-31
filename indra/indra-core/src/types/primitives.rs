@@ -642,6 +642,13 @@ pub mod hard_forks {
     /// activation height use the height-precise bond-local encoding.
     pub const SELF_UNSTAKE_HEIGHT_PRECISION_HEIGHT: u64 = u64::MAX;
 
+    /// Height-aware epoch-transition semantics.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: this coordinated consensus change assigns
+    /// boundary blocks to the epoch they close and activates the v5 transition
+    /// context only after review and an explicit network activation decision.
+    pub const EPOCH_TRANSITION_CONTEXT_HEIGHT: u64 = u64::MAX;
+
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
         "compact bond pubkey omission must not activate before identity registry"
@@ -660,11 +667,26 @@ pub mod hard_forks {
             || CONSENSUS_SNAPSHOT_HEIGHT > REVEAL_SET_COMMITMENT_HEIGHT,
         "consensus snapshot protocol version must activate after the reveal-set protocol version"
     );
+    const _: () = assert!(
+        super::epoch_transition_context_height_is_aligned(EPOCH_TRANSITION_CONTEXT_HEIGHT),
+        "epoch transition context activation must occur at an epoch boundary"
+    );
 }
 
 /// Whether a proposed consensus-snapshot gate is inert or epoch-aligned.
 pub const fn consensus_snapshot_height_is_aligned(height: u64) -> bool {
     height == u64::MAX || (height > 0 && (height - 1) % EPOCH_DURATION_BLOCKS == 0)
+}
+
+/// Whether a proposed epoch-transition-context gate is inert or a boundary.
+pub const fn epoch_transition_context_height_is_aligned(height: u64) -> bool {
+    height == u64::MAX || (height > 0 && height % EPOCH_DURATION_BLOCKS == 0)
+}
+
+/// Whether height-aware epoch-transition semantics govern `height`.
+#[inline]
+pub fn epoch_transition_context_active(height: u64) -> bool {
+    height >= hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT
 }
 
 /// Whether versioned consensus snapshots govern `height`.
@@ -1005,13 +1027,22 @@ pub const BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT: u16 = 3;
 /// behavior activates at its own height while the block version remains 4.
 pub const BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT: u16 = 4;
 
+/// Block protocol version used at/after EPOCH_TRANSITION_CONTEXT_HEIGHT.
+///
+/// Version 5 identifies the coordinated boundary-block ownership, liveness,
+/// governance-attribution, epoch-record, and reward-rate semantics.
+pub const BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT: u16 = 5;
+
 const fn block_protocol_version_for_height_at_gates(
     height: u64,
     reveal_set_height: u64,
     consensus_snapshot_height: u64,
     self_unstake_height_precision_height: u64,
+    epoch_transition_context_height: u64,
 ) -> u16 {
-    if height >= self_unstake_height_precision_height {
+    if height >= epoch_transition_context_height {
+        BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+    } else if height >= self_unstake_height_precision_height {
         BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
     } else if height >= consensus_snapshot_height {
         BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
@@ -1030,6 +1061,7 @@ pub fn block_protocol_version_for_height(height: u64) -> u16 {
         hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
         hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
         hard_forks::SELF_UNSTAKE_HEIGHT_PRECISION_HEIGHT,
+        hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
     )
 }
 
@@ -1203,6 +1235,7 @@ impl ProtocolVersion {
             || self.0 == BLOCK_PROTOCOL_VERSION_REVEAL_SET
             || self.0 == BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
             || self.0 == BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
+            || self.0 == BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
     }
 }
 
@@ -1223,6 +1256,7 @@ impl Decode for ProtocolVersion {
             && v != BLOCK_PROTOCOL_VERSION_REVEAL_SET
             && v != BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
             && v != BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
+            && v != BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
         {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
@@ -1287,6 +1321,7 @@ mod tests {
                 REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
+                u64::MAX,
             ),
             PROTOCOL_VERSION
         );
@@ -1296,6 +1331,7 @@ mod tests {
                 REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
+                u64::MAX,
             ),
             BLOCK_PROTOCOL_VERSION_REVEAL_SET
         );
@@ -1305,6 +1341,7 @@ mod tests {
                 REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
+                u64::MAX,
             ),
             BLOCK_PROTOCOL_VERSION_REVEAL_SET
         );
@@ -1314,6 +1351,7 @@ mod tests {
                 REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
+                u64::MAX,
             ),
             BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
         );
@@ -1323,6 +1361,7 @@ mod tests {
                 REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
+                u64::MAX,
             ),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
@@ -1331,21 +1370,46 @@ mod tests {
     #[test]
     fn self_unstake_protocol_version_coexists_with_either_snapshot_gate_order() {
         assert_eq!(
-            block_protocol_version_for_height_at_gates(300, 100, 200, 400),
+            block_protocol_version_for_height_at_gates(300, 100, 200, 400, u64::MAX),
             BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(400, 100, 200, 400),
+            block_protocol_version_for_height_at_gates(400, 100, 200, 400, u64::MAX),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(200, 100, 400, 200),
+            block_protocol_version_for_height_at_gates(200, 100, 400, 200, u64::MAX),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(400, 100, 400, 200),
+            block_protocol_version_for_height_at_gates(400, 100, 400, 200, u64::MAX),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
+    }
+
+    #[test]
+    fn epoch_transition_v5_is_highest_applicable_version_in_any_gate_order() {
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(300, 100, 200, 400, 300),
+            BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(400, 100, 200, 400, 300),
+            BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates(299, 100, 200, 250, 300),
+            BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn epoch_transition_gate_alignment_accepts_only_boundaries_or_inert() {
+        assert!(epoch_transition_context_height_is_aligned(u64::MAX));
+        assert!(epoch_transition_context_height_is_aligned(300));
+        assert!(epoch_transition_context_height_is_aligned(600));
+        assert!(!epoch_transition_context_height_is_aligned(0));
+        assert!(!epoch_transition_context_height_is_aligned(301));
     }
 
     #[test]
@@ -1366,7 +1430,7 @@ mod tests {
         }
         assert_eq!(
             block_protocol_version_for_height(u64::MAX),
-            BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
+            BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
         );
     }
 
@@ -1383,6 +1447,16 @@ mod tests {
     #[test]
     fn self_unstake_height_block_protocol_version_round_trips() {
         let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT);
+        assert!(version.is_supported());
+        assert_eq!(
+            ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),
+            version
+        );
+    }
+
+    #[test]
+    fn epoch_transition_context_block_protocol_version_round_trips() {
+        let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT);
         assert!(version.is_supported());
         assert_eq!(
             ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),

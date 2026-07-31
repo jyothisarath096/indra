@@ -43,7 +43,11 @@ pub struct EpochRecord {
     pub validators_left: Vec<Bytes32>,
     /// Era number at this epoch.
     pub era: u64,
-    /// Block reward per block at this epoch in Spark.
+    /// Block reward at `start_height` in Spark.
+    ///
+    /// An epoch that crosses a monetary-era boundary can contain more than one
+    /// rate. In that case this field remains the starting rate while
+    /// `block_rewards_distributed` records the exact mixed-rate total.
     pub block_reward_spark: u64,
     /// Total supply at end of epoch.
     pub total_supply: u64,

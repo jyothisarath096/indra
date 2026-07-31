@@ -41,9 +41,9 @@ use indra_core::{
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
             block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
-            overflow_fix_active, payment_blinding_active, vrf_commit_reveal_election_active,
-            Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK,
-            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
+            epoch_transition_context_active, overflow_fix_active, payment_blinding_active,
+            vrf_commit_reveal_election_active, Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
             SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
@@ -648,6 +648,40 @@ fn apply_block_inner(
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
     validate_block_header(txn.state(), block)?;
+    let transition_context = if is_epoch_boundary(block.header.height) {
+        let expected_parent =
+            block
+                .header
+                .height
+                .checked_sub(1)
+                .ok_or(StateError::InvariantViolation {
+                    message: "epoch boundary has no certified parent",
+                })?;
+        if epoch_transition_context_active(block.header.height) {
+            if block.header.quorum_certificate.as_slice().is_empty() {
+                return Err(StateError::InvariantViolation {
+                    message: "post-gate boundary block is missing its parent quorum certificate",
+                });
+            }
+            let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
+            let qc = QuorumCertificateV1::decode(&mut reader).map_err(|_| {
+                StateError::InvariantViolation {
+                    message: "post-gate boundary block has malformed quorum certificate",
+                }
+            })?;
+            if qc.height != expected_parent {
+                return Err(StateError::InvariantViolation {
+                    message: "boundary quorum certificate does not certify the parent height",
+                });
+            }
+        }
+        Some(crate::epoch::EpochTransitionContext::new(
+            block.header.height,
+            expected_parent,
+        )?)
+    } else {
+        None
+    };
     if indra_core::types::primitives::validator_cold_key_enforcement_active(block.header.height) {
         txn.snapshot_validator_activity_scope();
         crate::epoch::enforce_validator_cold_key_enrollment(txn.state_mut(), block.header.height);
@@ -717,7 +751,8 @@ fn apply_block_inner(
     if !block.governance_ops.is_empty() {
         let mut shadow = state.clone();
         let chain_id = state.chain_id.clone();
-        let current_epoch = epoch_for_height(block.header.height);
+        let current_epoch =
+            governance_operation_epoch(block.header.height, transition_context.as_ref());
         for op in &block.governance_ops {
             apply_governance_op(
                 &mut shadow,
@@ -770,7 +805,8 @@ fn apply_block_inner(
         txn.after_mutation()?;
     }
 
-    let current_epoch = epoch_for_height(block.header.height);
+    let current_epoch =
+        governance_operation_epoch(block.header.height, transition_context.as_ref());
     let chain_id = txn.state().chain_id.clone();
     for op in &block.governance_ops {
         txn.snapshot_governance_scope();
@@ -814,15 +850,23 @@ fn apply_block_inner(
     // Advance height and tip hash
     txn.set_tip(block.header.height, block.header.block_hash())?;
 
-    // Apply epoch transition if this is the last block of an epoch
-    let epoch_record = if is_epoch_boundary(txn.state().height) {
-        let epoch = epoch_for_height(txn.state().height);
+    // Post-gate, credit the certified parent's activity before the transition
+    // so the closing epoch's final QC participates in liveness evaluation.
+    if let Some(context) = transition_context
+        .filter(|context| epoch_transition_context_active(context.boundary_height))
+    {
+        txn.snapshot_validator_activity_scope();
+        update_last_active_epoch_from_block_qc(txn.state_mut(), block, Some(&context))?;
+        txn.after_mutation()?;
+    }
+
+    // Apply epoch transition if this is the last block of an epoch.
+    let epoch_record = if let Some(context) = transition_context {
         txn.snapshot_epoch_scope();
         Some(crate::epoch::apply_epoch_transition_at_height(
             txn.state_mut(),
-            epoch,
+            &context,
             timestamp_secs,
-            block.header.height,
         )?)
     } else {
         None
@@ -837,15 +881,19 @@ fn apply_block_inner(
         });
     }
 
-    txn.snapshot_validator_activity_scope();
-    update_last_active_epoch_from_block_qc(txn.state_mut(), block);
-    txn.after_mutation()?;
+    if transition_context
+        .is_none_or(|context| !epoch_transition_context_active(context.boundary_height))
+    {
+        txn.snapshot_validator_activity_scope();
+        update_last_active_epoch_from_block_qc(txn.state_mut(), block, None)?;
+        txn.after_mutation()?;
+    }
 
     // Snapshot rotation is deliberately last: it must observe the fully
     // settled post-boundary validator state after reselection, rewards,
     // releases, liveness penalties, and QC activity accounting.
-    if is_epoch_boundary(txn.state().height) {
-        let boundary_height = txn.state().height;
+    if let Some(context) = transition_context {
+        let boundary_height = context.boundary_height;
         txn.state_mut()
             .create_consensus_snapshot_after_boundary(boundary_height)?;
         if indra_core::types::primitives::consensus_snapshot_active(
@@ -859,23 +907,57 @@ fn apply_block_inner(
     Ok(epoch_record)
 }
 
+fn governance_operation_epoch(
+    height: u64,
+    context: Option<&crate::epoch::EpochTransitionContext>,
+) -> u64 {
+    governance_operation_epoch_at_gate(
+        height,
+        context,
+        indra_core::types::primitives::hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
+    )
+}
+
+fn governance_operation_epoch_at_gate(
+    height: u64,
+    context: Option<&crate::epoch::EpochTransitionContext>,
+    gate_height: u64,
+) -> u64 {
+    context
+        .filter(|_| height >= gate_height)
+        .map_or_else(|| epoch_for_height(height), |context| context.closing_epoch)
+}
+
 /// Update validator liveness from the QC embedded in the applied block.
 ///
 /// This is consensus state because `last_active_epoch` is committed in the
 /// validator-set root. Keeping this mutation inside `apply_block` ensures live
 /// import, sync import, snapshot replay, and block-production projection all
 /// execute the same state transition.
-fn update_last_active_epoch_from_block_qc(state: &mut ChainState, block: &BlockV1) {
+fn update_last_active_epoch_from_block_qc(
+    state: &mut ChainState,
+    block: &BlockV1,
+    context: Option<&crate::epoch::EpochTransitionContext>,
+) -> StateResult<()> {
     if block.header.quorum_certificate.as_slice().is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
     let Ok(qc) = QuorumCertificateV1::decode(&mut reader) else {
-        return;
+        return Ok(());
     };
 
-    let current_epoch = epoch_for_height(block.header.height);
+    let current_epoch = if let Some(context) = context {
+        if qc.height != context.certified_parent_height {
+            return Err(StateError::InvariantViolation {
+                message: "QC activity height does not match epoch transition context",
+            });
+        }
+        epoch_for_height(context.certified_parent_height)
+    } else {
+        epoch_for_height(block.header.height)
+    };
     let mut changed = Vec::new();
     for signature in qc.pq_signatures {
         if let Some(validator) = state.validators.get_mut(&signature.validator_id) {
@@ -890,6 +972,7 @@ fn update_last_active_epoch_from_block_qc(state: &mut ChainState, block: &BlockV
             }
         }
     }
+    Ok(())
 }
 
 /// Validate block-level invariants (does not touch state).
@@ -1166,6 +1249,7 @@ mod tests {
     use crate::chain::ChainState;
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
+        GOVERNANCE_DELIBERATION_EPOCHS,
     };
     use crate::validator::{
         ColdKeyStatus, StakeBondEntry, ValidatorEntry, ValidatorSet, ValidatorStatus,
@@ -1175,18 +1259,19 @@ mod tests {
         codec::Encode,
         types::{
             block::{BlockHeaderV1, BlockV1},
+            crypto::PQVoteSig,
             governance::{
                 compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
                 hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
-                BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
-                BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK,
-                EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
-                MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK,
-                MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_BOND_SPARK,
-                SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+                BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
+                BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
+                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
+                MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
+                MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
                 TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
             },
             slashing::SlashEvidenceV1,
@@ -5468,6 +5553,130 @@ mod tests {
     }
 
     #[test]
+    fn boundary_governance_epoch_switches_only_at_context_gate() {
+        let context = crate::epoch::EpochTransitionContext::new(300, 299).unwrap();
+        assert_eq!(
+            governance_operation_epoch_at_gate(300, Some(&context), 301),
+            1,
+            "legacy attribution remains the numerically opening epoch"
+        );
+        assert_eq!(
+            governance_operation_epoch_at_gate(300, Some(&context), 300),
+            0,
+            "post-gate boundary operations belong to the closing epoch"
+        );
+
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (pubkey, keypair, validator_id) =
+            install_governance_validator(&mut state, [0xA6; 32], 100_000);
+        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
+        let deposit = state
+            .utxos
+            .insert(governance_deposit_output(pubkey.clone(), 1_000), 299, 0, 0)
+            .unwrap();
+        let op = governance_propose_op(
+            validator_id,
+            &keypair,
+            pubkey,
+            deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark { value: 100_000 },
+        );
+        let chain_id = state.chain_id.clone();
+        apply_governance_op(
+            &mut state,
+            &op,
+            governance_operation_epoch_at_gate(300, Some(&context), 300),
+            300,
+            &chain_id,
+        )
+        .unwrap();
+        let proposal = state.governance.proposals.values().next().unwrap();
+        assert_eq!(proposal.proposed_epoch, context.closing_epoch);
+        assert_eq!(
+            proposal.commit_start_epoch,
+            context
+                .closing_epoch
+                .saturating_add(GOVERNANCE_DELIBERATION_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn boundary_qc_activity_uses_certified_parent_epoch_post_gate() {
+        let validator_id = Bytes32::from([0xA7; 32]);
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: "activity".into(),
+                hybrid_classical_pk: None,
+                hybrid_pq_pk: None,
+                vrf_pk: None,
+                stake_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 99,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                self_report_count: 0,
+                commission_bps: 0,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: 0,
+                auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: None,
+                cold_hybrid_pq_pk: None,
+                cold_key_version: 0,
+                cold_key_status: ColdKeyStatus::Unenrolled,
+                cold_nonce: 0,
+            })
+            .unwrap();
+        let qc = QuorumCertificateV1 {
+            height: 299,
+            round: 0,
+            block_hash: Bytes32::from([0x29; 32]),
+            election_result_hash: None,
+            signer_bitfield: [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES],
+            pq_signatures: vec![PQVoteSig {
+                validator_id,
+                pq_sig: VariableBytes::from_slice(&[1]).unwrap(),
+            }],
+            classical_signatures: vec![],
+        };
+        let mut block = make_block_at_height(&state, vec![], 300, 0);
+        block.header.quorum_certificate = VariableBytes::from_slice(&qc.encode_to_vec()).unwrap();
+        let context = crate::epoch::EpochTransitionContext::new(300, 299).unwrap();
+        update_last_active_epoch_from_block_qc(&mut state, &block, Some(&context)).unwrap();
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .last_active_epoch,
+            0
+        );
+
+        state
+            .validators
+            .get_mut(&validator_id)
+            .unwrap()
+            .last_active_epoch = 99;
+        update_last_active_epoch_from_block_qc(&mut state, &block, None).unwrap();
+        assert_eq!(
+            state
+                .validators
+                .get(&validator_id)
+                .unwrap()
+                .last_active_epoch,
+            1
+        );
+    }
+
+    #[test]
     fn snapshot_and_height_precision_protocol_transition_rejects_stale_version_and_replays() {
         fn state_before_inert_gate() -> ChainState {
             let mut state = ChainState::new_genesis();
@@ -5506,7 +5715,7 @@ mod tests {
             let post_gate = make_block_at_height(&state, vec![], u64::MAX, 1_900_000_001);
             assert_eq!(
                 post_gate.header.protocol_version,
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT)
+                ProtocolVersion(BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT)
             );
 
             let mut rejected = state.clone();

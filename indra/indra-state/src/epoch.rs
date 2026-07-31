@@ -59,23 +59,95 @@ struct AutoDelegationSnapshot {
     had_existing_entry: bool,
 }
 
+/// Immutable, derived facts for one epoch-boundary state transition.
+///
+/// This value is deliberately ephemeral: it is never encoded, persisted in
+/// `ChainState`, or committed to a state root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochTransitionContext {
+    /// Height of the transition block.
+    pub boundary_height: u64,
+    /// Height certified by the transition block's parent QC.
+    pub certified_parent_height: u64,
+    /// Epoch whose final produced block is `boundary_height`.
+    pub closing_epoch: u64,
+    /// First produced block belonging to `closing_epoch`.
+    pub closing_start_height: u64,
+    /// Last produced block belonging to `closing_epoch`, inclusive.
+    pub closing_end_height: u64,
+    /// Epoch that begins after the boundary transition completes.
+    pub opening_epoch: u64,
+}
+
+impl EpochTransitionContext {
+    /// Construct and validate context derived from a boundary block and its QC.
+    pub fn new(boundary_height: u64, certified_parent_height: u64) -> StateResult<Self> {
+        if boundary_height == 0 || !boundary_height.is_multiple_of(EPOCH_DURATION_BLOCKS) {
+            return Err(crate::error::StateError::InvariantViolation {
+                message: "epoch transition context requires a nonzero boundary height",
+            });
+        }
+        if certified_parent_height.checked_add(1) != Some(boundary_height) {
+            return Err(crate::error::StateError::InvariantViolation {
+                message: "certified parent height must immediately precede the boundary",
+            });
+        }
+        let opening_epoch = epoch_for_height(boundary_height);
+        let closing_epoch =
+            opening_epoch
+                .checked_sub(1)
+                .ok_or(crate::error::StateError::InvariantViolation {
+                    message: "epoch boundary has no closing epoch",
+                })?;
+        let closing_start_height = boundary_height
+            .checked_sub(EPOCH_DURATION_BLOCKS)
+            .and_then(|height| height.checked_add(1))
+            .ok_or(crate::error::StateError::InvariantViolation {
+                message: "closing epoch height range overflow",
+            })?;
+        Ok(Self {
+            boundary_height,
+            certified_parent_height,
+            closing_epoch,
+            closing_start_height,
+            closing_end_height: boundary_height,
+            opening_epoch,
+        })
+    }
+}
+
 /// Apply the epoch transition to the chain state.
 pub fn apply_epoch_transition(
     state: &mut ChainState,
-    current_epoch: u64,
+    context: &EpochTransitionContext,
     timestamp_secs: u64,
 ) -> StateResult<EpochRecord> {
-    let height = current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
-    apply_epoch_transition_at_height(state, current_epoch, timestamp_secs, height)
+    apply_epoch_transition_at_height(state, context, timestamp_secs)
 }
 
-/// Apply an epoch transition using the consensus block height that triggered it.
+/// Apply an epoch transition using an explicit, validated boundary context.
 pub fn apply_epoch_transition_at_height(
     state: &mut ChainState,
-    current_epoch: u64,
+    context: &EpochTransitionContext,
     timestamp_secs: u64,
-    height: u64,
 ) -> StateResult<EpochRecord> {
+    apply_epoch_transition_at_gate(
+        state,
+        context,
+        timestamp_secs,
+        indra_core::types::primitives::hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
+    )
+}
+
+fn apply_epoch_transition_at_gate(
+    state: &mut ChainState,
+    context: &EpochTransitionContext,
+    timestamp_secs: u64,
+    gate_height: u64,
+) -> StateResult<EpochRecord> {
+    let height = context.boundary_height;
+    let current_epoch = context.opening_epoch;
+    let context_active = height >= gate_height;
     enforce_validator_cold_key_enrollment(state, height);
     // DETERMINISM NOTE: timestamp_secs is stored ONLY in EpochRecord
     // and does NOT affect ChainState mutations. State root is computed
@@ -106,11 +178,36 @@ pub fn apply_epoch_transition_at_height(
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
     let explicit_slash_count_this_epoch = state.epoch_slash_event_count;
-    let current_height = height;
-    let record_epoch = current_epoch.saturating_sub(1);
-    let record_start_height = record_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
-    let reward_per_block = block_reward_at_height(current_height);
-    let epoch_block_reward = reward_per_block.saturating_mul(EPOCH_DURATION_BLOCKS);
+    let record_epoch = if context_active {
+        context.closing_epoch
+    } else {
+        current_epoch.saturating_sub(1)
+    };
+    let record_start_height = if context_active {
+        context.closing_start_height
+    } else {
+        record_epoch.saturating_mul(EPOCH_DURATION_BLOCKS)
+    };
+    let record_end_height = if context_active {
+        context.closing_end_height
+    } else {
+        record_start_height
+            .saturating_add(EPOCH_DURATION_BLOCKS)
+            .saturating_sub(1)
+    };
+    // `block_reward_spark` is intentionally the rate at the first rewarded
+    // height. A closing epoch may span an era boundary; the exact mixed-rate
+    // amount is carried by `block_rewards_distributed`.
+    let reward_per_block = block_reward_at_height(if context_active {
+        context.closing_start_height
+    } else {
+        height
+    });
+    let epoch_block_reward = if context_active {
+        block_rewards_for_inclusive_range(context.closing_start_height, context.closing_end_height)
+    } else {
+        reward_per_block.saturating_mul(EPOCH_DURATION_BLOCKS)
+    };
 
     state
         .validators
@@ -142,8 +239,13 @@ pub fn apply_epoch_transition_at_height(
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds_at_height(state, current_epoch, height)?;
+    let liveness_epoch = if context_active {
+        context.closing_epoch
+    } else {
+        current_epoch
+    };
     let (liveness_slashed, liveness_penalty_count) =
-        apply_liveness_penalties(state, current_epoch, height);
+        apply_liveness_penalties(state, liveness_epoch, height);
 
     let mut active_after: Vec<Bytes32> = state
         .validators
@@ -166,9 +268,7 @@ pub fn apply_epoch_transition_at_height(
     let record = EpochRecord {
         epoch: record_epoch,
         start_height: record_start_height,
-        end_height: record_start_height
-            .saturating_add(EPOCH_DURATION_BLOCKS)
-            .saturating_sub(1),
+        end_height: record_end_height,
         timestamp_secs,
         active_validators: active_validators_before,
         total_staked_spark: total_staked,
@@ -202,6 +302,12 @@ pub fn apply_epoch_transition_at_height(
         state.rebuild_state_commitment_v2(height);
     }
     Ok(record)
+}
+
+fn block_rewards_for_inclusive_range(start_height: u64, end_height: u64) -> u64 {
+    (start_height..=end_height).fold(0u64, |total, height| {
+        total.saturating_add(block_reward_at_height(height))
+    })
 }
 
 /// Apply the deterministic enforcement-height demotion. This is idempotent so
@@ -1242,6 +1348,107 @@ mod tests {
         indra_crypto::sha256(&input)
     }
 
+    #[test]
+    fn epoch_transition_context_validates_and_derives_boundary_facts() {
+        let context = EpochTransitionContext::new(300, 299).unwrap();
+        assert_eq!(
+            context,
+            EpochTransitionContext {
+                boundary_height: 300,
+                certified_parent_height: 299,
+                closing_epoch: 0,
+                closing_start_height: 1,
+                closing_end_height: 300,
+                opening_epoch: 1,
+            }
+        );
+        assert!(EpochTransitionContext::new(0, 0).is_err());
+        assert!(EpochTransitionContext::new(299, 298).is_err());
+        assert!(EpochTransitionContext::new(300, 298).is_err());
+    }
+
+    #[test]
+    fn post_gate_epoch_record_uses_inclusive_produced_block_range() {
+        let context = EpochTransitionContext::new(300, 299).unwrap();
+        let mut state = ChainState::new_genesis();
+        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 300).unwrap();
+        assert_eq!(record.epoch, 0);
+        assert_eq!(record.start_height, 1);
+        assert_eq!(record.end_height, 300);
+    }
+
+    #[test]
+    fn pre_gate_epoch_record_remains_legacy_byte_semantics() {
+        let context = EpochTransitionContext::new(300, 299).unwrap();
+        let mut state = ChainState::new_genesis();
+        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 301).unwrap();
+        assert_eq!(record.epoch, 0);
+        assert_eq!(record.start_height, 0);
+        assert_eq!(record.end_height, 299);
+        assert_eq!(record.block_reward_spark, block_reward_at_height(300));
+    }
+
+    #[test]
+    fn credited_closing_epoch_activity_prevents_same_boundary_liveness_penalty() {
+        let context = EpochTransitionContext::new(300, 299).unwrap();
+        let mut state = ChainState::new_genesis();
+        state.governance.params.slash_liveness_threshold_epochs = 1;
+        let mut validator = make_validator(0x92, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 2);
+        validator.last_active_epoch = context.closing_epoch;
+        validator.cold_key_status = crate::validator::ColdKeyStatus::Active;
+        let validator_id = validator.validator_id;
+        let original_stake = validator.stake_spark;
+        state.validators.upsert(validator).unwrap();
+
+        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 300).unwrap();
+        assert_eq!(record.liveness_penalty_count, 0);
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            original_stake
+        );
+    }
+
+    #[test]
+    fn independent_replays_across_context_gate_are_byte_identical() {
+        fn replay(mut state: ChainState) -> ChainState {
+            let legacy = EpochTransitionContext::new(300, 299).unwrap();
+            state.height = 300;
+            apply_epoch_transition_at_gate(&mut state, &legacy, 0, 600).unwrap();
+
+            let upgraded = EpochTransitionContext::new(600, 599).unwrap();
+            state.height = 600;
+            apply_epoch_transition_at_gate(&mut state, &upgraded, 0, 600).unwrap();
+            state
+        }
+
+        let first = replay(ChainState::new_genesis());
+        let second = replay(ChainState::new_genesis());
+        assert_eq!(first.encode_to_vec(), second.encode_to_vec());
+        assert_eq!(compute_state_root(&first), compute_state_root(&second));
+    }
+
+    #[test]
+    fn mixed_rate_epoch_sums_each_governed_height_exactly() {
+        let boundary = ERA_1_2_DURATION_BLOCKS;
+        let start = boundary - EPOCH_DURATION_BLOCKS + 1;
+        let expected = ERA_1_BLOCK_REWARD_SPARK
+            .saturating_mul(EPOCH_DURATION_BLOCKS - 1)
+            .saturating_add(ERA_2_BLOCK_REWARD_SPARK);
+        assert_eq!(block_rewards_for_inclusive_range(start, boundary), expected);
+        assert_eq!(block_reward_at_height(start), ERA_1_BLOCK_REWARD_SPARK);
+        assert_eq!(block_reward_at_height(boundary), ERA_2_BLOCK_REWARD_SPARK);
+
+        let context = EpochTransitionContext::new(boundary, boundary - 1).unwrap();
+        let mut state = ChainState::new_genesis();
+        let mut validator = make_validator(0x91, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 2);
+        validator.cold_key_status = crate::validator::ColdKeyStatus::Active;
+        validator.last_active_epoch = context.closing_epoch;
+        state.validators.upsert(validator).unwrap();
+        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, boundary).unwrap();
+        assert_eq!(record.block_reward_spark, ERA_1_BLOCK_REWARD_SPARK);
+        assert_eq!(record.block_rewards_distributed, expected);
+    }
+
     fn manual_normal_release_blinding(
         domain: &[u8],
         validator_id: Bytes32,
@@ -1708,7 +1915,9 @@ mod tests {
             .staked_bonds
             .insert(post_gate_bond.utxo_id, post_gate_bond.clone());
 
-        apply_epoch_transition_at_height(&mut state, pre_epoch, 1, pre_height).unwrap();
+        let pre_context =
+            EpochTransitionContext::new(pre_height, pre_height.saturating_sub(1)).unwrap();
+        apply_epoch_transition_at_height(&mut state, &pre_context, 1).unwrap();
         let pre_release_utxo_id = crate::utxo::UtxoSet::compute_utxo_id(
             &pre_gate_original_output,
             pre_height,
@@ -1722,7 +1931,9 @@ mod tests {
         );
         assert!(state.delegation_return_events.is_empty());
 
-        apply_epoch_transition_at_height(&mut state, post_epoch, 2, post_height).unwrap();
+        let post_context =
+            EpochTransitionContext::new(post_height, post_height.saturating_sub(1)).unwrap();
+        apply_epoch_transition_at_height(&mut state, &post_context, 2).unwrap();
         assert_eq!(state.delegation_return_events.len(), 1);
         let event = &state.delegation_return_events[0];
         assert_eq!(event.reason, DelegationReturnReason::UnbondingMatured);
@@ -1801,9 +2012,13 @@ mod tests {
                 .staked_bonds
                 .insert(fully_compact.utxo_id, fully_compact);
 
-            apply_epoch_transition_at_height(&mut state, pre_epoch, 1, pre_height).unwrap();
+            let pre_context =
+                EpochTransitionContext::new(pre_height, pre_height.saturating_sub(1)).unwrap();
+            apply_epoch_transition_at_height(&mut state, &pre_context, 1).unwrap();
             assert!(state.delegation_return_events.is_empty());
-            apply_epoch_transition_at_height(&mut state, post_epoch, 2, post_height).unwrap();
+            let post_context =
+                EpochTransitionContext::new(post_height, post_height.saturating_sub(1)).unwrap();
+            apply_epoch_transition_at_height(&mut state, &post_context, 2).unwrap();
             assert_eq!(state.delegation_return_events.len(), 1);
             assert_eq!(
                 state.delegation_return_events[0].bond_utxo_id,
@@ -2240,8 +2455,11 @@ mod tests {
 
     #[test]
     fn governance_pruning_replay_across_activation_is_deterministic() {
+        let boundary_height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
+            .div_ceil(EPOCH_DURATION_BLOCKS)
+            .saturating_mul(EPOCH_DURATION_BLOCKS);
         let mut continuous = ChainState::new_genesis();
-        continuous.height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT;
+        continuous.height = boundary_height;
         for index in 0..(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS + 3) {
             let proposal =
                 governance_pruning_test_proposal(index as u64, ProposalPhase::Failed, index as u64);
@@ -2252,20 +2470,11 @@ mod tests {
         }
         let mut replayed = continuous.clone();
 
-        apply_epoch_transition_at_height(
-            &mut continuous,
-            epoch_for_height(GOVERNANCE_PROPOSAL_PRUNING_HEIGHT),
-            111,
-            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT,
-        )
-        .unwrap();
-        apply_epoch_transition_at_height(
-            &mut replayed,
-            epoch_for_height(GOVERNANCE_PROPOSAL_PRUNING_HEIGHT),
-            999,
-            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT,
-        )
-        .unwrap();
+        let context =
+            EpochTransitionContext::new(boundary_height, boundary_height.saturating_sub(1))
+                .unwrap();
+        apply_epoch_transition_at_height(&mut continuous, &context, 111).unwrap();
+        apply_epoch_transition_at_height(&mut replayed, &context, 999).unwrap();
 
         assert_eq!(
             continuous.governance.proposals.keys().collect::<Vec<_>>(),
@@ -2637,12 +2846,34 @@ mod tests {
         validator.pending_commission_effective_epoch = Some(COMMISSION_CHANGE_DELAY_EPOCHS);
         state.validators.upsert(validator).unwrap();
 
-        apply_epoch_transition(&mut state, COMMISSION_CHANGE_DELAY_EPOCHS - 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (COMMISSION_CHANGE_DELAY_EPOCHS - 1).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (COMMISSION_CHANGE_DELAY_EPOCHS - 1)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         let before_effective = state.validators.get(&validator_id).unwrap();
         assert_eq!(before_effective.commission_bps, 1_000);
         assert_eq!(before_effective.pending_commission_bps, Some(1_500));
 
-        apply_epoch_transition(&mut state, COMMISSION_CHANGE_DELAY_EPOCHS, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (COMMISSION_CHANGE_DELAY_EPOCHS).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (COMMISSION_CHANGE_DELAY_EPOCHS)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         let after_effective = state.validators.get(&validator_id).unwrap();
         assert_eq!(after_effective.commission_bps, 1_500);
         assert_eq!(after_effective.pending_commission_bps, None);
@@ -2675,7 +2906,18 @@ mod tests {
             block_reward_at_height(activation_height).saturating_mul(EPOCH_DURATION_BLOCKS);
         let fee_reward_at_activation = 10_000;
         state.fee_reward_pool = fee_reward_at_activation;
-        apply_epoch_transition(&mut state, activation_epoch, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (activation_epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (activation_epoch)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         let validator_after_activation = state.validators.get(&validator_id).unwrap();
         assert_eq!(validator_after_activation.commission_bps, 2_000);
@@ -2704,7 +2946,18 @@ mod tests {
         let next_reward = block_reward_at_height(next_height).saturating_mul(EPOCH_DURATION_BLOCKS);
         let next_fee_reward = 20_000;
         state.fee_reward_pool = next_fee_reward;
-        apply_epoch_transition(&mut state, next_epoch, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (next_epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (next_epoch)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(
             state
@@ -2748,7 +3001,18 @@ mod tests {
         let epoch = 1;
         let height = epoch * EPOCH_DURATION_BLOCKS;
         let reward = block_reward_at_height(height).saturating_mul(EPOCH_DURATION_BLOCKS);
-        apply_epoch_transition(&mut state, epoch, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (epoch)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(
             state.validators.get(&validator_id).unwrap().pending_rewards,
@@ -2893,7 +3157,18 @@ mod tests {
     fn epoch_transition_does_not_increase_supply() {
         let mut state = crate::chain::ChainState::new_genesis();
         let supply_before = state.total_supply;
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         assert_eq!(state.total_supply, supply_before);
     }
 
@@ -2901,7 +3176,18 @@ mod tests {
     fn epoch_transition_does_not_increase_treasury() {
         let mut state = crate::chain::ChainState::new_genesis();
         let treasury_before = state.treasury_balance;
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         assert_eq!(state.treasury_balance, treasury_before);
     }
 
@@ -2912,7 +3198,18 @@ mod tests {
         let validator = make_validator(0x91, initial_stake);
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
-        apply_epoch_transition(&mut state, 3, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (3u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
@@ -2931,7 +3228,18 @@ mod tests {
         let validator = make_validator(0x92, initial_stake);
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
-        apply_epoch_transition(&mut state, 2, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (2u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (2u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
             initial_stake
@@ -2947,7 +3255,18 @@ mod tests {
             .upsert(make_validator(0x93, initial_stake))
             .unwrap();
         let supply_before = state.total_supply;
-        apply_epoch_transition(&mut state, 3, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (3u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
         assert_eq!(state.total_supply, supply_before - expected_penalty);
     }
@@ -2960,7 +3279,18 @@ mod tests {
         let validator_id = validator.validator_id;
         state.validators.upsert(validator).unwrap();
 
-        apply_epoch_transition(&mut state, 3, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (3u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
         let validator = state.validators.get(&validator_id).unwrap();
@@ -2985,8 +3315,30 @@ mod tests {
     fn epoch_transition_is_deterministic() {
         let mut s1 = crate::chain::ChainState::new_genesis();
         let mut s2 = crate::chain::ChainState::new_genesis();
-        apply_epoch_transition(&mut s1, 1, 0).unwrap();
-        apply_epoch_transition(&mut s2, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut s1,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
+        apply_epoch_transition(
+            &mut s2,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         assert_eq!(s1.total_supply, s2.total_supply);
         assert_eq!(s1.treasury_balance, s2.treasury_balance);
     }
@@ -3012,8 +3364,30 @@ mod tests {
             s2.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut s1, 1, 0).unwrap();
-        apply_epoch_transition(&mut s2, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut s1,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
+        apply_epoch_transition(
+            &mut s2,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         for validator in validators {
             let id = validator.validator_id;
@@ -3053,8 +3427,30 @@ mod tests {
             reverse.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut forward, 3, 0).unwrap();
-        apply_epoch_transition(&mut reverse, 3, 0).unwrap();
+        apply_epoch_transition(
+            &mut forward,
+            &EpochTransitionContext::new(
+                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (3u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
+        apply_epoch_transition(
+            &mut reverse,
+            &EpochTransitionContext::new(
+                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (3u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(forward, reverse);
         assert_eq!(compute_state_root(&forward), compute_state_root(&reverse));
@@ -3096,7 +3492,18 @@ mod tests {
             state.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         let inactive_id = Bytes32::from([0x15; 32]);
         let target_id = Bytes32::from([0x01; 32]);
@@ -3125,7 +3532,18 @@ mod tests {
             state.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         let inactive_id = Bytes32::from([0x16; 32]);
         let target_id = Bytes32::from([0x15; 32]);
@@ -3151,7 +3569,18 @@ mod tests {
             state.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(
             state
@@ -3183,7 +3612,18 @@ mod tests {
             state.validators.upsert(validator).unwrap();
         }
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         let root_after_first = compute_state_root(&state);
         let target_id = Bytes32::from([0x01; 32]);
         let inactive_id = Bytes32::from([0x15; 32]);
@@ -3213,7 +3653,18 @@ mod tests {
             .add_delegation(target_id, inactive_id, 123_456, 0)
             .unwrap();
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         let entries = state.delegations.get_delegators(&target_id);
         let restored = entries
@@ -3252,7 +3703,18 @@ mod tests {
         }
         let supply_before = state.total_supply;
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(state.total_supply, supply_before);
     }
@@ -3278,7 +3740,18 @@ mod tests {
             },
         );
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert!(state.staked_bonds.is_empty());
         assert_eq!(state.utxos.len(), 1);
@@ -3305,7 +3778,18 @@ mod tests {
             },
         );
 
-        apply_epoch_transition(&mut state, 1, 0).unwrap();
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (1u64)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
 
         assert!(state.staked_bonds.contains_key(&utxo_id));
         assert!(state.utxos.is_empty());

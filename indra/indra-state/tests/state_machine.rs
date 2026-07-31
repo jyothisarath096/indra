@@ -25,8 +25,11 @@ use indra_crypto::{
     commit, prove_range, ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair,
 };
 use indra_state::{
-    apply::apply_slash, apply_block, compute_state_root, epoch::apply_epoch_transition,
-    utxo::UtxoSet, ChainState, ColdKeyStatus, ValidatorEntry, ValidatorStatus,
+    apply::apply_slash,
+    apply_block, compute_state_root,
+    epoch::{apply_epoch_transition, EpochTransitionContext},
+    utxo::UtxoSet,
+    ChainState, ColdKeyStatus, ValidatorEntry, ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -766,7 +769,18 @@ fn test_self_stake_full_lifecycle() {
     validator.cold_key_version = 1;
     validator.cold_key_status = ColdKeyStatus::Active;
 
-    apply_epoch_transition(&mut state, UNBONDING_PERIOD_EPOCHS, 0).unwrap();
+    apply_epoch_transition(
+        &mut state,
+        &EpochTransitionContext::new(
+            (UNBONDING_PERIOD_EPOCHS).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (UNBONDING_PERIOD_EPOCHS)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
     assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
     assert_eq!(state.utxos.len(), 1);
     assert!(state
@@ -806,8 +820,19 @@ fn test_auto_delegate_full_lifecycle() {
     apply_block(&mut state, &set_block, 0).unwrap();
 
     let mut previous_rewards = 0;
-    for epoch in 1..=3 {
-        apply_epoch_transition(&mut state, epoch, 0).unwrap();
+    for epoch in 1u64..=3 {
+        apply_epoch_transition(
+            &mut state,
+            &EpochTransitionContext::new(
+                (epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (epoch)
+                    .saturating_mul(EPOCH_DURATION_BLOCKS)
+                    .saturating_sub(1),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
         let rewards = state.validators.get(&inactive_id).unwrap().pending_rewards;
         assert!(rewards > previous_rewards);
         previous_rewards = rewards;
@@ -905,8 +930,30 @@ fn epoch_transition_produces_identical_state_on_replay() {
         original.validators.get_mut(&id).unwrap().stake_spark = 1_000_000;
     }
     let mut replay = original.clone();
-    apply_epoch_transition(&mut original, 1, 0).unwrap();
-    apply_epoch_transition(&mut replay, 1, 0).unwrap();
+    apply_epoch_transition(
+        &mut original,
+        &EpochTransitionContext::new(
+            (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (1u64)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
+    apply_epoch_transition(
+        &mut replay,
+        &EpochTransitionContext::new(
+            (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (1u64)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
     assert_eq!(original.encode_to_vec(), replay.encode_to_vec());
 }
 

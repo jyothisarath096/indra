@@ -5,8 +5,9 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
-        MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES, UNBONDING_PERIOD_EPOCHS,
+        Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
+        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES,
+        MAX_VRF_PROOF_BYTES, UNBONDING_PERIOD_EPOCHS,
     },
     slashing::SlashEvidenceV1,
     staking::{StakingOp, StakingOpBody},
@@ -16,7 +17,7 @@ use indra_core::types::{
 use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_state::{
     apply::apply_slash_at_height, apply_block, apply_epoch_transition, apply_staking_op,
-    ChainState, ValidatorEntry, ValidatorStatus,
+    ChainState, EpochTransitionContext, ValidatorEntry, ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -310,7 +311,18 @@ fn bond_and_unbond_do_not_change_total_supply() {
     apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
     assert_eq!(state.total_supply, supply_before);
 
-    apply_epoch_transition(&mut state, UNBONDING_PERIOD_EPOCHS, 0).unwrap();
+    apply_epoch_transition(
+        &mut state,
+        &EpochTransitionContext::new(
+            (UNBONDING_PERIOD_EPOCHS).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (UNBONDING_PERIOD_EPOCHS)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
     assert_eq!(state.total_supply, supply_before);
 }
 
@@ -346,7 +358,18 @@ fn epoch_reward_does_not_increase_total_supply() {
         .unwrap();
     let supply_before = state.total_supply;
 
-    apply_epoch_transition(&mut state, 1, 0).unwrap();
+    apply_epoch_transition(
+        &mut state,
+        &EpochTransitionContext::new(
+            (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (1u64)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
 
     assert_eq!(state.total_supply, supply_before);
 }
@@ -396,7 +419,18 @@ fn liveness_penalty_burn_reduces_total_supply_if_active() {
         .unwrap();
     let supply_before = state.total_supply;
 
-    apply_epoch_transition(&mut state, 3, 0).unwrap();
+    apply_epoch_transition(
+        &mut state,
+        &EpochTransitionContext::new(
+            (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (3u64)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
 
     assert!(state.total_supply < supply_before);
     assert_eq!(supply_before - state.total_supply, INPUT_VALUE / 1_000);
@@ -439,7 +473,18 @@ fn total_supply_invariant_across_full_epoch_cycle() {
     let block = block_with_transactions(&state, vec![tx]);
     apply_block(&mut state, &block, 0).unwrap();
     let after_block_supply = state.total_supply;
-    apply_epoch_transition(&mut state, 1, 0).unwrap();
+    apply_epoch_transition(
+        &mut state,
+        &EpochTransitionContext::new(
+            (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (1u64)
+                .saturating_mul(EPOCH_DURATION_BLOCKS)
+                .saturating_sub(1),
+        )
+        .unwrap(),
+        0,
+    )
+    .unwrap();
 
     assert_eq!(after_block_supply, supply_before - expected_burn);
     assert_eq!(
