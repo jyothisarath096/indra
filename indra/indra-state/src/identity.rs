@@ -81,14 +81,27 @@ pub(crate) fn resolve_active_validator_cold_pubkey(
     state: &ChainState,
     validator_id: &Bytes32,
 ) -> Result<HybridPubKey, IdentityError> {
-    let validator =
-        state
-            .validators
+    let Some(validator) = state.validators.get(validator_id) else {
+        if let Some(cold) = state
+            .evicted_validator_tombstones
             .get(validator_id)
-            .ok_or(IdentityError::UnresolvableIdentity {
-                validator_id: Some(*validator_id),
-                delegator_id: *validator_id,
-            })?;
+            .and_then(|tombstone| tombstone.cold_custody.as_ref())
+        {
+            return Ok(HybridPubKey {
+                classical_pk: Bytes32::from(cold.classical_pk),
+                pq_pk: indra_core::VariableBytes::from_slice(&cold.pq_pk).map_err(|_| {
+                    IdentityError::UnresolvableIdentity {
+                        validator_id: Some(*validator_id),
+                        delegator_id: *validator_id,
+                    }
+                })?,
+            });
+        }
+        return Err(IdentityError::UnresolvableIdentity {
+            validator_id: Some(*validator_id),
+            delegator_id: *validator_id,
+        });
+    };
     if validator.cold_key_status != ColdKeyStatus::Active {
         return Err(IdentityError::UnresolvableIdentity {
             validator_id: Some(*validator_id),

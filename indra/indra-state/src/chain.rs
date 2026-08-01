@@ -30,8 +30,9 @@ use crate::{
     utxo::UtxoSet,
     validator::{
         decode_delegation_return_events, delegation_return_events_encoded_len,
-        encode_delegation_return_events, DelegationMap, DelegationReturnEvent, StakeBondEntry,
-        ValidatorSet,
+        encode_delegation_return_events, DelegationMap, DelegationReturnEvent,
+        EvictedValidatorTombstoneV1, StakeBondEntry, ValidatorSet,
+        MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE, MAX_TOTAL_RETAINED_BOND_REFERENCES,
     },
 };
 
@@ -116,6 +117,9 @@ pub struct ChainState {
 
     /// Canonical rolling commitments used for historical slash membership.
     pub slash_membership_roots: Vec<SlashMembershipRootRecord>,
+
+    /// Bounded historical/custody records for post-v8 registry evictions.
+    pub evicted_validator_tombstones: PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>,
 
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
@@ -237,6 +241,7 @@ impl Encode for ChainState {
         }
         if indra_core::types::primitives::slash_membership_proof_active(self.height) {
             encode_list(&self.slash_membership_roots, buf);
+            encode_tombstones(&self.evicted_validator_tombstones, buf);
         }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
@@ -303,6 +308,7 @@ impl Encode for ChainState {
             }
             + if indra_core::types::primitives::slash_membership_proof_active(self.height) {
                 list_encoded_len(&self.slash_membership_roots)
+                    + tombstones_encoded_len(&self.evicted_validator_tombstones)
             } else {
                 0
             }
@@ -402,6 +408,12 @@ impl Decode for ChainState {
             } else {
                 Vec::new()
             };
+        let evicted_validator_tombstones =
+            if indra_core::types::primitives::slash_membership_proof_active(height) {
+                decode_tombstones(r, &staked_bonds, &validators, height)?
+            } else {
+                PersistentOrdMap::new()
+            };
         Ok(Self {
             chain_id,
             height,
@@ -417,6 +429,7 @@ impl Decode for ChainState {
             consensus_snapshots,
             reward_economic_snapshot,
             slash_membership_roots,
+            evicted_validator_tombstones,
             delegations,
             staked_bonds,
             staking_nonces,
@@ -465,6 +478,7 @@ impl ChainState {
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
             slash_membership_roots: Vec::new(),
+            evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
@@ -503,6 +517,7 @@ impl ChainState {
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
             slash_membership_roots: Vec::new(),
+            evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map_legacy(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -545,6 +560,7 @@ impl ChainState {
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
             slash_membership_roots: Vec::new(),
+            evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -1046,6 +1062,159 @@ fn validate_reward_economic_membership(
         ));
     }
     Ok(())
+}
+
+fn encode_tombstones(
+    tombstones: &PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>,
+    buf: &mut Vec<u8>,
+) {
+    1u8.encode(buf);
+    (tombstones.len() as u32).encode(buf);
+    for tombstone in tombstones.values() {
+        tombstone.encode(buf);
+    }
+}
+
+fn tombstones_encoded_len(
+    tombstones: &PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>,
+) -> usize {
+    1 + 4 + tombstones.values().map(Encode::encoded_len).sum::<usize>()
+}
+
+fn decode_tombstones(
+    reader: &mut ByteReader<'_>,
+    staked_bonds: &PersistentOrdMap<Bytes32, StakeBondEntry>,
+    validators: &ValidatorSet,
+    state_height: u64,
+) -> IndraResult<PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>> {
+    let version = u8::decode(reader)?;
+    if version != 1 {
+        return Err(IndraError::UnsupportedVersion {
+            version: version.into(),
+        });
+    }
+    let tombstones: Vec<EvictedValidatorTombstoneV1> = decode_list(
+        reader,
+        indra_core::types::primitives::MAX_VALIDATORS,
+        "chain_state.evicted_validator_tombstones",
+    )?;
+    let mut result = PersistentOrdMap::new();
+    let mut previous_validator_id = None;
+    let mut seen_bonds = PersistentOrdSet::new();
+    let mut total_references = 0usize;
+    for tombstone in tombstones {
+        if previous_validator_id.is_some_and(|previous| previous >= tombstone.validator_id) {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "tombstones are not strictly ordered by validator ID".to_string(),
+            ));
+        }
+        if validators.get(&tombstone.validator_id).is_some() {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "tombstoned validator remains in the live registry".to_string(),
+            ));
+        }
+        if tombstone.eviction_height > state_height
+            || tombstone.eviction_epoch != crate::epoch::epoch_for_height(tombstone.eviction_height)
+            || tombstone.retained_bonds.len() > MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE
+        {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "malformed evicted-validator tombstone".to_string(),
+            ));
+        }
+        indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(
+            tombstone.last_classical_vote_pk,
+        ))
+        .map_err(|error| {
+            IndraError::InvalidSlashMembershipProof(format!(
+                "malformed tombstone classical vote key: {error}"
+            ))
+        })?;
+        indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(tombstone.last_pq_vote_pk))
+            .map_err(|error| {
+                IndraError::InvalidSlashMembershipProof(format!(
+                    "malformed tombstone PQ vote key: {error}"
+                ))
+            })?;
+        indra_crypto::validate_vrf_public_key(&tombstone.last_vrf_pk).map_err(|error| {
+            IndraError::InvalidSlashMembershipProof(format!("malformed tombstone VRF key: {error}"))
+        })?;
+        if let Some(cold) = &tombstone.cold_custody {
+            indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(
+                cold.classical_pk,
+            ))
+            .map_err(|error| {
+                IndraError::InvalidSlashMembershipProof(format!(
+                    "malformed tombstone cold classical key: {error}"
+                ))
+            })?;
+            indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(cold.pq_pk)).map_err(
+                |error| {
+                    IndraError::InvalidSlashMembershipProof(format!(
+                        "malformed tombstone cold PQ key: {error}"
+                    ))
+                },
+            )?;
+        }
+        total_references = total_references
+            .checked_add(tombstone.retained_bonds.len())
+            .ok_or_else(|| {
+                IndraError::InvalidSlashMembershipProof(
+                    "tombstone reference count overflow".to_string(),
+                )
+            })?;
+        if total_references > MAX_TOTAL_RETAINED_BOND_REFERENCES {
+            return Err(IndraError::LengthExceeded {
+                field: "tombstone bond references",
+                max: MAX_TOTAL_RETAINED_BOND_REFERENCES,
+                actual: total_references,
+            });
+        }
+        let mut previous_bond_id = None;
+        let mut requires_cold_custody = false;
+        for reference in &tombstone.retained_bonds {
+            if previous_bond_id.is_some_and(|previous| previous >= reference.bond_utxo_id)
+                || !seen_bonds.insert(reference.bond_utxo_id)
+            {
+                return Err(IndraError::InvalidSlashMembershipProof(
+                    "tombstone bond references are duplicated or non-canonical".to_string(),
+                ));
+            }
+            let bond = staked_bonds.get(&reference.bond_utxo_id).ok_or_else(|| {
+                IndraError::InvalidSlashMembershipProof(
+                    "tombstone references a missing bond".to_string(),
+                )
+            })?;
+            if bond.validator_id != tombstone.validator_id
+                || bond.delegator_id != reference.delegator_id
+                || bond.unbonding_end_epoch != Some(reference.unbonding_end_epoch)
+            {
+                return Err(IndraError::InvalidSlashMembershipProof(
+                    "tombstone bond reference does not match canonical bond".to_string(),
+                ));
+            }
+            requires_cold_custody |= matches!(
+                bond.custody_owner,
+                crate::validator::StakeBondCustodyOwner::ValidatorColdIdentity(id)
+                    if id == tombstone.validator_id
+            );
+            previous_bond_id = Some(reference.bond_utxo_id);
+        }
+        if requires_cold_custody && tombstone.cold_custody.is_none() {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "cold-owned tombstone bond has no retained cold custody key".to_string(),
+            ));
+        }
+        previous_validator_id = Some(tombstone.validator_id);
+        result.insert(tombstone.validator_id, tombstone);
+    }
+    for bond in staked_bonds.values() {
+        if result.contains_key(&bond.validator_id) && !seen_bonds.contains(&bond.utxo_id) {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "evicted-validator bond is missing its unique tombstone reference".to_string(),
+            ));
+        }
+    }
+    Ok(result)
 }
 
 fn validate_reward_economic_pairing(
@@ -1610,6 +1779,29 @@ mod tests {
     }
 
     #[test]
+    fn pre_gate_chain_state_encoding_omits_eviction_tombstones_byte_identically() {
+        let mut baseline = ChainState::new_genesis();
+        baseline.height = u64::MAX - 1;
+        let mut with_inert_field = baseline.clone();
+        let validator_id = Bytes32::from([0xE0; 32]);
+        with_inert_field.evicted_validator_tombstones.insert(
+            validator_id,
+            crate::validator::EvictedValidatorTombstoneV1 {
+                validator_id,
+                eviction_height: u64::MAX - 2,
+                eviction_epoch: crate::epoch::epoch_for_height(u64::MAX - 2),
+                last_classical_vote_pk: [0xE1; 32],
+                last_pq_vote_pk: [0xE2; indra_crypto::PQ_PK_BYTES],
+                last_vrf_pk: [0xE3; 32],
+                cold_custody: None,
+                retained_bonds: Vec::new(),
+            },
+        );
+        assert_eq!(baseline.encode_to_vec(), with_inert_field.encode_to_vec());
+        assert_eq!(baseline.encoded_len(), with_inert_field.encoded_len());
+    }
+
+    #[test]
     fn consensus_snapshot_storage_round_trips_with_exact_two_retained() {
         let mut state = snapshot_state();
         state.rotate_consensus_snapshot_after_boundary(300).unwrap();
@@ -1631,6 +1823,23 @@ mod tests {
             activation_height: u64::MAX,
             membership_root: compute_slash_membership_root(&bootstrap).unwrap(),
         }];
+        let tombstone_keys = bootstrap.entries()[0].clone();
+        let tombstone_id = Bytes32::from([0xE7; 32]);
+        state.evicted_validator_tombstones.insert(
+            tombstone_id,
+            crate::validator::EvictedValidatorTombstoneV1 {
+                validator_id: tombstone_id,
+                eviction_height: u64::MAX - 1,
+                eviction_epoch: crate::epoch::epoch_for_height(u64::MAX - 1),
+                last_classical_vote_pk: tombstone_keys.classical_vote_pk,
+                last_pq_vote_pk: tombstone_keys.pq_vote_pk,
+                last_vrf_pk: tombstone_keys.vrf_pk,
+                cold_custody: None,
+                // Empty is a valid later lifecycle state after all originally
+                // retained bonds have canonically matured or been slashed.
+                retained_bonds: Vec::new(),
+            },
+        );
 
         assert_eq!(state.consensus_snapshots.len(), 2);
         assert_eq!(state.consensus_snapshots[0].activation_height, 901);
@@ -1648,6 +1857,10 @@ mod tests {
         assert_eq!(bytes.len(), state.encoded_len());
         let decoded = ChainState::decode_exact(&bytes).unwrap();
         assert_eq!(decoded.consensus_snapshots, state.consensus_snapshots);
+        assert_eq!(
+            decoded.evicted_validator_tombstones,
+            state.evicted_validator_tombstones
+        );
         assert_eq!(
             decoded.reward_economic_snapshot,
             state.reward_economic_snapshot

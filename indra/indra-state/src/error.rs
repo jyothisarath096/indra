@@ -202,6 +202,10 @@ pub enum StateError {
     #[error("invalid staking op: {0}")]
     InvalidStakingOp(String),
 
+    /// No full-registry victim can be represented within tombstone bounds.
+    #[error("validator registry replacement cannot retain any victim within tombstone capacity")]
+    TombstoneCapacityExceeded,
+
     /// A bond-producing operation would exceed one validator's live-bond cap.
     #[error("validator {validator_id} already has the maximum {max} live stake bonds")]
     ValidatorBondCountAtMaximum {

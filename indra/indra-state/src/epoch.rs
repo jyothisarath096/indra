@@ -27,7 +27,8 @@ use indra_core::{
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
             ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
             MINIMUM_ACTIVE_SELF_STAKE_SPARK, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN, STAKING_TX_IDX,
+            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
         },
     },
     EpochRecord,
@@ -1267,6 +1268,7 @@ pub(crate) fn release_unbonded_bonds_at_height(
                     refund_utxo_id,
                 });
             }
+            remove_released_tombstone_bond_reference(state, &bond.validator_id, &bond.utxo_id)?;
         }
     }
     if precise_accounting {
@@ -1277,7 +1279,60 @@ pub(crate) fn release_unbonded_bonds_at_height(
             reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
         }
     }
+    prune_mature_evicted_validator_tombstones(state, current_epoch);
     Ok(())
+}
+
+fn remove_released_tombstone_bond_reference(
+    state: &mut ChainState,
+    validator_id: &Bytes32,
+    bond_utxo_id: &Bytes32,
+) -> StateResult<()> {
+    let Some(mut tombstone) = state
+        .evicted_validator_tombstones
+        .get(validator_id)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let old_len = tombstone.retained_bonds.len();
+    tombstone
+        .retained_bonds
+        .retain(|reference| reference.bond_utxo_id != *bond_utxo_id);
+    if tombstone.retained_bonds.len() + 1 != old_len {
+        return Err(crate::error::StateError::InvariantViolation {
+            message: "released tombstone bond did not have exactly one retained reference",
+        });
+    }
+    state
+        .evicted_validator_tombstones
+        .insert(*validator_id, tombstone.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_evicted_validator_tombstone(&tombstone);
+    }
+    Ok(())
+}
+
+fn prune_mature_evicted_validator_tombstones(state: &mut ChainState, current_epoch: u64) {
+    let mut prunable: Vec<(u64, Bytes32)> = state
+        .evicted_validator_tombstones
+        .values()
+        .filter(|tombstone| {
+            tombstone.retained_bonds.is_empty()
+                && current_epoch
+                    > tombstone
+                        .eviction_epoch
+                        .saturating_add(SLASH_EVIDENCE_WINDOW_EPOCHS)
+        })
+        .map(|tombstone| (tombstone.eviction_height, tombstone.validator_id))
+        .collect();
+    prunable.sort_by_key(|(height, validator_id)| (*height, validator_id.0));
+    for (_, validator_id) in prunable {
+        state.evicted_validator_tombstones.remove(&validator_id);
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.delete_evicted_validator_tombstone(&validator_id);
+        }
+    }
 }
 
 pub(crate) fn released_bond_output(

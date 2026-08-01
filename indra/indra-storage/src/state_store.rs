@@ -607,8 +607,8 @@ mod tests {
         Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{
-        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
-        ValidatorStatus,
+        apply_block, compute_state_root, compute_validator_set_root, EvictedValidatorTombstoneV1,
+        ValidatorEntry, ValidatorStatus,
     };
     use std::io::Write;
 
@@ -742,6 +742,21 @@ mod tests {
             activation_height: u64::MAX,
             membership_root: compute_slash_membership_root(&current).unwrap(),
         }];
+        let tombstone_id = Bytes32::from([0xD0; 32]);
+        continuous.evicted_validator_tombstones.insert(
+            tombstone_id,
+            EvictedValidatorTombstoneV1 {
+                validator_id: tombstone_id,
+                eviction_height: u64::MAX - 1,
+                eviction_epoch: (u64::MAX - 1)
+                    / indra_core::types::primitives::EPOCH_DURATION_BLOCKS,
+                last_classical_vote_pk: public.classical.0,
+                last_pq_vote_pk: public.pq.0,
+                last_vrf_pk: vrf.public_key(),
+                cold_custody: None,
+                retained_bonds: Vec::new(),
+            },
+        );
         continuous.rebuild_state_commitment_v2(continuous.height);
         let expected_bytes = serialise_chain_state(&continuous);
         let expected_roots = compute_state_roots(&continuous);
@@ -758,6 +773,10 @@ mod tests {
         assert_eq!(
             restored.slash_membership_roots,
             continuous.slash_membership_roots
+        );
+        assert_eq!(
+            restored.evicted_validator_tombstones,
+            continuous.evicted_validator_tombstones
         );
         assert_eq!(serialise_chain_state(&restored), expected_bytes);
         assert_eq!(compute_state_roots(&restored), expected_roots);

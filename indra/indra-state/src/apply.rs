@@ -266,16 +266,21 @@ fn apply_slash_common(
 
     let validator_id = evidence.validator_id;
 
-    let current_keys = {
-        let v = state
-            .validators
-            .get(&validator_id)
-            .ok_or(StateError::ValidatorNotFound)?;
-        match (v.hybrid_classical_pk, v.hybrid_pq_pk.clone()) {
+    let live_validator = state.validators.get(&validator_id);
+    let tombstone = state.evicted_validator_tombstones.get(&validator_id);
+    if live_validator.is_none() {
+        let tombstone = tombstone.ok_or(StateError::ValidatorNotFound)?;
+        if historical_keys.is_none() || tombstone.eviction_height < evidence.vote_1.height {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "validator was evicted before the alleged infraction height".into(),
+            });
+        }
+    }
+    let current_keys =
+        live_validator.and_then(|v| match (v.hybrid_classical_pk, v.hybrid_pq_pk.clone()) {
             (Some(classical), Some(pq)) => Some((classical, pq)),
             _ => None,
-        }
-    };
+        });
     let (classical_pk, pq_pk_bytes) = match historical_keys {
         Some(keys) => keys,
         None => current_keys.ok_or_else(|| StateError::InvalidSlashEvidence {
@@ -283,8 +288,7 @@ fn apply_slash_common(
         })?,
     };
 
-    {
-        let v = state.validators.get(&validator_id).unwrap();
+    if let Some(v) = live_validator {
         if matches!(v.status, ValidatorStatus::Slashed | ValidatorStatus::Exited) {
             return Err(StateError::InvalidSlashEvidence {
                 reason: "validator already slashed or exited".into(),
@@ -372,10 +376,21 @@ fn apply_slash_common(
     for bond in state.staked_bonds.values() {
         if bond.validator_id == validator_id
             && bond.delegator_id == validator_id
+            && tombstone.is_none_or(|tombstone| {
+                tombstone
+                    .retained_bonds
+                    .iter()
+                    .any(|reference| reference.bond_utxo_id == bond.utxo_id)
+            })
             && self_bond_is_slashable_at_height(bond, evidence.vote_1.height)?
         {
             bond_ids.push(bond.utxo_id);
         }
+    }
+    if live_validator.is_none() && bond_ids.is_empty() {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "tombstone has no retained self-bond slashable at the infraction height".into(),
+        });
     }
     let slashable_bond_stake = bond_ids.iter().fold(0u64, |acc, bond_id| {
         acc.saturating_add(
@@ -6750,6 +6765,110 @@ mod tests {
             state.validators.get(&validator_id).unwrap().stake_spark,
             950_000
         );
+    }
+
+    #[test]
+    fn membership_proven_slash_targets_same_height_eviction_tombstone() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0xD3; 32], 1_000_000);
+        let bond_id = Bytes32::from([0xD4; 32]);
+        state.staked_bonds.insert(
+            bond_id,
+            StakeBondEntry::new(
+                bond_id,
+                validator_id,
+                validator_id,
+                1_000_000,
+                0,
+                output_with_value(1_000_000, staking_pubkey_from_keypair(&keypair), 0xD4),
+                0,
+            ),
+        );
+        state.height = u64::MAX - 1;
+        let snapshot = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
+        state.consensus_snapshots = vec![snapshot];
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                u64::MAX,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xA3; 32]),
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                u64::MAX,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xB3; 32]),
+            ),
+            membership_proof: proof,
+        };
+        let validator = state.validators.get(&validator_id).unwrap().clone();
+        let mut bond = state
+            .staked_bonds
+            .values()
+            .find(|bond| bond.validator_id == validator_id && bond.delegator_id == validator_id)
+            .unwrap()
+            .clone();
+        let tombstone_end =
+            epoch_for_height(u64::MAX) + indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS;
+        bond.begin_unbonding(u64::MAX, tombstone_end).unwrap();
+        state.staked_bonds.insert(bond.utxo_id, bond.clone());
+        state.validators.remove(&validator_id);
+        state.evicted_validator_tombstones.insert(
+            validator_id,
+            crate::validator::EvictedValidatorTombstoneV1 {
+                validator_id,
+                eviction_height: u64::MAX,
+                eviction_epoch: epoch_for_height(u64::MAX),
+                last_classical_vote_pk: validator.hybrid_classical_pk.unwrap(),
+                last_pq_vote_pk: validator.hybrid_pq_pk.unwrap().try_into().unwrap(),
+                last_vrf_pk: validator.vrf_pk.unwrap(),
+                cold_custody: None,
+                retained_bonds: vec![crate::validator::EvictedBondReferenceV1 {
+                    bond_utxo_id: bond.utxo_id,
+                    delegator_id: validator_id,
+                    unbonding_end_epoch: tombstone_end,
+                }],
+            },
+        );
+        let chain_id = state.chain_id.clone();
+        apply_slash_v2_at_height_with_accounting(&mut state, &evidence, &chain_id, u64::MAX, None)
+            .unwrap();
+        assert_eq!(
+            state.staked_bonds.get(&bond.utxo_id).unwrap().amount_spark,
+            950_000
+        );
+
+        let mut already_evicted = state.clone();
+        already_evicted.applied_slash_hashes = crate::persistent::PersistentOrdSet::new();
+        already_evicted
+            .evicted_validator_tombstones
+            .get(&validator_id)
+            .cloned()
+            .map(|mut tombstone| {
+                tombstone.eviction_height = u64::MAX - 1;
+                already_evicted
+                    .evicted_validator_tombstones
+                    .insert(validator_id, tombstone);
+            });
+        assert!(matches!(
+            apply_slash_v2_at_height_with_accounting(
+                &mut already_evicted,
+                &evidence,
+                &chain_id,
+                u64::MAX,
+                None,
+            ),
+            Err(StateError::InvalidSlashEvidence { reason })
+                if reason.contains("evicted before")
+        ));
     }
 
     #[test]

@@ -9,12 +9,12 @@ use indra_core::types::{
     primitives::{
         delegator_bond_accounting_active, delegator_identity_registry_active,
         live_bond_count_cap_active, payment_blinding_active, registered_validator_cap_active,
-        staking_commitment_proof_required, validator_cold_key_enforcement_active,
-        validator_cold_key_enrollment_active, validator_network_address_active, Bytes32,
-        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
-        MAX_LIVE_BONDS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
-        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        slash_membership_proof_active, staking_commitment_proof_required,
+        validator_cold_key_enforcement_active, validator_cold_key_enrollment_active,
+        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+        DUST_LIMIT_SPARK, MAX_LIVE_BONDS_PER_VALIDATOR, MAX_VALIDATORS,
+        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -31,9 +31,11 @@ use crate::{
     },
     validator::{
         validate_new_validator_cold_key, validate_validator_cold_key, ColdKeyStatus,
-        DelegationReturnEvent, DelegationReturnReason, StakeBondCustodyOwner, StakeBondEntry,
+        DelegationReturnEvent, DelegationReturnReason, EvictedBondReferenceV1,
+        EvictedColdCustodyV1, EvictedValidatorTombstoneV1, StakeBondCustodyOwner, StakeBondEntry,
         ValidatorEntry, ValidatorStatus, MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS,
-        MAX_DELEGATORS_PER_VALIDATOR,
+        MAX_DELEGATORS_PER_VALIDATOR, MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE,
+        MAX_TOTAL_RETAINED_BOND_REFERENCES,
     },
 };
 
@@ -844,6 +846,15 @@ fn apply_register_validator(
     if state.validators.get(&validator_id).is_some() {
         return Err(StateError::ValidatorAlreadyRegistered);
     }
+    if slash_membership_proof_active(current_height)
+        && state
+            .evicted_validator_tombstones
+            .contains_key(&validator_id)
+    {
+        return Err(StateError::InvalidStakingOp(
+            "validator ID is retained by an evicted-validator tombstone".into(),
+        ));
+    }
     if identity_registry_active {
         check_validator_identity_registry_if_present(state, &validator_id, validator_pubkey)?;
     }
@@ -953,12 +964,16 @@ fn apply_register_validator(
                 message: "validator set at maximum capacity",
             });
         }
-        let (lowest_id, lowest_self_stake) =
+        let candidate = if slash_membership_proof_active(current_height) {
+            lowest_representable_registry_validator(state, current_height)?
+        } else {
             lowest_ranked_registry_validator(state, current_height).ok_or(
                 StateError::InvariantViolation {
                     message: "validator set full but no evictable validator found",
                 },
-            )?;
+            )?
+        };
+        let (lowest_id, lowest_self_stake) = candidate;
         if amount_spark <= lowest_self_stake {
             return Err(StateError::InvalidStakingOp(format!(
                 "validator registry at capacity; new self-stake {} does not exceed lowest evictable registered self-stake {}",
@@ -1063,12 +1078,147 @@ fn lowest_ranked_registry_validator(
         })
 }
 
+fn lowest_representable_registry_validator(
+    state: &ChainState,
+    current_height: u64,
+) -> StateResult<(Bytes32, u64)> {
+    let mut candidates: Vec<(Bytes32, u64)> = state
+        .validators
+        .all_validators()
+        .filter(|validator| {
+            matches!(
+                validator.status,
+                ValidatorStatus::Active | ValidatorStatus::Registered
+            ) && validator.cold_key_status != ColdKeyStatus::Unenrolled
+        })
+        .map(|validator| (validator.validator_id, validator.stake_spark))
+        .collect();
+    candidates.sort_by(|(id_a, stake_a), (id_b, stake_b)| {
+        stake_a.cmp(stake_b).then_with(|| id_b.0.cmp(&id_a.0))
+    });
+    for candidate in candidates {
+        if build_evicted_validator_tombstone(state, candidate.0, current_height).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(StateError::TombstoneCapacityExceeded)
+}
+
+fn build_evicted_validator_tombstone(
+    state: &ChainState,
+    validator_id: Bytes32,
+    current_height: u64,
+) -> StateResult<EvictedValidatorTombstoneV1> {
+    if state.evicted_validator_tombstones.len() >= MAX_VALIDATORS {
+        return Err(StateError::TombstoneCapacityExceeded);
+    }
+    let validator = state
+        .validators
+        .get(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?;
+    let classical = validator
+        .hybrid_classical_pk
+        .ok_or(StateError::TombstoneCapacityExceeded)?;
+    let pq_bytes = validator
+        .hybrid_pq_pk
+        .as_deref()
+        .ok_or(StateError::TombstoneCapacityExceeded)?;
+    let pq: [u8; indra_crypto::PQ_PK_BYTES] = pq_bytes
+        .try_into()
+        .map_err(|_| StateError::TombstoneCapacityExceeded)?;
+    let vrf = validator
+        .vrf_pk
+        .ok_or(StateError::TombstoneCapacityExceeded)?;
+    indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(classical))
+        .map_err(|_| StateError::TombstoneCapacityExceeded)?;
+    indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(pq))
+        .map_err(|_| StateError::TombstoneCapacityExceeded)?;
+    indra_crypto::validate_vrf_public_key(&vrf)
+        .map_err(|_| StateError::TombstoneCapacityExceeded)?;
+    let mut bonds: Vec<StakeBondEntry> = state
+        .staked_bonds
+        .values()
+        .filter(|bond| bond.validator_id == validator_id)
+        .cloned()
+        .collect();
+    bonds.sort_by_key(|bond| bond.utxo_id.0);
+    if bonds.is_empty() || bonds.len() > MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE {
+        return Err(StateError::TombstoneCapacityExceeded);
+    }
+    let existing_references: usize = state
+        .evicted_validator_tombstones
+        .values()
+        .map(|tombstone| tombstone.retained_bonds.len())
+        .sum();
+    if existing_references
+        .checked_add(bonds.len())
+        .is_none_or(|total| total > MAX_TOTAL_RETAINED_BOND_REFERENCES)
+    {
+        return Err(StateError::TombstoneCapacityExceeded);
+    }
+    let requires_cold = bonds.iter().any(|bond| {
+        matches!(
+            bond.custody_owner,
+            StakeBondCustodyOwner::ValidatorColdIdentity(id) if id == validator_id
+        )
+    });
+    let cold_custody = if requires_cold {
+        if validator.cold_key_status != ColdKeyStatus::Active {
+            return Err(StateError::TombstoneCapacityExceeded);
+        }
+        Some(EvictedColdCustodyV1 {
+            classical_pk: validator
+                .cold_hybrid_classical_pk
+                .ok_or(StateError::TombstoneCapacityExceeded)?,
+            pq_pk: validator
+                .cold_hybrid_pq_pk
+                .ok_or(StateError::TombstoneCapacityExceeded)?,
+            key_version: validator.cold_key_version,
+        })
+    } else {
+        None
+    };
+    if let Some(cold) = &cold_custody {
+        indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(
+            cold.classical_pk,
+        ))
+        .map_err(|_| StateError::TombstoneCapacityExceeded)?;
+        indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(cold.pq_pk))
+            .map_err(|_| StateError::TombstoneCapacityExceeded)?;
+    }
+    let current_epoch = epoch_for_height(current_height);
+    let unbonding_end = current_epoch
+        .checked_add(UNBONDING_PERIOD_EPOCHS)
+        .ok_or(StateError::TombstoneCapacityExceeded)?;
+    let retained_bonds = bonds
+        .iter()
+        .map(|bond| EvictedBondReferenceV1 {
+            bond_utxo_id: bond.utxo_id,
+            delegator_id: bond.delegator_id,
+            unbonding_end_epoch: bond.unbonding_end_epoch.unwrap_or(unbonding_end),
+        })
+        .collect();
+    Ok(EvictedValidatorTombstoneV1 {
+        validator_id,
+        eviction_height: current_height,
+        eviction_epoch: current_epoch,
+        last_classical_vote_pk: classical,
+        last_pq_vote_pk: pq,
+        last_vrf_pk: vrf,
+        cold_custody,
+        retained_bonds,
+    })
+}
+
 fn evict_validator_for_registry_replacement(
     state: &mut ChainState,
     validator_id: Bytes32,
     current_epoch: u64,
     current_height: u64,
 ) -> StateResult<()> {
+    if slash_membership_proof_active(current_height) {
+        return evict_validator_to_tombstone(state, validator_id, current_epoch, current_height);
+    }
     let validator = state
         .validators
         .get(&validator_id)
@@ -1181,6 +1331,115 @@ fn evict_validator_for_registry_replacement(
         hex::encode(&validator_id.0[..4]),
         delegators.len()
     );
+    Ok(())
+}
+
+fn evict_validator_to_tombstone(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    _legacy_current_epoch: u64,
+    current_height: u64,
+) -> StateResult<()> {
+    let current_epoch = epoch_for_height(current_height);
+    let tombstone = build_evicted_validator_tombstone(state, validator_id, current_height)?;
+    let validator = state
+        .validators
+        .get(&validator_id)
+        .cloned()
+        .ok_or(StateError::ValidatorNotFound)?;
+    let delegators = state.delegations.get_delegators(&validator_id).to_vec();
+    let validator_reward_owner = validator_public_key(&validator)?;
+    let mut delegator_reward_owners = Vec::with_capacity(delegators.len());
+    for entry in &delegators {
+        let owner = if entry.pending_rewards >= DUST_LIMIT_SPARK {
+            let bond = state
+                .staked_bonds
+                .values()
+                .find(|bond| {
+                    bond.validator_id == validator_id && bond.delegator_id == entry.delegator_id
+                })
+                .ok_or(StateError::InvariantViolation {
+                    message: "delegator reward has no retained bond during tombstone preflight",
+                })?;
+            Some(resolve_bond_owner_pubkey(bond, state).map_err(|_| {
+                StateError::InvariantViolation {
+                    message:
+                        "delegator reward owner could not be resolved during tombstone preflight",
+                }
+            })?)
+        } else {
+            None
+        };
+        delegator_reward_owners.push(owner);
+    }
+    if validator.pending_rewards > 0 {
+        payout_or_burn_pending_reward(
+            state,
+            &validator_id,
+            &validator_id,
+            validator.pending_rewards,
+            validator_reward_owner,
+            current_height,
+        )?;
+    }
+    for (entry, preflight_owner) in delegators.iter().zip(delegator_reward_owners) {
+        if entry.pending_rewards == 0 {
+            continue;
+        }
+        if let Some(owner) = preflight_owner {
+            payout_or_burn_pending_reward(
+                state,
+                &validator_id,
+                &entry.delegator_id,
+                entry.pending_rewards,
+                owner,
+                current_height,
+            )?;
+        } else if entry.pending_rewards >= DUST_LIMIT_SPARK {
+            return Err(StateError::InvariantViolation {
+                message: "delegator reward could not be paid during tombstone eviction",
+            });
+        }
+    }
+    let removed_delegators = state.delegations.take_delegators(&validator_id);
+    debug_assert_eq!(removed_delegators, delegators);
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        for entry in &delegators {
+            commitment.delete_delegator(&validator_id, &entry.delegator_id);
+        }
+    }
+    let unbonding_end = current_epoch.checked_add(UNBONDING_PERIOD_EPOCHS).ok_or(
+        StateError::InvariantViolation {
+            message: "eviction unbonding epoch overflow",
+        },
+    )?;
+    for reference in &tombstone.retained_bonds {
+        let mut bond = state
+            .staked_bonds
+            .get(&reference.bond_utxo_id)
+            .cloned()
+            .ok_or(StateError::InvariantViolation {
+                message: "preflighted eviction bond disappeared",
+            })?;
+        if bond.unbonding_end_epoch.is_none() {
+            bond.begin_unbonding(current_height, unbonding_end)?;
+        }
+        let updated = bond.clone();
+        state
+            .staked_bonds
+            .insert(reference.bond_utxo_id, updated.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_staked_bond(&reference.bond_utxo_id, &updated);
+        }
+    }
+    state.validators.remove(&validator_id);
+    state
+        .evicted_validator_tombstones
+        .insert(validator_id, tombstone.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.delete_validator(&validator_id);
+        commitment.put_evicted_validator_tombstone(&tombstone);
+    }
     Ok(())
 }
 
@@ -6003,7 +6262,7 @@ mod tests {
                 validator_id,
                 name: format!("cap-{index}"),
                 hybrid_classical_pk: Some(pubkey.classical_pk.0),
-                hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
+                hybrid_pq_pk: Some(vec![pk_byte; indra_crypto::PQ_PK_BYTES]),
                 vrf_pk: Some(raw_id(0x66, index).0),
                 stake_spark: stake,
                 status: ValidatorStatus::Registered,
@@ -6063,6 +6322,22 @@ mod tests {
         let validator = state.validators.get_mut(&validator_id).unwrap();
         validator.cold_hybrid_classical_pk = validator.hybrid_classical_pk;
         validator.cold_hybrid_pq_pk = Some([validator_id.0[0]; indra_crypto::PQ_PK_BYTES]);
+        validator.cold_key_version = 1;
+        validator.cold_key_status = ColdKeyStatus::Active;
+    }
+
+    fn install_valid_cap_registry_keys(state: &mut ChainState, validator_id: Bytes32, seed: u8) {
+        let hot = keypair(seed);
+        let hot_public = hot.public_key();
+        let cold = keypair(seed.wrapping_add(1));
+        let cold_public = cold.public_key();
+        let validator = state.validators.get_mut(&validator_id).unwrap();
+        validator.hybrid_classical_pk = Some(hot_public.classical.0);
+        validator.hybrid_pq_pk = Some(hot_public.pq.0.to_vec());
+        validator.vrf_pk =
+            Some(indra_crypto::VrfKeypair::from_seed(&[seed.wrapping_add(2); 32]).public_key());
+        validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
+        validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
         validator.cold_key_version = 1;
         validator.cold_key_status = ColdKeyStatus::Active;
     }
@@ -6128,6 +6403,7 @@ mod tests {
         for index in 1..MAX_VALIDATORS {
             mark_cap_registry_entry_cold_active(&mut state, raw_id(0x44, index));
         }
+        install_valid_cap_registry_keys(&mut state, next_evictable, 0xB9);
         let (op, new_bond, new_validator) =
             registration_op_with_cold_bond(&mut state, 0xE1, 0xE2, 0xE3, 0xE4);
         (
@@ -6234,6 +6510,177 @@ mod tests {
         );
         assert!(state.validators.get(&new_validator).is_some());
         assert!(state.staked_bonds.contains_key(&new_bond));
+    }
+
+    fn synthetic_tombstone(reference_count: usize) -> EvictedValidatorTombstoneV1 {
+        EvictedValidatorTombstoneV1 {
+            validator_id: raw_id(0xA0, 0),
+            eviction_height: u64::MAX - 1,
+            eviction_epoch: epoch_for_height(u64::MAX - 1),
+            last_classical_vote_pk: [0xA1; 32],
+            last_pq_vote_pk: [0xA2; indra_crypto::PQ_PK_BYTES],
+            last_vrf_pk: [0xA3; 32],
+            cold_custody: None,
+            retained_bonds: (0..reference_count)
+                .map(|index| EvictedBondReferenceV1 {
+                    bond_utxo_id: raw_id(0xA4, index),
+                    delegator_id: raw_id(0xA5, index),
+                    unbonding_end_epoch: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn post_gate_registry_eviction_retains_bonds_and_frees_live_slot() {
+        let (mut state, op, frozen_lowest, next_evictable, new_validator, _) =
+            full_registry_fallback_fixture();
+        let victim_bond = state
+            .staked_bonds
+            .values()
+            .find(|bond| bond.validator_id == next_evictable)
+            .unwrap()
+            .utxo_id;
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
+
+        assert_eq!(state.validators.len(), MAX_VALIDATORS);
+        assert!(state.validators.get(&frozen_lowest).is_some());
+        assert!(state.validators.get(&next_evictable).is_none());
+        assert!(state.validators.get(&new_validator).is_some());
+        let tombstone = state
+            .evicted_validator_tombstones
+            .get(&next_evictable)
+            .expect("eviction must retain a tombstone");
+        assert_eq!(tombstone.retained_bonds.len(), 1);
+        assert_eq!(tombstone.retained_bonds[0].bond_utxo_id, victim_bond);
+        assert_eq!(
+            state
+                .staked_bonds
+                .get(&victim_bond)
+                .unwrap()
+                .unbonding_end_epoch,
+            Some(epoch_for_height(u64::MAX) + UNBONDING_PERIOD_EPOCHS)
+        );
+    }
+
+    #[test]
+    fn post_gate_registration_rejects_tombstoned_validator_id_before_spending_bond() {
+        let mut state = ChainState::new_genesis();
+        let (op, bond_id, validator_id) =
+            registration_op_with_cold_bond(&mut state, 0xC1, 0xC2, 0xC3, 0xC4);
+        let mut tombstone = synthetic_tombstone(0);
+        tombstone.validator_id = validator_id;
+        state
+            .evicted_validator_tombstones
+            .insert(validator_id, tombstone);
+        let chain_id = state.chain_id.clone();
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
+            Err(StateError::InvalidStakingOp(reason)) if reason.contains("tombstone")
+        ));
+        assert!(state.utxos.contains(&bond_id));
+        assert!(state.validators.get(&validator_id).is_none());
+    }
+
+    #[test]
+    fn tombstone_capacity_skips_lowest_and_fails_when_no_candidate_fits() {
+        let mut state = ChainState::new_genesis();
+        let lowest =
+            insert_registry_entry_for_cap_test(&mut state, 0, MINIMUM_VALIDATOR_BOND_SPARK);
+        let next =
+            insert_registry_entry_for_cap_test(&mut state, 1, MINIMUM_VALIDATOR_BOND_SPARK + 1);
+        mark_cap_registry_entry_cold_active(&mut state, lowest);
+        mark_cap_registry_entry_cold_active(&mut state, next);
+        install_valid_cap_registry_keys(&mut state, lowest, 0xBA);
+        install_valid_cap_registry_keys(&mut state, next, 0xBB);
+        let extra_id = raw_id(0xB0, 0);
+        let mut extra = state
+            .staked_bonds
+            .values()
+            .find(|bond| bond.validator_id == lowest)
+            .unwrap()
+            .clone();
+        extra.utxo_id = extra_id;
+        state.staked_bonds.insert(extra_id, extra);
+        let existing = synthetic_tombstone(MAX_TOTAL_RETAINED_BOND_REFERENCES - 1);
+        state
+            .evicted_validator_tombstones
+            .insert(existing.validator_id, existing);
+
+        assert_eq!(
+            lowest_representable_registry_validator(&state, u64::MAX).unwrap(),
+            (next, MINIMUM_VALIDATOR_BOND_SPARK + 1)
+        );
+
+        let full = synthetic_tombstone(MAX_TOTAL_RETAINED_BOND_REFERENCES);
+        state.evicted_validator_tombstones = crate::persistent::PersistentOrdMap::new();
+        state
+            .evicted_validator_tombstones
+            .insert(full.validator_id, full);
+        assert_eq!(
+            lowest_representable_registry_validator(&state, u64::MAX),
+            Err(StateError::TombstoneCapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn tombstone_bond_matures_on_original_schedule_and_empty_record_waits_for_window() {
+        let mut state = ChainState::new_genesis();
+        let validator_id =
+            insert_registry_entry_for_cap_test(&mut state, 7, MINIMUM_VALIDATOR_BOND_SPARK);
+        let bond_id = state
+            .staked_bonds
+            .values()
+            .find(|bond| bond.validator_id == validator_id)
+            .unwrap()
+            .utxo_id;
+        state.validators.remove(&validator_id);
+        let eviction_height = u64::MAX - 1;
+        let eviction_epoch = epoch_for_height(eviction_height);
+        let maturity_epoch = eviction_epoch + 1;
+        let mut bond = state.staked_bonds.get(&bond_id).unwrap().clone();
+        bond.unbonding_end_epoch = Some(maturity_epoch);
+        state.staked_bonds.insert(bond_id, bond);
+        let mut tombstone = synthetic_tombstone(0);
+        tombstone.validator_id = validator_id;
+        tombstone.eviction_height = eviction_height;
+        tombstone.eviction_epoch = eviction_epoch;
+        tombstone.retained_bonds = vec![EvictedBondReferenceV1 {
+            bond_utxo_id: bond_id,
+            delegator_id: validator_id,
+            unbonding_end_epoch: maturity_epoch,
+        }];
+        state
+            .evicted_validator_tombstones
+            .insert(validator_id, tombstone);
+
+        crate::epoch::release_unbonded_bonds_at_height(&mut state, maturity_epoch - 1, u64::MAX)
+            .unwrap();
+        assert!(state.staked_bonds.contains_key(&bond_id));
+
+        crate::epoch::release_unbonded_bonds_at_height(&mut state, maturity_epoch, u64::MAX)
+            .unwrap();
+        assert!(!state.staked_bonds.contains_key(&bond_id));
+        assert!(state
+            .evicted_validator_tombstones
+            .get(&validator_id)
+            .unwrap()
+            .retained_bonds
+            .is_empty());
+
+        crate::epoch::release_unbonded_bonds_at_height(
+            &mut state,
+            eviction_epoch + indra_core::types::primitives::SLASH_EVIDENCE_WINDOW_EPOCHS + 1,
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(state
+            .evicted_validator_tombstones
+            .get(&validator_id)
+            .is_none());
     }
 
     #[test]

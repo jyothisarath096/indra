@@ -801,7 +801,10 @@ unreleasable. A tombstone MUST reject:
 - a missing or malformed hot consensus key;
 - a retained cold-owned bond without a complete active cold custody key;
 - a cold key version inconsistent with the evicted entry;
-- an empty retained-bond list;
+- an empty retained-bond list at tombstone creation (an empty list is valid
+  later only after every originally retained bond has canonically matured or
+  been slashed away, and the tombstone then remains until Section 7.6 permits
+  pruning);
 - a bond reference whose `validator_id` does not equal the tombstone ID;
 - a reference whose end epoch differs from its canonical `StakeBondEntry`;
 - duplicate bond IDs within or across tombstones; or
@@ -958,25 +961,19 @@ Introduce fixed consensus constants:
 ```text
 MAX_EVICTED_VALIDATOR_TOMBSTONES = MAX_VALIDATORS = 1,500
 
-MAX_EVICTED_BOND_REFERENCES =
-    MAX_STAKED_BONDS_DECODE
+MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE = 104,096
+
+MAX_TOTAL_RETAINED_BOND_REFERENCES = 104,096
 ```
 
-The first is a semantic write and decode cap. The second is an aggregate cap
-across all tombstones, not a per-tombstone allocation. It cannot exceed the
-already finite canonical staked-bond decode ceiling:
-
-```text
-MAX_STAKED_BONDS_DECODE =
-    MAX_VALIDATORS * MAX_DELEGATORS_PER_VALIDATOR
-```
-
-(`indra-state/src/chain.rs:32-41`,
-`indra-state/src/validator.rs:32-38`). This ceiling is very large
-(150,000,000 references at current constants), so implementation review SHOULD
-consider a smaller operational write cap derived from measured legitimate
-bond multiplicity. It MUST NOT select a smaller consensus cap without a
-separate explicit decision and migration analysis.
+The tombstone count and both reference limits are semantic write and decode
+caps. The aggregate reference limit is binding: per-tombstone capacity cannot
+be multiplied by the tombstone count. These explicit 104,096-reference limits
+supersede the earlier inherited 150,000,000-entry defensive bond-map decode
+ceiling, which was never a safe tombstone write bound. Eviction preflight MUST
+reject a candidate that cannot be represented under either reference limit,
+then try the next candidate. It MUST reject registration with a dedicated
+capacity error if no candidate fits. Truncation is forbidden.
 
 For tombstone `T`, define:
 
@@ -1446,7 +1443,7 @@ testnet constant accidentally.
 - Maximum additional proof bytes for three slash items: 8,919 bytes.
 - Tombstone base encoding: 2,710 bytes without cold custody or 5,342 bytes
   with cold custody, plus 72 bytes per retained bond reference.
-- 1,500 cold-custody tombstones with no bond references: 8,013,004 bytes
+- 1,500 cold-custody tombstones with no bond references: 8,013,005 bytes
   (7.64 MiB), including the four-byte outer count.
 
 These replace the roughly 257 MiB maximum-set canonical cost of retaining 500
@@ -1467,13 +1464,11 @@ shows that even the current four-validator set would otherwise consume
 
 The tombstone collection's principal remains in the already-counted
 `staked_bonds` map; the figures above are index/key overhead, not duplicated
-stake outputs. The inherited aggregate ceiling of 150,000,000 references has a
-theoretical reference-only encoding cost of 10,800,000,000 bytes
-(10.06 GiB). That is a finite fail-closed ceiling, not an acceptable operating
-target. The smaller write-cap question in Section 7.6 is therefore a material
-state-growth judgment that external review must resolve before implementation,
-and these numbers refine the earlier investigation's root-history-only cost
-estimate.
+stake outputs. The approved aggregate ceiling of 104,096 references costs
+exactly 7,494,912 reference bytes. Combining that binding reference maximum
+with the conservative 1,500 cold-custody tombstone bases produces a maximum
+canonical tombstone encoding of 15,507,917 bytes (14.79 MiB), including the
+outer count. Capacity exhaustion fails closed as specified in Section 7.6.
 
 ### 12.2 Relative implementation size
 
@@ -1560,9 +1555,10 @@ It does not solve:
 9. **Tombstone capacity.** Sustained adversarial replacement can exhaust the
    separate tombstone cap and temporarily reject new eviction-requiring
    registrations.
-10. **Large inherited bond ceiling.** The existing 150,000,000-bond decode
-    ceiling is finite but too large to be treated as an operational tombstone
-    target; a lower reviewed write cap remains a pre-implementation decision.
+10. **Bond-reference capacity.** The explicit aggregate 104,096-reference cap
+    bounds canonical growth but can make every live validator temporarily
+    non-evictable if existing tombstones consume all capacity; registration
+    then fails closed until references mature and capacity becomes available.
 
 ### 13.3 Decisions requiring confirmation before implementation
 

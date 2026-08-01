@@ -30,7 +30,10 @@ use indra_crypto::{sha256, PaymentPubKeyV1};
 
 use crate::{
     persistent::PersistentAuthTree,
-    validator::{DelegationReturnEvent, DelegatorEntry, StakeBondEntry, ValidatorEntry},
+    validator::{
+        DelegationReturnEvent, DelegatorEntry, EvictedValidatorTombstoneV1, StakeBondEntry,
+        ValidatorEntry,
+    },
     ChainState,
 };
 
@@ -48,6 +51,7 @@ const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
 const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
 const DOMAIN_REWARD_ECONOMIC_SNAPSHOT: u8 = 0x0B;
 const DOMAIN_SLASH_MEMBERSHIP_ROOT: u8 = 0x0C;
+const DOMAIN_EVICTED_VALIDATOR_TOMBSTONE: u8 = 0x0D;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -136,6 +140,12 @@ impl StateCommitmentV2 {
                 leaves.push((
                     slash_membership_root_key(record.activation_height),
                     slash_membership_root_value_hash(record),
+                ));
+            }
+            for tombstone in state.evicted_validator_tombstones.values() {
+                leaves.push((
+                    evicted_validator_tombstone_key(&tombstone.validator_id),
+                    evicted_validator_tombstone_value_hash(tombstone),
                 ));
             }
         }
@@ -242,6 +252,20 @@ impl StateCommitmentV2 {
             retired_cold_component_value_hash(kind, component),
         );
     }
+
+    /// Insert or replace an evicted-validator tombstone leaf.
+    pub fn put_evicted_validator_tombstone(&mut self, tombstone: &EvictedValidatorTombstoneV1) {
+        self.tree.insert(
+            evicted_validator_tombstone_key(&tombstone.validator_id),
+            evicted_validator_tombstone_value_hash(tombstone),
+        );
+    }
+
+    /// Delete an evicted-validator tombstone leaf.
+    pub fn delete_evicted_validator_tombstone(&mut self, validator_id: &Bytes32) {
+        self.tree
+            .delete(evicted_validator_tombstone_key(validator_id));
+    }
 }
 
 pub(crate) fn validator_key(validator_id: &Bytes32) -> [u8; 32] {
@@ -318,6 +342,16 @@ fn slash_membership_root_key(activation_height: u64) -> [u8; 32] {
 
 fn slash_membership_root_value_hash(record: &SlashMembershipRootRecord) -> [u8; 32] {
     sha256(&record.encode_to_vec())
+}
+
+fn evicted_validator_tombstone_key(validator_id: &Bytes32) -> [u8; 32] {
+    derive_key(DOMAIN_EVICTED_VALIDATOR_TOMBSTONE, &validator_id.0)
+}
+
+fn evicted_validator_tombstone_value_hash(tombstone: &EvictedValidatorTombstoneV1) -> [u8; 32] {
+    let mut value = b"INDRA-EVICTED-VALIDATOR-TOMBSTONE-v1".to_vec();
+    tombstone.encode(&mut value);
+    sha256(&value)
 }
 
 fn retired_cold_component_value_hash(kind: u8, component: &[u8]) -> [u8; 32] {
@@ -1188,6 +1222,10 @@ mod tests {
             ("consensus_snapshot", DOMAIN_CONSENSUS_SNAPSHOT),
             ("reward_economic_snapshot", DOMAIN_REWARD_ECONOMIC_SNAPSHOT),
             ("slash_membership_root", DOMAIN_SLASH_MEMBERSHIP_ROOT),
+            (
+                "evicted_validator_tombstone",
+                DOMAIN_EVICTED_VALIDATOR_TOMBSTONE,
+            ),
         ];
         let mut seen = std::collections::BTreeMap::new();
         for (name, domain) in domains {
@@ -1200,6 +1238,37 @@ mod tests {
         assert_eq!(DOMAIN_CONSENSUS_SNAPSHOT, 0x0A);
         assert_eq!(DOMAIN_REWARD_ECONOMIC_SNAPSHOT, 0x0B);
         assert_eq!(DOMAIN_SLASH_MEMBERSHIP_ROOT, 0x0C);
+        assert_eq!(DOMAIN_EVICTED_VALIDATOR_TOMBSTONE, 0x0D);
+    }
+
+    #[test]
+    fn evicted_validator_tombstone_incremental_commitment_matches_rebuild() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        state.height = height;
+        let baseline = StateCommitmentV2::from_state(&state, height).root();
+        let validator_id = id(0xED);
+        let tombstone = EvictedValidatorTombstoneV1 {
+            validator_id,
+            eviction_height: height - 1,
+            eviction_epoch: crate::epoch::epoch_for_height(height - 1),
+            last_classical_vote_pk: [0x01; 32],
+            last_pq_vote_pk: [0x02; indra_crypto::PQ_PK_BYTES],
+            last_vrf_pk: [0x03; 32],
+            cold_custody: None,
+            retained_bonds: Vec::new(),
+        };
+        state
+            .evicted_validator_tombstones
+            .insert(validator_id, tombstone.clone());
+        let rebuilt = StateCommitmentV2::from_state(&state, height).root();
+        assert_ne!(rebuilt, baseline);
+
+        let mut incremental = StateCommitmentV2::from_state(&ChainState::new_genesis(), height);
+        incremental.put_evicted_validator_tombstone(&tombstone);
+        assert_eq!(incremental.root(), rebuilt);
+        incremental.delete_evicted_validator_tombstone(&validator_id);
+        assert_eq!(incremental.root(), baseline);
     }
 
     #[test]

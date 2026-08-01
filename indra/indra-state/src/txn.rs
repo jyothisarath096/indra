@@ -23,7 +23,10 @@ use crate::{
     persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::{UtxoEntry, UtxoSet},
-    validator::{DelegationMap, DelegationReturnEvent, StakeBondEntry, ValidatorSet},
+    validator::{
+        DelegationMap, DelegationReturnEvent, EvictedValidatorTombstoneV1, StakeBondEntry,
+        ValidatorSet,
+    },
 };
 use indra_core::types::crypto::HybridPubKey;
 use indra_crypto::PaymentPubKeyV1;
@@ -64,6 +67,7 @@ enum UndoEntry {
     ConsensusSnapshots(Vec<ConsensusSnapshot>),
     RewardEconomicSnapshot(Option<RewardEconomicSnapshot>),
     SlashMembershipRoots(Vec<SlashMembershipRootRecord>),
+    EvictedValidatorTombstones(PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>),
 }
 
 #[cfg(test)]
@@ -96,6 +100,7 @@ pub(crate) struct StateTxn<'a> {
     consensus_snapshots_recorded: bool,
     reward_economic_snapshot_recorded: bool,
     slash_membership_roots_recorded: bool,
+    evicted_validator_tombstones_recorded: bool,
     commitment_touched: bool,
     commitment_before: Option<StateCommitmentV2>,
 }
@@ -124,6 +129,7 @@ impl<'a> StateTxn<'a> {
             consensus_snapshots_recorded: false,
             reward_economic_snapshot_recorded: false,
             slash_membership_roots_recorded: false,
+            evicted_validator_tombstones_recorded: false,
             commitment_touched: false,
             commitment_before,
         }
@@ -183,6 +189,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_utxos();
         self.snapshot_delegation_return_events();
         self.snapshot_retired_cold_components();
+        self.snapshot_evicted_validator_tombstones();
         self.record_scalars();
         self.mark_commitment_touched();
     }
@@ -200,6 +207,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_validators();
         self.snapshot_staked_bonds();
         self.snapshot_slash_hashes();
+        self.snapshot_evicted_validator_tombstones();
         self.snapshot_utxos();
         self.record_scalars();
         self.mark_commitment_touched();
@@ -232,6 +240,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_consensus_snapshots();
         self.snapshot_reward_economic_snapshot();
         self.snapshot_slash_membership_roots();
+        self.snapshot_evicted_validator_tombstones();
         self.record_scalars();
         self.mark_commitment_touched();
     }
@@ -459,6 +468,15 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    fn snapshot_evicted_validator_tombstones(&mut self) {
+        if !self.evicted_validator_tombstones_recorded {
+            self.undo.push(UndoEntry::EvictedValidatorTombstones(
+                self.state.evicted_validator_tombstones.clone(),
+            ));
+            self.evicted_validator_tombstones_recorded = true;
+        }
+    }
+
     fn rollback(&mut self) {
         #[cfg(test)]
         let rollback_start = Instant::now();
@@ -522,6 +540,9 @@ impl<'a> StateTxn<'a> {
                 }
                 UndoEntry::SlashMembershipRoots(roots) => {
                     self.state.slash_membership_roots = roots;
+                }
+                UndoEntry::EvictedValidatorTombstones(tombstones) => {
+                    self.state.evicted_validator_tombstones = tombstones;
                 }
             }
         }
@@ -699,6 +720,20 @@ mod tests {
             txn.state_mut()
                 .staking_nonces
                 .insert(Bytes32::from([0x22; 32]), 1);
+            let tombstone_id = Bytes32::from([0x33; 32]);
+            txn.state_mut().evicted_validator_tombstones.insert(
+                tombstone_id,
+                crate::validator::EvictedValidatorTombstoneV1 {
+                    validator_id: tombstone_id,
+                    eviction_height: 1,
+                    eviction_epoch: 0,
+                    last_classical_vote_pk: [0x34; 32],
+                    last_pq_vote_pk: [0x35; indra_crypto::PQ_PK_BYTES],
+                    last_vrf_pk: [0x36; 32],
+                    cold_custody: None,
+                    retained_bonds: Vec::new(),
+                },
+            );
             assert!(txn.after_mutation().is_err());
         }
         set_fail_after_mutation(None);

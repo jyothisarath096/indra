@@ -1797,6 +1797,172 @@ pub enum StakeBondCustodyOwner {
     ValidatorColdIdentity(Bytes32),
 }
 
+/// Cold-key custody retained after a validator is evicted from the bounded live registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedColdCustodyV1 {
+    /// Cold Ed25519 public key.
+    pub classical_pk: [u8; 32],
+    /// Cold ML-DSA-87 public key.
+    pub pq_pk: [u8; indra_crypto::PQ_PK_BYTES],
+    /// Last active cold-key version.
+    pub key_version: u64,
+}
+
+impl Encode for EvictedColdCustodyV1 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.classical_pk);
+        buf.extend_from_slice(&self.pq_pk);
+        self.key_version.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + indra_crypto::PQ_PK_BYTES + 8
+    }
+}
+
+impl Decode for EvictedColdCustodyV1 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let classical_pk = reader.read_bytes32()?;
+        let mut pq_pk = [0u8; indra_crypto::PQ_PK_BYTES];
+        pq_pk.copy_from_slice(reader.read_bytes(indra_crypto::PQ_PK_BYTES)?);
+        Ok(Self {
+            classical_pk,
+            pq_pk,
+            key_version: u64::decode(reader)?,
+        })
+    }
+}
+
+/// Canonical reference to principal retained in `ChainState::staked_bonds`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedBondReferenceV1 {
+    /// Canonical stake-bond UTXO identifier.
+    pub bond_utxo_id: Bytes32,
+    /// Identity receiving the matured principal.
+    pub delegator_id: Bytes32,
+    /// Canonical maturity epoch mirrored from the referenced bond.
+    pub unbonding_end_epoch: u64,
+}
+
+impl Encode for EvictedBondReferenceV1 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.bond_utxo_id.encode(buf);
+        self.delegator_id.encode(buf);
+        self.unbonding_end_epoch.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + 32 + 8
+    }
+}
+
+impl Decode for EvictedBondReferenceV1 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            bond_utxo_id: Bytes32::decode(reader)?,
+            delegator_id: Bytes32::decode(reader)?,
+            unbonding_end_epoch: u64::decode(reader)?,
+        })
+    }
+}
+
+/// Maximum references retained by one tombstone.
+pub const MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE: usize = 104_096;
+/// Maximum references retained by all tombstones together.
+pub const MAX_TOTAL_RETAINED_BOND_REFERENCES: usize = 104_096;
+
+/// Bounded historical and custody record for an evicted validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedValidatorTombstoneV1 {
+    /// Evicted validator identity.
+    pub validator_id: Bytes32,
+    /// Height at which registry eviction occurred.
+    pub eviction_height: u64,
+    /// Epoch containing `eviction_height`.
+    pub eviction_epoch: u64,
+    /// Last validated Ed25519 consensus key.
+    pub last_classical_vote_pk: [u8; 32],
+    /// Last validated ML-DSA-87 consensus key.
+    pub last_pq_vote_pk: [u8; indra_crypto::PQ_PK_BYTES],
+    /// Last validated VRF key.
+    pub last_vrf_pk: [u8; 32],
+    /// Cold custody needed to release retained self-bonds.
+    pub cold_custody: Option<EvictedColdCustodyV1>,
+    /// Canonically ordered references to retained principal.
+    pub retained_bonds: Vec<EvictedBondReferenceV1>,
+}
+
+impl Encode for EvictedValidatorTombstoneV1 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        1u8.encode(buf);
+        self.validator_id.encode(buf);
+        self.eviction_height.encode(buf);
+        self.eviction_epoch.encode(buf);
+        buf.extend_from_slice(&self.last_classical_vote_pk);
+        buf.extend_from_slice(&self.last_pq_vote_pk);
+        buf.extend_from_slice(&self.last_vrf_pk);
+        self.cold_custody.is_some().encode(buf);
+        if let Some(cold_custody) = &self.cold_custody {
+            cold_custody.encode(buf);
+        }
+        encode_list(&self.retained_bonds, buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        1 + 32
+            + 8
+            + 8
+            + 32
+            + indra_crypto::PQ_PK_BYTES
+            + 32
+            + 1
+            + self
+                .cold_custody
+                .as_ref()
+                .map(Encode::encoded_len)
+                .unwrap_or(0)
+            + list_encoded_len(&self.retained_bonds)
+    }
+}
+
+impl Decode for EvictedValidatorTombstoneV1 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let version = u8::decode(reader)?;
+        if version != 1 {
+            return Err(IndraError::UnsupportedVersion {
+                version: version.into(),
+            });
+        }
+        let validator_id = Bytes32::decode(reader)?;
+        let eviction_height = u64::decode(reader)?;
+        let eviction_epoch = u64::decode(reader)?;
+        let last_classical_vote_pk = reader.read_bytes32()?;
+        let mut last_pq_vote_pk = [0u8; indra_crypto::PQ_PK_BYTES];
+        last_pq_vote_pk.copy_from_slice(reader.read_bytes(indra_crypto::PQ_PK_BYTES)?);
+        let last_vrf_pk = reader.read_bytes32()?;
+        let cold_custody = if bool::decode(reader)? {
+            Some(EvictedColdCustodyV1::decode(reader)?)
+        } else {
+            None
+        };
+        let retained_bonds = decode_list(
+            reader,
+            MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE,
+            "tombstone.retained_bonds",
+        )?;
+        Ok(Self {
+            validator_id,
+            eviction_height,
+            eviction_epoch,
+            last_classical_vote_pk,
+            last_pq_vote_pk,
+            last_vrf_pk,
+            cold_custody,
+            retained_bonds,
+        })
+    }
+}
+
 impl Encode for StakeBondCustodyOwner {
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
