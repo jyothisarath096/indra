@@ -30,7 +30,8 @@ use indra_core::types::{
         Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
         MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
-    slashing::SlashEvidenceV1,
+    slash_membership::build_slash_membership_proof,
+    slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
     staking::StakingOp,
     vote::VoteStep,
     vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
@@ -41,7 +42,7 @@ use indra_crypto::{
     VrfKeypair,
 };
 use indra_state::{
-    apply::compute_slash_evidence_hash,
+    apply::{compute_slash_evidence_hash, compute_slash_evidence_v2_hash},
     apply_staking_op,
     epoch::epoch_for_height,
     governance_apply::{apply_governance_op, validate_governance_op},
@@ -382,9 +383,62 @@ impl NodeEngine {
             .collect()
     }
 
+    /// Select and prove evidence for a protocol-v8 proposal.
+    pub fn select_slash_evidence_v2(&self) -> Vec<SlashEvidenceEnvelopeV2> {
+        self.pending_slashes
+            .iter()
+            .filter_map(|evidence| {
+                if !indra_core::types::primitives::slash_membership_proof_active(
+                    evidence.vote_1.height,
+                ) {
+                    return Some(SlashEvidenceEnvelopeV2::Legacy(evidence.clone()));
+                }
+                let snapshot = self
+                    .state
+                    .snapshot_for_consensus_height(evidence.vote_1.height)
+                    .ok()?;
+                let (position, _) = snapshot.entry_with_position(&evidence.validator_id)?;
+                let membership_proof = build_slash_membership_proof(snapshot, position).ok()?;
+                Some(SlashEvidenceEnvelopeV2::MembershipProven(SlashEvidenceV2 {
+                    validator_id: evidence.validator_id,
+                    vote_1: evidence.vote_1.clone(),
+                    vote_2: evidence.vote_2.clone(),
+                    membership_proof,
+                }))
+            })
+            .take(MAX_SLASHES_PER_BLOCK)
+            .collect()
+    }
+
     /// Remove slash evidence that has already been committed.
     pub fn evict_committed_slashes(&mut self, committed: &[SlashEvidenceV1]) {
         for evidence in committed {
+            let hash = compute_slash_evidence_hash(evidence);
+            self.pending_slashes
+                .retain(|pending| compute_slash_evidence_hash(pending) != hash);
+        }
+    }
+
+    fn evict_committed_slashes_v2(&mut self, committed: &[SlashEvidenceEnvelopeV2]) {
+        for envelope in committed {
+            let evidence = match envelope {
+                SlashEvidenceEnvelopeV2::Legacy(evidence) => evidence,
+                SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
+                    let hash = compute_slash_evidence_v2_hash(evidence);
+                    if !self.state.applied_slash_hashes.contains(&hash) {
+                        continue;
+                    }
+                    let legacy = SlashEvidenceV1 {
+                        validator_id: evidence.validator_id,
+                        vote_1: evidence.vote_1.clone(),
+                        vote_2: evidence.vote_2.clone(),
+                    };
+                    let legacy_hash = compute_slash_evidence_hash(&legacy);
+                    self.pending_slashes
+                        .retain(|pending| compute_slash_evidence_hash(pending) != legacy_hash);
+                    continue;
+                }
+            };
             let hash = compute_slash_evidence_hash(evidence);
             self.pending_slashes
                 .retain(|pending| compute_slash_evidence_hash(pending) != hash);
@@ -628,6 +682,7 @@ impl NodeEngine {
             timestamp,
             polc_round,
             slash_evidence: self.select_slash_evidence(),
+            slash_evidence_v2: self.select_slash_evidence_v2(),
             governance_ops: self.select_governance_ops(),
             staking_ops: self.select_staking_ops(),
             election_result_hash,
@@ -784,6 +839,7 @@ impl NodeEngine {
             },
             transactions: original_block.transactions.clone(),
             slashing_evidence: original_block.slashing_evidence.clone(),
+            slashing_evidence_v2: original_block.slashing_evidence_v2.clone(),
             governance_ops: original_block.governance_ops.clone(),
             staking_ops: original_block.staking_ops.clone(),
             vrf_reveals,
@@ -1057,6 +1113,7 @@ impl NodeEngine {
         self.evict_committed_staking_ops(&block.staking_ops);
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
+        self.evict_committed_slashes_v2(&block.slashing_evidence_v2);
         Ok(())
     }
 
@@ -1637,6 +1694,7 @@ mod tests {
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),

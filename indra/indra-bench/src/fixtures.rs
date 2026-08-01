@@ -79,6 +79,7 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockV1 
         },
         transactions: txs,
         slashing_evidence: vec![],
+        slashing_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],

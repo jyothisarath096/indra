@@ -20,10 +20,10 @@ use indra_core::types::{
     governance::GovernanceOpV2,
     primitives::{
         block_protocol_version_for_height, reveal_set_commitment_active,
-        vrf_commit_reveal_election_active, Bytes32, ProtocolVersion, VariableBytes,
-        MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+        slash_membership_proof_active, vrf_commit_reveal_election_active, Bytes32, ProtocolVersion,
+        VariableBytes, MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
-    slashing::SlashEvidenceV1,
+    slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1},
     staking::StakingOp,
     transaction::TransactionV1,
     vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
@@ -56,6 +56,8 @@ pub struct BlockTemplate {
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Slash evidence selected for inclusion.
     pub slash_evidence: Vec<SlashEvidenceV1>,
+    /// Versioned evidence selected for a protocol-v8 block.
+    pub slash_evidence_v2: Vec<SlashEvidenceEnvelopeV2>,
     /// Commit-reveal election result hash for this proposal, when active.
     pub election_result_hash: Option<Bytes32>,
     /// Authoritative commit-reveal election result, when known to the caller.
@@ -236,7 +238,16 @@ pub fn produce_block(
     let mut block = BlockV1 {
         header,
         transactions: selected,
-        slashing_evidence: template.slash_evidence.clone(),
+        slashing_evidence: if slash_membership_proof_active(height) {
+            Vec::new()
+        } else {
+            template.slash_evidence.clone()
+        },
+        slashing_evidence_v2: if slash_membership_proof_active(height) {
+            template.slash_evidence_v2.clone()
+        } else {
+            Vec::new()
+        },
         governance_ops: template.governance_ops.clone(),
         staking_ops: template.staking_ops.clone(),
         vrf_reveals: if reveal_set_commitment_active(height) {
@@ -376,6 +387,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
@@ -403,6 +415,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash),
@@ -435,6 +448,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
@@ -482,6 +496,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: None,
@@ -556,6 +571,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: None,
@@ -595,6 +611,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: None,
@@ -646,6 +663,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
@@ -670,6 +688,7 @@ mod tests {
             timestamp: 1_700_000_001,
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
@@ -706,6 +725,7 @@ mod tests {
                 timestamp: 1_700_000_001 + index as u64,
                 polc_round: None,
                 slash_evidence: vec![],
+                slash_evidence_v2: vec![],
                 governance_ops: vec![],
                 staking_ops: vec![],
                 election_result_hash: Some(election_hash_for(&election, seed)),

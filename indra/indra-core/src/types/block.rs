@@ -8,10 +8,11 @@ use crate::{
         governance::GovernanceOpV2,
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
-            MAX_ACTIVE_VALIDATORS, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
-            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+            BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP, MAX_ACTIVE_VALIDATORS, MAX_GOV_OPS_PER_BLOCK,
+            MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
+            MAX_VRF_PROOF_BYTES,
         },
-        slashing::SlashEvidenceV1,
+        slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1},
         staking::StakingOp,
         transaction::TransactionV1,
         vrf_election::VrfRevealEvidence,
@@ -183,6 +184,8 @@ pub struct BlockV1 {
     pub transactions: Vec<TransactionV1>,
     /// Slash evidence (0–10).
     pub slashing_evidence: Vec<SlashEvidenceV1>,
+    /// Versioned slash evidence used by protocol version 8 and later.
+    pub slashing_evidence_v2: Vec<SlashEvidenceEnvelopeV2>,
     /// Governance operations (0–5).
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Staking operations (0–10).
@@ -200,7 +203,11 @@ impl Encode for BlockV1 {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.header.encode(buf);
         encode_list(&self.transactions, buf);
-        encode_list(&self.slashing_evidence, buf);
+        if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP {
+            encode_list(&self.slashing_evidence_v2, buf);
+        } else {
+            encode_list(&self.slashing_evidence, buf);
+        }
         encode_list(&self.governance_ops, buf);
         encode_list(&self.staking_ops, buf);
         if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET {
@@ -210,7 +217,11 @@ impl Encode for BlockV1 {
     fn encoded_len(&self) -> usize {
         self.header.encoded_len()
             + list_encoded_len(&self.transactions)
-            + list_encoded_len(&self.slashing_evidence)
+            + if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP {
+                list_encoded_len(&self.slashing_evidence_v2)
+            } else {
+                list_encoded_len(&self.slashing_evidence)
+            }
             + list_encoded_len(&self.governance_ops)
             + list_encoded_len(&self.staking_ops)
             + if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET {
@@ -225,10 +236,25 @@ impl Decode for BlockV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let header = BlockHeaderV1::decode(r)?;
         let use_reveal_set_body = header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET;
+        let use_slash_membership_body =
+            header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP;
+        let transactions = decode_list(r, MAX_TX_PER_BLOCK, "transactions")?;
+        let (slashing_evidence, slashing_evidence_v2) = if use_slash_membership_body {
+            (
+                Vec::new(),
+                decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence_v2")?,
+            )
+        } else {
+            (
+                decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence")?,
+                Vec::new(),
+            )
+        };
         Ok(Self {
             header,
-            transactions: decode_list(r, MAX_TX_PER_BLOCK, "transactions")?,
-            slashing_evidence: decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence")?,
+            transactions,
+            slashing_evidence,
+            slashing_evidence_v2,
             governance_ops: decode_list(r, MAX_GOV_OPS_PER_BLOCK, "governance_ops")?,
             staking_ops: decode_list(r, MAX_STAKING_OPS_PER_BLOCK, "staking_ops")?,
             vrf_reveals: if use_reveal_set_body {
@@ -266,6 +292,7 @@ mod tests {
         BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING,
         BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT,
         BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP, BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT,
+        BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
     };
 
     fn dummy_header() -> BlockHeaderV1 {
@@ -382,11 +409,48 @@ mod tests {
             header: dummy_header(),
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
         };
         assert_eq!(b, BlockV1::decode_exact(&b.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn protocol_v8_block_round_trips_versioned_slash_body() {
+        let mut header = dummy_header();
+        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP);
+        let block = BlockV1 {
+            header,
+            transactions: vec![],
+            slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+            vrf_reveals: vec![],
+        };
+        assert_eq!(
+            BlockV1::decode_exact(&block.encode_to_vec()).unwrap(),
+            block
+        );
+    }
+
+    #[test]
+    fn version_seven_binary_rejects_slash_membership_version_at_header_decode() {
+        let mut header = dummy_header();
+        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP);
+        let bytes = header.encode_to_vec();
+        let mut reader = ByteReader::new(&bytes);
+        let version = reader.read_u16_le().unwrap();
+        assert!(version > BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP);
+        assert_eq!(
+            Err::<(), _>(crate::error::IndraError::UnsupportedVersion { version }),
+            Err(crate::error::IndraError::UnsupportedVersion {
+                version: BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
+            })
+        );
+        assert_eq!(BlockHeaderV1::decode_exact(&bytes).unwrap(), header);
     }
 
     #[test]
@@ -397,6 +461,7 @@ mod tests {
             header: h.clone(),
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],

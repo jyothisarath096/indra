@@ -61,6 +61,10 @@ pub enum IndraError {
     #[error("invalid reward economic snapshot: {0}")]
     InvalidRewardEconomicSnapshot(String),
 
+    /// A slash-membership root, proof, or evidence envelope failed validation.
+    #[error("invalid slash membership proof: {0}")]
+    InvalidSlashMembershipProof(String),
+
     /// Unsupported persisted-struct schema version.
     #[error(
         "unsupported schema version {version} for {struct_name} (max supported {max_supported})"

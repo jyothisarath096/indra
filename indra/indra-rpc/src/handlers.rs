@@ -2934,6 +2934,7 @@ mod tests {
             },
             transactions: Vec::new(),
             slashing_evidence: Vec::new(),
+            slashing_evidence_v2: Vec::new(),
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
             vrf_reveals: Vec::new(),

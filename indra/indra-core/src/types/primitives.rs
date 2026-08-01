@@ -666,6 +666,12 @@ pub mod hard_forks {
     /// operations cannot create a 104,097th bond for one validator.
     pub const LIVE_BOND_COUNT_CAP_HEIGHT: u64 = u64::MAX;
 
+    /// Slash-evidence historical membership proofs and rolling root history.
+    ///
+    /// INTENTIONALLY UNSCHEDULED: activation changes slash-evidence block-body
+    /// encoding and requires versioned consensus snapshots to be active first.
+    pub const SLASH_MEMBERSHIP_PROOF_HEIGHT: u64 = u64::MAX;
+
     const _: () = assert!(
         COMPACT_BOND_PUBKEY_OMISSION_HEIGHT >= DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
         "compact bond pubkey omission must not activate before identity registry"
@@ -687,6 +693,16 @@ pub mod hard_forks {
     const _: () = assert!(
         super::epoch_transition_context_height_is_aligned(EPOCH_TRANSITION_CONTEXT_HEIGHT),
         "epoch transition context activation must occur at an epoch boundary"
+    );
+    const _: () = assert!(
+        super::consensus_snapshot_height_is_aligned(SLASH_MEMBERSHIP_PROOF_HEIGHT),
+        "slash membership proof activation must be the first height after an epoch boundary"
+    );
+    const _: () = assert!(
+        SLASH_MEMBERSHIP_PROOF_HEIGHT == u64::MAX
+            || (CONSENSUS_SNAPSHOT_HEIGHT != u64::MAX
+                && SLASH_MEMBERSHIP_PROOF_HEIGHT >= CONSENSUS_SNAPSHOT_HEIGHT),
+        "slash membership proofs cannot activate before consensus snapshots"
     );
 }
 
@@ -722,6 +738,12 @@ pub fn live_bond_count_cap_active(height: u64) -> bool {
 #[inline]
 pub fn consensus_snapshot_active(height: u64) -> bool {
     height >= hard_forks::CONSENSUS_SNAPSHOT_HEIGHT
+}
+
+/// Whether proof-carrying slash evidence governs infractions at `height`.
+#[inline]
+pub fn slash_membership_proof_active(height: u64) -> bool {
+    height >= hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
 }
 
 /// Whether newly-created stake bonds record height-precise unbonding starts.
@@ -1068,6 +1090,34 @@ pub const BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING: u16 = 6;
 /// Block protocol version used at/after LIVE_BOND_COUNT_CAP_HEIGHT.
 pub const BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP: u16 = 7;
 
+/// Block protocol version used at/after SLASH_MEMBERSHIP_PROOF_HEIGHT.
+pub const BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP: u16 = 8;
+
+const fn block_protocol_version_for_height_at_gates_with_slash_membership(
+    height: u64,
+    reveal_set_height: u64,
+    consensus_snapshot_height: u64,
+    self_unstake_height_precision_height: u64,
+    epoch_transition_context_height: u64,
+    delegator_bond_accounting_height: u64,
+    live_bond_count_cap_height: u64,
+    slash_membership_proof_height: u64,
+) -> u16 {
+    if height >= slash_membership_proof_height {
+        BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP
+    } else {
+        block_protocol_version_for_height_at_gates_with_live_bond_cap(
+            height,
+            reveal_set_height,
+            consensus_snapshot_height,
+            self_unstake_height_precision_height,
+            epoch_transition_context_height,
+            delegator_bond_accounting_height,
+            live_bond_count_cap_height,
+        )
+    }
+}
+
 const fn block_protocol_version_for_height_at_gates_with_live_bond_cap(
     height: u64,
     reveal_set_height: u64,
@@ -1135,7 +1185,7 @@ const fn block_protocol_version_for_height_at_gates(
 /// Protocol version required for a block at the supplied height.
 #[inline]
 pub fn block_protocol_version_for_height(height: u64) -> u16 {
-    block_protocol_version_for_height_at_gates_with_live_bond_cap(
+    block_protocol_version_for_height_at_gates_with_slash_membership(
         height,
         hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
         hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
@@ -1143,6 +1193,7 @@ pub fn block_protocol_version_for_height(height: u64) -> u16 {
         hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
         hard_forks::DELEGATOR_BOND_ACCOUNTING_HEIGHT,
         hard_forks::LIVE_BOND_COUNT_CAP_HEIGHT,
+        hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT,
     )
 }
 
@@ -1319,6 +1370,7 @@ impl ProtocolVersion {
             || self.0 == BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
             || self.0 == BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
             || self.0 == BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+            || self.0 == BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP
     }
 }
 
@@ -1342,6 +1394,7 @@ impl Decode for ProtocolVersion {
             && v != BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
             && v != BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
             && v != BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+            && v != BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP
         {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
@@ -1536,6 +1589,22 @@ mod tests {
     }
 
     #[test]
+    fn slash_membership_v8_is_highest_applicable_version() {
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_slash_membership(
+                800, 100, 200, 300, 400, 600, 700, 800,
+            ),
+            BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP
+        );
+        assert_eq!(
+            block_protocol_version_for_height_at_gates_with_slash_membership(
+                799, 100, 200, 300, 400, 600, 700, 800,
+            ),
+            BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+        );
+    }
+
+    #[test]
     fn epoch_transition_gate_alignment_accepts_only_boundaries_or_inert() {
         assert!(epoch_transition_context_height_is_aligned(u64::MAX));
         assert!(epoch_transition_context_height_is_aligned(300));
@@ -1562,7 +1631,7 @@ mod tests {
         }
         assert_eq!(
             block_protocol_version_for_height(u64::MAX),
-            BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
+            BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP
         );
     }
 
@@ -1589,6 +1658,16 @@ mod tests {
     #[test]
     fn epoch_transition_context_block_protocol_version_round_trips() {
         let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT);
+        assert!(version.is_supported());
+        assert_eq!(
+            ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),
+            version
+        );
+    }
+
+    #[test]
+    fn slash_membership_block_protocol_version_round_trips() {
+        let version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP);
         assert!(version.is_supported());
         assert_eq!(
             ProtocolVersion::decode_exact(&version.encode_to_vec()).unwrap(),

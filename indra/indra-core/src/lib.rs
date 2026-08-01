@@ -32,7 +32,7 @@ pub use types::{
     governance::GovernanceOpV2,
     primitives::{Bytes32, ProtocolVersion, VariableBytes},
     qc::QuorumCertificateV1,
-    slashing::SlashEvidenceV1,
+    slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
     transaction::{InputV1, OutputV1, TransactionV1, TxId},
     vote::VoteV1,
     vrf_election::{VrfCommit, VrfElectionResult, VrfReveal},

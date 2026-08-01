@@ -20,9 +20,10 @@ use indra_core::{
         crypto::HybridPubKey,
         primitives::{
             consensus_snapshot_active, registered_validator_cap_active,
-            validator_network_address_active, Bytes32,
+            slash_membership_proof_active, validator_network_address_active, Bytes32,
         },
         reward_economic_snapshot::RewardEconomicSnapshot,
+        slash_membership::SlashMembershipRootRecord,
     },
 };
 use indra_crypto::{sha256, PaymentPubKeyV1};
@@ -46,6 +47,7 @@ const DOMAIN_PAYMENT_IDENTITY: u8 = 0x08;
 const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
 const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
 const DOMAIN_REWARD_ECONOMIC_SNAPSHOT: u8 = 0x0B;
+const DOMAIN_SLASH_MEMBERSHIP_ROOT: u8 = 0x0C;
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -126,6 +128,14 @@ impl StateCommitmentV2 {
                 leaves.push((
                     reward_economic_snapshot_key(snapshot.activation_height),
                     reward_economic_snapshot_value_hash(snapshot),
+                ));
+            }
+        }
+        if slash_membership_proof_active(height) {
+            for record in &state.slash_membership_roots {
+                leaves.push((
+                    slash_membership_root_key(record.activation_height),
+                    slash_membership_root_value_hash(record),
                 ));
             }
         }
@@ -297,6 +307,17 @@ fn reward_economic_snapshot_key(activation_height: u64) -> [u8; 32] {
 
 fn reward_economic_snapshot_value_hash(snapshot: &RewardEconomicSnapshot) -> [u8; 32] {
     sha256(&snapshot.encode_to_vec())
+}
+
+fn slash_membership_root_key(activation_height: u64) -> [u8; 32] {
+    derive_key(
+        DOMAIN_SLASH_MEMBERSHIP_ROOT,
+        &activation_height.to_le_bytes(),
+    )
+}
+
+fn slash_membership_root_value_hash(record: &SlashMembershipRootRecord) -> [u8; 32] {
+    sha256(&record.encode_to_vec())
 }
 
 fn retired_cold_component_value_hash(kind: u8, component: &[u8]) -> [u8; 32] {
@@ -578,6 +599,40 @@ mod tests {
         assert_ne!(
             reward_economic_snapshot_key(301),
             consensus_snapshot_key(301)
+        );
+    }
+
+    #[test]
+    fn slash_membership_root_leaf_is_content_sensitive_and_domain_separated() {
+        let height = u64::MAX;
+        let mut state = ChainState::new_genesis();
+        state.height = height;
+        state.slash_membership_roots = vec![SlashMembershipRootRecord {
+            activation_height: height,
+            membership_root: id(0xC1),
+        }];
+        let baseline = StateCommitmentV2::from_state(&state, height).root();
+
+        let mut changed = state.clone();
+        changed.slash_membership_roots[0].membership_root = id(0xC2);
+        assert_ne!(
+            StateCommitmentV2::from_state(&changed, height).root(),
+            baseline
+        );
+
+        let mut unrelated = state.clone();
+        unrelated.epoch_fees_burned = 99;
+        assert_eq!(
+            StateCommitmentV2::from_state(&unrelated, height).root(),
+            baseline
+        );
+        assert_ne!(
+            slash_membership_root_key(height),
+            reward_economic_snapshot_key(height)
+        );
+        assert_ne!(
+            slash_membership_root_key(height),
+            consensus_snapshot_key(height)
         );
     }
 
@@ -1131,6 +1186,8 @@ mod tests {
             ("payment_identity", DOMAIN_PAYMENT_IDENTITY),
             ("retired_cold_component", DOMAIN_RETIRED_COLD_COMPONENT),
             ("consensus_snapshot", DOMAIN_CONSENSUS_SNAPSHOT),
+            ("reward_economic_snapshot", DOMAIN_REWARD_ECONOMIC_SNAPSHOT),
+            ("slash_membership_root", DOMAIN_SLASH_MEMBERSHIP_ROOT),
         ];
         let mut seen = std::collections::BTreeMap::new();
         for (name, domain) in domains {
@@ -1141,6 +1198,8 @@ mod tests {
             );
         }
         assert_eq!(DOMAIN_CONSENSUS_SNAPSHOT, 0x0A);
+        assert_eq!(DOMAIN_REWARD_ECONOMIC_SNAPSHOT, 0x0B);
+        assert_eq!(DOMAIN_SLASH_MEMBERSHIP_ROOT, 0x0C);
     }
 
     #[test]

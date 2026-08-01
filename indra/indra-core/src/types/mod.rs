@@ -11,6 +11,7 @@ pub mod primitives;
 pub mod qc;
 pub mod reward_economic_snapshot;
 pub mod slash_detector;
+pub mod slash_membership;
 pub mod slashing;
 pub mod staking;
 pub mod transaction;

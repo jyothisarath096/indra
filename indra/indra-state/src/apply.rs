@@ -42,13 +42,14 @@ use indra_core::{
         primitives::{
             block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
             epoch_transition_context_active, overflow_fix_active, payment_blinding_active,
-            vrf_commit_reveal_election_active, Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
-            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, PROTOCOL_VERSION,
-            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            slash_membership_proof_active, vrf_commit_reveal_election_active, Bytes32,
+            HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+            MAX_TX_PER_BLOCK, PROTOCOL_VERSION, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
-        slashing::SlashEvidenceV1,
+        slash_membership::{compute_slash_membership_root, SlashMembershipRootRecord},
+        slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
         staking::StakingOpBody,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
@@ -158,36 +159,128 @@ fn apply_slash_at_height_with_accounting(
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
 ) -> StateResult<SlashAccounting> {
+    apply_slash_common(
+        state,
+        evidence,
+        compute_slash_evidence_hash(evidence),
+        None,
+        chain_id,
+        height,
+        reporter_pubkey,
+    )
+}
+
+fn apply_slash_v2_at_height_with_accounting(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    chain_id: &str,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<SlashAccounting> {
+    if !slash_membership_proof_active(evidence.vote_1.height) {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "membership proof supplied for a pre-gate infraction".to_string(),
+        });
+    }
+    if evidence.membership_proof.entry.validator_id != evidence.validator_id
+        || evidence.vote_1.validator_id != evidence.validator_id
+        || evidence.vote_2.validator_id != evidence.validator_id
+    {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "membership entry and votes do not match claimed validator".to_string(),
+        });
+    }
+    let record = slash_membership_record_for_validation(state, evidence.vote_1.height)?;
+    evidence.membership_proof.verify(&record).map_err(|error| {
+        StateError::InvalidSlashEvidence {
+            reason: error.to_string(),
+        }
+    })?;
+    let legacy_shape = SlashEvidenceV1 {
+        validator_id: evidence.validator_id,
+        vote_1: evidence.vote_1.clone(),
+        vote_2: evidence.vote_2.clone(),
+    };
+    apply_slash_common(
+        state,
+        &legacy_shape,
+        compute_slash_evidence_v2_hash(evidence),
+        Some((
+            evidence.membership_proof.entry.classical_vote_pk,
+            evidence.membership_proof.entry.pq_vote_pk.to_vec(),
+        )),
+        chain_id,
+        height,
+        reporter_pubkey,
+    )
+}
+
+fn slash_membership_record_for_validation(
+    state: &ChainState,
+    infraction_height: u64,
+) -> StateResult<SlashMembershipRootRecord> {
+    if let Ok(record) = state.slash_membership_root_for_height(infraction_height) {
+        return Ok(*record);
+    }
+    let gate = indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT;
+    if infraction_height != gate || state.height >= gate {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: format!("missing membership root for height {infraction_height}"),
+        });
+    }
+    let snapshot = state
+        .consensus_snapshots
+        .iter()
+        .find(|snapshot| snapshot.activation_height == gate)
+        .ok_or_else(|| StateError::InvalidSlashEvidence {
+            reason: "bootstrap consensus snapshot is missing".to_string(),
+        })?;
+    Ok(SlashMembershipRootRecord {
+        activation_height: gate,
+        membership_root: compute_slash_membership_root(snapshot).map_err(|error| {
+            StateError::InvalidSlashEvidence {
+                reason: error.to_string(),
+            }
+        })?,
+    })
+}
+
+fn apply_slash_common(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV1,
+    evidence_hash: Bytes32,
+    historical_keys: Option<([u8; 32], Vec<u8>)>,
+    chain_id: &str,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<SlashAccounting> {
     use crate::ValidatorStatus;
     use indra_core::types::{
         primitives::{DUST_LIMIT_SPARK, SLASH_REPORTER_REWARD_BPS},
         vote::VoteStep,
     };
 
-    let evidence_hash = compute_slash_evidence_hash(evidence);
     if state.applied_slash_hashes.contains(&evidence_hash) {
         return Err(StateError::SlashAlreadyApplied);
     }
 
     let validator_id = evidence.validator_id;
 
-    let (classical_pk, pq_pk_bytes) = {
+    let current_keys = {
         let v = state
             .validators
             .get(&validator_id)
             .ok_or(StateError::ValidatorNotFound)?;
-        let cpk = v
-            .hybrid_classical_pk
-            .ok_or_else(|| StateError::InvalidSlashEvidence {
-                reason: "validator has no classical public key".into(),
-            })?;
-        let ppk = v
-            .hybrid_pq_pk
-            .clone()
-            .ok_or_else(|| StateError::InvalidSlashEvidence {
-                reason: "validator has no PQ public key".into(),
-            })?;
-        (cpk, ppk)
+        match (v.hybrid_classical_pk, v.hybrid_pq_pk.clone()) {
+            (Some(classical), Some(pq)) => Some((classical, pq)),
+            _ => None,
+        }
+    };
+    let (classical_pk, pq_pk_bytes) = match historical_keys {
+        Some(keys) => keys,
+        None => current_keys.ok_or_else(|| StateError::InvalidSlashEvidence {
+            reason: "validator has incomplete current hybrid public keys".into(),
+        })?,
     };
 
     {
@@ -384,6 +477,11 @@ fn apply_slash_at_height_with_accounting(
 
 /// Compute the canonical slash-evidence hash used for deduplication.
 pub fn compute_slash_evidence_hash(evidence: &SlashEvidenceV1) -> Bytes32 {
+    Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
+}
+
+/// Compute the canonical proof-carrying evidence hash used for deduplication.
+pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
 }
 
@@ -701,10 +799,49 @@ fn apply_block_inner(
             max: MAX_GOV_OPS_PER_BLOCK,
         });
     }
+    if slash_membership_proof_active(block.header.height) {
+        if !block.slashing_evidence.is_empty() {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "post-gate block populated the legacy slash list".to_string(),
+            });
+        }
+    } else if !block.slashing_evidence_v2.is_empty() {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "pre-gate block populated the versioned slash list".to_string(),
+        });
+    }
 
     let mut seen_slash_hashes: HashSet<Bytes32> = HashSet::new();
     for evidence in &block.slashing_evidence {
+        if slash_membership_proof_active(evidence.vote_1.height) {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "legacy evidence cannot target a proof-governed height".to_string(),
+            });
+        }
         if !seen_slash_hashes.insert(compute_slash_evidence_hash(evidence)) {
+            return Err(StateError::DuplicateSlashEvidence);
+        }
+    }
+    for envelope in &block.slashing_evidence_v2 {
+        let hash = match envelope {
+            SlashEvidenceEnvelopeV2::Legacy(evidence) => {
+                if slash_membership_proof_active(evidence.vote_1.height) {
+                    return Err(StateError::InvalidSlashEvidence {
+                        reason: "legacy envelope cannot target a proof-governed height".to_string(),
+                    });
+                }
+                compute_slash_evidence_hash(evidence)
+            }
+            SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
+                if !slash_membership_proof_active(evidence.vote_1.height) {
+                    return Err(StateError::InvalidSlashEvidence {
+                        reason: "proof envelope cannot target a pre-gate height".to_string(),
+                    });
+                }
+                compute_slash_evidence_v2_hash(evidence)
+            }
+        };
+        if !seen_slash_hashes.insert(hash) {
             return Err(StateError::DuplicateSlashEvidence);
         }
     }
@@ -778,6 +915,33 @@ fn apply_block_inner(
             )?;
         }
     }
+    if !block.slashing_evidence_v2.is_empty() {
+        let mut shadow = state.clone();
+        let chain_id_clone = state.chain_id.clone();
+        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block);
+        for envelope in &block.slashing_evidence_v2 {
+            match envelope {
+                SlashEvidenceEnvelopeV2::Legacy(evidence) => {
+                    apply_slash_at_height(
+                        &mut shadow,
+                        evidence,
+                        &chain_id_clone,
+                        block.header.height,
+                        reporter_pubkey.as_ref(),
+                    )?;
+                }
+                SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
+                    apply_slash_v2_at_height_with_accounting(
+                        &mut shadow,
+                        evidence,
+                        &chain_id_clone,
+                        block.header.height,
+                        reporter_pubkey.as_ref(),
+                    )?;
+                }
+            }
+        }
+    }
 
     // ── Phase 3: State mutation (all validation passed) ───────────────────
 
@@ -842,6 +1006,31 @@ fn apply_block_inner(
         })?;
         txn.add_slash_accounting(accounting.slash_amount)?;
     }
+    for envelope in &block.slashing_evidence_v2 {
+        txn.snapshot_slashing_scope();
+        let accounting = match envelope {
+            SlashEvidenceEnvelopeV2::Legacy(evidence) => apply_slash_at_height_with_accounting(
+                txn.state_mut(),
+                evidence,
+                &chain_id_for_slash,
+                block.header.height,
+                reporter_pubkey.as_ref(),
+            ),
+            SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
+                apply_slash_v2_at_height_with_accounting(
+                    txn.state_mut(),
+                    evidence,
+                    &chain_id_for_slash,
+                    block.header.height,
+                    reporter_pubkey.as_ref(),
+                )
+            }
+        }
+        .map_err(|_| StateError::InvariantViolation {
+            message: "versioned slash failed on real state after shadow validation",
+        })?;
+        txn.add_slash_accounting(accounting.slash_amount)?;
+    }
 
     // Update base fee for next block
     let next_fee = compute_next_base_fee(txn.state().base_fee, block.transactions.len());
@@ -849,6 +1038,17 @@ fn apply_block_inner(
 
     // Advance height and tip hash
     txn.set_tip(block.header.height, block.header.block_hash())?;
+
+    if block.header.height
+        == indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
+    {
+        txn.snapshot_slash_membership_root_scope();
+        txn.state_mut()
+            .bootstrap_slash_membership_root(block.header.height)?;
+        txn.state_mut()
+            .rebuild_state_commitment_v2(block.header.height);
+        txn.after_mutation()?;
+    }
 
     // Post-gate, credit the certified parent's activity before the transition
     // so the closing epoch's final QC participates in liveness evaluation.
@@ -1266,15 +1466,15 @@ mod tests {
             },
             primitives::{
                 hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
-                BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
-                BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+                BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
                 DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
                 MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
                 MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
                 TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
             },
-            slashing::SlashEvidenceV1,
+            slash_membership::build_slash_membership_proof,
+            slashing::{SlashEvidenceV1, SlashEvidenceV2},
             staking::{StakingOp, StakingOpBody},
             transaction::{InputV1, OutputV1, TransactionV1},
             vote::{VoteStep, VoteV1},
@@ -2056,10 +2256,24 @@ mod tests {
             },
             transactions: txs,
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
         }
+    }
+
+    fn install_inert_gate_snapshot_fixture(state: &mut ChainState) {
+        let (_, _, validator_id) =
+            install_governance_validator(state, [0xD9; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        state.validators.get_mut(&validator_id).unwrap().vrf_pk =
+            Some(indra_crypto::VrfKeypair::from_seed(&[0xD9; 32]).public_key());
+        let snapshot = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
+        state.consensus_snapshots = vec![snapshot];
     }
 
     fn assert_same_consensus_state(left: &ChainState, right: &ChainState) {
@@ -2309,6 +2523,7 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -2428,6 +2643,7 @@ mod tests {
     #[test]
     fn project_block_for_roots_restores_state_on_success() {
         let mut state = ChainState::new_genesis();
+        install_inert_gate_snapshot_fixture(&mut state);
         state.height = u64::MAX - 1;
         state.tip_hash = Bytes32::ZERO;
         state.state_commitment_v2 = None;
@@ -2464,6 +2680,7 @@ mod tests {
     #[test]
     fn project_block_for_roots_preserves_active_state_commitment_v2_cache() {
         let mut state = ChainState::new_genesis();
+        install_inert_gate_snapshot_fixture(&mut state);
         state.height = u64::MAX - 1;
         state.tip_hash = Bytes32::ZERO;
         state.rebuild_state_commitment_v2(state.height);
@@ -4869,6 +5086,7 @@ mod tests {
     #[test]
     fn state_txn_rebuilds_state_commitment_v2_cache_after_rollback() {
         let mut state = ChainState::new_genesis();
+        install_inert_gate_snapshot_fixture(&mut state);
         state.height = u64::MAX - 1;
         state.tip_hash = Bytes32::ZERO;
         let block = BlockV1 {
@@ -4891,6 +5109,7 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -4913,10 +5132,10 @@ mod tests {
             .to_string()
             .contains("state transaction failpoint injected after mutation"));
         assert_same_consensus_state(&rolled_back, &state);
-        let rollback_root = rolled_back.state_commitment_v2_root(block.header.height);
-        rolled_back.rebuild_state_commitment_v2(block.header.height);
+        let rollback_root = rolled_back.state_commitment_v2_root(rolled_back.height);
+        rolled_back.rebuild_state_commitment_v2(rolled_back.height);
         assert_eq!(
-            rolled_back.state_commitment_v2_root(block.header.height),
+            rolled_back.state_commitment_v2_root(rolled_back.height),
             rollback_root
         );
         crate::txn::set_fail_after_mutation(None);
@@ -5715,7 +5934,9 @@ mod tests {
             let post_gate = make_block_at_height(&state, vec![], u64::MAX, 1_900_000_001);
             assert_eq!(
                 post_gate.header.protocol_version,
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP)
+                ProtocolVersion(
+                    indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
+                )
             );
 
             let mut rejected = state.clone();
@@ -6486,6 +6707,103 @@ mod tests {
             state.validators.get(&validator_id).unwrap().stake_spark,
             950_000
         );
+    }
+
+    #[test]
+    fn membership_proven_slash_uses_bootstrap_snapshot_and_historical_keys() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0xD1; 32], 1_000_000);
+        state.height = u64::MAX - 1;
+        let snapshot = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
+        state.consensus_snapshots = vec![snapshot];
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                u64::MAX,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xA1; 32]),
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                u64::MAX,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xB1; 32]),
+            ),
+            membership_proof: proof,
+        };
+        let chain_id = state.chain_id.clone();
+        let current = state.validators.get_mut(&validator_id).unwrap();
+        current.hybrid_classical_pk = None;
+        current.hybrid_pq_pk = None;
+
+        apply_slash_v2_at_height_with_accounting(&mut state, &evidence, &chain_id, u64::MAX, None)
+            .unwrap();
+
+        assert_eq!(
+            state.validators.get(&validator_id).unwrap().stake_spark,
+            950_000
+        );
+    }
+
+    #[test]
+    fn membership_proven_slash_rejects_wrong_root_and_missing_root() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0xD2; 32], 1_000_000);
+        state.height = u64::MAX - 1;
+        let snapshot = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                u64::MAX,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xA2; 32]),
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                u64::MAX,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xB2; 32]),
+            ),
+            membership_proof: proof,
+        };
+        let chain_id = state.chain_id.clone();
+        assert!(apply_slash_v2_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            u64::MAX,
+            None,
+        )
+        .is_err());
+
+        state.consensus_snapshots = vec![snapshot];
+        state.height = u64::MAX;
+        state.slash_membership_roots = vec![SlashMembershipRootRecord {
+            activation_height: u64::MAX,
+            membership_root: Bytes32::from([0xEE; 32]),
+        }];
+        assert!(apply_slash_v2_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            u64::MAX,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

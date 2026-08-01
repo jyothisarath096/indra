@@ -352,10 +352,12 @@ The record MUST remain available while:
 current_epoch <= I_last + SLASH_EVIDENCE_WINDOW_EPOCHS
 ```
 
-Because the window is inclusive, canonical state MUST permit up to:
+Because the window is inclusive and the newly activated open-interval root
+coexists with the oldest still-provable closed interval for one epoch,
+canonical state MUST permit up to:
 
 ```text
-SLASH_EVIDENCE_WINDOW_EPOCHS + 1 = 501 records
+SLASH_EVIDENCE_WINDOW_EPOCHS + 2 = 502 records
 ```
 
 under the ordinary one-snapshot-per-epoch schedule.
@@ -374,23 +376,23 @@ height 301 governs through boundary height 600: `epoch_for_height(600) == 2`
 even though `epoch_for_height(301) == 1`. Pruning from the activation epoch
 would remove the root one epoch too early for evidence about height 600.
 Implementations MUST not use collection length alone as the semantic pruning
-rule, although a 501-record cap MUST also be enforced as an invariant.
+rule, although a 502-record cap MUST also be enforced as an invariant.
 
 Replay, block projection, rollback, and checkpoint restore MUST perform
 identical creation and pruning.
 
 ### 3.4 Exact canonical cost
 
-At the 501-record inclusive maximum:
+At the 502-record inclusive maximum:
 
 ```text
-4-byte list prefix + 501 * 40-byte records = 20,044 bytes
+4-byte list prefix + 502 * 40-byte records = 20,084 bytes
 ```
 
 This is independent of active-validator count.
 
 `StateCommitmentV2` authenticated-tree node overhead and in-memory collection
-overhead are additional and implementation-dependent; 20,044 bytes is the
+overhead are additional and implementation-dependent; 20,084 bytes is the
 exact canonical encoding cost.
 
 ### 3.5 State-commitment placement
@@ -400,7 +402,8 @@ dedicated `StateCommitmentV2` leaf domain, separate from both validators and
 full consensus snapshots:
 
 ```text
-DOMAIN_SLASH_MEMBERSHIP_ROOT = 0x0B
+DOMAIN_REWARD_ECONOMIC_SNAPSHOT = 0x0B
+DOMAIN_SLASH_MEMBERSHIP_ROOT = 0x0C
 
 leaf_key = derive_key(
     DOMAIN_SLASH_MEMBERSHIP_ROOT,
@@ -412,10 +415,10 @@ leaf_value_hash = H(
 )
 ```
 
-The current domain inventory ends with consensus snapshots at `0x0A`
-(`indra-state/src/state_commitment.rs:45-54`). Implementation MUST re-run a
-complete collision inventory before reserving `0x0B`; this document does not
-authorize reuse if another concurrent arc has claimed it.
+The current domain inventory assigns consensus snapshots to `0x0A` and reward
+economic snapshots to `0x0B`; slash-membership roots therefore use `0x0C`
+(`indra-state/src/state_commitment.rs`). The collision-inventory test MUST
+cover both adjacent assignments and reject any reuse.
 
 The collection MUST also be included in:
 
@@ -676,7 +679,7 @@ consensus_snapshots
 slash_membership_roots
     compact membership commitments only
     authoritative for historical slash eligibility
-    retain up to 501
+    retain up to 502
 ```
 
 They MUST be separate `ChainState` collections and separate state-commitment
@@ -994,10 +997,10 @@ and bonds_empty(T)
 ```
 
 In the ordinary case, newly unbonding bonds keep the tombstone alive for 1,008
-epochs, longer than the 501-record membership-root horizon. That is safe:
+epochs, longer than the 502-record membership-root horizon. That is safe:
 membership roots are needed only while new evidence can be admitted; the
 tombstone remains afterward solely to release locked principal. Tombstones
-therefore do not piggyback on the 501-root collection and do not share its
+therefore do not piggyback on the 502-root collection and do not share its
 retention length.
 
 Prunable tombstones are removed in deterministic ascending order of:
@@ -1050,11 +1053,10 @@ leaf_value_hash = H(
 )
 ```
 
-The existing inventory currently ends at consensus snapshots at `0x0A`;
-Section 3.5 provisionally reserves `0x0B` for slash-membership roots
-(`indra-state/src/state_commitment.rs:32-45`). The implementation MUST inventory
-the then-current tree and assign a collision-free value; this specification
-does not hard-code `0x0C` against concurrent work.
+The existing inventory assigns `0x0B` to reward-economic snapshots and `0x0C`
+to slash-membership roots (`indra-state/src/state_commitment.rs`). Section 7
+does not reserve a future tombstone domain; Part B MUST inventory the
+then-current tree and assign its own collision-free value.
 
 Canonical encoding MUST include:
 
@@ -1438,7 +1440,7 @@ testnet constant accidentally.
 
 ### 12.1 Cost summary
 
-- Canonical root history: exactly 20,044 bytes at 501 records.
+- Canonical root history: exactly 20,084 bytes at 502 records.
 - Membership proof: 2,717–2,973 bytes.
 - Typical proof-carrying evidence: approximately 12.3–12.6 KB.
 - Maximum additional proof bytes for three slash items: 8,919 bytes.
@@ -1450,14 +1452,14 @@ testnet constant accidentally.
 These replace the roughly 257 MiB maximum-set canonical cost of retaining 500
 full 200-validator snapshots.
 
-For an exact like-for-like 501-record inclusive history, a full snapshot's
+For an exact like-for-like 502-record inclusive history, a full snapshot's
 canonical size is `61 + 2,696 * member_count` bytes, plus one four-byte outer
 list prefix. The comparison is:
 
-| Members | One full snapshot | 501 full snapshots | Compact 501-root history |
+| Members | One full snapshot | 502 full snapshots | Compact 502-root history |
 |---:|---:|---:|---:|
-| 4 | 10,845 bytes | 5,433,349 bytes (5.18 MiB) | 20,044 bytes |
-| 200 | 539,261 bytes | 270,169,765 bytes (257.65 MiB) | 20,044 bytes |
+| 4 | 10,845 bytes | 5,444,194 bytes (5.19 MiB) | 20,084 bytes |
+| 200 | 539,261 bytes | 270,709,026 bytes (258.17 MiB) | 20,084 bytes |
 
 This refines “hundreds of MB” to 257.65 MiB at the active-set ceiling and
 shows that even the current four-validator set would otherwise consume
@@ -1569,7 +1571,8 @@ from current code and MUST be explicitly approved after external review:
 
 1. fixed ordered binary Merkle tree rather than serialized
    `PersistentAuthTree` proofs;
-2. dedicated `StateCommitmentV2` domain `0x0B`, subject to collision inventory;
+2. dedicated `StateCommitmentV2` domain `0x0C`, with `0x0B` assigned to
+   reward-economic snapshots and both covered by collision inventory;
 3. minimal 40-byte root records with member count carried in proofs;
 4. single-gate bootstrap derived from committed `S(G)`;
 5. legacy handling for pre-activation infractions until their windows expire;

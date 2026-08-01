@@ -3,7 +3,7 @@
 use crate::{
     codec::{ByteReader, Decode, Encode},
     error::IndraResult,
-    types::{primitives::Bytes32, vote::VoteV1},
+    types::{primitives::Bytes32, slash_membership::SlashMembershipProofV1, vote::VoteV1},
 };
 
 /// Evidence of a slashable offence: two conflicting votes from the same validator.
@@ -35,5 +35,103 @@ impl Decode for SlashEvidenceV1 {
             vote_1: VoteV1::decode(r)?,
             vote_2: VoteV1::decode(r)?,
         })
+    }
+}
+
+/// Proof-carrying evidence for an infraction governed by membership roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashEvidenceV2 {
+    /// Validator who committed the offence.
+    pub validator_id: Bytes32,
+    /// First conflicting vote.
+    pub vote_1: VoteV1,
+    /// Second conflicting vote.
+    pub vote_2: VoteV1,
+    /// Proof of historical consensus membership and vote keys.
+    pub membership_proof: SlashMembershipProofV1,
+}
+
+impl Encode for SlashEvidenceV2 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.validator_id.encode(buf);
+        self.vote_1.encode(buf);
+        self.vote_2.encode(buf);
+        self.membership_proof.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + self.vote_1.encoded_len()
+            + self.vote_2.encoded_len()
+            + self.membership_proof.encoded_len()
+    }
+}
+
+impl Decode for SlashEvidenceV2 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            validator_id: Bytes32::decode(reader)?,
+            vote_1: VoteV1::decode(reader)?,
+            vote_2: VoteV1::decode(reader)?,
+            membership_proof: SlashMembershipProofV1::decode(reader)?,
+        })
+    }
+}
+
+/// Versioned post-activation slash-evidence block-body envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashEvidenceEnvelopeV2 {
+    /// Legacy evidence for an infraction before proof activation.
+    Legacy(SlashEvidenceV1),
+    /// Membership-proven evidence for a governed infraction.
+    MembershipProven(SlashEvidenceV2),
+}
+
+impl SlashEvidenceEnvelopeV2 {
+    /// Alleged infraction height used to select the validation rule.
+    pub fn infraction_height(&self) -> u64 {
+        match self {
+            Self::Legacy(evidence) => evidence.vote_1.height,
+            Self::MembershipProven(evidence) => evidence.vote_1.height,
+        }
+    }
+}
+
+impl From<SlashEvidenceV1> for SlashEvidenceEnvelopeV2 {
+    fn from(value: SlashEvidenceV1) -> Self {
+        Self::Legacy(value)
+    }
+}
+
+impl Encode for SlashEvidenceEnvelopeV2 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::Legacy(evidence) => {
+                0u8.encode(buf);
+                evidence.encode(buf);
+            }
+            Self::MembershipProven(evidence) => {
+                1u8.encode(buf);
+                evidence.encode(buf);
+            }
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        1 + match self {
+            Self::Legacy(evidence) => evidence.encoded_len(),
+            Self::MembershipProven(evidence) => evidence.encoded_len(),
+        }
+    }
+}
+
+impl Decode for SlashEvidenceEnvelopeV2 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        match u8::decode(reader)? {
+            0 => Ok(Self::Legacy(SlashEvidenceV1::decode(reader)?)),
+            1 => Ok(Self::MembershipProven(SlashEvidenceV2::decode(reader)?)),
+            tag => Err(crate::error::IndraError::InvalidSlashMembershipProof(
+                format!("unknown slash evidence envelope tag {tag}",),
+            )),
+        }
     }
 }

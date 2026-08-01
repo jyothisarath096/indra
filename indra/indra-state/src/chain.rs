@@ -10,6 +10,9 @@ use indra_core::types::crypto::HybridPubKey;
 use indra_core::types::reward_economic_snapshot::{
     RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
 };
+use indra_core::types::slash_membership::{
+    compute_slash_membership_root, SlashMembershipRootRecord, MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
+};
 use indra_crypto::PaymentPubKeyV1;
 
 use indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT;
@@ -110,6 +113,9 @@ pub struct ChainState {
 
     /// Epoch-start commission/delegation basis paired with consensus authority.
     pub reward_economic_snapshot: Option<RewardEconomicSnapshot>,
+
+    /// Canonical rolling commitments used for historical slash membership.
+    pub slash_membership_roots: Vec<SlashMembershipRootRecord>,
 
     /// Delegation map: validator_id → delegator entries.
     pub delegations: DelegationMap,
@@ -229,6 +235,9 @@ impl Encode for ChainState {
                 snapshot.encode(buf);
             }
         }
+        if indra_core::types::primitives::slash_membership_proof_active(self.height) {
+            encode_list(&self.slash_membership_roots, buf);
+        }
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
     }
@@ -289,6 +298,11 @@ impl Encode for ChainState {
                         .as_ref()
                         .map(Encode::encoded_len)
                         .unwrap_or(0)
+            } else {
+                0
+            }
+            + if indra_core::types::primitives::slash_membership_proof_active(self.height) {
+                list_encoded_len(&self.slash_membership_roots)
             } else {
                 0
             }
@@ -356,6 +370,38 @@ impl Decode for ChainState {
             reward_economic_snapshot.as_ref(),
             height,
         )?;
+        let slash_membership_roots =
+            if indra_core::types::primitives::slash_membership_proof_active(height) {
+                let roots = decode_list(
+                    r,
+                    MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
+                    "chain_state.slash_membership_roots",
+                )?;
+                validate_slash_membership_root_history(&roots, height)?;
+                for snapshot in &consensus_snapshots {
+                    if snapshot.activation_height
+                        >= indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
+                    {
+                        let record = roots
+                            .iter()
+                            .find(|record| record.activation_height == snapshot.activation_height)
+                            .ok_or_else(|| {
+                                IndraError::InvalidSlashMembershipProof(
+                                    "retained full snapshot has no matching membership root"
+                                        .to_string(),
+                                )
+                            })?;
+                        if compute_slash_membership_root(snapshot)? != record.membership_root {
+                            return Err(IndraError::InvalidSlashMembershipProof(
+                                "retained full snapshot membership root mismatch".to_string(),
+                            ));
+                        }
+                    }
+                }
+                roots
+            } else {
+                Vec::new()
+            };
         Ok(Self {
             chain_id,
             height,
@@ -370,6 +416,7 @@ impl Decode for ChainState {
             validators,
             consensus_snapshots,
             reward_economic_snapshot,
+            slash_membership_roots,
             delegations,
             staked_bonds,
             staking_nonces,
@@ -417,6 +464,7 @@ impl ChainState {
             validators: ValidatorSet::new(),
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
+            slash_membership_roots: Vec::new(),
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
             staking_nonces: PersistentOrdMap::new(),
@@ -454,6 +502,7 @@ impl ChainState {
             validators: ValidatorSet::decode_legacy(r, schema_version)?,
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
+            slash_membership_roots: Vec::new(),
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map_legacy(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -495,6 +544,7 @@ impl ChainState {
             validators: ValidatorSet::decode(r)?,
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
+            slash_membership_roots: Vec::new(),
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
@@ -795,9 +845,128 @@ impl ChainState {
         })?;
         let snapshot = self.build_consensus_snapshot(activation_height, boundary_height)?;
         let economic = self.build_reward_economic_snapshot(&snapshot)?;
+        let membership_record = if activation_height
+            > indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
+        {
+            Some(SlashMembershipRootRecord {
+                activation_height,
+                membership_root: compute_slash_membership_root(&snapshot).map_err(|error| {
+                    crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+                })?,
+            })
+        } else {
+            None
+        };
         self.install_consensus_snapshot(snapshot)?;
         self.reward_economic_snapshot = Some(economic);
+        if let Some(record) = membership_record {
+            self.append_slash_membership_root(record)?;
+            self.prune_slash_membership_roots(boundary_height)?;
+        }
         Ok(())
+    }
+
+    /// Insert the bootstrap root into block `G` post-state.
+    pub(crate) fn bootstrap_slash_membership_root(
+        &mut self,
+        height: u64,
+    ) -> crate::error::StateResult<()> {
+        use indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT;
+        if height != SLASH_MEMBERSHIP_PROOF_HEIGHT {
+            return Ok(());
+        }
+        if !self.slash_membership_roots.is_empty() {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "slash membership bootstrap requires empty root history".to_string(),
+            ));
+        }
+        let snapshot = self
+            .consensus_snapshots
+            .iter()
+            .find(|snapshot| snapshot.activation_height == height)
+            .ok_or_else(|| {
+                crate::error::StateError::InvalidConsensusSnapshot(
+                    "slash membership bootstrap snapshot is missing".to_string(),
+                )
+            })?;
+        let record = SlashMembershipRootRecord {
+            activation_height: height,
+            membership_root: compute_slash_membership_root(snapshot).map_err(|error| {
+                crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+            })?,
+        };
+        self.append_slash_membership_root(record)
+    }
+
+    fn append_slash_membership_root(
+        &mut self,
+        record: SlashMembershipRootRecord,
+    ) -> crate::error::StateResult<()> {
+        if self
+            .slash_membership_roots
+            .last()
+            .is_some_and(|last| last.activation_height >= record.activation_height)
+        {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "slash membership roots are duplicate or not strictly ordered".to_string(),
+            ));
+        }
+        self.slash_membership_roots.push(record);
+        Ok(())
+    }
+
+    fn prune_slash_membership_roots(
+        &mut self,
+        current_height: u64,
+    ) -> crate::error::StateResult<()> {
+        let current_epoch = crate::epoch::epoch_for_height(current_height);
+        while self.slash_membership_roots.len() > 1 {
+            let successor_activation = self
+                .slash_membership_roots
+                .get(1)
+                .ok_or_else(|| crate::error::StateError::InvariantViolation {
+                    message: "slash root successor disappeared during pruning",
+                })?
+                .activation_height;
+            let last_governed_height = successor_activation.checked_sub(1).ok_or_else(|| {
+                crate::error::StateError::InvariantViolation {
+                    message: "slash root successor activation underflow",
+                }
+            })?;
+            let last_epoch = crate::epoch::epoch_for_height(last_governed_height);
+            if current_epoch
+                <= last_epoch
+                    .saturating_add(indra_core::types::primitives::SLASH_EVIDENCE_WINDOW_EPOCHS)
+            {
+                break;
+            }
+            self.slash_membership_roots.remove(0);
+        }
+        if self.slash_membership_roots.len() > MAX_SLASH_MEMBERSHIP_ROOT_RECORDS {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "slash membership root history exceeds 502 nonexpired records".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve the unique retained root authoritative for `height`.
+    pub fn slash_membership_root_for_height(
+        &self,
+        height: u64,
+    ) -> crate::error::StateResult<&SlashMembershipRootRecord> {
+        validate_slash_membership_root_history(&self.slash_membership_roots, self.height).map_err(
+            |error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()),
+        )?;
+        self.slash_membership_roots
+            .iter()
+            .rev()
+            .find(|record| record.activation_height <= height)
+            .ok_or_else(|| {
+                crate::error::StateError::InvalidConsensusSnapshot(format!(
+                    "no slash membership root governs height {height}",
+                ))
+            })
     }
 
     fn install_consensus_snapshot(
@@ -901,6 +1070,73 @@ fn validate_reward_economic_pairing(
             )
         })?;
     validate_reward_economic_membership(consensus, economic)
+}
+
+fn validate_slash_membership_root_history(
+    roots: &[SlashMembershipRootRecord],
+    state_height: u64,
+) -> IndraResult<()> {
+    use indra_core::types::primitives::{
+        hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT, slash_membership_proof_active,
+        SLASH_EVIDENCE_WINDOW_EPOCHS,
+    };
+    if !slash_membership_proof_active(state_height) {
+        if !roots.is_empty() {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "pre-gate state contains slash membership roots".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if roots.is_empty() {
+        return Err(IndraError::InvalidSlashMembershipProof(
+            "post-gate state is missing slash membership root history".to_string(),
+        ));
+    }
+    if roots.len() > MAX_SLASH_MEMBERSHIP_ROOT_RECORDS {
+        return Err(IndraError::LengthExceeded {
+            field: "chain_state.slash_membership_roots",
+            max: MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
+            actual: roots.len(),
+        });
+    }
+    for (index, root) in roots.iter().enumerate() {
+        if root.activation_height < SLASH_MEMBERSHIP_PROOF_HEIGHT {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "root activation precedes slash membership gate".to_string(),
+            ));
+        }
+        if index > 0
+            && roots
+                .get(index - 1)
+                .is_some_and(|previous| previous.activation_height >= root.activation_height)
+        {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "root activations are duplicate or not strictly ascending".to_string(),
+            ));
+        }
+    }
+    for pair in roots.windows(2) {
+        let previous = pair.first().ok_or_else(|| {
+            IndraError::InvalidSlashMembershipProof("root-history pair is empty".to_string())
+        })?;
+        let successor = pair.get(1).ok_or_else(|| {
+            IndraError::InvalidSlashMembershipProof("root-history successor is missing".to_string())
+        })?;
+        let last_height = successor.activation_height.checked_sub(1).ok_or_else(|| {
+            IndraError::InvalidSlashMembershipProof("successor activation underflow".to_string())
+        })?;
+        let expiry_epoch = crate::epoch::epoch_for_height(last_height)
+            .saturating_add(SLASH_EVIDENCE_WINDOW_EPOCHS);
+        if crate::epoch::epoch_for_height(state_height) > expiry_epoch
+            && previous.activation_height != roots.last().map_or(0, |root| root.activation_height)
+        {
+            return Err(IndraError::InvalidSlashMembershipProof(
+                "expired slash membership root was not pruned".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_consensus_snapshot_collection(
@@ -1385,17 +1621,27 @@ mod tests {
         state.rotate_consensus_snapshot_after_boundary(600).unwrap();
         state.rotate_consensus_snapshot_after_boundary(900).unwrap();
         state.height = u64::MAX;
+        let bootstrap = state
+            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .unwrap();
+        let bootstrap_economic = state.build_reward_economic_snapshot(&bootstrap).unwrap();
+        state.consensus_snapshots = vec![state.consensus_snapshots[1].clone(), bootstrap.clone()];
+        state.reward_economic_snapshot = Some(bootstrap_economic);
+        state.slash_membership_roots = vec![SlashMembershipRootRecord {
+            activation_height: u64::MAX,
+            membership_root: compute_slash_membership_root(&bootstrap).unwrap(),
+        }];
 
         assert_eq!(state.consensus_snapshots.len(), 2);
-        assert_eq!(state.consensus_snapshots[0].activation_height, 601);
-        assert_eq!(state.consensus_snapshots[1].activation_height, 901);
+        assert_eq!(state.consensus_snapshots[0].activation_height, 901);
+        assert_eq!(state.consensus_snapshots[1].activation_height, u64::MAX);
         assert_eq!(
             state
                 .reward_economic_snapshot
                 .as_ref()
                 .unwrap()
                 .activation_height,
-            901
+            u64::MAX
         );
 
         let bytes = state.encode_to_vec();
@@ -1407,6 +1653,27 @@ mod tests {
             state.reward_economic_snapshot
         );
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn slash_membership_history_keeps_502_until_last_governed_window_expires() {
+        let mut state = ChainState::new_genesis();
+        state.slash_membership_roots = (0u64..502)
+            .map(|index| SlashMembershipRootRecord {
+                activation_height: 301 + index * EPOCH_DURATION_BLOCKS,
+                membership_root: Bytes32::from([(index % 251) as u8; 32]),
+            })
+            .collect();
+
+        state.prune_slash_membership_roots(150_600).unwrap();
+        assert_eq!(crate::epoch::epoch_for_height(150_600), 502);
+        assert_eq!(state.slash_membership_roots.len(), 502);
+        assert_eq!(state.slash_membership_roots[0].activation_height, 301);
+
+        state.prune_slash_membership_roots(150_900).unwrap();
+        assert_eq!(crate::epoch::epoch_for_height(150_900), 503);
+        assert_eq!(state.slash_membership_roots.len(), 501);
+        assert_eq!(state.slash_membership_roots[0].activation_height, 601);
     }
 
     #[test]
@@ -1707,6 +1974,10 @@ mod tests {
                 .build_reward_economic_snapshot(&with_staged_snapshot.consensus_snapshots[0])
                 .unwrap(),
         );
+        with_staged_snapshot.slash_membership_roots = vec![SlashMembershipRootRecord {
+            activation_height: u64::MAX,
+            membership_root: Bytes32::from([0xCC; 32]),
+        }];
 
         assert!(!consensus_snapshot_active(baseline.height));
         assert_eq!(
@@ -1725,6 +1996,10 @@ mod tests {
             .unwrap()
             .reward_economic_snapshot
             .is_none());
+        assert!(ChainState::decode_exact(&baseline.encode_to_vec())
+            .unwrap()
+            .slash_membership_roots
+            .is_empty());
     }
 
     #[test]

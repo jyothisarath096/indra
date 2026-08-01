@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use indra_core::{
     types::{
-        consensus_snapshot::ConsensusSnapshot, primitives::state_commitment_v2_active,
-        reward_economic_snapshot::RewardEconomicSnapshot, transaction::OutputV1,
+        consensus_snapshot::ConsensusSnapshot, reward_economic_snapshot::RewardEconomicSnapshot,
+        slash_membership::SlashMembershipRootRecord, transaction::OutputV1,
     },
     Bytes32,
 };
@@ -21,6 +21,7 @@ use crate::{
     error::StateResult,
     governance::GovernanceState,
     persistent::{PersistentOrdMap, PersistentOrdSet},
+    state_commitment::StateCommitmentV2,
     utxo::{UtxoEntry, UtxoSet},
     validator::{DelegationMap, DelegationReturnEvent, StakeBondEntry, ValidatorSet},
 };
@@ -62,6 +63,7 @@ enum UndoEntry {
     DelegationReturnEvents(Vec<DelegationReturnEvent>),
     ConsensusSnapshots(Vec<ConsensusSnapshot>),
     RewardEconomicSnapshot(Option<RewardEconomicSnapshot>),
+    SlashMembershipRoots(Vec<SlashMembershipRootRecord>),
 }
 
 #[cfg(test)]
@@ -93,12 +95,15 @@ pub(crate) struct StateTxn<'a> {
     delegation_return_events_recorded: bool,
     consensus_snapshots_recorded: bool,
     reward_economic_snapshot_recorded: bool,
+    slash_membership_roots_recorded: bool,
     commitment_touched: bool,
+    commitment_before: Option<StateCommitmentV2>,
 }
 
 impl<'a> StateTxn<'a> {
     /// Begin a new in-place transaction for `state`.
     pub(crate) fn begin(state: &'a mut ChainState, height: u64) -> Self {
+        let commitment_before = state.state_commitment_v2.clone();
         Self {
             state,
             undo: Vec::new(),
@@ -118,7 +123,9 @@ impl<'a> StateTxn<'a> {
             delegation_return_events_recorded: false,
             consensus_snapshots_recorded: false,
             reward_economic_snapshot_recorded: false,
+            slash_membership_roots_recorded: false,
             commitment_touched: false,
+            commitment_before,
         }
     }
 
@@ -224,6 +231,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_delegation_return_events();
         self.snapshot_consensus_snapshots();
         self.snapshot_reward_economic_snapshot();
+        self.snapshot_slash_membership_roots();
         self.record_scalars();
         self.mark_commitment_touched();
     }
@@ -437,6 +445,20 @@ impl<'a> StateTxn<'a> {
         }
     }
 
+    pub(crate) fn snapshot_slash_membership_root_scope(&mut self) {
+        self.snapshot_slash_membership_roots();
+        self.mark_commitment_touched();
+    }
+
+    fn snapshot_slash_membership_roots(&mut self) {
+        if !self.slash_membership_roots_recorded {
+            self.undo.push(UndoEntry::SlashMembershipRoots(
+                self.state.slash_membership_roots.clone(),
+            ));
+            self.slash_membership_roots_recorded = true;
+        }
+    }
+
     fn rollback(&mut self) {
         #[cfg(test)]
         let rollback_start = Instant::now();
@@ -498,14 +520,17 @@ impl<'a> StateTxn<'a> {
                 UndoEntry::RewardEconomicSnapshot(snapshot) => {
                     self.state.reward_economic_snapshot = snapshot;
                 }
+                UndoEntry::SlashMembershipRoots(roots) => {
+                    self.state.slash_membership_roots = roots;
+                }
             }
         }
         if self.commitment_touched {
-            if state_commitment_v2_active(self.height) {
-                self.state.rebuild_state_commitment_v2(self.height);
-            } else {
-                self.state.state_commitment_v2 = None;
-            }
+            // The cache's projection height is not encoded in the cache and
+            // cannot safely be inferred from either the restored tip or the
+            // rejected block height at a gate boundary. Restore the exact
+            // persistent-tree snapshot captured when the transaction began.
+            self.state.state_commitment_v2 = self.commitment_before.clone();
         }
         #[cfg(test)]
         record_rollback_timing(rollback_start.elapsed());
@@ -725,6 +750,31 @@ mod tests {
         set_fail_after_mutation(None);
 
         assert_eq!(state.staked_bonds.get(&bond_id), Some(&original_bond));
+        assert_eq!(state.state_commitment_v2_root(height), root_before);
+    }
+
+    #[test]
+    fn rollback_restores_slash_membership_root_history_and_commitment() {
+        let height = u64::MAX;
+        let original_record = SlashMembershipRootRecord {
+            activation_height: height,
+            membership_root: Bytes32::from([0xA1; 32]),
+        };
+        let mut state = ChainState::new_genesis();
+        state.slash_membership_roots = vec![original_record];
+        state.rebuild_state_commitment_v2(height);
+        let root_before = state.state_commitment_v2_root(height);
+
+        set_fail_after_mutation(Some(1));
+        {
+            let mut txn = StateTxn::begin(&mut state, height);
+            txn.snapshot_slash_membership_root_scope();
+            txn.state_mut().slash_membership_roots[0].membership_root = Bytes32::from([0xA2; 32]);
+            assert!(txn.after_mutation().is_err());
+        }
+        set_fail_after_mutation(None);
+
+        assert_eq!(state.slash_membership_roots, vec![original_record]);
         assert_eq!(state.state_commitment_v2_root(height), root_before);
     }
 

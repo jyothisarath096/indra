@@ -106,6 +106,7 @@ fn make_strict_block(
         timestamp: 1_700_000_000 + state.height + 1,
         polc_round: None,
         slash_evidence: vec![],
+        slash_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),

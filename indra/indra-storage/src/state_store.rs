@@ -602,6 +602,7 @@ mod tests {
             block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
+            slash_membership::{compute_slash_membership_root, SlashMembershipRootRecord},
         },
         Bytes32, ProtocolVersion, VariableBytes,
     };
@@ -718,14 +719,14 @@ mod tests {
         let mut continuous = ChainState::new_genesis();
         continuous.height = u64::MAX;
         continuous.tip_hash = Bytes32::from([0xCF; 32]);
-        continuous.consensus_snapshots = vec![
-            ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)]).unwrap(),
-            ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)]).unwrap(),
-        ];
+        let previous = ConsensusSnapshot::new(901, 900, vec![entry(2_000_000_000)]).unwrap();
+        let current =
+            ConsensusSnapshot::new(u64::MAX, u64::MAX - 1, vec![entry(3_000_000_000)]).unwrap();
+        continuous.consensus_snapshots = vec![previous, current.clone()];
         continuous.reward_economic_snapshot = Some(
             RewardEconomicSnapshot::new(
-                901,
-                900,
+                u64::MAX,
+                u64::MAX - 1,
                 10_000,
                 vec![RewardEconomicValidatorEntry::new(
                     Bytes32::from([0xC0; 32]),
@@ -737,6 +738,10 @@ mod tests {
             )
             .unwrap(),
         );
+        continuous.slash_membership_roots = vec![SlashMembershipRootRecord {
+            activation_height: u64::MAX,
+            membership_root: compute_slash_membership_root(&current).unwrap(),
+        }];
         continuous.rebuild_state_commitment_v2(continuous.height);
         let expected_bytes = serialise_chain_state(&continuous);
         let expected_roots = compute_state_roots(&continuous);
@@ -749,6 +754,10 @@ mod tests {
         assert_eq!(
             restored.reward_economic_snapshot,
             continuous.reward_economic_snapshot
+        );
+        assert_eq!(
+            restored.slash_membership_roots,
+            continuous.slash_membership_roots
         );
         assert_eq!(serialise_chain_state(&restored), expected_bytes);
         assert_eq!(compute_state_roots(&restored), expected_roots);
@@ -1040,6 +1049,7 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],

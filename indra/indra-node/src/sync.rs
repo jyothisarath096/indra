@@ -1041,6 +1041,7 @@ mod tests {
             timestamp: 1_700_000_000u64.saturating_add(state.height.saturating_add(1)),
             polc_round: None,
             slash_evidence: vec![],
+            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
@@ -1149,6 +1150,7 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: evidence,
@@ -1261,6 +1263,7 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
+            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -2721,12 +2724,10 @@ mod tests {
         install_test_snapshot_at_inert_gate(&mut state);
         let post_activation = make_reveal_set_block(&state, &[0x81], &[0x81]);
         // This synthetic u64::MAX height activates every currently-inert gate,
-        // so the highest applicable block protocol version is version 7.
+        // so the highest applicable block protocol version is version 8.
         assert_eq!(
             post_activation.header.protocol_version,
-            ProtocolVersion(
-                indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
-            )
+            ProtocolVersion(indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP)
         );
         assert!(verify_reveal_set_evidence(&post_activation, &state).is_ok());
     }
