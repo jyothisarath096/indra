@@ -138,6 +138,7 @@ pub fn apply_epoch_transition_at_height(
         context,
         timestamp_secs,
         indra_core::types::primitives::hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
+        indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
     )
 }
 
@@ -146,6 +147,7 @@ fn apply_epoch_transition_at_gate(
     context: &EpochTransitionContext,
     timestamp_secs: u64,
     gate_height: u64,
+    consensus_snapshot_gate_height: u64,
 ) -> StateResult<EpochRecord> {
     let height = context.boundary_height;
     let current_epoch = context.opening_epoch;
@@ -164,18 +166,43 @@ fn apply_epoch_transition_at_gate(
     );
     apply_governance_phase_transitions(state, current_epoch, height)?;
     prune_governance_history_if_active(state, height);
+    let closing_snapshot = if context.closing_end_height >= consensus_snapshot_gate_height {
+        Some(
+            state
+                .snapshot_for_consensus_height_at_gate(
+                    context.closing_end_height,
+                    consensus_snapshot_gate_height,
+                )
+                .map_err(|error| {
+                    crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+                })?
+                .clone(),
+        )
+    } else {
+        None
+    };
     let active_before: HashSet<Bytes32> = state
         .validators
         .active_validators()
         .map(|v| v.validator_id)
         .collect();
-    let active_validators_before = active_before.len() as u32;
+    let active_validators_before = match closing_snapshot.as_ref() {
+        Some(snapshot) => u32::try_from(snapshot.entries().len()).map_err(|_| {
+            crate::error::StateError::InvalidConsensusSnapshot(
+                "closing snapshot membership does not fit EpochRecord".to_string(),
+            )
+        })?,
+        None => active_before.len() as u32,
+    };
     // Active-set size and ranking use the same self-stake model as consensus
     // voting weight and reward weight. Delegations affect reward splitting,
     // but do not increase proposer/voter/election weight in this protocol.
     let total_staked = state
         .validators
         .total_selectable_self_stake_at_height(height);
+    let record_total_staked = closing_snapshot
+        .as_ref()
+        .map_or(total_staked, |snapshot| snapshot.total_weight_spark);
     let fee_pool_before = state.fee_reward_pool;
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
@@ -255,8 +282,15 @@ fn apply_epoch_transition_at_gate(
     } else {
         current_epoch
     };
+    let closing_members = closing_snapshot.as_ref().map(|snapshot| {
+        snapshot
+            .entries()
+            .iter()
+            .map(|entry| entry.validator_id)
+            .collect::<Vec<_>>()
+    });
     let (liveness_slashed, liveness_penalty_count) =
-        apply_liveness_penalties(state, liveness_epoch, height);
+        apply_liveness_penalties(state, liveness_epoch, height, closing_members.as_deref());
 
     let mut active_after: Vec<Bytes32> = state
         .validators
@@ -282,7 +316,7 @@ fn apply_epoch_transition_at_gate(
         end_height: record_end_height,
         timestamp_secs,
         active_validators: active_validators_before,
-        total_staked_spark: total_staked,
+        total_staked_spark: record_total_staked,
         block_rewards_distributed: if state.validators.total_active_stake() == 0 {
             0
         } else {
@@ -1485,16 +1519,35 @@ fn regenerated_bond_output(
     Ok(output)
 }
 
-fn apply_liveness_penalties(state: &mut ChainState, current_epoch: u64, height: u64) -> (u64, u32) {
+fn apply_liveness_penalties(
+    state: &mut ChainState,
+    current_epoch: u64,
+    height: u64,
+    snapshot_members: Option<&[Bytes32]>,
+) -> (u64, u32) {
     let mut total_slashed = 0u64;
     let mut penalty_count = 0u32;
     let threshold = state.governance.params.slash_liveness_threshold_epochs;
     let slash_bps = state.governance.params.slash_liveness_bps;
-    let validator_ids: Vec<Bytes32> = state
-        .validators
-        .active_validators()
-        .map(|v| v.validator_id)
-        .collect();
+    let validator_ids: Vec<Bytes32> = match snapshot_members {
+        Some(members) => members
+            .iter()
+            .copied()
+            .filter(|validator_id| {
+                state.validators.get(validator_id).is_some_and(|validator| {
+                    matches!(
+                        validator.status,
+                        ValidatorStatus::Active | ValidatorStatus::Registered
+                    )
+                })
+            })
+            .collect(),
+        None => state
+            .validators
+            .active_validators()
+            .map(|v| v.validator_id)
+            .collect(),
+    };
 
     for validator_id in validator_ids {
         let (missed, stake) = {
@@ -1846,21 +1899,132 @@ mod tests {
     fn post_gate_epoch_record_uses_inclusive_produced_block_range() {
         let context = EpochTransitionContext::new(300, 299).unwrap();
         let mut state = ChainState::new_genesis();
-        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 300).unwrap();
+        let record =
+            apply_epoch_transition_at_gate(&mut state, &context, 0, 300, u64::MAX).unwrap();
         assert_eq!(record.epoch, 0);
         assert_eq!(record.start_height, 1);
         assert_eq!(record.end_height, 300);
     }
 
     #[test]
+    fn post_snapshot_gate_epoch_record_uses_frozen_closing_authority() {
+        let context = EpochTransitionContext::new(600, 599).unwrap();
+        let mut state = ChainState::new_genesis();
+        let first = make_snapshot_validator(0xA1, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 2);
+        let first_id = first.validator_id;
+        let second = make_snapshot_validator(0xA2, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 3);
+        state.validators.upsert(first).unwrap();
+        state.validators.upsert(second).unwrap();
+        state.consensus_snapshots = vec![state.build_consensus_snapshot(301, 300).unwrap()];
+
+        let first_live = state.validators.get_mut(&first_id).unwrap();
+        first_live.status = ValidatorStatus::Registered;
+        first_live.stake_spark = MINIMUM_ACTIVE_SELF_STAKE_SPARK * 9;
+        state
+            .validators
+            .upsert(make_snapshot_validator(
+                0xA3,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK * 7,
+            ))
+            .unwrap();
+
+        let replay_initial = state.clone();
+        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 600, 301).unwrap();
+        assert_eq!(record.active_validators, 2);
+        assert_eq!(
+            record.total_staked_spark,
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK * 5
+        );
+        let mut replay = replay_initial;
+        let replay_record =
+            apply_epoch_transition_at_gate(&mut replay, &context, 0, 600, 301).unwrap();
+        assert_eq!(replay_record, record);
+        assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
+        assert_eq!(compute_state_root(&replay), compute_state_root(&state));
+    }
+
+    #[test]
+    fn snapshot_liveness_uses_membership_but_live_stake_and_exempts_non_live_targets() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.slash_liveness_threshold_epochs = 1;
+        state.governance.params.slash_liveness_bps = 1_000;
+
+        let mut registered = make_validator(0xB1, 20_000);
+        registered.status = ValidatorStatus::Registered;
+        let registered_id = registered.validator_id;
+        state.validators.upsert(registered).unwrap();
+
+        let mut slashed = make_validator(0xB2, 30_000);
+        slashed.status = ValidatorStatus::Slashed;
+        let slashed_id = slashed.validator_id;
+        state.validators.upsert(slashed).unwrap();
+
+        let tombstoned_id = Bytes32::from([0xB3; 32]);
+        state.evicted_validator_tombstones.insert(
+            tombstoned_id,
+            crate::validator::EvictedValidatorTombstoneV1 {
+                validator_id: tombstoned_id,
+                eviction_height: 300,
+                eviction_epoch: 1,
+                last_classical_vote_pk: [1; 32],
+                last_pq_vote_pk: [2; indra_crypto::PQ_PK_BYTES],
+                last_vrf_pk: [3; 32],
+                cold_custody: None,
+                retained_bonds: Vec::new(),
+            },
+        );
+
+        let promoted = make_validator(0xB4, 40_000);
+        let promoted_id = promoted.validator_id;
+        state.validators.upsert(promoted).unwrap();
+
+        let replay_initial = state.clone();
+        let supply_before = state.total_supply;
+        let (slashed_total, count) = apply_liveness_penalties(
+            &mut state,
+            1,
+            600,
+            Some(&[registered_id, slashed_id, tombstoned_id]),
+        );
+        assert_eq!(count, 1);
+        assert_eq!(slashed_total, 2_000);
+        assert_eq!(state.total_supply, supply_before - 2_000);
+        assert_eq!(
+            state.validators.get(&registered_id).unwrap().stake_spark,
+            18_000
+        );
+        assert_eq!(
+            state.validators.get(&slashed_id).unwrap().stake_spark,
+            30_000
+        );
+        assert_eq!(
+            state.validators.get(&promoted_id).unwrap().stake_spark,
+            40_000
+        );
+        let mut replay = replay_initial;
+        let replay_result = apply_liveness_penalties(
+            &mut replay,
+            1,
+            600,
+            Some(&[registered_id, slashed_id, tombstoned_id]),
+        );
+        assert_eq!(replay_result, (slashed_total, count));
+        assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
+        assert_eq!(compute_state_root(&replay), compute_state_root(&state));
+    }
+
+    #[test]
     fn pre_gate_epoch_record_remains_legacy_byte_semantics() {
         let context = EpochTransitionContext::new(300, 299).unwrap();
         let mut state = ChainState::new_genesis();
-        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 301).unwrap();
+        let record =
+            apply_epoch_transition_at_gate(&mut state, &context, 0, 301, u64::MAX).unwrap();
         assert_eq!(record.epoch, 0);
         assert_eq!(record.start_height, 0);
         assert_eq!(record.end_height, 299);
         assert_eq!(record.block_reward_spark, block_reward_at_height(300));
+        assert_eq!(record.active_validators, 0);
+        assert_eq!(record.total_staked_spark, 0);
     }
 
     #[test]
@@ -1875,7 +2039,8 @@ mod tests {
         let original_stake = validator.stake_spark;
         state.validators.upsert(validator).unwrap();
 
-        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 300).unwrap();
+        let record =
+            apply_epoch_transition_at_gate(&mut state, &context, 0, 300, u64::MAX).unwrap();
         assert_eq!(record.liveness_penalty_count, 0);
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
@@ -1888,11 +2053,11 @@ mod tests {
         fn replay(mut state: ChainState) -> ChainState {
             let legacy = EpochTransitionContext::new(300, 299).unwrap();
             state.height = 300;
-            apply_epoch_transition_at_gate(&mut state, &legacy, 0, 600).unwrap();
+            apply_epoch_transition_at_gate(&mut state, &legacy, 0, 600, u64::MAX).unwrap();
 
             let upgraded = EpochTransitionContext::new(600, 599).unwrap();
             state.height = 600;
-            apply_epoch_transition_at_gate(&mut state, &upgraded, 0, 600).unwrap();
+            apply_epoch_transition_at_gate(&mut state, &upgraded, 0, 600, u64::MAX).unwrap();
             state
         }
 
@@ -1919,7 +2084,8 @@ mod tests {
         validator.cold_key_status = crate::validator::ColdKeyStatus::Active;
         validator.last_active_epoch = context.closing_epoch;
         state.validators.upsert(validator).unwrap();
-        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, boundary).unwrap();
+        let record =
+            apply_epoch_transition_at_gate(&mut state, &context, 0, boundary, u64::MAX).unwrap();
         assert_eq!(record.block_reward_spark, ERA_1_BLOCK_REWARD_SPARK);
         assert_eq!(record.block_rewards_distributed, expected);
     }

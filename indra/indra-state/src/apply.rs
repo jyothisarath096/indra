@@ -552,13 +552,60 @@ fn create_slash_reporter_reward_utxo(
 
 const VRF_FALLBACK_OUTPUT_BYTES: Bytes32 = Bytes32([0xFF; 32]);
 
-fn slash_reporter_pubkey_for_block(state: &ChainState, block: &BlockV1) -> Option<HybridPubKey> {
-    let proposer_id = slash_reporter_validator_id_for_block(state, block)?;
-    let validator = state.validators.get(&proposer_id)?;
-    Some(HybridPubKey {
-        classical_pk: Bytes32::from(validator.hybrid_classical_pk?),
-        pq_pk: indra_core::VariableBytes::from_slice(validator.hybrid_pq_pk.as_deref()?).ok()?,
-    })
+fn slash_reporter_pubkey_for_block(
+    state: &ChainState,
+    block: &BlockV1,
+) -> StateResult<Option<HybridPubKey>> {
+    slash_reporter_pubkey_for_block_at_gate(
+        state,
+        block,
+        indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
+    )
+}
+
+fn slash_reporter_pubkey_for_block_at_gate(
+    state: &ChainState,
+    block: &BlockV1,
+    consensus_snapshot_gate_height: u64,
+) -> StateResult<Option<HybridPubKey>> {
+    if block.header.height >= consensus_snapshot_gate_height {
+        let snapshot = state
+            .snapshot_for_consensus_height_at_gate(
+                block.header.height,
+                consensus_snapshot_gate_height,
+            )
+            .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
+        let proposer_id = if !vrf_commit_reveal_election_active(block.header.height) {
+            proposer_id_from_vrf_proof_snapshot(snapshot, block)
+        } else {
+            slash_reporter_validator_id_from_candidate_ids(
+                snapshot.entries().iter().map(|entry| entry.validator_id),
+                block,
+            )
+        };
+        return Ok(proposer_id.and_then(|proposer_id| {
+            snapshot
+                .entries()
+                .iter()
+                .find(|entry| entry.validator_id == proposer_id)
+                .and_then(|entry| {
+                    Some(HybridPubKey {
+                        classical_pk: Bytes32::from(entry.classical_vote_pk),
+                        pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
+                    })
+                })
+        }));
+    }
+
+    let proposer_id = slash_reporter_validator_id_for_block(state, block);
+    Ok(proposer_id.and_then(|proposer_id| {
+        let validator = state.validators.get(&proposer_id)?;
+        Some(HybridPubKey {
+            classical_pk: Bytes32::from(validator.hybrid_classical_pk?),
+            pq_pk: indra_core::VariableBytes::from_slice(validator.hybrid_pq_pk.as_deref()?)
+                .ok()?,
+        })
+    }))
 }
 
 fn slash_reporter_validator_id_for_block(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
@@ -642,6 +689,31 @@ fn proposer_id_from_vrf_proof(state: &ChainState, block: &BlockV1) -> Option<Byt
                 .is_ok()
                 .then_some(validator.validator_id)
         });
+    let proposer_id = matches.next()?;
+    matches.next().is_none().then_some(proposer_id)
+}
+
+fn proposer_id_from_vrf_proof_snapshot(
+    snapshot: &indra_core::types::consensus_snapshot::ConsensusSnapshot,
+    block: &BlockV1,
+) -> Option<Bytes32> {
+    let proof_bytes = block.header.proposer_vrf_proof.as_slice();
+    if proof_bytes.is_empty() || block.header.proposer_vrf_output == Bytes32::ZERO {
+        return None;
+    }
+    let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
+    let vrf_input = compute_vrf_input_for_block(
+        &epoch_seed,
+        block.header.height,
+        block.header.proposer_round,
+    );
+    let proof = VrfProof(proof_bytes.to_vec());
+    let output = VrfOutput(block.header.proposer_vrf_output.0);
+    let mut matches = snapshot.entries().iter().filter_map(|entry| {
+        vrf_verify(&entry.vrf_pk, &vrf_input, &output, &proof)
+            .is_ok()
+            .then_some(entry.validator_id)
+    });
     let proposer_id = matches.next()?;
     matches.next().is_none().then_some(proposer_id)
 }
@@ -919,7 +991,7 @@ fn apply_block_inner(
     if !block.slashing_evidence.is_empty() {
         let mut shadow = state.clone();
         let chain_id_clone = state.chain_id.clone();
-        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block);
+        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
         for evidence in &block.slashing_evidence {
             apply_slash_at_height(
                 &mut shadow,
@@ -933,7 +1005,7 @@ fn apply_block_inner(
     if !block.slashing_evidence_v2.is_empty() {
         let mut shadow = state.clone();
         let chain_id_clone = state.chain_id.clone();
-        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block);
+        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
         for envelope in &block.slashing_evidence_v2 {
             match envelope {
                 SlashEvidenceEnvelopeV2::Legacy(evidence) => {
@@ -1006,7 +1078,7 @@ fn apply_block_inner(
     }
 
     let chain_id_for_slash = txn.state().chain_id.clone();
-    let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block);
+    let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block)?;
     for evidence in &block.slashing_evidence {
         txn.snapshot_slashing_scope();
         let accounting = apply_slash_at_height_with_accounting(
@@ -7119,6 +7191,109 @@ mod tests {
             slash_reporter_validator_id_from_candidate_ids([proposer_id, proposer_id], &block),
             None,
             "ambiguous candidate matches must preserve the prior uniqueness-required behavior"
+        );
+    }
+
+    #[test]
+    fn snapshot_reporter_authority_survives_live_registry_removal_and_pays_reward() {
+        let (mut state, accused_id, accused_keypair) =
+            slash_validator_state([0xD2; 32], 10_000_000);
+        let (reporter_public, _) = make_test_keypair([0xD3; 32]);
+        let reporter_id = Bytes32::from(indra_crypto::sha256(&reporter_public.classical_pk.0));
+        let mut reporter = active_validator(reporter_id);
+        reporter.hybrid_classical_pk = Some(reporter_public.classical_pk.0);
+        reporter.hybrid_pq_pk = Some(reporter_public.pq_pk.as_slice().to_vec());
+        reporter.vrf_pk = Some(indra_crypto::VrfKeypair::from_seed(&[0xD4; 32]).public_key());
+        state.validators.upsert(reporter).unwrap();
+        state.consensus_snapshots = vec![state.build_consensus_snapshot(1, 0).unwrap()];
+        state.validators.remove(&reporter_id);
+
+        let mut block = make_block(&state, vec![]);
+        block.header.proposer_vrf_output = Bytes32::from([0x51; 32]);
+        block.header.election_result_hash = Some(
+            VrfElectionResult {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                elected_validator_id: reporter_id,
+                elected_vrf_output: block.header.proposer_vrf_output,
+                fallback_used: false,
+                reveal_set_commitment: Bytes32::ZERO,
+            }
+            .hash(),
+        );
+
+        let resolved = slash_reporter_pubkey_for_block_at_gate(&state, &block, 1)
+            .unwrap()
+            .expect("snapshot-authorized reporter");
+        assert_eq!(resolved, reporter_public);
+
+        let evidence = slash_evidence(&accused_keypair, accused_id, VoteStep::Precommit);
+        let chain_id = state.chain_id.clone();
+        let replay_initial = state.clone();
+        let accounting = apply_slash_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            block.header.height,
+            Some(&resolved),
+        )
+        .unwrap();
+        assert!(accounting.reporter_reward > 0);
+        assert!(state.utxos.all_entries().any(|entry| {
+            entry.output.value_spark == accounting.reporter_reward
+                && entry.output.owner_pubkey == reporter_public
+        }));
+        let mut replay = replay_initial;
+        let replay_reporter = slash_reporter_pubkey_for_block_at_gate(&replay, &block, 1)
+            .unwrap()
+            .expect("snapshot-authorized reporter during replay");
+        let replay_accounting = apply_slash_at_height_with_accounting(
+            &mut replay,
+            &evidence,
+            &chain_id,
+            block.header.height,
+            Some(&replay_reporter),
+        )
+        .unwrap();
+        assert_eq!(replay_accounting, accounting);
+        assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
+        assert_eq!(
+            crate::compute_state_root(&replay),
+            crate::compute_state_root(&state)
+        );
+    }
+
+    #[test]
+    fn snapshot_reporter_lookup_fails_closed_and_legacy_path_is_unchanged() {
+        let mut state = ChainState::new_genesis();
+        let (proposer_public, _) = make_test_keypair([0xD5; 32]);
+        let proposer_id = Bytes32::from(indra_crypto::sha256(&proposer_public.classical_pk.0));
+        let mut proposer = active_validator(proposer_id);
+        proposer.hybrid_classical_pk = Some(proposer_public.classical_pk.0);
+        proposer.hybrid_pq_pk = Some(proposer_public.pq_pk.as_slice().to_vec());
+        state.validators.upsert(proposer).unwrap();
+        let mut block = make_block(&state, vec![]);
+        block.header.proposer_vrf_output = Bytes32::from([0x52; 32]);
+        block.header.election_result_hash = Some(
+            VrfElectionResult {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                elected_validator_id: proposer_id,
+                elected_vrf_output: block.header.proposer_vrf_output,
+                fallback_used: false,
+                reveal_set_commitment: Bytes32::ZERO,
+            }
+            .hash(),
+        );
+
+        assert!(matches!(
+            slash_reporter_pubkey_for_block_at_gate(&state, &block, 1),
+            Err(StateError::InvalidConsensusSnapshot(_))
+        ));
+        assert_eq!(
+            slash_reporter_pubkey_for_block_at_gate(&state, &block, 2).unwrap(),
+            Some(proposer_public),
+            "legacy live reporter identity and payout-key behavior must remain unchanged"
         );
     }
 

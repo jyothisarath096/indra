@@ -616,7 +616,7 @@ impl ChainState {
         self.snapshot_for_consensus_height_at_gate(height, CONSENSUS_SNAPSHOT_HEIGHT)
     }
 
-    fn snapshot_for_consensus_height_at_gate(
+    pub(crate) fn snapshot_for_consensus_height_at_gate(
         &self,
         height: u64,
         gate_height: u64,
