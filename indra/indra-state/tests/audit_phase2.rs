@@ -13,10 +13,14 @@ use indra_core::types::{
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
         MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES,
+        TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
-use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::{
+    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
+    PaymentBlindingNoteV1, PqKeypair,
+};
 use indra_state::{apply_block, ChainState, StateError};
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -39,6 +43,17 @@ fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> Hybri
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+    }
+}
+
+fn note(owner: &HybridPubKey) -> PaymentBlindingNoteV1 {
+    PaymentBlindingNoteV1 {
+        version: 1,
+        owner_id: sha256(&owner.classical_pk.0),
+        payment_pubkey_hash: [0; 32],
+        sender_x25519_ephemeral_pk: [0; 32],
+        ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+        note_nonce: [0; 32],
     }
 }
 
@@ -80,11 +95,16 @@ fn tx_spending(
     let fee_commitment = commit(fee, &fee_blinding);
 
     let mut tx = TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![InputV1 { utxo_id, nullifier }],
-        outputs: vec![output(value_out, output_blinding, owner_pubkey, proof_seed)],
-        payment_notes: Vec::new(),
+        outputs: vec![output(
+            value_out,
+            output_blinding,
+            owner_pubkey.clone(),
+            proof_seed,
+        )],
+        payment_notes: vec![note(&owner_pubkey)],
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {
@@ -121,7 +141,7 @@ fn tx_spending_same_utxo_twice(
     let fee_commitment = commit(fee, &fee_blinding);
 
     let mut tx = TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![
             InputV1 {
@@ -133,8 +153,13 @@ fn tx_spending_same_utxo_twice(
                 nullifier: nullifier_b,
             },
         ],
-        outputs: vec![output(value_out, output_blinding, owner_pubkey, [0x71; 32])],
-        payment_notes: Vec::new(),
+        outputs: vec![output(
+            value_out,
+            output_blinding,
+            owner_pubkey.clone(),
+            [0x71; 32],
+        )],
+        payment_notes: vec![note(&owner_pubkey)],
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {
@@ -202,8 +227,9 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
     let utxo_a = state.utxos.insert(huge_output_a, 0, 0, 0).unwrap();
     let utxo_b = state.utxos.insert(huge_output_b, 0, 0, 1).unwrap();
 
+    let overflow_owner = keypair([0x46; 32]).0;
     let tx = TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![
             InputV1 {
@@ -220,11 +246,11 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
             commitment: CommitmentV1 {
                 compressed_point: Bytes32::ZERO,
             },
-            owner_pubkey: keypair([0x46; 32]).0,
+            owner_pubkey: overflow_owner.clone(),
             range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
             lock_height: 0,
         }],
-        payment_notes: Vec::new(),
+        payment_notes: vec![note(&overflow_owner)],
         fee_amount: INITIAL_BASE_FEE_SPARK_PER_KB,
         fee_blinding: Bytes32::ZERO,
         fee_commitment: CommitmentV1 {

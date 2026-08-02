@@ -8,13 +8,13 @@ use indra_core::types::{
     crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
         delegator_bond_accounting_active, delegator_identity_registry_active,
-        live_bond_count_cap_active, payment_blinding_active, registered_validator_cap_active,
-        slash_membership_proof_active, staking_commitment_proof_required,
-        validator_cold_key_enforcement_active, validator_cold_key_enrollment_active,
-        validator_network_address_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
-        DUST_LIMIT_SPARK, MAX_LIVE_BONDS_PER_VALIDATOR, MAX_VALIDATORS,
-        MINIMUM_ACTIVE_SELF_STAKE_SPARK, MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        live_bond_count_cap_active, registered_validator_cap_active, slash_membership_proof_active,
+        staking_commitment_proof_required, validator_cold_key_enforcement_active,
+        validator_cold_key_enrollment_active, validator_network_address_active, Bytes32,
+        VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
+        MAX_LIVE_BONDS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        MINIMUM_VALIDATOR_BOND_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
+        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
     },
     staking::{validate_network_addr_string, StakingBondProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -67,14 +67,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
     current_height: u64,
     identity_registry_active: bool,
 ) -> StateResult<()> {
-    if matches!(op.body, StakingOpBody::RegisterPaymentKey { .. })
-        && !payment_blinding_active(current_height)
-    {
-        return Err(StateError::InvalidStakingOp(
-            "RegisterPaymentKey is not active before PAYMENT_BLINDING_HEIGHT".into(),
-        ));
-    }
-
     if matches!(op.body, StakingOpBody::RotateValidatorColdKey { .. }) {
         return verify_and_apply_rotate_validator_cold_key(state, op, chain_id, current_height);
     }
@@ -87,7 +79,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             | StakingOpBody::SelfStake { .. }
             | StakingOpBody::SelfUnstake { .. }
             | StakingOpBody::SetAutoDelegate { .. }
-            | StakingOpBody::RegisterPaymentKey { .. }
     );
     let active_cold_validator = cold_designated
         && state
@@ -363,20 +354,11 @@ pub(crate) fn apply_staking_op_with_identity_activation(
                 validator_pubkey.pq_pk.as_slice(),
             )?;
         }
-        StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } if !active_cold_validator => {
-            verify_staking_sig(
-                &signing_bytes,
-                &op.signature,
-                &owner_pubkey.classical_pk.0,
-                owner_pubkey.pq_pk.as_slice(),
-            )?;
-        }
         StakingOpBody::ClaimRewards { .. }
         | StakingOpBody::SetCommission { .. }
         | StakingOpBody::SelfStake { .. }
         | StakingOpBody::SelfUnstake { .. }
-        | StakingOpBody::SetAutoDelegate { .. }
-        | StakingOpBody::RegisterPaymentKey { .. } => {}
+        | StakingOpBody::SetAutoDelegate { .. } => {}
         StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     }
 
@@ -486,11 +468,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             current_height,
             identity_registry_active,
         ),
-        StakingOpBody::RegisterPaymentKey {
-            owner_pubkey,
-            payment_pubkey,
-            ..
-        } => apply_register_payment_key(state, owner_pubkey, payment_pubkey),
         StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     };
 
@@ -513,21 +490,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
             commitment.put_staking_nonce(&signer_id, op.nonce);
         }
-    }
-    Ok(())
-}
-
-fn apply_register_payment_key(
-    state: &mut ChainState,
-    owner_pubkey: &HybridPubKey,
-    payment_pubkey: &indra_crypto::PaymentPubKeyV1,
-) -> StateResult<()> {
-    let owner_id = pubkey_to_id(owner_pubkey);
-    state
-        .payment_identities
-        .insert(owner_id, payment_pubkey.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_payment_identity(&owner_id, payment_pubkey);
     }
     Ok(())
 }
@@ -2486,8 +2448,7 @@ mod tests {
         crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{
             hard_forks::{
-                PAYMENT_BLINDING_HEIGHT, VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,
-                VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
+                VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT, VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
             },
             VariableBytes,
         },
@@ -2496,7 +2457,7 @@ mod tests {
     use indra_crypto::{
         commit,
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
-        prove_range, PaymentKeypairV1, PaymentPubKeyV1, PAYMENT_VERSION_V1,
+        prove_range,
     };
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -2535,15 +2496,6 @@ mod tests {
             classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
         }
-    }
-
-    fn payment_pubkey(seed: u8) -> PaymentPubKeyV1 {
-        PaymentKeypairV1 {
-            version: PAYMENT_VERSION_V1,
-            x25519_sk: [seed; 32],
-            ml_kem_1024_seed: [seed.wrapping_add(1); 64],
-        }
-        .public_key()
     }
 
     fn test_output(value_spark: u64, owner_pubkey: HybridPubKey, seed: u8) -> OutputV1 {
@@ -2721,9 +2673,6 @@ mod tests {
                 cold_authorization, ..
             }
             | StakingOpBody::SetAutoDelegate {
-                cold_authorization, ..
-            }
-            | StakingOpBody::RegisterPaymentKey {
                 cold_authorization, ..
             } => cold_authorization,
             _ => panic!("not a cold-designated staking body"),
@@ -4793,203 +4742,6 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::StakingOpSignatureInvalid { .. })
         ));
-    }
-
-    #[test]
-    fn register_payment_key_rejects_before_activation() {
-        let mut state = ChainState::new_genesis();
-        let owner_keypair = keypair(0x41);
-        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
-        let op = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey: payment_pubkey(0x42),
-                cold_authorization: None,
-            },
-            1,
-            &owner_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        let err =
-            apply_staking_op(&mut state, &op, &chain_id, PAYMENT_BLINDING_HEIGHT - 1).unwrap_err();
-        assert!(
-            matches!(err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
-        );
-        assert!(state.payment_identities.is_empty());
-        assert!(state.staking_nonces.is_empty());
-    }
-
-    #[test]
-    fn register_payment_key_succeeds_and_updates_commitment_after_activation() {
-        let mut state = ChainState::new_genesis();
-        let height = PAYMENT_BLINDING_HEIGHT;
-        state.rebuild_state_commitment_v2(height);
-        let before_root = state.state_commitment_v2_root(height);
-        let owner_keypair = keypair(0x43);
-        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
-        let owner_id = pubkey_to_id(&owner_pubkey);
-        let payment_pubkey = payment_pubkey(0x44);
-        let op = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey: payment_pubkey.clone(),
-                cold_authorization: None,
-            },
-            1,
-            &owner_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        apply_staking_op(&mut state, &op, &chain_id, height).unwrap();
-
-        assert_eq!(
-            state.payment_identities.get(&owner_id),
-            Some(&payment_pubkey)
-        );
-        assert_eq!(state.staking_nonces.get(&owner_id), Some(&1));
-        let incremental_root = state.state_commitment_v2_root(height);
-        assert_ne!(incremental_root, before_root);
-        let rebuilt_root =
-            crate::state_commitment::StateCommitmentV2::from_state(&state, height).root();
-        assert_eq!(incremental_root, rebuilt_root);
-    }
-
-    #[test]
-    fn register_payment_key_rejects_wrong_signer() {
-        let mut state = ChainState::new_genesis();
-        let owner_keypair = keypair(0x45);
-        let wrong_keypair = keypair(0x46);
-        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
-        let op = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey: payment_pubkey(0x47),
-                cold_authorization: None,
-            },
-            1,
-            &wrong_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        assert!(matches!(
-            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
-            Err(StateError::StakingOpSignatureInvalid { .. })
-        ));
-    }
-
-    #[test]
-    fn register_payment_key_rejects_replayed_nonce() {
-        let mut state = ChainState::new_genesis();
-        let owner_keypair = keypair(0x48);
-        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
-        let payment_pubkey = payment_pubkey(0x49);
-        let op = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey,
-                cold_authorization: None,
-            },
-            1,
-            &owner_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
-            Err(StateError::StakingNonceInvalid {
-                expected: 2,
-                got: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn register_payment_key_allows_owner_rotation_by_replacement() {
-        let mut state = ChainState::new_genesis();
-        state.rebuild_state_commitment_v2(u64::MAX);
-        let owner_keypair = keypair(0x4A);
-        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
-        let owner_id = pubkey_to_id(&owner_pubkey);
-        let first_pubkey = payment_pubkey(0x4B);
-        let second_pubkey = payment_pubkey(0x4C);
-        let first = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey: owner_pubkey.clone(),
-                payment_pubkey: first_pubkey,
-                cold_authorization: None,
-            },
-            1,
-            &owner_keypair,
-            &state.chain_id,
-        );
-        let second = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey: second_pubkey.clone(),
-                cold_authorization: None,
-            },
-            2,
-            &owner_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        apply_staking_op(&mut state, &first, &chain_id, u64::MAX).unwrap();
-        let first_root = state.state_commitment_v2_root(u64::MAX);
-        apply_staking_op(&mut state, &second, &chain_id, u64::MAX).unwrap();
-
-        assert_eq!(
-            state.payment_identities.get(&owner_id),
-            Some(&second_pubkey)
-        );
-        assert_eq!(state.payment_identities.len(), 1);
-        assert_eq!(state.staking_nonces.get(&owner_id), Some(&2));
-        let second_root = state.state_commitment_v2_root(u64::MAX);
-        assert_ne!(first_root, second_root);
-        assert_eq!(
-            second_root,
-            crate::state_commitment::StateCommitmentV2::from_state(&state, u64::MAX).root()
-        );
-    }
-
-    #[test]
-    fn state_txn_rolls_back_register_payment_key_scope() {
-        let mut state = ChainState::new_genesis();
-        state.rebuild_state_commitment_v2(u64::MAX);
-        let original = state.clone();
-        let owner_keypair = keypair(0x4D);
-        let owner_pubkey = pubkey_from_keypair(&owner_keypair);
-        let op = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey: payment_pubkey(0x4E),
-                cold_authorization: None,
-            },
-            1,
-            &owner_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        {
-            let mut txn = crate::txn::StateTxn::begin(&mut state, u64::MAX);
-            txn.snapshot_staking_scope();
-            txn.snapshot_payment_identity_scope();
-            apply_staking_op(txn.state_mut(), &op, &chain_id, u64::MAX).unwrap();
-        }
-
-        assert_eq!(state.payment_identities, original.payment_identities);
-        assert_eq!(state.staking_nonces, original.staking_nonces);
-        assert_eq!(
-            state.state_commitment_v2_root(u64::MAX),
-            original.state_commitment_v2_root(u64::MAX)
-        );
     }
 
     #[test]
@@ -7885,20 +7637,11 @@ mod tests {
                 &state.chain_id,
             ),
             cold_signed_op(
-                StakingOpBody::RegisterPaymentKey {
-                    owner_pubkey: hot_pubkey.clone(),
-                    payment_pubkey: payment_pubkey(seed),
-                    cold_authorization: cold_auth(4),
-                },
-                cold,
-                &state.chain_id,
-            ),
-            cold_signed_op(
                 StakingOpBody::SelfStake {
                     bond_utxo_id: self_stake_utxo,
                     validator_pubkey: hot_pubkey.clone(),
                     bond_proof: Some(bond_proof(DUST_LIMIT_SPARK, seed)),
-                    cold_authorization: cold_auth(5),
+                    cold_authorization: cold_auth(4),
                 },
                 cold,
                 &state.chain_id,
@@ -7907,7 +7650,7 @@ mod tests {
                 StakingOpBody::SelfUnstake {
                     bond_utxo_id: self_stake_utxo,
                     validator_pubkey: hot_pubkey,
-                    cold_authorization: cold_auth(6),
+                    cold_authorization: cold_auth(5),
                 },
                 cold,
                 &state.chain_id,
@@ -7923,18 +7666,18 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 6);
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 5);
         assert_eq!(state.staking_nonces.get(&validator_id), Some(&1));
     }
 
     #[test]
-    fn enrolled_validator_all_six_cold_only_operations_succeed() {
+    fn enrolled_validator_all_cold_only_operations_succeed() {
         let (mut state, validator_id, hot, cold) = enrolled_authority_fixture(0x91, 0x92, 0x93);
         six_cold_operations(&mut state, validator_id, &hot, &cold, 0x94);
     }
 
     #[test]
-    fn enrolled_validator_all_six_reject_hot_signatures_without_fallback() {
+    fn enrolled_validator_all_cold_operations_reject_hot_signatures_without_fallback() {
         let (state, validator_id, hot, _) = enrolled_authority_fixture(0x95, 0x96, 0x97);
         let hot_pubkey = pubkey_from_keypair(&hot);
         let bodies = vec![
@@ -7951,11 +7694,6 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id,
                 target_validator_id: Bytes32::ZERO,
-                cold_authorization: None,
-            },
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey: hot_pubkey.clone(),
-                payment_pubkey: payment_pubkey(0x98),
                 cold_authorization: None,
             },
             StakingOpBody::SelfStake {
@@ -8010,7 +7748,7 @@ mod tests {
     }
 
     #[test]
-    fn unenrolled_validator_all_six_legacy_hot_operations_still_succeed() {
+    fn unenrolled_validator_hot_operations_still_succeed() {
         let mut state = ChainState::new_genesis();
         let (validator_id, hot) = make_active_validator(&mut state, 0x9B);
         let hot_pubkey = pubkey_from_keypair(&hot);
@@ -8037,11 +7775,6 @@ mod tests {
                 target_validator_id: Bytes32::ZERO,
                 cold_authorization: None,
             },
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey: hot_pubkey.clone(),
-                payment_pubkey: payment_pubkey(0x9D),
-                cold_authorization: None,
-            },
             StakingOpBody::SelfStake {
                 bond_utxo_id: self_stake_utxo,
                 validator_pubkey: hot_pubkey.clone(),
@@ -8065,65 +7798,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(state.staking_nonces.get(&validator_id), Some(&6));
-        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
-    }
-
-    #[test]
-    fn delegator_claim_and_payment_registration_ignore_validator_cold_status() {
-        let (mut state, validator_id, _, _) = enrolled_authority_fixture(0xA1, 0xA2, 0xA3);
-        let delegator = keypair(0xA4);
-        let delegator_pubkey = pubkey_from_keypair(&delegator);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        let claim = signed_op(
-            StakingOpBody::ClaimRewards {
-                validator_id,
-                delegator_pubkey: delegator_pubkey.clone(),
-                cold_authorization: None,
-            },
-            1,
-            &delegator,
-            &state.chain_id,
-        );
-        let payment = signed_op(
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey: delegator_pubkey,
-                payment_pubkey: payment_pubkey(0xA5),
-                cold_authorization: None,
-            },
-            2,
-            &delegator,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(
-            &mut state,
-            &claim,
-            &chain_id,
-            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
-        )
-        .unwrap();
-        apply_staking_op(
-            &mut state,
-            &payment,
-            &chain_id,
-            VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
-        )
-        .unwrap();
-        assert_eq!(state.staking_nonces.get(&delegator_id), Some(&2));
+        assert_eq!(state.staking_nonces.get(&validator_id), Some(&5));
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
     }
 
@@ -8717,16 +8392,6 @@ mod tests {
                 crate::compute_state_root(&state),
             ));
 
-            state.height = PAYMENT_BLINDING_HEIGHT;
-            state
-                .payment_identities
-                .insert(delegator_id, payment_pubkey(0xB3));
-            transcript.push((
-                state.height,
-                state.encode_to_vec(),
-                crate::compute_state_root(&state),
-            ));
-
             state.height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
             crate::epoch::release_unbonded_bonds_at_height(
                 &mut state,
@@ -8806,13 +8471,12 @@ mod tests {
         let first = replay();
         let second = replay();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 7);
+        assert_eq!(first.len(), 6);
         assert_eq!(
             first.iter().map(|entry| entry.0).collect::<Vec<_>>(),
             vec![
                 indra_core::types::primitives::hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
                 indra_core::types::primitives::hard_forks::COMPACT_BOND_PUBKEY_OMISSION_HEIGHT,
-                PAYMENT_BLINDING_HEIGHT,
                 indra_core::types::primitives::hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
                 VALIDATOR_COLD_KEY_ENROLLMENT_HEIGHT,
                 VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT,

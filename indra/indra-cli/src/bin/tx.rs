@@ -131,13 +131,14 @@ fn cmd_send(args: &[String]) {
             std::process::exit(1);
         });
 
-    let recipient_pubkey = resolve_recipient_pubkey(&rpc, &recipient_address);
-    let recipient_payment_pubkey = lookup_payment_identity(&rpc, &recipient_address);
-    let recipient_hex = format!(
-        "{}:{}",
-        hex::encode(recipient_pubkey.classical_pk.0),
-        hex::encode(recipient_pubkey.pq_pk.as_slice())
-    );
+    let sender_payment_pubkey = keys
+        .payment_keypair
+        .as_ref()
+        .map(indra_crypto::PaymentKeypairV1::public_key)
+        .unwrap_or_else(|| {
+            eprintln!("Error: canonical keystore is missing payment key material");
+            std::process::exit(1);
+        });
 
     let sender_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(classical_pk),
@@ -149,14 +150,14 @@ fn cmd_send(args: &[String]) {
 
     let built = build_transaction(&TxParams {
         chain_id: &chain_id,
-        recipient_pubkey_hex: &recipient_hex,
+        recipient_address: &recipient_address,
         amount_spark,
         fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
         wallet: &wallet,
         hybrid_seed,
         pq_sk_bytes,
         sender_pubkey,
-        recipient_payment_pubkey,
+        sender_payment_pubkey,
     })
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
@@ -222,26 +223,6 @@ fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
             std::process::exit(1);
         }),
     }
-}
-
-fn lookup_payment_identity(
-    rpc: &str,
-    recipient_address_hex: &str,
-) -> Option<indra_crypto::PaymentPubKeyV1> {
-    let raw = rpc_call(
-        rpc,
-        "indra_getPaymentIdentity",
-        &[recipient_address_hex.to_string()],
-    );
-    payment_identity_from_rpc_json(&raw)
-}
-
-fn payment_identity_from_rpc_json(json: &str) -> Option<indra_crypto::PaymentPubKeyV1> {
-    let version = extract_number(json, "version")?;
-    let x25519_pk = hex::encode(extract_hex_string(json, "x25519_pk")?);
-    let ml_kem_1024_ek = hex::encode(extract_hex_string(json, "ml_kem_1024_ek")?);
-    let bytes = hex::decode(format!("{version:02x}{x25519_pk}{ml_kem_1024_ek}")).ok()?;
-    indra_crypto::PaymentPubKeyV1::decode(&bytes).ok()
 }
 
 fn parse_balance_response(json: &str) -> Result<u64, String> {
@@ -509,82 +490,6 @@ mod tests {
         assert!(err.contains("authorized RPC found 1 UTXO"));
         assert!(err.contains("known blinding factor"));
         assert!(err.contains("indra-wallet-scan"));
-    }
-
-    #[test]
-    fn old_rpc_zero_blinding_path_builds_unbalanced_transaction() {
-        let (hybrid_seed, pq_sk, sender_pubkey) = key_material(0x11);
-        let (_, _, recipient_pubkey) = key_material(0x22);
-        let recipient_hex = pubkey_hex(&recipient_pubkey);
-        let utxo_id = Bytes32::from([0xA7; 32]);
-        let input_value = 1_000_000;
-        let real_input_blinding = [0x42; 32];
-
-        let mut old_rpc_wallet = Wallet::new();
-        old_rpc_wallet.add_utxo(utxo_id, input_value, [0u8; 32], 7, 0, 0);
-
-        let built = build_transaction(&TxParams {
-            chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 500_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &old_rpc_wallet,
-            hybrid_seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: None,
-        })
-        .unwrap();
-        let tx = decode_built_tx(&built);
-        let real_input_commitment = commit(input_value, &real_input_blinding);
-
-        assert!(verify_balance(
-            &[PedersenCommitment(real_input_commitment.0)],
-            &output_commitments(&tx.outputs),
-            &PedersenCommitment(tx.fee_commitment.compressed_point.0),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn known_local_blinding_builds_balanced_transaction() {
-        let (hybrid_seed, pq_sk, sender_pubkey) = key_material(0x33);
-        let (_, _, recipient_pubkey) = key_material(0x44);
-        let recipient_hex = pubkey_hex(&recipient_pubkey);
-        let utxo_id = Bytes32::from([0xB8; 32]);
-        let input_value = 1_000_000;
-        let real_input_blinding = [0x42; 32];
-        let rpc_json = format!(
-            r#"{{"result":{{"utxos":[{{"utxo_id":"{}","amount":{},"created_height":7,"tx_index":0,"out_index":0}}]}}}}"#,
-            hex::encode(utxo_id.0),
-            input_value
-        );
-        let mut local_wallet = Wallet::new();
-        local_wallet.add_utxo(utxo_id, input_value, real_input_blinding, 7, 0, 0);
-        let spendable_wallet =
-            spendable_wallet_from_authorized_utxos(&rpc_json, &local_wallet).unwrap();
-
-        let built = build_transaction(&TxParams {
-            chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 500_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &spendable_wallet,
-            hybrid_seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: None,
-        })
-        .unwrap();
-        let tx = decode_built_tx(&built);
-        let real_input_commitment = commit(input_value, &real_input_blinding);
-
-        verify_balance(
-            &[PedersenCommitment(real_input_commitment.0)],
-            &output_commitments(&tx.outputs),
-            &PedersenCommitment(tx.fee_commitment.compressed_point.0),
-        )
-        .unwrap();
     }
 
     #[test]

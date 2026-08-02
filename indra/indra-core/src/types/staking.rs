@@ -12,12 +12,11 @@ use crate::{
         authorization::AuthorizationEnvelope,
         crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
         primitives::{
-            payment_blinding_active, validator_cold_key_enrollment_active, Bytes32,
-            MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN,
+            validator_cold_key_enrollment_active, Bytes32, MAX_VALIDATOR_NETWORK_ADDR_LEN,
+            STAKING_OP_DOMAIN,
         },
     },
 };
-use indra_crypto::PaymentPubKeyV1;
 
 /// Discriminant tags for StakingOp variants.
 const TAG_DELEGATE: u8 = 1;
@@ -29,7 +28,6 @@ const TAG_SELF_STAKE: u8 = 6;
 const TAG_SELF_UNSTAKE: u8 = 7;
 const TAG_SET_AUTO_DELEGATE: u8 = 8;
 const TAG_UPDATE_NETWORK_ADDRESS: u8 = 9;
-const TAG_REGISTER_PAYMENT_KEY: u8 = 10;
 const TAG_REGISTER_VALIDATOR_WITH_COLD_KEY: u8 = 11;
 const TAG_ENROLL_VALIDATOR_COLD_KEY: u8 = 12;
 const TAG_COLD_CLAIM_REWARDS: u8 = 13;
@@ -37,7 +35,6 @@ const TAG_COLD_SET_COMMISSION: u8 = 14;
 const TAG_COLD_SELF_STAKE: u8 = 15;
 const TAG_COLD_SELF_UNSTAKE: u8 = 16;
 const TAG_COLD_SET_AUTO_DELEGATE: u8 = 17;
-const TAG_COLD_REGISTER_PAYMENT_KEY: u8 = 18;
 const TAG_ROTATE_VALIDATOR_COLD_KEY: u8 = 23;
 
 /// Stable operation tag used inside hot/cold registration envelopes.
@@ -54,8 +51,6 @@ pub const AUTH_TAG_COLD_SELF_STAKE: u16 = TAG_COLD_SELF_STAKE as u16;
 pub const AUTH_TAG_COLD_SELF_UNSTAKE: u16 = TAG_COLD_SELF_UNSTAKE as u16;
 /// Stable envelope tag for cold auto-delegation updates.
 pub const AUTH_TAG_COLD_SET_AUTO_DELEGATE: u16 = TAG_COLD_SET_AUTO_DELEGATE as u16;
-/// Stable envelope tag for cold validator payment-key registration.
-pub const AUTH_TAG_COLD_REGISTER_PAYMENT_KEY: u16 = TAG_COLD_REGISTER_PAYMENT_KEY as u16;
 /// Stable envelope tag for validator cold-key rotation.
 pub const AUTH_TAG_ROTATE_VALIDATOR_COLD_KEY: u16 = TAG_ROTATE_VALIDATOR_COLD_KEY as u16;
 
@@ -284,16 +279,6 @@ pub enum StakingOpBody {
         /// Strict IP:port address. `None` clears the advertised address.
         network_addr: Option<String>,
     },
-
-    /// Publish or rotate the owner's current payment key-exchange public key.
-    RegisterPaymentKey {
-        /// Owner's permanent identity key proving control of owner_id.
-        owner_pubkey: HybridPubKey,
-        /// Current payment key-exchange public key for receiving blinded payments.
-        payment_pubkey: PaymentPubKeyV1,
-        /// Present only when the owner is an enrolled validator.
-        cold_authorization: Option<ColdStakingAuthorization>,
-    },
 }
 
 impl StakingOp {
@@ -357,15 +342,6 @@ impl StakingOp {
                 *validator_id,
                 authorization,
             ),
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                cold_authorization: Some(authorization),
-                ..
-            } => (
-                AUTH_TAG_COLD_REGISTER_PAYMENT_KEY,
-                pubkey_to_id(owner_pubkey),
-                authorization,
-            ),
             _ => return Ok(None),
         };
         let mut payload = self.body.encode_to_vec();
@@ -399,9 +375,6 @@ impl StakingOp {
                 cold_authorization, ..
             }
             | StakingOpBody::SetAutoDelegate {
-                cold_authorization, ..
-            }
-            | StakingOpBody::RegisterPaymentKey {
                 cold_authorization, ..
             } => *cold_authorization,
             StakingOpBody::RotateValidatorColdKey {
@@ -630,7 +603,6 @@ impl StakingOp {
             | StakingOpBody::UpdateNetworkAddress { validator_id, .. }
             | StakingOpBody::EnrollValidatorColdKey { validator_id, .. }
             | StakingOpBody::RotateValidatorColdKey { validator_id, .. } => *validator_id,
-            StakingOpBody::RegisterPaymentKey { owner_pubkey, .. } => pubkey_to_id(owner_pubkey),
         }
     }
 
@@ -733,13 +705,6 @@ impl StakingOp {
             StakingOpBody::UpdateNetworkAddress { network_addr, .. } => {
                 if let Some(addr) = network_addr {
                     validate_network_addr_string(addr)?;
-                }
-            }
-            StakingOpBody::RegisterPaymentKey { .. } => {
-                if !payment_blinding_active(height) {
-                    return Err(IndraError::InvalidStakingOp(
-                        "RegisterPaymentKey is not active before PAYMENT_BLINDING_HEIGHT".into(),
-                    ));
                 }
             }
         }
@@ -925,22 +890,6 @@ impl Encode for StakingOpBody {
                 validator_id.encode(buf);
                 encode_optional_network_addr(network_addr, buf);
             }
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey,
-                cold_authorization,
-            } => {
-                buf.push(if cold_authorization.is_some() {
-                    TAG_COLD_REGISTER_PAYMENT_KEY
-                } else {
-                    TAG_REGISTER_PAYMENT_KEY
-                });
-                owner_pubkey.encode(buf);
-                buf.extend_from_slice(&payment_pubkey.encode());
-                if let Some(authorization) = cold_authorization {
-                    authorization.encode(buf);
-                }
-            }
         }
     }
 
@@ -1068,18 +1017,6 @@ impl Encode for StakingOpBody {
                         .map(|addr| 2 + addr.len())
                         .unwrap_or(0)
             }
-            StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey,
-                cold_authorization,
-            } => {
-                owner_pubkey.encoded_len()
-                    + payment_pubkey.encode().len()
-                    + cold_authorization
-                        .as_ref()
-                        .map(Encode::encoded_len)
-                        .unwrap_or(0)
-            }
         }
     }
 }
@@ -1199,22 +1136,6 @@ impl Decode for StakingOpBody {
                 validator_id: Bytes32::decode(r)?,
                 network_addr: decode_optional_network_addr(r)?,
             }),
-            TAG_REGISTER_PAYMENT_KEY => {
-                let owner_pubkey = HybridPubKey::decode(r)?;
-                let payment_pubkey_bytes =
-                    r.read_bytes(indra_crypto::PAYMENT_PUBKEY_V1_ENCODED_LEN)?;
-                let payment_pubkey =
-                    PaymentPubKeyV1::decode(payment_pubkey_bytes).map_err(|_| {
-                        IndraError::InvalidStakingOp(
-                            "RegisterPaymentKey contains malformed payment public key".into(),
-                        )
-                    })?;
-                Ok(StakingOpBody::RegisterPaymentKey {
-                    owner_pubkey,
-                    payment_pubkey,
-                    cold_authorization: None,
-                })
-            }
             TAG_COLD_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
                 validator_id: Bytes32::decode(r)?,
                 delegator_pubkey: HybridPubKey::decode(r)?,
@@ -1241,22 +1162,6 @@ impl Decode for StakingOpBody {
                 target_validator_id: Bytes32::decode(r)?,
                 cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
             }),
-            TAG_COLD_REGISTER_PAYMENT_KEY => {
-                let owner_pubkey = HybridPubKey::decode(r)?;
-                let payment_pubkey_bytes =
-                    r.read_bytes(indra_crypto::PAYMENT_PUBKEY_V1_ENCODED_LEN)?;
-                let payment_pubkey =
-                    PaymentPubKeyV1::decode(payment_pubkey_bytes).map_err(|_| {
-                        IndraError::InvalidStakingOp(
-                            "RegisterPaymentKey contains malformed payment public key".into(),
-                        )
-                    })?;
-                Ok(StakingOpBody::RegisterPaymentKey {
-                    owner_pubkey,
-                    payment_pubkey,
-                    cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
-                })
-            }
             _ => Err(IndraError::InvalidStakingOp(format!(
                 "unknown staking op tag: {}",
                 tag
@@ -1378,7 +1283,6 @@ fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::primitives::hard_forks::PAYMENT_BLINDING_HEIGHT;
     use crate::{codec::Decode, types::primitives::VariableBytes};
 
     fn dummy_pubkey() -> HybridPubKey {
@@ -1407,15 +1311,6 @@ mod tests {
             committed_value_spark: value,
             blinding_factor: Bytes32::from([byte; 32]),
         }
-    }
-
-    fn dummy_payment_pubkey(byte: u8) -> PaymentPubKeyV1 {
-        indra_crypto::PaymentKeypairV1 {
-            version: indra_crypto::PAYMENT_VERSION_V1,
-            x25519_sk: [byte; 32],
-            ml_kem_1024_seed: [byte.wrapping_add(1); 64],
-        }
-        .public_key()
     }
 
     fn op(body: StakingOpBody) -> StakingOp {
@@ -1488,11 +1383,6 @@ mod tests {
                 validator_id: Bytes32::from([0xABu8; 32]),
                 network_addr: None,
             }),
-            op(StakingOpBody::RegisterPaymentKey {
-                owner_pubkey: dummy_pubkey(),
-                payment_pubkey: dummy_payment_pubkey(0xC0),
-                cold_authorization: None,
-            }),
         ];
 
         for op in cases {
@@ -1505,7 +1395,6 @@ mod tests {
     fn cold_staking_wire_extensions_round_trip_and_legacy_bytes_are_unchanged() {
         let validator_id = Bytes32::from([0xD1; 32]);
         let validator_pubkey = dummy_pubkey();
-        let payment = dummy_payment_pubkey(0xD2);
         let authorization = ColdStakingAuthorization {
             cold_key_version: 7,
             cold_nonce: 9,
@@ -1582,20 +1471,6 @@ mod tests {
                 },
                 TAG_SET_AUTO_DELEGATE,
                 TAG_COLD_SET_AUTO_DELEGATE,
-            ),
-            (
-                StakingOpBody::RegisterPaymentKey {
-                    owner_pubkey: validator_pubkey.clone(),
-                    payment_pubkey: payment.clone(),
-                    cold_authorization: None,
-                },
-                StakingOpBody::RegisterPaymentKey {
-                    owner_pubkey: validator_pubkey,
-                    payment_pubkey: payment,
-                    cold_authorization: Some(authorization),
-                },
-                TAG_REGISTER_PAYMENT_KEY,
-                TAG_COLD_REGISTER_PAYMENT_KEY,
             ),
         ];
 
@@ -1795,21 +1670,6 @@ mod tests {
             bond_proof: None,
         });
         assert!(op.validate_structure().is_ok());
-    }
-
-    #[test]
-    fn register_payment_key_is_height_gated_structurally() {
-        let op = op(StakingOpBody::RegisterPaymentKey {
-            owner_pubkey: dummy_pubkey(),
-            payment_pubkey: dummy_payment_pubkey(0xC1),
-            cold_authorization: None,
-        });
-        assert!(op
-            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT - 1)
-            .is_err());
-        assert!(op
-            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT)
-            .is_ok());
     }
 
     #[test]

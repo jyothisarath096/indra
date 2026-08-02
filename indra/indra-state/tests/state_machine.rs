@@ -11,7 +11,8 @@ use indra_core::{
         crypto::PQVoteSig,
         primitives::{
             DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, UNBONDING_PERIOD_EPOCHS,
+            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES,
+            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
         qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         slashing::SlashEvidenceV1,
@@ -22,7 +23,8 @@ use indra_core::{
     Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
 use indra_crypto::{
-    commit, prove_range, ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair,
+    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair,
+    ColdHybridKeypair, HybridKeypair, PaymentBlindingNoteV1, PqKeypair,
 };
 use indra_state::{
     apply::apply_slash,
@@ -208,7 +210,7 @@ fn make_tx(
     let mut rng = StdRng::from_seed([out_byte; 32]);
     let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
     let mut tx = TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id,
@@ -219,11 +221,18 @@ fn make_tx(
             commitment: CommitmentV1 {
                 compressed_point: Bytes32::from(commitment.0),
             },
-            owner_pubkey,
+            owner_pubkey: owner_pubkey.clone(),
             range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }],
-        payment_notes: Vec::new(),
+        payment_notes: vec![PaymentBlindingNoteV1 {
+            version: 1,
+            owner_id: sha256(&owner_pubkey.classical_pk.0),
+            payment_pubkey_hash: [0; 32],
+            sender_x25519_ephemeral_pk: [0; 32],
+            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+            note_nonce: [0; 32],
+        }],
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {

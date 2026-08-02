@@ -16,6 +16,7 @@
 use indra_core::{
     codec::Decode,
     types::{
+        block::BlockV1,
         primitives::{
             Bytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
             NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN,
@@ -23,7 +24,7 @@ use indra_core::{
         transaction::{OutputV1, TransactionV1},
     },
 };
-use indra_crypto::{commit, recipient_derive_payment_blinding_v1, PaymentKeypairV1};
+use indra_crypto::{commit, recipient_derive_payment_blinding_v1, sha256, PaymentKeypairV1};
 use indra_state::UtxoSet;
 
 const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
@@ -41,7 +42,6 @@ fn main() {
     let wallet_path = get("--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let add_utxo = get("--add-utxo"); // manual: --add-utxo <utxo_id>:<value>:<blinding>
-    let show_genesis_blinding = args.iter().any(|arg| arg == "--show-genesis-blinding");
 
     println!("INDRA Wallet Scanner");
     println!("─────────────────────────────────────────");
@@ -55,11 +55,8 @@ fn main() {
         eprintln!("Error loading keys: {}", e);
         std::process::exit(1);
     });
-    let hybrid_seed = keys.hybrid_seed;
-
-    // Derive classical pubkey
+    // Display the canonical ownership key being scanned.
     let classical_pk = keys.public.hybrid_classical_pk;
-    let address_hex = hex::encode(indra_crypto::sha256(&classical_pk));
     let pubkey_hex = hex::encode(classical_pk);
 
     println!("Scanning for UTXOs owned by: {}...", &pubkey_hex[..16]);
@@ -126,147 +123,29 @@ fn main() {
         return;
     }
 
-    // Query node for UTXOs
-    println!("\nQuerying node for UTXOs...");
-    let scan_auth_proof =
-        match indra_cli::build_legacy_scan_auth_proof(&node_url, &keys, &address_hex) {
-            Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Error building scan authorization proof: {}", e);
-                std::process::exit(1);
-            }
-        };
-    match query_utxos(&node_url, &address_hex, &scan_auth_proof) {
-        Ok(response) => {
-            println!("Node response: {}", response);
-            let discovered = parse_utxos_json(&response).unwrap_or_else(|e| {
-                eprintln!("Error parsing authorized UTXO response: {}", e);
+    println!("\\nScanning canonical blocks locally...");
+    let payment_keys = keys.payment_keypairs().cloned().collect::<Vec<_>>();
+    if payment_keys.is_empty() {
+        eprintln!("Error: canonical keystore contains no payment keys");
+        std::process::exit(1);
+    }
+    wallet.set_payment_key_hashes(
+        payment_keys
+            .iter()
+            .map(|keypair| keypair.public_key().hash())
+            .collect(),
+    );
+    match scan_canonical_blocks(&node_url, &mut wallet, &payment_keys) {
+        Ok(discovered) => {
+            wallet.save(&wallet_path).unwrap_or_else(|error| {
+                eprintln!("Error saving wallet: {error}");
                 std::process::exit(1);
             });
-            let genesis_blinding = derive_genesis_blinding(&hybrid_seed);
-            let mut chain_id = None::<String>;
-            let mut added = 0usize;
-            let mut reconciled = 0usize;
-            let mut recovered_payment_notes = 0usize;
-            let mut recovered_protocol = 0usize;
-            let mut unrecoverable_protocol = 0usize;
-            for utxo in discovered {
-                if wallet.contains(&utxo.utxo_id) {
-                    continue;
-                }
-                if utxo.created_height == 0 {
-                    wallet.add_utxo(
-                        utxo.utxo_id,
-                        utxo.value,
-                        genesis_blinding,
-                        utxo.created_height,
-                        utxo.tx_index,
-                        utxo.out_index,
-                    );
-                    added += 1;
-                    continue;
-                }
-                if wallet.reconcile_pending_change(
-                    utxo.utxo_id,
-                    utxo.created_height,
-                    utxo.tx_index,
-                    utxo.out_index,
-                ) {
-                    reconciled += 1;
-                    continue;
-                }
-                match recover_payment_note_if_available(&node_url, &utxo, &keys, &mut chain_id) {
-                    Ok(Some(blinding)) => {
-                        wallet.add_utxo(
-                            utxo.utxo_id,
-                            utxo.value,
-                            blinding,
-                            utxo.created_height,
-                            utxo.tx_index,
-                            utxo.out_index,
-                        );
-                        recovered_payment_notes += 1;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("Error recovering payment note: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-                match recover_protocol_provenance_from_node(
-                    &node_url,
-                    &address_hex,
-                    &scan_auth_proof,
-                    &utxo,
-                ) {
-                    Ok(ProtocolRecovery::Recovered { category, blinding }) => {
-                        wallet.add_utxo(
-                            utxo.utxo_id,
-                            utxo.value,
-                            blinding,
-                            utxo.created_height,
-                            utxo.tx_index,
-                            utxo.out_index,
-                        );
-                        recovered_protocol += 1;
-                        println!(
-                            "Recovered protocol UTXO {} via {}.",
-                            hex::encode(utxo.utxo_id.0),
-                            category
-                        );
-                    }
-                    Ok(ProtocolRecovery::Unrecoverable { category, reason }) => {
-                        unrecoverable_protocol += 1;
-                        println!(
-                            "Unrecoverable protocol UTXO {} ({category}): {reason}",
-                            hex::encode(utxo.utxo_id.0)
-                        );
-                    }
-                    Ok(ProtocolRecovery::NotProtocolGenerated) => {}
-                    Err(e) => {
-                        eprintln!("Error recovering protocol-generated UTXO: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            if added > 0 || reconciled > 0 || recovered_payment_notes > 0 || recovered_protocol > 0
-            {
-                wallet.save(&wallet_path).unwrap_or_else(|e| {
-                    eprintln!("Error saving wallet: {}", e);
-                    std::process::exit(1);
-                });
-            }
-
-            if added > 0 {
-                println!("Added {} genesis UTXO(s) automatically.", added);
-            }
-            if reconciled > 0 {
-                println!("Reconciled {} pending change UTXO(s).", reconciled);
-            }
-            if recovered_payment_notes > 0 {
-                println!(
-                    "Recovered {} payment-note UTXO(s) automatically.",
-                    recovered_payment_notes
-                );
-            }
-            if recovered_protocol > 0 {
-                println!(
-                    "Recovered {} protocol-generated UTXO(s) automatically.",
-                    recovered_protocol
-                );
-            }
-            if unrecoverable_protocol > 0 {
-                println!(
-                    "Reported {} protocol-generated UTXO(s) as unrecoverable.",
-                    unrecoverable_protocol
-                );
-            }
-
-            print!("{}", scan_footer(&hybrid_seed, show_genesis_blinding));
+            println!("Discovered {discovered} recoverable payment output(s).");
         }
-        Err(e) => {
-            eprintln!("Error querying node: {}", e);
+        Err(error) => {
+            eprintln!("Wallet scan failed: {error}");
+            std::process::exit(1);
         }
     }
 
@@ -275,6 +154,150 @@ fn main() {
         wallet.balance(),
         wallet.balance() as f64 / SPARK_PER_INDRA_F64
     );
+}
+
+fn scan_canonical_blocks(
+    node_url: &str,
+    wallet: &mut indra_cli::Wallet,
+    payment_keys: &[PaymentKeypairV1],
+) -> Result<usize, String> {
+    let chain_id = indra_cli::fetch_chain_id(node_url).map_err(|error| error.to_string())?;
+    let mut discovered = 0usize;
+    loop {
+        let (from_height, expected_parent) = wallet
+            .scan_tip()
+            .map_or((1, Bytes32::ZERO), |(height, hash)| (height + 1, hash));
+        let response = indra_cli::rpc_call_raw_params(
+            node_url,
+            "indra_getCanonicalBlocks",
+            &[
+                from_height.to_string(),
+                "25".to_string(),
+                indra_cli::json_string(&hex::encode(expected_parent.0)),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+
+        if response.contains("canonical parent mismatch") {
+            let Some((height, _)) = wallet.scan_tip() else {
+                return Err("canonical chain rejected the genesis scan anchor".to_string());
+            };
+            wallet.rollback_scan_from(height);
+            continue;
+        }
+        if response.contains("exceeds current tip") || response.contains("not retained") {
+            break;
+        }
+        let blocks = canonical_blocks_from_rpc(&response)?;
+        if blocks.is_empty() {
+            break;
+        }
+        for block in blocks {
+            if block.header.prev_hash != expected_scan_parent(wallet) {
+                wallet.rollback_scan_from(block.header.height.saturating_sub(1));
+                return Err(format!(
+                    "non-contiguous canonical block page at height {}",
+                    block.header.height
+                ));
+            }
+            discovered += scan_canonical_block(wallet, &block, payment_keys, chain_id.as_bytes())?;
+            wallet.record_scanned_block(block.header.height, block.header.block_hash());
+        }
+        if response.contains("\"next_height\":null") {
+            break;
+        }
+    }
+    Ok(discovered)
+}
+
+fn scan_canonical_block(
+    wallet: &mut indra_cli::Wallet,
+    block: &BlockV1,
+    payment_keys: &[PaymentKeypairV1],
+    chain_id: &[u8],
+) -> Result<usize, String> {
+    let mut discovered = 0usize;
+    for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+        let transaction_index = u32::try_from(transaction_index)
+            .map_err(|_| "transaction index exceeds u32".to_string())?;
+        for input in &transaction.inputs {
+            wallet.mark_spent_at_height(&input.utxo_id, block.header.height);
+        }
+        for (output_index, (output, note)) in transaction
+            .outputs
+            .iter()
+            .zip(&transaction.payment_notes)
+            .enumerate()
+        {
+            let owner_id = sha256(&output.owner_pubkey.classical_pk.0);
+            if note.owner_id != owner_id {
+                return Err("payment note owner ID does not match canonical output".to_string());
+            }
+            let Some(keypair) = payment_keys
+                .iter()
+                .find(|keypair| keypair.public_key().hash() == note.payment_pubkey_hash)
+            else {
+                continue;
+            };
+            let output_index =
+                u32::try_from(output_index).map_err(|_| "output index exceeds u32".to_string())?;
+            let recovered = recipient_derive_payment_blinding_v1(
+                keypair,
+                note,
+                chain_id,
+                output_index,
+                output.value_spark,
+                output.lock_height,
+            )
+            .map_err(|error| format!("payment note derivation failed: {error}"))?;
+            if commit(output.value_spark, &recovered.blinding).0
+                != output.commitment.compressed_point.0
+            {
+                return Err("payment note does not open output commitment".to_string());
+            }
+            let utxo_id = UtxoSet::compute_utxo_id(
+                output,
+                block.header.height,
+                transaction_index,
+                output_index,
+            );
+            if !wallet.contains(&utxo_id) {
+                wallet.add_utxo(
+                    utxo_id,
+                    output.value_spark,
+                    recovered.blinding,
+                    block.header.height,
+                    transaction_index,
+                    output_index,
+                );
+                discovered += 1;
+            }
+        }
+    }
+    Ok(discovered)
+}
+
+fn expected_scan_parent(wallet: &indra_cli::Wallet) -> Bytes32 {
+    wallet.scan_tip().map_or(Bytes32::ZERO, |(_, hash)| hash)
+}
+
+fn canonical_blocks_from_rpc(json: &str) -> Result<Vec<BlockV1>, String> {
+    let mut blocks = Vec::new();
+    let mut remaining = json;
+    let marker = "\"block_hex\":\"";
+    while let Some(start) = remaining.find(marker) {
+        let encoded = &remaining[start + marker.len()..];
+        let end = encoded
+            .find('"')
+            .ok_or_else(|| "unterminated block_hex in RPC response".to_string())?;
+        let bytes = hex::decode(&encoded[..end]).map_err(|_| "invalid block_hex".to_string())?;
+        blocks.push(
+            BlockV1::decode_exact(&bytes)
+                .map_err(|error| format!("invalid canonical block encoding: {error}"))?,
+        );
+        remaining = &encoded[end + 1..];
+    }
+    Ok(blocks)
 }
 
 /// Query the node for UTXOs owned by this keypair's legacy address.
@@ -379,8 +402,8 @@ fn recover_payment_note_blinding(
     if computed_utxo_id != utxo.utxo_id {
         return Err("UTXO metadata does not match the referenced transaction output".to_string());
     }
-    let Some(Some(note)) = tx.payment_notes.get(output_index) else {
-        return Ok(None);
+    let Some(note) = tx.payment_notes.get(output_index) else {
+        return Err("transaction is missing its mandatory payment note".to_string());
     };
     let output_owner_id = indra_crypto::sha256(&output.owner_pubkey.classical_pk.0);
     if note.owner_id != output_owner_id {
@@ -834,7 +857,7 @@ mod tests {
         Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
     };
     use indra_crypto::{
-        hybrid::{ClassicalKeypair, PqKeypair},
+        hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
         PaymentKeypairV1,
     };
     use indra_keystore::generate_from_master_seed;
@@ -861,6 +884,20 @@ mod tests {
         )
     }
 
+    fn payment_address(seed: u8, payment: &PaymentKeypairV1) -> String {
+        let keypair = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[seed; 32]),
+            PqKeypair::from_seed(&[seed; 32]).unwrap(),
+        );
+        indra_crypto::PaymentAddress::new(
+            DEFAULT_CHAIN_ID.as_bytes(),
+            &keypair,
+            payment.public_key(),
+        )
+        .unwrap()
+        .to_text()
+    }
+
     fn source_wallet() -> Wallet {
         let mut wallet = Wallet::new();
         wallet.add_utxo(Bytes32::from([0xA0; 32]), 10_000_000, [0x01; 32], 1, 0, 0);
@@ -879,16 +916,17 @@ mod tests {
         let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0x42);
         let (recipient_seed, recipient_pq_sk, recipient_pubkey) = hybrid_material(0x61);
         let payment_keypair = PaymentKeypairV1::generate();
+        let recipient_address = payment_address(0x61, &payment_keypair);
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &pubkey_hex(&recipient_pubkey),
+            recipient_address: &recipient_address,
             amount_spark: 2_000_000,
             fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: sender_seed,
             pq_sk_bytes: sender_pq_sk,
             sender_pubkey,
-            recipient_payment_pubkey: Some(payment_keypair.public_key()),
+            sender_payment_pubkey: PaymentKeypairV1::generate().public_key(),
         };
         let built = build_transaction(&params).unwrap();
         let tx = TransactionV1::decode_exact(&hex::decode(&built.tx_hex).unwrap()).unwrap();
@@ -980,6 +1018,36 @@ mod tests {
             staking_ops: Vec::new(),
             vrf_reveals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn canonical_scan_discovers_with_historical_key_and_rolls_back_reorg() {
+        let (_, tx, historical_key, _, _, _) = build_received_payment();
+        let current_key = PaymentKeypairV1::generate();
+        assert_ne!(
+            current_key.public_key().hash(),
+            historical_key.public_key().hash()
+        );
+        let mut block = dummy_block(7);
+        block.header.prev_hash = Bytes32::ZERO;
+        block.transactions.push(tx);
+        let mut wallet = Wallet::new();
+
+        let discovered = scan_canonical_block(
+            &mut wallet,
+            &block,
+            &[current_key, historical_key],
+            DEFAULT_CHAIN_ID.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(discovered, 1);
+        assert_eq!(wallet.balance(), 2_000_000);
+        wallet.record_scanned_block(block.header.height, block.header.block_hash());
+        assert_eq!(wallet.scan_tip().unwrap().0, 7);
+
+        wallet.rollback_scan_from(7);
+        assert_eq!(wallet.balance(), 0);
+        assert!(wallet.scan_tip().is_none());
     }
 
     fn owned_protocol_output(amount: u64, blinding: [u8; 32]) -> OutputV1 {
@@ -1133,43 +1201,11 @@ mod tests {
     fn malformed_payment_note_fails_commitment_opening_check() {
         let (_, mut tx, payment_keypair, _, _, _) = build_received_payment();
         let utxo = recipient_rpc_utxo(&tx);
-        tx.payment_notes[0].as_mut().unwrap().note_nonce = [0x99; 32];
+        tx.payment_notes[0].note_nonce = [0x99; 32];
 
         let err = recover_payment_note_blinding(&tx, &utxo, &payment_keypair, DEFAULT_CHAIN_ID)
             .unwrap_err();
         assert!(err.contains("does not open"));
-    }
-
-    #[test]
-    fn scanner_ignores_legacy_utxo_with_no_payment_note() {
-        let wallet = source_wallet();
-        let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0x42);
-        let (_, _, recipient_pubkey) = hybrid_material(0x62);
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &pubkey_hex(&recipient_pubkey),
-            amount_spark: 2_000_000,
-            fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: sender_seed,
-            pq_sk_bytes: sender_pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: None,
-        };
-        let built = build_transaction(&params).unwrap();
-        let tx = TransactionV1::decode_exact(&hex::decode(&built.tx_hex).unwrap()).unwrap();
-        let utxo = recipient_rpc_utxo(&tx);
-
-        assert_eq!(
-            recover_payment_note_blinding(
-                &tx,
-                &utxo,
-                &PaymentKeypairV1::generate(),
-                DEFAULT_CHAIN_ID,
-            )
-            .unwrap(),
-            None
-        );
     }
 
     #[test]
@@ -1196,18 +1232,19 @@ mod tests {
             built.recipient_blinding
         );
 
-        let (_, _, destination_pubkey) = hybrid_material(0x73);
+        let destination_payment = PaymentKeypairV1::generate();
+        let destination_address = payment_address(0x73, &destination_payment);
         let wallet = Wallet::from_json(&wallet.to_json()).unwrap();
         let spend_params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &pubkey_hex(&destination_pubkey),
+            recipient_address: &destination_address,
             amount_spark: 1_000_000,
             fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: recipient_seed,
             pq_sk_bytes: recipient_pq_sk,
             sender_pubkey: recipient_pubkey,
-            recipient_payment_pubkey: None,
+            sender_payment_pubkey: payment_keypair.public_key(),
         };
 
         let spend = build_transaction(&spend_params).unwrap();
@@ -1648,85 +1685,5 @@ mod tests {
 
         assert!(footer.contains("your initial UTXO blinding is"));
         assert!(footer.contains(&genesis_blinding_hex));
-    }
-
-    #[test]
-    fn recovered_protocol_utxo_is_spendable_after_wallet_scan() {
-        let validator_id = [0x91; 32];
-        let delegator_id = [0x92; 32];
-        let height = 12;
-        let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
-        let context = format!(
-            r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
-            hex::encode(validator_id),
-            hex::encode(delegator_id),
-            height
-        );
-        let (wallet, utxo) =
-            assert_recovered_wallet_entry("staking_reward_claim", context, blinding);
-
-        let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0xA8);
-        let (_, _, destination_pubkey) = hybrid_material(0xA9);
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &pubkey_hex(&destination_pubkey),
-            amount_spark: 1_000_000,
-            fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: sender_seed,
-            pq_sk_bytes: sender_pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: None,
-        };
-
-        let spend = build_transaction(&params).unwrap();
-        let spend_tx = TransactionV1::decode_exact(&hex::decode(&spend.tx_hex).unwrap()).unwrap();
-        assert_eq!(spend_tx.inputs.len(), 1);
-        assert_eq!(spend_tx.inputs[0].utxo_id, utxo.utxo_id);
-    }
-
-    #[test]
-    fn recovered_normal_bond_release_utxo_is_spendable_after_wallet_scan() {
-        let validator_id = [0xB1; 32];
-        let delegator_id = [0xB2; 32];
-        let bond_utxo_id = [0xB3; 32];
-        let height = 12;
-        let amount = 4_000_000;
-        let blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let context = format!(
-            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"normal_bond_release"}}"#,
-            hex::encode(validator_id),
-            hex::encode(delegator_id),
-            hex::encode(bond_utxo_id),
-            height,
-            amount
-        );
-        let (wallet, utxo) =
-            assert_recovered_wallet_entry("normal_bond_release", context, blinding);
-
-        let (sender_seed, sender_pq_sk, sender_pubkey) = hybrid_material(0xB4);
-        let (_, _, destination_pubkey) = hybrid_material(0xB5);
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &pubkey_hex(&destination_pubkey),
-            amount_spark: 1_000_000,
-            fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: sender_seed,
-            pq_sk_bytes: sender_pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: None,
-        };
-
-        let spend = build_transaction(&params).unwrap();
-        let spend_tx = TransactionV1::decode_exact(&hex::decode(&spend.tx_hex).unwrap()).unwrap();
-        assert_eq!(spend_tx.inputs.len(), 1);
-        assert_eq!(spend_tx.inputs[0].utxo_id, utxo.utxo_id);
     }
 }

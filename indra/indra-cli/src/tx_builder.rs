@@ -25,7 +25,7 @@ use indra_core::{
 use indra_crypto::{
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
     pedersen::commit,
-    sender_derive_payment_blinding_v1, sha256, PaymentPubKeyV1,
+    sender_derive_payment_blinding_v1, sha256, PaymentAddress, PaymentPubKeyV1,
 };
 
 use crate::{
@@ -45,8 +45,8 @@ pub const DUST_LIMIT_SPARK: u64 = 100_000;
 pub struct TxParams<'a> {
     /// Chain identifier used in transaction signing.
     pub chain_id: &'a str,
-    /// Recipient's hybrid public key (hex-encoded).
-    pub recipient_pubkey_hex: &'a str,
+    /// Recipient's complete canonical payment address.
+    pub recipient_address: &'a str,
     /// Amount to send in Spark.
     pub amount_spark: u64,
     /// Fee in Spark (must be >= MIN_FEE_SPARK).
@@ -59,8 +59,8 @@ pub struct TxParams<'a> {
     pub pq_sk_bytes: Vec<u8>,
     /// Sender's own pubkey (for change output).
     pub sender_pubkey: HybridPubKey,
-    /// Recipient payment key, when discovered from the payment identity registry.
-    pub recipient_payment_pubkey: Option<PaymentPubKeyV1>,
+    /// Sender's canonical payment key for self-directed change.
+    pub sender_payment_pubkey: PaymentPubKeyV1,
 }
 
 /// The result of building a transaction.
@@ -105,8 +105,12 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         )));
     }
 
-    // 2. Parse recipient pubkey
-    let recipient_pubkey = parse_pubkey_hex(params.recipient_pubkey_hex)?;
+    // 2. Decode and authenticate the complete recipient descriptor.
+    let recipient_address =
+        PaymentAddress::from_text(params.recipient_address, params.chain_id.as_bytes()).map_err(
+            |e| CliError::Transaction(format!("invalid recipient payment address: {e}")),
+        )?;
+    let recipient_pubkey = crypto_pubkey_to_wire(recipient_address.owner_pubkey())?;
 
     // 3. Coin selection
     let selected = params
@@ -134,19 +138,26 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         .collect();
 
     let mut rng = rand::rngs::OsRng;
-    // 5. Generate output blinding material. If the recipient has registered a
-    // payment key, derive the recipient blinding and note through the payment
-    // delivery helper; otherwise preserve the existing random-blinding path.
-    use rand::RngCore;
-    let recipient_owner_id = sha256(&recipient_pubkey.classical_pk.0);
-    let recipient_payment = if let Some(payment_pubkey) = &params.recipient_payment_pubkey {
+    // 5. Every ordinary output uses the same mandatory note-construction path.
+    let recipient_payment = sender_derive_payment_blinding_v1(
+        recipient_address.payment_pubkey(),
+        params.chain_id.as_bytes(),
+        recipient_address.owner_id(),
+        0,
+        params.amount_spark,
+        0,
+    )
+    .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let recipient_blinding = recipient_payment.blinding;
+
+    let change_payment = if change_spark > DUST_LIMIT_SPARK {
         Some(
             sender_derive_payment_blinding_v1(
-                payment_pubkey,
+                &params.sender_payment_pubkey,
                 params.chain_id.as_bytes(),
-                recipient_owner_id,
-                0,
-                params.amount_spark,
+                sha256(&params.sender_pubkey.classical_pk.0),
+                1,
+                change_spark,
                 0,
             )
             .map_err(|e| CliError::Crypto(e.to_string()))?,
@@ -154,21 +165,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     } else {
         None
     };
-    let recipient_blinding = if let Some(payment) = &recipient_payment {
-        payment.blinding
-    } else {
-        let mut blinding_buf = [0u8; 32];
-        rng.fill_bytes(&mut blinding_buf);
-        blinding_buf
-    };
-
-    let change_blinding = if change_spark > DUST_LIMIT_SPARK {
-        let mut cb = [0u8; 32];
-        rng.fill_bytes(&mut cb);
-        Some(cb)
-    } else {
-        None
-    };
+    let change_blinding = change_payment.as_ref().map(|payment| payment.blinding);
 
     let input_blinding_sum = selected.iter().fold(Scalar::ZERO, |acc, entry| {
         acc + Scalar::from_bytes_mod_order(entry.blinding)
@@ -229,21 +226,13 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
 
     // 8. Build unsigned transaction
     let mut tx = TransactionV1 {
-        version: if recipient_payment.is_some() {
-            ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES)
-        } else {
-            ProtocolVersion::CURRENT
-        },
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs,
         outputs,
-        payment_notes: if let Some(payment) = recipient_payment {
-            let mut notes = vec![Some(payment.note)];
-            notes.resize(tx_output_count_for_notes(change_blinding.is_some()), None);
-            notes
-        } else {
-            Vec::new()
-        },
+        payment_notes: std::iter::once(recipient_payment.note)
+            .chain(change_payment.map(|payment| payment.note))
+            .collect(),
         fee_amount: params.fee_spark,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {
@@ -294,14 +283,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     })
 }
 
-fn tx_output_count_for_notes(has_change: bool) -> usize {
-    if has_change {
-        2
-    } else {
-        1
-    }
-}
-
 /// Build and sign a validator self-stake operation.
 pub fn build_self_stake_op(
     bond_utxo_id: Bytes32,
@@ -344,25 +325,6 @@ pub fn build_register_validator_op(
             cold_signature: None,
         },
         keypair,
-        nonce,
-        chain_id,
-    )
-}
-
-/// Build and sign a payment key registration staking operation.
-pub fn build_register_payment_key_op(
-    payment_pubkey: PaymentPubKeyV1,
-    owner_keypair: &HybridKeypair,
-    nonce: u64,
-    chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::RegisterPaymentKey {
-            owner_pubkey: hybrid_pubkey_from_keypair(owner_keypair)?,
-            payment_pubkey,
-            cold_authorization: None,
-        },
-        owner_keypair,
         nonce,
         chain_id,
     )
@@ -608,40 +570,11 @@ fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey
     })
 }
 
-/// Parse a hex-encoded hybrid public key.
-fn parse_pubkey_hex(hex_str: &str) -> CliResult<HybridPubKey> {
-    let parts: Vec<&str> = hex_str.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err(CliError::Transaction(
-            "recipient pubkey must be full hybrid format classical_pk_hex:pq_pk_hex".into(),
-        ));
-    }
-
-    let classical_bytes = hex::decode(parts[0])
-        .map_err(|_| CliError::InvalidHex("bad classical pubkey hex".into()))?;
-
-    if classical_bytes.len() != 32 {
-        return Err(CliError::Transaction(format!(
-            "classical pubkey must be 32 bytes, got {}",
-            classical_bytes.len()
-        )));
-    }
-
-    let mut classical_arr = [0u8; 32];
-    classical_arr.copy_from_slice(&classical_bytes);
-
-    let pq_bytes =
-        hex::decode(parts[1]).map_err(|_| CliError::InvalidHex("bad pq pubkey hex".into()))?;
-    if pq_bytes.iter().all(|&byte| byte == 0) {
-        return Err(CliError::Transaction(
-            "recipient pq pubkey must not be all zero".into(),
-        ));
-    }
-
+fn crypto_pubkey_to_wire(pubkey: &indra_crypto::HybridPublicKey) -> CliResult<HybridPubKey> {
     Ok(HybridPubKey {
-        classical_pk: Bytes32::from(classical_arr),
-        pq_pk: VariableBytes::from_slice(&pq_bytes)
-            .map_err(|_| CliError::Transaction("pq pubkey too large".into()))?,
+        classical_pk: Bytes32::from(pubkey.classical.0),
+        pq_pk: VariableBytes::from_slice(&pubkey.pq.0)
+            .map_err(|_| CliError::Transaction("PQ public key is too large".into()))?,
     })
 }
 
@@ -749,309 +682,129 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_basic_transaction() {
-        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = pubkey_hex(&spk);
-
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey: spk,
-            recipient_payment_pubkey: None,
-        };
-
-        let result = build_transaction(&params).unwrap();
-        assert!(!result.tx_hex.is_empty());
-        assert_eq!(result.tx_id.len(), 64);
-        assert_eq!(result.change_spark, 8_950_000);
-        assert_eq!(result.spent_utxo_ids.len(), 1);
+    fn payment_address(keypair: &HybridKeypair, payment: &PaymentKeypairV1) -> String {
+        PaymentAddress::new(DEFAULT_CHAIN_ID.as_bytes(), keypair, payment.public_key())
+            .unwrap()
+            .to_text()
     }
 
     #[test]
-    fn build_transaction_rejects_classical_only_recipient_pubkey() {
-        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = hex::encode(spk.classical_pk.0);
-
-        let result = build_transaction(&TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey: spk,
-            recipient_payment_pubkey: None,
-        });
-        let Err(err) = result else {
-            panic!("classical-only recipient pubkey unexpectedly succeeded");
-        };
-
-        assert!(err
-            .to_string()
-            .contains("recipient pubkey must be full hybrid format"));
-    }
-
-    #[test]
-    fn build_transaction_rejects_all_zero_recipient_pq_pubkey() {
-        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = format!(
-            "{}:{}",
-            hex::encode(spk.classical_pk.0),
-            hex::encode([0u8; 2592])
-        );
-
-        let result = build_transaction(&TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey: spk,
-            recipient_payment_pubkey: None,
-        });
-        let Err(err) = result else {
-            panic!("all-zero recipient pq pubkey unexpectedly succeeded");
-        };
-
-        assert!(err
-            .to_string()
-            .contains("recipient pq pubkey must not be all zero"));
-    }
-
-    #[test]
-    fn build_transaction_with_registered_payment_key_uses_v2_real_note() {
+    fn build_transaction_requires_valid_descriptor_and_mandatory_notes() {
         let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
         let recipient_keypair = test_keypair(0x61);
-        let recipient_pubkey = hybrid_pubkey_from_keypair(&recipient_keypair).unwrap();
-        let recipient_hex = format!(
-            "{}:{}",
-            hex::encode(recipient_pubkey.classical_pk.0),
-            hex::encode(recipient_pubkey.pq_pk.as_slice())
-        );
-        let payment_keypair = PaymentKeypairV1::generate();
-
+        let recipient_payment = PaymentKeypairV1::generate();
+        let recipient_address = payment_address(&recipient_keypair, &recipient_payment);
+        let sender_payment = PaymentKeypairV1::generate();
         let params = TxParams {
             chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
+            recipient_address: &recipient_address,
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,
             sender_pubkey,
-            recipient_payment_pubkey: Some(payment_keypair.public_key()),
+            sender_payment_pubkey: sender_payment.public_key(),
         };
 
         let built = build_transaction(&params).unwrap();
         let tx = decode_built_tx(&built);
-        assert_eq!(tx.version.0, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
         assert_eq!(tx.payment_notes.len(), tx.outputs.len());
-        let note = tx.payment_notes[0].as_ref().unwrap();
-        assert_eq!(note.owner_id, sha256(&recipient_pubkey.classical_pk.0));
-        assert_eq!(
-            tx.outputs[0].commitment.compressed_point.0,
-            commit(1_000_000, &built.recipient_blinding).0
-        );
-
+        assert!(tx.validate_structure().is_ok());
+        let recipient_note = &tx.payment_notes[0];
         let recipient_side = recipient_derive_payment_blinding_v1(
-            &payment_keypair,
-            note,
+            &recipient_payment,
+            recipient_note,
             DEFAULT_CHAIN_ID.as_bytes(),
             0,
             1_000_000,
             0,
         )
         .unwrap();
-        let x_secret = payment_x25519_shared_secret(
-            payment_keypair.x25519_sk,
-            note.sender_x25519_ephemeral_pk,
+        assert_eq!(
+            tx.outputs[0].commitment.compressed_point.0,
+            commit(1_000_000, &recipient_side.blinding).0
         );
-        assert_eq!(recipient_side.x_secret, x_secret);
-        let expected = direct_blinding_oracle(
-            note,
-            recipient_side.x_secret,
-            recipient_side.kem_secret,
-            DEFAULT_CHAIN_ID.as_bytes(),
-            0,
-            1_000_000,
-            0,
-        );
-        assert_eq!(built.recipient_blinding, expected);
     }
 
     #[test]
-    fn build_transaction_without_payment_key_preserves_legacy_shape() {
-        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = pubkey_hex(&spk);
-
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey: spk,
-            recipient_payment_pubkey: None,
-        };
-
-        let built = build_transaction(&params).unwrap();
-        let tx = decode_built_tx(&built);
-        assert_eq!(tx.version, ProtocolVersion::CURRENT);
-        assert!(tx.payment_notes.is_empty());
-        assert_eq!(built.change_spark, 8_950_000);
-        assert_eq!(built.spent_utxo_ids.len(), 1);
-    }
-
-    #[test]
-    fn build_transaction_sets_change_payment_note_to_none() {
+    fn self_directed_change_uses_sender_payment_key() {
         let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
         let recipient_keypair = test_keypair(0x62);
-        let recipient_pubkey = hybrid_pubkey_from_keypair(&recipient_keypair).unwrap();
-        let recipient_hex = format!(
-            "{}:{}",
-            hex::encode(recipient_pubkey.classical_pk.0),
-            hex::encode(recipient_pubkey.pq_pk.as_slice())
-        );
-
-        let params = TxParams {
+        let recipient_address = payment_address(&recipient_keypair, &PaymentKeypairV1::generate());
+        let sender_payment = PaymentKeypairV1::generate();
+        let built = build_transaction(&TxParams {
             chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
+            recipient_address: &recipient_address,
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
             hybrid_seed: seed,
             pq_sk_bytes: pq_sk,
             sender_pubkey,
-            recipient_payment_pubkey: Some(PaymentKeypairV1::generate().public_key()),
-        };
-
-        let tx = decode_built_tx(&build_transaction(&params).unwrap());
-        assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.payment_notes.len(), 2);
-        assert!(tx.payment_notes[0].is_some());
-        assert!(tx.payment_notes[1].is_none());
-    }
-
-    #[test]
-    fn build_transaction_payment_notes_length_matches_outputs() {
-        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
-        let recipient_keypair = test_keypair(0x63);
-        let recipient_pubkey = hybrid_pubkey_from_keypair(&recipient_keypair).unwrap();
-        let recipient_hex = format!(
-            "{}:{}",
-            hex::encode(recipient_pubkey.classical_pk.0),
-            hex::encode(recipient_pubkey.pq_pk.as_slice())
-        );
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: Some(PaymentKeypairV1::generate().public_key()),
-        };
-
-        let tx = decode_built_tx(&build_transaction(&params).unwrap());
-        assert_eq!(tx.payment_notes.len(), tx.outputs.len());
-        assert!(tx.validate_structure_at_height(u64::MAX).is_ok());
-    }
-
-    #[test]
-    fn build_transaction_real_note_recipient_can_open_commitment() {
-        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
-        let recipient_keypair = test_keypair(0x64);
-        let recipient_pubkey = hybrid_pubkey_from_keypair(&recipient_keypair).unwrap();
-        let recipient_hex = format!(
-            "{}:{}",
-            hex::encode(recipient_pubkey.classical_pk.0),
-            hex::encode(recipient_pubkey.pq_pk.as_slice())
-        );
-        let payment_keypair = PaymentKeypairV1::generate();
-        let amount_spark = 1_000_000;
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey,
-            recipient_payment_pubkey: Some(payment_keypair.public_key()),
-        };
-
-        let built = build_transaction(&params).unwrap();
+            sender_payment_pubkey: sender_payment.public_key(),
+        })
+        .unwrap();
         let tx = decode_built_tx(&built);
-        let note = tx.payment_notes[0].as_ref().unwrap();
-        let recipient_side = recipient_derive_payment_blinding_v1(
-            &payment_keypair,
-            note,
+        assert_eq!(tx.outputs.len(), 2);
+        let recovered = recipient_derive_payment_blinding_v1(
+            &sender_payment,
+            &tx.payment_notes[1],
             DEFAULT_CHAIN_ID.as_bytes(),
-            0,
-            amount_spark,
+            1,
+            built.change_spark,
             0,
         )
         .unwrap();
-        let expected_commitment = commit(amount_spark, &recipient_side.blinding);
-
         assert_eq!(
-            tx.outputs[0].commitment.compressed_point.0,
-            expected_commitment.0
+            tx.outputs[1].commitment.compressed_point.0,
+            commit(built.change_spark, &recovered.blinding).0
         );
     }
 
     #[test]
-    fn insufficient_balance_errors() {
-        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = pubkey_hex(&spk);
-
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 100_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey: spk,
-            recipient_payment_pubkey: None,
-        };
-
-        assert!(build_transaction(&params).is_err());
+    fn malformed_or_wrong_chain_descriptor_is_rejected() {
+        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
+        let sender_payment = PaymentKeypairV1::generate();
+        for recipient_address in [
+            "not-an-address".to_string(),
+            payment_address(&test_keypair(0x63), &PaymentKeypairV1::generate())
+                .replace("indra:", "bad:"),
+        ] {
+            assert!(build_transaction(&TxParams {
+                chain_id: DEFAULT_CHAIN_ID,
+                recipient_address: &recipient_address,
+                amount_spark: 1_000_000,
+                fee_spark: MIN_FEE_SPARK,
+                wallet: &wallet,
+                hybrid_seed: seed,
+                pq_sk_bytes: pq_sk.clone(),
+                sender_pubkey: sender_pubkey.clone(),
+                sender_payment_pubkey: sender_payment.public_key(),
+            })
+            .is_err());
+        }
     }
 
     #[test]
-    fn dust_amount_rejected() {
-        let (wallet, seed, pq_sk, spk) = make_wallet_with_funds();
-        let recipient_hex = pubkey_hex(&spk);
-
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_pubkey_hex: &recipient_hex,
-            amount_spark: 1,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
-            sender_pubkey: spk,
-            recipient_payment_pubkey: None,
-        };
-
-        assert!(build_transaction(&params).is_err());
+    fn insufficient_balance_and_dust_are_rejected() {
+        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
+        let recipient_address = payment_address(&test_keypair(0x64), &PaymentKeypairV1::generate());
+        let sender_payment = PaymentKeypairV1::generate().public_key();
+        for amount_spark in [1, 100_000_000] {
+            assert!(build_transaction(&TxParams {
+                chain_id: DEFAULT_CHAIN_ID,
+                recipient_address: &recipient_address,
+                amount_spark,
+                fee_spark: MIN_FEE_SPARK,
+                wallet: &wallet,
+                hybrid_seed: seed,
+                pq_sk_bytes: pq_sk.clone(),
+                sender_pubkey: sender_pubkey.clone(),
+                sender_payment_pubkey: sender_payment.clone(),
+            })
+            .is_err());
+        }
     }
 
     #[test]

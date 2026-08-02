@@ -29,6 +29,14 @@ fn main() {
         .position(|a| a == "--output")
         .and_then(|i| args.get(i + 1))
         .map_or("keys.json", String::as_str);
+    let chain_id = args
+        .iter()
+        .position(|a| a == "--chain-id")
+        .and_then(|i| args.get(i + 1))
+        .map_or(
+            indra_core::types::primitives::DEFAULT_CHAIN_ID,
+            String::as_str,
+        );
     if indra_cli::has_secret_value_in_argv(&args, "--recover") {
         eprintln!("Error: do not pass a mnemonic in argv. Use '--recover' and enter it at the secure prompt.");
         std::process::exit(1);
@@ -162,6 +170,13 @@ fn main() {
             hex::encode(payment_pubkey.encode())
         );
     }
+    let payment_address = keys
+        .payment_address(chain_id.as_bytes())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to construct canonical payment address: {error}");
+            std::process::exit(1);
+        });
+    println!("  Payment Address:  {}", payment_address.to_text());
     println!("  Keys written to:  {}", output);
     if !plaintext_unsafe {
         println!("  Storage:          encrypted at rest");
@@ -338,7 +353,7 @@ fn keygen_password_source_slice(args: &[String]) -> indra_cli::PasswordSource<'_
 
 fn print_help() {
     println!(
-        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path | --plaintext-unsafe] [--force]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json"
+        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--chain-id id] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path | --plaintext-unsafe] [--force]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json"
     );
 }
 

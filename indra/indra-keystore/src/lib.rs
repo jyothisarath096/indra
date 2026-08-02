@@ -18,7 +18,7 @@ use chacha20poly1305::{
 use indra_crypto::{
     derive_all_seeds, generate_mnemonic,
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
-    mnemonic_to_seed, sha256, PaymentKeypairV1, PaymentPubKeyV1, VrfKeypair,
+    mnemonic_to_seed, sha256, PaymentAddress, PaymentKeypairV1, PaymentPubKeyV1, VrfKeypair,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,8 @@ pub struct KeysFile {
     pub pq_sk: Vec<u8>,
     /// Optional payment key-exchange private keypair (keep secret).
     pub payment_keypair: Option<PaymentKeypairV1>,
+    /// Ordered retained historical payment keys, oldest first.
+    pub payment_key_history: Vec<PaymentKeypairV1>,
 }
 
 /// Dedicated validator cold-key material. It contains no hot identity fields.
@@ -154,6 +156,26 @@ impl ColdKeysFile {
 }
 
 impl KeysFile {
+    /// Build this identity's canonical, self-contained payment address.
+    pub fn payment_address(&self, chain_id: &[u8]) -> KeystoreResult<PaymentAddress> {
+        let classical = ClassicalKeypair::from_seed(&self.hybrid_seed);
+        let pq = PqKeypair::from_bytes(&self.public.hybrid_pq_pk, &self.pq_sk)
+            .map_err(|error| KeystoreError::Crypto(error.to_string()))?;
+        let hybrid = HybridKeypair::new(classical, pq);
+        let payment = self.payment_keypair.as_ref().ok_or_else(|| {
+            KeystoreError::Crypto("canonical keystore is missing its payment key".to_string())
+        })?;
+        PaymentAddress::new(chain_id, &hybrid, payment.public_key())
+            .map_err(|error| KeystoreError::Crypto(error.to_string()))
+    }
+
+    /// Return the current payment key followed by retained historical keys.
+    pub fn payment_keypairs(&self) -> impl Iterator<Item = &PaymentKeypairV1> {
+        self.payment_keypair
+            .iter()
+            .chain(self.payment_key_history.iter())
+    }
+
     /// Render the legacy plaintext JSON format.
     pub fn to_json(&self) -> String {
         plaintext_json(self)
@@ -306,6 +328,7 @@ fn build_keys_file(
         vrf_seed,
         pq_sk: pq_sk_bytes,
         payment_keypair: Some(payment_keypair),
+        payment_key_history: Vec::new(),
     })
 }
 
@@ -632,6 +655,8 @@ struct PrivateJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payment_keypair: Option<String>,
     #[serde(default)]
+    payment_key_history: Vec<String>,
+    #[serde(default)]
     #[allow(dead_code)]
     warning: Option<String>,
 }
@@ -652,6 +677,11 @@ impl PrivatePayload {
                     .payment_keypair
                     .as_ref()
                     .map(|payment_keypair| hex::encode(payment_keypair.encode())),
+                payment_key_history: keys
+                    .payment_key_history
+                    .iter()
+                    .map(|keypair| hex::encode(keypair.encode()))
+                    .collect(),
                 warning: None,
             },
         }
@@ -673,6 +703,15 @@ impl PrivatePayload {
                         .map_err(|e| KeystoreError::Crypto(e.to_string()))
                 })
                 .transpose()?,
+            payment_key_history: self
+                .private
+                .payment_key_history
+                .iter()
+                .map(|value| {
+                    PaymentKeypairV1::decode(&decode_hex(value, "payment_key_history")?)
+                        .map_err(|e| KeystoreError::Crypto(e.to_string()))
+                })
+                .collect::<KeystoreResult<Vec<_>>>()?,
         })
     }
 }
@@ -940,6 +979,12 @@ fn plaintext_json(keys: &KeysFile) -> String {
         .as_ref()
         .map(|payment_keypair| format!(r#""{}""#, hex::encode(payment_keypair.encode())))
         .unwrap_or_else(|| "null".to_string());
+    let payment_key_history_json = keys
+        .payment_key_history
+        .iter()
+        .map(|keypair| format!(r#""{}""#, hex::encode(keypair.encode())))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"{{
   "name": "{name}",
@@ -956,6 +1001,7 @@ fn plaintext_json(keys: &KeysFile) -> String {
     "vrf_seed": "{v_seed}",
     "pq_sk": "{pq_sk}",
     "payment_keypair": {payment_keypair},
+    "payment_key_history": [{payment_key_history}],
     "WARNING": "Keep private seeds secret. Never share this section."
   }}
 }}"#,
@@ -969,6 +1015,7 @@ fn plaintext_json(keys: &KeysFile) -> String {
         pq_sk = hex::encode(&keys.pq_sk),
         payment_pubkey = payment_pubkey_json,
         payment_keypair = payment_keypair_json,
+        payment_key_history = payment_key_history_json,
     )
 }
 
@@ -992,6 +1039,15 @@ fn plaintext_from_json(json: &str) -> KeystoreResult<KeysFile> {
                     .map_err(|e| KeystoreError::Crypto(e.to_string()))
             })
             .transpose()?,
+        payment_key_history: parsed
+            .private
+            .payment_key_history
+            .iter()
+            .map(|value| {
+                PaymentKeypairV1::decode(&decode_hex(value, "payment_key_history")?)
+                    .map_err(|e| KeystoreError::Crypto(e.to_string()))
+            })
+            .collect::<KeystoreResult<Vec<_>>>()?,
     };
     verify_public_metadata(&keys)?;
     Ok(keys)
@@ -1418,14 +1474,17 @@ mod tests {
 
     #[test]
     fn payment_keypair_encrypted_storage_round_trip() {
-        let keys = fixture();
+        let mut keys = fixture();
+        keys.payment_key_history.push(PaymentKeypairV1::generate());
         let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         assert!(json.contains("\"payment_pubkey\""));
         assert!(!json.contains("\"payment_keypair\""));
+        assert!(!json.contains("payment_key_history"));
         assert!(!json.contains("bls_seed"));
         assert!(!json.contains("bls_pk"));
         let recovered = decrypt_encrypted_keys(&json, b"pw").unwrap();
         assert_eq!(recovered.payment_keypair, keys.payment_keypair);
+        assert_eq!(recovered.payment_key_history, keys.payment_key_history);
         assert_eq!(recovered.public.payment_pubkey, keys.public.payment_pubkey);
     }
 

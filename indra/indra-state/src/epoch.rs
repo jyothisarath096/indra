@@ -1625,11 +1625,10 @@ mod tests {
                 hard_forks::{
                     GOVERNANCE_PROPOSAL_PRUNING_HEIGHT, NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
                 },
-                payment_blinding_active, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
-                DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS,
-                ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
-                ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
+                Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
+                DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+                ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+                MAX_DELEGATION_RETURN_EVENTS, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
                 SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
@@ -2536,7 +2535,6 @@ mod tests {
         assert!(compact_stake_bond_active(post_height));
         assert!(compact_bond_pubkey_omission_active(post_height));
         assert!(delegator_identity_registry_active(post_height));
-        assert!(payment_blinding_active(post_height));
 
         let validator_id = Bytes32::from([0xB0; 32]);
         let delegator_id = Bytes32::from([0xB1; 32]);
@@ -2623,11 +2621,9 @@ mod tests {
             assert!(compact_stake_bond_active(pre_height));
             assert!(compact_bond_pubkey_omission_active(pre_height));
             assert!(delegator_identity_registry_active(pre_height));
-            assert!(payment_blinding_active(pre_height));
             assert!(compact_stake_bond_active(post_height));
             assert!(compact_bond_pubkey_omission_active(post_height));
             assert!(delegator_identity_registry_active(post_height));
-            assert!(payment_blinding_active(post_height));
 
             let validator_id = Bytes32::from([0xC0; 32]);
             let delegator_id = Bytes32::from([0xC1; 32]);

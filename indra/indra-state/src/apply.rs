@@ -41,16 +41,15 @@ use indra_core::{
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
             block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
-            epoch_transition_context_active, overflow_fix_active, payment_blinding_active,
-            slash_membership_proof_active, vrf_commit_reveal_election_active, Bytes32,
-            HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-            MAX_TX_PER_BLOCK, PROTOCOL_VERSION, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            epoch_transition_context_active, overflow_fix_active, slash_membership_proof_active,
+            vrf_commit_reveal_election_active, Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
         slash_membership::{compute_slash_membership_root, SlashMembershipRootRecord},
         slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
-        staking::StakingOpBody,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
         vrf_election::VrfElectionResult,
@@ -1045,9 +1044,6 @@ fn apply_block_inner(
         if delegator_identity_registry_active(block.header.height) {
             txn.snapshot_delegator_identity_scope();
         }
-        if matches!(op.body, StakingOpBody::RegisterPaymentKey { .. }) {
-            txn.snapshot_payment_identity_scope();
-        }
         apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
             StateError::InvariantViolation {
                 message: "staking op failed on real state after shadow validation",
@@ -1340,27 +1336,22 @@ pub fn validate_transaction(
     if tx.outputs.is_empty() {
         return Err(StateError::ZeroOutputs);
     }
-    match tx.version.0 {
-        PROTOCOL_VERSION => {
-            if !tx.payment_notes.is_empty() {
-                return Err(StateError::InvariantViolation {
-                    message: "v1 transaction cannot carry payment notes",
-                });
-            }
+    if tx.version.0 != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
+        return Err(StateError::UnsupportedTxVersion {
+            version: tx.version.0,
+        });
+    }
+    if tx.payment_notes.len() != tx.outputs.len() {
+        return Err(StateError::InvariantViolation {
+            message: "payment_notes length must equal outputs length",
+        });
+    }
+    for (output, note) in tx.outputs.iter().zip(&tx.payment_notes) {
+        if note.owner_id != indra_crypto::sha256(&output.owner_pubkey.classical_pk.0) {
+            return Err(StateError::InvariantViolation {
+                message: "payment note owner_id does not match output owner",
+            });
         }
-        TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES => {
-            if !payment_blinding_active(current_height) {
-                return Err(StateError::UnsupportedTxVersion {
-                    version: tx.version.0,
-                });
-            }
-            if tx.payment_notes.len() != tx.outputs.len() {
-                return Err(StateError::InvariantViolation {
-                    message: "payment_notes length must equal outputs length",
-                });
-            }
-        }
-        version => return Err(StateError::UnsupportedTxVersion { version }),
     }
     if tx.signature_module_id != 1 {
         return Err(StateError::UnsupportedSignatureModule {
@@ -1552,7 +1543,7 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
-                hard_forks::{DELEGATOR_IDENTITY_REGISTRY_HEIGHT, PAYMENT_BLINDING_HEIGHT},
+                hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
                 BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
                 DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
@@ -1570,7 +1561,7 @@ mod tests {
     };
     use indra_crypto::{
         commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PaymentBlindingNoteV1,
-        PaymentKeypairV1, PaymentPubKeyV1, PqKeypair, PAYMENT_VERSION_V1,
+        PqKeypair, PAYMENT_VERSION_V1,
     };
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
@@ -1625,6 +1616,25 @@ mod tests {
         }
     }
 
+    fn mandatory_note(owner_pubkey: &HybridPubKey, seed: u8) -> PaymentBlindingNoteV1 {
+        PaymentBlindingNoteV1 {
+            version: PAYMENT_VERSION_V1,
+            owner_id: sha256(&owner_pubkey.classical_pk.0),
+            payment_pubkey_hash: [seed; 32],
+            sender_x25519_ephemeral_pk: [seed.wrapping_add(1); 32],
+            ml_kem_1024_ciphertext: [seed.wrapping_add(2); 1568],
+            note_nonce: [seed.wrapping_add(3); 32],
+        }
+    }
+
+    fn staking_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
+        let public = keypair.public_key();
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical.0),
+            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+        }
+    }
+
     fn pubkey_to_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
         use indra_core::codec::Encode;
         Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
@@ -1640,64 +1650,6 @@ mod tests {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
         };
-    }
-
-    fn payment_pubkey(seed: u8) -> PaymentPubKeyV1 {
-        PaymentKeypairV1 {
-            version: PAYMENT_VERSION_V1,
-            x25519_sk: [seed; 32],
-            ml_kem_1024_seed: [seed.wrapping_add(1); 64],
-        }
-        .public_key()
-    }
-
-    fn payment_note(seed: u8) -> PaymentBlindingNoteV1 {
-        PaymentBlindingNoteV1 {
-            version: PAYMENT_VERSION_V1,
-            owner_id: [seed; 32],
-            payment_pubkey_hash: [seed.wrapping_add(1); 32],
-            sender_x25519_ephemeral_pk: [seed.wrapping_add(2); 32],
-            ml_kem_1024_ciphertext: [seed.wrapping_add(3); 1568],
-            note_nonce: [seed.wrapping_add(4); 32],
-        }
-    }
-
-    fn set_v2_payment_notes(
-        tx: &mut TransactionV1,
-        keypair: &HybridKeypair,
-        chain_id: &str,
-        payment_notes: Vec<Option<PaymentBlindingNoteV1>>,
-    ) {
-        tx.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
-        tx.payment_notes = payment_notes;
-        tx.signature = sign_transaction(keypair, chain_id, tx);
-    }
-
-    fn staking_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
-        let public = keypair.public_key();
-        HybridPubKey {
-            classical_pk: Bytes32::from(public.classical.0),
-            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
-        }
-    }
-
-    fn signed_register_payment_key_op(
-        state: &ChainState,
-        owner_keypair: &HybridKeypair,
-        payment_pubkey: PaymentPubKeyV1,
-        nonce: u64,
-    ) -> StakingOp {
-        let mut op = StakingOp {
-            body: StakingOpBody::RegisterPaymentKey {
-                owner_pubkey: staking_pubkey_from_keypair(owner_keypair),
-                payment_pubkey,
-                cold_authorization: None,
-            },
-            nonce,
-            signature: dummy_sig(),
-        };
-        sign_staking_op(owner_keypair, &state.chain_id, &mut op);
-        op
     }
 
     fn governance_validator_id(pubkey: &HybridPubKey) -> Bytes32 {
@@ -2223,7 +2175,7 @@ mod tests {
         let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
         let (owner_pubkey, _) = make_test_keypair([0x11; 32]);
         let mut tx = TransactionV1 {
-            version: ProtocolVersion::CURRENT,
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
             signature_module_id: 1,
             inputs: vec![InputV1 { utxo_id, nullifier }],
             outputs: vec![OutputV1 {
@@ -2231,11 +2183,11 @@ mod tests {
                 commitment: CommitmentV1 {
                     compressed_point: Bytes32::from(commitment.0),
                 },
-                owner_pubkey,
+                owner_pubkey: owner_pubkey.clone(),
                 range_proof: VariableBytes::from_slice(&proof).unwrap(),
                 lock_height: 0,
             }],
-            payment_notes: Vec::new(),
+            payment_notes: vec![mandatory_note(&owner_pubkey, 0x41)],
             fee_amount: fee,
             fee_blinding: Bytes32::from(fee_blinding),
             fee_commitment: CommitmentV1 {
@@ -2290,7 +2242,7 @@ mod tests {
         let fee_blinding = derive_fee_blinding(&input_blindings, &output_blindings);
         let fee_commitment = commit(fee, &fee_blinding);
         let mut tx = TransactionV1 {
-            version: ProtocolVersion::CURRENT,
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
             signature_module_id: 1,
             inputs: inputs
                 .iter()
@@ -2299,8 +2251,12 @@ mod tests {
                     nullifier: *nullifier,
                 })
                 .collect(),
+            payment_notes: outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| mandatory_note(&output.owner_pubkey, index as u8))
+                .collect(),
             outputs,
-            payment_notes: Vec::new(),
             fee_amount: fee,
             fee_blinding: Bytes32::from(fee_blinding),
             fee_commitment: CommitmentV1 {
@@ -4181,412 +4137,6 @@ mod tests {
             first.validators.get(&unenrolled_id).unwrap().status,
             ValidatorStatus::Registered
         );
-    }
-
-    #[test]
-    fn payment_key_activation_replay_is_deterministic_before_gate_and_populates_after_gate() {
-        let mut initial = ChainState::new_genesis();
-        initial.height = PAYMENT_BLINDING_HEIGHT - 2;
-        initial.tip_hash = Bytes32::ZERO;
-
-        let owner_keypair = HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[0xA6; 32]),
-            PqKeypair::from_seed(&[0xA6; 32]).unwrap(),
-        );
-        let owner_pubkey = staking_pubkey_from_keypair(&owner_keypair);
-        let owner_id = staking_delegator_id_for_test(&owner_pubkey);
-        let pre_payment_pubkey = payment_pubkey(0xA7);
-        let pre_op =
-            signed_register_payment_key_op(&initial, &owner_keypair, pre_payment_pubkey, 1);
-        let mut pre_block = make_block_at_height(&initial, vec![], PAYMENT_BLINDING_HEIGHT - 1, 0);
-        pre_block.staking_ops.push(pre_op);
-
-        let mut first_replay = initial.clone();
-        let mut second_replay = initial.clone();
-        let first_err = apply_block(&mut first_replay, &pre_block, 0).unwrap_err();
-        let second_err = apply_block(&mut second_replay, &pre_block, 0).unwrap_err();
-        assert!(
-            matches!(first_err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
-        );
-        assert!(
-            matches!(second_err, StateError::InvalidStakingOp(message) if message.contains("PAYMENT_BLINDING_HEIGHT"))
-        );
-        assert_eq!(first_replay, initial);
-        assert_eq!(second_replay, initial);
-
-        let mut activated_initial = initial.clone();
-        activated_initial.height = PAYMENT_BLINDING_HEIGHT - 1;
-        activated_initial.tip_hash = Bytes32::ZERO;
-        first_replay = activated_initial.clone();
-        second_replay = activated_initial.clone();
-
-        let post_payment_pubkey = payment_pubkey(0xA8);
-        let post_op = signed_register_payment_key_op(
-            &activated_initial,
-            &owner_keypair,
-            post_payment_pubkey.clone(),
-            1,
-        );
-        let mut post_block =
-            make_block_at_height(&activated_initial, vec![], PAYMENT_BLINDING_HEIGHT, 0);
-        post_block.staking_ops.push(post_op.clone());
-        let mut post_block_second =
-            make_block_at_height(&second_replay, vec![], PAYMENT_BLINDING_HEIGHT, 0);
-        post_block_second.staking_ops.push(post_op);
-
-        apply_block(&mut first_replay, &post_block, 0).unwrap();
-        apply_block(&mut second_replay, &post_block_second, 0).unwrap();
-        assert_eq!(first_replay, second_replay);
-        assert_eq!(
-            first_replay.payment_identities.get(&owner_id),
-            Some(&post_payment_pubkey)
-        );
-        assert_eq!(first_replay.staking_nonces.get(&owner_id), Some(&1));
-    }
-
-    #[test]
-    fn payment_notes_transaction_is_rejected_before_gate() {
-        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        state.height = PAYMENT_BLINDING_HEIGHT - 2;
-        state.tip_hash = Bytes32::ZERO;
-
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0xB1; 32]),
-        );
-        set_v2_payment_notes(
-            &mut tx,
-            &keypair,
-            &state.chain_id.clone(),
-            vec![Some(payment_note(0xB2))],
-        );
-        let block = make_block_at_height(&state, vec![tx], PAYMENT_BLINDING_HEIGHT - 1, 0);
-
-        let before = state.clone();
-        let err = apply_block(&mut state, &block, 0).unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::UnsupportedTxVersion {
-                version: TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
-            }
-        ));
-        assert_eq!(state, before);
-    }
-
-    #[test]
-    fn payment_notes_transaction_is_accepted_after_gate_and_mutates_no_new_state() {
-        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        state.height = PAYMENT_BLINDING_HEIGHT - 1;
-        state.tip_hash = Bytes32::ZERO;
-        let original_payment_registry = state.payment_identities.clone();
-
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0xB3; 32]),
-        );
-        set_v2_payment_notes(
-            &mut tx,
-            &keypair,
-            &state.chain_id.clone(),
-            vec![Some(payment_note(0xB4))],
-        );
-        let block = make_block_at_height(&state, vec![tx], PAYMENT_BLINDING_HEIGHT, 0);
-
-        apply_block(&mut state, &block, 0).unwrap();
-        assert_eq!(state.payment_identities, original_payment_registry);
-        assert!(!state.utxos.contains(&utxo_id));
-        assert!(state.nullifiers.contains(&Bytes32::from([0xB3; 32])));
-    }
-
-    #[test]
-    fn payment_notes_all_none_has_same_spendability_after_gate() {
-        let (mut initial, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        initial.height = PAYMENT_BLINDING_HEIGHT - 1;
-        initial.tip_hash = Bytes32::ZERO;
-
-        let legacy_tx = make_tx(
-            &initial,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0xB5; 32]),
-        );
-        let mut explicit_none_tx = legacy_tx.clone();
-        set_v2_payment_notes(
-            &mut explicit_none_tx,
-            &keypair,
-            &initial.chain_id.clone(),
-            vec![None],
-        );
-
-        let mut legacy_state = initial.clone();
-        let legacy_block =
-            make_block_at_height(&legacy_state, vec![legacy_tx], PAYMENT_BLINDING_HEIGHT, 0);
-        apply_block(&mut legacy_state, &legacy_block, 0).unwrap();
-
-        let mut explicit_none_state = initial;
-        let explicit_none_block = make_block_at_height(
-            &explicit_none_state,
-            vec![explicit_none_tx],
-            PAYMENT_BLINDING_HEIGHT,
-            0,
-        );
-        apply_block(&mut explicit_none_state, &explicit_none_block, 0).unwrap();
-
-        assert_eq!(legacy_state.total_supply, explicit_none_state.total_supply);
-        assert_eq!(legacy_state.burn_buffer, explicit_none_state.burn_buffer);
-        assert_eq!(
-            legacy_state.fee_reward_pool,
-            explicit_none_state.fee_reward_pool
-        );
-        assert_eq!(
-            legacy_state.utxos.all_entries().count(),
-            explicit_none_state.utxos.all_entries().count()
-        );
-        assert_eq!(
-            legacy_state
-                .utxos
-                .all_entries()
-                .map(|entry| entry.output.value_spark)
-                .collect::<Vec<_>>(),
-            explicit_none_state
-                .utxos
-                .all_entries()
-                .map(|entry| entry.output.value_spark)
-                .collect::<Vec<_>>()
-        );
-        assert!(!legacy_state.utxos.contains(&utxo_id));
-        assert!(!explicit_none_state.utxos.contains(&utxo_id));
-    }
-
-    #[test]
-    fn payment_notes_activation_boundary_replay_is_deterministic_for_mixed_transactions() {
-        let mut initial = ChainState::new_genesis();
-        initial.height = PAYMENT_BLINDING_HEIGHT - 1;
-        initial.tip_hash = Bytes32::ZERO;
-        let (owner_pubkey, keypair) = make_test_keypair([0xB6; 32]);
-        let mut inputs = Vec::new();
-        for index in 0..3u8 {
-            let input_blinding = [0xB7u8.wrapping_add(index); 32];
-            let output = output_with_value(
-                TEST_INPUT_VALUE + index as u64,
-                owner_pubkey.clone(),
-                0xB7u8.wrapping_add(index),
-            );
-            let utxo_id = initial.utxos.insert(output, 0, 0, index as u32).unwrap();
-            inputs.push((utxo_id, TEST_INPUT_VALUE + index as u64, input_blinding));
-        }
-
-        let legacy_tx = make_tx(
-            &initial,
-            &keypair,
-            inputs[0].0,
-            inputs[0].1,
-            inputs[0].2,
-            Bytes32::from([0xBA; 32]),
-        );
-        let mut noted_tx = make_tx(
-            &initial,
-            &keypair,
-            inputs[1].0,
-            inputs[1].1,
-            inputs[1].2,
-            Bytes32::from([0xBB; 32]),
-        );
-        set_v2_payment_notes(
-            &mut noted_tx,
-            &keypair,
-            &initial.chain_id.clone(),
-            vec![Some(payment_note(0xBC))],
-        );
-        let mut all_none_tx = make_tx(
-            &initial,
-            &keypair,
-            inputs[2].0,
-            inputs[2].1,
-            inputs[2].2,
-            Bytes32::from([0xBD; 32]),
-        );
-        set_v2_payment_notes(
-            &mut all_none_tx,
-            &keypair,
-            &initial.chain_id.clone(),
-            vec![None],
-        );
-
-        let mut first_replay = initial.clone();
-        let mut second_replay = initial;
-        let first_block = make_block_at_height(
-            &first_replay,
-            vec![legacy_tx.clone(), noted_tx.clone(), all_none_tx.clone()],
-            PAYMENT_BLINDING_HEIGHT,
-            0,
-        );
-        let second_block = make_block_at_height(
-            &second_replay,
-            vec![legacy_tx, noted_tx, all_none_tx],
-            PAYMENT_BLINDING_HEIGHT,
-            0,
-        );
-
-        apply_block(&mut first_replay, &first_block, 0).unwrap();
-        apply_block(&mut second_replay, &second_block, 0).unwrap();
-        assert_eq!(first_replay, second_replay);
-    }
-
-    #[test]
-    fn payment_blinding_capstone_cross_gate_block_sequence_is_deterministic() {
-        let mut initial = ChainState::new_genesis();
-        initial.height = PAYMENT_BLINDING_HEIGHT - 2;
-        initial.tip_hash = Bytes32::ZERO;
-        let (tx_owner_pubkey, tx_keypair) = make_test_keypair([0xC0; 32]);
-        let mut spendable = Vec::new();
-        for index in 0..4u8 {
-            let blinding = [0xC1u8.wrapping_add(index); 32];
-            let output = output_with_value(
-                TEST_INPUT_VALUE + 50_000 + index as u64,
-                tx_owner_pubkey.clone(),
-                0xC1u8.wrapping_add(index),
-            );
-            let utxo_id = initial.utxos.insert(output, 0, 10, index as u32).unwrap();
-            spendable.push((utxo_id, TEST_INPUT_VALUE + 50_000 + index as u64, blinding));
-        }
-
-        let pre_gate_tx = make_tx(
-            &initial,
-            &tx_keypair,
-            spendable[0].0,
-            spendable[0].1,
-            spendable[0].2,
-            Bytes32::from([0xD0; 32]),
-        );
-        let pre_gate_tx_bytes = pre_gate_tx.encode_to_vec();
-        let pre_gate_block = make_block_at_height(
-            &initial,
-            vec![pre_gate_tx.clone()],
-            PAYMENT_BLINDING_HEIGHT - 1,
-            111,
-        );
-        let mut first = initial.clone();
-        let mut second = initial;
-        apply_block(&mut first, &pre_gate_block, 0).unwrap();
-        apply_block(&mut second, &pre_gate_block, 0).unwrap();
-        assert_eq!(pre_gate_tx.encode_to_vec(), pre_gate_tx_bytes);
-        assert_same_consensus_state(&first, &second);
-        assert!(first.payment_identities.is_empty());
-
-        let mut post_base = first;
-        let (registered_validator_op, registered_validator_id) =
-            signed_register_validator_op(&mut post_base, [0xD1; 32], 1);
-        let (governance_pubkey, governance_keypair, governance_validator_id) =
-            install_governance_validator(&mut post_base, [0xD2; 32], 10_000_000_000);
-        let governance_deposit_id = post_base
-            .utxos
-            .insert(
-                governance_deposit_output(
-                    governance_pubkey.clone(),
-                    post_base.governance.params.proposal_deposit_spark,
-                ),
-                0,
-                11,
-                0,
-            )
-            .unwrap();
-
-        let legacy_post_gate_tx = make_tx(
-            &post_base,
-            &tx_keypair,
-            spendable[1].0,
-            spendable[1].1,
-            spendable[1].2,
-            Bytes32::from([0xD3; 32]),
-        );
-        let mut noted_post_gate_tx = make_tx(
-            &post_base,
-            &tx_keypair,
-            spendable[2].0,
-            spendable[2].1,
-            spendable[2].2,
-            Bytes32::from([0xD4; 32]),
-        );
-        set_v2_payment_notes(
-            &mut noted_post_gate_tx,
-            &tx_keypair,
-            &post_base.chain_id.clone(),
-            vec![Some(payment_note(0xD5))],
-        );
-        let mut all_none_post_gate_tx = make_tx(
-            &post_base,
-            &tx_keypair,
-            spendable[3].0,
-            spendable[3].1,
-            spendable[3].2,
-            Bytes32::from([0xD6; 32]),
-        );
-        set_v2_payment_notes(
-            &mut all_none_post_gate_tx,
-            &tx_keypair,
-            &post_base.chain_id.clone(),
-            vec![None],
-        );
-
-        let (payment_owner_pubkey, payment_owner_keypair) = make_test_keypair([0xD7; 32]);
-        let payment_owner_id = Bytes32::from(sha256(&payment_owner_pubkey.classical_pk.0));
-        let payment_key = payment_pubkey(0xD8);
-        let register_payment_op = signed_register_payment_key_op(
-            &post_base,
-            &payment_owner_keypair,
-            payment_key.clone(),
-            1,
-        );
-        let governance_op = governance_propose_op(
-            governance_validator_id,
-            &governance_keypair,
-            governance_pubkey,
-            governance_deposit_id,
-            1,
-            GovernableAction::SetMinDelegationSpark {
-                value: DUST_LIMIT_SPARK,
-            },
-        );
-
-        let mut post_block = make_block_at_height(
-            &post_base,
-            vec![
-                legacy_post_gate_tx,
-                noted_post_gate_tx,
-                all_none_post_gate_tx,
-            ],
-            PAYMENT_BLINDING_HEIGHT,
-            222,
-        );
-        post_block.staking_ops = vec![register_payment_op, registered_validator_op];
-        post_block.governance_ops = vec![governance_op];
-
-        let mut first_post_replay = post_base.clone();
-        let mut second_post_replay = post_base;
-        apply_block(&mut first_post_replay, &post_block, 0).unwrap();
-        apply_block(&mut second_post_replay, &post_block, 0).unwrap();
-
-        assert_same_consensus_state(&first_post_replay, &second_post_replay);
-        assert_eq!(
-            first_post_replay.payment_identities.get(&payment_owner_id),
-            Some(&payment_key)
-        );
-        assert!(first_post_replay
-            .validators
-            .get(&registered_validator_id)
-            .is_some());
-        assert_eq!(first_post_replay.governance.proposals.len(), 1);
     }
 
     #[test]

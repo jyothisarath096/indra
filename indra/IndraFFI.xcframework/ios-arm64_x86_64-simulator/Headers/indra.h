@@ -61,39 +61,15 @@ typedef struct {
 } IndraUtxoEntry;
 
 typedef struct {
-    const uint8_t* recipient_classical_pk;
+    const uint8_t* recipient_address;
+    size_t         recipient_address_len;
     uint64_t       amount_spark;
     uint64_t       fee_spark;
     const IndraUtxoEntry* utxos;
     size_t         utxo_count;
     IndraKeyHandle sender_handle;
-} IndraTxParamsV2;
-
-typedef struct {
-    const uint8_t* recipient_classical_pk;
-    uint64_t       amount_spark;
-    uint64_t       fee_spark;
-    const IndraUtxoEntry* utxos;
-    size_t         utxo_count;
-    IndraKeyHandle sender_handle;
-    /* Nullable. When non-null, points to INDRA_PAYMENT_PUBKEY_V1_BYTES bytes. */
-    const uint8_t* recipient_payment_pubkey;
     const char*    chain_id;
-} IndraTxParamsV3;
-
-typedef struct {
-    const uint8_t* recipient_classical_pk;
-    const uint8_t* recipient_pq_pk;
-    size_t         recipient_pq_pk_len;
-    uint64_t       amount_spark;
-    uint64_t       fee_spark;
-    const IndraUtxoEntry* utxos;
-    size_t         utxo_count;
-    IndraKeyHandle sender_handle;
-    /* Nullable. When non-null, points to INDRA_PAYMENT_PUBKEY_V1_BYTES bytes. */
-    const uint8_t* recipient_payment_pubkey;
-    const char*    chain_id;
-} IndraTxParamsV4;
+} IndraTxParams;
 
 typedef struct {
     uint8_t  tx_id[INDRA_TX_ID_BYTES];
@@ -155,22 +131,12 @@ int32_t indra_validator_id(
 );
 
 int32_t indra_build_tx_with_handle(
-    const IndraTxParamsV2* params,
-    IndraTxResult* out
-);
-
-int32_t indra_build_tx_with_payment_with_handle(
-    const IndraTxParamsV3* params,
-    IndraTxResult* out
-);
-
-int32_t indra_build_tx_v4_with_handle(
-    const IndraTxParamsV4* params,
+    const IndraTxParams* params,
     IndraTxResult* out
 );
 
 int32_t indra_derive_payment_note(
-    const uint8_t* recipient_payment_pubkey,
+    const uint8_t* payment_pubkey,
     const uint8_t* owner_id,
     const char* chain_id,
     uint32_t output_index,
@@ -224,15 +190,6 @@ int32_t indra_build_register_validator_with_handle(
     uint64_t bond_value_spark,
     const uint8_t* bond_blinding_factor,
     IndraKeyHandle handle,
-    uint64_t nonce,
-    const char* chain_id,
-    char* out_hex,
-    size_t out_len
-);
-
-int32_t indra_build_register_payment_key_with_handle(
-    IndraKeyHandle handle,
-    const uint8_t* payment_pubkey,
     uint64_t nonce,
     const char* chain_id,
     char* out_hex,

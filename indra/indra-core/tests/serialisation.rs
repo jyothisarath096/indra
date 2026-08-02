@@ -7,7 +7,7 @@ use indra_core::codec::{Decode, Encode};
 use indra_core::types::primitives::{
     DUST_LIMIT_SPARK, FEE_BURN_BPS, FEE_VALIDATOR_BPS, GENESIS_SUPPLY_INDRA, GENESIS_SUPPLY_SPARK,
     HARD_CAP_SPARK, MAX_INPUTS, MAX_OUTPUTS, MIN_BASE_FEE_SPARK_PER_KB, SPARK_PER_INDRA,
-    VALIDATOR_REWARDS_POOL_SPARK,
+    TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, VALIDATOR_REWARDS_POOL_SPARK,
 };
 use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
 use indra_core::types::vote::VoteStep;
@@ -16,6 +16,7 @@ use indra_core::{
     BlockHeaderV1, BlockV1, Bytes32, CheckpointV1, CommitmentV1, HybridPubKey, HybridSignature,
     InputV1, OutputV1, ProtocolVersion, QuorumCertificateV1, TransactionV1, VariableBytes, VoteV1,
 };
+use indra_crypto::{constants::ML_KEM_1024_CT_BYTES, sha256, PaymentBlindingNoteV1};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,13 +57,24 @@ fn output(c: u8) -> OutputV1 {
     }
 }
 
+fn note() -> PaymentBlindingNoteV1 {
+    PaymentBlindingNoteV1 {
+        version: 1,
+        owner_id: sha256(&pubkey().classical_pk.0),
+        payment_pubkey_hash: [0; 32],
+        sender_x25519_ephemeral_pk: [0; 32],
+        ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+        note_nonce: [0; 32],
+    }
+}
+
 fn minimal_tx() -> TransactionV1 {
     TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![input(0x01, 0x02)],
         outputs: vec![output(0x03)],
-        payment_notes: Vec::new(),
+        payment_notes: vec![note()],
         fee_amount: 1_000,
         fee_blinding: Bytes32::ZERO,
         fee_commitment: commitment(0x00),
@@ -129,6 +141,7 @@ fn transaction_max_inputs_and_outputs() {
         .map(|i| input(i, i.wrapping_add(100)))
         .collect();
     tx.outputs = (0..MAX_OUTPUTS as u8).map(|i| output(i)).collect();
+    tx.payment_notes = (0..MAX_OUTPUTS).map(|_| note()).collect();
     assert_eq!(
         tx,
         TransactionV1::decode_exact(&tx.encode_to_vec()).unwrap()

@@ -568,20 +568,6 @@ pub mod hard_forks {
     /// reuse this testnet activation height for mainnet.
     pub const DELEGATOR_IDENTITY_REGISTRY_HEIGHT: u64 = 171_000;
 
-    /// Payment blinding key registry and RegisterPaymentKey operation.
-    ///
-    /// Testnet activation height for the payment-blinding key registry and
-    /// RegisterPaymentKey operation. At/after activation, an owner may publish
-    /// or rotate their current payment key-exchange public key in canonical
-    /// chain state.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
-    /// no per-chain-ID differentiation. Before building mainnet genesis, this
-    /// MUST be deliberately reset to the correct mainnet value (often 0 if the
-    /// registry should be active from mainnet's first block). Do not silently
-    /// reuse this testnet activation height for mainnet.
-    pub const PAYMENT_BLINDING_HEIGHT: u64 = 175_050;
-
     /// Compact stake-bond records omit embedded owner pubkeys for newly created bonds.
     ///
     /// Testnet activation height for omitting embedded owner pubkeys from newly
@@ -839,12 +825,6 @@ pub fn delegator_identity_registry_active(height: u64) -> bool {
     height >= hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT
 }
 
-/// Whether payment blinding key registration is active.
-#[inline]
-pub fn payment_blinding_active(height: u64) -> bool {
-    height >= hard_forks::PAYMENT_BLINDING_HEIGHT
-}
-
 /// Whether newly created stake-bond records omit their embedded owner pubkey.
 #[inline]
 pub fn compact_bond_pubkey_omission_active(height: u64) -> bool {
@@ -1054,7 +1034,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// This reuses the existing in-transaction `ProtocolVersion` field rather than
 /// introducing a wrapper format. Version 1 transactions remain byte-identical;
 /// version 2 transactions encode the payment-notes tail and are admitted only
-/// at/after `PAYMENT_BLINDING_HEIGHT`.
+/// Canonical transaction format carrying mandatory payment notes.
 pub const TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES: u16 = 2;
 
 /// Block protocol version used at/after REVEAL_SET_COMMITMENT_HEIGHT.

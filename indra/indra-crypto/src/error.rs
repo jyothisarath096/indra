@@ -97,6 +97,13 @@ pub enum CryptoError {
     /// Payment blinding note did not target the provided recipient keypair.
     #[error("payment blinding note target hash does not match recipient payment key")]
     PaymentKeyHashMismatch,
+
+    /// A payment address failed canonical decoding or validation.
+    #[error("invalid payment address: {reason}")]
+    InvalidPaymentAddress {
+        /// Static validation failure reason.
+        reason: &'static str,
+    },
 }
 
 /// Convenience alias.

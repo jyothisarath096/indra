@@ -12,6 +12,7 @@ pub mod hash;
 pub mod hybrid;
 pub mod mnemonic;
 pub mod payment;
+pub mod payment_address;
 pub mod pedersen;
 pub mod vrf;
 
@@ -36,6 +37,9 @@ pub use payment::{
     PaymentKeypairV1, PaymentPubKeyV1, RecipientPaymentBlindingV1, SenderPaymentBlindingV1,
     PAYMENT_BLINDING_CONTEXT_V1, PAYMENT_KEYPAIR_V1_ENCODED_LEN, PAYMENT_NOTE_V1_ENCODED_LEN,
     PAYMENT_PUBKEY_V1_ENCODED_LEN, PAYMENT_VERSION_V1,
+};
+pub use payment_address::{
+    PaymentAddress, PAYMENT_ADDRESS_DOMAIN, PAYMENT_ADDRESS_TEXT_PREFIX, PAYMENT_ADDRESS_VERSION,
 };
 pub use pedersen::{commit, verify_opening, PedersenCommitment, PedersenOpening};
 pub use vrf::{validate_vrf_public_key, vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};

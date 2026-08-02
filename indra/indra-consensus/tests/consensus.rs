@@ -13,14 +13,17 @@ use indra_consensus::{
 use indra_core::{
     types::{
         crypto::HybridSignature,
-        primitives::DEFAULT_CHAIN_ID,
+        primitives::{DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
         vrf_election::VrfElectionResult,
     },
     Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
 };
-use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::{
+    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
+    PaymentBlindingNoteV1, PqKeypair,
+};
 use indra_state::ChainState;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -75,14 +78,21 @@ fn dummy_tx(
     let fee_blinding = derive_fee_blinding([nonce; 32], output_blinding);
     let fee_commitment = commit(fee, &fee_blinding);
     let mut tx = TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id,
             nullifier: Bytes32::from([nonce; 32]),
         }],
-        outputs: vec![dummy_output(nonce, output_value, owner_pubkey)],
-        payment_notes: Vec::new(),
+        outputs: vec![dummy_output(nonce, output_value, owner_pubkey.clone())],
+        payment_notes: vec![PaymentBlindingNoteV1 {
+            version: 1,
+            owner_id: sha256(&owner_pubkey.classical_pk.0),
+            payment_pubkey_hash: [0; 32],
+            sender_x25519_ephemeral_pk: [0; 32],
+            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+            note_nonce: [0; 32],
+        }],
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {

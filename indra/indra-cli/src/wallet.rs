@@ -10,7 +10,7 @@
 //! Format: wallet.json
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -46,6 +46,8 @@ pub struct WalletEntry {
     pub out_index: u32,
     /// Whether this UTXO has been spent (pending confirmation).
     pub spent: bool,
+    /// Confirmed block height that spent this entry, if discovered by scanning.
+    pub spent_height: Option<u64>,
 }
 
 impl WalletEntry {
@@ -75,6 +77,8 @@ pub struct PendingChange {
 pub struct Wallet {
     entries: HashMap<Bytes32, WalletEntry>,
     pending_changes: Vec<PendingChange>,
+    scan_block_hashes: BTreeMap<u64, Bytes32>,
+    payment_key_hashes: Vec<[u8; 32]>,
 }
 
 impl Wallet {
@@ -83,6 +87,8 @@ impl Wallet {
         Self {
             entries: HashMap::new(),
             pending_changes: Vec::new(),
+            scan_block_hashes: BTreeMap::new(),
+            payment_key_hashes: Vec::new(),
         }
     }
 
@@ -106,6 +112,7 @@ impl Wallet {
                 tx_index,
                 out_index,
                 spent: false,
+                spent_height: None,
             },
         );
     }
@@ -114,7 +121,50 @@ impl Wallet {
     pub fn mark_spent(&mut self, utxo_id: &Bytes32) {
         if let Some(entry) = self.entries.get_mut(utxo_id) {
             entry.spent = true;
+            entry.spent_height = None;
         }
+    }
+
+    /// Mark an entry spent by a confirmed canonical block.
+    pub fn mark_spent_at_height(&mut self, utxo_id: &Bytes32, height: u64) {
+        if let Some(entry) = self.entries.get_mut(utxo_id) {
+            entry.spent = true;
+            entry.spent_height = Some(height);
+        }
+    }
+
+    /// Record public scan metadata for one canonical block.
+    pub fn record_scanned_block(&mut self, height: u64, hash: Bytes32) {
+        self.scan_block_hashes.insert(height, hash);
+    }
+
+    /// Return the latest recorded canonical scan anchor.
+    pub fn scan_tip(&self) -> Option<(u64, Bytes32)> {
+        self.scan_block_hashes
+            .last_key_value()
+            .map(|(height, hash)| (*height, *hash))
+    }
+
+    /// Replace the public payment-key hash index used by local scanning.
+    pub fn set_payment_key_hashes(&mut self, hashes: Vec<[u8; 32]>) {
+        self.payment_key_hashes = hashes;
+    }
+
+    /// Roll back discoveries and confirmed spends at or above a reorg height.
+    pub fn rollback_scan_from(&mut self, height: u64) {
+        self.entries
+            .retain(|_, entry| entry.created_height < height);
+        for entry in self.entries.values_mut() {
+            if entry
+                .spent_height
+                .is_some_and(|spent_height| spent_height >= height)
+            {
+                entry.spent = false;
+                entry.spent_height = None;
+            }
+        }
+        self.scan_block_hashes
+            .retain(|block_height, _| *block_height < height);
     }
 
     /// Mark accepted transaction inputs spent and record any pending change.
@@ -224,7 +274,7 @@ impl Wallet {
     pub fn to_json(&self) -> String {
         let entries: Vec<String> = self.entries.values().map(|e| {
             format!(
-                r#"  {{"utxo_id":"{}","value_spark":{},"blinding":"{}","created_height":{},"tx_index":{},"out_index":{},"spent":{}}}"#,
+                r#"  {{"utxo_id":"{}","value_spark":{},"blinding":"{}","created_height":{},"tx_index":{},"out_index":{},"spent":{},"spent_height":{}}}"#,
                 hex::encode(e.utxo_id.0),
                 e.value_spark,
                 hex::encode(e.blinding),
@@ -232,6 +282,7 @@ impl Wallet {
                 e.tx_index,
                 e.out_index,
                 e.spent,
+                e.spent_height.map_or_else(|| "null".to_string(), |height| height.to_string()),
             )
         }).collect();
         let pending: Vec<String> = self
@@ -246,10 +297,28 @@ impl Wallet {
             })
             .collect();
 
+        let scan_blocks = self
+            .scan_block_hashes
+            .iter()
+            .map(|(height, hash)| {
+                format!(
+                    r#"  {{"height":{},"hash":"{}"}}"#,
+                    height,
+                    hex::encode(hash.0)
+                )
+            })
+            .collect::<Vec<_>>();
+        let payment_hashes = self
+            .payment_key_hashes
+            .iter()
+            .map(|hash| format!(r#""{}""#, hex::encode(hash)))
+            .collect::<Vec<_>>();
         format!(
-            "{{\n  \"entries\": [\n{}\n  ],\n  \"pending_changes\": [\n{}\n  ]\n}}",
+            "{{\n  \"entries\": [\n{}\n  ],\n  \"pending_changes\": [\n{}\n  ],\n  \"scan_blocks\": [\n{}\n  ],\n  \"payment_key_hashes\": [{}]\n}}",
             entries.join(",\n"),
             pending.join(",\n"),
+            scan_blocks.join(",\n"),
+            payment_hashes.join(","),
         )
     }
 
@@ -284,6 +353,7 @@ impl Wallet {
             let tx_idx = parse_u64_field(obj, "tx_index")? as u32;
             let out_idx = parse_u64_field(obj, "out_index")? as u32;
             let spent = obj.contains("\"spent\":true");
+            let spent_height = parse_optional_u64_field(obj, "spent_height")?;
 
             let id_bytes =
                 hex::decode(&utxo_id).map_err(|_| CliError::Parse("bad utxo_id hex".into()))?;
@@ -310,8 +380,49 @@ impl Wallet {
                     tx_index: tx_idx,
                     out_index: out_idx,
                     spent,
+                    spent_height,
                 },
             );
+        }
+
+        if let Some(scan_json) = extract_array(json, "scan_blocks") {
+            let mut pos = 0;
+            while let Some(offset) = scan_json[pos..].find('{') {
+                let start = pos + offset;
+                let end = scan_json[start..]
+                    .find('}')
+                    .ok_or_else(|| CliError::Parse("bad scan block metadata".into()))?
+                    + start
+                    + 1;
+                let object = &scan_json[start..end];
+                let height = parse_u64_field(object, "height")?;
+                let bytes = hex::decode(parse_str_field(object, "hash")?)
+                    .map_err(|_| CliError::Parse("bad scan block hash".into()))?;
+                if bytes.len() != 32 {
+                    return Err(CliError::Parse("bad scan block hash length".into()));
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&bytes);
+                wallet.scan_block_hashes.insert(height, Bytes32::from(hash));
+                pos = end;
+            }
+        }
+        if let Some(hashes_json) = extract_array(json, "payment_key_hashes") {
+            for raw in hashes_json
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let value = raw.trim_matches('"');
+                let bytes = hex::decode(value)
+                    .map_err(|_| CliError::Parse("bad payment key hash".into()))?;
+                if bytes.len() != 32 {
+                    return Err(CliError::Parse("bad payment key hash length".into()));
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&bytes);
+                wallet.payment_key_hashes.push(hash);
+            }
         }
 
         if let Some(pending_json) = extract_array(json, "pending_changes") {
@@ -476,6 +587,25 @@ fn parse_u64_field(json: &str, field: &str) -> CliResult<u64> {
     let after = json[pos + key.len()..].trim_start();
     let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse::<u64>()
+        .map_err(|_| CliError::Parse(format!("bad number: {field}")))
+}
+
+fn parse_optional_u64_field(json: &str, field: &str) -> CliResult<Option<u64>> {
+    let key = format!("\"{field}\":");
+    let Some(pos) = json.find(&key) else {
+        return Ok(None);
+    };
+    let after = json[pos + key.len()..].trim_start();
+    if after.starts_with("null") {
+        return Ok(None);
+    }
+    let number = after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    number
+        .parse::<u64>()
+        .map(Some)
         .map_err(|_| CliError::Parse(format!("bad number: {field}")))
 }
 

@@ -14,8 +14,8 @@ use crate::{
     types::{
         crypto::{CommitmentV1, HybridPubKey, HybridSignature},
         primitives::{
-            payment_blinding_active, Bytes32, ProtocolVersion, VariableBytes, DUST_LIMIT_SPARK,
-            MAX_CHAIN_ID_BYTES, MAX_INPUTS, MAX_OUTPUTS, MAX_RANGE_PROOF_BYTES, PROTOCOL_VERSION,
+            Bytes32, ProtocolVersion, VariableBytes, DUST_LIMIT_SPARK, MAX_CHAIN_ID_BYTES,
+            MAX_INPUTS, MAX_OUTPUTS, MAX_RANGE_PROOF_BYTES,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
         },
     },
@@ -104,37 +104,24 @@ impl Decode for OutputV1 {
     }
 }
 
-impl Encode for Option<PaymentBlindingNoteV1> {
+impl Encode for PaymentBlindingNoteV1 {
     fn encode(&self, buf: &mut Vec<u8>) {
-        match self {
-            Some(note) => {
-                1u8.encode(buf);
-                buf.extend_from_slice(&note.encode());
-            }
-            None => 0u8.encode(buf),
-        }
+        buf.extend_from_slice(&PaymentBlindingNoteV1::encode(self));
     }
 
     fn encoded_len(&self) -> usize {
-        1 + self.as_ref().map(|note| note.encode().len()).unwrap_or(0)
+        indra_crypto::PAYMENT_NOTE_V1_ENCODED_LEN
     }
 }
 
-impl Decode for Option<PaymentBlindingNoteV1> {
+impl Decode for PaymentBlindingNoteV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        match u8::decode(r)? {
-            0 => Ok(None),
-            1 => {
-                let bytes = r.read_bytes(indra_crypto::PAYMENT_NOTE_V1_ENCODED_LEN)?;
-                let note = PaymentBlindingNoteV1::decode(bytes).map_err(|_| {
-                    IndraError::InvalidTransaction(
-                        "payment_notes contains malformed payment blinding note".into(),
-                    )
-                })?;
-                Ok(Some(note))
-            }
-            byte => Err(IndraError::InvalidBool { byte }),
-        }
+        let bytes = r.read_bytes(indra_crypto::PAYMENT_NOTE_V1_ENCODED_LEN)?;
+        PaymentBlindingNoteV1::decode(bytes).map_err(|_| {
+            IndraError::InvalidTransaction(
+                "payment_notes contains malformed payment blinding note".into(),
+            )
+        })
     }
 }
 
@@ -155,11 +142,8 @@ pub struct TransactionV1 {
     pub inputs: Vec<InputV1>,
     /// Outputs created (1–16).
     pub outputs: Vec<OutputV1>,
-    /// Optional payment-blinding delivery note for each output.
-    ///
-    /// Version 1 transactions leave this empty and encode exactly as before.
-    /// Version 2 transactions encode one optional slot per output.
-    pub payment_notes: Vec<Option<PaymentBlindingNoteV1>>,
+    /// Mandatory payment-blinding delivery note corresponding to each output.
+    pub payment_notes: Vec<PaymentBlindingNoteV1>,
     /// PUBLIC: fee in Spark. Validators verify this covers the base fee.
     pub fee_amount: u64,
     /// Pedersen blinding factor for the fee commitment.
@@ -206,27 +190,23 @@ impl TransactionV1 {
                 });
             }
         }
-        match self.version.0 {
-            PROTOCOL_VERSION => {
-                if !self.payment_notes.is_empty() {
-                    return Err(IndraError::InvalidTransaction(
-                        "payment notes require transaction protocol version 2".into(),
-                    ));
-                }
+        let _ = height;
+        if self.version.0 != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
+            return Err(IndraError::UnsupportedVersion {
+                version: self.version.0,
+            });
+        }
+        if self.payment_notes.len() != self.outputs.len() {
+            return Err(IndraError::InvalidTransaction(
+                "payment_notes length must equal outputs length".into(),
+            ));
+        }
+        for (output, note) in self.outputs.iter().zip(&self.payment_notes) {
+            if note.owner_id != sha256(&output.owner_pubkey.classical_pk.0) {
+                return Err(IndraError::InvalidTransaction(
+                    "payment note owner_id does not match output owner".into(),
+                ));
             }
-            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES => {
-                if !payment_blinding_active(height) {
-                    return Err(IndraError::InvalidTransaction(
-                        "payment notes are not active before PAYMENT_BLINDING_HEIGHT".into(),
-                    ));
-                }
-                if self.payment_notes.len() != self.outputs.len() {
-                    return Err(IndraError::InvalidTransaction(
-                        "payment_notes length must equal outputs length".into(),
-                    ));
-                }
-            }
-            version => return Err(IndraError::UnsupportedVersion { version }),
         }
         // No duplicate nullifiers within this transaction
         let mut seen: BTreeSet<Bytes32> = BTreeSet::new();
@@ -269,9 +249,7 @@ impl TransactionV1 {
         self.signature_module_id.encode(&mut buf);
         encode_list(&self.inputs, &mut buf);
         encode_list(&self.outputs, &mut buf);
-        if self.version.0 >= TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
-            encode_list(&self.payment_notes, &mut buf);
-        }
+        encode_list(&self.payment_notes, &mut buf);
         self.fee_amount.encode(&mut buf);
         self.fee_blinding.encode(&mut buf);
         self.fee_commitment.encode(&mut buf);
@@ -290,9 +268,7 @@ impl Encode for TransactionV1 {
         self.signature_module_id.encode(buf);
         encode_list(&self.inputs, buf);
         encode_list(&self.outputs, buf);
-        if self.version.0 >= TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
-            encode_list(&self.payment_notes, buf);
-        }
+        encode_list(&self.payment_notes, buf);
         self.fee_amount.encode(buf);
         self.fee_blinding.encode(buf);
         self.fee_commitment.encode(buf);
@@ -302,11 +278,7 @@ impl Encode for TransactionV1 {
         2 + 2
             + list_encoded_len(&self.inputs)
             + list_encoded_len(&self.outputs)
-            + if self.version.0 >= TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
-                list_encoded_len(&self.payment_notes)
-            } else {
-                0
-            }
+            + list_encoded_len(&self.payment_notes)
             + 8
             + 32
             + self.fee_commitment.encoded_len()
@@ -320,11 +292,10 @@ impl Decode for TransactionV1 {
         let signature_module_id = u16::decode(r)?;
         let inputs = decode_list(r, MAX_INPUTS, "inputs")?;
         let outputs = decode_list(r, MAX_OUTPUTS, "outputs")?;
-        let payment_notes = if version.0 >= TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
-            decode_list(r, MAX_OUTPUTS, "payment_notes")?
-        } else {
-            Vec::new()
-        };
+        if version.0 != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
+            return Err(IndraError::UnsupportedVersion { version: version.0 });
+        }
+        let payment_notes = decode_list(r, MAX_OUTPUTS, "payment_notes")?;
         Ok(Self {
             version,
             signature_module_id,
@@ -344,7 +315,6 @@ mod tests {
     use super::*;
     use crate::codec::Decode;
     use crate::codec::Encode;
-    use crate::types::primitives::hard_forks::PAYMENT_BLINDING_HEIGHT;
 
     fn dummy_pubkey() -> HybridPubKey {
         HybridPubKey {
@@ -362,7 +332,7 @@ mod tests {
 
     fn minimal_tx() -> TransactionV1 {
         TransactionV1 {
-            version: ProtocolVersion::CURRENT,
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([0x01u8; 32]),
@@ -377,7 +347,7 @@ mod tests {
                 range_proof: VariableBytes::from_slice(&[0u8; 674]).unwrap(),
                 lock_height: 0,
             }],
-            payment_notes: Vec::new(),
+            payment_notes: vec![note_for_owner(sha256(&[0u8; 32]), 0x10)],
             fee_amount: 500,
             fee_blinding: Bytes32::ZERO,
             fee_commitment: CommitmentV1 {
@@ -387,10 +357,10 @@ mod tests {
         }
     }
 
-    fn note(seed: u8) -> PaymentBlindingNoteV1 {
+    fn note_for_owner(owner_id: [u8; 32], seed: u8) -> PaymentBlindingNoteV1 {
         PaymentBlindingNoteV1 {
             version: indra_crypto::PAYMENT_VERSION_V1,
-            owner_id: [seed; 32],
+            owner_id,
             payment_pubkey_hash: [seed.wrapping_add(1); 32],
             sender_x25519_ephemeral_pk: [seed.wrapping_add(2); 32],
             ml_kem_1024_ciphertext: [seed.wrapping_add(3); 1568],
@@ -454,13 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn v1_transaction_encoding_is_byte_identical_without_payment_notes() {
+    fn canonical_transaction_encoding_includes_mandatory_notes() {
         let tx = minimal_tx();
         let mut expected = Vec::new();
         tx.version.encode(&mut expected);
         tx.signature_module_id.encode(&mut expected);
         encode_list(&tx.inputs, &mut expected);
         encode_list(&tx.outputs, &mut expected);
+        encode_list(&tx.payment_notes, &mut expected);
         tx.fee_amount.encode(&mut expected);
         tx.fee_blinding.encode(&mut expected);
         tx.fee_commitment.encode(&mut expected);
@@ -477,6 +448,7 @@ mod tests {
         tx.signature_module_id.encode(&mut expected_signing);
         encode_list(&tx.inputs, &mut expected_signing);
         encode_list(&tx.outputs, &mut expected_signing);
+        encode_list(&tx.payment_notes, &mut expected_signing);
         tx.fee_amount.encode(&mut expected_signing);
         tx.fee_blinding.encode(&mut expected_signing);
         tx.fee_commitment.encode(&mut expected_signing);
@@ -484,11 +456,11 @@ mod tests {
     }
 
     #[test]
-    fn transaction_v2_payment_notes_round_trip_mixed_some_none() {
+    fn mandatory_payment_notes_round_trip() {
         let mut tx = minimal_tx();
-        tx.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
         tx.outputs.push(tx.outputs[0].clone());
-        tx.payment_notes = vec![Some(note(0x10)), None];
+        tx.payment_notes
+            .push(note_for_owner(sha256(&[0u8; 32]), 0x11));
 
         let decoded = TransactionV1::decode_exact(&tx.encode_to_vec()).unwrap();
         assert_eq!(decoded, tx);
@@ -498,8 +470,7 @@ mod tests {
     #[test]
     fn transaction_v2_rejects_payment_note_length_mismatch() {
         let mut tx = minimal_tx();
-        tx.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
-        tx.payment_notes = vec![Some(note(0x20)), None];
+        tx.payment_notes.clear();
 
         assert_eq!(
             tx.validate_structure_at_height(u64::MAX),
@@ -510,57 +481,36 @@ mod tests {
     }
 
     #[test]
-    fn payment_notes_are_height_gated_structurally() {
+    fn payment_notes_are_not_height_gated() {
         let mut tx = minimal_tx();
-        tx.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
-        tx.payment_notes = vec![Some(note(0x30))];
-
-        assert!(tx
-            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT - 1)
-            .is_err());
-        assert!(tx
-            .validate_structure_at_height(PAYMENT_BLINDING_HEIGHT)
-            .is_ok());
+        tx.payment_notes[0].note_nonce = [0x30; 32];
+        assert!(tx.validate_structure_at_height(0).is_ok());
+        assert!(tx.validate_structure_at_height(u64::MAX).is_ok());
     }
 
     #[test]
-    fn v1_transaction_with_payment_notes_is_rejected() {
+    fn payment_note_owner_mismatch_is_rejected() {
         let mut tx = minimal_tx();
-        tx.payment_notes = vec![Some(note(0x40))];
-
-        assert_eq!(
+        tx.payment_notes[0].owner_id = [0x40; 32];
+        assert!(matches!(
             tx.validate_structure(),
-            Err(IndraError::InvalidTransaction(
-                "payment notes require transaction protocol version 2".into()
-            ))
-        );
+            Err(IndraError::InvalidTransaction(_))
+        ));
     }
 
     #[test]
     fn payment_notes_are_bound_to_signing_bytes_and_transaction_id() {
         let mut left = minimal_tx();
-        left.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
-        left.payment_notes = vec![Some(note(0x50))];
+        left.payment_notes[0].note_nonce = [0x50; 32];
 
         let mut right = left.clone();
-        right.payment_notes = vec![Some(note(0x51))];
+        right.payment_notes[0].note_nonce = [0x51; 32];
 
         assert_ne!(
             left.signing_bytes("indra-testnet-1"),
             right.signing_bytes("indra-testnet-1")
         );
         assert_ne!(left.tx_hash(), right.tx_hash());
-
-        let legacy = minimal_tx();
-        let mut explicit_none = legacy.clone();
-        explicit_none.version = ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES);
-        explicit_none.payment_notes = vec![None];
-
-        assert_ne!(
-            legacy.signing_bytes("indra-testnet-1"),
-            explicit_none.signing_bytes("indra-testnet-1")
-        );
-        assert_ne!(legacy.tx_hash(), explicit_none.tx_hash());
     }
 
     #[test]

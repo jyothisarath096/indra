@@ -329,18 +329,28 @@ mod tests {
     use indra_core::{
         types::{
             crypto::{CommitmentV1, HybridSignature},
-            primitives::{DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_RANGE_PROOF_BYTES},
+            primitives::{
+                DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_RANGE_PROOF_BYTES,
+                TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+            },
             transaction::{InputV1, OutputV1, TransactionV1},
         },
         Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::{
+        commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair,
+        HybridKeypair, PaymentBlindingNoteV1, PqKeypair,
+    };
     use indra_state::ChainState;
     use rand::{rngs::StdRng, SeedableRng};
 
     fn dummy_tx(fee: u64, nullifier_byte: u8) -> TransactionV1 {
+        let owner_pubkey = HybridPubKey {
+            classical_pk: Bytes32::ZERO,
+            pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+        };
         TransactionV1 {
-            version: ProtocolVersion::CURRENT,
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([nullifier_byte; 32]),
@@ -351,14 +361,11 @@ mod tests {
                 commitment: CommitmentV1 {
                     compressed_point: Bytes32::ZERO,
                 },
-                owner_pubkey: HybridPubKey {
-                    classical_pk: Bytes32::ZERO,
-                    pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                },
+                owner_pubkey: owner_pubkey.clone(),
                 range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 lock_height: 0,
             }],
-            payment_notes: Vec::new(),
+            payment_notes: vec![dummy_note(&owner_pubkey)],
             fee_amount: fee,
             fee_blinding: Bytes32::ZERO,
             fee_commitment: CommitmentV1 {
@@ -368,6 +375,17 @@ mod tests {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
+        }
+    }
+
+    fn dummy_note(owner: &HybridPubKey) -> PaymentBlindingNoteV1 {
+        PaymentBlindingNoteV1 {
+            version: 1,
+            owner_id: sha256(&owner.classical_pk.0),
+            payment_pubkey_hash: [0; 32],
+            sender_x25519_ephemeral_pk: [0; 32],
+            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+            note_nonce: [0; 32],
         }
     }
 
@@ -433,7 +451,7 @@ mod tests {
         .to_bytes();
         let fee_commitment = commit(fee, &fee_blinding);
         let mut tx = TransactionV1 {
-            version: ProtocolVersion::CURRENT,
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id,
@@ -442,10 +460,10 @@ mod tests {
             outputs: vec![output(
                 output_value,
                 output_blinding,
-                owner_pubkey,
+                owner_pubkey.clone(),
                 [0x61; 32],
             )],
-            payment_notes: Vec::new(),
+            payment_notes: vec![dummy_note(&owner_pubkey)],
             fee_amount: fee,
             fee_blinding: Bytes32::from(fee_blinding),
             fee_commitment: CommitmentV1 {

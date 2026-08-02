@@ -3,7 +3,7 @@
 //! Usage:
 //!   indra-send --keys keys.json --wallet wallet.json \
 //!              [--keys-password-file keys.pass] \
-//!              --to <validator_address_or_pubkey> \
+//!              --to <canonical_payment_address> \
 //!              --amount <INDRA> \
 //!              --fee <INDRA> \
 //!              --node http://127.0.0.1:8545
@@ -87,24 +87,26 @@ fn main() {
         std::process::exit(1);
     }
 
-    let recipient = resolve_recipient(&node_url, &to);
-    let recipient_owner_id = recipient
-        .split_once(':')
-        .map(|(classical, _)| classical)
-        .unwrap_or(&recipient);
-    let recipient_payment_pubkey = lookup_payment_identity(&node_url, recipient_owner_id);
+    let sender_payment_pubkey = keys
+        .payment_keypair
+        .as_ref()
+        .map(indra_crypto::PaymentKeypairV1::public_key)
+        .unwrap_or_else(|| {
+            eprintln!("Error: canonical keystore is missing payment key material");
+            std::process::exit(1);
+        });
 
     // Build transaction
     let params = indra_cli::tx_builder::TxParams {
         chain_id: &chain_id,
-        recipient_pubkey_hex: &recipient,
+        recipient_address: &to,
         amount_spark,
         fee_spark,
         wallet: &wallet,
         hybrid_seed,
         pq_sk_bytes,
         sender_pubkey,
-        recipient_payment_pubkey,
+        sender_payment_pubkey,
     };
 
     let built = indra_cli::build_transaction(&params).unwrap_or_else(|e| {
@@ -205,29 +207,6 @@ fn lookup_validator_pubkey(node_url: &str, address: &str) -> Option<String> {
     let classical = extract_json_field(&response, "hybrid_classical_pk")?;
     let pq = extract_json_field(&response, "hybrid_pq_pk")?;
     Some(format!("{classical}:{pq}"))
-}
-
-fn lookup_payment_identity(
-    node_url: &str,
-    recipient_classical_pk_hex: &str,
-) -> Option<indra_crypto::PaymentPubKeyV1> {
-    let owner_id = hex::encode(indra_crypto::sha256(
-        &hex::decode(recipient_classical_pk_hex).ok()?,
-    ));
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","method":"indra_getPaymentIdentity","params":["{}"],"id":1}}"#,
-        owner_id
-    );
-    let response = submit_raw_rpc(node_url, &body).ok()?;
-    payment_identity_from_rpc_json(&response)
-}
-
-fn payment_identity_from_rpc_json(json: &str) -> Option<indra_crypto::PaymentPubKeyV1> {
-    let version = extract_number(json, "version")?;
-    let x25519_pk = extract_json_field(json, "x25519_pk")?;
-    let ml_kem_1024_ek = extract_json_field(json, "ml_kem_1024_ek")?;
-    let bytes = hex::decode(format!("{version:02x}{x25519_pk}{ml_kem_1024_ek}")).ok()?;
-    indra_crypto::PaymentPubKeyV1::decode(&bytes).ok()
 }
 
 /// Submit a hex-encoded transaction to the node via JSON-RPC.

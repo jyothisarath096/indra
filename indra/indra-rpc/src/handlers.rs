@@ -20,7 +20,6 @@ use indra_core::{
     },
     Bytes32,
 };
-use indra_crypto::PaymentPubKeyV1;
 use indra_state::{
     epoch::epoch_for_height, validator::DelegationReturnReason, AuthTreeProof, ChainState,
     ProofTerminal,
@@ -319,6 +318,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getChainInfo", RpcMethodAccess::ReadOnly),
     ("indra_getMempoolSize", RpcMethodAccess::ReadOnly),
     ("indra_getBlock", RpcMethodAccess::ReadOnly),
+    ("indra_getCanonicalBlocks", RpcMethodAccess::ReadOnly),
     ("indra_getTransaction", RpcMethodAccess::ReadOnly),
     ("indra_getLegacyScanChallenge", RpcMethodAccess::ReadOnly),
     (
@@ -336,7 +336,6 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getDelegations", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorPositions", RpcMethodAccess::ReadOnly),
     ("indra_getDelegationReturnEvents", RpcMethodAccess::ReadOnly),
-    ("indra_getPaymentIdentity", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
     ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
@@ -460,6 +459,7 @@ pub fn dispatch_with_admin(
         "indra_getChainInfo" => Ready(get_chain_info(state)),
         "indra_getMempoolSize" => Ready(get_mempool_size(state)),
         "indra_getBlock" => Ready(get_block(params, state)),
+        "indra_getCanonicalBlocks" => Ready(get_canonical_blocks(params, state)),
         "indra_getTransaction" => Ready(get_transaction(params, state)),
         "indra_getLegacyScanChallenge" => Ready(get_legacy_scan_challenge(params, state)),
         "indra_getLegacyBalanceAuthorized" => Ready(get_legacy_balance_authorized(params, state)),
@@ -473,7 +473,6 @@ pub fn dispatch_with_admin(
         "indra_getDelegations" => Ready(get_delegations(params, state)),
         "indra_getDelegatorPositions" => Ready(get_delegator_positions(params, state)),
         "indra_getDelegationReturnEvents" => Ready(get_delegation_return_events(params, state)),
-        "indra_getPaymentIdentity" => Ready(get_payment_identity(params, state)),
         "indra_getDelegatorRewards" => Ready(get_delegator_rewards(params, state)),
         "indra_getValidatorDelegators" => Ready(get_validator_delegators(params, state)),
         "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
@@ -680,6 +679,80 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
             "failed to read block {height}: {error}"
         ))),
     }
+}
+
+const MAX_CANONICAL_BLOCK_PAGE: u64 = 100;
+
+/// `indra_getCanonicalBlocks(from_height, limit, expected_parent_hash)`.
+///
+/// Returns canonical full block encodings. The caller-provided parent anchor
+/// makes a reorg explicit instead of silently continuing on another branch.
+fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    if params.len() != 3 {
+        return Err(RpcError::InvalidParams(
+            "expected [from_height, limit, expected_parent_hash]".to_string(),
+        ));
+    }
+    let from_height = unquote(&params[0])
+        .parse::<u64>()
+        .map_err(|_| RpcError::InvalidParams("invalid from_height".to_string()))?;
+    let limit = unquote(&params[1])
+        .parse::<u64>()
+        .map_err(|_| RpcError::InvalidParams("invalid limit".to_string()))?;
+    if limit == 0 || limit > MAX_CANONICAL_BLOCK_PAGE {
+        return Err(RpcError::InvalidParams(format!(
+            "limit must be between 1 and {MAX_CANONICAL_BLOCK_PAGE}"
+        )));
+    }
+    if from_height < state.lowest_block {
+        return Err(RpcError::NotFound(format!(
+            "block {from_height} is below the local retention window; lowest available block is {}",
+            state.lowest_block
+        )));
+    }
+    let expected_parent = parse_hex32_param(&[params[2].clone()], "expected_parent_hash")?;
+    let first = state
+        .engine
+        .get_block_by_height(from_height)
+        .map_err(|error| RpcError::Internal(format!("failed to read block: {error}")))?
+        .ok_or_else(|| RpcError::NotFound(format!("block {from_height} is not retained")))?;
+    if first.header.prev_hash != expected_parent {
+        return Err(RpcError::InvalidParams(format!(
+            "canonical parent mismatch at height {from_height}: expected {}, canonical {}",
+            hex::encode(expected_parent.0),
+            hex::encode(first.header.prev_hash.0)
+        )));
+    }
+
+    let last_height = state
+        .chain
+        .height
+        .min(from_height.saturating_add(limit).saturating_sub(1));
+    let mut entries = Vec::new();
+    for height in from_height..=last_height {
+        let block = state
+            .engine
+            .get_block_by_height(height)
+            .map_err(|error| RpcError::Internal(format!("failed to read block: {error}")))?
+            .ok_or_else(|| RpcError::NotFound(format!("block {height} is not retained")))?;
+        entries.push(format!(
+            r#"{{"height":{},"block_hash":"{}","block_hex":"{}"}}"#,
+            height,
+            hex::encode(block.header.block_hash().0),
+            hex::encode(block.encode_to_vec())
+        ));
+    }
+    let next_height = last_height
+        .checked_add(1)
+        .filter(|height| *height <= state.chain.height);
+    Ok(format!(
+        r#"{{"from_height":{},"blocks":[{}],"next_height":{},"tip_height":{},"tip_hash":"{}"}}"#,
+        from_height,
+        entries.join(","),
+        next_height.map_or_else(|| "null".to_string(), |height| height.to_string()),
+        state.chain.height,
+        hex::encode(state.chain.tip_hash.0),
+    ))
 }
 
 /// `indra_getTransaction` — returns a canonical transaction by block position.
@@ -1637,29 +1710,6 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
         },
         cold_nonce = validator.cold_nonce,
     ))
-}
-
-/// `indra_getPaymentIdentity` — returns a registered payment public key by owner ID.
-///
-/// Params: `["<owner_id_hex>"]`
-/// Result: `null` or `{"owner_id","version","x25519_pk","ml_kem_1024_ek","payment_pubkey_hash"}`
-fn get_payment_identity(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let owner_id = parse_hex32_param(params, "owner_id")?;
-    let Some(pubkey) = state.chain.payment_identities.get(&owner_id) else {
-        return Ok("null".to_string());
-    };
-    Ok(payment_identity_json(&owner_id, pubkey))
-}
-
-fn payment_identity_json(owner_id: &Bytes32, pubkey: &PaymentPubKeyV1) -> String {
-    format!(
-        r#"{{"owner_id":"{}","version":{},"x25519_pk":"{}","ml_kem_1024_ek":"{}","payment_pubkey_hash":"{}"}}"#,
-        hex::encode(owner_id.0),
-        pubkey.version,
-        hex::encode(pubkey.x25519_pk),
-        hex::encode(pubkey.ml_kem_1024_ek),
-        hex::encode(pubkey.hash()),
-    )
 }
 
 /// `indra_getValidatorSelfStake` — returns active self-stake bonds for a validator.
@@ -3722,6 +3772,39 @@ mod tests {
     }
 
     #[test]
+    fn canonical_block_range_returns_full_blocks_and_rejects_wrong_anchor() {
+        assert!(rpc_method_is_read_only("indra_getCanonicalBlocks"));
+        let engine = block_backed_engine();
+        let state = NodeState::read_only(&engine);
+        let result = get_canonical_blocks(
+            &[
+                "1".to_string(),
+                "2".to_string(),
+                format!("\"{}\"", "10".repeat(32)),
+            ],
+            &state,
+        )
+        .unwrap();
+        assert!(result.contains(&hex::encode(engine.blocks[&1].encode_to_vec())));
+        assert!(result.contains(&hex::encode(engine.blocks[&2].encode_to_vec())));
+        assert!(result.contains(r#""tip_height":2"#));
+        assert!(result.contains(r#""next_height":null"#));
+
+        let error = get_canonical_blocks(
+            &[
+                "1".to_string(),
+                "2".to_string(),
+                format!("\"{}\"", "ff".repeat(32)),
+            ],
+            &state,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, RpcError::InvalidParams(message) if message.contains("canonical parent mismatch"))
+        );
+    }
+
+    #[test]
     fn get_block_below_retention_window_has_specific_error() {
         let engine = block_backed_engine();
         let state = NodeState::read_only(&engine);
@@ -3783,72 +3866,6 @@ mod tests {
         let state = NodeState::read_only(&engine);
         let result = get_validator(&["not_hex".to_string()], &state);
         assert!(matches!(result, Err(RpcError::InvalidParams(_))));
-    }
-
-    #[test]
-    fn get_payment_identity_returns_null_or_registered_pubkey() {
-        assert!(rpc_method_is_read_only("indra_getPaymentIdentity"));
-        assert_eq!(
-            crate::server::rpc_method_cost("indra_getPaymentIdentity"),
-            crate::server::RpcMethodCost::Cheap
-        );
-
-        let mut engine = make_state("pi");
-        let owner_keypair = HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[0xA1; 32]),
-            PqKeypair::from_seed(&[0xA1; 32]).unwrap(),
-        );
-        let owner_public = owner_keypair.public_key();
-        let owner_pubkey = HybridPubKey {
-            classical_pk: Bytes32::from(owner_public.classical.0),
-            pq_pk: VariableBytes::from_slice(&owner_public.pq.0).unwrap(),
-        };
-        let owner_id = Bytes32::from(sha256(&owner_pubkey.classical_pk.0));
-        let payment_pubkey = PaymentKeypairV1::generate().public_key();
-        let state = NodeState::read_only(&engine);
-        assert_eq!(
-            get_payment_identity(&[hex::encode(owner_id.0)], &state).unwrap(),
-            "null"
-        );
-
-        let mut op = StakingOp {
-            body: StakingOpBody::RegisterPaymentKey {
-                owner_pubkey,
-                payment_pubkey: payment_pubkey.clone(),
-                cold_authorization: None,
-            },
-            nonce: 1,
-            signature: HybridSignature {
-                classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-                pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
-            },
-        };
-        let sig = owner_keypair
-            .sign(&op.signing_bytes(&engine.chain_id))
-            .unwrap();
-        op.signature = HybridSignature {
-            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-        };
-        let chain_id = engine.chain_id.clone();
-        apply_staking_op(&mut engine, &op, &chain_id, u64::MAX).unwrap();
-        let state = NodeState::read_only(&engine);
-        let result = get_payment_identity(&[hex::encode(owner_id.0)], &state).unwrap();
-
-        assert!(result.contains(&format!(r#""owner_id":"{}""#, hex::encode(owner_id.0))));
-        assert!(result.contains(r#""version":1"#));
-        assert!(result.contains(&format!(
-            r#""x25519_pk":"{}""#,
-            hex::encode(payment_pubkey.x25519_pk)
-        )));
-        assert!(result.contains(&format!(
-            r#""ml_kem_1024_ek":"{}""#,
-            hex::encode(payment_pubkey.ml_kem_1024_ek)
-        )));
-        assert!(result.contains(&format!(
-            r#""payment_pubkey_hash":"{}""#,
-            hex::encode(payment_pubkey.hash())
-        )));
     }
 
     #[test]

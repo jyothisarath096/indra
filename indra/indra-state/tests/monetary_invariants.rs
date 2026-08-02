@@ -7,14 +7,17 @@ use indra_core::types::{
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
         INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES,
-        MAX_VRF_PROOF_BYTES, UNBONDING_PERIOD_EPOCHS,
+        MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
     },
     slashing::SlashEvidenceV1,
     staking::{StakingOp, StakingOpBody},
     transaction::{InputV1, OutputV1, TransactionV1},
     vote::{VoteStep, VoteV1},
 };
-use indra_crypto::{commit, prove_range, ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::{
+    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
+    PaymentBlindingNoteV1, PqKeypair,
+};
 use indra_state::{
     apply::apply_slash_at_height, apply_block, apply_epoch_transition, apply_staking_op,
     ChainState, EpochTransitionContext, ValidatorEntry, ValidatorStatus,
@@ -184,7 +187,7 @@ fn fee_tx(
     .to_bytes();
     let fee_commitment = commit(fee, &fee_blinding);
     let mut tx = TransactionV1 {
-        version: ProtocolVersion::CURRENT,
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id,
@@ -193,10 +196,17 @@ fn fee_tx(
         outputs: vec![output(
             output_value,
             output_blinding,
-            owner_pubkey,
+            owner_pubkey.clone(),
             [0x43; 32],
         )],
-        payment_notes: Vec::new(),
+        payment_notes: vec![PaymentBlindingNoteV1 {
+            version: 1,
+            owner_id: sha256(&owner_pubkey.classical_pk.0),
+            payment_pubkey_hash: [0; 32],
+            sender_x25519_ephemeral_pk: [0; 32],
+            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+            note_nonce: [0; 32],
+        }],
         fee_amount: fee,
         fee_blinding: Bytes32::from(fee_blinding),
         fee_commitment: CommitmentV1 {

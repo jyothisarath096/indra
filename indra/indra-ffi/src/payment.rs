@@ -115,11 +115,11 @@ pub unsafe extern "C" fn indra_key_handle_payment_keypair(
 ///
 /// # Safety
 ///
-/// `recipient_payment_pubkey`, `owner_id`, `chain_id`, `out_note`, and
+/// `payment_pubkey`, `owner_id`, `chain_id`, `out_note`, and
 /// `out_blinding` must be valid for the documented fixed lengths.
 #[no_mangle]
 pub unsafe extern "C" fn indra_derive_payment_note(
-    recipient_payment_pubkey: *const u8,
+    payment_pubkey: *const u8,
     owner_id: *const u8,
     chain_id: *const c_char,
     output_index: u32,
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn indra_derive_payment_note(
     out_note: *mut u8,
     out_blinding: *mut u8,
 ) -> i32 {
-    if recipient_payment_pubkey.is_null()
+    if payment_pubkey.is_null()
         || owner_id.is_null()
         || chain_id.is_null()
         || out_note.is_null()
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn indra_derive_payment_note(
     }
 
     match catch_unwind(|| {
-        let pubkey = read_payment_pubkey(recipient_payment_pubkey)?;
+        let pubkey = read_payment_pubkey(payment_pubkey)?;
         let owner = read_bytes32(owner_id);
         let chain = bounded_cstr(chain_id)?;
         let derived = sender_derive_payment_blinding_v1(
