@@ -16,9 +16,9 @@ use indra_core::types::slash_membership::{
 
 use indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT;
 use indra_core::types::primitives::{
-    consensus_snapshot_active, state_commitment_v2_active, Bytes32, VariableBytes,
-    DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
-    MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
+    consensus_snapshot_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
+    GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES,
+    MAX_DELEGATION_RETURN_EVENTS,
 };
 
 use crate::{
@@ -548,14 +548,11 @@ impl ChainState {
         })
     }
 
-    /// Ensure the derived StateCommitmentV2 cache exists when the V2 root rule
-    /// is active at `height`.
+    /// Ensure the derived StateCommitmentV2 cache exists at `height`.
     pub fn ensure_state_commitment_v2(&mut self, height: u64) {
         let crossing_snapshot_gate =
             consensus_snapshot_active(height) && !consensus_snapshot_active(self.height);
-        if state_commitment_v2_active(height)
-            && (self.state_commitment_v2.is_none() || crossing_snapshot_gate)
-        {
+        if self.state_commitment_v2.is_none() || crossing_snapshot_gate {
             self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
         }
     }
@@ -790,9 +787,7 @@ impl ChainState {
         let economic = self.build_reward_economic_snapshot(&snapshot)?;
         self.install_consensus_snapshot(snapshot)?;
         self.reward_economic_snapshot = Some(economic);
-        if state_commitment_v2_active(1) {
-            self.rebuild_state_commitment_v2(1);
-        }
+        self.rebuild_state_commitment_v2(1);
         Ok(())
     }
 
@@ -2734,7 +2729,7 @@ mod tests {
     #[test]
     fn chain_state_migrated_clone_matches_deep_materialized_oracle() {
         let mut state = ChainState::new_genesis();
-        state.height = indra_core::types::primitives::hard_forks::STATE_COMMITMENT_V2_HEIGHT;
+        state.height = 1;
         state.utxos.insert(test_output(0x11), 1, 0, 0).unwrap();
         state.nullifiers.insert(Bytes32::from([0x22; 32]));
         state
@@ -2819,7 +2814,7 @@ mod tests {
 
         fn populate_state(size: usize, heavy_bond_count: usize) -> ChainState {
             let mut state = ChainState::new_genesis();
-            state.height = indra_core::types::primitives::hard_forks::STATE_COMMITMENT_V2_HEIGHT;
+            state.height = 1;
             let validator_count = size.clamp(1, 10_000);
             for index in 0..size {
                 let validator_id = id_from_index(0x70, index % validator_count);

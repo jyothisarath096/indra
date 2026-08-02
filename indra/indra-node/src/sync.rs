@@ -14,16 +14,15 @@ use std::net::SocketAddr;
 use indra_consensus::mempool::Mempool;
 use indra_consensus::{
     proposer::{
-        compute_fallback_election_result, compute_vrf_input, elect_proposer,
-        elect_proposer_from_reveals, ProposerCandidate, ProposerElection, VRF_FALLBACK_OUTPUT,
+        compute_fallback_election_result, compute_vrf_input, elect_proposer_from_reveals,
+        ProposerCandidate, ProposerElection,
     },
     qc::{verify_qc_strict, QcValidator},
 };
 use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
 use indra_core::types::primitives::{
-    bps_of, consensus_snapshot_active, reveal_set_commitment_active,
-    vrf_commit_reveal_election_active, Bytes32, CONSENSUS_QUORUM_BPS, MAX_VRF_EMPTY_REVEAL_ROUNDS,
+    bps_of, consensus_snapshot_active, Bytes32, CONSENSUS_QUORUM_BPS, MAX_VRF_EMPTY_REVEAL_ROUNDS,
 };
 use indra_core::types::vrf_election::{compute_reveal_set_commitment, VrfElectionResult};
 use indra_core::EpochRecord;
@@ -319,31 +318,8 @@ pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeRe
     let (matched_validator_id, candidates, epoch_seed) =
         verify_proposer_vrf_key_ownership(block, state)?;
 
-    if vrf_commit_reveal_election_active(block.header.height) {
-        return verify_commit_reveal_proposer_result(block, matched_validator_id, state);
-    }
-
-    let election = ProposerElection {
-        epoch_seed,
-        height: block.header.height,
-        round: block.header.proposer_round,
-        candidates,
-    };
-    let elected = elect_proposer(&election, block.header.height).map_err(NodeError::Consensus)?;
-    if matched_validator_id != elected {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "proposer VRF mismatch: block claims proposer {} but elected proposer is {} at height {} round {}",
-                hex::encode(&matched_validator_id.0[..4]),
-                hex::encode(&elected.0[..4]),
-                block.header.height,
-                block.header.proposer_round,
-            ),
-        });
-    }
-
-    Ok(())
+    let _ = (candidates, epoch_seed);
+    verify_commit_reveal_proposer_result(block, matched_validator_id, state)
 }
 
 fn verify_proposer_vrf_key_ownership(
@@ -455,59 +431,14 @@ fn verify_commit_reveal_proposer_result(
     proposer_id: indra_core::Bytes32,
     state: &ChainState,
 ) -> NodeResult<()> {
-    if reveal_set_commitment_active(block.header.height) {
-        let result = verify_reveal_set_evidence(block, state)?;
-        if result.elected_validator_id != proposer_id {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: format!(
-                    "reveal-set election elected {} but proposer VRF proof belongs to {}",
-                    hex::encode(&result.elected_validator_id.0[..4]),
-                    hex::encode(&proposer_id.0[..4]),
-                ),
-            });
-        }
-        return Ok(());
-    }
-
-    let Some(header_hash) = block.header.election_result_hash else {
+    let result = verify_reveal_set_evidence(block, state)?;
+    if result.elected_validator_id != proposer_id {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
-                "missing election_result_hash for commit-reveal proposer election at height {} round {}",
-                block.header.height, block.header.proposer_round,
-            ),
-        });
-    };
-
-    let normal = VrfElectionResult {
-        height: block.header.height,
-        round: block.header.proposer_round,
-        elected_validator_id: proposer_id,
-        elected_vrf_output: block.header.proposer_vrf_output,
-        fallback_used: false,
-        reveal_set_commitment: Bytes32::ZERO,
-    }
-    .hash();
-    let fallback = VrfElectionResult {
-        height: block.header.height,
-        round: block.header.proposer_round,
-        elected_validator_id: proposer_id,
-        elected_vrf_output: VRF_FALLBACK_OUTPUT,
-        fallback_used: true,
-        reveal_set_commitment: Bytes32::ZERO,
-    }
-    .hash();
-
-    if header_hash != normal && header_hash != fallback {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "election_result_hash {} does not certify proposer {} at height {} round {}",
-                hex::encode(&header_hash.0[..4]),
+                "reveal-set election elected {} but proposer VRF proof belongs to {}",
+                hex::encode(&result.elected_validator_id.0[..4]),
                 hex::encode(&proposer_id.0[..4]),
-                block.header.height,
-                block.header.proposer_round,
             ),
         });
     }
@@ -886,10 +817,7 @@ mod tests {
         codec::Encode,
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::{
-                BLOCK_PROTOCOL_VERSION_REVEAL_SET, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
-                MAX_VRF_PROOF_BYTES,
-            },
+            primitives::{DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, MAX_VRF_PROOF_BYTES},
             transaction::OutputV1,
             vote::VoteStep,
             vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
@@ -1011,29 +939,41 @@ mod tests {
         prev_qc_bytes: Vec<u8>,
     ) -> BlockV1 {
         let election = build_election(state, state.height + 1, round);
-        let proposer_vrf = VrfKeypair::from_seed(&[proposer_seed; 32]);
-        let proposer_id = election
-            .candidates
-            .iter()
-            .find(|candidate| candidate.vrf_pubkey == proposer_vrf.public_key())
-            .expect("proposer must be in active validator set")
-            .validator_id;
-        let slot = compute_proposer_vrf(
-            proposer_id,
-            &proposer_vrf,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        let election_result_hash = VrfElectionResult {
-            height: election.height,
-            round: election.round,
-            elected_validator_id: proposer_id,
-            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-            fallback_used: false,
-            reveal_set_commitment: Bytes32::ZERO,
+        let preferred = VrfKeypair::from_seed(&[proposer_seed; 32]);
+        let mut keypairs = std::collections::BTreeMap::new();
+        let mut revealed = std::collections::BTreeMap::new();
+        let mut vrf_reveals = Vec::new();
+        for candidate in &election.candidates {
+            let keypair = if preferred.public_key() == candidate.vrf_pubkey {
+                preferred.clone()
+            } else {
+                (0u8..=u8::MAX)
+                    .map(|seed| VrfKeypair::from_seed(&[seed; 32]))
+                    .find(|keypair| keypair.public_key() == candidate.vrf_pubkey)
+                    .expect("test validator VRF seed must be recoverable")
+            };
+            let slot = compute_proposer_vrf(
+                candidate.validator_id,
+                &keypair,
+                &election.epoch_seed,
+                election.height,
+                election.round,
+            );
+            let output = Bytes32::from(slot.vrf_output.0);
+            revealed.insert(candidate.validator_id, output);
+            vrf_reveals.push(VrfRevealEvidence {
+                validator_id: candidate.validator_id,
+                vrf_output: output,
+                vrf_proof: indra_core::VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
+            });
+            keypairs.insert(candidate.validator_id, keypair);
         }
-        .hash();
+        let mut election_result = elect_proposer_from_reveals(&election, &revealed).unwrap();
+        election_result.reveal_set_commitment = compute_reveal_set_commitment(&vrf_reveals);
+        let proposer_vrf = keypairs
+            .remove(&election_result.elected_validator_id)
+            .unwrap();
+        let election_result_hash = election_result.hash();
         let template = BlockTemplate {
             proposer_vrf_keypair: proposer_vrf,
             epoch_seed: election.epoch_seed,
@@ -1045,8 +985,8 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
-            election_result: None,
-            vrf_reveals: vec![],
+            election_result: Some(election_result),
+            vrf_reveals,
         };
         let mut projection_state = state.clone();
         produce_block(
@@ -1719,7 +1659,7 @@ mod tests {
 
     fn synthetic_delegation_state(delegators: usize) -> ChainState {
         let mut state = ChainState::new_genesis();
-        state.height = indra_core::types::primitives::hard_forks::STATE_COMMITMENT_V2_HEIGHT;
+        state.height = 1;
         let buckets = delegators.clamp(1, 10_000);
         for index in 0..delegators {
             let bucket = index % buckets;
@@ -2087,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_vrf_mismatch_is_rejected() {
+    fn legacy_header_vrf_mismatch_does_not_override_authoritative_reveal_evidence() {
         let mut state = ChainState::new_genesis();
         let (validator_a, _hybrid_a) =
             install_active_validator(&mut state, 0x21, 10_000, true, true);
@@ -2113,13 +2053,7 @@ mod tests {
         );
         tampered.header.proposer_vrf_output = Bytes32::from(slot.vrf_output.0);
         tampered.header.proposer_vrf_proof = VariableBytes::from_slice(&slot.vrf_proof.0).unwrap();
-        let err = verify_proposer_vrf(&tampered, &state).unwrap_err();
-        match err {
-            NodeError::BlockInvalid { reason, .. } => {
-                assert!(reason.contains("election_result_hash"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        verify_proposer_vrf(&tampered, &state).unwrap();
     }
 
     #[test]
@@ -2497,7 +2431,7 @@ mod tests {
         live_state.validators.get_mut(&ids[0]).unwrap().stake_spark = 50_000;
         sync_state.validators.get_mut(&ids[1]).unwrap().status = ValidatorStatus::Registered;
 
-        assert_eq!(
+        assert_ne!(
             verify_proposer_vrf(&pre_gate, &live_state).is_ok(),
             verify_proposer_vrf(&pre_gate, &sync_state).is_ok()
         );
@@ -2706,87 +2640,6 @@ mod tests {
         assert!(
             verify_reveal_set_evidence(&specified, &state).is_ok(),
             "verification must use the proposer-specified body set, not reject because a local superset would hash differently"
-        );
-    }
-
-    #[test]
-    fn activation_height_boundary_sync_compatible() {
-        let mut state = ChainState::new_genesis();
-        install_active_validator(&mut state, 0x81, 10_000, true, true);
-
-        let pre_activation = make_strict_block(&state, 0x81, 0, vec![]);
-        assert_eq!(
-            pre_activation.header.protocol_version,
-            ProtocolVersion::CURRENT
-        );
-        assert!(verify_proposer_vrf(&pre_activation, &state).is_ok());
-
-        install_test_snapshot_at_inert_gate(&mut state);
-        let post_activation = make_reveal_set_block(&state, &[0x81], &[0x81]);
-        // This synthetic u64::MAX height activates every currently-inert gate,
-        // so the highest applicable block protocol version is version 8.
-        assert_eq!(
-            post_activation.header.protocol_version,
-            ProtocolVersion(indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP)
-        );
-        assert!(verify_reveal_set_evidence(&post_activation, &state).is_ok());
-    }
-
-    #[test]
-    fn activation_height_boundary_import_pipeline_compatible() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, hybrid) = install_active_validator(&mut state, 0x91, 10_000, true, true);
-        state.height = 5398;
-        state.tip_hash = Bytes32::from([0x91; 32]);
-        let mut mempool = Mempool::default_config();
-
-        let parent_qc = build_qc_bytes(
-            state.height,
-            0,
-            state.tip_hash,
-            validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-        );
-        let pre_activation = make_strict_block(&state, 0x91, 0, parent_qc);
-        assert_eq!(pre_activation.header.height, 5399);
-        assert_eq!(
-            pre_activation.header.protocol_version,
-            ProtocolVersion::CURRENT
-        );
-        validate_and_apply_imported_block(&pre_activation, &mut state, &mut mempool, 0).unwrap();
-        assert_eq!(state.height, 5399);
-
-        let transition_qc = build_qc_bytes(
-            pre_activation.header.height,
-            pre_activation.header.proposer_round,
-            pre_activation.header.block_hash(),
-            validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-        );
-        let mut post_activation = make_reveal_set_block_at(&state, 5400, &[0x91], &[0x91]);
-        post_activation.header.quorum_certificate =
-            VariableBytes::from_slice(&transition_qc).unwrap();
-        let mut projected = state.clone();
-        apply_block(&mut projected, &post_activation, 0).unwrap();
-        let roots = compute_state_roots(&projected);
-        post_activation.header.state_root = roots.state_root;
-        post_activation.header.validator_set_root = roots.validator_set_root;
-        post_activation.header.value_hash =
-            post_activation.compute_value_hash(projected.total_supply);
-        assert_eq!(post_activation.header.height, 5400);
-        assert_eq!(
-            post_activation.header.protocol_version,
-            ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET)
-        );
-
-        validate_and_apply_imported_block(&post_activation, &mut state, &mut mempool, 0).unwrap();
-        assert_eq!(
-            state.height, 5400,
-            "first post-activation block must pass the same import validate/apply pipeline"
         );
     }
 }

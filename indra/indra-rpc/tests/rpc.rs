@@ -101,27 +101,17 @@ fn rpc_get_tip() {
 }
 
 #[test]
-fn rpc_get_utxo_proof_reports_versioned_shape_before_and_after_compressed_activation() {
-    let mut legacy = engine("rpc_utxo_proof_legacy");
-    let id = legacy.utxos.insert(dummy_output(0xB1), 1, 0, 0).unwrap();
-    let legacy_resp = call_rpc(
+fn rpc_get_utxo_proof_reports_canonical_compressed_shape() {
+    let mut state = engine("rpc_utxo_proof_compressed");
+    let id = state.utxos.insert(dummy_output(0xB1), 1, 0, 0).unwrap();
+    let response = call_rpc(
         "indra_getUtxoProof",
         &[format!(r#""{}""#, hex::encode(id.0))],
-        &legacy,
+        &state,
     );
-    assert!(legacy_resp.contains(r#""proof_version":"legacy-smt-v1""#));
-    assert!(legacy_resp.contains(r#""siblings":["#));
-
-    let mut compressed = legacy.clone();
-    compressed.height = u64::MAX;
-    let compressed_resp = call_rpc(
-        "indra_getUtxoProof",
-        &[format!(r#""{}""#, hex::encode(id.0))],
-        &compressed,
-    );
-    assert!(compressed_resp.contains(r#""proof_version":"compressed-auth-tree-v2""#));
-    assert!(compressed_resp.contains(r#""terminal":"#));
-    assert!(compressed_resp.contains(r#""steps":["#));
+    assert!(response.contains(r#""proof_version":"compressed-auth-tree-v2""#));
+    assert!(response.contains(r#""terminal":"#));
+    assert!(response.contains(r#""steps":["#));
 }
 
 #[test]

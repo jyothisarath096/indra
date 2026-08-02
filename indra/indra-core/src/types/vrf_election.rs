@@ -6,10 +6,7 @@ use crate::{
     ssz::sha256,
     types::{
         crypto::HybridSignature,
-        primitives::{
-            reveal_set_commitment_active, Bytes32, VariableBytes, MAX_ACTIVE_VALIDATORS,
-            MAX_VRF_PROOF_BYTES,
-        },
+        primitives::{Bytes32, VariableBytes, MAX_ACTIVE_VALIDATORS, MAX_VRF_PROOF_BYTES},
     },
 };
 
@@ -202,9 +199,7 @@ pub struct VrfElectionResult {
     pub fallback_used: bool,
     /// Merkle root over the full sorted reveal evidence set.
     ///
-    /// This is included in the election result hash only when
-    /// reveal_set_commitment_active(height) is true, preserving pre-fork
-    /// election hashes before the activation boundary.
+    /// This is always included in the election result hash.
     pub reveal_set_commitment: Bytes32,
 }
 
@@ -217,9 +212,7 @@ impl VrfElectionResult {
         self.elected_validator_id.encode(&mut data);
         self.elected_vrf_output.encode(&mut data);
         (self.fallback_used as u8).encode(&mut data);
-        if reveal_set_commitment_active(self.height) {
-            self.reveal_set_commitment.encode(&mut data);
-        }
+        self.reveal_set_commitment.encode(&mut data);
         Bytes32::from(sha256(&data))
     }
 }

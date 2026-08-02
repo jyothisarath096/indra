@@ -53,8 +53,7 @@ pub struct VoteV1 {
     pub validator_id: Bytes32,
     /// Hash of the commit-reveal election result observed by this validator.
     ///
-    /// Present on precommit votes when commit-reveal proposer election is active.
-    /// Absent on prevotes and pre-activation votes.
+    /// Present on non-nil precommit votes and absent on prevotes or nil votes.
     pub election_result_hash: Option<Bytes32>,
     /// Hybrid signature over the canonical vote signing bytes.
     pub signature: HybridSignature,
@@ -108,31 +107,6 @@ impl Decode for VoteV1 {
             election_result_hash,
             signature: HybridSignature::decode(r)?,
         })
-    }
-}
-
-impl VoteV1 {
-    /// Construct a vote from the legacy pre-commit-reveal wire shape.
-    ///
-    /// This is only used by tests/tooling that deliberately decode old fixtures;
-    /// the active encoder always writes the explicit election-result flag.
-    pub fn legacy_without_election_result(
-        height: u64,
-        round: u32,
-        step: VoteStep,
-        block_hash: Bytes32,
-        validator_id: Bytes32,
-        signature: HybridSignature,
-    ) -> Self {
-        Self {
-            height,
-            round,
-            step,
-            block_hash,
-            validator_id,
-            election_result_hash: None,
-            signature,
-        }
     }
 }
 

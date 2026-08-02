@@ -10,8 +10,8 @@ use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
         compact_bond_pubkey_omission_active, compact_stake_bond_active, max_active_validators,
-        muldiv, overflow_fix_active, self_unstake_height_precision_active, Bytes32, VariableBytes,
-        DUST_LIMIT_SPARK, MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
+        muldiv, self_unstake_height_precision_active, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
+        MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
         MAX_VALIDATOR_NETWORK_ADDR_LEN, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION,
         SCHEMA_VERSION_GENESIS, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
         UNBONDING_PERIOD_EPOCHS,
@@ -3589,7 +3589,7 @@ impl DelegationMap {
         validator_id: &Bytes32,
         pool: u64,
         current_epoch: u64,
-        height: u64,
+        _height: u64,
     ) -> u64 {
         let mut entries = match self.delegators.get(validator_id).cloned() {
             Some(entries) => entries,
@@ -3610,11 +3610,7 @@ impl DelegationMap {
             .iter_mut()
             .filter(|d| d.unbonding_end_epoch.is_none())
         {
-            let reward = if overflow_fix_active(height) {
-                muldiv(pool, entry.staked_spark, total)
-            } else {
-                pool.saturating_mul(entry.staked_spark) / total
-            };
+            let reward = muldiv(pool, entry.staked_spark, total);
             entry.pending_rewards = entry.pending_rewards.saturating_add(reward);
             entry.rewards_last_epoch = current_epoch;
             distributed = distributed.saturating_add(reward);

@@ -18,10 +18,7 @@ use indra_core::{
     types::{
         consensus_snapshot::ConsensusSnapshot,
         crypto::HybridPubKey,
-        primitives::{
-            consensus_snapshot_active, registered_validator_cap_active,
-            slash_membership_proof_active, validator_network_address_active, Bytes32,
-        },
+        primitives::{consensus_snapshot_active, slash_membership_proof_active, Bytes32},
         reward_economic_snapshot::RewardEconomicSnapshot,
         slash_membership::SlashMembershipRootRecord,
     },
@@ -106,7 +103,7 @@ impl StateCommitmentV2 {
                 retired_cold_component_value_hash(1, component),
             ));
         }
-        if registered_validator_cap_active(height) {
+        {
             for event in &state.delegation_return_events {
                 leaves.push((
                     delegation_return_event_key(event),
@@ -350,8 +347,8 @@ fn derive_key(domain: u8, raw_key: &[u8]) -> [u8; 32] {
     sha256(&data)
 }
 
-pub(crate) fn validator_value_hash(validator: &ValidatorEntry, height: u64) -> [u8; 32] {
-    let include_network_addr = validator_network_address_active(height);
+pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> [u8; 32] {
+    let include_network_addr = true;
     let mut value = Vec::new();
     value.extend_from_slice(&validator.validator_id.0);
     value.extend_from_slice(&validator.stake_spark.to_le_bytes());
@@ -710,7 +707,7 @@ mod tests {
                 delegator_identity_value_hash(delegator_id, pubkey),
             ));
         }
-        if registered_validator_cap_active(height) {
+        {
             for event in &state.delegation_return_events {
                 leaves.push((
                     delegation_return_event_key(event),
@@ -753,7 +750,7 @@ mod tests {
         for hash in &state.applied_slash_hashes {
             leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
         }
-        if registered_validator_cap_active(height) {
+        {
             for event in &state.delegation_return_events {
                 leaves.push((
                     delegation_return_event_key(event),

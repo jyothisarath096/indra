@@ -20,8 +20,7 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, delegator_bond_accounting_active, governance_proposal_pruning_active, muldiv,
-            normal_bond_release_blinding_active, overflow_fix_active, state_commitment_v2_active,
+            bps_of, delegator_bond_accounting_active, muldiv, normal_bond_release_blinding_active,
             validator_cold_key_enforcement_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
             COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
@@ -343,9 +342,7 @@ fn apply_epoch_transition_at_gate(
     state.epoch_fees_burned = 0;
     state.epoch_slashed_spark = 0;
     state.epoch_slash_event_count = 0;
-    if state_commitment_v2_active(height) {
-        state.rebuild_state_commitment_v2(height);
-    }
+    state.rebuild_state_commitment_v2(height);
     Ok(record)
 }
 
@@ -516,9 +513,6 @@ pub fn apply_governance_phase_transitions(
 }
 
 fn prune_governance_history_if_active(state: &mut ChainState, height: u64) {
-    if !governance_proposal_pruning_active(height) {
-        return;
-    }
     let pruned = state
         .governance
         .prune_terminal_proposals(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS);
@@ -895,14 +889,8 @@ fn saturation_adjusted_reward(
     proportional_reward(raw_reward, saturation_point, validator_stake, height)
 }
 
-fn proportional_reward(amount: u64, numerator: u64, denominator: u64, height: u64) -> u64 {
-    if overflow_fix_active(height) {
-        muldiv(amount, numerator, denominator)
-    } else if denominator == 0 {
-        0
-    } else {
-        amount.saturating_mul(numerator) / denominator
-    }
+fn proportional_reward(amount: u64, numerator: u64, denominator: u64, _height: u64) -> u64 {
+    muldiv(amount, numerator, denominator)
 }
 
 fn distribute_block_rewards(
@@ -963,11 +951,7 @@ fn distribute_block_rewards(
         let (validator_share, delegator_pool) = if delegated == 0 {
             (adjusted_reward, 0)
         } else {
-            let commission = if overflow_fix_active(height) {
-                bps_of(adjusted_reward, commission_bps)
-            } else {
-                adjusted_reward.saturating_mul(commission_bps as u64) / 10_000
-            };
+            let commission = bps_of(adjusted_reward, commission_bps);
             (commission, adjusted_reward.saturating_sub(commission))
         };
 
@@ -1051,11 +1035,7 @@ fn distribute_fee_rewards(
         let (validator_share, delegator_pool) = if delegated == 0 {
             (reward, 0)
         } else {
-            let commission = if overflow_fix_active(height) {
-                bps_of(reward, commission_bps)
-            } else {
-                reward.saturating_mul(commission_bps as u64) / 10_000
-            };
+            let commission = bps_of(reward, commission_bps);
             (commission, reward.saturating_sub(commission))
         };
 
@@ -1522,7 +1502,7 @@ fn regenerated_bond_output(
 fn apply_liveness_penalties(
     state: &mut ChainState,
     current_epoch: u64,
-    height: u64,
+    _height: u64,
     snapshot_members: Option<&[Bytes32]>,
 ) -> (u64, u32) {
     let mut total_slashed = 0u64;
@@ -1560,11 +1540,7 @@ fn apply_liveness_penalties(
         };
 
         if missed >= threshold && stake > 0 {
-            let penalty = if overflow_fix_active(height) {
-                bps_of(stake, slash_bps)
-            } else {
-                stake.saturating_mul(slash_bps as u64) / 10_000
-            };
+            let penalty = bps_of(stake, slash_bps);
             if let Some(v) = state.validators.get_mut(&validator_id) {
                 v.stake_spark = v.stake_spark.saturating_sub(penalty);
                 if v.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK {
@@ -1622,13 +1598,11 @@ mod tests {
             primitives::{
                 compact_bond_pubkey_omission_active, compact_stake_bond_active,
                 delegator_identity_registry_active,
-                hard_forks::{
-                    GOVERNANCE_PROPOSAL_PRUNING_HEIGHT, NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
-                },
-                Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
-                DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-                ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-                MAX_DELEGATION_RETURN_EVENTS, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
+                hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT, Bytes32, VariableBytes,
+                COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+                ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
+                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
                 SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
@@ -3043,29 +3017,9 @@ mod tests {
     }
 
     #[test]
-    fn governance_pruning_pre_activation_state_root_unchanged() {
-        let mut state = ChainState::new_genesis();
-        state.height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT.saturating_sub(1);
-        for index in 0..5 {
-            let proposal = governance_pruning_test_proposal(index, ProposalPhase::Failed, index);
-            state
-                .governance
-                .proposals
-                .insert(proposal.proposal_id, proposal);
-        }
-        let before = compute_state_root(&state);
-        let height = state.height;
-
-        prune_governance_history_if_active(&mut state, height);
-
-        assert_eq!(state.governance.proposals.len(), 5);
-        assert_eq!(compute_state_root(&state), before);
-    }
-
-    #[test]
     fn governance_pruning_changes_state_root_at_activation_when_records_removed() {
         let mut state = ChainState::new_genesis();
-        state.height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT;
+        state.height = 1;
         for index in 0..(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS + 1) {
             let proposal =
                 governance_pruning_test_proposal(index as u64, ProposalPhase::Failed, index as u64);
@@ -3092,9 +3046,7 @@ mod tests {
 
     #[test]
     fn governance_pruning_replay_across_activation_is_deterministic() {
-        let boundary_height = GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
-            .div_ceil(EPOCH_DURATION_BLOCKS)
-            .saturating_mul(EPOCH_DURATION_BLOCKS);
+        let boundary_height = EPOCH_DURATION_BLOCKS;
         let mut continuous = ChainState::new_genesis();
         continuous.height = boundary_height;
         for index in 0..(MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS + 3) {

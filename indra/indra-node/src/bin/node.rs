@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 use fs2::available_space;
 use indra_core::codec::Encode;
 use indra_core::types::primitives::{
-    validator_network_address_active, DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES,
-    DISK_WARN_THRESHOLD_BYTES, DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS,
-    MAX_PEER_LIST_SIZE, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS,
-    PEER_TABLE_SAVE_INTERVAL_SECS, TARGET_OUTBOUND_PEERS,
+    DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
+    DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS, MAX_PEER_LIST_SIZE,
+    MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS, PEER_TABLE_SAVE_INTERVAL_SECS,
+    TARGET_OUTBOUND_PEERS,
 };
 use indra_crypto::sha256;
 use indra_crypto::{PqKeypair, PqPublicKey};
@@ -2405,21 +2405,12 @@ fn main() {
                                     Ok(election) => {
                                         let vrf_actions =
                                             d.ensure_vrf_election_for_round(&election);
-                                        let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
-                                        let election_result = if active {
-                                            d.vrf_election_result(height, round)
-                                        } else {
-                                            None
-                                        };
-                                        let should = if active {
-                                            d.can_propose()
-                                                && election_result.is_some_and(|result| {
-                                                    Some(result.elected_validator_id)
-                                                        == d.engine.validator_id()
-                                                })
-                                        } else {
-                                            d.can_propose() && d.engine.is_proposer(&election)
-                                        };
+                                        let election_result = d.vrf_election_result(height, round);
+                                        let should = d.can_propose()
+                                            && election_result.is_some_and(|result| {
+                                                Some(result.elected_validator_id)
+                                                    == d.engine.validator_id()
+                                            });
                                         (should, height, round, vrf_actions)
                                     }
                                 }
@@ -2520,26 +2511,17 @@ fn main() {
                                                 continue;
                                             }
                                         };
-                                        let active = indra_core::types::primitives::vrf_commit_reveal_election_active(height);
-                                        let election_result = if active {
-                                            d.vrf_election_result(height, round)
-                                        } else {
-                                            None
-                                        };
-                                        if active
-                                            && !election_result.is_some_and(|result| {
-                                                Some(result.elected_validator_id)
-                                                    == d.engine.validator_id()
-                                            })
-                                        {
+                                        let election_result = d.vrf_election_result(height, round);
+                                        if !election_result.is_some_and(|result| {
+                                            Some(result.elected_validator_id)
+                                                == d.engine.validator_id()
+                                        }) {
                                             eprintln!(
                                                 "[consensus] proposal skipped at height={} round={}: no current quorum-backed local election result for this validator",
                                                 height, round,
                                             );
                                             None
                                         } else {
-                                            let election_result_hash =
-                                                election_result.map(|result| result.hash());
                                             let vrf_reveals = d.vrf_reveal_evidence(height, round);
                                             let timestamp = std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
@@ -2555,24 +2537,22 @@ fn main() {
                                                     .expect(
                                                         "reproposal mode requires a valid block",
                                                     );
-                                                d.engine.repropose_with_election_result(
+                                                d.engine.repropose(
                                                     &valid_block,
                                                     round,
                                                     Some(valid_round),
                                                     &election,
                                                     valid_block.header.timestamp,
                                                     last_qc_bytes,
-                                                    election_result_hash,
                                                     election_result,
                                                     vrf_reveals.clone(),
                                                 )
                                             } else {
-                                                d.engine.propose_with_election_result(
+                                                d.engine.propose(
                                                     &election,
                                                     timestamp,
                                                     last_qc_bytes,
                                                     polc_round,
-                                                    election_result_hash,
                                                     election_result,
                                                     vrf_reveals.clone(),
                                                 )
@@ -2805,7 +2785,7 @@ fn main() {
             check_disk_space(Path::new(&data_dir));
         }
 
-        if validator_network_address_active(height) {
+        {
             let on_chain_addrs = {
                 let d = driver.lock().unwrap();
                 let consensus_height = d.height().saturating_add(1);

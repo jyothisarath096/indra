@@ -2,9 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use indra_core::types::primitives::{
-    public_proposer_election_active, vrf_verified_output_active, Bytes32, MAX_ROUNDS_PER_HEIGHT,
-};
+use indra_core::types::primitives::{Bytes32, MAX_ROUNDS_PER_HEIGHT};
 use indra_core::types::vrf_election::VrfElectionResult;
 use indra_crypto::{sha256, vrf_prove, VrfKeypair, VrfOutput, VrfProof};
 
@@ -115,7 +113,7 @@ pub fn candidate_output(vrf_pubkey: &[u8; 32], vrf_input: &[u8; 32]) -> VrfOutpu
 ///
 /// The VRF proof in the block header still proves ownership of the registered
 /// VRF key, but is not used for winner selection while
-/// `PUBLIC_PROPOSER_ELECTION_HEIGHT` is active.
+/// This is the permanent deterministic zero-reveal fallback.
 pub fn public_proposer_output(
     epoch_seed: &Bytes32,
     height: u64,
@@ -133,11 +131,10 @@ pub fn public_proposer_output(
 }
 
 /// Elect the proposer for a given height.
-pub fn elect_proposer(election: &ProposerElection, height: u64) -> ConsensusResult<Bytes32> {
+pub fn elect_proposer(election: &ProposerElection, _height: u64) -> ConsensusResult<Bytes32> {
     if election.candidates.is_empty() {
         return Err(ConsensusError::EmptyValidatorSet);
     }
-    let vrf_input = election.vrf_input();
     let total_stake: u64 = election
         .candidates
         .iter()
@@ -148,28 +145,13 @@ pub fn elect_proposer(election: &ProposerElection, height: u64) -> ConsensusResu
         .candidates
         .iter()
         .map(|candidate| {
-            let output = if public_proposer_election_active(height) {
-                // DETERMINISM SAFETY: winner selection must be a single public
-                // function over the full candidate set. Do not use
-                // `verified_vrf_output` here; a proposal only reveals one
-                // validator's actual VRF output, which makes the old mixed
-                // election perspective-dependent and permits multiple
-                // apparent proposers for the same slot.
-                public_proposer_output(
-                    &election.epoch_seed,
-                    election.height,
-                    election.round,
-                    &candidate.validator_id,
-                    &candidate.vrf_pubkey,
-                )
-            } else if vrf_verified_output_active(height) {
-                candidate
-                    .verified_vrf_output
-                    .clone()
-                    .unwrap_or_else(|| candidate_output(&candidate.vrf_pubkey, &vrf_input))
-            } else {
-                candidate_output(&candidate.vrf_pubkey, &vrf_input)
-            };
+            let output = public_proposer_output(
+                &election.epoch_seed,
+                election.height,
+                election.round,
+                &candidate.validator_id,
+                &candidate.vrf_pubkey,
+            );
             let score = election_score(&output, candidate.stake, total_stake);
             (candidate, score, output)
         })

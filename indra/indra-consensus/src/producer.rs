@@ -19,8 +19,7 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
     primitives::{
-        block_protocol_version_for_height, reveal_set_commitment_active,
-        slash_membership_proof_active, vrf_commit_reveal_election_active, Bytes32, ProtocolVersion,
+        block_protocol_version_for_height, slash_membership_proof_active, Bytes32, ProtocolVersion,
         VariableBytes, MAX_QC_SIZE_BYTES, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
     slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1},
@@ -34,7 +33,7 @@ use indra_state::{project_block_for_roots, ChainState};
 use crate::{
     error::{ConsensusError, ConsensusResult},
     mempool::Mempool,
-    proposer::{compute_proposer_vrf, elect_proposer, ProposerElection, VRF_FALLBACK_OUTPUT},
+    proposer::{compute_proposer_vrf, ProposerElection},
 };
 
 /// A block template — the inputs needed to produce a block.
@@ -103,8 +102,7 @@ pub fn produce_block(
         election.round,
     );
 
-    let mut election_result_hash = template.election_result_hash;
-    if vrf_commit_reveal_election_active(election.height) {
+    let election_result_hash = {
         if let Some(result) = template.election_result {
             if result.height != election.height
                 || result.round != election.round
@@ -114,68 +112,28 @@ pub fn produce_block(
                     "authoritative election result does not match proposer slot",
                 ));
             }
-            if reveal_set_commitment_active(election.height)
-                && result.reveal_set_commitment
-                    != compute_reveal_set_commitment(&template.vrf_reveals)
+            if result.reveal_set_commitment != compute_reveal_set_commitment(&template.vrf_reveals)
             {
                 return Err(ConsensusError::wrong_proposer(
                     "authoritative reveal-set commitment does not match proposal evidence",
                 ));
             }
             let result_hash = result.hash();
-            if election_result_hash.is_some_and(|hash| hash != result_hash) {
+            if template
+                .election_result_hash
+                .is_some_and(|hash| hash != result_hash)
+            {
                 return Err(ConsensusError::wrong_proposer(
                     "provided election_result_hash disagrees with authoritative result",
                 ));
             }
-            election_result_hash = Some(result_hash);
-        } else if reveal_set_commitment_active(election.height) {
-            return Err(ConsensusError::wrong_proposer(
-                "missing authoritative election result after reveal-set activation",
-            ));
+            Some(result_hash)
         } else {
-            let expected_normal = VrfElectionResult {
-                height: election.height,
-                round: election.round,
-                elected_validator_id: slot.proposer_id,
-                elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-                fallback_used: false,
-                reveal_set_commitment: if reveal_set_commitment_active(election.height) {
-                    compute_reveal_set_commitment(&template.vrf_reveals)
-                } else {
-                    Bytes32::ZERO
-                },
-            }
-            .hash();
-            let expected_fallback = VrfElectionResult {
-                height: election.height,
-                round: election.round,
-                elected_validator_id: slot.proposer_id,
-                elected_vrf_output: VRF_FALLBACK_OUTPUT,
-                fallback_used: true,
-                reveal_set_commitment: if reveal_set_commitment_active(election.height) {
-                    compute_reveal_set_commitment(&template.vrf_reveals)
-                } else {
-                    Bytes32::ZERO
-                },
-            }
-            .hash();
-            if template.election_result_hash != Some(expected_normal)
-                && template.election_result_hash != Some(expected_fallback)
-            {
-                return Err(ConsensusError::wrong_proposer(
-                    "legacy commit-reveal hash does not match proposer VRF result or fallback",
-                ));
-            }
-        }
-    } else {
-        let elected = elect_proposer(election, election.height)?;
-        if elected != slot.proposer_id {
             return Err(ConsensusError::wrong_proposer(
-                "legacy proposer election selected a different validator",
+                "missing authoritative election result",
             ));
         }
-    }
+    };
 
     // Transaction selection policy:
     // - Transactions are selected from the mempool by age eligibility first,
@@ -250,11 +208,7 @@ pub fn produce_block(
         },
         governance_ops: template.governance_ops.clone(),
         staking_ops: template.staking_ops.clone(),
-        vrf_reveals: if reveal_set_commitment_active(height) {
-            template.vrf_reveals.clone()
-        } else {
-            Vec::new()
-        },
+        vrf_reveals: template.vrf_reveals.clone(),
     };
 
     let projected =
@@ -287,7 +241,7 @@ fn compute_selected_tx_root(transactions: &[TransactionV1]) -> Bytes32 {
 mod tests {
     use super::*;
     use crate::mempool::Mempool;
-    use indra_core::types::primitives::hard_forks::REVEAL_SET_COMMITMENT_HEIGHT;
+    use crate::proposer::VRF_FALLBACK_OUTPUT;
     use indra_crypto::VrfKeypair;
     use indra_state::{apply_block, state_root, ChainState};
 
@@ -313,7 +267,7 @@ mod tests {
         }
     }
 
-    fn election_hash_for(election: &ProposerElection, vrf_seed: [u8; 32]) -> Bytes32 {
+    fn election_result_for(election: &ProposerElection, vrf_seed: [u8; 32]) -> VrfElectionResult {
         let vrf = VrfKeypair::from_seed(&vrf_seed);
         let validator_id = election
             .candidates
@@ -334,9 +288,12 @@ mod tests {
             elected_validator_id: validator_id,
             elected_vrf_output: Bytes32::from(slot.vrf_output.0),
             fallback_used: false,
-            reveal_set_commitment: Bytes32::ZERO,
+            reveal_set_commitment: compute_reveal_set_commitment(&[]),
         }
-        .hash()
+    }
+
+    fn election_hash_for(election: &ProposerElection, vrf_seed: [u8; 32]) -> Bytes32 {
+        election_result_for(election, vrf_seed).hash()
     }
 
     fn assert_produced_block_matches_clone_projection(block: &BlockV1, pre_state: &ChainState) {
@@ -391,7 +348,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: None,
+            election_result: Some(election_result_for(&election, seed)),
             vrf_reveals: vec![],
         };
 
@@ -419,7 +376,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash),
-            election_result: None,
+            election_result: Some(election_result_for(&election, seed)),
             vrf_reveals: vec![],
         };
 
@@ -466,7 +423,7 @@ mod tests {
     #[test]
     fn authoritative_reveal_set_result_is_single_proposer_authority() {
         let mut state = ChainState::new_genesis();
-        state.height = REVEAL_SET_COMMITMENT_HEIGHT.saturating_sub(1);
+        state.height = 0;
         let mempool = Mempool::default_config();
         let seed = [0x57u8; 32];
         let height = state.height + 1;
@@ -519,7 +476,7 @@ mod tests {
     #[test]
     fn wrong_candidate_rejected_by_authoritative_result() {
         let mut state = ChainState::new_genesis();
-        state.height = REVEAL_SET_COMMITMENT_HEIGHT.saturating_sub(1);
+        state.height = 0;
         let mempool = Mempool::default_config();
         let epoch_seed = [0x58u8; 32];
         let seed_a = [0x59u8; 32];
@@ -589,7 +546,7 @@ mod tests {
     #[test]
     fn wrong_proposer_reasons_are_distinct_for_authoritative_checks() {
         let mut state = ChainState::new_genesis();
-        state.height = REVEAL_SET_COMMITMENT_HEIGHT.saturating_sub(1);
+        state.height = 0;
         let mempool = Mempool::default_config();
         let seed = [0x5Bu8; 32];
         let height = state.height + 1;
@@ -646,7 +603,7 @@ mod tests {
         assert!(matches!(
             produce_block(&missing_result, &mut state, &mempool, &election),
             Err(ConsensusError::WrongProposer { reason })
-                if reason == "missing authoritative election result after reveal-set activation"
+                if reason == "missing authoritative election result"
         ));
     }
 
@@ -667,7 +624,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: None,
+            election_result: Some(election_result_for(&election, seed)),
             vrf_reveals: vec![],
         };
         let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
@@ -692,7 +649,7 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: None,
+            election_result: Some(election_result_for(&election, seed)),
             vrf_reveals: vec![],
         };
 
@@ -729,7 +686,7 @@ mod tests {
                 governance_ops: vec![],
                 staking_ops: vec![],
                 election_result_hash: Some(election_hash_for(&election, seed)),
-                election_result: None,
+                election_result: Some(election_result_for(&election, seed)),
                 vrf_reveals: vec![],
             };
 

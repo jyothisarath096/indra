@@ -948,7 +948,6 @@ impl PersistentAuthTree {
             AuthTreeProof::V2Compressed(proof) => {
                 CompressedAuthTree::verify_proof(root, key, proof)
             }
-            AuthTreeProof::V1LegacySparse(_) => false,
         }
     }
 

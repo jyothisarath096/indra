@@ -7,10 +7,9 @@ use crate::{
     types::{
         governance::GovernanceOpV2,
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
-            BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP, MAX_ACTIVE_VALIDATORS, MAX_GOV_OPS_PER_BLOCK,
-            MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-            MAX_VRF_PROOF_BYTES,
+            Bytes32, ProtocolVersion, VariableBytes, BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
+            MAX_ACTIVE_VALIDATORS, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
         },
         slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1},
         staking::StakingOp,
@@ -150,8 +149,14 @@ impl Encode for BlockHeaderV1 {
 
 impl Decode for BlockHeaderV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let protocol_version = ProtocolVersion::decode(r)?;
+        if protocol_version.0 < crate::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET {
+            return Err(crate::error::IndraError::UnsupportedVersion {
+                version: protocol_version.0,
+            });
+        }
         Ok(Self {
-            protocol_version: ProtocolVersion::decode(r)?,
+            protocol_version,
             height: u64::decode(r)?,
             prev_hash: Bytes32::decode(r)?,
             timestamp: u64::decode(r)?,
@@ -192,8 +197,8 @@ pub struct BlockV1 {
     pub staking_ops: Vec<StakingOp>,
     /// Full VRF reveal evidence used to compute the commit-reveal election result.
     ///
-    /// Present at/after REVEAL_SET_COMMITMENT_HEIGHT via block protocol version
-    /// 2. Retention follows ordinary block-body retention: pruned validators keep
+    /// Always encoded, even when empty. Retention follows ordinary block-body
+    /// retention: pruned validators keep
     /// it for their configured block window, while archive nodes keep it for
     /// full history.
     pub vrf_reveals: Vec<VrfRevealEvidence>,
@@ -210,9 +215,7 @@ impl Encode for BlockV1 {
         }
         encode_list(&self.governance_ops, buf);
         encode_list(&self.staking_ops, buf);
-        if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET {
-            encode_list(&self.vrf_reveals, buf);
-        }
+        encode_list(&self.vrf_reveals, buf);
     }
     fn encoded_len(&self) -> usize {
         self.header.encoded_len()
@@ -224,18 +227,13 @@ impl Encode for BlockV1 {
             }
             + list_encoded_len(&self.governance_ops)
             + list_encoded_len(&self.staking_ops)
-            + if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET {
-                list_encoded_len(&self.vrf_reveals)
-            } else {
-                0
-            }
+            + list_encoded_len(&self.vrf_reveals)
     }
 }
 
 impl Decode for BlockV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let header = BlockHeaderV1::decode(r)?;
-        let use_reveal_set_body = header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_REVEAL_SET;
         let use_slash_membership_body =
             header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP;
         let transactions = decode_list(r, MAX_TX_PER_BLOCK, "transactions")?;
@@ -257,11 +255,7 @@ impl Decode for BlockV1 {
             slashing_evidence_v2,
             governance_ops: decode_list(r, MAX_GOV_OPS_PER_BLOCK, "governance_ops")?,
             staking_ops: decode_list(r, MAX_STAKING_OPS_PER_BLOCK, "staking_ops")?,
-            vrf_reveals: if use_reveal_set_body {
-                decode_list(r, MAX_ACTIVE_VALIDATORS, "vrf_reveals")?
-            } else {
-                Vec::new()
-            },
+            vrf_reveals: decode_list(r, MAX_ACTIVE_VALIDATORS, "vrf_reveals")?,
         })
     }
 }
@@ -291,8 +285,8 @@ mod tests {
         BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
         BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING,
         BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT,
-        BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP, BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT,
-        BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
+        BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
+        BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT, BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
     };
 
     fn dummy_header() -> BlockHeaderV1 {

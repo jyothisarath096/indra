@@ -115,13 +115,6 @@ pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
 /// differ between testnet and mainnet, and silently reusing a testnet value
 /// would activate this rule at an arbitrary, meaningless point in mainnet's own
 /// history.
-pub const STAKING_COMMITMENT_PROOF_HEIGHT: u64 = 0;
-
-/// True when staking bond operations must prove that the bonded UTXO's
-/// Pedersen commitment opens to its public `value_spark` field.
-pub fn staking_commitment_proof_required(height: u64) -> bool {
-    height >= STAKING_COMMITMENT_PROOF_HEIGHT
-}
 
 /// Epochs delay before a governance-approved timeout change takes effect.
 pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
@@ -414,131 +407,6 @@ pub fn bps_of(value: u64, bps: u32) -> u64 {
 /// differ between testnet and mainnet, and silently reusing testnet values would
 /// activate rules at arbitrary, meaningless points in mainnet's own history.
 pub mod hard_forks {
-    /// u128 intermediate arithmetic for proportional reward and slash math.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const OVERFLOW_FIX_HEIGHT: u64 = 0;
-    /// Proposer election uses verified VRF output instead of public key grinding hashes.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const VRF_VERIFIED_OUTPUT_HEIGHT: u64 = 0;
-    /// Quorum certificates require both Ed25519 and ML-DSA vote signatures.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const HYBRID_QC_HEIGHT: u64 = 0;
-    /// Vote signatures include the chain ID in their signing domain.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const VOTE_CHAIN_ID_HEIGHT: u64 = 0;
-    /// Proposer election uses a fully public deterministic score.
-    ///
-    /// Testnet activates this from genesis after a fresh reset. Mainnet may
-    /// choose a future height if migrating an existing chain.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const PUBLIC_PROPOSER_ELECTION_HEIGHT: u64 = 0;
-    /// Commit-reveal VRF proposer election.
-    ///
-    /// Testnet activates this from genesis after a fresh reset. Mainnet must
-    /// choose a future announced hard-fork height.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const VRF_COMMIT_REVEAL_ELECTION_HEIGHT: u64 = 0;
-    /// Block bodies commit to full proposer-specified VRF reveal evidence.
-    ///
-    /// This is intentionally unscheduled in source. A concrete testnet/mainnet
-    /// activation height must be selected during coordinated deployment, after
-    /// all validators have upgraded.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis.
-    pub const REVEAL_SET_COMMITMENT_HEIGHT: u64 = 5400;
-    /// Validators may publish an on-chain P2P dial address.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
-    /// with no per-chain-ID differentiation. It currently holds a
-    /// testnet-specific activation height chosen for this already-running
-    /// testnet's rolling deployment. Before building mainnet genesis, this MUST
-    /// be deliberately reset (almost certainly to 0, so the rule is active from
-    /// mainnet's first block). It will NOT automatically differ between testnet
-    /// and mainnet, and silently reusing the testnet value would activate this
-    /// rule at an arbitrary, meaningless point in mainnet's own history rather
-    /// than from genesis.
-    pub const VALIDATOR_NETWORK_ADDRESS_HEIGHT: u64 = 19900;
-
-    /// Registered-validator cap replacement rule.
-    ///
-    /// INTENTIONALLY UNSCHEDULED: set this to a concrete future height during
-    /// coordinated deployment, comfortably ahead of the live chain tip at that
-    /// time. Before this height, a full validator registry rejects new
-    /// registrations exactly as before. At/after this height, a higher
-    /// self-stake registration may synchronously evict the lowest-self-stake
-    /// evictable registered validator to preserve the hard cap without
-    /// first-come bias.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: single global hard-fork height; reset
-    /// deliberately for mainnet genesis. Leaving `u64::MAX` here means this rule
-    /// never activates on that network.
-    pub const REGISTERED_VALIDATOR_CAP_HEIGHT: u64 = 97_000;
-
-    /// Governance terminal-proposal pruning.
-    ///
-    /// At/after this height, consensus state retains all active governance
-    /// proposals and only the most recent terminal proposal records. Deep
-    /// historical governance transparency is delegated to archive nodes/indexers,
-    /// matching block-pruning precedent.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
-    /// with no per-chain-ID differentiation. It currently holds a
-    /// testnet-specific activation height chosen for this already-running
-    /// testnet's rolling deployment. Before building mainnet genesis, this MUST
-    /// be deliberately reset (almost certainly to 0, so the rule is active from
-    /// mainnet's first block). It will NOT automatically differ between testnet
-    /// and mainnet, and silently reusing the testnet value would activate this
-    /// rule at an arbitrary, meaningless point in mainnet's own history rather
-    /// than from genesis.
-    pub const GOVERNANCE_PROPOSAL_PRUNING_HEIGHT: u64 = 97_000;
-
-    /// Incremental validator/delegation/staking state commitment.
-    ///
-    /// At/after this height, block headers use StateCommitmentV2 for the
-    /// validator/delegation/staking commitment instead of rebuilding the legacy
-    /// sorted-vector validator-set Merkle root on every block. The canonical
-    /// state maps remain the source of truth; the commitment cache is rebuilt
-    /// deterministically from them on startup/snapshot load.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
-    /// with no per-chain-ID differentiation. It currently holds a testnet-
-    /// specific activation height chosen for this already-running testnet's
-    /// coordinated deployment. Before building mainnet genesis, this MUST be
-    /// deliberately reset (almost certainly to 0 if the rule should be active
-    /// from mainnet's first block). It will NOT automatically differ between
-    /// testnet and mainnet.
-    pub const STATE_COMMITMENT_V2_HEIGHT: u64 = 120_000;
-
-    /// Compressed authenticated tree for UTXO/nullifier roots and versioned proofs.
-    ///
-    /// At/after this height, UTXO/nullifier roots switch from the legacy
-    /// fixed-depth SMT to the compressed authenticated tree. This is separate
-    /// from `STATE_COMMITMENT_V2_HEIGHT` because UTXO/nullifier roots are
-    /// already-live consensus commitments with a different readiness/rollback
-    /// profile from the validator/delegation/staking commitment. This testnet
-    /// activation deliberately sets both heights to the same value.
-    ///
-    /// MAINNET GENESIS REQUIREMENT: this constant is a single, global value
-    /// with no per-chain-ID differentiation. It currently holds a testnet-
-    /// specific activation height chosen for this already-running testnet's
-    /// coordinated deployment. Before building mainnet genesis, this MUST be
-    /// deliberately reset (almost certainly to 0 if the rule should be active
-    /// from mainnet's first block). It will NOT automatically differ between
-    /// testnet and mainnet.
-    pub const COMPRESSED_AUTH_TREE_HEIGHT: u64 = 120_000;
 
     /// Compact stake-bond records omit stored range proofs for newly created bonds.
     ///
@@ -672,11 +540,6 @@ pub mod hard_forks {
         "consensus snapshot activation must be the first height after an epoch boundary"
     );
     const _: () = assert!(
-        CONSENSUS_SNAPSHOT_HEIGHT == u64::MAX
-            || CONSENSUS_SNAPSHOT_HEIGHT > REVEAL_SET_COMMITMENT_HEIGHT,
-        "consensus snapshot protocol version must activate after the reveal-set protocol version"
-    );
-    const _: () = assert!(
         super::epoch_transition_context_height_is_aligned(EPOCH_TRANSITION_CONTEXT_HEIGHT),
         "epoch transition context activation must occur at an epoch boundary"
     );
@@ -736,81 +599,6 @@ pub fn slash_membership_proof_active(height: u64) -> bool {
 #[inline]
 pub fn self_unstake_height_precision_active(height: u64) -> bool {
     height >= hard_forks::SELF_UNSTAKE_HEIGHT_PRECISION_HEIGHT
-}
-
-/// Whether proportional arithmetic uses the overflow-safe implementation.
-#[inline]
-pub fn overflow_fix_active(height: u64) -> bool {
-    height >= hard_forks::OVERFLOW_FIX_HEIGHT
-}
-
-/// Whether proposer election must use verified VRF output when available.
-#[inline]
-pub fn vrf_verified_output_active(height: u64) -> bool {
-    height >= hard_forks::VRF_VERIFIED_OUTPUT_HEIGHT
-}
-
-/// Whether QCs must carry and verify both classical and PQ vote signatures.
-#[inline]
-pub fn hybrid_qc_active(height: u64) -> bool {
-    height >= hard_forks::HYBRID_QC_HEIGHT
-}
-
-/// Whether vote signatures must include the chain ID in their signing bytes.
-#[inline]
-pub fn vote_chain_id_active(height: u64) -> bool {
-    height >= hard_forks::VOTE_CHAIN_ID_HEIGHT
-}
-
-/// Whether proposer election must use the fully public deterministic score.
-#[inline]
-pub fn public_proposer_election_active(height: u64) -> bool {
-    height >= hard_forks::PUBLIC_PROPOSER_ELECTION_HEIGHT
-}
-
-/// Whether proposer election must use commit-reveal VRF election.
-#[inline]
-pub fn vrf_commit_reveal_election_active(height: u64) -> bool {
-    height >= hard_forks::VRF_COMMIT_REVEAL_ELECTION_HEIGHT
-}
-
-/// Whether block bodies must carry full VRF reveal evidence and
-/// VrfElectionResult hashes must include its Merkle commitment.
-#[inline]
-pub fn reveal_set_commitment_active(height: u64) -> bool {
-    height >= hard_forks::REVEAL_SET_COMMITMENT_HEIGHT
-}
-
-/// Whether validators may update and discovery may consume on-chain network
-/// addresses.
-#[inline]
-pub fn validator_network_address_active(height: u64) -> bool {
-    height >= hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT
-}
-
-/// Whether full-registry synchronous replacement is active.
-#[inline]
-pub fn registered_validator_cap_active(height: u64) -> bool {
-    height >= hard_forks::REGISTERED_VALIDATOR_CAP_HEIGHT
-}
-
-/// Whether terminal governance proposal pruning is active.
-#[inline]
-pub fn governance_proposal_pruning_active(height: u64) -> bool {
-    height >= hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
-}
-
-/// Whether validator/delegation/staking state uses the incremental
-/// StateCommitmentV2 root rule.
-#[inline]
-pub fn state_commitment_v2_active(height: u64) -> bool {
-    height >= hard_forks::STATE_COMMITMENT_V2_HEIGHT
-}
-
-/// Whether UTXO/nullifier roots and proofs use the compressed authenticated tree.
-#[inline]
-pub fn compressed_auth_tree_active(height: u64) -> bool {
-    height >= hard_forks::COMPRESSED_AUTH_TREE_HEIGHT
 }
 
 /// Whether newly created stake-bond records omit their stored output range proof.
@@ -1026,7 +814,7 @@ pub const PRUNE_WINDOW_EPOCHS: u64 = 500;
 
 // ── Protocol Version ──────────────────────────────────────────────────────────
 
-/// The baseline protocol version for transactions and pre-reveal-set blocks.
+/// Legacy transaction protocol version retained until its dedicated pure-format pass.
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Transaction protocol version carrying optional payment-blinding note sidecars.
@@ -1037,10 +825,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Canonical transaction format carrying mandatory payment notes.
 pub const TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES: u16 = 2;
 
-/// Block protocol version used at/after REVEAL_SET_COMMITMENT_HEIGHT.
-///
-/// Old binaries reject this at header decode, preventing them from silently
-/// accepting post-activation blocks while ignoring the new body evidence field.
+/// Baseline block protocol version. Every block carries reveal evidence.
 pub const BLOCK_PROTOCOL_VERSION_REVEAL_SET: u16 = 2;
 
 /// Block protocol version used at/after CONSENSUS_SNAPSHOT_HEIGHT.
@@ -1075,7 +860,6 @@ pub const BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP: u16 = 8;
 
 const fn block_protocol_version_for_height_at_gates_with_slash_membership(
     height: u64,
-    reveal_set_height: u64,
     consensus_snapshot_height: u64,
     self_unstake_height_precision_height: u64,
     epoch_transition_context_height: u64,
@@ -1088,7 +872,6 @@ const fn block_protocol_version_for_height_at_gates_with_slash_membership(
     } else {
         block_protocol_version_for_height_at_gates_with_live_bond_cap(
             height,
-            reveal_set_height,
             consensus_snapshot_height,
             self_unstake_height_precision_height,
             epoch_transition_context_height,
@@ -1100,7 +883,6 @@ const fn block_protocol_version_for_height_at_gates_with_slash_membership(
 
 const fn block_protocol_version_for_height_at_gates_with_live_bond_cap(
     height: u64,
-    reveal_set_height: u64,
     consensus_snapshot_height: u64,
     self_unstake_height_precision_height: u64,
     epoch_transition_context_height: u64,
@@ -1112,7 +894,6 @@ const fn block_protocol_version_for_height_at_gates_with_live_bond_cap(
     } else {
         block_protocol_version_for_height_at_gates_with_bond_accounting(
             height,
-            reveal_set_height,
             consensus_snapshot_height,
             self_unstake_height_precision_height,
             epoch_transition_context_height,
@@ -1123,7 +904,6 @@ const fn block_protocol_version_for_height_at_gates_with_live_bond_cap(
 
 const fn block_protocol_version_for_height_at_gates_with_bond_accounting(
     height: u64,
-    reveal_set_height: u64,
     consensus_snapshot_height: u64,
     self_unstake_height_precision_height: u64,
     epoch_transition_context_height: u64,
@@ -1137,24 +917,20 @@ const fn block_protocol_version_for_height_at_gates_with_bond_accounting(
         BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
     } else if height >= consensus_snapshot_height {
         BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
-    } else if height >= reveal_set_height {
-        BLOCK_PROTOCOL_VERSION_REVEAL_SET
     } else {
-        PROTOCOL_VERSION
+        BLOCK_PROTOCOL_VERSION_REVEAL_SET
     }
 }
 
 #[cfg(test)]
 const fn block_protocol_version_for_height_at_gates(
     height: u64,
-    reveal_set_height: u64,
     consensus_snapshot_height: u64,
     self_unstake_height_precision_height: u64,
     epoch_transition_context_height: u64,
 ) -> u16 {
     block_protocol_version_for_height_at_gates_with_bond_accounting(
         height,
-        reveal_set_height,
         consensus_snapshot_height,
         self_unstake_height_precision_height,
         epoch_transition_context_height,
@@ -1167,7 +943,6 @@ const fn block_protocol_version_for_height_at_gates(
 pub fn block_protocol_version_for_height(height: u64) -> u16 {
     block_protocol_version_for_height_at_gates_with_slash_membership(
         height,
-        hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
         hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
         hard_forks::SELF_UNSTAKE_HEIGHT_PRECISION_HEIGHT,
         hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
@@ -1337,8 +1112,8 @@ impl<const MAX: usize> Decode for VariableBytes<MAX> {
 pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
-    /// The version this implementation supports.
-    pub const CURRENT: Self = Self(PROTOCOL_VERSION);
+    /// The canonical baseline version emitted by this implementation.
+    pub const CURRENT: Self = Self(BLOCK_PROTOCOL_VERSION_REVEAL_SET);
 
     /// True if this version is supported.
     pub fn is_supported(&self) -> bool {
@@ -1428,25 +1203,22 @@ mod tests {
     }
 
     #[test]
-    fn block_protocol_versions_cross_reveal_and_snapshot_gates_in_order() {
-        const REVEAL_GATE: u64 = 100;
+    fn block_protocol_versions_start_at_reveal_shape_then_cross_later_gates() {
         const SNAPSHOT_GATE: u64 = 301;
         const SELF_UNSTAKE_GATE: u64 = 500;
 
         assert_eq!(
             block_protocol_version_for_height_at_gates(
                 99,
-                REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
                 u64::MAX,
             ),
-            PROTOCOL_VERSION
+            BLOCK_PROTOCOL_VERSION_REVEAL_SET
         );
         assert_eq!(
             block_protocol_version_for_height_at_gates(
                 100,
-                REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
                 u64::MAX,
@@ -1456,7 +1228,6 @@ mod tests {
         assert_eq!(
             block_protocol_version_for_height_at_gates(
                 300,
-                REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
                 u64::MAX,
@@ -1466,7 +1237,6 @@ mod tests {
         assert_eq!(
             block_protocol_version_for_height_at_gates(
                 301,
-                REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
                 u64::MAX,
@@ -1476,7 +1246,6 @@ mod tests {
         assert_eq!(
             block_protocol_version_for_height_at_gates(
                 500,
-                REVEAL_GATE,
                 SNAPSHOT_GATE,
                 SELF_UNSTAKE_GATE,
                 u64::MAX,
@@ -1488,19 +1257,19 @@ mod tests {
     #[test]
     fn self_unstake_protocol_version_coexists_with_either_snapshot_gate_order() {
         assert_eq!(
-            block_protocol_version_for_height_at_gates(300, 100, 200, 400, u64::MAX),
+            block_protocol_version_for_height_at_gates(300, 200, 400, u64::MAX),
             BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(400, 100, 200, 400, u64::MAX),
+            block_protocol_version_for_height_at_gates(400, 200, 400, u64::MAX),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(200, 100, 400, 200, u64::MAX),
+            block_protocol_version_for_height_at_gates(200, 400, 200, u64::MAX),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(400, 100, 400, 200, u64::MAX),
+            block_protocol_version_for_height_at_gates(400, 400, 200, u64::MAX),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
     }
@@ -1508,15 +1277,15 @@ mod tests {
     #[test]
     fn epoch_transition_v5_is_highest_applicable_version_in_any_gate_order() {
         assert_eq!(
-            block_protocol_version_for_height_at_gates(300, 100, 200, 400, 300),
+            block_protocol_version_for_height_at_gates(300, 200, 400, 300),
             BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(400, 100, 200, 400, 300),
+            block_protocol_version_for_height_at_gates(400, 200, 400, 300),
             BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
         );
         assert_eq!(
-            block_protocol_version_for_height_at_gates(299, 100, 200, 250, 300),
+            block_protocol_version_for_height_at_gates(299, 200, 250, 300),
             BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
         );
     }
@@ -1525,13 +1294,13 @@ mod tests {
     fn delegator_bond_accounting_v6_is_highest_applicable_version() {
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_bond_accounting(
-                600, 100, 200, 300, 400, 600,
+                600, 200, 300, 400, 600,
             ),
             BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
         );
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_bond_accounting(
-                599, 100, 200, 300, 400, 600,
+                599, 200, 300, 400, 600,
             ),
             BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
         );
@@ -1541,13 +1310,13 @@ mod tests {
     fn live_bond_cap_v7_is_highest_applicable_version() {
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_live_bond_cap(
-                700, 100, 200, 300, 400, 600, 700,
+                700, 200, 300, 400, 600, 700,
             ),
             BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
         );
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_live_bond_cap(
-                699, 100, 200, 300, 400, 600, 700,
+                699, 200, 300, 400, 600, 700,
             ),
             BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
         );
@@ -1556,13 +1325,13 @@ mod tests {
         // the independently activated v6 behavior starts at a later height.
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_live_bond_cap(
-                500, 100, 200, 300, 400, 600, 500,
+                500, 200, 300, 400, 600, 500,
             ),
             BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
         );
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_live_bond_cap(
-                600, 100, 200, 300, 400, 600, 500,
+                600, 200, 300, 400, 600, 500,
             ),
             BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
         );
@@ -1572,13 +1341,13 @@ mod tests {
     fn slash_membership_v8_is_highest_applicable_version() {
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_slash_membership(
-                800, 100, 200, 300, 400, 600, 700, 800,
+                800, 200, 300, 400, 600, 700, 800,
             ),
             BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP
         );
         assert_eq!(
             block_protocol_version_for_height_at_gates_with_slash_membership(
-                799, 100, 200, 300, 400, 600, 700, 800,
+                799, 200, 300, 400, 600, 700, 800,
             ),
             BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP
         );
@@ -1594,20 +1363,9 @@ mod tests {
     }
 
     #[test]
-    fn inert_snapshot_gate_preserves_every_reachable_pre_gate_version() {
-        for height in [
-            0,
-            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT.saturating_sub(1),
-            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT,
-            hard_forks::REVEAL_SET_COMMITMENT_HEIGHT.saturating_add(1),
-            u64::MAX - 1,
-        ] {
-            let expected = if reveal_set_commitment_active(height) {
-                BLOCK_PROTOCOL_VERSION_REVEAL_SET
-            } else {
-                PROTOCOL_VERSION
-            };
-            assert_eq!(block_protocol_version_for_height(height), expected);
+    fn reveal_set_is_the_baseline_block_protocol() {
+        for height in [0, 1, u64::MAX - 1] {
+            assert!(block_protocol_version_for_height(height) >= BLOCK_PROTOCOL_VERSION_REVEAL_SET);
         }
         assert_eq!(
             block_protocol_version_for_height(u64::MAX),
@@ -1732,26 +1490,6 @@ mod tests {
         assert_eq!(max_active_validators(u64::MAX), VALIDATOR_SET_PHASE4_MAX);
         assert!(MAX_QC_SIGNERS >= VALIDATOR_SET_PHASE4_MAX);
         assert!(MIN_ACTIVE_VALIDATORS <= VALIDATOR_SET_PHASE1_MAX);
-    }
-
-    #[test]
-    fn overflow_fix_activates_at_correct_height() {
-        assert!(overflow_fix_active(0));
-        assert!(overflow_fix_active(1));
-        assert!(overflow_fix_active(25_932));
-        assert!(overflow_fix_active(u64::MAX));
-    }
-
-    #[test]
-    fn governance_proposal_pruning_activates_only_at_configured_height() {
-        use hard_forks::GOVERNANCE_PROPOSAL_PRUNING_HEIGHT;
-
-        assert!(!governance_proposal_pruning_active(
-            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT.saturating_sub(1)
-        ));
-        assert!(governance_proposal_pruning_active(
-            GOVERNANCE_PROPOSAL_PRUNING_HEIGHT
-        ));
     }
 
     #[test]

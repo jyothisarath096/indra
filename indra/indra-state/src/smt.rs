@@ -41,8 +41,6 @@ pub struct MerkleProof {
 /// Versioned authenticated-tree proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthTreeProof {
-    /// Legacy fixed-depth sparse Merkle proof.
-    V1LegacySparse(MerkleProof),
     /// Compressed authenticated tree proof.
     V2Compressed(CompressedProof),
 }

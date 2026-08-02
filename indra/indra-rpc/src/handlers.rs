@@ -2487,8 +2487,7 @@ fn get_governance_params(state: &NodeState<'_>) -> RpcResult<String> {
 
 fn get_proposals(_params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     // Returns active proposals plus the consensus-retained recent terminal
-    // history. Older terminal proposals may be pruned from ChainState after
-    // `GOVERNANCE_PROPOSAL_PRUNING_HEIGHT`; deep history is an archive
+    // history. Older terminal proposals are pruned from ChainState; deep history is an archive
     // node/indexer concern, matching block-pruning precedent.
     let mut proposals: Vec<_> = state.chain.governance.proposals.values().collect();
     proposals.sort_by_key(|proposal| proposal.proposed_epoch);
@@ -2764,27 +2763,6 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
         .prove_at_height(&utxo_id, state.chain.height);
     let state_root = indra_state::compute_state_root(&state.chain);
     match proof {
-        AuthTreeProof::V1LegacySparse(proof) => {
-            let siblings = proof
-                .siblings
-                .iter()
-                .map(|sibling| format!(r#""{}""#, hex::encode(sibling)))
-                .collect::<Vec<_>>()
-                .join(",");
-            let value_hash = proof.value.map(hex::encode).unwrap_or_default();
-            Ok(format!(
-                r#"{{"proof_version":"legacy-smt-v1","utxo_id":"{}","present":{},"value_hash":"{}","siblings":[{}],"state_root":"{}"}}"#,
-                hex::encode(utxo_id.0),
-                if proof.value.is_some() {
-                    "true"
-                } else {
-                    "false"
-                },
-                value_hash,
-                siblings,
-                hex::encode(state_root.0),
-            ))
-        }
         AuthTreeProof::V2Compressed(proof) => {
             let value_hash = proof.value.map(hex::encode).unwrap_or_default();
             Ok(format!(

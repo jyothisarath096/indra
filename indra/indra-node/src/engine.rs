@@ -26,9 +26,8 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
     primitives::{
-        consensus_snapshot_active, reveal_set_commitment_active, vrf_commit_reveal_election_active,
-        Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
-        MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+        consensus_snapshot_active, Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK,
+        MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
     slash_membership::build_slash_membership_proof,
     slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
@@ -576,77 +575,14 @@ impl NodeEngine {
         elected == validator_id
     }
 
-    fn local_election_result_hash(&self, election: &ProposerElection) -> Option<Bytes32> {
-        if !vrf_commit_reveal_election_active(election.height) {
-            return None;
-        }
-        if reveal_set_commitment_active(election.height) {
-            // Post reveal-set activation the election hash commits to quorum
-            // reveal evidence. The engine does not own that ephemeral evidence;
-            // callers must pass the driver's quorum-backed result explicitly.
-            return None;
-        }
-        let validator_id = self.validator_id?;
-        let vrf_kp = self.vrf_keypair.as_ref()?;
-        if !election.candidates.iter().any(|candidate| {
-            candidate.validator_id == validator_id && candidate.vrf_pubkey == vrf_kp.public_key()
-        }) {
-            return None;
-        }
-        let slot = compute_proposer_vrf(
-            validator_id,
-            vrf_kp,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        Some(
-            VrfElectionResult {
-                height: election.height,
-                round: election.round,
-                elected_validator_id: validator_id,
-                elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-                fallback_used: false,
-                reveal_set_commitment: Bytes32::ZERO,
-            }
-            .hash(),
-        )
-    }
-
     /// Propose a block for the next height (only if this node is the proposer).
+    /// Propose a block using the authoritative commit-reveal election result.
     pub fn propose(
         &mut self,
         election: &ProposerElection,
         timestamp: u64,
         prev_qc_bytes: Vec<u8>,
         polc_round: Option<u32>,
-        election_result_hash: Option<Bytes32>,
-        vrf_reveals: Vec<VrfRevealEvidence>,
-    ) -> NodeResult<BlockV1> {
-        self.propose_with_election_result(
-            election,
-            timestamp,
-            prev_qc_bytes,
-            polc_round,
-            election_result_hash,
-            None,
-            vrf_reveals,
-        )
-    }
-
-    /// Propose a block using an authoritative commit-reveal election result.
-    ///
-    /// The consensus driver owns post-activation reveal-set election state.
-    /// This entry point lets the driver pass that quorum-backed result through
-    /// to block production so producer validation does not recompute a second,
-    /// potentially different proposer-election result from local-only data.
-    pub fn propose_with_election_result(
-        &mut self,
-        election: &ProposerElection,
-        timestamp: u64,
-        prev_qc_bytes: Vec<u8>,
-        polc_round: Option<u32>,
-        election_result_hash: Option<Bytes32>,
         election_result: Option<VrfElectionResult>,
         vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
@@ -671,10 +607,12 @@ impl NodeEngine {
 
         self.prune_invalid_governance_ops();
 
-        let election_result_hash = election_result
-            .map(|result| result.hash())
-            .or(election_result_hash)
-            .or_else(|| self.local_election_result_hash(election));
+        let election_result = election_result.ok_or_else(|| {
+            NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer {
+                reason: "missing authoritative election result",
+            })
+        })?;
+        let election_result_hash = election_result.hash();
         let template = BlockTemplate {
             proposer_vrf_keypair: vrf_kp,
             epoch_seed: election.epoch_seed,
@@ -685,8 +623,8 @@ impl NodeEngine {
             slash_evidence_v2: self.select_slash_evidence_v2(),
             governance_ops: self.select_governance_ops(),
             staking_ops: self.select_staking_ops(),
-            election_result_hash,
-            election_result,
+            election_result_hash: Some(election_result_hash),
+            election_result: Some(election_result),
             vrf_reveals,
         };
 
@@ -700,6 +638,7 @@ impl NodeEngine {
 
     /// Re-propose an already validated value in a later round while keeping
     /// its stable consensus value hash unchanged.
+    /// Re-propose a valid block using the authoritative commit-reveal election result.
     pub fn repropose(
         &mut self,
         original_block: &BlockV1,
@@ -708,36 +647,6 @@ impl NodeEngine {
         election: &ProposerElection,
         timestamp: u64,
         last_qc: Vec<u8>,
-        election_result_hash: Option<Bytes32>,
-        vrf_reveals: Vec<VrfRevealEvidence>,
-    ) -> NodeResult<BlockV1> {
-        self.repropose_with_election_result(
-            original_block,
-            new_round,
-            valid_round,
-            election,
-            timestamp,
-            last_qc,
-            election_result_hash,
-            None,
-            vrf_reveals,
-        )
-    }
-
-    /// Re-propose a valid block using an authoritative commit-reveal election result.
-    ///
-    /// This mirrors [`Self::propose_with_election_result`] for POLC
-    /// re-proposals, preserving the same single-authority proposer identity
-    /// rule across fresh proposals and re-proposals.
-    pub fn repropose_with_election_result(
-        &mut self,
-        original_block: &BlockV1,
-        new_round: u32,
-        valid_round: Option<u32>,
-        election: &ProposerElection,
-        timestamp: u64,
-        last_qc: Vec<u8>,
-        election_result_hash: Option<Bytes32>,
         election_result: Option<VrfElectionResult>,
         vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
@@ -765,46 +674,18 @@ impl NodeEngine {
             election.height,
             election.round,
         );
-        let election_result_hash = election_result
-            .map(|result| result.hash())
-            .or(election_result_hash)
-            .or_else(|| self.local_election_result_hash(election));
-        if vrf_commit_reveal_election_active(election.height) {
-            if let Some(result) = election_result {
-                if result.height != election.height
-                    || result.round != election.round
-                    || result.elected_validator_id != slot.proposer_id
-                    || result.reveal_set_commitment != compute_reveal_set_commitment(&vrf_reveals)
-                    || election_result_hash != Some(result.hash())
-                {
-                    return Err(NodeError::NotProposer {
-                        height: proposal_height,
-                    });
-                }
-            } else {
-                let expected = VrfElectionResult {
-                    height: election.height,
-                    round: election.round,
-                    elected_validator_id: slot.proposer_id,
-                    elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-                    fallback_used: false,
-                    reveal_set_commitment: compute_reveal_set_commitment(&vrf_reveals),
-                }
-                .hash();
-                if election_result_hash != Some(expected) {
-                    return Err(NodeError::NotProposer {
-                        height: proposal_height,
-                    });
-                }
-            }
-        } else {
-            let elected =
-                elect_proposer(election, election.height).map_err(NodeError::Consensus)?;
-            if elected != slot.proposer_id {
-                return Err(NodeError::NotProposer {
-                    height: proposal_height,
-                });
-            }
+        let election_result = election_result.ok_or(NodeError::NotProposer {
+            height: proposal_height,
+        })?;
+        let election_result_hash = election_result.hash();
+        if election_result.height != election.height
+            || election_result.round != election.round
+            || election_result.elected_validator_id != slot.proposer_id
+            || election_result.reveal_set_commitment != compute_reveal_set_commitment(&vrf_reveals)
+        {
+            return Err(NodeError::NotProposer {
+                height: proposal_height,
+            });
         }
 
         let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
@@ -835,7 +716,7 @@ impl NodeEngine {
                 proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
                 proposer_vrf_proof: vrf_proof_bytes,
                 quorum_certificate: qc_bytes,
-                election_result_hash,
+                election_result_hash: Some(election_result_hash),
             },
             transactions: original_block.transactions.clone(),
             slashing_evidence: original_block.slashing_evidence.clone(),
@@ -1664,29 +1545,42 @@ mod tests {
             round: 0,
             candidates,
         };
-        let proposer_vrf = VrfKeypair::from_seed(&proposer_seed);
-        let proposer_id = election
-            .candidates
-            .iter()
-            .find(|candidate| candidate.vrf_pubkey == proposer_vrf.public_key())
-            .expect("proposer must be in active validator set")
-            .validator_id;
-        let slot = compute_proposer_vrf(
-            proposer_id,
-            &proposer_vrf,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        let election_result_hash = VrfElectionResult {
-            height: election.height,
-            round: election.round,
-            elected_validator_id: proposer_id,
-            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-            fallback_used: false,
-            reveal_set_commitment: Bytes32::ZERO,
+        let preferred = VrfKeypair::from_seed(&proposer_seed);
+        let mut keypairs = std::collections::BTreeMap::new();
+        let mut revealed = std::collections::BTreeMap::new();
+        let mut vrf_reveals = Vec::new();
+        for candidate in &election.candidates {
+            let keypair = if preferred.public_key() == candidate.vrf_pubkey {
+                preferred.clone()
+            } else {
+                (0u8..=u8::MAX)
+                    .map(|seed| VrfKeypair::from_seed(&[seed; 32]))
+                    .find(|keypair| keypair.public_key() == candidate.vrf_pubkey)
+                    .expect("test validator VRF seed must be recoverable")
+            };
+            let slot = compute_proposer_vrf(
+                candidate.validator_id,
+                &keypair,
+                &election.epoch_seed,
+                election.height,
+                election.round,
+            );
+            let output = Bytes32::from(slot.vrf_output.0);
+            revealed.insert(candidate.validator_id, output);
+            vrf_reveals.push(VrfRevealEvidence {
+                validator_id: candidate.validator_id,
+                vrf_output: output,
+                vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
+            });
+            keypairs.insert(candidate.validator_id, keypair);
         }
-        .hash();
+        let mut election_result =
+            indra_consensus::proposer::elect_proposer_from_reveals(&election, &revealed).unwrap();
+        election_result.reveal_set_commitment = compute_reveal_set_commitment(&vrf_reveals);
+        let proposer_vrf = keypairs
+            .remove(&election_result.elected_validator_id)
+            .unwrap();
+        let election_result_hash = election_result.hash();
         let template = BlockTemplate {
             proposer_vrf_keypair: proposer_vrf,
             epoch_seed: election.epoch_seed,
@@ -1698,8 +1592,8 @@ mod tests {
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
-            election_result: None,
-            vrf_reveals: vec![],
+            election_result: Some(election_result),
+            vrf_reveals,
         };
         let mut projection_state = state.clone();
         produce_block(
@@ -2529,8 +2423,35 @@ mod tests {
             engine.is_proposer(&election),
             "single local validator should be eligible to produce height 1"
         );
+        let slot = compute_proposer_vrf(
+            candidate.validator_id,
+            &VrfKeypair::from_seed(&[0x42u8; 32]),
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let evidence = vec![VrfRevealEvidence {
+            validator_id: candidate.validator_id,
+            vrf_output: Bytes32::from(slot.vrf_output.0),
+            vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
+        }];
+        let result = VrfElectionResult {
+            height: election.height,
+            round: election.round,
+            elected_validator_id: candidate.validator_id,
+            elected_vrf_output: evidence[0].vrf_output,
+            fallback_used: false,
+            reveal_set_commitment: compute_reveal_set_commitment(&evidence),
+        };
         let block = engine
-            .propose(&election, 1_700_000_001, Vec::new(), None, None, vec![])
+            .propose(
+                &election,
+                1_700_000_001,
+                Vec::new(),
+                None,
+                Some(result),
+                evidence,
+            )
             .unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.header.prev_hash, engine.state.tip_hash);
@@ -2573,7 +2494,7 @@ mod tests {
         assert!(matches!(
             err,
             NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer { reason })
-                if reason == "local VRF key is not in election candidates"
+                if reason == "missing authoritative election result"
         ));
 
         let _ = std::fs::remove_dir_all(&dir);

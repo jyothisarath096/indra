@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::{bps_of, muldiv, overflow_fix_active, Bytes32},
+    primitives::{bps_of, muldiv, Bytes32},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
@@ -201,17 +201,9 @@ impl VoteCollector {
         }
 
         // Check if any hash crossed the quorum threshold
-        let threshold = if overflow_fix_active(self.height) {
-            bps_of(self.total_stake, CONSENSUS_QUORUM_BPS)
-        } else {
-            self.total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
-        };
+        let threshold = bps_of(self.total_stake, CONSENSUS_QUORUM_BPS);
         for (block_hash, stake) in &stake_by_hash {
-            let bps = if overflow_fix_active(self.height) {
-                muldiv(*stake, 10_000, self.total_stake)
-            } else {
-                stake.saturating_mul(10_000) / self.total_stake
-            };
+            let bps = muldiv(*stake, 10_000, self.total_stake);
             if *stake >= threshold {
                 return VoteDecision::QuorumReached {
                     block_hash: *block_hash,

@@ -4,7 +4,7 @@ use indra_consensus::mempool::Mempool;
 use indra_consensus::{
     build_qc,
     producer::{produce_block, BlockTemplate},
-    proposer::ProposerCandidate,
+    proposer::{compute_proposer_vrf, elect_proposer_from_reveals, ProposerCandidate},
     qc::QcValidator,
     vote::produce_vote,
 };
@@ -15,6 +15,7 @@ use indra_core::{
         crypto::HybridSignature,
         primitives::{VariableBytes, DEFAULT_CHAIN_ID},
         vote::{VoteStep, VoteV1},
+        vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
     },
     Bytes32,
 };
@@ -75,30 +76,41 @@ fn make_strict_block(
         round: 0,
         candidates,
     };
-    let proposer_vrf_keypair = VrfKeypair::from_seed(&proposer_seed);
-    let proposer_vrf_pk = proposer_vrf_keypair.public_key();
-    let proposer_id = election
-        .candidates
-        .iter()
-        .find(|candidate| candidate.vrf_pubkey == proposer_vrf_pk)
-        .map(|candidate| candidate.validator_id)
-        .expect("test proposer must be in the active validator set");
-    let slot = indra_consensus::proposer::compute_proposer_vrf(
-        proposer_id,
-        &proposer_vrf_keypair,
-        &election.epoch_seed,
-        election.height,
-        election.round,
-    );
-    let election_result_hash = indra_core::types::vrf_election::VrfElectionResult {
-        height: election.height,
-        round: election.round,
-        elected_validator_id: proposer_id,
-        elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-        fallback_used: false,
-        reveal_set_commitment: Bytes32::ZERO,
+    let preferred = VrfKeypair::from_seed(&proposer_seed);
+    let mut keypairs = std::collections::BTreeMap::new();
+    let mut revealed = std::collections::BTreeMap::new();
+    let mut vrf_reveals = Vec::new();
+    for candidate in &election.candidates {
+        let keypair = if preferred.public_key() == candidate.vrf_pubkey {
+            preferred.clone()
+        } else {
+            (0u8..=u8::MAX)
+                .map(|seed| VrfKeypair::from_seed(&[seed; 32]))
+                .find(|keypair| keypair.public_key() == candidate.vrf_pubkey)
+                .expect("test validator VRF seed must be recoverable")
+        };
+        let slot = compute_proposer_vrf(
+            candidate.validator_id,
+            &keypair,
+            &election.epoch_seed,
+            election.height,
+            election.round,
+        );
+        let output = Bytes32::from(slot.vrf_output.0);
+        revealed.insert(candidate.validator_id, output);
+        vrf_reveals.push(VrfRevealEvidence {
+            validator_id: candidate.validator_id,
+            vrf_output: output,
+            vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
+        });
+        keypairs.insert(candidate.validator_id, keypair);
     }
-    .hash();
+    let mut election_result = elect_proposer_from_reveals(&election, &revealed).unwrap();
+    election_result.reveal_set_commitment = compute_reveal_set_commitment(&vrf_reveals);
+    let proposer_vrf_keypair = keypairs
+        .remove(&election_result.elected_validator_id)
+        .unwrap();
+    let election_result_hash = election_result.hash();
     let template = BlockTemplate {
         proposer_vrf_keypair,
         epoch_seed: election.epoch_seed,
@@ -110,8 +122,8 @@ fn make_strict_block(
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
-        election_result: None,
-        vrf_reveals: vec![],
+        election_result: Some(election_result),
+        vrf_reveals,
     };
     let mut projection_state = state.clone();
     produce_block(

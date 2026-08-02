@@ -16,7 +16,7 @@ use indra_core::{
         primitives::{DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
-        vrf_election::VrfElectionResult,
+        vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
     },
     Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
 };
@@ -212,15 +212,20 @@ fn mempool_to_block_pipeline() {
         election.height,
         election.round,
     );
-    let election_result_hash = VrfElectionResult {
+    let vrf_reveals = vec![VrfRevealEvidence {
+        validator_id,
+        vrf_output: Bytes32::from(slot.vrf_output.0),
+        vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
+    }];
+    let election_result = VrfElectionResult {
         height: election.height,
         round: election.round,
         elected_validator_id: validator_id,
         elected_vrf_output: Bytes32::from(slot.vrf_output.0),
         fallback_used: false,
-        reveal_set_commitment: Bytes32::ZERO,
-    }
-    .hash();
+        reveal_set_commitment: compute_reveal_set_commitment(&vrf_reveals),
+    };
+    let election_result_hash = election_result.hash();
 
     let template = BlockTemplate {
         proposer_vrf_keypair: vrf_keypair,
@@ -233,8 +238,8 @@ fn mempool_to_block_pipeline() {
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
-        election_result: None,
-        vrf_reveals: vec![],
+        election_result: Some(election_result),
+        vrf_reveals,
     };
 
     let block = produce_block(&template, &mut state, &mempool, &election).unwrap();

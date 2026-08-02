@@ -2,10 +2,7 @@
 
 use crate::{
     codec::Encode,
-    types::{
-        primitives::{vote_chain_id_active, Bytes32},
-        vote::VoteStep,
-    },
+    types::{primitives::Bytes32, vote::VoteStep},
 };
 
 /// Produce the canonical bytes a vote signature covers.
@@ -22,11 +19,9 @@ pub fn vote_signing_bytes(
 ) -> Vec<u8> {
     let chain_bytes = chain_id.as_bytes();
     let mut buf = indra_crypto::hash::domains::VOTE_SIGN.to_vec();
-    if vote_chain_id_active(height) {
-        let chain_len = u16::try_from(chain_bytes.len()).expect("chain_id length must fit in u16");
-        chain_len.encode(&mut buf);
-        buf.extend_from_slice(chain_bytes);
-    }
+    let chain_len = u16::try_from(chain_bytes.len()).expect("chain_id length must fit in u16");
+    chain_len.encode(&mut buf);
+    buf.extend_from_slice(chain_bytes);
     height.encode(&mut buf);
     round.encode(&mut buf);
     step.encode(&mut buf);

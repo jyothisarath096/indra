@@ -9,8 +9,7 @@ use crate::{
     types::{
         crypto::PQVoteSig,
         primitives::{
-            hybrid_qc_active, Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS,
-            MAX_VALIDATORS,
+            Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS,
         },
     },
 };
@@ -18,7 +17,6 @@ use crate::{
 /// Bytes needed for the signer bitfield. ceil(MAX_VALIDATORS / 8).
 pub const SIGNER_BITFIELD_BYTES: usize = MAX_VALIDATORS.div_ceil(8);
 /// QC format version for pre-hybrid PQ-only signatures.
-pub const QC_FORMAT_LEGACY: u8 = 1;
 /// QC format version for hybrid PQ + Ed25519 signatures.
 pub const QC_FORMAT_HYBRID: u8 = 2;
 
@@ -93,11 +91,7 @@ impl QuorumCertificateV1 {
 
 impl Encode for QuorumCertificateV1 {
     fn encode(&self, buf: &mut Vec<u8>) {
-        if hybrid_qc_active(self.height) {
-            QC_FORMAT_HYBRID.encode(buf);
-        } else {
-            QC_FORMAT_LEGACY.encode(buf);
-        }
+        QC_FORMAT_HYBRID.encode(buf);
         self.height.encode(buf);
         self.round.encode(buf);
         self.block_hash.encode(buf);
@@ -109,9 +103,7 @@ impl Encode for QuorumCertificateV1 {
         }
         buf.extend_from_slice(&self.signer_bitfield);
         encode_list(&self.pq_signatures, buf);
-        if hybrid_qc_active(self.height) {
-            encode_list(&self.classical_signatures, buf);
-        }
+        encode_list(&self.classical_signatures, buf);
     }
     fn encoded_len(&self) -> usize {
         1 + 8
@@ -121,18 +113,14 @@ impl Encode for QuorumCertificateV1 {
             + self.election_result_hash.map(|_| 32).unwrap_or(0)
             + SIGNER_BITFIELD_BYTES
             + list_encoded_len(&self.pq_signatures)
-            + if hybrid_qc_active(self.height) {
-                list_encoded_len(&self.classical_signatures)
-            } else {
-                0
-            }
+            + list_encoded_len(&self.classical_signatures)
     }
 }
 
 impl Decode for QuorumCertificateV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let format = u8::decode(r)?;
-        if !matches!(format, QC_FORMAT_LEGACY | QC_FORMAT_HYBRID) {
+        if format != QC_FORMAT_HYBRID {
             return Err(IndraError::InvalidQcFormat { format });
         }
         let height = u64::decode(r)?;
@@ -148,11 +136,7 @@ impl Decode for QuorumCertificateV1 {
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield.copy_from_slice(bf_bytes);
         let pq_signatures = decode_list(r, MAX_QC_SIGNERS, "pq_signatures")?;
-        let classical_signatures = if format == QC_FORMAT_HYBRID {
-            decode_list(r, MAX_QC_SIGNERS, "classical_signatures")?
-        } else {
-            Vec::new()
-        };
+        let classical_signatures = decode_list(r, MAX_QC_SIGNERS, "classical_signatures")?;
         Ok(Self {
             height,
             round,
@@ -192,35 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_qc_encodes_and_decodes_without_classical_sigs() {
-        let qc = QuorumCertificateV1 {
-            height: 1,
-            round: 0,
-            block_hash: Bytes32::from([0x01; 32]),
-            election_result_hash: None,
-            signer_bitfield: [0u8; SIGNER_BITFIELD_BYTES],
-            pq_signatures: vec![],
-            classical_signatures: vec![],
-        };
-
-        let mut buf = Vec::new();
-        QC_FORMAT_LEGACY.encode(&mut buf);
-        qc.height.encode(&mut buf);
-        qc.round.encode(&mut buf);
-        qc.block_hash.encode(&mut buf);
-        0u8.encode(&mut buf);
-        buf.extend_from_slice(&qc.signer_bitfield);
-        encode_list(&qc.pq_signatures, &mut buf);
-
-        let decoded = QuorumCertificateV1::decode_exact(&buf).unwrap();
-        assert_eq!(decoded.height, qc.height);
-        assert_eq!(decoded.round, qc.round);
-        assert_eq!(decoded.block_hash, qc.block_hash);
-        assert_eq!(decoded.pq_signatures, qc.pq_signatures);
-        assert!(decoded.classical_signatures.is_empty());
-    }
-
-    #[test]
     fn hybrid_qc_encodes_and_decodes_with_classical_sigs() {
         let qc = QuorumCertificateV1 {
             height: 1,
@@ -252,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pq_only_qc_bytes_without_version_fail_gracefully() {
+    fn pq_only_qc_bytes_are_rejected() {
         let mut legacy = Vec::new();
         3u64.encode(&mut legacy);
         0u32.encode(&mut legacy);

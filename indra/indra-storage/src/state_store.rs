@@ -579,7 +579,7 @@ fn decode_legacy_snapshot(payload: &[u8]) -> Result<(ChainState, u8), String> {
 }
 
 fn validate_snapshot_state(
-    state: ChainState,
+    mut state: ChainState,
     file_height: u64,
 ) -> Result<Option<ChainState>, String> {
     if state.height != file_height {
@@ -588,6 +588,7 @@ fn validate_snapshot_state(
             file_height, state.height
         ));
     }
+    state.rebuild_state_commitment_v2(state.height);
     Ok(Some(state))
 }
 
@@ -595,9 +596,7 @@ fn validate_snapshot_state(
 mod tests {
     use super::*;
     use indra_core::{
-        types::primitives::{
-            hard_forks::VALIDATOR_NETWORK_ADDRESS_HEIGHT, DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES,
-        },
+        types::primitives::{DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES},
         types::{
             block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
@@ -688,6 +687,7 @@ mod tests {
         state.height = 42;
         state.base_fee = 500;
         state.fee_reward_pool = 777;
+        state.rebuild_state_commitment_v2(state.height);
 
         store.save(&state).unwrap();
 
@@ -811,6 +811,7 @@ mod tests {
         let mut state = ChainState::new_genesis();
         state.height = 123;
         state.treasury_balance = 456;
+        state.rebuild_state_commitment_v2(state.height);
         store.save(&state).unwrap();
         assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
         let loaded = store.load_latest().unwrap().unwrap();
@@ -823,7 +824,7 @@ mod tests {
         let dir = temp_dir("pre_activation_migrated_sidecar");
         let store = StateStore::open(&dir).unwrap();
         let mut state = ChainState::new_genesis();
-        state.height = VALIDATOR_NETWORK_ADDRESS_HEIGHT.saturating_sub(1);
+        state.height = 0;
         state.tip_hash = Bytes32::from([0x99; 32]);
         state.validators.upsert(test_validator()).unwrap();
 
@@ -1039,6 +1040,7 @@ mod tests {
                 9,
             )
             .unwrap();
+        state.rebuild_state_commitment_v2(state.height);
 
         store.save(&state).unwrap();
         let loaded = store.load_latest().unwrap().unwrap();
@@ -1099,8 +1101,14 @@ mod tests {
 
         assert_eq!(decoded, original);
         assert_eq!(compute_state_root(&decoded), compute_state_root(&original));
-        assert_eq!(decoded.utxos.root(), original.utxos.root());
-        assert_eq!(decoded.nullifiers.root(), original.nullifiers.root());
+        assert_eq!(
+            decoded.utxos.root_at_height(decoded.height),
+            original.utxos.root_at_height(original.height)
+        );
+        assert_eq!(
+            decoded.nullifiers.root_at_height(decoded.height),
+            original.nullifiers.root_at_height(original.height)
+        );
         assert_eq!(
             compute_validator_set_root(&decoded),
             compute_validator_set_root(&original)

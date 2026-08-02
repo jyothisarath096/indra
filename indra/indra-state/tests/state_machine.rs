@@ -968,8 +968,8 @@ fn epoch_transition_produces_identical_state_on_replay() {
 }
 
 #[test]
-fn replay_with_different_arithmetic_diverges_without_height_gating() {
-    use indra_core::types::primitives::{muldiv, overflow_fix_active};
+fn corrected_arithmetic_differs_from_saturating_multiply_then_divide() {
+    use indra_core::types::primitives::muldiv;
 
     const EPOCH_REWARD: u64 = 1_189_200_000 * 300;
     const STAKE: u64 = 100_000_000_000;
@@ -1012,43 +1012,17 @@ fn replay_with_different_arithmetic_diverges_without_height_gating() {
             .pending_rewards = new_reward;
     }
     assert_ne!(committed_root, compute_state_root(&ungated_replay));
-
-    // Simulate a mainnet activation at 50,000. A replay of height 300 must
-    // continue using historical arithmetic even when executed by the new code.
-    let activation_height = 50_000;
-    let gated_reward = if EPOCH_DURATION_BLOCKS >= activation_height {
-        new_reward
-    } else {
-        old_reward
-    };
-    let mut gated_replay = snapshot;
-    gated_replay.height = EPOCH_DURATION_BLOCKS;
-    for id in &validator_ids {
-        gated_replay.validators.get_mut(id).unwrap().pending_rewards = gated_reward;
-    }
-    assert_eq!(committed_root, compute_state_root(&gated_replay));
-
-    // The current testnet configuration activates the corrected path at genesis.
-    assert!(overflow_fix_active(0));
-    assert!(overflow_fix_active(25_932));
-    assert!(overflow_fix_active(u64::MAX));
 }
 
 #[test]
-fn height_gated_arithmetic_is_deterministic_across_restarts() {
-    use indra_core::types::primitives::{muldiv, overflow_fix_active};
+fn corrected_arithmetic_is_deterministic_across_restarts() {
+    use indra_core::types::primitives::muldiv;
 
     let epoch_reward = 356_760_000_000;
     let stake = 100_000_000_000;
     let total_stake = 400_000_000_000;
     let replay_height = 100u64;
-    let reward_for = |height: u64| {
-        if overflow_fix_active(height) {
-            muldiv(epoch_reward, stake, total_stake)
-        } else {
-            epoch_reward.saturating_mul(stake) / total_stake
-        }
-    };
+    let reward_for = |_height: u64| muldiv(epoch_reward, stake, total_stake);
 
     // Both binaries dispatch from the block height, not from binary version.
     assert_eq!(reward_for(replay_height), reward_for(replay_height));
@@ -1115,8 +1089,8 @@ fn delegator_reward_distribution_is_height_gated() {
 }
 
 #[test]
-fn commission_bps_is_height_gated() {
-    use indra_core::types::primitives::{bps_of, overflow_fix_active};
+fn commission_bps_uses_corrected_arithmetic() {
+    use indra_core::types::primitives::bps_of;
 
     let reward = 89_190_000_000u64;
     let commission_bps = 1_000u32;
@@ -1125,12 +1099,11 @@ fn commission_bps_is_height_gated() {
 
     assert_eq!(old, 8_919_000_000);
     assert_eq!(new, 8_919_000_000);
-    assert!(overflow_fix_active(0));
 }
 
 #[test]
-fn liveness_penalty_is_height_gated() {
-    use indra_core::types::primitives::{bps_of, overflow_fix_active};
+fn liveness_penalty_uses_corrected_arithmetic() {
+    use indra_core::types::primitives::bps_of;
 
     let stake = 100_000_000_000u64;
     let liveness_bps = 10u32;
@@ -1139,7 +1112,6 @@ fn liveness_penalty_is_height_gated() {
 
     assert_eq!(old, 100_000_000);
     assert_eq!(new, 100_000_000);
-    assert!(overflow_fix_active(0));
 }
 
 #[test]

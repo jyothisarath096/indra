@@ -41,10 +41,9 @@ use indra_core::{
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
             block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
-            epoch_transition_context_active, overflow_fix_active, slash_membership_proof_active,
-            vrf_commit_reveal_election_active, Bytes32, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
-            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            epoch_transition_context_active, slash_membership_proof_active, Bytes32,
+            HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+            MAX_TX_PER_BLOCK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
@@ -57,8 +56,8 @@ use indra_core::{
     EpochRecord,
 };
 use indra_crypto::{
-    verify_balance, verify_hybrid, verify_opening, verify_range, vrf_verify, PedersenCommitment,
-    PedersenOpening, VrfOutput, VrfProof,
+    verify_balance, verify_hybrid, verify_opening, verify_range, PedersenCommitment,
+    PedersenOpening,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -363,13 +362,7 @@ fn apply_slash_common(
         }
     };
 
-    let bps = |amount, rate| {
-        if overflow_fix_active(height) {
-            bps_of(amount, rate)
-        } else {
-            amount.saturating_mul(rate as u64) / 10_000
-        }
-    };
+    let bps = |amount, rate| bps_of(amount, rate);
 
     let mut bond_ids = Vec::new();
     for bond in state.staked_bonds.values() {
@@ -574,14 +567,10 @@ fn slash_reporter_pubkey_for_block_at_gate(
                 consensus_snapshot_gate_height,
             )
             .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
-        let proposer_id = if !vrf_commit_reveal_election_active(block.header.height) {
-            proposer_id_from_vrf_proof_snapshot(snapshot, block)
-        } else {
-            slash_reporter_validator_id_from_candidate_ids(
-                snapshot.entries().iter().map(|entry| entry.validator_id),
-                block,
-            )
-        };
+        let proposer_id = slash_reporter_validator_id_from_candidate_ids(
+            snapshot.entries().iter().map(|entry| entry.validator_id),
+            block,
+        );
         return Ok(proposer_id.and_then(|proposer_id| {
             snapshot
                 .entries()
@@ -608,15 +597,6 @@ fn slash_reporter_pubkey_for_block_at_gate(
 }
 
 fn slash_reporter_validator_id_for_block(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
-    if !vrf_commit_reveal_election_active(block.header.height) {
-        // Legacy pre-commit-reveal path: there is no QC-attested
-        // election_result_hash to recover the proposer from, so retain the
-        // original live VRF proof verification for alternate/future chain
-        // configurations. With VRF_COMMIT_REVEAL_ELECTION_HEIGHT = 0 this
-        // branch is unreachable on the current chain configuration.
-        return proposer_id_from_vrf_proof(state, block);
-    }
-
     slash_reporter_validator_id_from_election_hash(state, block)
 }
 
@@ -664,67 +644,6 @@ where
     });
     let proposer_id = matches.next()?;
     matches.next().is_none().then_some(proposer_id)
-}
-
-fn proposer_id_from_vrf_proof(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
-    let proof_bytes = block.header.proposer_vrf_proof.as_slice();
-    if proof_bytes.is_empty() || block.header.proposer_vrf_output == Bytes32::ZERO {
-        return None;
-    }
-    let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
-    let vrf_input = compute_vrf_input_for_block(
-        &epoch_seed,
-        block.header.height,
-        block.header.proposer_round,
-    );
-    let proof = VrfProof(proof_bytes.to_vec());
-    let output = VrfOutput(block.header.proposer_vrf_output.0);
-    let mut matches = state
-        .validators
-        .active_validators()
-        .filter_map(|validator| {
-            let vrf_pk = validator.vrf_pk?;
-            vrf_verify(&vrf_pk, &vrf_input, &output, &proof)
-                .is_ok()
-                .then_some(validator.validator_id)
-        });
-    let proposer_id = matches.next()?;
-    matches.next().is_none().then_some(proposer_id)
-}
-
-fn proposer_id_from_vrf_proof_snapshot(
-    snapshot: &indra_core::types::consensus_snapshot::ConsensusSnapshot,
-    block: &BlockV1,
-) -> Option<Bytes32> {
-    let proof_bytes = block.header.proposer_vrf_proof.as_slice();
-    if proof_bytes.is_empty() || block.header.proposer_vrf_output == Bytes32::ZERO {
-        return None;
-    }
-    let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
-    let vrf_input = compute_vrf_input_for_block(
-        &epoch_seed,
-        block.header.height,
-        block.header.proposer_round,
-    );
-    let proof = VrfProof(proof_bytes.to_vec());
-    let output = VrfOutput(block.header.proposer_vrf_output.0);
-    let mut matches = snapshot.entries().iter().filter_map(|entry| {
-        vrf_verify(&entry.vrf_pk, &vrf_input, &output, &proof)
-            .is_ok()
-            .then_some(entry.validator_id)
-    });
-    let proposer_id = matches.next()?;
-    matches.next().is_none().then_some(proposer_id)
-}
-
-fn compute_vrf_input_for_block(epoch_seed: &Bytes32, height: u64, round: u32) -> [u8; 32] {
-    use indra_crypto::hash::domains::VRF_INPUT;
-    let mut input = Vec::new();
-    input.extend_from_slice(VRF_INPUT);
-    input.extend_from_slice(&height.to_le_bytes());
-    input.extend_from_slice(&round.to_le_bytes());
-    input.extend_from_slice(&epoch_seed.0[..8]);
-    indra_crypto::sha256(&input)
 }
 
 fn verify_vote_sig_with_keys(

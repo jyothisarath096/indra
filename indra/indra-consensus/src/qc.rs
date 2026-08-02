@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
-        bps_of, hybrid_qc_active, muldiv, overflow_fix_active, Bytes32, VariableBytes,
-        CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
+        bps_of, muldiv, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES,
+        MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
     qc::{ClassicalVoteSig, QuorumCertificateV1},
     vote::{VoteStep, VoteV1},
@@ -109,11 +109,7 @@ impl QcBuilder {
             .filter_map(|id| self.validators.iter().find(|v| v.validator_id == *id))
             .map(|v| v.stake)
             .fold(0u64, |a, b| a.saturating_add(b));
-        if overflow_fix_active(self.height) {
-            muldiv(voted, 10_000, self.total_stake)
-        } else {
-            voted.saturating_mul(10_000) / self.total_stake
-        }
+        muldiv(voted, 10_000, self.total_stake)
     }
 
     /// Build the QC if quorum has been reached.
@@ -126,11 +122,7 @@ impl QcBuilder {
             .fold(0u64, |total, validator| {
                 total.saturating_add(validator.stake)
             });
-        let quorum_stake = if overflow_fix_active(self.height) {
-            bps_of(self.total_stake, CONSENSUS_QUORUM_BPS)
-        } else {
-            self.total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
-        };
+        let quorum_stake = bps_of(self.total_stake, CONSENSUS_QUORUM_BPS);
         if voted_stake < quorum_stake {
             return Err(ConsensusError::QuorumNotReached {
                 have_bps: stake_bps,
@@ -273,11 +265,7 @@ pub fn verify_qc(
     let signed_stake = signers
         .iter()
         .fold(0u64, |acc, validator| acc.saturating_add(validator.stake));
-    let quorum_stake = if overflow_fix_active(qc.height) {
-        bps_of(total_stake, CONSENSUS_QUORUM_BPS)
-    } else {
-        total_stake.saturating_mul(CONSENSUS_QUORUM_BPS as u64) / 10_000
-    };
+    let quorum_stake = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
 
     if signed_stake < quorum_stake {
         return Err(ConsensusError::InsufficientStake {
@@ -303,21 +291,18 @@ pub fn verify_qc(
     }
 
     let mut classical_by_validator = HashMap::new();
-    if hybrid_qc_active(qc.height) {
-        if qc.classical_signatures.len() != signers.len() {
-            return Err(ConsensusError::SignatureCountMismatch {
-                expected: signers.len(),
-                got: qc.classical_signatures.len(),
-            });
+    if qc.classical_signatures.len() != signers.len() {
+        return Err(ConsensusError::SignatureCountMismatch {
+            expected: signers.len(),
+            got: qc.classical_signatures.len(),
+        });
+    }
+    let mut seen_classical = HashSet::new();
+    for signature in &qc.classical_signatures {
+        if !seen_classical.insert(signature.validator_id) {
+            return Err(ConsensusError::DuplicateSignature);
         }
-
-        let mut seen_classical = HashSet::new();
-        for signature in &qc.classical_signatures {
-            if !seen_classical.insert(signature.validator_id) {
-                return Err(ConsensusError::DuplicateSignature);
-            }
-            classical_by_validator.insert(signature.validator_id, signature);
-        }
+        classical_by_validator.insert(signature.validator_id, signature);
     }
 
     for validator in signers {
@@ -357,35 +342,33 @@ pub fn verify_qc(
             validator_id: validator.validator_id,
         })?;
 
-        if hybrid_qc_active(qc.height) {
-            let classical_sig = classical_by_validator
-                .get(&validator.validator_id)
-                .copied()
-                .ok_or(ConsensusError::MissingSignature {
-                    validator_id: validator.validator_id,
-                })?;
-            let classical_sig_bytes: [u8; indra_crypto::CLASSICAL_SIG_BYTES] = classical_sig
-                .classical_sig
-                .as_slice()
-                .try_into()
-                .map_err(|_| ConsensusError::CryptoError {
-                    detail: format!(
-                        "invalid QC classical signature for validator {}",
-                        validator.validator_id
-                    ),
-                })?;
-            verify_classical(
-                &signing_bytes,
-                &ClassicalSignature(classical_sig_bytes),
-                &ClassicalPublicKey(validator.classical_pk),
-            )
+        let classical_sig = classical_by_validator
+            .get(&validator.validator_id)
+            .copied()
+            .ok_or(ConsensusError::MissingSignature {
+                validator_id: validator.validator_id,
+            })?;
+        let classical_sig_bytes: [u8; indra_crypto::CLASSICAL_SIG_BYTES] = classical_sig
+            .classical_sig
+            .as_slice()
+            .try_into()
             .map_err(|_| ConsensusError::CryptoError {
                 detail: format!(
                     "invalid QC classical signature for validator {}",
                     validator.validator_id
                 ),
             })?;
-        }
+        verify_classical(
+            &signing_bytes,
+            &ClassicalSignature(classical_sig_bytes),
+            &ClassicalPublicKey(validator.classical_pk),
+        )
+        .map_err(|_| ConsensusError::CryptoError {
+            detail: format!(
+                "invalid QC classical signature for validator {}",
+                validator.validator_id
+            ),
+        })?;
     }
 
     Ok(())
@@ -393,8 +376,7 @@ pub fn verify_qc(
 
 /// Verify a QC with full hybrid signature enforcement.
 ///
-/// When `hybrid_qc_active(qc.height)` is true (which is always the case
-/// on testnet since `HYBRID_QC_HEIGHT = 0`), both ML-DSA-87 (PQ) and
+/// Both ML-DSA-87 (PQ) and
 /// Ed25519 (classical) signatures are required for every signer.
 /// Delegates to `verify_qc`, which enforces the hybrid requirement.
 pub fn verify_qc_strict(

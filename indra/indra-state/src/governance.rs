@@ -9,10 +9,9 @@ use indra_core::{
         crypto::HybridPubKey,
         governance::{GovernableAction, ProposalTier},
         primitives::{
-            bps_of, muldiv, overflow_fix_active, Bytes32, DUST_LIMIT_SPARK,
-            GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS, MAX_DELEGATION_SPARK,
-            SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS,
-            SLASH_SURROUND_VOTE_BPS, SPARK_PER_INDRA,
+            bps_of, muldiv, Bytes32, DUST_LIMIT_SPARK, GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS,
+            MAX_DELEGATION_SPARK, SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_LIVENESS_BPS,
+            SLASH_LIVENESS_THRESHOLD_EPOCHS, SLASH_SURROUND_VOTE_BPS, SPARK_PER_INDRA,
         },
     },
 };
@@ -27,8 +26,7 @@ pub const GOVERNANCE_PROPOSAL_COOLDOWN_EPOCHS: u64 = 10;
 /// already bounded by validator count. This matches the existing governance
 /// vector/u64-map decode cap style.
 pub const MAX_GOVERNANCE_SNAPSHOT_ITEMS_DECODE: usize = 10_000;
-/// Maximum terminal governance proposal records retained in consensus state
-/// after `GOVERNANCE_PROPOSAL_PRUNING_HEIGHT`.
+/// Maximum terminal governance proposal records retained in consensus state.
 ///
 /// Active proposals are always retained. Deep historical governance history is
 /// an archive-node/indexer responsibility, matching block-pruning precedent.
@@ -348,15 +346,11 @@ impl GovernanceSnapshot {
 
     /// Return whether YES stake clears the configured total-snapshot-stake
     /// threshold under the arithmetic active at `height`.
-    pub fn quorum_met_at_height(&self, yes_stake: u64, quorum_bps: u32, height: u64) -> bool {
+    pub fn quorum_met_at_height(&self, yes_stake: u64, quorum_bps: u32, _height: u64) -> bool {
         if self.total_stake == 0 {
             return false;
         }
-        let required = if overflow_fix_active(height) {
-            bps_of(self.total_stake, quorum_bps)
-        } else {
-            self.total_stake.saturating_mul(quorum_bps as u64) / 10_000
-        };
+        let required = bps_of(self.total_stake, quorum_bps);
         yes_stake > required
     }
 
@@ -366,15 +360,11 @@ impl GovernanceSnapshot {
     }
 
     /// Return yes support in bps under the arithmetic active at `height`.
-    pub fn support_bps_at_height(&self, yes_stake: u64, height: u64) -> u32 {
+    pub fn support_bps_at_height(&self, yes_stake: u64, _height: u64) -> u32 {
         if self.total_stake == 0 {
             return 0;
         }
-        if overflow_fix_active(height) {
-            muldiv(yes_stake, 10_000, self.total_stake) as u32
-        } else {
-            (yes_stake.saturating_mul(10_000) / self.total_stake) as u32
-        }
+        muldiv(yes_stake, 10_000, self.total_stake) as u32
     }
 }
 

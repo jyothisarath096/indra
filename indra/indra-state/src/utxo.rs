@@ -20,14 +20,12 @@
 //! legacy sparse tree for pre-compressed-auth-tree compatibility and a
 //! persistent compressed authenticated tree for active roots/proofs.
 
-use std::sync::Arc;
-
 use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
         primitives::{
-            compressed_auth_tree_active, Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+            Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
             SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
         },
         transaction::OutputV1,
@@ -38,7 +36,7 @@ use indra_crypto::sha256;
 use crate::{
     error::{StateError, StateResult},
     persistent::{PersistentAuthTree, PersistentOrdMap},
-    smt::{AuthTreeProof, MerkleProof, SparseMerkleTree},
+    smt::AuthTreeProof,
 };
 
 /// Defensive snapshot decode ceiling for UTXO entries.
@@ -136,17 +134,12 @@ fn decode_utxo_entry_fields(
 #[derive(Debug, Clone)]
 pub struct UtxoSet {
     entries: PersistentOrdMap<Bytes32, UtxoEntry>,
-    smt: Arc<SparseMerkleTree>,
     compressed: PersistentAuthTree,
 }
 
 impl PartialEq for UtxoSet {
     fn eq(&self, other: &Self) -> bool {
-        // The legacy SMT is a derived pre-activation cache. After
-        // `COMPRESSED_AUTH_TREE_HEIGHT`, post-activation snapshots may omit or
-        // freeze it because consensus roots/proofs use `compressed` instead.
-        // Equality therefore compares canonical entries and the active derived
-        // compressed cache, not the cold legacy cache.
+        // Equality covers canonical entries and the derived compressed root.
         self.entries == other.entries && self.compressed.root() == other.compressed.root()
     }
 }
@@ -180,13 +173,8 @@ impl Decode for UtxoSet {
 }
 
 impl UtxoSet {
-    /// Decode a UTXO set for a state snapshot at `height`.
-    ///
-    /// Pre-activation states rebuild the legacy SMT because their consensus root
-    /// still depends on it. Post-activation states intentionally skip rebuilding
-    /// that cold cache; UTXO roots/proofs use the compressed tree at and after
-    /// `COMPRESSED_AUTH_TREE_HEIGHT`.
-    pub fn decode_at_height(r: &mut ByteReader<'_>, height: u64) -> IndraResult<Self> {
+    /// Decode a UTXO set and rebuild its canonical compressed tree.
+    pub fn decode_at_height(r: &mut ByteReader<'_>, _height: u64) -> IndraResult<Self> {
         let count = u32::decode(r)? as usize;
         if count > MAX_UTXOS_DECODE {
             return Err(IndraError::LengthExceeded {
@@ -196,17 +184,12 @@ impl UtxoSet {
             });
         }
         let mut set = Self::new();
-        let update_legacy = should_update_legacy_smt(height);
         for _ in 0..count {
             let entry = UtxoEntry::decode(r)?;
             if set.entries.contains_key(&entry.utxo_id) {
                 return Err(IndraError::DuplicateEntries {
                     field: "snapshot.utxos",
                 });
-            }
-            let leaf_value = Self::leaf_value(&entry);
-            if update_legacy {
-                Arc::make_mut(&mut set.smt).insert(entry.utxo_id.0, leaf_value);
             }
             set.entries.insert(entry.utxo_id, entry);
         }
@@ -218,7 +201,6 @@ impl UtxoSet {
     pub fn new() -> Self {
         Self {
             entries: PersistentOrdMap::new(),
-            smt: Arc::new(SparseMerkleTree::new()),
             compressed: PersistentAuthTree::new(),
         }
     }
@@ -239,17 +221,13 @@ impl UtxoSet {
             });
         }
         let mut set = Self::new();
-        let update_legacy = should_update_legacy_smt(height);
+        let _ = height;
         for _ in 0..count {
             let entry = UtxoEntry::decode_legacy(r)?;
             if set.entries.contains_key(&entry.utxo_id) {
                 return Err(IndraError::DuplicateEntries {
                     field: "snapshot.utxos",
                 });
-            }
-            let leaf_value = Self::leaf_value(&entry);
-            if update_legacy {
-                Arc::make_mut(&mut set.smt).insert(entry.utxo_id.0, leaf_value);
             }
             set.entries.insert(entry.utxo_id, entry);
         }
@@ -317,9 +295,7 @@ impl UtxoSet {
             .get(&id)
             .map(Self::leaf_value)
             .unwrap_or([0u8; 32]);
-        if should_update_legacy_smt(height) {
-            Arc::make_mut(&mut self.smt).insert(id.0, smt_value);
-        }
+        let _ = height;
         self.compressed.insert(id.0, smt_value);
         Ok(id)
     }
@@ -340,9 +316,7 @@ impl UtxoSet {
     pub fn spend_at_height(&mut self, id: &Bytes32, height: u64) -> Option<UtxoEntry> {
         let removed = self.entries.remove(id);
         if removed.is_some() {
-            if should_update_legacy_smt(height) {
-                Arc::make_mut(&mut self.smt).delete(id.0);
-            }
+            let _ = height;
             self.compressed.delete(id.0);
         }
         removed
@@ -360,9 +334,7 @@ impl UtxoSet {
         let id = entry.utxo_id;
         let value = Self::leaf_value(&entry);
         self.entries.insert(id, entry);
-        if should_update_legacy_smt(height) {
-            Arc::make_mut(&mut self.smt).insert(id.0, value);
-        }
+        let _ = height;
         self.compressed.insert(id.0, value);
     }
 
@@ -377,32 +349,14 @@ impl UtxoSet {
         self.entries.contains_key(id)
     }
 
-    /// Current SMT root for all unspent outputs.
-    pub fn root(&self) -> [u8; 32] {
-        self.smt.root()
-    }
-
     /// Consensus root for all unspent outputs under the root rule active at `height`.
-    pub fn root_at_height(&self, height: u64) -> [u8; 32] {
-        if compressed_auth_tree_active(height) {
-            self.compressed.root()
-        } else {
-            self.smt.root()
-        }
-    }
-
-    /// Inclusion or exclusion proof for a specific UTXO ID.
-    pub fn prove(&self, id: &Bytes32) -> MerkleProof {
-        self.smt.prove(id.0)
+    pub fn root_at_height(&self, _height: u64) -> [u8; 32] {
+        self.compressed.root()
     }
 
     /// Versioned proof under the proof rule active at `height`.
-    pub fn prove_at_height(&self, id: &Bytes32, height: u64) -> AuthTreeProof {
-        if compressed_auth_tree_active(height) {
-            self.compressed.prove(id.0)
-        } else {
-            AuthTreeProof::V1LegacySparse(self.smt.prove(id.0))
-        }
+    pub fn prove_at_height(&self, id: &Bytes32, _height: u64) -> AuthTreeProof {
+        self.compressed.prove(id.0)
     }
 
     /// Deterministic 32-byte value committed at a UTXO leaf.
@@ -426,460 +380,67 @@ impl UtxoSet {
         data.extend_from_slice(&entry.output_index.to_le_bytes());
         sha256(&data)
     }
-
-    #[cfg(test)]
-    fn legacy_smt_ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.smt, &other.smt)
-    }
-}
-
-fn should_update_legacy_smt(height: u64) -> bool {
-    !compressed_auth_tree_active(height)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smt::CompressedAuthTree;
-    use indra_core::{
-        codec::ByteReader, types::primitives::hard_forks::COMPRESSED_AUTH_TREE_HEIGHT,
-        types::transaction::OutputV1, Bytes32, CommitmentV1, HybridPubKey, VariableBytes,
-    };
-    use std::{
-        collections::HashMap,
-        env,
-        time::{Duration, Instant},
-    };
+    use indra_core::types::crypto::CommitmentV1;
 
     fn dummy_output(byte: u8) -> OutputV1 {
         OutputV1 {
-            value_spark: 1_000 + byte as u64,
+            value_spark: 1_000,
             commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
+                compressed_point: Bytes32::from([byte.wrapping_add(1); 32]),
             },
-            owner_pubkey: HybridPubKey {
+            owner_pubkey: indra_core::types::crypto::HybridPubKey {
                 classical_pk: Bytes32::from([byte; 32]),
-                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+                pq_pk: indra_core::VariableBytes::from_slice(&[byte; 32]).unwrap(),
             },
-            range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            range_proof: indra_core::VariableBytes::from_slice(&[byte]).unwrap(),
             lock_height: 0,
         }
     }
 
     #[test]
-    fn insert_and_get() {
+    fn canonical_tree_round_trip_and_membership() {
         let mut set = UtxoSet::new();
-        let output = dummy_output(0x01);
-        let id = set.insert(output.clone(), 1, 0, 0).unwrap();
-        let entry = set.get(&id).unwrap();
-        assert_eq!(entry.created_height, 1);
-        assert_eq!(entry.tx_index, 0);
-        assert_eq!(entry.output_index, 0);
-    }
+        let id = set.insert(dummy_output(7), 1, 0, 1).unwrap();
+        let root = set.root_at_height(1);
+        let proof = set.prove_at_height(&id, 1);
+        assert!(PersistentAuthTree::verify_proof(root, id.0, &proof));
 
-    #[test]
-    fn spend_removes_utxo() {
-        let mut set = UtxoSet::new();
-        let id = set.insert(dummy_output(0x02), 1, 0, 0).unwrap();
-        assert!(set.contains(&id));
-        let entry = set.spend(&id);
-        assert!(entry.is_some());
-        assert!(!set.contains(&id));
-    }
-
-    #[test]
-    fn spend_nonexistent_returns_none() {
-        let mut set = UtxoSet::new();
-        let fake_id = Bytes32::from([0xFFu8; 32]);
-        assert!(set.spend(&fake_id).is_none());
-    }
-
-    #[test]
-    fn utxo_id_is_position_dependent() {
-        let output = dummy_output(0x42);
-        let id1 = UtxoSet::compute_utxo_id(&output, 1, 0, 0);
-        let id2 = UtxoSet::compute_utxo_id(&output, 1, 0, 1); // different output_index
-        let id3 = UtxoSet::compute_utxo_id(&output, 2, 0, 0); // different height
-        assert_ne!(id1, id2);
-        assert_ne!(id1, id3);
-        assert_ne!(id2, id3);
-    }
-
-    #[test]
-    fn utxo_id_is_deterministic() {
-        let output = dummy_output(0x55);
-        let id1 = UtxoSet::compute_utxo_id(&output, 100, 3, 7);
-        let id2 = UtxoSet::compute_utxo_id(&output, 100, 3, 7);
-        assert_eq!(id1, id2);
-    }
-
-    #[test]
-    fn len_tracks_insertions_and_spends() {
-        let mut set = UtxoSet::new();
-        assert_eq!(set.len(), 0);
-        let id1 = set.insert(dummy_output(0x01), 1, 0, 0).unwrap();
-        let _id2 = set.insert(dummy_output(0x02), 1, 0, 1).unwrap();
-        assert_eq!(set.len(), 2);
-        set.spend(&id1);
-        assert_eq!(set.len(), 1);
-    }
-
-    #[test]
-    fn utxo_set_decode_rejects_excessive_entry_count() {
-        let mut bytes = Vec::new();
-        ((MAX_UTXOS_DECODE + 1) as u32).encode(&mut bytes);
-
-        let err = UtxoSet::decode_exact(&bytes).unwrap_err();
-        assert!(matches!(
-            err,
-            IndraError::LengthExceeded {
-                field: "snapshot.utxos",
-                max: MAX_UTXOS_DECODE,
-                actual
-            } if actual == MAX_UTXOS_DECODE + 1
-        ));
-    }
-
-    #[test]
-    fn utxo_set_decode_accepts_realistic_entry_count() {
-        let mut set = UtxoSet::new();
-        set.insert(dummy_output(0x31), 1, 0, 0).unwrap();
-        set.insert(dummy_output(0x32), 1, 0, 1).unwrap();
-
-        let decoded = UtxoSet::decode_exact(&set.encode_to_vec()).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.root(), set.root());
-    }
-
-    #[test]
-    fn root_and_proof_track_membership() {
-        let mut set = UtxoSet::new();
-        let id = set.insert(dummy_output(0x11), 2, 1, 0).unwrap();
-        let proof = set.prove(&id);
-        let value = set.value_hash(&id).unwrap();
-        assert_eq!(proof.value, Some(value));
-        assert!(SparseMerkleTree::verify_proof(set.root(), id.0, &proof));
-
-        set.spend(&id);
-        let missing = set.prove(&id);
-        assert_eq!(missing.value, None);
-        assert!(SparseMerkleTree::verify_proof(set.root(), id.0, &missing));
-    }
-
-    #[test]
-    fn compressed_auth_tree_roots_and_proofs_switch_only_at_activation_height() {
-        let mut set = UtxoSet::new();
-        let id = set.insert(dummy_output(0x12), 2, 1, 0).unwrap();
-
-        assert!(
-            COMPRESSED_AUTH_TREE_HEIGHT > 0,
-            "this test needs a pre-activation height; update it if compressed auth trees activate at genesis"
-        );
-        let pre_activation_height = COMPRESSED_AUTH_TREE_HEIGHT - 1;
-
-        assert_eq!(set.root_at_height(pre_activation_height), set.root());
-        assert!(matches!(
-            set.prove_at_height(&id, pre_activation_height),
-            AuthTreeProof::V1LegacySparse(_)
-        ));
-
-        let compressed_root = set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT);
-        assert_ne!(compressed_root, set.root());
-        let AuthTreeProof::V2Compressed(proof) =
-            set.prove_at_height(&id, COMPRESSED_AUTH_TREE_HEIGHT)
-        else {
-            panic!("expected compressed proof at activation");
-        };
-        assert!(CompressedAuthTree::verify_proof(
-            compressed_root,
-            id.0,
-            &proof
-        ));
-    }
-
-    #[test]
-    fn legacy_smt_updates_until_activation_then_freezes() {
-        let mut set = UtxoSet::new();
-        assert!(
-            COMPRESSED_AUTH_TREE_HEIGHT > 0,
-            "this test needs a pre-activation height"
-        );
-        let last_legacy_height = COMPRESSED_AUTH_TREE_HEIGHT - 1;
-        let activation_height = COMPRESSED_AUTH_TREE_HEIGHT;
-
-        let legacy_root_before = set.root();
-        let id1 = set
-            .insert(dummy_output(0x81), last_legacy_height, 0, 0)
-            .unwrap();
-        assert_ne!(
-            set.root(),
-            legacy_root_before,
-            "legacy SMT must still be updated by the last pre-activation block"
-        );
-        let frozen_legacy_root = set.root();
-        let compressed_before_activation_mutation = set.root_at_height(activation_height);
-        let before_activation_mutation = set.clone();
-
-        let id2 = set
-            .insert(dummy_output(0x82), activation_height, 0, 1)
-            .unwrap();
-        assert!(set.contains(&id1));
-        assert!(set.contains(&id2));
-        assert_eq!(
-            set.root(),
-            frozen_legacy_root,
-            "legacy SMT must be untouched at the first compressed-tree block height"
-        );
-        assert!(
-            set.legacy_smt_ptr_eq(&before_activation_mutation),
-            "post-activation UTXO mutation must not copy or mutate the frozen legacy SMT"
-        );
-        assert_ne!(
-            set.root_at_height(activation_height),
-            compressed_before_activation_mutation,
-            "compressed tree must still track post-activation canonical UTXO mutations"
-        );
-
-        let before_spend = set.clone();
-        let _ = set.spend_at_height(&id1, activation_height);
-        assert_eq!(
-            set.root(),
-            frozen_legacy_root,
-            "post-activation UTXO spend must not mutate the frozen legacy SMT"
-        );
-        assert!(
-            set.legacy_smt_ptr_eq(&before_spend),
-            "post-activation UTXO spend must keep sharing the frozen legacy SMT"
-        );
-    }
-
-    #[test]
-    fn post_activation_decode_skips_legacy_smt_rebuild_but_preserves_compressed_root() {
-        let mut set = UtxoSet::new();
-        set.insert(dummy_output(0x91), 1, 0, 0).unwrap();
-        set.insert(dummy_output(0x92), 2, 0, 1).unwrap();
         let encoded = set.encode_to_vec();
-        let expected_compressed_root = set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT);
-
-        let decoded =
-            UtxoSet::decode_at_height(&mut ByteReader::new(&encoded), COMPRESSED_AUTH_TREE_HEIGHT)
-                .unwrap();
-
-        assert_eq!(decoded.len(), set.len());
-        assert_eq!(
-            decoded.root(),
-            SparseMerkleTree::new().root(),
-            "post-activation snapshots do not rebuild the unread legacy SMT"
-        );
-        assert_eq!(
-            decoded.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
-            expected_compressed_root,
-            "post-activation consensus root still comes from the rebuilt compressed tree"
-        );
+        let decoded = UtxoSet::decode(&mut ByteReader::new(&encoded)).unwrap();
+        assert_eq!(decoded, set);
+        assert_eq!(decoded.root_at_height(1), root);
     }
 
     #[test]
-    fn persistent_entries_preserve_legacy_encoding_order_and_compressed_proofs() {
-        let mut set = UtxoSet::new();
-        let mut legacy_entries = HashMap::new();
-        for (idx, tag) in [0x44, 0x11, 0x77, 0x22].into_iter().enumerate() {
-            let output = dummy_output(tag);
-            let id = set.insert(output.clone(), 10, 0, idx as u32).unwrap();
-            legacy_entries.insert(
-                id,
-                UtxoEntry {
-                    utxo_id: id,
-                    output,
-                    created_height: 10,
-                    tx_index: 0,
-                    output_index: idx as u32,
-                },
-            );
-        }
-
-        let mut legacy_encoded_entries: Vec<_> = legacy_entries.values().cloned().collect();
-        legacy_encoded_entries.sort_by_key(|entry| entry.utxo_id.0);
-        let mut legacy_encoded = Vec::new();
-        encode_list(&legacy_encoded_entries, &mut legacy_encoded);
-        assert_eq!(
-            set.encode_to_vec(),
-            legacy_encoded,
-            "PersistentOrdMap-backed UtxoSet encoding must remain byte-identical to sorted legacy HashMap encoding"
-        );
-
-        let legacy_compressed = CompressedAuthTree::from_pairs(
-            legacy_entries
-                .values()
-                .map(|entry| (entry.utxo_id.0, UtxoSet::leaf_value(entry))),
-        )
-        .unwrap();
-        assert_eq!(
-            set.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
-            legacy_compressed.root()
-        );
-
-        for entry in legacy_entries.values() {
-            let AuthTreeProof::V2Compressed(proof) =
-                set.prove_at_height(&entry.utxo_id, COMPRESSED_AUTH_TREE_HEIGHT)
-            else {
-                panic!("expected compressed UTXO proof after activation");
-            };
-            assert_eq!(proof, legacy_compressed.prove(entry.utxo_id.0));
-        }
-    }
-
-    #[test]
-    fn persistent_entries_are_insertion_order_independent() {
-        let outputs: Vec<_> = (0..8u8).map(dummy_output).collect();
-        let mut forward = UtxoSet::new();
-        let mut reverse = UtxoSet::new();
-
-        for (idx, output) in outputs.iter().cloned().enumerate() {
-            forward.insert(output, 10, 0, idx as u32).unwrap();
-        }
-        for (idx, output) in outputs.into_iter().enumerate().rev() {
-            reverse.insert(output, 10, 0, idx as u32).unwrap();
-        }
-
-        assert_eq!(forward.encode_to_vec(), reverse.encode_to_vec());
-        assert_eq!(
-            forward.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT),
-            reverse.root_at_height(COMPRESSED_AUTH_TREE_HEIGHT)
-        );
-    }
-
-    #[test]
-    #[ignore = "release-mode Stage 2b clone benchmark; run with --release --ignored --nocapture"]
-    fn persistent_entries_and_compressed_tree_clone_benchmark() {
-        // This is intentionally ignored and release-mode-only. The benchmark
-        // isolates the Stage 2b payoff: cloning canonical UTXO entries plus the
-        // active compressed tree. Debug-mode timings are not meaningful.
-        let sizes = env::var("INDRA_STAGE2B_UTXO_CLONE_BENCH_SIZES")
-            .unwrap_or_else(|_| "100000,1000000".to_string());
-        for size in sizes
-            .split(',')
-            .map(|raw| raw.trim().parse::<usize>().expect("valid benchmark size"))
-        {
-            let mut entries = Vec::with_capacity(size);
-            for i in 0..size {
-                let output = dummy_output((i & 0xff) as u8);
-                let utxo_id = UtxoSet::compute_utxo_id(&output, 1, 0, i as u32);
-                entries.push(UtxoEntry {
-                    utxo_id,
-                    output,
-                    created_height: 1,
-                    tx_index: 0,
-                    output_index: i as u32,
-                });
-            }
-            entries.sort_by_key(|entry| entry.utxo_id.0);
-
-            let mut migrated = UtxoSet::new();
-            for entry in entries.iter().cloned() {
-                migrated.restore_for_rollback_at_height(entry, COMPRESSED_AUTH_TREE_HEIGHT);
-            }
-            let mut legacy_entries = HashMap::with_capacity(size);
-            for entry in entries.iter().cloned() {
-                legacy_entries.insert(entry.utxo_id, entry);
-            }
-            let legacy_compressed = CompressedAuthTree::from_pairs(
-                entries
-                    .iter()
-                    .map(|entry| (entry.utxo_id.0, UtxoSet::leaf_value(entry))),
-            )
-            .unwrap();
-            let mut legacy_encoded = Vec::new();
-            encode_list(&entries, &mut legacy_encoded);
-            assert_eq!(
-                migrated.encode_to_vec(),
-                legacy_encoded,
-                "large-scale migrated UTXO encoding must stay byte-identical to the sorted legacy HashMap encoding"
-            );
-
-            let start = Instant::now();
-            let migrated_clone = migrated.clone();
-            let migrated_clone_time = start.elapsed();
-            std::hint::black_box(migrated_clone);
-
-            let start = Instant::now();
-            let legacy_entries_clone = legacy_entries.clone();
-            let legacy_compressed_clone = legacy_compressed.clone();
-            let legacy_clone_time = start.elapsed();
-            std::hint::black_box((legacy_entries_clone, legacy_compressed_clone));
-
-            assert!(
-                migrated_clone_time < Duration::from_millis(10),
-                "persistent UTXO clone should be near-constant, got {:?}",
-                migrated_clone_time
-            );
-            eprintln!(
-                "[stage2b-clone] utxos={size} migrated_entries_plus_compressed_clone={:?} legacy_hashmap_plus_compressed_clone={:?}",
-                migrated_clone_time, legacy_clone_time
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "release-mode legacy SMT freeze benchmark; run with --release --ignored --nocapture"]
-    fn legacy_smt_freeze_decode_and_clone_benchmark() {
-        let sizes = env::var("INDRA_LEGACY_SMT_FREEZE_BENCH_SIZES")
-            .unwrap_or_else(|_| "100000".to_string());
-        let skip_old_baseline = env::var("INDRA_LEGACY_SMT_FREEZE_BENCH_SKIP_OLD")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        for size in sizes
-            .split(',')
-            .map(|raw| raw.trim().parse::<usize>().expect("valid benchmark size"))
-        {
-            let mut entries = Vec::with_capacity(size);
-            for i in 0..size {
-                let output = dummy_output((i & 0xff) as u8);
-                let utxo_id = UtxoSet::compute_utxo_id(&output, 1, 0, i as u32);
-                entries.push(UtxoEntry {
-                    utxo_id,
-                    output,
-                    created_height: 1,
-                    tx_index: 0,
-                    output_index: i as u32,
-                });
-            }
-            entries.sort_by_key(|entry| entry.utxo_id.0);
-            let mut encoded = Vec::new();
-            encode_list(&entries, &mut encoded);
-
-            let start = Instant::now();
-            let post_activation = UtxoSet::decode_at_height(
-                &mut ByteReader::new(&encoded),
-                COMPRESSED_AUTH_TREE_HEIGHT,
-            )
-            .unwrap();
-            let post_activation_decode = start.elapsed();
-
-            let start = Instant::now();
-            let legacy_arc_clone = post_activation.smt.clone();
-            let arc_clone = start.elapsed();
-            std::hint::black_box(legacy_arc_clone);
-
-            let (old_deep_clone, pre_activation_decode) = if skip_old_baseline {
-                (None, None)
-            } else {
-                let start = Instant::now();
-                let pre_activation =
-                    UtxoSet::decode_at_height(&mut ByteReader::new(&encoded), 0).unwrap();
-                let pre_activation_decode = start.elapsed();
-
-                let start = Instant::now();
-                let legacy_deep_clone = (*pre_activation.smt).clone();
-                let old_deep_clone = start.elapsed();
-                std::hint::black_box(legacy_deep_clone);
-                std::hint::black_box(pre_activation);
-                (Some(old_deep_clone), Some(pre_activation_decode))
-            };
-
-            eprintln!(
-                "[legacy-smt-freeze] utxos={size} post_activation_decode={:?} pre_activation_decode_old_rebuild={:?} legacy_arc_clone={:?} legacy_deep_clone_old={:?}",
-                post_activation_decode, pre_activation_decode, arc_clone, old_deep_clone
-            );
-        }
+    fn canonical_tree_is_insertion_order_independent_and_rolls_back() {
+        let a = UtxoEntry {
+            utxo_id: Bytes32::from([1; 32]),
+            output: dummy_output(1),
+            created_height: 1,
+            tx_index: 0,
+            output_index: 0,
+        };
+        let b = UtxoEntry {
+            utxo_id: Bytes32::from([2; 32]),
+            output: dummy_output(2),
+            created_height: 1,
+            tx_index: 0,
+            output_index: 1,
+        };
+        let mut first = UtxoSet::new();
+        first.restore_for_rollback_at_height(a.clone(), 1);
+        first.restore_for_rollback_at_height(b.clone(), 1);
+        let mut second = UtxoSet::new();
+        second.restore_for_rollback_at_height(b, 1);
+        second.restore_for_rollback_at_height(a.clone(), 1);
+        assert_eq!(first.root_at_height(1), second.root_at_height(1));
+        assert_eq!(first.spend_at_height(&a.utxo_id, 1), Some(a.clone()));
+        first.restore_for_rollback_at_height(a, 1);
+        assert_eq!(first.root_at_height(1), second.root_at_height(1));
     }
 }
