@@ -31,9 +31,6 @@ name                = "alice"
 validator_id        = "aabbcc..."   # 64 hex chars (32 bytes)
 hybrid_classical_pk = "aabbcc..."   # 64 hex chars (Ed25519 public key)
 hybrid_pq_pk        = "aabbcc..."   # variable length (Dilithium2 public key)
-# bls_pk is no longer used for QC verification (Dilithium2-only QCs).
-# Retained for reference/backward compatibility with older genesis tooling.
-bls_pk              = "aabbcc..."   # 96 hex chars (legacy BLS12-381 public key)
 vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
 # Genesis validator stake in Spark (1 INDRA = 100,000,000 Spark)
 # Genesis validators are exempt from minimum stake requirements.
@@ -48,7 +45,6 @@ name                = "bob"
 validator_id        = "112233..."
 hybrid_classical_pk = "112233..."
 hybrid_pq_pk        = "112233..."
-bls_pk              = "112233..."
 vrf_pk              = "112233..."
 stake               = 100000000000
 
@@ -57,7 +53,6 @@ name                = "carol"
 validator_id        = "334455..."
 hybrid_classical_pk = "334455..."
 hybrid_pq_pk        = "334455..."
-bls_pk              = "334455..."
 vrf_pk              = "334455..."
 stake               = 100000000000
 
@@ -66,6 +61,5 @@ name                = "dave"
 validator_id        = "556677..."
 hybrid_classical_pk = "556677..."
 hybrid_pq_pk        = "556677..."
-bls_pk              = "556677..."
 vrf_pk              = "556677..."
 stake               = 100000000000

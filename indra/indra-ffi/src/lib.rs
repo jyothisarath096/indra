@@ -103,8 +103,8 @@ mod handle_tests {
         },
     };
     use indra_crypto::{
-        derive_all_seeds, mnemonic_to_seed, verify_opening, PaymentKeypairV1, PaymentPubKeyV1,
-        PedersenCommitment, PedersenOpening,
+        mnemonic_to_seed, verify_opening, PaymentKeypairV1, PaymentPubKeyV1, PedersenCommitment,
+        PedersenOpening,
     };
     use indra_state::{apply_block, apply_staking_op, ChainState};
     use std::{
@@ -287,22 +287,13 @@ mod handle_tests {
     }
 
     #[test]
-    fn ffi_seed_and_mnemonic_payment_keygen_paths_are_compatible_but_distinct() {
+    fn ffi_master_seed_matches_keystore_master_seed_api() {
         let _guard = test_lock();
 
         let seed = [0x27; 32];
         let seed_keys = keygen::generate_keys(seed).unwrap();
-        let compat_from_identity = indra_cli::generate_keypairs(
-            String::new(),
-            seed_keys.hybrid_seed,
-            seed_keys.bls_seed,
-            seed_keys.vrf_seed,
-        )
-        .unwrap();
-        assert_eq!(
-            seed_keys.payment_keypair,
-            compat_from_identity.payment_keypair
-        );
+        let canonical = indra_cli::generate_from_master_seed(String::new(), seed).unwrap();
+        assert_eq!(seed_keys, canonical);
         assert_eq!(
             seed_keys.public.payment_pubkey,
             seed_keys
@@ -330,18 +321,9 @@ mod handle_tests {
         let phrase = keygen::new_mnemonic();
         let mnemonic_keys = keygen::generate_keys_from_mnemonic(&phrase).unwrap();
         let master_seed = mnemonic_to_seed(&phrase).unwrap();
-        let derived = derive_all_seeds(&master_seed);
-        let mnemonic_compat_from_identity = indra_cli::generate_keypairs(
-            String::new(),
-            derived.hybrid_seed,
-            derived.bls_seed,
-            derived.vrf_seed,
-        )
-        .unwrap();
-        assert_ne!(
-            mnemonic_keys.payment_keypair,
-            mnemonic_compat_from_identity.payment_keypair
-        );
+        let canonical_mnemonic =
+            indra_cli::generate_from_master_seed(String::new(), master_seed).unwrap();
+        assert_eq!(mnemonic_keys, canonical_mnemonic);
         assert_eq!(
             mnemonic_keys.public.payment_pubkey,
             mnemonic_keys
@@ -534,6 +516,7 @@ mod handle_tests {
             },
             transactions: vec![tx],
             slashing_evidence: Vec::new(),
+            slashing_evidence_v2: Vec::new(),
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
             vrf_reveals: Vec::new(),
@@ -927,6 +910,7 @@ mod handle_tests {
             StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey,
+                ..
             } => {
                 assert_eq!(validator_id.0, public.validator_id);
                 assert_eq!(delegator_pubkey.classical_pk.0, public.classical_pk);
@@ -1087,7 +1071,6 @@ pub struct IndraKeyPair {
     pub pq_pk: [u8; PQ_PK_BYTES],
     pub classical_seed: [u8; CLASSICAL_SK_BYTES],
     pub pq_sk: [u8; PQ_SK_BYTES],
-    pub bls_seed: [u8; BYTES32_LEN],
     pub vrf_seed: [u8; BYTES32_LEN],
 }
 
@@ -1101,7 +1084,6 @@ impl IndraKeyPair {
             pq_pk: [0u8; PQ_PK_BYTES],
             classical_seed: [0u8; CLASSICAL_SK_BYTES],
             pq_sk: [0u8; PQ_SK_BYTES],
-            bls_seed: [0u8; BYTES32_LEN],
             vrf_seed: [0u8; BYTES32_LEN],
         }
     }
@@ -2205,19 +2187,10 @@ mod tests {
 
         assert_eq!(result, INDRA_OK);
         assert_ne!(out.classical_seed, [0u8; 32], "hybrid_seed is zero");
-        assert_ne!(out.bls_seed, [0u8; 32], "bls_seed is zero");
         assert_ne!(out.vrf_seed, [0u8; 32], "vrf_seed is zero");
-        assert_ne!(
-            out.classical_seed, out.bls_seed,
-            "hybrid and bls seeds are identical"
-        );
         assert_ne!(
             out.classical_seed, out.vrf_seed,
             "hybrid and vrf seeds are identical"
-        );
-        assert_ne!(
-            out.bls_seed, out.vrf_seed,
-            "bls and vrf seeds are identical"
         );
 
         let mut out2 = IndraKeyPair::zeroed();
@@ -2227,7 +2200,6 @@ mod tests {
                 INDRA_OK
             );
         }
-        assert_eq!(out.bls_seed, out2.bls_seed);
         assert_eq!(out.vrf_seed, out2.vrf_seed);
     }
 
@@ -2241,7 +2213,6 @@ mod tests {
         }
         assert_ne!(keypair.classical_seed, [0u8; 32]);
         assert_ne!(keypair.pq_sk, [0u8; 32]);
-        assert_ne!(keypair.bls_seed, [0u8; 32]);
         assert_ne!(keypair.vrf_seed, [0u8; 32]);
 
         unsafe {
@@ -2249,7 +2220,6 @@ mod tests {
         }
         assert_eq!(keypair.classical_seed, [0u8; 32]);
         assert_eq!(keypair.pq_sk, [0u8; 32]);
-        assert_eq!(keypair.bls_seed, [0u8; 32]);
         assert_eq!(keypair.vrf_seed, [0u8; 32]);
     }
 

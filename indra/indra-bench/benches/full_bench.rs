@@ -5,8 +5,7 @@ use indra_bench::{
     codec_bench::*, crypto_bench::*, mempool_bench::*, state_bench::*, storage_bench::*,
 };
 
-#[test]
-fn full_benchmark_suite() {
+fn main() {
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║         INDRA v2 Performance Benchmark Suite          ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
@@ -16,9 +15,6 @@ fn full_benchmark_suite() {
     bench_ed25519(500);
     bench_dilithium2(100);
     bench_hybrid(100);
-    bench_bls_sign(500);
-    bench_bls_aggregate(10, 100);
-    bench_bls_aggregate(100, 20);
     bench_vrf(200);
 
     println!("\n── Serialisation ────────────────────────────────────────");

@@ -18,7 +18,6 @@
 //! validator_id        = "<hex>"
 //! hybrid_classical_pk = "<hex>"
 //! hybrid_pq_pk        = "<hex>"
-//! bls_pk              = "<hex>"
 //! vrf_pk              = "<hex>"
 //! stake               = 10000000000  # Spark
 //! ```
@@ -36,8 +35,6 @@ pub struct GenesisEntry {
     pub hybrid_classical_pk: String,
     /// ML-DSA-87 public key (hex).
     pub hybrid_pq_pk: String,
-    /// BLS12-381 public key (hex).
-    pub bls_pk: String,
     /// VRF public key (hex).
     pub vrf_pk: String,
     /// Initial stake in Spark.
@@ -81,7 +78,6 @@ impl GenesisConfig {
                 v.hybrid_classical_pk
             ));
             out.push_str(&format!("hybrid_pq_pk        = \"{}\"\n", v.hybrid_pq_pk));
-            out.push_str(&format!("bls_pk              = \"{}\"\n", v.bls_pk));
             out.push_str(&format!("vrf_pk              = \"{}\"\n", v.vrf_pk));
             out.push_str(&format!("stake               = {}  # Spark\n\n", v.stake));
         }
@@ -155,7 +151,6 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
         validator_id: hex::encode(keys.public.validator_id),
         hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
         hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
-        bls_pk: hex::encode(keys.public.bls_pk),
         vrf_pk: hex::encode(keys.public.vrf_pk),
         stake,
     }
@@ -164,14 +159,14 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keygen::generate_keypairs;
+    use crate::keygen::generate_from_master_seed;
     use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
     fn test_validators(count: usize) -> Vec<GenesisEntry> {
         (0..count)
             .map(|i| {
                 let seed = [i as u8 + 1; 32];
-                let keys = generate_keypairs(format!("validator-{i}"), seed, seed, seed).unwrap();
+                let keys = generate_from_master_seed(format!("validator-{i}"), seed).unwrap();
                 entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10)
             })
             .collect()
@@ -227,6 +222,6 @@ mod tests {
         assert!(toml.contains("[genesis]"));
         assert!(toml.contains("[[validators]]"));
         assert!(toml.contains("validator_id"));
-        assert!(toml.contains("bls_pk"));
+        assert!(!toml.contains("bls_pk"));
     }
 }

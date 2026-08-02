@@ -674,10 +674,7 @@ fn staking_signer_id(keys: &KeysFile) -> CliResult<Bytes32> {
 
 fn payment_pubkey_from_keys(keys: &KeysFile) -> CliResult<indra_crypto::PaymentPubKeyV1> {
     let payment_keypair = keys.payment_keypair.as_ref().ok_or_else(|| {
-        CliError::MissingArgument(
-            "keys.json does not contain a payment_keypair; run indra-keygen add-payment-key before registering a payment key"
-                .to_string(),
-        )
+        CliError::MissingArgument("canonical keys.json is missing payment_keypair".to_string())
     })?;
     Ok(payment_keypair.public_key())
 }
@@ -768,7 +765,7 @@ fn print_nonce_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_cli::{generate_keypairs, ColdKeysFile};
+    use indra_cli::{generate_from_master_seed, ColdKeysFile};
     use indra_crypto::hybrid::ColdHybridKeypair;
 
     #[test]
@@ -841,8 +838,7 @@ mod tests {
 
     #[test]
     fn validator_owned_address_update_uses_keys_json_validator_id() {
-        let keys =
-            generate_keypairs("validator".to_string(), [0xA1; 32], [0xA2; 32], [0xA3; 32]).unwrap();
+        let keys = generate_from_master_seed("validator".to_string(), [0xA1; 32]).unwrap();
         let canonical = Bytes32::from(keys.public.validator_id);
         let old_hybrid_encoding_hash = {
             let pubkey = hybrid_pubkey_from_keys(&keys).unwrap();
@@ -863,8 +859,7 @@ mod tests {
 
     #[test]
     fn claim_rewards_uses_keys_json_validator_id_for_signer() {
-        let keys =
-            generate_keypairs("validator".to_string(), [0xB1; 32], [0xB2; 32], [0xB3; 32]).unwrap();
+        let keys = generate_from_master_seed("validator".to_string(), [0xB1; 32]).unwrap();
         let keypair = reconstruct_keypair(&keys).unwrap();
         let canonical = validator_id_from_keys(&keys);
         let built = indra_cli::tx_builder::build_claim_rewards_op(
@@ -883,8 +878,7 @@ mod tests {
 
     #[test]
     fn register_payment_key_uses_keys_json_payment_key_and_signer() {
-        let keys =
-            generate_keypairs("validator".to_string(), [0xC1; 32], [0xC2; 32], [0xC3; 32]).unwrap();
+        let keys = generate_from_master_seed("validator".to_string(), [0xC1; 32]).unwrap();
         let keypair = reconstruct_keypair(&keys).unwrap();
         let canonical = validator_id_from_keys(&keys);
         let payment_pubkey = payment_pubkey_from_keys(&keys).unwrap();
@@ -906,19 +900,17 @@ mod tests {
 
     #[test]
     fn register_payment_key_requires_stored_payment_keypair() {
-        let mut keys =
-            generate_keypairs("validator".to_string(), [0xD1; 32], [0xD2; 32], [0xD3; 32]).unwrap();
+        let mut keys = generate_from_master_seed("validator".to_string(), [0xD1; 32]).unwrap();
         keys.payment_keypair = None;
 
         let err = payment_pubkey_from_keys(&keys).unwrap_err();
-        assert!(err.to_string().contains("indra-keygen add-payment-key"));
+        assert!(err.to_string().contains("missing payment_keypair"));
         assert!(!err.to_string().contains("generate/recover"));
     }
 
     #[test]
     fn cold_enrollment_dry_run_details_are_derived_from_real_operation_values() {
-        let hot_keys =
-            generate_keypairs("validator".to_string(), [0xE1; 32], [0xE2; 32], [0xE3; 32]).unwrap();
+        let hot_keys = generate_from_master_seed("validator".to_string(), [0xE1; 32]).unwrap();
         let hot_keypair = reconstruct_keypair(&hot_keys).unwrap();
         let validator_id = validator_id_from_keys(&hot_keys);
         let cold_keypair =

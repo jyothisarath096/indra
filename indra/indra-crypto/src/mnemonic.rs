@@ -20,14 +20,10 @@ pub const MNEMONIC_WORD_COUNT: usize = 24;
 /// All seeds derived from a master seed.
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DerivedSeeds {
-    /// Master seed (32 bytes). This is what the mnemonic encodes.
-    pub master_seed: [u8; 32],
     /// Ed25519 + ML-DSA-87 hybrid keypair seed.
     pub hybrid_seed: [u8; 32],
     /// VRF keypair seed.
     pub vrf_seed: [u8; 32],
-    /// BLS keypair seed (for compatibility).
-    pub bls_seed: [u8; 32],
     /// Payment X25519 key seed.
     pub payment_x25519_seed: [u8; 32],
     /// Payment ML-KEM-1024 key seed.
@@ -59,7 +55,6 @@ pub fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 32], CryptoError> {
 pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
     let hybrid_seed = derive_seed(master_seed, b"indra-hybrid-v1");
     let vrf_seed = derive_seed(master_seed, b"indra-vrf-v1");
-    let bls_seed = derive_seed(master_seed, b"indra-bls-v1");
     let payment_x25519_seed = derive_seed(master_seed, b"indra-payment-x25519-v1");
     let mut payment_ml_kem_seed = [0u8; 64];
     payment_ml_kem_seed[..32]
@@ -67,10 +62,8 @@ pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
     payment_ml_kem_seed[32..]
         .copy_from_slice(&derive_seed(master_seed, b"indra-payment-ml-kem-v1:1"));
     DerivedSeeds {
-        master_seed: *master_seed,
         hybrid_seed,
         vrf_seed,
-        bls_seed,
         payment_x25519_seed,
         payment_ml_kem_seed,
     }
@@ -125,7 +118,6 @@ mod tests {
         let derived2 = derive_all_seeds(&seed);
         assert_eq!(derived1.hybrid_seed, derived2.hybrid_seed);
         assert_eq!(derived1.vrf_seed, derived2.vrf_seed);
-        assert_eq!(derived1.bls_seed, derived2.bls_seed);
         assert_eq!(derived1.payment_x25519_seed, derived2.payment_x25519_seed);
         assert_eq!(derived1.payment_ml_kem_seed, derived2.payment_ml_kem_seed);
     }
@@ -168,10 +160,14 @@ mod tests {
         let seed = mnemonic_to_seed(&phrase).unwrap();
         let derived = derive_all_seeds(&seed);
         assert_ne!(derived.hybrid_seed, derived.vrf_seed);
-        assert_ne!(derived.hybrid_seed, derived.bls_seed);
-        assert_ne!(derived.vrf_seed, derived.bls_seed);
         assert_ne!(derived.hybrid_seed, derived.payment_x25519_seed);
         assert_ne!(derived.vrf_seed, derived.payment_x25519_seed);
+        assert_ne!(
+            derived.payment_x25519_seed,
+            derived.payment_ml_kem_seed[..32]
+        );
+        assert_ne!(derived.hybrid_seed, derived.payment_ml_kem_seed[..32]);
+        assert_ne!(derived.vrf_seed, derived.payment_ml_kem_seed[..32]);
     }
 
     #[test]
@@ -179,7 +175,19 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
         let seed = mnemonic_to_seed(phrase).unwrap();
         let derived = derive_all_seeds(&seed);
-        assert_eq!(&derived.hybrid_seed[0..4], &[227u8, 28u8, 214u8, 187u8]);
+        assert_eq!(
+            hex::encode(derived.hybrid_seed),
+            "e31cd6bbc6df5c923042490bd724e35cd77472fccdb8245c99ff17aec69cb3f6"
+        );
+        assert_eq!(
+            hex::encode(derived.vrf_seed),
+            "811b0f1a2f383b23d5f3d995e0a8415da9a989f198bfaed04375c38889ed792e"
+        );
+        assert_eq!(
+            hex::encode(derived.payment_x25519_seed),
+            "3358ce89349f3bb7179ce31c867b20570a18f69c2f87c736a8bd0fcd70528c7a"
+        );
+        assert_eq!(hex::encode(derived.payment_ml_kem_seed), "0d2b50fa6eb99ac37c3daf0dcf4015b1f82cce65476ab669c5820e1cccf05858d9adfac5f98f5c9b4b6222f7e7f83283ec94f9f69be729b1122fc7f073789039");
     }
 
     #[test]

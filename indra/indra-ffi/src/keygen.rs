@@ -1,5 +1,5 @@
-use indra_cli::{generate_keypairs, recover_from_mnemonic, KeysFile};
-use indra_crypto::{derive_all_seeds, generate_mnemonic, validate_mnemonic};
+use indra_cli::{generate_from_master_seed, recover_from_mnemonic, KeysFile};
+use indra_crypto::{generate_mnemonic, validate_mnemonic};
 
 #[cfg(not(feature = "legacy_raw_keys"))]
 use crate::errors::IndraError;
@@ -13,15 +13,10 @@ const PQ_SK_BYTES: usize = 32;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
 pub fn generate_keys(mut seed: [u8; 32]) -> Result<KeysFile, IndraError> {
-    let derived = derive_all_seeds(&seed);
+    let result =
+        generate_from_master_seed(String::new(), seed).map_err(|_| IndraError::KeygenFailed);
     seed.fill(0);
-    generate_keypairs(
-        String::new(),
-        derived.hybrid_seed,
-        derived.bls_seed,
-        derived.vrf_seed,
-    )
-    .map_err(|_| IndraError::KeygenFailed)
+    result
 }
 
 /// Generate an INDRA keypair bundle from one wallet seed.
@@ -66,7 +61,6 @@ fn keys_to_ffi(keys: &indra_cli::KeysFile) -> Result<IndraKeyPair, IndraError> {
     out.pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
     out.classical_seed.copy_from_slice(&keys.hybrid_seed);
     out.pq_sk.copy_from_slice(&keys.pq_sk);
-    out.bls_seed.copy_from_slice(&keys.bls_seed);
     out.vrf_seed.copy_from_slice(&keys.vrf_seed);
     Ok(out)
 }

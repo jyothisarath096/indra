@@ -837,7 +837,7 @@ mod tests {
         hybrid::{ClassicalKeypair, PqKeypair},
         PaymentKeypairV1,
     };
-    use indra_keystore::generate_keypairs;
+    use indra_keystore::generate_from_master_seed;
     use indra_rpc::{handlers::RpcEngineView, server::call_rpc};
     use indra_state::ChainState;
     use std::collections::BTreeMap;
@@ -1408,8 +1408,7 @@ mod tests {
 
     #[test]
     fn scanner_parses_real_rpc_provenance_envelope() {
-        let mut keys =
-            generate_keypairs("claimant".to_string(), [0x80; 32], [0x81; 32], [0x82; 32]).unwrap();
+        let mut keys = generate_from_master_seed("claimant".to_string(), [0x80; 32]).unwrap();
         keys.payment_keypair = None;
         keys.public.payment_pubkey = None;
 
@@ -1507,13 +1506,8 @@ mod tests {
 
     #[test]
     fn scanner_attempts_protocol_provenance_without_payment_keypair() {
-        let mut keys = generate_keypairs(
-            "legacy-validator".to_string(),
-            [0x7A; 32],
-            [0x7B; 32],
-            [0x7C; 32],
-        )
-        .unwrap();
+        let mut keys =
+            generate_from_master_seed("legacy-validator".to_string(), [0x7A; 32]).unwrap();
         keys.payment_keypair = None;
         keys.public.payment_pubkey = None;
         assert!(keys.payment_keypair.is_none());

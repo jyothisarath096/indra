@@ -5,7 +5,6 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-pub mod bls;
 pub mod commitment;
 pub mod constants;
 pub mod error;
@@ -16,10 +15,6 @@ pub mod payment;
 pub mod pedersen;
 pub mod vrf;
 
-pub use bls::{
-    aggregate_signatures, verify_aggregate, BlsAggregateSignature, BlsKeypair, BlsPublicKey,
-    BlsSignature,
-};
 pub use commitment::verify_balance;
 pub use constants::{CLASSICAL_SIG_BYTES, PQ_PK_BYTES, PQ_SIG_BYTES, PQ_SK_BYTES};
 pub use error::{CryptoError, CryptoResult};

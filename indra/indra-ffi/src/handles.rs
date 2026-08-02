@@ -64,7 +64,6 @@ struct StoredKeyMaterial {
     public: IndraPublicKeyInfo,
     classical_seed: [u8; CLASSICAL_SK_BYTES],
     pq_sk: [u8; PQ_SK_BYTES],
-    bls_seed: [u8; BYTES32_LEN],
     vrf_seed: [u8; BYTES32_LEN],
     payment_keypair: PaymentKeypairV1,
 }
@@ -91,7 +90,6 @@ impl StoredKeyMaterial {
             },
             classical_seed: keys.hybrid_seed,
             pq_sk,
-            bls_seed: keys.bls_seed,
             vrf_seed: keys.vrf_seed,
             payment_keypair,
         })
@@ -114,7 +112,6 @@ impl Drop for StoredKeyMaterial {
     fn drop(&mut self) {
         self.classical_seed.zeroize();
         self.pq_sk.zeroize();
-        self.bls_seed.zeroize();
         self.vrf_seed.zeroize();
         self.payment_keypair.x25519_sk.zeroize();
         self.payment_keypair.ml_kem_1024_seed.zeroize();

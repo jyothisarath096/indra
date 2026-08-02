@@ -22,8 +22,6 @@ use indra_crypto::PQ_PK_BYTES;
 pub struct KeysData {
     /// Ed25519 seed for the hybrid classical key.
     pub hybrid_seed: [u8; 32],
-    /// Legacy BLS seed.
-    pub bls_seed: [u8; 32],
     /// VRF seed.
     pub vrf_seed: [u8; 32],
     /// ML-DSA private key bytes.
@@ -327,14 +325,13 @@ impl NodeConfigFile {
                 None => Some(crate::metrics::DEFAULT_METRICS_ADDR.to_string()),
             }
         };
-        let (validator_seed, bls_seed, vrf_seed, pq_sk, pq_pk) = if mode == "observer" {
-            (None, None, None, None, None)
+        let (validator_seed, vrf_seed, pq_sk, pq_pk) = if mode == "observer" {
+            (None, None, None, None)
         } else {
             let keys =
                 keys_data.ok_or_else(|| "validator mode requires keys.json data".to_string())?;
             (
                 Some(keys.hybrid_seed),
-                Some(keys.bls_seed),
                 Some(keys.vrf_seed),
                 if keys.pq_sk.is_empty() {
                     None
@@ -352,7 +349,6 @@ impl NodeConfigFile {
             data_dir: PathBuf::from(data_dir),
             genesis_path: Some(genesis.clone()),
             validator_seed,
-            bls_seed,
             vrf_seed,
             pq_sk,
             pq_pk,
@@ -530,7 +526,6 @@ mod tests {
     fn keys() -> KeysData {
         KeysData {
             hybrid_seed: [1u8; 32],
-            bls_seed: [2u8; 32],
             vrf_seed: [3u8; 32],
             pq_sk: vec![4, 5, 6],
             pq_pk: vec![7, 8, 9],

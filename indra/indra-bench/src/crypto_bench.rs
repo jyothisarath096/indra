@@ -3,14 +3,13 @@
 use std::time::Duration;
 
 use indra_crypto::{
-    bls::{aggregate_signatures, BlsSignature},
     hybrid::{verify_hybrid, ClassicalKeypair, PqKeypair},
     sha256,
     vrf::{vrf_prove, vrf_verify},
 };
 
 use crate::{
-    fixtures::{bls_keypair, hybrid_keypair, vrf_keypair},
+    fixtures::{hybrid_keypair, vrf_keypair},
     timer::bench,
 };
 
@@ -77,31 +76,6 @@ pub fn bench_hybrid(iterations: u64) {
     r.assert_faster_than(Duration::from_millis(2));
 }
 
-/// Benchmark BLS12-381 single sign.
-pub fn bench_bls_sign(iterations: u64) {
-    let kp = bls_keypair(0x01);
-    let msg = b"INDRA benchmark message for BLS signing";
-
-    let r = bench("bls_sign", iterations, || {
-        let _ = kp.sign(msg);
-    });
-    r.print();
-    r.assert_faster_than(Duration::from_millis(1));
-}
-
-/// Benchmark BLS aggregate over N signatures.
-pub fn bench_bls_aggregate(n: usize, iterations: u64) {
-    let keypairs: Vec<_> = (0..n as u8).map(bls_keypair).collect();
-    let msg = b"INDRA benchmark message for BLS aggregation";
-    let sigs: Vec<BlsSignature> = keypairs.iter().map(|kp| kp.sign(msg)).collect();
-
-    let r = bench(&format!("bls_aggregate_{n}"), iterations, || {
-        let _ = aggregate_signatures(&sigs);
-    });
-    r.print();
-    r.assert_faster_than(Duration::from_millis(n as u64 / 10 + 5));
-}
-
 /// Benchmark SHA-256 on a 1 KB message.
 pub fn bench_sha256(iterations: u64) {
     let data = vec![0xABu8; 1024];
@@ -151,17 +125,6 @@ mod tests {
     #[test]
     fn bench_hybrid_runs() {
         bench_hybrid(20);
-    }
-
-    #[test]
-    fn bench_bls_sign_runs() {
-        bench_bls_sign(50);
-    }
-
-    #[test]
-    fn bench_bls_aggregate_runs() {
-        bench_bls_aggregate(10, 20);
-        bench_bls_aggregate(100, 10);
     }
 
     #[test]

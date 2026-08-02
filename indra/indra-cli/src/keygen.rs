@@ -7,13 +7,12 @@
 use crate::{CliError, CliResult};
 
 pub use indra_keystore::{
-    add_payment_key_to_file, check_password_file_permissions, decrypt_encrypted_keys,
-    encrypt_plaintext_keys, encrypt_plaintext_keys_replace, generate_cold_keys_file,
-    generate_from_new_mnemonic, generate_from_passphrase, generate_keypairs,
-    has_secret_value_in_argv, inspect_public_metadata, load_cold_keys, load_keys,
-    recover_from_mnemonic, warn_if_key_file_permissive,
-    write_keys_secure as write_keys_file_secure, AddPaymentKeyReport, ColdKeysFile,
-    IdentityMaterialSnapshot, KeysFile, KeystoreError, PasswordSource, ValidatorKeys,
+    check_password_file_permissions, decrypt_encrypted_keys, encrypt_plaintext_keys,
+    encrypt_plaintext_keys_replace, generate_cold_keys_file, generate_from_master_seed,
+    generate_from_new_mnemonic, generate_from_passphrase, has_secret_value_in_argv,
+    inspect_public_metadata, load_cold_keys, load_keys, recover_from_mnemonic,
+    warn_if_key_file_permissive, write_keys_secure as write_keys_file_secure, ColdKeysFile,
+    KeysFile, KeystoreError, PasswordSource, ValidatorKeys,
 };
 
 /// Convert a keystore result into the CLI error type.
@@ -55,7 +54,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture() -> KeysFile {
-        generate_keypairs("validator".to_string(), [1; 32], [2; 32], [3; 32]).unwrap()
+        generate_from_master_seed("validator".to_string(), [1; 32]).unwrap()
     }
 
     #[cfg(unix)]
@@ -75,7 +74,8 @@ mod tests {
         let json = keys.to_json();
         assert!(json.contains("\"validator_id\""));
         assert!(json.contains("\"hybrid_seed\""));
-        assert!(json.contains("\"bls_seed\""));
+        assert!(!json.contains("bls_seed"));
+        assert!(!json.contains("bls_pk"));
         assert!(json.contains("\"vrf_seed\""));
         assert!(json.contains("\"pq_sk\""));
     }

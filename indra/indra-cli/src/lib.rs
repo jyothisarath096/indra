@@ -7,7 +7,6 @@
 //! ### `keygen`
 //! Generate a complete validator keypair set:
 //! - Ed25519 + ML-DSA-87 hybrid keypair (for signing transactions and votes)
-//! - Legacy BLS12-381 keypair metadata (retained for backward compatibility)
 //! - VRF keypair (for proposer election)
 //!
 //! Output: an encrypted `keys.json` by default, with legacy plaintext available
@@ -50,12 +49,12 @@ pub use amount::{parse_indra_amount_to_spark, SPARK_PER_INDRA};
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
 pub use keygen::{
-    add_payment_key_to_file, decrypt_encrypted_keys, encrypt_plaintext_keys,
-    encrypt_plaintext_keys_replace, generate_cold_keys_file, generate_from_new_mnemonic,
-    generate_from_passphrase, generate_keypairs, has_secret_value_in_argv, inspect_public_metadata,
-    load_cold_keys, load_keys_for_cli, password_source_from_args, recover_from_mnemonic,
-    warn_if_key_file_permissive, write_keys_file_secure, AddPaymentKeyReport, ColdKeysFile,
-    IdentityMaterialSnapshot, KeysFile, PasswordSource, ValidatorKeys,
+    decrypt_encrypted_keys, encrypt_plaintext_keys, encrypt_plaintext_keys_replace,
+    generate_cold_keys_file, generate_from_master_seed, generate_from_new_mnemonic,
+    generate_from_passphrase, has_secret_value_in_argv, inspect_public_metadata, load_cold_keys,
+    load_keys_for_cli, password_source_from_args, recover_from_mnemonic,
+    warn_if_key_file_permissive, write_keys_file_secure, ColdKeysFile, KeysFile, PasswordSource,
+    ValidatorKeys,
 };
 pub use legacy_scan_auth::{
     build_legacy_scan_auth_proof, fetch_legacy_scan_challenge, json_string, rpc_call_raw_params,

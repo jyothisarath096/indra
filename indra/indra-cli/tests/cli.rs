@@ -2,7 +2,8 @@
 
 use indra_cli::{
     build_claim_rewards_op, build_delegate_op, build_register_validator_op,
-    build_set_commission_op, build_undelegate_op, generate_from_passphrase, generate_keypairs,
+    build_set_commission_op, build_undelegate_op, generate_from_master_seed,
+    generate_from_passphrase,
     genesis_cmd::{build_genesis_config, entry_from_keys},
     load_cold_keys,
     query::rpc_call,
@@ -38,36 +39,17 @@ fn engine(suffix: &str) -> (NodeEngine, PathBuf) {
 
 #[test]
 fn keygen_all_keys_present() {
-    let keys = generate_keypairs(
-        "TestValidator".to_string(),
-        [0x01u8; 32],
-        [0x02u8; 32],
-        [0x03u8; 32],
-    )
-    .unwrap();
+    let keys = generate_from_master_seed("TestValidator".to_string(), [0x01u8; 32]).unwrap();
     assert_eq!(keys.name, "TestValidator");
     assert_eq!(keys.public.hybrid_classical_pk.len(), 32);
-    assert_eq!(keys.public.bls_pk.len(), 48);
     assert_eq!(keys.public.vrf_pk.len(), 32);
     assert!(!keys.public.hybrid_pq_pk.is_empty());
 }
 
 #[test]
 fn keygen_deterministic_from_seed() {
-    let k1 = generate_keypairs(
-        "Deterministic".to_string(),
-        [0xAAu8; 32],
-        [0xBBu8; 32],
-        [0xCCu8; 32],
-    )
-    .unwrap();
-    let k2 = generate_keypairs(
-        "Deterministic".to_string(),
-        [0xAAu8; 32],
-        [0xBBu8; 32],
-        [0xCCu8; 32],
-    )
-    .unwrap();
+    let k1 = generate_from_master_seed("Deterministic".to_string(), [0xAAu8; 32]).unwrap();
+    let k2 = generate_from_master_seed("Deterministic".to_string(), [0xAAu8; 32]).unwrap();
     assert_eq!(k1.public.validator_id, k2.public.validator_id);
     assert_eq!(k1.name, k2.name);
 }
@@ -85,20 +67,13 @@ fn keygen_from_passphrase() {
 
 #[test]
 fn keys_json_is_valid_structure() {
-    let keys = generate_keypairs(
-        "TestValidator".to_string(),
-        [0x01u8; 32],
-        [0x02u8; 32],
-        [0x03u8; 32],
-    )
-    .unwrap();
+    let keys = generate_from_master_seed("TestValidator".to_string(), [0x01u8; 32]).unwrap();
     let json = keys.to_json();
     // All required fields present
     for field in &[
         "name",
         "validator_id",
         "hybrid_classical_pk",
-        "bls_pk",
         "vrf_pk",
         "hybrid_seed",
         "WARNING",
@@ -180,7 +155,7 @@ fn genesis_with_4_validators() {
     let validators: Vec<_> = (0..4u8)
         .map(|i| {
             let seed = [i + 1; 32];
-            let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
+            let keys = generate_from_master_seed(format!("v{i}"), seed).unwrap();
             entry_from_keys(&format!("v{i}"), &keys, stake)
         })
         .collect();
@@ -205,7 +180,7 @@ fn genesis_rejects_3_validators() {
     let validators: Vec<_> = (0..3u8)
         .map(|i| {
             let seed = [i + 1; 32];
-            let keys = generate_keypairs(format!("v{i}"), seed, seed, seed).unwrap();
+            let keys = generate_from_master_seed(format!("v{i}"), seed).unwrap();
             entry_from_keys(&format!("v{i}"), &keys, stake)
         })
         .collect();

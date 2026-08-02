@@ -390,7 +390,6 @@ typedef struct {
     uint8_t pq_pk[INDRA_PQ_PK_BYTES];
     uint8_t classical_seed[INDRA_CLASSICAL_SK_BYTES];
     uint8_t pq_sk[INDRA_PQ_SK_BYTES];
-    uint8_t bls_seed[INDRA_BYTES32_LEN];
     uint8_t vrf_seed[INDRA_BYTES32_LEN];
 } IndraKeyPair;
 

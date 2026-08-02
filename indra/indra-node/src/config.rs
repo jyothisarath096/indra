@@ -28,11 +28,6 @@ pub struct NodeConfig {
     /// If None, this node is a full node (validates but does not propose).
     pub validator_seed: Option<[u8; 32]>,
 
-    /// Legacy BLS signing seed (32 bytes).
-    /// Retained for backward compatibility with existing key files.
-    /// No longer used for QC verification.
-    pub bls_seed: Option<[u8; 32]>,
-
     /// The node's VRF seed (32 bytes).
     /// Required if validator_seed is set.
     pub vrf_seed: Option<[u8; 32]>,
@@ -119,7 +114,6 @@ impl NodeConfig {
             data_dir,
             genesis_path: None,
             validator_seed: Some([0x42u8; 32]),
-            bls_seed: Some([0x42u8; 32]),
             vrf_seed: Some([0x42u8; 32]),
             pq_sk: None,
             pq_pk: None,
@@ -147,7 +141,6 @@ impl NodeConfig {
             data_dir,
             genesis_path: None,
             validator_seed: None,
-            bls_seed: None,
             vrf_seed: None,
             pq_sk: None,
             pq_pk: None,
@@ -178,7 +171,6 @@ impl NodeConfig {
             data_dir,
             genesis_path: None,
             validator_seed: None,
-            bls_seed: None,
             vrf_seed: None,
             pq_sk: None,
             pq_pk: None,

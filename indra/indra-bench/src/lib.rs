@@ -9,8 +9,6 @@
 //! | `bench_ed25519`        | Ed25519 sign + verify throughput                  |
 //! | `bench_dilithium2`     | Dilithium2 sign + verify throughput               |
 //! | `bench_hybrid`         | Full hybrid sign + verify (Ed25519 + Dilithium2)  |
-//! | `bench_bls_sign`       | BLS12-381 single signature                        |
-//! | `bench_bls_aggregate`  | BLS aggregate over N signatures                   |
 //! | `bench_sha256`         | SHA-256 throughput                                |
 //! | `bench_vrf`            | VRF prove + verify                                |
 //! | `bench_tx_encode`      | Transaction serialisation                         |
@@ -48,8 +46,6 @@
 //! | Dilithium2 verify    | < 0.5 ms    |
 //! | Hybrid sign          | < 1.5 ms    |
 //! | Hybrid verify        | < 0.8 ms    |
-//! | BLS sign             | < 0.5 ms    |
-//! | BLS aggregate (100)  | < 5 ms      |
 //! | Block apply (200 tx) | < 500 ms    |
 //! | Mempool select (200) | < 10 ms     |
 

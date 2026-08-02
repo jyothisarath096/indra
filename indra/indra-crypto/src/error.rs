@@ -20,13 +20,6 @@ pub enum CryptoError {
         role: &'static str,
     },
 
-    /// BLS operation failed.
-    #[error("BLS operation failed: {detail}")]
-    BlsFailed {
-        /// Detail of the failure.
-        detail: &'static str,
-    },
-
     /// A public key had the wrong length or was malformed.
     #[error("malformed public key for {scheme}: got {actual} bytes")]
     MalformedPublicKey {
@@ -60,10 +53,6 @@ pub enum CryptoError {
     /// VRF proof verification failed.
     #[error("VRF proof verification failed")]
     VrfProofFailed,
-
-    /// BLS aggregation requires at least one signer.
-    #[error("BLS aggregation requires at least one signer")]
-    EmptySignerSet,
 
     /// Invalid or malformed BIP-39 mnemonic phrase.
     #[error("invalid BIP-39 mnemonic phrase")]

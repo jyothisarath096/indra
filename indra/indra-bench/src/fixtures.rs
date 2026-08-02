@@ -13,7 +13,6 @@ use indra_core::{
     Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
 };
 use indra_crypto::{
-    bls::BlsKeypair,
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
 };
@@ -91,11 +90,6 @@ pub fn hybrid_keypair(seed: u8) -> HybridKeypair {
     let classical = ClassicalKeypair::from_seed(&[seed; 32]);
     let pq = PqKeypair::generate();
     HybridKeypair::new(classical, pq)
-}
-
-/// A BLS keypair for benchmarks.
-pub fn bls_keypair(seed: u8) -> BlsKeypair {
-    BlsKeypair::from_seed(&[seed; 32]).unwrap()
 }
 
 /// A VRF keypair for benchmarks.

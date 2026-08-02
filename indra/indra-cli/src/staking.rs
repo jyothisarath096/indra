@@ -125,12 +125,11 @@ fn parse_string_json_field(json: &str, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generate_keypairs;
+    use crate::generate_from_master_seed;
 
     #[test]
     fn test_reconstruct_keypair_is_deterministic() {
-        let keys =
-            generate_keypairs("validator".to_string(), [0x11; 32], [0x22; 32], [0x33; 32]).unwrap();
+        let keys = generate_from_master_seed("validator".to_string(), [0x11; 32]).unwrap();
         let a = reconstruct_keypair(&keys).unwrap().public_key();
         let b = reconstruct_keypair(&keys).unwrap().public_key();
         assert_eq!(a.classical.0, b.classical.0);
@@ -139,8 +138,7 @@ mod tests {
 
     #[test]
     fn test_reconstruct_keypair_from_known_seed() {
-        let keys =
-            generate_keypairs("validator".to_string(), [0x44; 32], [0x55; 32], [0x66; 32]).unwrap();
+        let keys = generate_from_master_seed("validator".to_string(), [0x44; 32]).unwrap();
         let keypair = reconstruct_keypair(&keys).unwrap();
         assert_eq!(
             keypair.public_key().classical.0,

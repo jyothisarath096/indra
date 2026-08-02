@@ -16,7 +16,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
 };
 use indra_crypto::{
-    bls::BlsKeypair,
     derive_all_seeds, generate_mnemonic,
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
     mnemonic_to_seed, sha256, PaymentKeypairV1, PaymentPubKeyV1, VrfKeypair,
@@ -88,8 +87,6 @@ pub struct ValidatorKeys {
     pub hybrid_classical_pk: [u8; 32],
     /// ML-DSA-87 public key bytes.
     pub hybrid_pq_pk: Vec<u8>,
-    /// BLS12-381 public key (48 bytes).
-    pub bls_pk: [u8; 48],
     /// VRF public key (32 bytes).
     pub vrf_pk: [u8; 32],
     /// Optional payment key-exchange public key for payment-blinding delivery.
@@ -105,8 +102,6 @@ pub struct KeysFile {
     pub public: ValidatorKeys,
     /// Hybrid keypair seed (keep secret).
     pub hybrid_seed: [u8; 32],
-    /// Legacy BLS keypair seed (keep secret).
-    pub bls_seed: [u8; 32],
     /// VRF keypair seed (keep secret).
     pub vrf_seed: [u8; 32],
     /// ML-DSA-87 secret key bytes (keep secret).
@@ -156,124 +151,6 @@ impl ColdKeysFile {
         }
         Ok(keypair)
     }
-}
-
-/// Byte-for-byte identity material snapshot used by payment-key retrofit checks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityMaterialSnapshot {
-    /// Private hybrid seed.
-    pub hybrid_seed: [u8; 32],
-    /// Private BLS seed.
-    pub bls_seed: [u8; 32],
-    /// Private VRF seed.
-    pub vrf_seed: [u8; 32],
-    /// Private ML-DSA-87 key bytes.
-    pub pq_sk: Vec<u8>,
-    /// Public validator id.
-    pub validator_id: [u8; 32],
-    /// Public classical signing key.
-    pub hybrid_classical_pk: [u8; 32],
-    /// Public PQ signing key bytes.
-    pub hybrid_pq_pk: Vec<u8>,
-    /// Public BLS key.
-    pub bls_pk: [u8; 48],
-    /// Public VRF key.
-    pub vrf_pk: [u8; 32],
-}
-
-impl IdentityMaterialSnapshot {
-    /// Capture all non-payment identity material.
-    pub fn from_keys(keys: &KeysFile) -> Self {
-        Self {
-            hybrid_seed: keys.hybrid_seed,
-            bls_seed: keys.bls_seed,
-            vrf_seed: keys.vrf_seed,
-            pq_sk: keys.pq_sk.clone(),
-            validator_id: keys.public.validator_id,
-            hybrid_classical_pk: keys.public.hybrid_classical_pk,
-            hybrid_pq_pk: keys.public.hybrid_pq_pk.clone(),
-            bls_pk: keys.public.bls_pk,
-            vrf_pk: keys.public.vrf_pk,
-        }
-    }
-
-    /// Rows for explicit operator-facing before/after reporting.
-    pub fn comparison_rows(
-        before: &Self,
-        after: &Self,
-    ) -> Vec<(&'static str, String, String, bool)> {
-        vec![
-            (
-                "hybrid_seed",
-                hex::encode(before.hybrid_seed),
-                hex::encode(after.hybrid_seed),
-                before.hybrid_seed == after.hybrid_seed,
-            ),
-            (
-                "bls_seed",
-                hex::encode(before.bls_seed),
-                hex::encode(after.bls_seed),
-                before.bls_seed == after.bls_seed,
-            ),
-            (
-                "vrf_seed",
-                hex::encode(before.vrf_seed),
-                hex::encode(after.vrf_seed),
-                before.vrf_seed == after.vrf_seed,
-            ),
-            (
-                "pq_sk",
-                hex::encode(&before.pq_sk),
-                hex::encode(&after.pq_sk),
-                before.pq_sk == after.pq_sk,
-            ),
-            (
-                "validator_id",
-                hex::encode(before.validator_id),
-                hex::encode(after.validator_id),
-                before.validator_id == after.validator_id,
-            ),
-            (
-                "hybrid_classical_pk",
-                hex::encode(before.hybrid_classical_pk),
-                hex::encode(after.hybrid_classical_pk),
-                before.hybrid_classical_pk == after.hybrid_classical_pk,
-            ),
-            (
-                "hybrid_pq_pk",
-                hex::encode(&before.hybrid_pq_pk),
-                hex::encode(&after.hybrid_pq_pk),
-                before.hybrid_pq_pk == after.hybrid_pq_pk,
-            ),
-            (
-                "bls_pk",
-                hex::encode(before.bls_pk),
-                hex::encode(after.bls_pk),
-                before.bls_pk == after.bls_pk,
-            ),
-            (
-                "vrf_pk",
-                hex::encode(before.vrf_pk),
-                hex::encode(after.vrf_pk),
-                before.vrf_pk == after.vrf_pk,
-            ),
-        ]
-    }
-}
-
-/// Result of a payment-key retrofit operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AddPaymentKeyReport {
-    /// Identity material before adding payment fields.
-    pub before: IdentityMaterialSnapshot,
-    /// Identity material after adding payment fields.
-    pub after: IdentityMaterialSnapshot,
-    /// Newly installed payment public key, hex-encoded.
-    pub payment_pubkey_hex: String,
-    /// File written by the operation.
-    pub output_path: PathBuf,
-    /// Backup created before replacement, if `--replace` was used.
-    pub backup_path: Option<PathBuf>,
 }
 
 impl KeysFile {
@@ -396,43 +273,9 @@ fn detect_format(json: &str) -> KeystoreResult<KeyFileFormat> {
     ))
 }
 
-/// Generate a complete set of validator keypairs from three seeds.
-pub fn generate_keypairs(
+fn build_keys_file(
     name: String,
     hybrid_seed: [u8; 32],
-    bls_seed: [u8; 32],
-    vrf_seed: [u8; 32],
-) -> KeystoreResult<KeysFile> {
-    use indra_crypto::hash::domain_hash;
-    let mut payment_material = Vec::with_capacity(96);
-    payment_material.extend_from_slice(&hybrid_seed);
-    payment_material.extend_from_slice(&bls_seed);
-    payment_material.extend_from_slice(&vrf_seed);
-    let payment_x25519_seed =
-        domain_hash(b"INDRA-KEYGEN-PAYMENT-X25519-COMPAT-v1", &payment_material);
-    let mut payment_ml_kem_seed = [0u8; 64];
-    payment_ml_kem_seed[..32].copy_from_slice(&domain_hash(
-        b"INDRA-KEYGEN-PAYMENT-ML-KEM-COMPAT-v1:0",
-        &payment_material,
-    ));
-    payment_ml_kem_seed[32..].copy_from_slice(&domain_hash(
-        b"INDRA-KEYGEN-PAYMENT-ML-KEM-COMPAT-v1:1",
-        &payment_material,
-    ));
-    generate_keypairs_with_payment(
-        name,
-        hybrid_seed,
-        bls_seed,
-        vrf_seed,
-        payment_x25519_seed,
-        payment_ml_kem_seed,
-    )
-}
-
-fn generate_keypairs_with_payment(
-    name: String,
-    hybrid_seed: [u8; 32],
-    bls_seed: [u8; 32],
     vrf_seed: [u8; 32],
     payment_x25519_seed: [u8; 32],
     payment_ml_kem_seed: [u8; 64],
@@ -443,7 +286,6 @@ fn generate_keypairs_with_payment(
     let pq_sk_bytes = pq.secret_key_bytes();
     let hybrid = HybridKeypair::new(classical, pq);
     let pk = hybrid.public_key();
-    let bls = BlsKeypair::from_seed(&bls_seed).map_err(|e| KeystoreError::Crypto(e.to_string()))?;
     let vrf = VrfKeypair::from_seed(&vrf_seed);
     let payment_keypair = PaymentKeypairV1 {
         version: indra_crypto::PAYMENT_VERSION_V1,
@@ -457,16 +299,26 @@ fn generate_keypairs_with_payment(
             validator_id: sha256(&pk.classical.0),
             hybrid_classical_pk: pk.classical.0,
             hybrid_pq_pk: pk.pq.0.to_vec(),
-            bls_pk: bls.public_key().0,
             vrf_pk: vrf.public_key(),
             payment_pubkey: Some(payment_pubkey),
         },
         hybrid_seed,
-        bls_seed,
         vrf_seed,
         pq_sk: pq_sk_bytes,
         payment_keypair: Some(payment_keypair),
     })
+}
+
+/// Generate a complete canonical keystore from one 32-byte master seed.
+pub fn generate_from_master_seed(name: String, master_seed: [u8; 32]) -> KeystoreResult<KeysFile> {
+    let derived = derive_all_seeds(&master_seed);
+    build_keys_file(
+        name,
+        derived.hybrid_seed,
+        derived.vrf_seed,
+        derived.payment_x25519_seed,
+        derived.payment_ml_kem_seed,
+    )
 }
 
 /// Generate a complete validator keypair set from a new mnemonic.
@@ -474,32 +326,13 @@ pub fn generate_from_new_mnemonic(name: String) -> KeystoreResult<(String, KeysF
     let phrase = generate_mnemonic();
     let master_seed =
         mnemonic_to_seed(&phrase).map_err(|e| KeystoreError::Crypto(e.to_string()))?;
-    let derived = derive_all_seeds(&master_seed);
-    Ok((
-        phrase,
-        generate_keypairs_with_payment(
-            name,
-            derived.hybrid_seed,
-            derived.bls_seed,
-            derived.vrf_seed,
-            derived.payment_x25519_seed,
-            derived.payment_ml_kem_seed,
-        )?,
-    ))
+    Ok((phrase, generate_from_master_seed(name, master_seed)?))
 }
 
 /// Recover a validator keypair set from an existing mnemonic.
 pub fn recover_from_mnemonic(phrase: &str, name: String) -> KeystoreResult<KeysFile> {
     let master_seed = mnemonic_to_seed(phrase).map_err(|e| KeystoreError::Crypto(e.to_string()))?;
-    let derived = derive_all_seeds(&master_seed);
-    generate_keypairs_with_payment(
-        name,
-        derived.hybrid_seed,
-        derived.bls_seed,
-        derived.vrf_seed,
-        derived.payment_x25519_seed,
-        derived.payment_ml_kem_seed,
-    )
+    generate_from_master_seed(name, master_seed)
 }
 
 /// Generate keypairs with random-looking seeds derived from a passphrase.
@@ -511,28 +344,9 @@ pub fn generate_from_passphrase(passphrase: &str, name: String) -> KeystoreResul
          (bcrypt/argon2/scrypt). This is NOT suitable for mainnet or production use. \
          Use secure mnemonic generation for production keys."
     );
-    use indra_crypto::hash::domain_hash;
-    let hybrid_seed = domain_hash(b"INDRA-KEYGEN-HYBRID-v1", passphrase.as_bytes());
-    let bls_seed = domain_hash(b"INDRA-KEYGEN-BLS-v1", passphrase.as_bytes());
-    let vrf_seed = domain_hash(b"INDRA-KEYGEN-VRF-v1", passphrase.as_bytes());
-    let payment_x25519_seed = domain_hash(b"INDRA-KEYGEN-PAYMENT-X25519-v1", passphrase.as_bytes());
-    let mut payment_ml_kem_seed = [0u8; 64];
-    payment_ml_kem_seed[..32].copy_from_slice(&domain_hash(
-        b"INDRA-KEYGEN-PAYMENT-ML-KEM-v1:0",
-        passphrase.as_bytes(),
-    ));
-    payment_ml_kem_seed[32..].copy_from_slice(&domain_hash(
-        b"INDRA-KEYGEN-PAYMENT-ML-KEM-v1:1",
-        passphrase.as_bytes(),
-    ));
-    generate_keypairs_with_payment(
-        name,
-        hybrid_seed,
-        bls_seed,
-        vrf_seed,
-        payment_x25519_seed,
-        payment_ml_kem_seed,
-    )
+    let master_seed =
+        indra_crypto::hash::domain_hash(b"INDRA-TEST-ONLY-MASTER-SEED-v1", passphrase.as_bytes());
+    generate_from_master_seed(name, master_seed)
 }
 
 /// Encrypt keys to the v1 encrypted keystore format.
@@ -744,147 +558,17 @@ pub fn encrypt_plaintext_keys_replace(
     Ok(backup)
 }
 
-/// Add deterministic payment key material to an existing key set without
-/// changing any validator identity material.
-pub fn add_payment_key_material(keys: &KeysFile, force: bool) -> KeystoreResult<KeysFile> {
-    if keys.payment_keypair.is_some() && !force {
-        return Err(KeystoreError::Parse(
-            "payment_keypair already exists; pass --force to replace payment key material"
-                .to_string(),
-        ));
-    }
-    let before = IdentityMaterialSnapshot::from_keys(keys);
-    let payment_source = generate_keypairs(
-        keys.name.clone(),
-        keys.hybrid_seed,
-        keys.bls_seed,
-        keys.vrf_seed,
-    )?;
-    let payment_keypair = payment_source.payment_keypair.ok_or_else(|| {
-        KeystoreError::Crypto(
-            "compatibility payment-key derivation did not produce a keypair".into(),
-        )
-    })?;
-    let mut updated = keys.clone();
-    updated.payment_keypair = Some(payment_keypair.clone());
-    updated.public.payment_pubkey = Some(payment_keypair.public_key());
-    let after = IdentityMaterialSnapshot::from_keys(&updated);
-    if before != after {
-        return Err(KeystoreError::Crypto(
-            "payment-key retrofit changed validator identity material".to_string(),
-        ));
-    }
-    verify_public_metadata(&updated)?;
-    Ok(updated)
-}
-
-/// Add payment key material, encrypt, verify decryption, and write the result.
-///
-/// By default this writes a sibling file named `keys.with-payment.json`. Passing
-/// `replace=true` creates a timestamped backup and atomically replaces `path`.
-pub fn add_payment_key_to_file(
-    path: &Path,
-    password: &[u8],
-    out: Option<&Path>,
-    replace: bool,
-    force: bool,
-) -> KeystoreResult<AddPaymentKeyReport> {
-    add_payment_key_to_file_with_encryptor(
-        path,
-        password,
-        out,
-        replace,
-        force,
-        encrypt_plaintext_keys,
-    )
-}
-
-fn add_payment_key_to_file_with_encryptor(
-    path: &Path,
-    password: &[u8],
-    out: Option<&Path>,
-    replace: bool,
-    force: bool,
-    encryptor: fn(&KeysFile, &[u8]) -> KeystoreResult<String>,
-) -> KeystoreResult<AddPaymentKeyReport> {
-    if replace && out.is_some() {
-        return Err(KeystoreError::Parse(
-            "choose either --replace or --out, not both".to_string(),
-        ));
-    }
-    let json = std::fs::read_to_string(path)
-        .map_err(|e| KeystoreError::Io(format!("{}: {}", path.display(), e)))?;
-    let original = match detect_format(&json)? {
-        KeyFileFormat::Plaintext => plaintext_from_json(&json)?,
-        KeyFileFormat::Encrypted => decrypt_encrypted_keys(&json, password)?,
-    };
-    let before = IdentityMaterialSnapshot::from_keys(&original);
-    let updated = add_payment_key_material(&original, force)?;
-    let after = IdentityMaterialSnapshot::from_keys(&updated);
-    let encrypted = encryptor(&updated, password)?;
-    let verified = decrypt_encrypted_keys(&encrypted, password)?;
-    if verified != updated {
-        return Err(KeystoreError::Crypto(
-            "payment-key retrofit encryption round-trip verification failed".to_string(),
-        ));
-    }
-
-    let output_path = if replace {
-        path.to_path_buf()
-    } else {
-        out.map(Path::to_path_buf)
-            .unwrap_or_else(|| default_payment_key_output_path(path))
-    };
-    let backup_path = if replace {
-        let tmp = path.with_extension("json.payment-key.tmp");
-        write_keys_secure(path_to_str(&tmp)?, &encrypted)?;
-        let backup = timestamped_backup_path(path);
-        std::fs::rename(path, &backup).map_err(|e| KeystoreError::Io(e.to_string()))?;
-        set_secret_file_permissions(&backup)?;
-        std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-        set_secret_file_permissions(path)?;
-        Some(backup)
-    } else {
-        write_keys_secure(path_to_str(&output_path)?, &encrypted)?;
-        None
-    };
-
-    Ok(AddPaymentKeyReport {
-        before,
-        after,
-        payment_pubkey_hex: hex::encode(
-            updated
-                .public
-                .payment_pubkey
-                .as_ref()
-                .expect("retrofit installs payment_pubkey")
-                .encode(),
-        ),
-        output_path,
-        backup_path,
-    })
-}
-
-fn default_payment_key_output_path(path: &Path) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("keys");
-    parent.join(format!("{stem}.with-payment.json"))
+fn path_to_str(path: &Path) -> KeystoreResult<&str> {
+    path.to_str()
+        .ok_or_else(|| KeystoreError::Io(format!("non-UTF-8 path: {}", path.display())))
 }
 
 fn timestamped_backup_path(path: &Path) -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    path.with_extension(format!("pre-payment-key-backup-{ts}.json"))
-}
-
-fn path_to_str(path: &Path) -> KeystoreResult<&str> {
-    path.to_str()
-        .ok_or_else(|| KeystoreError::Io(format!("non-UTF-8 path: {}", path.display())))
+    path.with_extension(format!("plaintext-backup-{ts}.json"))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -900,7 +584,6 @@ struct PlaintextContainer {
 struct PublicJson {
     hybrid_classical_pk: String,
     hybrid_pq_pk: String,
-    bls_pk: String,
     vrf_pk: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payment_pubkey: Option<String>,
@@ -911,7 +594,6 @@ impl PublicJson {
         Self {
             hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
             hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
-            bls_pk: hex::encode(keys.public.bls_pk),
             vrf_pk: hex::encode(keys.public.vrf_pk),
             payment_pubkey: keys
                 .public
@@ -936,7 +618,6 @@ impl PublicJson {
             validator_id: sha256(&hybrid_classical_pk),
             hybrid_classical_pk,
             hybrid_pq_pk: decode_hex(&self.hybrid_pq_pk, "public.hybrid_pq_pk")?,
-            bls_pk: decode_hex_fixed::<48>(&self.bls_pk, "public.bls_pk")?,
             vrf_pk: decode_hex_fixed::<32>(&self.vrf_pk, "public.vrf_pk")?,
             payment_pubkey,
         })
@@ -946,7 +627,6 @@ impl PublicJson {
 #[derive(Debug, Serialize, Deserialize)]
 struct PrivateJson {
     hybrid_seed: String,
-    bls_seed: String,
     vrf_seed: String,
     pq_sk: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -966,7 +646,6 @@ impl PrivatePayload {
         Self {
             private: PrivateJson {
                 hybrid_seed: hex::encode(keys.hybrid_seed),
-                bls_seed: hex::encode(keys.bls_seed),
                 vrf_seed: hex::encode(keys.vrf_seed),
                 pq_sk: hex::encode(&keys.pq_sk),
                 payment_keypair: keys
@@ -983,7 +662,6 @@ impl PrivatePayload {
             name,
             public,
             hybrid_seed: decode_hex_fixed::<32>(&self.private.hybrid_seed, "hybrid_seed")?,
-            bls_seed: decode_hex_fixed::<32>(&self.private.bls_seed, "bls_seed")?,
             vrf_seed: decode_hex_fixed::<32>(&self.private.vrf_seed, "vrf_seed")?,
             pq_sk: decode_hex(&self.private.pq_sk, "pq_sk")?,
             payment_keypair: self
@@ -1270,13 +948,11 @@ fn plaintext_json(keys: &KeysFile) -> String {
   "public": {{
     "hybrid_classical_pk": "{classical}",
     "hybrid_pq_pk": "{pq}",
-    "bls_pk": "{bls}",
     "vrf_pk": "{vrf}",
     "payment_pubkey": {payment_pubkey}
   }},
   "private": {{
     "hybrid_seed": "{h_seed}",
-    "bls_seed": "{b_seed}",
     "vrf_seed": "{v_seed}",
     "pq_sk": "{pq_sk}",
     "payment_keypair": {payment_keypair},
@@ -1287,10 +963,8 @@ fn plaintext_json(keys: &KeysFile) -> String {
         validator_id = hex::encode(keys.public.validator_id),
         classical = hex::encode(keys.public.hybrid_classical_pk),
         pq = hex::encode(&keys.public.hybrid_pq_pk),
-        bls = hex::encode(keys.public.bls_pk),
         vrf = hex::encode(keys.public.vrf_pk),
         h_seed = hex::encode(keys.hybrid_seed),
-        b_seed = hex::encode(keys.bls_seed),
         v_seed = hex::encode(keys.vrf_seed),
         pq_sk = hex::encode(&keys.pq_sk),
         payment_pubkey = payment_pubkey_json,
@@ -1307,7 +981,6 @@ fn plaintext_from_json(json: &str) -> KeystoreResult<KeysFile> {
         name: parsed.name,
         public,
         hybrid_seed: decode_hex_fixed::<32>(&parsed.private.hybrid_seed, "hybrid_seed")?,
-        bls_seed: decode_hex_fixed::<32>(&parsed.private.bls_seed, "bls_seed")?,
         vrf_seed: decode_hex_fixed::<32>(&parsed.private.vrf_seed, "vrf_seed")?,
         pq_sk: decode_hex(&parsed.private.pq_sk, "pq_sk")?,
         payment_keypair: parsed
@@ -1338,16 +1011,19 @@ fn validate_public_container_identity(
 }
 
 fn verify_public_metadata(keys: &KeysFile) -> KeystoreResult<()> {
-    let derived = generate_keypairs(
+    let payment_keypair = keys.payment_keypair.clone().ok_or_else(|| {
+        KeystoreError::Crypto("canonical keystore is missing payment key material".to_string())
+    })?;
+    let derived = build_keys_file(
         keys.name.clone(),
         keys.hybrid_seed,
-        keys.bls_seed,
         keys.vrf_seed,
+        payment_keypair.x25519_sk,
+        payment_keypair.ml_kem_1024_seed,
     )?;
     if derived.public.validator_id != keys.public.validator_id
         || derived.public.hybrid_classical_pk != keys.public.hybrid_classical_pk
         || derived.public.hybrid_pq_pk != keys.public.hybrid_pq_pk
-        || derived.public.bls_pk != keys.public.bls_pk
         || derived.public.vrf_pk != keys.public.vrf_pk
     {
         return Err(KeystoreError::Crypto(
@@ -1639,25 +1315,13 @@ mod tests {
     use super::*;
 
     fn fixture() -> KeysFile {
-        generate_keypairs("validator".to_string(), [1; 32], [2; 32], [3; 32]).unwrap()
-    }
-
-    fn fixture_without_payment() -> KeysFile {
-        let mut keys = fixture();
-        keys.payment_keypair = None;
-        keys.public.payment_pubkey = None;
-        keys
+        generate_from_master_seed("validator".to_string(), [1; 32]).unwrap()
     }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("{name}-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn corrupt_encryptor(keys: &KeysFile, password: &[u8]) -> KeystoreResult<String> {
-        let encrypted = encrypt_plaintext_keys(keys, password)?;
-        Ok(encrypted.replacen(r#""ciphertext": ""#, r#""ciphertext": "00"#, 1))
     }
 
     #[test]
@@ -1667,6 +1331,15 @@ mod tests {
             encrypt_plaintext_keys_with_params(&keys, b"correct horse", [7; 32], [8; 12]).unwrap();
         let recovered = decrypt_encrypted_keys(&json, b"correct horse").unwrap();
         assert_eq!(recovered, keys);
+    }
+
+    #[test]
+    fn mnemonic_generation_and_recovery_produce_identical_complete_keystores() {
+        let (phrase, generated) = generate_from_new_mnemonic("validator".to_string()).unwrap();
+        let recovered = recover_from_mnemonic(&phrase, "validator".to_string()).unwrap();
+        assert_eq!(generated, recovered);
+        assert!(generated.payment_keypair.is_some());
+        assert!(generated.public.payment_pubkey.is_some());
     }
 
     #[test]
@@ -1684,6 +1357,14 @@ mod tests {
         let recovered = decrypt_cold_keys(&json, b"cold-password").unwrap();
         assert_eq!(recovered, generated);
         assert_ne!(generated.classical_seed, generated.pq_seed);
+        let hot = derive_all_seeds(&[0x42; 32]);
+        for cold_seed in [generated.classical_seed, generated.pq_seed] {
+            assert_ne!(cold_seed, hot.hybrid_seed);
+            assert_ne!(cold_seed, hot.vrf_seed);
+            assert_ne!(cold_seed, hot.payment_x25519_seed);
+            assert_ne!(cold_seed, hot.payment_ml_kem_seed[..32]);
+            assert_ne!(cold_seed, hot.payment_ml_kem_seed[32..]);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1708,139 +1389,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn legacy_stage5_encrypted_keys_json(keys: &KeysFile, password: &[u8]) -> String {
-        #[derive(Serialize)]
-        struct LegacyPublicJson {
-            hybrid_classical_pk: String,
-            hybrid_pq_pk: String,
-            bls_pk: String,
-            vrf_pk: String,
-        }
-        #[derive(Serialize)]
-        struct LegacyAad<'a> {
-            format: &'a str,
-            version: u8,
-            name: &'a str,
-            validator_id: &'a str,
-            public: &'a LegacyPublicJson,
-            kdf: &'a KdfJson,
-            cipher_function: &'a str,
-            cipher_params: &'a CipherParamsJson,
-        }
-        #[derive(Serialize)]
-        struct LegacyPrivateJson {
-            hybrid_seed: String,
-            bls_seed: String,
-            vrf_seed: String,
-            pq_sk: String,
-            warning: Option<String>,
-        }
-        #[derive(Serialize)]
-        struct LegacyPrivatePayload {
-            private: LegacyPrivateJson,
-        }
-        #[derive(Serialize)]
-        struct LegacyEncryptedContainer {
-            format: String,
-            version: u8,
-            name: String,
-            validator_id: String,
-            public: LegacyPublicJson,
-            crypto: CryptoJson,
-        }
-
-        let salt = [7u8; ARGON2_SALT_BYTES];
-        let nonce = [8u8; CHACHA_NONCE_BYTES];
-        let public = LegacyPublicJson {
-            hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
-            hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
-            bls_pk: hex::encode(keys.public.bls_pk),
-            vrf_pk: hex::encode(keys.public.vrf_pk),
-        };
-        let kdf = KdfJson {
-            function: "argon2id".to_string(),
-            params: KdfParamsJson {
-                version: 19,
-                memory_kib: ARGON2_MEMORY_KIB,
-                iterations: ARGON2_ITERATIONS,
-                parallelism: ARGON2_PARALLELISM,
-                salt: hex::encode(salt),
-            },
-        };
-        let cipher_params = CipherParamsJson {
-            nonce: hex::encode(nonce),
-        };
-        let validator_id = hex::encode(keys.public.validator_id);
-        let aad = serde_json::to_vec(&LegacyAad {
-            format: KEYSTORE_FORMAT,
-            version: KEYSTORE_VERSION,
-            name: &keys.name,
-            validator_id: &validator_id,
-            public: &public,
-            kdf: &kdf,
-            cipher_function: "chacha20-poly1305",
-            cipher_params: &cipher_params,
-        })
-        .unwrap();
-        let plaintext = serde_json::to_vec(&LegacyPrivatePayload {
-            private: LegacyPrivateJson {
-                hybrid_seed: hex::encode(keys.hybrid_seed),
-                bls_seed: hex::encode(keys.bls_seed),
-                vrf_seed: hex::encode(keys.vrf_seed),
-                pq_sk: hex::encode(&keys.pq_sk),
-                warning: None,
-            },
-        })
-        .unwrap();
-        let ciphertext = encrypt_payload(password, &salt, &nonce, &aad, &plaintext).unwrap();
-        serde_json::to_string_pretty(&LegacyEncryptedContainer {
-            format: KEYSTORE_FORMAT.to_string(),
-            version: KEYSTORE_VERSION,
-            name: keys.name.clone(),
-            validator_id,
-            public,
-            crypto: CryptoJson {
-                kdf,
-                cipher: CipherJson {
-                    function: "chacha20-poly1305".to_string(),
-                    params: cipher_params,
-                    ciphertext: hex::encode(ciphertext),
-                },
-            },
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn stage5_encrypted_keystore_without_payment_fields_still_decrypts() {
-        let keys = fixture();
-        let json = legacy_stage5_encrypted_keys_json(&keys, b"pw");
-        assert!(!json.contains("payment_pubkey"));
-        assert!(!json.contains("payment_keypair"));
-
-        let loaded = decrypt_encrypted_keys(&json, b"pw").unwrap();
-        assert_eq!(loaded.public.payment_pubkey, None);
-        assert_eq!(loaded.payment_keypair, None);
-        assert_eq!(
-            loaded.public.hybrid_classical_pk,
-            keys.public.hybrid_classical_pk
-        );
-        assert_eq!(loaded.pq_sk, keys.pq_sk);
-    }
-
-    #[test]
-    fn encrypted_keystore_aad_omits_absent_optional_public_fields() {
-        let mut keys = fixture();
-        keys.public.payment_pubkey = None;
-        keys.payment_keypair = None;
-        let container =
-            EncryptedContainer::from_public(&keys, [7; ARGON2_SALT_BYTES], [8; 12], "00".into());
-        let aad = String::from_utf8(container.associated_data().unwrap()).unwrap();
-
-        assert!(!aad.contains("payment_pubkey"));
-        assert!(!aad.contains("null"));
-    }
-
     #[test]
     fn key_generation_includes_payment_keypair() {
         let keys = fixture();
@@ -1861,6 +1409,8 @@ mod tests {
     fn payment_keypair_plaintext_json_round_trip() {
         let keys = fixture();
         let json = keys.to_json();
+        assert!(!json.contains("bls_seed"));
+        assert!(!json.contains("bls_pk"));
         assert!(json.contains("\"payment_pubkey\""));
         assert!(json.contains("\"payment_keypair\""));
         assert_eq!(KeysFile::from_json(&json).unwrap(), keys);
@@ -1872,164 +1422,11 @@ mod tests {
         let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         assert!(json.contains("\"payment_pubkey\""));
         assert!(!json.contains("\"payment_keypair\""));
+        assert!(!json.contains("bls_seed"));
+        assert!(!json.contains("bls_pk"));
         let recovered = decrypt_encrypted_keys(&json, b"pw").unwrap();
         assert_eq!(recovered.payment_keypair, keys.payment_keypair);
         assert_eq!(recovered.public.payment_pubkey, keys.public.payment_pubkey);
-    }
-
-    #[test]
-    fn add_payment_key_writes_new_file_with_identity_material_unchanged() {
-        let dir = test_dir("indra-add-payment-key-new");
-        let path = dir.join("keys.json");
-        let out = dir.join("keys.retrofit.json");
-        let keys = fixture_without_payment();
-        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
-        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
-
-        let report = add_payment_key_to_file(&path, b"pw", Some(&out), false, false).unwrap();
-        let updated_json = std::fs::read_to_string(&out).unwrap();
-        let updated = decrypt_encrypted_keys(&updated_json, b"pw").unwrap();
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        assert_eq!(report.output_path, out);
-        assert_eq!(report.backup_path, None);
-        assert!(updated.payment_keypair.is_some());
-        assert!(updated.public.payment_pubkey.is_some());
-        assert_eq!(
-            IdentityMaterialSnapshot::from_keys(&keys),
-            IdentityMaterialSnapshot::from_keys(&updated)
-        );
-        assert!(
-            IdentityMaterialSnapshot::comparison_rows(&report.before, &report.after)
-                .into_iter()
-                .all(|(_, _, _, unchanged)| unchanged)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn add_payment_key_refuses_existing_payment_key_unless_forced() {
-        let dir = test_dir("indra-add-payment-key-force");
-        let path = dir.join("keys.json");
-        let out = dir.join("forced.json");
-        let keys = fixture();
-        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
-        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
-
-        assert!(add_payment_key_to_file(&path, b"pw", Some(&out), false, false).is_err());
-        let report = add_payment_key_to_file(&path, b"pw", Some(&out), false, true).unwrap();
-        let forced =
-            decrypt_encrypted_keys(&std::fs::read_to_string(&out).unwrap(), b"pw").unwrap();
-
-        assert_eq!(report.output_path, out);
-        assert!(forced.payment_keypair.is_some());
-        assert_eq!(
-            IdentityMaterialSnapshot::from_keys(&keys),
-            IdentityMaterialSnapshot::from_keys(&forced)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn add_payment_key_round_trip_failure_does_not_write_output() {
-        let dir = test_dir("indra-add-payment-key-corrupt");
-        let path = dir.join("keys.json");
-        let out = dir.join("keys.with-payment.json");
-        let keys = fixture_without_payment();
-        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
-        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
-
-        let err = add_payment_key_to_file_with_encryptor(
-            &path,
-            b"pw",
-            Some(&out),
-            false,
-            false,
-            corrupt_encryptor,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            KeystoreError::InvalidHex(_) | KeystoreError::Crypto(_)
-        ));
-        assert!(!out.exists());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn add_payment_key_replace_creates_backup_before_replacing() {
-        let dir = test_dir("indra-add-payment-key-replace");
-        let path = dir.join("keys.json");
-        let keys = fixture_without_payment();
-        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
-        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
-
-        let report = add_payment_key_to_file(&path, b"pw", None, true, false).unwrap();
-        let backup = report.backup_path.expect("replace creates backup");
-        let replaced =
-            decrypt_encrypted_keys(&std::fs::read_to_string(&path).unwrap(), b"pw").unwrap();
-        let backup_keys =
-            decrypt_encrypted_keys(&std::fs::read_to_string(&backup).unwrap(), b"pw").unwrap();
-
-        assert!(backup.exists());
-        assert!(backup
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .contains("pre-payment-key-backup"));
-        assert!(!backup
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .contains("plaintext-backup"));
-        assert_eq!(backup_keys.payment_keypair, None);
-        assert_eq!(backup_keys.public.payment_pubkey, None);
-        assert!(replaced.payment_keypair.is_some());
-        assert!(replaced.public.payment_pubkey.is_some());
-        assert_eq!(
-            IdentityMaterialSnapshot::from_keys(&keys),
-            IdentityMaterialSnapshot::from_keys(&replaced)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn add_payment_key_default_output_never_touches_original() {
-        let dir = test_dir("indra-add-payment-key-default");
-        let path = dir.join("keys.json");
-        let default_out = dir.join("keys.with-payment.json");
-        let keys = fixture_without_payment();
-        let original = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
-        write_keys_secure(path.to_str().unwrap(), &original).unwrap();
-
-        let report = add_payment_key_to_file(&path, b"pw", None, false, false).unwrap();
-
-        assert_eq!(report.output_path, default_out);
-        assert!(default_out.exists());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn pre_payment_key_plaintext_json_still_loads_with_absent_payment_fields() {
-        let keys = fixture();
-        let json = keys.to_json();
-        let payment_pubkey_line = format!(
-            ",\n    \"payment_pubkey\": \"{}\"",
-            hex::encode(keys.public.payment_pubkey.as_ref().unwrap().encode())
-        );
-        let payment_keypair_line = format!(
-            ",\n    \"payment_keypair\": \"{}\"",
-            hex::encode(keys.payment_keypair.as_ref().unwrap().encode())
-        );
-        let legacy_json = json
-            .replace(&payment_pubkey_line, "")
-            .replace(&payment_keypair_line, "");
-        let loaded = KeysFile::from_json(&legacy_json).unwrap();
-        assert_eq!(loaded.public.payment_pubkey, None);
-        assert_eq!(loaded.payment_keypair, None);
     }
 
     #[test]
