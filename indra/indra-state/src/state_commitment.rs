@@ -16,9 +16,7 @@
 use indra_core::{
     codec::Encode,
     types::{
-        consensus_snapshot::ConsensusSnapshot,
-        crypto::HybridPubKey,
-        primitives::{consensus_snapshot_active, slash_membership_proof_active, Bytes32},
+        consensus_snapshot::ConsensusSnapshot, crypto::HybridPubKey, primitives::Bytes32,
         reward_economic_snapshot::RewardEconomicSnapshot,
         slash_membership::SlashMembershipRootRecord,
     },
@@ -111,33 +109,29 @@ impl StateCommitmentV2 {
                 ));
             }
         }
-        if consensus_snapshot_active(height) {
-            for snapshot in &state.consensus_snapshots {
-                leaves.push((
-                    consensus_snapshot_key(snapshot.activation_height),
-                    consensus_snapshot_value_hash(snapshot),
-                ));
-            }
-            if let Some(snapshot) = &state.reward_economic_snapshot {
-                leaves.push((
-                    reward_economic_snapshot_key(snapshot.activation_height),
-                    reward_economic_snapshot_value_hash(snapshot),
-                ));
-            }
+        for snapshot in &state.consensus_snapshots {
+            leaves.push((
+                consensus_snapshot_key(snapshot.activation_height),
+                consensus_snapshot_value_hash(snapshot),
+            ));
         }
-        if slash_membership_proof_active(height) {
-            for record in &state.slash_membership_roots {
-                leaves.push((
-                    slash_membership_root_key(record.activation_height),
-                    slash_membership_root_value_hash(record),
-                ));
-            }
-            for tombstone in state.evicted_validator_tombstones.values() {
-                leaves.push((
-                    evicted_validator_tombstone_key(&tombstone.validator_id),
-                    evicted_validator_tombstone_value_hash(tombstone),
-                ));
-            }
+        if let Some(snapshot) = &state.reward_economic_snapshot {
+            leaves.push((
+                reward_economic_snapshot_key(snapshot.activation_height),
+                reward_economic_snapshot_value_hash(snapshot),
+            ));
+        }
+        for record in &state.slash_membership_roots {
+            leaves.push((
+                slash_membership_root_key(record.activation_height),
+                slash_membership_root_value_hash(record),
+            ));
+        }
+        for tombstone in state.evicted_validator_tombstones.values() {
+            leaves.push((
+                evicted_validator_tombstone_key(&tombstone.validator_id),
+                evicted_validator_tombstone_value_hash(tombstone),
+            ));
         }
         Self {
             tree: PersistentAuthTree::from_pairs(leaves)
@@ -468,14 +462,17 @@ mod tests {
     }
 
     fn validator(byte: u8) -> ValidatorEntry {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[byte; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[byte.wrapping_add(1); 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
         ValidatorEntry {
             validator_id: id(byte),
             name: format!("validator-{byte}"),
-            hybrid_classical_pk: Some([byte; 32]),
-            hybrid_pq_pk: Some(vec![byte; 32]),
-            vrf_pk: Some([byte.wrapping_add(1); 32]),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
+            vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[byte.wrapping_add(2); 32]).public_key()),
             stake_spark: 1_000_000 + byte as u64,
-            status: crate::validator::ValidatorStatus::Registered,
+            status: crate::validator::ValidatorStatus::Active,
             registered_epoch: 1,
             last_active_epoch: 1,
             pending_rewards: 0,
@@ -488,10 +485,9 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: None,
-            cold_hybrid_pq_pk: None,
-            cold_key_version: 0,
-            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+            cold_hybrid_classical_pk: Some(public.classical.0),
+            cold_hybrid_pq_pk: Some(public.pq.0),
+            cold_key_version: 1,
             cold_nonce: 0,
         }
     }
@@ -660,7 +656,7 @@ mod tests {
             amount_spark: 7_000,
             bonded_epoch: 3,
             unbonding_end_epoch: None,
-            unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
+            unbonding_start_height: None,
             custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output: output(0xAA, 7_000).into(),
         }
@@ -714,6 +710,30 @@ mod tests {
                     delegation_return_event_value_hash(event),
                 ));
             }
+        }
+        for snapshot in &state.consensus_snapshots {
+            leaves.push((
+                consensus_snapshot_key(snapshot.activation_height),
+                consensus_snapshot_value_hash(snapshot),
+            ));
+        }
+        if let Some(snapshot) = &state.reward_economic_snapshot {
+            leaves.push((
+                reward_economic_snapshot_key(snapshot.activation_height),
+                reward_economic_snapshot_value_hash(snapshot),
+            ));
+        }
+        for record in &state.slash_membership_roots {
+            leaves.push((
+                slash_membership_root_key(record.activation_height),
+                slash_membership_root_value_hash(record),
+            ));
+        }
+        for tombstone in state.evicted_validator_tombstones.values() {
+            leaves.push((
+                evicted_validator_tombstone_key(&tombstone.validator_id),
+                evicted_validator_tombstone_value_hash(tombstone),
+            ));
         }
         Bytes32::from(
             CompressedAuthTree::from_pairs(leaves)
@@ -805,6 +825,7 @@ mod tests {
                 },
             );
         }
+        state.finalize_genesis().unwrap();
         state.height = height;
         state
     }
@@ -850,7 +871,6 @@ mod tests {
         cold.cold_hybrid_classical_pk = Some([0x81; 32]);
         cold.cold_hybrid_pq_pk = Some([0x82; indra_crypto::PQ_PK_BYTES]);
         cold.cold_key_version = 1;
-        cold.cold_key_status = crate::validator::ColdKeyStatus::Active;
         assert_ne!(validator_value_hash(&cold, height), base_hash);
 
         cold.cold_nonce = 1;
@@ -1226,10 +1246,7 @@ mod tests {
         let height = 100;
         let bond_id = id(0xE4);
         let mut precise = bond(bond_id, id(0xE5), id(0xE5));
-        precise.unbonding_precision =
-            crate::validator::StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: None,
-            };
+        precise.unbonding_start_height = None;
         let mut state = ChainState::new_genesis();
         state.staked_bonds.insert(bond_id, precise.clone());
         state.rebuild_state_commitment_v2(height);
@@ -1273,6 +1290,7 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let validator = validator(0x77);
         state.validators.upsert(validator).unwrap();
+        state.finalize_genesis().unwrap();
         state.rebuild_state_commitment_v2(height);
         let root_before = state.state_commitment_v2_root(height);
 

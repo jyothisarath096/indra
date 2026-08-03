@@ -192,9 +192,13 @@ impl<'a> StateTxn<'a> {
     /// Record the full governance mutation surface before delegating to existing
     /// governance helpers.
     pub(crate) fn snapshot_governance_scope(&mut self) {
+        // Cold-authorized governance operations advance the validator's
+        // canonical cold nonce, so validator state is part of this scope.
+        self.snapshot_validators();
         self.snapshot_governance();
         self.snapshot_utxos();
         self.record_scalars();
+        self.mark_commitment_touched();
     }
 
     /// Record the slashing mutation surface before applying slash evidence.
@@ -661,7 +665,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
-            unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
+            unbonding_start_height: None,
             custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                 Bytes32::from([0xD0 | byte; 32]),
             ),
@@ -733,10 +737,7 @@ mod tests {
         let height = 100;
         let mut state = ChainState::new_genesis();
         let mut original_bond = test_bond(0x03);
-        original_bond.unbonding_precision =
-            crate::validator::StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: None,
-            };
+        original_bond.unbonding_start_height = None;
         let bond_id = original_bond.utxo_id;
         state.staked_bonds.insert(bond_id, original_bond.clone());
         state.rebuild_state_commitment_v2(height);

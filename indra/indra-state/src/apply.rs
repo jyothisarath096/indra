@@ -40,15 +40,14 @@ use indra_core::{
         block::BlockV1,
         crypto::{CommitmentV1, HybridPubKey},
         primitives::{
-            block_protocol_version_for_height, bps_of, delegator_identity_registry_active,
-            epoch_transition_context_active, slash_membership_proof_active, Bytes32,
-            HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES, MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-            MAX_TX_PER_BLOCK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            bps_of, Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
         },
         qc::QuorumCertificateV1,
-        slash_membership::{compute_slash_membership_root, SlashMembershipRootRecord},
-        slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
+        slash_membership::SlashMembershipRootRecord,
+        slashing::{SlashEvidenceV1, SlashEvidenceV2},
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
         vrf_election::VrfElectionResult,
@@ -69,7 +68,7 @@ use crate::{
     fee::compute_next_base_fee,
     governance_apply::apply_governance_op,
     txn::StateTxn,
-    validator::{StakeBondEntry, StakeBondUnbondingPrecision},
+    validator::StakeBondEntry,
 };
 
 /// Roots and value commitment produced by temporarily projecting a block.
@@ -96,51 +95,13 @@ fn self_bond_is_slashable_at_height(
         .map_err(|_| StateError::InvariantViolation {
             message: "malformed stake-bond unbonding precision",
         })?;
-    match (bond.unbonding_end_epoch, bond.unbonding_precision) {
-        (None, _) => Ok(true),
-        (Some(end_epoch), StakeBondUnbondingPrecision::LegacyEpochOnly) => {
-            let infraction_epoch = epoch_for_height(infraction_height);
-            let unbonding_start_epoch = end_epoch.saturating_sub(UNBONDING_PERIOD_EPOCHS);
-            Ok(unbonding_start_epoch >= infraction_epoch)
-        }
-        (
-            Some(_),
-            StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: Some(unbonding_start_height),
-            },
-        ) => Ok(unbonding_start_height >= infraction_height),
-        (
-            Some(_),
-            StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: None,
-            },
-        ) => Err(StateError::InvariantViolation {
-            message: "height-precise unbonding bond is missing its start height".into(),
+    match (bond.unbonding_end_epoch, bond.unbonding_start_height) {
+        (None, None) => Ok(true),
+        (Some(_), Some(unbonding_start_height)) => Ok(unbonding_start_height >= infraction_height),
+        _ => Err(StateError::InvariantViolation {
+            message: "unbonding bond has inconsistent height precision fields".into(),
         }),
     }
-}
-
-/// Apply slash evidence to chain state.
-///
-/// Verification is fail-fast and performs no state mutation until all checks pass.
-pub fn apply_slash(
-    state: &mut ChainState,
-    evidence: &SlashEvidenceV1,
-    chain_id: &str,
-) -> StateResult<()> {
-    apply_slash_at_height(state, evidence, chain_id, state.height, None)
-}
-
-/// Apply slash evidence using the arithmetic rules active at `height`.
-pub fn apply_slash_at_height(
-    state: &mut ChainState,
-    evidence: &SlashEvidenceV1,
-    chain_id: &str,
-    height: u64,
-    reporter_pubkey: Option<&HybridPubKey>,
-) -> StateResult<()> {
-    apply_slash_at_height_with_accounting(state, evidence, chain_id, height, reporter_pubkey)
-        .map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,24 +111,6 @@ struct SlashAccounting {
     reporter_reward: u64,
 }
 
-fn apply_slash_at_height_with_accounting(
-    state: &mut ChainState,
-    evidence: &SlashEvidenceV1,
-    chain_id: &str,
-    height: u64,
-    reporter_pubkey: Option<&HybridPubKey>,
-) -> StateResult<SlashAccounting> {
-    apply_slash_common(
-        state,
-        evidence,
-        compute_slash_evidence_hash(evidence),
-        None,
-        chain_id,
-        height,
-        reporter_pubkey,
-    )
-}
-
 fn apply_slash_v2_at_height_with_accounting(
     state: &mut ChainState,
     evidence: &SlashEvidenceV2,
@@ -175,11 +118,6 @@ fn apply_slash_v2_at_height_with_accounting(
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
 ) -> StateResult<SlashAccounting> {
-    if !slash_membership_proof_active(evidence.vote_1.height) {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "membership proof supplied for a pre-gate infraction".to_string(),
-        });
-    }
     if evidence.membership_proof.entry.validator_id != evidence.validator_id
         || evidence.vote_1.validator_id != evidence.validator_id
         || evidence.vote_2.validator_id != evidence.validator_id
@@ -217,30 +155,12 @@ fn slash_membership_record_for_validation(
     state: &ChainState,
     infraction_height: u64,
 ) -> StateResult<SlashMembershipRootRecord> {
-    if let Ok(record) = state.slash_membership_root_for_height(infraction_height) {
-        return Ok(*record);
-    }
-    let gate = indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT;
-    if infraction_height != gate || state.height >= gate {
-        return Err(StateError::InvalidSlashEvidence {
+    state
+        .slash_membership_root_for_height(infraction_height)
+        .copied()
+        .map_err(|_| StateError::InvalidSlashEvidence {
             reason: format!("missing membership root for height {infraction_height}"),
-        });
-    }
-    let snapshot = state
-        .consensus_snapshots
-        .iter()
-        .find(|snapshot| snapshot.activation_height == gate)
-        .ok_or_else(|| StateError::InvalidSlashEvidence {
-            reason: "bootstrap consensus snapshot is missing".to_string(),
-        })?;
-    Ok(SlashMembershipRootRecord {
-        activation_height: gate,
-        membership_root: compute_slash_membership_root(snapshot).map_err(|error| {
-            StateError::InvalidSlashEvidence {
-                reason: error.to_string(),
-            }
-        })?,
-    })
+        })
 }
 
 fn apply_slash_common(
@@ -482,13 +402,14 @@ fn apply_slash_common(
     })
 }
 
-/// Compute the canonical slash-evidence hash used for deduplication.
-pub fn compute_slash_evidence_hash(evidence: &SlashEvidenceV1) -> Bytes32 {
+/// Compute the canonical proof-carrying evidence hash used for deduplication.
+pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
 }
 
-/// Compute the canonical proof-carrying evidence hash used for deduplication.
-pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
+/// Hash an unproven equivocation pair while it is held in the node-local
+/// pending pool. Only `SlashEvidenceV2` is accepted by blocks/state transition.
+pub fn compute_pending_slash_evidence_hash(evidence: &SlashEvidenceV1) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
 }
 
@@ -548,69 +469,25 @@ fn slash_reporter_pubkey_for_block(
     state: &ChainState,
     block: &BlockV1,
 ) -> StateResult<Option<HybridPubKey>> {
-    slash_reporter_pubkey_for_block_at_gate(
-        state,
+    let snapshot = state
+        .snapshot_for_consensus_height(block.header.height)
+        .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
+    let proposer_id = slash_reporter_validator_id_from_candidate_ids(
+        snapshot.entries().iter().map(|entry| entry.validator_id),
         block,
-        indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
-    )
-}
-
-fn slash_reporter_pubkey_for_block_at_gate(
-    state: &ChainState,
-    block: &BlockV1,
-    consensus_snapshot_gate_height: u64,
-) -> StateResult<Option<HybridPubKey>> {
-    if block.header.height >= consensus_snapshot_gate_height {
-        let snapshot = state
-            .snapshot_for_consensus_height_at_gate(
-                block.header.height,
-                consensus_snapshot_gate_height,
-            )
-            .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
-        let proposer_id = slash_reporter_validator_id_from_candidate_ids(
-            snapshot.entries().iter().map(|entry| entry.validator_id),
-            block,
-        );
-        return Ok(proposer_id.and_then(|proposer_id| {
-            snapshot
-                .entries()
-                .iter()
-                .find(|entry| entry.validator_id == proposer_id)
-                .and_then(|entry| {
-                    Some(HybridPubKey {
-                        classical_pk: Bytes32::from(entry.classical_vote_pk),
-                        pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
-                    })
-                })
-        }));
-    }
-
-    let proposer_id = slash_reporter_validator_id_for_block(state, block);
+    );
     Ok(proposer_id.and_then(|proposer_id| {
-        let validator = state.validators.get(&proposer_id)?;
-        Some(HybridPubKey {
-            classical_pk: Bytes32::from(validator.hybrid_classical_pk?),
-            pq_pk: indra_core::VariableBytes::from_slice(validator.hybrid_pq_pk.as_deref()?)
-                .ok()?,
-        })
+        snapshot
+            .entries()
+            .iter()
+            .find(|entry| entry.validator_id == proposer_id)
+            .and_then(|entry| {
+                Some(HybridPubKey {
+                    classical_pk: Bytes32::from(entry.classical_vote_pk),
+                    pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
+                })
+            })
     }))
-}
-
-fn slash_reporter_validator_id_for_block(state: &ChainState, block: &BlockV1) -> Option<Bytes32> {
-    slash_reporter_validator_id_from_election_hash(state, block)
-}
-
-fn slash_reporter_validator_id_from_election_hash(
-    state: &ChainState,
-    block: &BlockV1,
-) -> Option<Bytes32> {
-    slash_reporter_validator_id_from_candidate_ids(
-        state
-            .validators
-            .active_validators()
-            .map(|validator| validator.validator_id),
-        block,
-    )
 }
 
 fn slash_reporter_validator_id_from_candidate_ids<I>(
@@ -760,23 +637,21 @@ fn apply_block_inner(
                 .ok_or(StateError::InvariantViolation {
                     message: "epoch boundary has no certified parent",
                 })?;
-        if epoch_transition_context_active(block.header.height) {
-            if block.header.quorum_certificate.as_slice().is_empty() {
-                return Err(StateError::InvariantViolation {
-                    message: "post-gate boundary block is missing its parent quorum certificate",
-                });
+        if block.header.quorum_certificate.as_slice().is_empty() {
+            return Err(StateError::InvariantViolation {
+                message: "boundary block is missing its parent quorum certificate",
+            });
+        }
+        let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
+        let qc = QuorumCertificateV1::decode(&mut reader).map_err(|_| {
+            StateError::InvariantViolation {
+                message: "boundary block has malformed quorum certificate",
             }
-            let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
-            let qc = QuorumCertificateV1::decode(&mut reader).map_err(|_| {
-                StateError::InvariantViolation {
-                    message: "post-gate boundary block has malformed quorum certificate",
-                }
-            })?;
-            if qc.height != expected_parent {
-                return Err(StateError::InvariantViolation {
-                    message: "boundary quorum certificate does not certify the parent height",
-                });
-            }
+        })?;
+        if qc.height != expected_parent {
+            return Err(StateError::InvariantViolation {
+                message: "boundary quorum certificate does not certify the parent height",
+            });
         }
         Some(crate::epoch::EpochTransitionContext::new(
             block.header.height,
@@ -785,11 +660,6 @@ fn apply_block_inner(
     } else {
         None
     };
-    if indra_core::types::primitives::validator_cold_key_enforcement_active(block.header.height) {
-        txn.snapshot_validator_activity_scope();
-        crate::epoch::enforce_validator_cold_key_enrollment(txn.state_mut(), block.header.height);
-        txn.after_mutation()?;
-    }
     let state = txn.state();
 
     if block.staking_ops.len() > MAX_STAKING_OPS_PER_BLOCK {
@@ -804,49 +674,9 @@ fn apply_block_inner(
             max: MAX_GOV_OPS_PER_BLOCK,
         });
     }
-    if slash_membership_proof_active(block.header.height) {
-        if !block.slashing_evidence.is_empty() {
-            return Err(StateError::InvalidSlashEvidence {
-                reason: "post-gate block populated the legacy slash list".to_string(),
-            });
-        }
-    } else if !block.slashing_evidence_v2.is_empty() {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "pre-gate block populated the versioned slash list".to_string(),
-        });
-    }
-
     let mut seen_slash_hashes: HashSet<Bytes32> = HashSet::new();
     for evidence in &block.slashing_evidence {
-        if slash_membership_proof_active(evidence.vote_1.height) {
-            return Err(StateError::InvalidSlashEvidence {
-                reason: "legacy evidence cannot target a proof-governed height".to_string(),
-            });
-        }
-        if !seen_slash_hashes.insert(compute_slash_evidence_hash(evidence)) {
-            return Err(StateError::DuplicateSlashEvidence);
-        }
-    }
-    for envelope in &block.slashing_evidence_v2 {
-        let hash = match envelope {
-            SlashEvidenceEnvelopeV2::Legacy(evidence) => {
-                if slash_membership_proof_active(evidence.vote_1.height) {
-                    return Err(StateError::InvalidSlashEvidence {
-                        reason: "legacy envelope cannot target a proof-governed height".to_string(),
-                    });
-                }
-                compute_slash_evidence_hash(evidence)
-            }
-            SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
-                if !slash_membership_proof_active(evidence.vote_1.height) {
-                    return Err(StateError::InvalidSlashEvidence {
-                        reason: "proof envelope cannot target a pre-gate height".to_string(),
-                    });
-                }
-                compute_slash_evidence_v2_hash(evidence)
-            }
-        };
-        if !seen_slash_hashes.insert(hash) {
+        if !seen_slash_hashes.insert(compute_slash_evidence_v2_hash(evidence)) {
             return Err(StateError::DuplicateSlashEvidence);
         }
     }
@@ -911,40 +741,13 @@ fn apply_block_inner(
         let chain_id_clone = state.chain_id.clone();
         let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
         for evidence in &block.slashing_evidence {
-            apply_slash_at_height(
+            apply_slash_v2_at_height_with_accounting(
                 &mut shadow,
                 evidence,
                 &chain_id_clone,
                 block.header.height,
                 reporter_pubkey.as_ref(),
             )?;
-        }
-    }
-    if !block.slashing_evidence_v2.is_empty() {
-        let mut shadow = state.clone();
-        let chain_id_clone = state.chain_id.clone();
-        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
-        for envelope in &block.slashing_evidence_v2 {
-            match envelope {
-                SlashEvidenceEnvelopeV2::Legacy(evidence) => {
-                    apply_slash_at_height(
-                        &mut shadow,
-                        evidence,
-                        &chain_id_clone,
-                        block.header.height,
-                        reporter_pubkey.as_ref(),
-                    )?;
-                }
-                SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
-                    apply_slash_v2_at_height_with_accounting(
-                        &mut shadow,
-                        evidence,
-                        &chain_id_clone,
-                        block.header.height,
-                        reporter_pubkey.as_ref(),
-                    )?;
-                }
-            }
         }
     }
 
@@ -960,9 +763,7 @@ fn apply_block_inner(
     let chain_id = txn.state().chain_id.clone();
     for op in &block.staking_ops {
         txn.snapshot_staking_scope();
-        if delegator_identity_registry_active(block.header.height) {
-            txn.snapshot_delegator_identity_scope();
-        }
+        txn.snapshot_delegator_identity_scope();
         apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
             StateError::InvariantViolation {
                 message: "staking op failed on real state after shadow validation",
@@ -976,9 +777,7 @@ fn apply_block_inner(
     let chain_id = txn.state().chain_id.clone();
     for op in &block.governance_ops {
         txn.snapshot_governance_scope();
-        if delegator_identity_registry_active(block.header.height) {
-            txn.snapshot_delegator_identity_scope();
-        }
+        txn.snapshot_delegator_identity_scope();
         apply_governance_op(
             txn.state_mut(),
             op,
@@ -996,7 +795,7 @@ fn apply_block_inner(
     let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block)?;
     for evidence in &block.slashing_evidence {
         txn.snapshot_slashing_scope();
-        let accounting = apply_slash_at_height_with_accounting(
+        let accounting = apply_slash_v2_at_height_with_accounting(
             txn.state_mut(),
             evidence,
             &chain_id_for_slash,
@@ -1008,32 +807,6 @@ fn apply_block_inner(
         })?;
         txn.add_slash_accounting(accounting.slash_amount)?;
     }
-    for envelope in &block.slashing_evidence_v2 {
-        txn.snapshot_slashing_scope();
-        let accounting = match envelope {
-            SlashEvidenceEnvelopeV2::Legacy(evidence) => apply_slash_at_height_with_accounting(
-                txn.state_mut(),
-                evidence,
-                &chain_id_for_slash,
-                block.header.height,
-                reporter_pubkey.as_ref(),
-            ),
-            SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
-                apply_slash_v2_at_height_with_accounting(
-                    txn.state_mut(),
-                    evidence,
-                    &chain_id_for_slash,
-                    block.header.height,
-                    reporter_pubkey.as_ref(),
-                )
-            }
-        }
-        .map_err(|_| StateError::InvariantViolation {
-            message: "versioned slash failed on real state after shadow validation",
-        })?;
-        txn.add_slash_accounting(accounting.slash_amount)?;
-    }
-
     // Update base fee for next block
     let next_fee = compute_next_base_fee(txn.state().base_fee, block.transactions.len());
     txn.set_base_fee(next_fee)?;
@@ -1041,22 +814,9 @@ fn apply_block_inner(
     // Advance height and tip hash
     txn.set_tip(block.header.height, block.header.block_hash())?;
 
-    if block.header.height
-        == indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
-    {
-        txn.snapshot_slash_membership_root_scope();
-        txn.state_mut()
-            .bootstrap_slash_membership_root(block.header.height)?;
-        txn.state_mut()
-            .rebuild_state_commitment_v2(block.header.height);
-        txn.after_mutation()?;
-    }
-
-    // Post-gate, credit the certified parent's activity before the transition
+    // Credit the certified parent's activity before the transition
     // so the closing epoch's final QC participates in liveness evaluation.
-    if let Some(context) = transition_context
-        .filter(|context| epoch_transition_context_active(context.boundary_height))
-    {
+    if let Some(context) = transition_context {
         txn.snapshot_validator_activity_scope();
         update_last_active_epoch_from_block_qc(txn.state_mut(), block, Some(&context))?;
         txn.after_mutation()?;
@@ -1083,9 +843,7 @@ fn apply_block_inner(
         });
     }
 
-    if transition_context
-        .is_none_or(|context| !epoch_transition_context_active(context.boundary_height))
-    {
+    if transition_context.is_none() {
         txn.snapshot_validator_activity_scope();
         update_last_active_epoch_from_block_qc(txn.state_mut(), block, None)?;
         txn.after_mutation()?;
@@ -1098,11 +856,7 @@ fn apply_block_inner(
         let boundary_height = context.boundary_height;
         txn.state_mut()
             .create_consensus_snapshot_after_boundary(boundary_height)?;
-        if indra_core::types::primitives::consensus_snapshot_active(
-            boundary_height.saturating_add(1),
-        ) {
-            txn.state_mut().rebuild_state_commitment_v2(boundary_height);
-        }
+        txn.state_mut().rebuild_state_commitment_v2(boundary_height);
         txn.after_mutation()?;
     }
 
@@ -1113,21 +867,7 @@ fn governance_operation_epoch(
     height: u64,
     context: Option<&crate::epoch::EpochTransitionContext>,
 ) -> u64 {
-    governance_operation_epoch_at_gate(
-        height,
-        context,
-        indra_core::types::primitives::hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
-    )
-}
-
-fn governance_operation_epoch_at_gate(
-    height: u64,
-    context: Option<&crate::epoch::EpochTransitionContext>,
-    gate_height: u64,
-) -> u64 {
-    context
-        .filter(|_| height >= gate_height)
-        .map_or_else(|| epoch_for_height(height), |context| context.closing_epoch)
+    context.map_or_else(|| epoch_for_height(height), |context| context.closing_epoch)
 }
 
 /// Update validator liveness from the QC embedded in the applied block.
@@ -1180,8 +920,7 @@ fn update_last_active_epoch_from_block_qc(
 /// Validate block-level invariants (does not touch state).
 fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()> {
     // Protocol version
-    let expected_protocol_version = block_protocol_version_for_height(block.header.height);
-    if block.header.protocol_version.0 != expected_protocol_version {
+    if block.header.protocol_version.0 != BLOCK_FORMAT_VERSION {
         return Err(StateError::UnsupportedVersion {
             version: block.header.protocol_version.0,
         });
@@ -1448,9 +1187,7 @@ mod tests {
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
         GOVERNANCE_DELIBERATION_EPOCHS,
     };
-    use crate::validator::{
-        ColdKeyStatus, StakeBondEntry, ValidatorEntry, ValidatorSet, ValidatorStatus,
-    };
+    use crate::validator::{StakeBondEntry, ValidatorEntry, ValidatorSet, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         codec::Encode,
@@ -1462,13 +1199,12 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
-                hard_forks::DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-                BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
-                DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK, MAX_INPUTS, MAX_OUTPUTS,
-                MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-                MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
-                TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
+                BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS,
+                GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK,
+                MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
+                MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS,
+                STAKING_TX_IDX, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+                UNBONDING_PERIOD_EPOCHS,
             },
             slash_membership::build_slash_membership_proof,
             slashing::{SlashEvidenceV1, SlashEvidenceV2},
@@ -1564,7 +1300,11 @@ mod tests {
     }
 
     fn sign_staking_op(keypair: &HybridKeypair, chain_id: &str, op: &mut StakingOp) {
-        let sig = keypair.sign(&op.signing_bytes(chain_id)).unwrap();
+        let signing_bytes = op
+            .cold_authorization_signing_bytes(chain_id)
+            .unwrap()
+            .unwrap_or_else(|| op.signing_bytes(chain_id));
+        let sig = keypair.sign(&signing_bytes).unwrap();
         op.signature = HybridSignature {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -1576,6 +1316,39 @@ mod tests {
     }
 
     fn sign_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair, chain_id: &str) {
+        if matches!(
+            op.payload,
+            GovernancePayload::Propose { .. }
+                | GovernancePayload::Commit { .. }
+                | GovernancePayload::Reveal { .. }
+                | GovernancePayload::Cancel { .. }
+        ) {
+            let cold_nonce = op.nonce;
+            let authorization = Some(indra_core::types::governance::ColdGovernanceAuthorization {
+                cold_key_version: 1,
+                cold_nonce,
+            });
+            match &mut op.payload {
+                GovernancePayload::Propose { cold_authorization, .. }
+                | GovernancePayload::Commit { cold_authorization, .. }
+                | GovernancePayload::Reveal { cold_authorization, .. }
+                | GovernancePayload::Cancel { cold_authorization, .. } => {
+                    *cold_authorization = authorization;
+                }
+                _ => unreachable!(),
+            }
+            op.nonce = 0;
+            let bytes = op
+                .cold_authorization_signing_bytes(chain_id)
+                .unwrap()
+                .unwrap();
+            let sig = keypair.sign(&bytes).unwrap();
+            op.signature = HybridSignature {
+                classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+                pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+            };
+            return;
+        }
         let domain = governance_signing_domain(
             op.action_type,
             op.signer_id,
@@ -1605,7 +1378,7 @@ mod tests {
                 name: "governance-txn-validator".into(),
                 hybrid_classical_pk: Some(pubkey.classical_pk.0),
                 hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
-                vrf_pk: Some(seed),
+                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
                 stake_spark,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -1620,14 +1393,20 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: None,
-                cold_hybrid_pq_pk: None,
-                cold_key_version: 0,
-                cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+                cold_hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                cold_hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().try_into().unwrap()),
+                cold_key_version: 1,
                 cold_nonce: 0,
             })
             .unwrap();
         (pubkey, keypair, validator_id)
+    }
+
+    fn canonical_test_genesis() -> ChainState {
+        let mut state = ChainState::new_genesis();
+        install_governance_validator(&mut state, [0xF0; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        state.finalize_genesis().unwrap();
+        state
     }
 
     fn governance_deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
@@ -1780,13 +1559,16 @@ mod tests {
         nonce: u64,
     ) -> (StakingOp, Bytes32) {
         let (validator_pubkey, keypair) = make_test_keypair(seed);
+        let mut cold_seed = seed;
+        cold_seed[0] = cold_seed[0].wrapping_add(1);
+        let (cold_pubkey, cold_keypair) = make_test_keypair(cold_seed);
         let validator_id = staking_delegator_id_for_test(&validator_pubkey);
         let bond_utxo_id = state
             .utxos
             .insert(
                 output_with_value(
                     MINIMUM_VALIDATOR_BOND_SPARK,
-                    validator_pubkey.clone(),
+                    cold_pubkey.clone(),
                     seed[0],
                 ),
                 0,
@@ -1804,13 +1586,32 @@ mod tests {
                     committed_value_spark: MINIMUM_VALIDATOR_BOND_SPARK,
                     blinding_factor: Bytes32::from([seed[0]; 32]),
                 }),
-                cold_pubkey: None,
-                cold_signature: None,
+                cold_pubkey: Some(indra_core::types::crypto::ColdHybridPubKey {
+                    classical_pk: cold_pubkey.classical_pk,
+                    pq_pk: cold_pubkey.pq_pk,
+                }),
+                cold_signature: Some(dummy_sig()),
             },
             nonce,
             signature: dummy_sig(),
         };
-        sign_staking_op(&keypair, &state.chain_id, &mut op);
+        let message = op
+            .register_validator_dual_signing_bytes(&state.chain_id)
+            .unwrap()
+            .unwrap();
+        let hot_sig = keypair.sign(&message).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&hot_sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&hot_sig.pq.0).unwrap(),
+        };
+        let cold_sig = cold_keypair.sign(&message).unwrap();
+        let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body else {
+            unreachable!()
+        };
+        *cold_signature = Some(HybridSignature {
+            classical_sig: VariableBytes::from_slice(&cold_sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&cold_sig.pq.0).unwrap(),
+        });
         (op, validator_id)
     }
 
@@ -1944,7 +1745,6 @@ mod tests {
             cold_hybrid_classical_pk: None,
             cold_hybrid_pq_pk: None,
             cold_key_version: 0,
-            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
             cold_nonce: 0,
         }
     }
@@ -1981,10 +1781,10 @@ mod tests {
                 cold_hybrid_classical_pk: None,
                 cold_hybrid_pq_pk: None,
                 cold_key_version: 0,
-                cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
                 cold_nonce: 0,
             })
             .unwrap();
+        state.finalize_genesis().unwrap();
         (state, validator_id, keypair)
     }
 
@@ -2017,18 +1817,6 @@ mod tests {
                 classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
                 pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
             },
-        }
-    }
-
-    fn slash_evidence(
-        keypair: &HybridKeypair,
-        validator_id: Bytes32,
-        step: VoteStep,
-    ) -> SlashEvidenceV1 {
-        SlashEvidenceV1 {
-            validator_id,
-            vote_1: signed_vote(keypair, validator_id, 7, 0, step, Bytes32::from([0xAA; 32])),
-            vote_2: signed_vote(keypair, validator_id, 7, 0, step, Bytes32::from([0xBB; 32])),
         }
     }
 
@@ -2070,9 +1858,11 @@ mod tests {
     /// Build a state that has one pre-existing UTXO ready to be spent.
     fn state_with_utxo() -> (ChainState, Bytes32, HybridKeypair, [u8; 32], u64) {
         let mut state = ChainState::new_genesis();
+        install_governance_validator(&mut state, [0xF1; 32], MINIMUM_VALIDATOR_BOND_SPARK);
         let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
         let output = dummy_output(0x01, owner_pubkey);
         let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
+        state.finalize_genesis().unwrap();
         (state, utxo_id, keypair, [0x01; 32], TEST_INPUT_VALUE + 1)
     }
 
@@ -2198,9 +1988,23 @@ mod tests {
         height: u64,
         timestamp: u64,
     ) -> BlockV1 {
+        let quorum_certificate = if height > 0 && height % EPOCH_DURATION_BLOCKS == 0 {
+            let qc = QuorumCertificateV1 {
+                height: height - 1,
+                round: 0,
+                block_hash: state.tip_hash,
+                election_result_hash: None,
+                signer_bitfield: [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES],
+                pq_signatures: vec![],
+                classical_signatures: vec![],
+            };
+            VariableBytes::from_slice(&qc.encode_to_vec()).unwrap()
+        } else {
+            VariableBytes::from_slice(&[0u8; 32]).unwrap()
+        };
         BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
+                protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
                 height,
                 prev_hash: state.tip_hash,
                 timestamp,
@@ -2213,12 +2017,11 @@ mod tests {
                 polc_round: indra_core::types::block::NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                quorum_certificate,
                 election_result_hash: None,
             },
             transactions: txs,
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -2236,6 +2039,7 @@ mod tests {
         state.reward_economic_snapshot =
             Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
         state.consensus_snapshots = vec![snapshot];
+        state.rebuild_state_commitment_v2(u64::MAX);
     }
 
     fn assert_same_consensus_state(left: &ChainState, right: &ChainState) {
@@ -2411,10 +2215,19 @@ mod tests {
     fn governance_proposal_state(
         phase: ProposalPhase,
     ) -> (ChainState, HybridPubKey, HybridKeypair, Bytes32, Bytes32) {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair, proposer_id) =
             install_governance_validator(&mut state, [0x91; 32], 100_000);
+        let snapshot = state.build_genesis_consensus_snapshot().unwrap();
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
+        state.slash_membership_roots = vec![indra_core::types::slash_membership::SlashMembershipRootRecord {
+            activation_height: 1,
+            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(&snapshot).unwrap(),
+        }];
+        state.consensus_snapshots = vec![snapshot];
+        state.rebuild_state_commitment_v2(0);
         let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
         let proposal_id = compute_proposal_id(proposer_id, &action, 0, DEFAULT_CHAIN_ID);
         let mut proposal = test_proposal_record(
@@ -2467,7 +2280,7 @@ mod tests {
     fn empty_block_at(state: &ChainState, height: u64, timestamp: u64) -> BlockV1 {
         BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
+                protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
                 height,
                 prev_hash: state.tip_hash,
                 timestamp,
@@ -2485,7 +2298,6 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -2495,116 +2307,8 @@ mod tests {
     // ── Tests ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn project_block_for_roots_matches_clone_projection() {
-        let mut cases: Vec<(String, ChainState, BlockV1, u64)> = Vec::new();
-
-        let empty_state = ChainState::new_genesis();
-        cases.push((
-            "empty".into(),
-            empty_state.clone(),
-            make_block(&empty_state, vec![]),
-            0,
-        ));
-
-        let (tx_state, utxo_id, keypair, blinding, value) = state_with_utxo();
-        let tx = make_tx(
-            &tx_state,
-            &keypair,
-            utxo_id,
-            value,
-            blinding,
-            Bytes32::from([0xA1; 32]),
-        );
-        cases.push((
-            "transaction".into(),
-            tx_state.clone(),
-            make_block(&tx_state, vec![tx]),
-            0,
-        ));
-
-        let mut staking_state = ChainState::new_genesis();
-        let (staking_op, _) = signed_register_validator_op(&mut staking_state, [0x61; 32], 1);
-        let mut staking_block = make_block(&staking_state, vec![]);
-        staking_block.staking_ops.push(staking_op);
-        cases.push(("staking".into(), staking_state, staking_block, 0));
-
-        let mut governance_state = ChainState::new_genesis();
-        governance_state.governance.params.proposal_deposit_spark = 1_000;
-        let (proposer_pubkey, proposer_keypair, proposer_id) =
-            install_governance_validator(&mut governance_state, [0x81; 32], 100_000);
-        let deposit = governance_state
-            .utxos
-            .insert(
-                governance_deposit_output(proposer_pubkey.clone(), 1_500),
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        let governance_op = governance_propose_op(
-            proposer_id,
-            &proposer_keypair,
-            proposer_pubkey,
-            deposit,
-            1,
-            GovernableAction::SetMinDelegationSpark { value: 100_000 },
-        );
-        let mut governance_block = make_block(&governance_state, vec![]);
-        governance_block.governance_ops.push(governance_op);
-        cases.push(("governance".into(), governance_state, governance_block, 0));
-
-        let (slash_state, validator_id, slash_keypair) =
-            slash_validator_state([0x62; 32], MINIMUM_VALIDATOR_BOND_SPARK);
-        let mut slash_block = make_block(&slash_state, vec![]);
-        slash_block.slashing_evidence.push(slash_evidence(
-            &slash_keypair,
-            validator_id,
-            VoteStep::Precommit,
-        ));
-        cases.push(("slashing".into(), slash_state, slash_block, 0));
-
-        let mut epoch_state = ChainState::new_genesis();
-        epoch_state.height = EPOCH_DURATION_BLOCKS - 1;
-        let epoch_block = make_block(&epoch_state, vec![]);
-        assert!(is_epoch_boundary(epoch_block.header.height));
-        cases.push(("epoch-boundary".into(), epoch_state, epoch_block, 123_456));
-
-        for (label, state, block, timestamp_secs) in cases {
-            let reference =
-                clone_atomic_reference_apply_block(&state, &block, timestamp_secs).unwrap();
-            let mut projected_state = state.clone();
-            let projected =
-                project_block_for_roots(&mut projected_state, &block, timestamp_secs).unwrap();
-            assert_eq!(projected.state_root, reference.state_root, "{label}");
-            assert_eq!(
-                projected.validator_set_root, reference.validator_set_root,
-                "{label}"
-            );
-            let mut reference_block = block.clone();
-            reference_block.header.state_root = reference.state_root;
-            reference_block.header.validator_set_root = reference.validator_set_root;
-            assert_eq!(
-                projected.value_hash,
-                reference_block.compute_value_hash(reference.state.total_supply),
-                "{label}"
-            );
-            assert_eq!(
-                projected.total_supply, reference.state.total_supply,
-                "{label}"
-            );
-            assert_eq!(projected.epoch_record, reference.epoch_record, "{label}");
-            assert_same_consensus_state(&projected_state, &state);
-            assert_eq!(
-                projected_state.state_commitment_v2.is_some(),
-                state.state_commitment_v2.is_some(),
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
     fn project_block_for_roots_restores_state_on_success() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         install_inert_gate_snapshot_fixture(&mut state);
         state.height = u64::MAX - 1;
         state.tip_hash = Bytes32::ZERO;
@@ -2624,7 +2328,7 @@ mod tests {
 
     #[test]
     fn project_block_for_roots_restores_state_on_apply_failure() {
-        let state = ChainState::new_genesis();
+        let state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.prev_hash = Bytes32::from([0xEE; 32]);
         let reference_err = clone_atomic_reference_apply_block(&state, &block, 0).unwrap_err();
@@ -2641,7 +2345,7 @@ mod tests {
 
     #[test]
     fn project_block_for_roots_preserves_active_state_commitment_v2_cache() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         install_inert_gate_snapshot_fixture(&mut state);
         state.height = u64::MAX - 1;
         state.tip_hash = Bytes32::ZERO;
@@ -2761,7 +2465,7 @@ mod tests {
 
     #[test]
     fn state_txn_rolls_back_staking_scope_failpoints() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let (op, _) = signed_register_validator_op(&mut state, [0x61; 32], 1);
         let mut block = make_block(&state, vec![]);
         block.staking_ops.push(op);
@@ -2774,7 +2478,7 @@ mod tests {
 
     #[test]
     fn state_txn_rolls_back_delegation_mutation_failpoints() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let (delegator_pubkey, keypair) = make_test_keypair([0x71; 32]);
         let output = dummy_output(0x08, delegator_pubkey.clone());
         let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
@@ -2820,7 +2524,7 @@ mod tests {
 
     #[test]
     fn delegation_side_index_replay_determinism_independent_of_cache_state() {
-        let mut base = ChainState::new_genesis();
+        let mut base = canonical_test_genesis();
         let (delegator_pubkey, keypair) = make_test_keypair([0x75; 32]);
         let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
         let output = dummy_output(0x0A, delegator_pubkey.clone());
@@ -2873,319 +2577,9 @@ mod tests {
     }
 
     #[test]
-    fn state_txn_rolls_back_delegate_identity_registry_population_failpoints() {
-        let mut state = ChainState::new_genesis();
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
-        state.tip_hash = Bytes32::ZERO;
-        let (delegator_pubkey, keypair) = make_test_keypair([0x73; 32]);
-        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
-        let output = dummy_output(0x09, delegator_pubkey.clone());
-        let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
-        let validator_id = Bytes32::from([0x74; 32]);
-        state
-            .validators
-            .upsert(active_validator(validator_id))
-            .unwrap();
-
-        let delegate_op = signed_delegate_op(
-            &state,
-            validator_id,
-            bond_utxo_id,
-            delegator_pubkey,
-            &keypair,
-            1,
-        );
-        let mut block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
-        block.staking_ops.push(delegate_op);
-
-        crate::txn::set_fail_after_mutation(None);
-        let mut success = state.clone();
-        apply_block(&mut success, &block, 0).unwrap();
-        assert!(success.delegator_identities.contains_key(&delegator_id));
-        let success_bond = success.staked_bonds.get(&bond_utxo_id).unwrap();
-        assert!(success_bond.original_output.range_proof.is_none());
-        assert!(success_bond.original_output.owner_pubkey.is_some());
-
-        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
-        assert!(
-            mutation_count >= 5,
-            "delegate identity population should be rollback-covered, got {mutation_count}"
-        );
-        assert!(!state.delegator_identities.contains_key(&delegator_id));
-        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    }
-
-    #[test]
-    fn state_txn_rolls_back_undelegate_identity_registry_population_failpoints() {
-        let mut state = ChainState::new_genesis();
-        let (delegator_pubkey, keypair) = make_test_keypair([0x79; 32]);
-        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
-        let output = dummy_output(0x0D, delegator_pubkey.clone());
-        let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
-        let validator_id = Bytes32::from([0x7A; 32]);
-        state
-            .validators
-            .upsert(active_validator(validator_id))
-            .unwrap();
-        let chain_id = state.chain_id.clone();
-        let delegate_op = signed_delegate_op(
-            &state,
-            validator_id,
-            bond_utxo_id,
-            delegator_pubkey.clone(),
-            &keypair,
-            1,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut state,
-            &delegate_op,
-            &chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        assert!(state.delegator_identities.is_empty());
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            None
-        );
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
-        state.tip_hash = Bytes32::ZERO;
-
-        let undelegate_op = signed_undelegate_op(
-            &state,
-            validator_id,
-            bond_utxo_id,
-            delegator_pubkey,
-            &keypair,
-            2,
-        );
-        let mut block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
-        block.staking_ops.push(undelegate_op);
-
-        crate::txn::set_fail_after_mutation(None);
-        let mut success = state.clone();
-        apply_block(&mut success, &block, 0).unwrap();
-        assert!(success.delegator_identities.contains_key(&delegator_id));
-        assert_eq!(
-            success
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch)
-                .is_some(),
-            true
-        );
-
-        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
-        assert!(
-            mutation_count >= 4,
-            "undelegate identity population should be rollback-covered, got {mutation_count}"
-        );
-        assert!(!state.delegator_identities.contains_key(&delegator_id));
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            None
-        );
-    }
-
-    #[test]
-    fn state_txn_rolls_back_claim_rewards_identity_registry_population_failpoints() {
-        let mut state = ChainState::new_genesis();
-        let (delegator_pubkey, keypair) = make_test_keypair([0x80; 32]);
-        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
-        let output = dummy_output(0x10, delegator_pubkey.clone());
-        let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
-        let validator_id = Bytes32::from([0x81; 32]);
-        state
-            .validators
-            .upsert(active_validator(validator_id))
-            .unwrap();
-        let chain_id = state.chain_id.clone();
-        let delegate_op = signed_delegate_op(
-            &state,
-            validator_id,
-            bond_utxo_id,
-            delegator_pubkey.clone(),
-            &keypair,
-            1,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut state,
-            &delegate_op,
-            &chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        assert!(state.delegator_identities.is_empty());
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
-        state.tip_hash = Bytes32::ZERO;
-
-        let claim_op = signed_claim_rewards_op(&state, validator_id, delegator_pubkey, &keypair, 2);
-        let mut block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
-        block.staking_ops.push(claim_op);
-
-        crate::txn::set_fail_after_mutation(None);
-        let mut success = state.clone();
-        apply_block(&mut success, &block, 0).unwrap();
-        assert!(success.delegator_identities.contains_key(&delegator_id));
-        assert_eq!(
-            success
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-        assert_eq!(success.utxos.len(), state.utxos.len() + 1);
-
-        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
-        assert!(
-            mutation_count >= 4,
-            "claim rewards identity population should be rollback-covered, got {mutation_count}"
-        );
-        assert!(!state.delegator_identities.contains_key(&delegator_id));
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            DUST_LIMIT_SPARK
-        );
-    }
-
-    #[test]
-    fn state_txn_rolls_back_governance_redelegation_identity_population_failpoints() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0x87; 32]);
-        let to_validator = Bytes32::from([0x88; 32]);
-        let proposal_id = Bytes32::from([0x89; 32]);
-        install_reveal_phase_governance_proposal(
-            &mut state,
-            proposal_id,
-            from_validator,
-            to_validator,
-        );
-        let (delegator_pubkey, delegator_keypair) = make_test_keypair([0x8A; 32]);
-        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x8B; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey.clone(),
-            1_000,
-            0x8B,
-        );
-        assert!(state.delegator_identities.is_empty());
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
-        state.tip_hash = Bytes32::ZERO;
-
-        let op = governance_redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-        let mut block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
-        block.governance_ops.push(op);
-
-        crate::txn::set_fail_after_mutation(None);
-        let mut success = state.clone();
-        apply_block(&mut success, &block, 0).unwrap();
-        assert_eq!(
-            success.delegator_identities.get(&delegator_id),
-            Some(&delegator_pubkey)
-        );
-        assert_eq!(
-            success
-                .governance
-                .proposals
-                .get(&proposal_id)
-                .unwrap()
-                .redelegations
-                .len(),
-            1
-        );
-
-        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
-        assert!(
-            mutation_count >= 3,
-            "governance redelegation identity population should be rollback-covered, got {mutation_count}"
-        );
-        assert!(!state.delegator_identities.contains_key(&delegator_id));
-        assert!(state
-            .governance
-            .proposals
-            .get(&proposal_id)
-            .unwrap()
-            .redelegations
-            .is_empty());
-    }
-
-    #[test]
-    fn state_txn_rolls_back_register_validator_identity_population_failpoints() {
-        let mut state = ChainState::new_genesis();
-        state.validators = ValidatorSet::new();
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT;
-        state.tip_hash = Bytes32::ZERO;
-        let (op, validator_id) = signed_register_validator_op(&mut state, [0x93; 32], 1);
-        let validator_pubkey = match &op.body {
-            StakingOpBody::RegisterValidator {
-                validator_pubkey, ..
-            } => validator_pubkey.clone(),
-            _ => unreachable!(),
-        };
-        let mut block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT + 1, 0);
-        block.staking_ops.push(op);
-
-        crate::txn::set_fail_after_mutation(None);
-        let mut success = state.clone();
-        apply_block(&mut success, &block, 0).unwrap();
-        assert_eq!(
-            success.delegator_identities.get(&validator_id),
-            Some(&validator_pubkey)
-        );
-        assert!(success.validators.get(&validator_id).is_some());
-
-        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
-        assert!(
-            mutation_count >= 3,
-            "validator identity registration should be rollback-covered, got {mutation_count}"
-        );
-        assert!(!state.delegator_identities.contains_key(&validator_id));
-        assert!(state.validators.get(&validator_id).is_none());
-    }
-
-    #[test]
     fn delegate_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate() {
         let activation_height = 2;
-        let mut reference = ChainState::new_genesis();
+        let mut reference = canonical_test_genesis();
         let mut candidate = reference.clone();
         let validator_id = Bytes32::from([0x75; 32]);
         reference
@@ -3351,1169 +2745,11 @@ mod tests {
         assert!(!candidate.staked_bonds.contains_key(&attack_candidate_utxo));
     }
 
-    #[test]
-    fn undelegate_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate() {
-        let activation_height = 2;
-        let mut reference = ChainState::new_genesis();
-        let mut candidate = reference.clone();
-        let first_validator_id = Bytes32::from([0x7B; 32]);
-        let second_validator_id = Bytes32::from([0x7F; 32]);
-        reference
-            .validators
-            .upsert(active_validator(first_validator_id))
-            .unwrap();
-        reference
-            .validators
-            .upsert(active_validator(second_validator_id))
-            .unwrap();
-        candidate
-            .validators
-            .upsert(active_validator(first_validator_id))
-            .unwrap();
-        candidate
-            .validators
-            .upsert(active_validator(second_validator_id))
-            .unwrap();
 
-        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0x7C; 32], [0x7D; 32]);
-        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
-        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0x7C; 32], [0x7E; 32]);
-        assert_eq!(
-            staking_delegator_id_for_test(&attacker_pubkey),
-            delegator_id
-        );
-        assert_ne!(attacker_pubkey, legit_pubkey);
-
-        let first_reference_utxo = reference
-            .utxos
-            .insert(dummy_output(0x0E, legit_pubkey.clone()), 0, 0, 0)
-            .unwrap();
-        let first_candidate_utxo = candidate
-            .utxos
-            .insert(dummy_output(0x0E, legit_pubkey.clone()), 0, 0, 0)
-            .unwrap();
-        assert_eq!(first_reference_utxo, first_candidate_utxo);
-        let first_reference_delegate = signed_delegate_op(
-            &reference,
-            first_validator_id,
-            first_reference_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            1,
-        );
-        let first_candidate_delegate = signed_delegate_op(
-            &candidate,
-            first_validator_id,
-            first_candidate_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            1,
-        );
-        let reference_chain_id = reference.chain_id.clone();
-        let candidate_chain_id = candidate.chain_id.clone();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &first_reference_delegate,
-            &reference_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &first_candidate_delegate,
-            &candidate_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        assert_eq!(reference.encode_to_vec(), candidate.encode_to_vec());
-        assert!(candidate.delegator_identities.is_empty());
-
-        let second_reference_utxo = reference
-            .utxos
-            .insert(dummy_output(0x0F, legit_pubkey.clone()), 1, 0, 0)
-            .unwrap();
-        let second_candidate_utxo = candidate
-            .utxos
-            .insert(dummy_output(0x0F, legit_pubkey.clone()), 1, 0, 0)
-            .unwrap();
-        assert_eq!(second_reference_utxo, second_candidate_utxo);
-        let second_reference_delegate = signed_delegate_op(
-            &reference,
-            second_validator_id,
-            second_reference_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            2,
-        );
-        let second_candidate_delegate = signed_delegate_op(
-            &candidate,
-            second_validator_id,
-            second_candidate_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            2,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &second_reference_delegate,
-            &reference_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &second_candidate_delegate,
-            &candidate_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        assert_eq!(reference.encode_to_vec(), candidate.encode_to_vec());
-
-        let establish_reference = signed_undelegate_op(
-            &reference,
-            first_validator_id,
-            first_reference_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            3,
-        );
-        let establish_candidate = signed_undelegate_op(
-            &candidate,
-            first_validator_id,
-            first_candidate_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            3,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &establish_reference,
-            &reference_chain_id,
-            activation_height,
-            false,
-        )
-        .unwrap();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &establish_candidate,
-            &candidate_chain_id,
-            activation_height,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            candidate.delegator_identities.get(&delegator_id),
-            Some(&legit_pubkey)
-        );
-        assert_eq!(
-            reference
-                .staked_bonds
-                .get(&first_reference_utxo)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-        assert_eq!(
-            candidate
-                .staked_bonds
-                .get(&first_candidate_utxo)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-
-        let attack_reference = signed_undelegate_op(
-            &reference,
-            second_validator_id,
-            second_reference_utxo,
-            attacker_pubkey.clone(),
-            &attacker_keypair,
-            4,
-        );
-        let attack_candidate = signed_undelegate_op(
-            &candidate,
-            second_validator_id,
-            second_candidate_utxo,
-            attacker_pubkey,
-            &attacker_keypair,
-            4,
-        );
-
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &attack_reference,
-            &reference_chain_id,
-            activation_height + 1,
-            false,
-        )
-        .unwrap();
-        let candidate_before_attack = candidate.clone();
-        let err = crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &attack_candidate,
-            &candidate_chain_id,
-            activation_height + 1,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(candidate, candidate_before_attack);
-        assert_eq!(
-            reference
-                .staked_bonds
-                .get(&second_reference_utxo)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-        assert_eq!(
-            candidate
-                .staked_bonds
-                .get(&second_candidate_utxo)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            None
-        );
-    }
-
-    #[test]
-    fn claim_rewards_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate(
-    ) {
-        let activation_height = 2;
-        let mut reference = ChainState::new_genesis();
-        let mut candidate = reference.clone();
-        let first_validator_id = Bytes32::from([0x82; 32]);
-        let second_validator_id = Bytes32::from([0x83; 32]);
-        reference
-            .validators
-            .upsert(active_validator(first_validator_id))
-            .unwrap();
-        reference
-            .validators
-            .upsert(active_validator(second_validator_id))
-            .unwrap();
-        candidate
-            .validators
-            .upsert(active_validator(first_validator_id))
-            .unwrap();
-        candidate
-            .validators
-            .upsert(active_validator(second_validator_id))
-            .unwrap();
-
-        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0x84; 32], [0x85; 32]);
-        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
-        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0x84; 32], [0x86; 32]);
-        assert_eq!(
-            staking_delegator_id_for_test(&attacker_pubkey),
-            delegator_id
-        );
-        assert_ne!(attacker_pubkey, legit_pubkey);
-
-        let first_reference_utxo = reference
-            .utxos
-            .insert(dummy_output(0x11, legit_pubkey.clone()), 0, 0, 0)
-            .unwrap();
-        let first_candidate_utxo = candidate
-            .utxos
-            .insert(dummy_output(0x11, legit_pubkey.clone()), 0, 0, 0)
-            .unwrap();
-        assert_eq!(first_reference_utxo, first_candidate_utxo);
-        let first_reference_delegate = signed_delegate_op(
-            &reference,
-            first_validator_id,
-            first_reference_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            1,
-        );
-        let first_candidate_delegate = signed_delegate_op(
-            &candidate,
-            first_validator_id,
-            first_candidate_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            1,
-        );
-        let reference_chain_id = reference.chain_id.clone();
-        let candidate_chain_id = candidate.chain_id.clone();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &first_reference_delegate,
-            &reference_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &first_candidate_delegate,
-            &candidate_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        assert_eq!(reference.encode_to_vec(), candidate.encode_to_vec());
-
-        let second_reference_utxo = reference
-            .utxos
-            .insert(dummy_output(0x12, legit_pubkey.clone()), 1, 0, 0)
-            .unwrap();
-        let second_candidate_utxo = candidate
-            .utxos
-            .insert(dummy_output(0x12, legit_pubkey.clone()), 1, 0, 0)
-            .unwrap();
-        assert_eq!(second_reference_utxo, second_candidate_utxo);
-        let second_reference_delegate = signed_delegate_op(
-            &reference,
-            second_validator_id,
-            second_reference_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            2,
-        );
-        let second_candidate_delegate = signed_delegate_op(
-            &candidate,
-            second_validator_id,
-            second_candidate_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            2,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &second_reference_delegate,
-            &reference_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &second_candidate_delegate,
-            &candidate_chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        reference
-            .delegations
-            .update_delegator(&first_validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        candidate
-            .delegations
-            .update_delegator(&first_validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        reference
-            .delegations
-            .update_delegator(&second_validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        candidate
-            .delegations
-            .update_delegator(&second_validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        assert_eq!(reference.encode_to_vec(), candidate.encode_to_vec());
-        assert!(candidate.delegator_identities.is_empty());
-
-        let establish_reference = signed_claim_rewards_op(
-            &reference,
-            first_validator_id,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            3,
-        );
-        let establish_candidate = signed_claim_rewards_op(
-            &candidate,
-            first_validator_id,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            3,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &establish_reference,
-            &reference_chain_id,
-            activation_height,
-            false,
-        )
-        .unwrap();
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &establish_candidate,
-            &candidate_chain_id,
-            activation_height,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            candidate.delegator_identities.get(&delegator_id),
-            Some(&legit_pubkey)
-        );
-        assert_eq!(
-            reference
-                .delegations
-                .get_delegators(&first_validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-        assert_eq!(
-            candidate
-                .delegations
-                .get_delegators(&first_validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-
-        let attack_reference = signed_claim_rewards_op(
-            &reference,
-            second_validator_id,
-            attacker_pubkey.clone(),
-            &attacker_keypair,
-            4,
-        );
-        let attack_candidate = signed_claim_rewards_op(
-            &candidate,
-            second_validator_id,
-            attacker_pubkey,
-            &attacker_keypair,
-            4,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut reference,
-            &attack_reference,
-            &reference_chain_id,
-            activation_height + 1,
-            false,
-        )
-        .unwrap();
-        let candidate_before_attack = candidate.clone();
-        let err = crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &attack_candidate,
-            &candidate_chain_id,
-            activation_height + 1,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(candidate, candidate_before_attack);
-        assert_eq!(
-            reference
-                .delegations
-                .get_delegators(&second_validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-        assert_eq!(
-            candidate
-                .delegations
-                .get_delegators(&second_validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            DUST_LIMIT_SPARK
-        );
-    }
-
-    #[test]
-    fn governance_redelegation_identity_activation_replay_is_deterministic_before_gate_and_rejects_after_gate(
-    ) {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0x8C; 32]);
-        let to_validator = Bytes32::from([0x8D; 32]);
-        let pre_gate_proposal = Bytes32::from([0x8E; 32]);
-        let post_gate_proposal = Bytes32::from([0x8F; 32]);
-        install_reveal_phase_governance_proposal(
-            &mut state,
-            pre_gate_proposal,
-            from_validator,
-            to_validator,
-        );
-        install_reveal_phase_governance_proposal(
-            &mut state,
-            post_gate_proposal,
-            from_validator,
-            to_validator,
-        );
-        let (first_pubkey, first_keypair) = make_mixed_test_keypair([0x90; 32], [0x91; 32]);
-        let (second_pubkey, _) = make_mixed_test_keypair([0x90; 32], [0x92; 32]);
-        let delegator_id = staking_delegator_id_for_test(&first_pubkey);
-        assert_eq!(staking_delegator_id_for_test(&second_pubkey), delegator_id);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x01; 32]),
-            from_validator,
-            delegator_id,
-            first_pubkey,
-            1_000,
-            0x90,
-        );
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x02; 32]),
-            from_validator,
-            delegator_id,
-            second_pubkey,
-            1_000,
-            0x91,
-        );
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 2;
-        state.tip_hash = Bytes32::ZERO;
-
-        let pre_gate = governance_redelegate_op(
-            delegator_id,
-            &first_keypair,
-            pre_gate_proposal,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-        let mut pre_gate_block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1, 0);
-        pre_gate_block.governance_ops.push(pre_gate);
-        apply_block(&mut state, &pre_gate_block, 0).unwrap();
-        assert!(state.delegator_identities.is_empty());
-        assert_eq!(
-            state
-                .governance
-                .proposals
-                .get(&pre_gate_proposal)
-                .unwrap()
-                .redelegations
-                .len(),
-            1
-        );
-
-        let post_gate = governance_redelegate_op(
-            delegator_id,
-            &first_keypair,
-            post_gate_proposal,
-            from_validator,
-            to_validator,
-            500,
-            2,
-        );
-        let mut old_behavior = state.clone();
-        apply_governance_op(
-            &mut old_behavior,
-            &post_gate,
-            0,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1,
-            DEFAULT_CHAIN_ID,
-        )
-        .unwrap();
-        assert_eq!(
-            old_behavior
-                .governance
-                .proposals
-                .get(&post_gate_proposal)
-                .unwrap()
-                .redelegations
-                .len(),
-            1
-        );
-
-        let before_post_gate = state.clone();
-        let mut post_gate_block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
-        post_gate_block.governance_ops.push(post_gate);
-        let err = apply_block(&mut state, &post_gate_block, 0).unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidGovernanceOp { reason }
-                if reason.contains("delegator identity has ambiguous legacy pubkeys")
-        ));
-        assert_eq!(state, before_post_gate);
-    }
-
-    #[test]
-    fn validator_identity_activation_replay_is_deterministic_before_gate_and_populates_after_gate()
-    {
-        let mut initial = ChainState::new_genesis();
-        initial.validators = ValidatorSet::new();
-        initial.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 2;
-        initial.tip_hash = Bytes32::ZERO;
-
-        let (pre_op, pre_validator_id) = signed_register_validator_op(&mut initial, [0x94; 32], 1);
-        let pre_pubkey = match &pre_op.body {
-            StakingOpBody::RegisterValidator {
-                validator_pubkey, ..
-            } => validator_pubkey.clone(),
-            _ => unreachable!(),
-        };
-        let mut pre_block =
-            make_block_at_height(&initial, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1, 0);
-        pre_block.staking_ops.push(pre_op);
-
-        let mut first_replay = initial.clone();
-        let mut second_replay = initial.clone();
-        apply_block(&mut first_replay, &pre_block, 0).unwrap();
-        apply_block(&mut second_replay, &pre_block, 0).unwrap();
-        assert_eq!(first_replay, second_replay);
-        assert!(first_replay.validators.get(&pre_validator_id).is_some());
-        assert!(!first_replay
-            .delegator_identities
-            .contains_key(&pre_validator_id));
-        assert_ne!(
-            first_replay.delegator_identities.get(&pre_validator_id),
-            Some(&pre_pubkey)
-        );
-
-        let (post_op, post_validator_id) =
-            signed_register_validator_op(&mut first_replay, [0x95; 32], 1);
-        let post_pubkey = match &post_op.body {
-            StakingOpBody::RegisterValidator {
-                validator_pubkey, ..
-            } => validator_pubkey.clone(),
-            _ => unreachable!(),
-        };
-        second_replay = first_replay.clone();
-        let mut post_block =
-            make_block_at_height(&first_replay, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
-        post_block.staking_ops.push(post_op.clone());
-        let mut post_block_second = make_block_at_height(
-            &second_replay,
-            vec![],
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            0,
-        );
-        post_block_second.staking_ops.push(post_op);
-
-        apply_block(&mut first_replay, &post_block, 0).unwrap();
-        apply_block(&mut second_replay, &post_block_second, 0).unwrap();
-        assert_eq!(first_replay, second_replay);
-        assert_eq!(
-            first_replay.delegator_identities.get(&post_validator_id),
-            Some(&post_pubkey)
-        );
-        assert!(!first_replay
-            .delegator_identities
-            .contains_key(&pre_validator_id));
-    }
-
-    #[test]
-    fn cold_enforcement_height_block_demotes_only_unenrolled_and_replays_deterministically() {
-        let enforcement =
-            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
-        let mut initial = ChainState::new_genesis();
-        initial.height = enforcement - 1;
-        let (_, _, enrolled_id) = install_governance_validator(&mut initial, [0x61; 32], 2_000);
-        let (_, _, unenrolled_id) = install_governance_validator(&mut initial, [0x62; 32], 1_000);
-        let cold = HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[0x63; 32]),
-            PqKeypair::from_seed(&[0x64; 32]).unwrap(),
-        );
-        let public = cold.public_key();
-        let enrolled = initial.validators.get_mut(&enrolled_id).unwrap();
-        enrolled.cold_hybrid_classical_pk = Some(public.classical.0);
-        enrolled.cold_hybrid_pq_pk = Some(public.pq.0);
-        enrolled.cold_key_version = 1;
-        enrolled.cold_key_status = crate::validator::ColdKeyStatus::Active;
-
-        let block = empty_block_at(&initial, enforcement, 0);
-        let mut first = initial.clone();
-        let mut second = initial;
-        apply_block(&mut first, &block, 0).unwrap();
-        apply_block(&mut second, &block, 0).unwrap();
-
-        assert_eq!(first, second);
-        assert_eq!(
-            crate::compute_state_root(&first),
-            crate::compute_state_root(&second)
-        );
-        assert_eq!(
-            first.validators.get(&enrolled_id).unwrap().status,
-            ValidatorStatus::Active
-        );
-        assert_eq!(
-            first.validators.get(&unenrolled_id).unwrap().status,
-            ValidatorStatus::Registered
-        );
-    }
-
-    #[test]
-    fn identity_registry_capstone_rejects_all_substitution_attacks_and_preserves_state() {
-        let mut base = ChainState::new_genesis();
-        let first_validator = Bytes32::from([0xA1; 32]);
-        let second_validator = Bytes32::from([0xA2; 32]);
-        base.validators
-            .upsert(active_validator(first_validator))
-            .unwrap();
-        base.validators
-            .upsert(active_validator(second_validator))
-            .unwrap();
-
-        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0xA3; 32], [0xA4; 32]);
-        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0xA3; 32], [0xA5; 32]);
-        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
-        assert_eq!(
-            staking_delegator_id_for_test(&attacker_pubkey),
-            delegator_id
-        );
-        assert_ne!(attacker_pubkey, legit_pubkey);
-        base.delegator_identities
-            .insert(delegator_id, legit_pubkey.clone());
-
-        install_legacy_redelegation_bond(
-            &mut base,
-            Bytes32::from([0xA6; 32]),
-            first_validator,
-            delegator_id,
-            legit_pubkey.clone(),
-            DUST_LIMIT_SPARK,
-            0xA6,
-        );
-        install_legacy_redelegation_bond(
-            &mut base,
-            Bytes32::from([0xA7; 32]),
-            second_validator,
-            delegator_id,
-            legit_pubkey.clone(),
-            DUST_LIMIT_SPARK,
-            0xA7,
-        );
-        base.delegations
-            .update_delegator(&second_validator, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-
-        let proposal_id = Bytes32::from([0xA8; 32]);
-        install_reveal_phase_governance_proposal(
-            &mut base,
-            proposal_id,
-            first_validator,
-            second_validator,
-        );
-
-        let (validator_pubkey, validator_keypair) = make_mixed_test_keypair([0xA9; 32], [0xAA; 32]);
-        let (attacker_validator_pubkey, attacker_validator_keypair) =
-            make_mixed_test_keypair([0xA9; 32], [0xAB; 32]);
-        let validator_id = staking_delegator_id_for_test(&validator_pubkey);
-        assert_eq!(
-            staking_delegator_id_for_test(&attacker_validator_pubkey),
-            validator_id
-        );
-        base.validators
-            .upsert(ValidatorEntry {
-                validator_id,
-                name: "capstone-validator".into(),
-                hybrid_classical_pk: Some(validator_pubkey.classical_pk.0),
-                hybrid_pq_pk: Some(validator_pubkey.pq_pk.as_slice().to_vec()),
-                vrf_pk: Some([0xA9; 32]),
-                stake_spark: MINIMUM_VALIDATOR_BOND_SPARK,
-                status: ValidatorStatus::Active,
-                registered_epoch: 0,
-                last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
-                self_report_count: 0,
-                commission_bps: 1_000,
-                pending_commission_bps: None,
-                pending_commission_effective_epoch: None,
-                min_delegation_spark: DUST_LIMIT_SPARK,
-                auto_delegate_to: None,
-                network_addr: None,
-                network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: None,
-                cold_hybrid_pq_pk: None,
-                cold_key_version: 0,
-                cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
-                cold_nonce: 0,
-            })
-            .unwrap();
-        base.delegator_identities
-            .insert(validator_id, validator_pubkey.clone());
-
-        let chain_id = base.chain_id.clone();
-
-        let mut legitimate_delegate_state = base.clone();
-        let legit_delegate_utxo = legitimate_delegate_state
-            .utxos
-            .insert(
-                output_with_value(DUST_LIMIT_SPARK, legit_pubkey.clone(), 0xB0),
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        let legit_delegate = signed_delegate_op(
-            &legitimate_delegate_state,
-            second_validator,
-            legit_delegate_utxo,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            1,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut legitimate_delegate_state,
-            &legit_delegate,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap();
-        let new_bond = legitimate_delegate_state
-            .staked_bonds
-            .get(&legit_delegate_utxo)
-            .unwrap();
-        assert!(new_bond.original_output.range_proof.is_none());
-        assert!(new_bond.original_output.owner_pubkey.is_some());
-
-        let attack_delegate_utxo = base
-            .utxos
-            .insert(
-                output_with_value(DUST_LIMIT_SPARK, attacker_pubkey.clone(), 0xB1),
-                0,
-                0,
-                1,
-            )
-            .unwrap();
-        let delegate_attack = signed_delegate_op(
-            &base,
-            first_validator,
-            attack_delegate_utxo,
-            attacker_pubkey.clone(),
-            &attacker_keypair,
-            1,
-        );
-        let mut candidate = base.clone();
-        let err = crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &delegate_attack,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(reason)
-                if reason.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(candidate, base);
-
-        let undelegate_attack = signed_undelegate_op(
-            &base,
-            first_validator,
-            Bytes32::from([0xA6; 32]),
-            attacker_pubkey.clone(),
-            &attacker_keypair,
-            1,
-        );
-        let mut candidate = base.clone();
-        let err = crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &undelegate_attack,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(reason)
-                if reason.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(candidate, base);
-
-        let claim_attack = signed_claim_rewards_op(
-            &base,
-            second_validator,
-            attacker_pubkey.clone(),
-            &attacker_keypair,
-            1,
-        );
-        let mut candidate = base.clone();
-        let err = crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &claim_attack,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(reason)
-                if reason.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(candidate, base);
-
-        let governance_attack = governance_redelegate_op(
-            delegator_id,
-            &attacker_keypair,
-            proposal_id,
-            first_validator,
-            second_validator,
-            DUST_LIMIT_SPARK / 2,
-            1,
-        );
-        let mut candidate = base.clone();
-        let err = apply_governance_op(
-            &mut candidate,
-            &governance_attack,
-            0,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            DEFAULT_CHAIN_ID,
-        )
-        .unwrap_err();
-        assert!(matches!(err, StateError::GovernanceSignatureInvalid { .. }));
-        assert_eq!(candidate, base);
-
-        let self_stake_utxo = base
-            .utxos
-            .insert(
-                output_with_value(DUST_LIMIT_SPARK, attacker_validator_pubkey.clone(), 0xB2),
-                0,
-                0,
-                2,
-            )
-            .unwrap();
-        let self_stake_attack = signed_self_stake_op(
-            &base,
-            self_stake_utxo,
-            attacker_validator_pubkey,
-            &attacker_validator_keypair,
-            1,
-        );
-        let mut candidate = base.clone();
-        let err = crate::delegation::apply_staking_op_with_identity_activation(
-            &mut candidate,
-            &self_stake_attack,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(reason)
-                if reason.contains("validator identity stored pubkey mismatch")
-        ));
-        assert_eq!(candidate, base);
-
-        let mut legitimate_claim_state = base.clone();
-        let legit_claim = signed_claim_rewards_op(
-            &legitimate_claim_state,
-            second_validator,
-            legit_pubkey.clone(),
-            &legit_keypair,
-            1,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut legitimate_claim_state,
-            &legit_claim,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            legitimate_claim_state
-                .delegations
-                .get_delegators(&second_validator)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-
-        let mut legitimate_governance_state = base.clone();
-        let legitimate_governance = governance_redelegate_op(
-            delegator_id,
-            &legit_keypair,
-            proposal_id,
-            first_validator,
-            second_validator,
-            DUST_LIMIT_SPARK / 2,
-            1,
-        );
-        apply_governance_op(
-            &mut legitimate_governance_state,
-            &legitimate_governance,
-            0,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            DEFAULT_CHAIN_ID,
-        )
-        .unwrap();
-        assert_eq!(
-            legitimate_governance_state
-                .governance
-                .proposals
-                .get(&proposal_id)
-                .unwrap()
-                .redelegations
-                .len(),
-            1
-        );
-
-        let mut legitimate_self_stake_state = base.clone();
-        let self_stake_utxo = legitimate_self_stake_state
-            .utxos
-            .insert(
-                output_with_value(DUST_LIMIT_SPARK, validator_pubkey.clone(), 0xB3),
-                0,
-                0,
-                3,
-            )
-            .unwrap();
-        let legitimate_self_stake = signed_self_stake_op(
-            &legitimate_self_stake_state,
-            self_stake_utxo,
-            validator_pubkey,
-            &validator_keypair,
-            1,
-        );
-        crate::delegation::apply_staking_op_with_identity_activation(
-            &mut legitimate_self_stake_state,
-            &legitimate_self_stake,
-            &chain_id,
-            DELEGATOR_IDENTITY_REGISTRY_HEIGHT,
-            true,
-        )
-        .unwrap();
-        let self_bond = legitimate_self_stake_state
-            .staked_bonds
-            .get(&self_stake_utxo)
-            .unwrap();
-        assert!(self_bond.original_output.owner_pubkey.is_some());
-    }
-
-    #[test]
-    fn identity_registry_capstone_rejected_mixed_block_rolls_back_prior_successes() {
-        let mut state = ChainState::new_genesis();
-        state.height = DELEGATOR_IDENTITY_REGISTRY_HEIGHT - 1;
-        state.tip_hash = Bytes32::ZERO;
-        let validator_id = Bytes32::from([0xB4; 32]);
-        state
-            .validators
-            .upsert(active_validator(validator_id))
-            .unwrap();
-
-        let (legit_pubkey, legit_keypair) = make_mixed_test_keypair([0xB5; 32], [0xB6; 32]);
-        let (attacker_pubkey, attacker_keypair) = make_mixed_test_keypair([0xB5; 32], [0xB7; 32]);
-        let delegator_id = staking_delegator_id_for_test(&legit_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, legit_pubkey.clone());
-        state.staking_nonces.insert(delegator_id, 1);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0xB8; 32]),
-            validator_id,
-            delegator_id,
-            legit_pubkey.clone(),
-            DUST_LIMIT_SPARK,
-            0xB8,
-        );
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        let legit_utxo = state
-            .utxos
-            .insert(
-                output_with_value(DUST_LIMIT_SPARK, legit_pubkey.clone(), 0xB9),
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-
-        let legit_delegate = signed_delegate_op(
-            &state,
-            validator_id,
-            legit_utxo,
-            legit_pubkey,
-            &legit_keypair,
-            2,
-        );
-        let attack_claim =
-            signed_claim_rewards_op(&state, validator_id, attacker_pubkey, &attacker_keypair, 3);
-        let mut rejected_block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
-        rejected_block.staking_ops.push(legit_delegate.clone());
-        rejected_block.staking_ops.push(attack_claim);
-
-        let before = state.clone();
-        let err = apply_block(&mut state, &rejected_block, 0).unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(reason)
-                if reason.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(state, before);
-        assert!(!state.staked_bonds.contains_key(&legit_utxo));
-        assert_eq!(state.staking_nonces.get(&delegator_id), Some(&1));
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            DUST_LIMIT_SPARK
-        );
-
-        let mut clean_block =
-            make_block_at_height(&state, vec![], DELEGATOR_IDENTITY_REGISTRY_HEIGHT, 0);
-        clean_block.staking_ops.push(legit_delegate);
-        apply_block(&mut state, &clean_block, 0).unwrap();
-        let clean_bond = state.staked_bonds.get(&legit_utxo).unwrap();
-        assert!(clean_bond.original_output.range_proof.is_none());
-        assert!(clean_bond.original_output.owner_pubkey.is_some());
-        assert_eq!(state.staking_nonces.get(&delegator_id), Some(&2));
-    }
-
-    #[test]
-    fn state_txn_rolls_back_slashing_scope_failpoints() {
-        let (state, validator_id, keypair) =
-            slash_validator_state([0x62; 32], MINIMUM_VALIDATOR_BOND_SPARK);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let mut block = make_block(&state, vec![]);
-        block.slashing_evidence.push(evidence);
-        let mutation_count = assert_all_failpoints_roll_back(&state, &block);
-        assert!(
-            mutation_count >= 4,
-            "slashing block should exercise scoped undo mutations, got {mutation_count}"
-        );
-    }
 
     #[test]
     fn state_txn_rolls_back_epoch_transition_scope_failpoints() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         state.height = EPOCH_DURATION_BLOCKS - 1;
         let block = make_block(&state, vec![]);
         assert!(is_epoch_boundary(block.header.height));
@@ -4526,7 +2762,7 @@ mod tests {
 
     #[test]
     fn state_txn_rolls_back_governance_proposal_failpoints() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair, proposer_id) =
             install_governance_validator(&mut state, [0x81; 32], 100_000);
@@ -4590,7 +2826,13 @@ mod tests {
                     committed_epoch: 0,
                 },
             );
-        reveal_state.governance.gov_nonces.insert(proposer_id, 1);
+        // Commit/reveal authorization is cold-key-native in the pure protocol.
+        // Model the preceding commit by advancing the validator's cold nonce.
+        reveal_state
+            .validators
+            .get_mut(&proposer_id)
+            .unwrap()
+            .cold_nonce = 1;
         let reveal_op = governance_reveal_op(
             proposer_id,
             &proposer_keypair,
@@ -4641,13 +2883,13 @@ mod tests {
 
     #[test]
     fn state_txn_rebuilds_state_commitment_v2_cache_after_rollback() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         install_inert_gate_snapshot_fixture(&mut state);
         state.height = u64::MAX - 1;
         state.tip_hash = Bytes32::ZERO;
         let block = BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(block_protocol_version_for_height(u64::MAX)),
+                protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
                 height: u64::MAX,
                 prev_hash: Bytes32::ZERO,
                 timestamp: 0,
@@ -4665,7 +2907,6 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -4698,106 +2939,6 @@ mod tests {
     }
 
     #[test]
-    fn state_txn_oracle_matches_clone_atomic_reference_across_block_types() {
-        let state = ChainState::new_genesis();
-        assert_oracle_matches(&state, &make_block(&state, vec![]), 0);
-
-        let (tx_state, utxo_id, keypair, blinding, value) = state_with_utxo();
-        let tx = make_tx(
-            &tx_state,
-            &keypair,
-            utxo_id,
-            value,
-            blinding,
-            Bytes32::from([0xB1; 32]),
-        );
-        assert_oracle_matches(&tx_state, &make_block(&tx_state, vec![tx]), 0);
-
-        let mut staking_state = ChainState::new_genesis();
-        let (staking_op, _) = signed_register_validator_op(&mut staking_state, [0xB2; 32], 1);
-        let mut staking_block = make_block(&staking_state, vec![]);
-        staking_block.staking_ops.push(staking_op);
-        assert_oracle_matches(&staking_state, &staking_block, 0);
-
-        let mut governance_state = ChainState::new_genesis();
-        governance_state.governance.params.proposal_deposit_spark = 1_000;
-        let (proposer_pubkey, proposer_keypair, proposer_id) =
-            install_governance_validator(&mut governance_state, [0xB3; 32], 100_000);
-        let deposit = governance_state
-            .utxos
-            .insert(
-                governance_deposit_output(proposer_pubkey.clone(), 1_000),
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        let governance_op = governance_propose_op(
-            proposer_id,
-            &proposer_keypair,
-            proposer_pubkey,
-            deposit,
-            1,
-            GovernableAction::SetMinDelegationSpark { value: 100_000 },
-        );
-        let mut governance_block = make_block(&governance_state, vec![]);
-        governance_block.governance_ops.push(governance_op);
-        assert_oracle_matches(&governance_state, &governance_block, 0);
-
-        let (slash_state, validator_id, slash_keypair) =
-            slash_validator_state([0xB4; 32], MINIMUM_VALIDATOR_BOND_SPARK);
-        let mut slash_block = make_block(&slash_state, vec![]);
-        slash_block.slashing_evidence.push(slash_evidence(
-            &slash_keypair,
-            validator_id,
-            VoteStep::Precommit,
-        ));
-        assert_oracle_matches(&slash_state, &slash_block, 0);
-
-        let mut epoch_state = ChainState::new_genesis();
-        epoch_state.height = EPOCH_DURATION_BLOCKS - 1;
-        let epoch_block = make_block(&epoch_state, vec![]);
-        assert!(is_epoch_boundary(epoch_block.header.height));
-        assert_oracle_matches(&epoch_state, &epoch_block, 123_456);
-    }
-
-    fn assert_reference_and_candidate_sequences_match(
-        initial: ChainState,
-        mut make_next_block: impl FnMut(&ChainState, usize) -> BlockV1,
-        count: usize,
-    ) {
-        let mut reference = initial.clone();
-        let mut candidate = initial;
-        for index in 0..count {
-            let reference_block = make_next_block(&reference, index);
-            let candidate_block = reference_block.clone();
-            let reference_outcome =
-                clone_atomic_reference_apply_block(&reference, &reference_block, index as u64)
-                    .unwrap();
-            reference = reference_outcome.state;
-            apply_block(&mut candidate, &candidate_block, index as u64).unwrap();
-            assert_same_consensus_state(&candidate, &reference);
-        }
-    }
-
-    #[test]
-    fn state_txn_replay_determinism_normal_and_epoch_boundary_sequences() {
-        assert_reference_and_candidate_sequences_match(
-            ChainState::new_genesis(),
-            |state, _| make_block(state, vec![]),
-            5,
-        );
-
-        let mut epoch_initial = ChainState::new_genesis();
-        epoch_initial.height = EPOCH_DURATION_BLOCKS - 2;
-        assert_reference_and_candidate_sequences_match(
-            epoch_initial,
-            |state, _| make_block(state, vec![]),
-            3,
-        );
-    }
-
-    #[test]
     fn state_txn_replay_determinism_governance_phase_boundary_sequence() {
         let (mut initial, _, _, proposer_id, proposal_id) =
             governance_proposal_state(ProposalPhase::Deliberation);
@@ -4817,6 +2958,20 @@ mod tests {
         for target_epoch in 1..=4 {
             reference.height = target_epoch * EPOCH_DURATION_BLOCKS - 1;
             candidate.height = reference.height;
+            // This test exercises governance replay across phase boundaries,
+            // not inactivity slashing. Keep both replay states observably active
+            // through the closing epoch so snapshot construction remains valid.
+            let validator_ids: Vec<_> = reference
+                .validators
+                .active_validators()
+                .map(|validator| validator.validator_id)
+                .collect();
+            for validator_id in validator_ids {
+                reference.validators.get_mut(&validator_id).unwrap().last_active_epoch =
+                    target_epoch - 1;
+                candidate.validators.get_mut(&validator_id).unwrap().last_active_epoch =
+                    target_epoch - 1;
+            }
             let block = make_block(&reference, vec![]);
             if target_epoch == 2 {
                 let vote_nonce = Bytes32::from([0xC2; 32]);
@@ -4875,7 +3030,7 @@ mod tests {
 
     #[test]
     fn state_txn_replay_determinism_rejected_block_then_valid_block() {
-        let mut reference = ChainState::new_genesis();
+        let mut reference = canonical_test_genesis();
         let mut candidate = reference.clone();
         let mut bad_block = make_block(&reference, vec![]);
         bad_block.header.prev_hash = Bytes32::from([0xEE; 32]);
@@ -4899,7 +3054,7 @@ mod tests {
         use std::time::Instant;
 
         fn realistic_state(staked_bonds: usize) -> ChainState {
-            let mut state = ChainState::new_genesis();
+            let mut state = canonical_test_genesis();
             let validator_id = Bytes32::from([0x55; 32]);
             let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
             let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
@@ -4933,7 +3088,7 @@ mod tests {
                         amount_spark: 1_000,
                         bonded_epoch: 0,
                         unbonding_end_epoch: None,
-                        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
+                        unbonding_start_height: None,
                         custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                             Bytes32::from([0x66; 32]),
                         ),
@@ -4975,347 +3130,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "realistic production/reproposal projection benchmark; run explicitly with --ignored --nocapture"]
-    fn project_block_for_roots_realistic_projection_benchmark() {
-        use std::time::Instant;
-
-        fn realistic_state(staked_bonds: usize) -> ChainState {
-            let mut state = ChainState::new_genesis();
-            let validator_id = Bytes32::from([0x75; 32]);
-            let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
-            let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
-            for index in 0..staked_bonds {
-                let mut id_bytes = [0u8; 32];
-                for (dst, src) in id_bytes
-                    .iter_mut()
-                    .zip((index as u64).to_le_bytes().into_iter())
-                {
-                    *dst = src;
-                }
-                let utxo_id = Bytes32::from(id_bytes);
-                let output = OutputV1 {
-                    value_spark: 1_000,
-                    commitment: CommitmentV1 {
-                        compressed_point: Bytes32::from([0x77; 32]),
-                    },
-                    owner_pubkey: HybridPubKey {
-                        classical_pk: Bytes32::from([0x88; 32]),
-                        pq_pk: pq_pk.clone(),
-                    },
-                    range_proof: range_proof.clone(),
-                    lock_height: 0,
-                };
-                state.staked_bonds.insert(
-                    utxo_id,
-                    StakeBondEntry {
-                        utxo_id,
-                        validator_id,
-                        delegator_id: Bytes32::from([0x66; 32]),
-                        amount_spark: 1_000,
-                        bonded_epoch: 0,
-                        unbonding_end_epoch: None,
-                        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                        custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                            Bytes32::from([0x66; 32]),
-                        ),
-                        original_output: output.into(),
-                    },
-                );
-            }
-            state
-        }
-
-        for size in [100_000usize, 1_000_000usize] {
-            let mut state = realistic_state(size);
-            let block = make_block(&state, vec![]);
-
-            let start = Instant::now();
-            let mut clone_projection = state.clone();
-            apply_block(&mut clone_projection, &block, 0).unwrap();
-            let state_root = crate::state_root::compute_state_root(&clone_projection);
-            let validator_set_root =
-                crate::state_root::compute_validator_set_root(&clone_projection);
-            let mut clone_projected_block = block.clone();
-            clone_projected_block.header.state_root = state_root;
-            clone_projected_block.header.validator_set_root = validator_set_root;
-            let clone_value_hash =
-                clone_projected_block.compute_value_hash(clone_projection.total_supply);
-            let clone_projection_elapsed = start.elapsed();
-
-            let start = Instant::now();
-            let projected = project_block_for_roots(&mut state, &block, 0).unwrap();
-            let rollback_projection_elapsed = start.elapsed();
-
-            assert_eq!(projected.state_root, state_root);
-            assert_eq!(projected.validator_set_root, validator_set_root);
-            assert_eq!(projected.value_hash, clone_value_hash);
-            println!(
-                "project_block_for_roots_realistic_projection size={size} clone_based_projection={clone_projection_elapsed:?} rollback_projection={rollback_projection_elapsed:?}"
-            );
-        }
-    }
-
-    fn max_cap_stress_state_and_block() -> (ChainState, BlockV1) {
-        let mut state = ChainState::new_genesis();
-
-        let (tx_owner_pubkey, tx_keypair) = make_test_keypair([0xD0; 32]);
-        let mut multi_inputs = Vec::new();
-        for index in 0..MAX_INPUTS {
-            let seed = 0x10u8.saturating_add(index as u8);
-            let value = TEST_INPUT_VALUE + seed as u64 + 10_000;
-            let utxo_id = state
-                .utxos
-                .insert(
-                    output_with_value(value, tx_owner_pubkey.clone(), seed),
-                    0,
-                    0,
-                    index as u32,
-                )
-                .unwrap();
-            multi_inputs.push((utxo_id, value, [seed; 32], Bytes32::from([seed; 32])));
-        }
-        let mut transactions = vec![make_multi_io_tx(
-            &state,
-            &tx_keypair,
-            &multi_inputs,
-            MAX_OUTPUTS,
-        )];
-        for index in 1..MAX_TX_PER_BLOCK {
-            let seed = 0x30u8.wrapping_add(index as u8);
-            let value = TEST_INPUT_VALUE + seed as u64 + 10_000;
-            let utxo_id = state
-                .utxos
-                .insert(
-                    output_with_value(value, tx_owner_pubkey.clone(), seed),
-                    0,
-                    1,
-                    index as u32,
-                )
-                .unwrap();
-            transactions.push(make_tx(
-                &state,
-                &tx_keypair,
-                utxo_id,
-                value,
-                [seed; 32],
-                Bytes32::from([seed.wrapping_add(1); 32]),
-            ));
-        }
-        assert_eq!(transactions.len(), MAX_TX_PER_BLOCK);
-        assert_eq!(transactions[0].inputs.len(), MAX_INPUTS);
-        assert_eq!(transactions[0].outputs.len(), MAX_OUTPUTS);
-
-        let mut staking_ops = Vec::new();
-        for index in 0..MAX_STAKING_OPS_PER_BLOCK {
-            let seed = [0xE0u8.wrapping_add(index as u8); 32];
-            let (op, _) = signed_register_validator_op(&mut state, seed, 1);
-            staking_ops.push(op);
-        }
-        assert_eq!(staking_ops.len(), MAX_STAKING_OPS_PER_BLOCK);
-
-        let (proposer_pubkey, proposer_keypair, proposer_id) =
-            install_governance_validator(&mut state, [0xA1; 32], 100_000);
-        let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
-        let proposal_id = compute_proposal_id(proposer_id, &action, 0, DEFAULT_CHAIN_ID);
-        let mut proposal = test_proposal_record(
-            proposal_id,
-            proposer_id,
-            proposer_pubkey,
-            action,
-            ProposalPhase::Commit,
-        );
-        let mut weights = BTreeMap::from([(proposer_id, 100_000)]);
-        let mut governance_signers = vec![(proposer_id, proposer_keypair)];
-        for index in 1..MAX_GOV_OPS_PER_BLOCK {
-            let (_, keypair, validator_id) =
-                install_governance_validator(&mut state, [0xA1u8 + index as u8; 32], 100_000);
-            weights.insert(validator_id, 100_000);
-            governance_signers.push((validator_id, keypair));
-        }
-        proposal.snapshot1 = Some(GovernanceSnapshot {
-            weights,
-            total_stake: 100_000 * MAX_GOV_OPS_PER_BLOCK as u64,
-        });
-        state.governance.proposals.insert(proposal_id, proposal);
-        let governance_ops = governance_signers
-            .iter()
-            .enumerate()
-            .map(|(index, (validator_id, keypair))| {
-                governance_commit_op(
-                    *validator_id,
-                    keypair,
-                    proposal_id,
-                    Bytes32::from([0xB0u8.wrapping_add(index as u8); 32]),
-                    1,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(governance_ops.len(), MAX_GOV_OPS_PER_BLOCK);
-
-        let mut slashing_evidence = Vec::new();
-        for index in 0..MAX_SLASHES_PER_BLOCK {
-            let (slash_state, validator_id, keypair) =
-                slash_validator_state([0xC0u8.wrapping_add(index as u8); 32], 100_000);
-            let validator = slash_state.validators.get(&validator_id).unwrap().clone();
-            state.validators.upsert(validator).unwrap();
-            slashing_evidence.push(slash_evidence(&keypair, validator_id, VoteStep::Precommit));
-        }
-        assert_eq!(slashing_evidence.len(), MAX_SLASHES_PER_BLOCK);
-
-        let mut block = make_block(&state, transactions);
-        block.staking_ops = staking_ops;
-        block.governance_ops = governance_ops;
-        block.slashing_evidence = slashing_evidence;
-
-        (state, block)
-    }
-
-    #[test]
-    #[ignore = "max-cap block validation timing guard; run explicitly with --release --ignored --nocapture"]
-    fn max_cap_block_apply_release_timing_guard() {
-        use std::time::{Duration, Instant};
-
-        const RELEASE_APPLY_LIMIT: Duration = Duration::from_secs(4);
-
-        if cfg!(debug_assertions) {
-            eprintln!(
-                "max_cap_block_apply_release_timing_guard skipped: run with `cargo test -p indra-state max_cap_block_apply_release_timing_guard --release -- --ignored --nocapture`. Debug builds are expected to be dramatically slower and must not be interpreted as release-regression evidence."
-            );
-            return;
-        }
-
-        // This fixture intentionally mirrors the max-cap StateTxn stress case:
-        // 200 transactions total, including one 16-input/16-output transaction,
-        // plus 10 staking ops, 5 governance ops, and 3 slash evidence entries.
-        //
-        // This guard is meaningful only for optimized validator-style builds.
-        // In debug mode, the same crypto-heavy validation path has measured
-        // roughly 14x slower during this session; debug timing is useful for
-        // local profiling only, not for deployment-risk conclusions.
-        //
-        // The 4s limit is deliberately below the 6s target block time while
-        // leaving broad headroom over the current ~1.3s release measurement on
-        // the development Mac. If this trips in release mode, re-check hardware
-        // and load first, then treat a repeatable failure as a real regression.
-        let (state, block) = max_cap_stress_state_and_block();
-        let start = Instant::now();
-        let mut applied = state.clone();
-        apply_block(&mut applied, &block, 0).unwrap();
-        let elapsed = start.elapsed();
-        println!(
-            "max_cap_block_apply_release_timing_guard elapsed={elapsed:?} limit={RELEASE_APPLY_LIMIT:?} txs={} max_inputs={} max_outputs={} staking_ops={} governance_ops={} slashes={}",
-            MAX_TX_PER_BLOCK,
-            MAX_INPUTS,
-            MAX_OUTPUTS,
-            MAX_STAKING_OPS_PER_BLOCK,
-            MAX_GOV_OPS_PER_BLOCK,
-            MAX_SLASHES_PER_BLOCK,
-        );
-        assert!(
-            elapsed < RELEASE_APPLY_LIMIT,
-            "max-cap block apply took {elapsed:?}, exceeding release guard {RELEASE_APPLY_LIMIT:?}"
-        );
-    }
-
-    #[test]
-    #[ignore = "max-cap StateTxn stress benchmark; run explicitly with --ignored --nocapture"]
-    fn state_txn_stress_max_op_caps_applies_and_rolls_back() {
-        use std::time::Instant;
-
-        let (state, block) = max_cap_stress_state_and_block();
-
-        let time_apply_case = |label: &str, block: &BlockV1| {
-            let start = Instant::now();
-            let mut candidate = state.clone();
-            apply_block(&mut candidate, block, 0).unwrap();
-            let elapsed = start.elapsed();
-            println!("state_txn_max_cap_component {label}={elapsed:?}");
-            elapsed
-        };
-        let tx_only = make_block(&state, block.transactions.clone());
-        let mut staking_only = make_block(&state, vec![]);
-        staking_only.staking_ops = block.staking_ops.clone();
-        let mut governance_only = make_block(&state, vec![]);
-        governance_only.governance_ops = block.governance_ops.clone();
-        let mut slash_only = make_block(&state, vec![]);
-        slash_only.slashing_evidence = block.slashing_evidence.clone();
-        let start = Instant::now();
-        let mut seen_tx_hashes: HashSet<Vec<u8>> = HashSet::new();
-        let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
-        let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
-        for tx in &tx_only.transactions {
-            assert!(seen_tx_hashes.insert(tx.encode_to_vec()));
-            validate_transaction(
-                &state,
-                tx,
-                &state.chain_id,
-                &mut block_nullifiers,
-                &mut block_input_utxos,
-                tx_only.header.height,
-            )
-            .unwrap();
-        }
-        let tx_validation_only_elapsed = start.elapsed();
-        let tx_input_count = tx_only
-            .transactions
-            .iter()
-            .map(|tx| tx.inputs.len())
-            .sum::<usize>();
-        let tx_output_count = tx_only
-            .transactions
-            .iter()
-            .map(|tx| tx.outputs.len())
-            .sum::<usize>();
-        println!(
-            "state_txn_max_cap_component tx_validation_only={tx_validation_only_elapsed:?} tx_inputs={tx_input_count} tx_outputs={tx_output_count}"
-        );
-        let tx_only_elapsed = time_apply_case("tx_only", &tx_only);
-        let staking_only_elapsed = time_apply_case("staking_only", &staking_only);
-        let governance_only_elapsed = time_apply_case("governance_only", &governance_only);
-        let slash_only_elapsed = time_apply_case("slash_only", &slash_only);
-
-        crate::txn::reset_timing();
-        crate::txn::set_fail_after_mutation(None);
-        let start = Instant::now();
-        let mut applied = state.clone();
-        apply_block(&mut applied, &block, 0).unwrap();
-        let apply_elapsed = start.elapsed();
-        let apply_txn_timing = crate::txn::timing();
-
-        let mutation_count = crate::txn::mutation_count();
-        let fail_after = mutation_count.max(1);
-        crate::txn::set_fail_after_mutation(Some(fail_after));
-        crate::txn::reset_timing();
-        let start = Instant::now();
-        let mut rolled_back = state.clone();
-        let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
-        let rollback_elapsed = start.elapsed();
-        let rollback_txn_timing = crate::txn::timing();
-        assert!(err
-            .to_string()
-            .contains("state transaction failpoint injected after mutation"));
-        assert_same_consensus_state(&rolled_back, &state);
-        crate::txn::set_fail_after_mutation(None);
-
-        println!(
-            "state_txn_max_cap_stress txs={} max_inputs={} max_outputs={} staking_ops={} governance_ops={} slashes={} mutation_count={} fail_after={} apply={apply_elapsed:?} rollback={rollback_elapsed:?} apply_undo_recording={:?} rollback_undo_recording={:?} rollback_only={:?} components=(tx_only:{tx_only_elapsed:?}, staking_only:{staking_only_elapsed:?}, governance_only:{governance_only_elapsed:?}, slash_only:{slash_only_elapsed:?})",
-            MAX_TX_PER_BLOCK,
-            MAX_INPUTS,
-            MAX_OUTPUTS,
-            MAX_STAKING_OPS_PER_BLOCK,
-            MAX_GOV_OPS_PER_BLOCK,
-            MAX_SLASHES_PER_BLOCK,
-            mutation_count,
-            fail_after,
-            apply_txn_timing.undo_recording,
-            rollback_txn_timing.undo_recording,
-            rollback_txn_timing.rollback,
-        );
-    }
-
-    #[test]
     fn block_protocol_version_validation_is_strict_allow_list() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.protocol_version = ProtocolVersion(999);
 
@@ -5328,59 +3144,9 @@ mod tests {
     }
 
     #[test]
-    fn boundary_governance_epoch_switches_only_at_context_gate() {
-        let context = crate::epoch::EpochTransitionContext::new(300, 299).unwrap();
-        assert_eq!(
-            governance_operation_epoch_at_gate(300, Some(&context), 301),
-            1,
-            "legacy attribution remains the numerically opening epoch"
-        );
-        assert_eq!(
-            governance_operation_epoch_at_gate(300, Some(&context), 300),
-            0,
-            "post-gate boundary operations belong to the closing epoch"
-        );
-
-        let mut state = ChainState::new_genesis();
-        state.governance.params.proposal_deposit_spark = 1_000;
-        let (pubkey, keypair, validator_id) =
-            install_governance_validator(&mut state, [0xA6; 32], 100_000);
-        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
-        let deposit = state
-            .utxos
-            .insert(governance_deposit_output(pubkey.clone(), 1_000), 299, 0, 0)
-            .unwrap();
-        let op = governance_propose_op(
-            validator_id,
-            &keypair,
-            pubkey,
-            deposit,
-            1,
-            GovernableAction::SetMinDelegationSpark { value: 100_000 },
-        );
-        let chain_id = state.chain_id.clone();
-        apply_governance_op(
-            &mut state,
-            &op,
-            governance_operation_epoch_at_gate(300, Some(&context), 300),
-            300,
-            &chain_id,
-        )
-        .unwrap();
-        let proposal = state.governance.proposals.values().next().unwrap();
-        assert_eq!(proposal.proposed_epoch, context.closing_epoch);
-        assert_eq!(
-            proposal.commit_start_epoch,
-            context
-                .closing_epoch
-                .saturating_add(GOVERNANCE_DELIBERATION_EPOCHS)
-        );
-    }
-
-    #[test]
     fn boundary_qc_activity_uses_certified_parent_epoch_post_gate() {
         let validator_id = Bytes32::from([0xA7; 32]);
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         state
             .validators
             .upsert(ValidatorEntry {
@@ -5406,7 +3172,6 @@ mod tests {
                 cold_hybrid_classical_pk: None,
                 cold_hybrid_pq_pk: None,
                 cold_key_version: 0,
-                cold_key_status: ColdKeyStatus::Unenrolled,
                 cold_nonce: 0,
             })
             .unwrap();
@@ -5452,77 +3217,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_height_precision_protocol_transition_rejects_stale_version_and_replays() {
-        fn state_before_inert_gate() -> ChainState {
-            let mut state = ChainState::new_genesis();
-            let (_, _, validator_id) =
-                install_governance_validator(&mut state, [0xD3; 32], MINIMUM_VALIDATOR_BOND_SPARK);
-            let validator = state.validators.get_mut(&validator_id).unwrap();
-            validator.vrf_pk = Some(indra_crypto::VrfKeypair::from_seed(&[0xD3; 32]).public_key());
-            validator.cold_hybrid_classical_pk = validator.hybrid_classical_pk;
-            validator.cold_hybrid_pq_pk = Some(
-                validator
-                    .hybrid_pq_pk
-                    .as_deref()
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-            );
-            validator.cold_key_version = 1;
-            validator.cold_key_status = ColdKeyStatus::Active;
-            let snapshot = state
-                .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
-                .unwrap();
-            state.consensus_snapshots.push(snapshot);
-            state.height = u64::MAX - 2;
-            state.tip_hash = Bytes32::from([0xD2; 32]);
-            state
-        }
-
-        fn replay(mut state: ChainState) -> ChainState {
-            let pre_gate = make_block_at_height(&state, vec![], u64::MAX - 1, 1_900_000_000);
-            assert_eq!(
-                pre_gate.header.protocol_version,
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET)
-            );
-            apply_block(&mut state, &pre_gate, 0).unwrap();
-
-            let post_gate = make_block_at_height(&state, vec![], u64::MAX, 1_900_000_001);
-            assert_eq!(
-                post_gate.header.protocol_version,
-                ProtocolVersion(
-                    indra_core::types::primitives::BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
-                )
-            );
-
-            let mut rejected = state.clone();
-            let mut stale_version = post_gate.clone();
-            stale_version.header.protocol_version =
-                ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT);
-            assert_eq!(
-                apply_block(&mut rejected, &stale_version, 0),
-                Err(StateError::UnsupportedVersion {
-                    version: BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
-                })
-            );
-            assert_same_consensus_state(&rejected, &state);
-
-            apply_block(&mut state, &post_gate, 0).unwrap();
-            assert_eq!(state.height, u64::MAX);
-            assert_eq!(state.consensus_snapshots.len(), 1);
-            assert_eq!(state.consensus_snapshots[0].activation_height, u64::MAX);
-            state
-        }
-
-        let initial = state_before_inert_gate();
-        let replay_a = replay(initial.clone());
-        let replay_b = replay(initial);
-        assert_same_consensus_state(&replay_a, &replay_b);
-    }
-
-    #[test]
     fn apply_block_rejects_too_many_staking_ops() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let (op, _) = signed_register_validator_op(&mut state, [0x41; 32], 1);
         let mut block = make_block(&state, vec![]);
         block.staking_ops = vec![op; MAX_STAKING_OPS_PER_BLOCK + 1];
@@ -5539,26 +3235,25 @@ mod tests {
 
     #[test]
     fn apply_block_with_staking_ops_atomicity() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let (op, validator_id) = signed_register_validator_op(&mut state, [0x42; 32], 1);
         let original = state.clone();
         let mut block = make_block(&state, vec![]);
         block.staking_ops = vec![op.clone(), op];
 
-        assert!(matches!(
-            apply_block(&mut state, &block, 0),
-            Err(StateError::StakingNonceInvalid { .. })
-        ));
+        assert!(apply_block(&mut state, &block, 0).is_err());
         assert_eq!(state, original);
         assert!(state.validators.get(&validator_id).is_none());
     }
 
     #[test]
     fn staking_nonces_committed_to_state_root() {
-        let mut a = ChainState::new_genesis();
-        let mut b = ChainState::new_genesis();
+        let mut a = canonical_test_genesis();
+        let mut b = canonical_test_genesis();
         a.staking_nonces.insert(Bytes32::from([0xAA; 32]), 1);
         b.staking_nonces.insert(Bytes32::from([0xAA; 32]), 2);
+        a.rebuild_state_commitment_v2(a.height);
+        b.rebuild_state_commitment_v2(b.height);
 
         assert_ne!(
             crate::state_root::compute_state_root(&a),
@@ -5568,8 +3263,8 @@ mod tests {
 
     #[test]
     fn staked_bonds_in_state_root() {
-        let mut a = ChainState::new_genesis();
-        let mut b = ChainState::new_genesis();
+        let mut a = canonical_test_genesis();
+        let mut b = canonical_test_genesis();
         let (delegator_pubkey, _) = make_test_keypair([0x77; 32]);
         let delegator_id = pubkey_to_id_for_test(&delegator_pubkey);
         let validator_id = Bytes32::from([0x66; 32]);
@@ -5584,7 +3279,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
+                unbonding_start_height: None,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
@@ -5600,13 +3295,15 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 1,
                 unbonding_end_epoch: None,
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
+                unbonding_start_height: None,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
                 original_output: output.into(),
             },
         );
+        a.rebuild_state_commitment_v2(a.height);
+        b.rebuild_state_commitment_v2(b.height);
 
         assert_ne!(
             crate::state_root::compute_state_root(&a),
@@ -5616,7 +3313,7 @@ mod tests {
 
     #[test]
     fn apply_empty_block_advances_height() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
@@ -5640,9 +3337,6 @@ mod tests {
         // The production gate is intentionally inert, so invoke the same
         // ungated rotation primitive to inspect the accepted post-transition
         // state selected by this realistic boundary.
-        state
-            .rotate_consensus_snapshot_after_boundary(EPOCH_DURATION_BLOCKS)
-            .unwrap();
         let snapshot = state.consensus_snapshots.last().unwrap();
         let final_active: Vec<_> = state
             .validators
@@ -5686,7 +3380,7 @@ mod tests {
 
     #[test]
     fn apply_block_empty_and_nonempty_fast_paths_replay_deterministically() {
-        let mut initial = ChainState::new_genesis();
+        let mut initial = canonical_test_genesis();
         let (register_op, _validator_id) =
             signed_register_validator_op(&mut initial, [0x91; 32], 1);
 
@@ -5702,7 +3396,7 @@ mod tests {
         let mut block2 = make_block(&continuous, vec![]);
         block2.staking_ops = vec![register_op];
         apply_block(&mut continuous, &block2, 0).unwrap();
-        assert_eq!(continuous.validators.len(), 1);
+        assert_eq!(continuous.validators.len(), 2);
         continuous_roots.push(crate::state_root::compute_state_root(&continuous));
         blocks.push(block2);
 
@@ -5724,7 +3418,7 @@ mod tests {
 
     #[test]
     fn apply_block_nonempty_governance_shadow_still_rejects_invalid_op_before_real_apply() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.governance_ops = vec![GovernanceOpV2 {
             action_type: GovernanceActionType::ExecuteProposal,
@@ -5752,7 +3446,7 @@ mod tests {
 
     #[test]
     fn apply_block_success_at_epoch_boundary_commits_all_changes() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         state.height = EPOCH_DURATION_BLOCKS - 1;
         let block = make_block(&state, vec![]);
         let expected_hash = block.header.block_hash();
@@ -5766,7 +3460,7 @@ mod tests {
 
     #[test]
     fn apply_block_epoch_transition_failure_leaves_state_unchanged() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         state.height = EPOCH_DURATION_BLOCKS - 1;
         let (owner_pubkey, _) = make_test_keypair([0x62; 32]);
         let validator_id = Bytes32::from([0x63; 32]);
@@ -5776,29 +3470,24 @@ mod tests {
             .utxos
             .insert(output.clone(), EPOCH_DURATION_BLOCKS, STAKING_TX_IDX, 1)
             .unwrap();
-        state.staked_bonds.insert(
+        let mut bond = StakeBondEntry::new(
             bond_id,
-            StakeBondEntry {
-                utxo_id: bond_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: 1_000_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: Some(epoch_for_height(EPOCH_DURATION_BLOCKS)),
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: output.into(),
-            },
+            validator_id,
+            validator_id,
+            1_000_000,
+            0,
+            output,
+            1,
         );
+        bond.unbonding_end_epoch = Some(epoch_for_height(EPOCH_DURATION_BLOCKS));
+        state.staked_bonds.insert(bond_id, bond);
         let original = state.clone();
         let block = make_block(&state, vec![]);
 
         assert_eq!(
             apply_block(&mut state, &block, 0),
             Err(StateError::InvariantViolation {
-                message: "UTXO ID collision in staking bond release",
+                message: "stake bond release owner pubkey is unresolvable",
             })
         );
         assert_eq!(
@@ -5809,7 +3498,7 @@ mod tests {
 
     #[test]
     fn apply_block_updates_tip_hash() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let block = make_block(&state, vec![]);
         let expected_hash = block.header.block_hash();
         apply_block(&mut state, &block, 0).unwrap();
@@ -5863,7 +3552,7 @@ mod tests {
 
     #[test]
     fn apply_block_with_delegate_removes_utxo() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let (delegator_pubkey, keypair) = make_test_keypair([0x71; 32]);
         let output = dummy_output(0x08, delegator_pubkey.clone());
         let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
@@ -5929,7 +3618,7 @@ mod tests {
 
     #[test]
     fn wrong_height_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.height = 99; // wrong
         assert!(matches!(
@@ -5943,7 +3632,7 @@ mod tests {
 
     #[test]
     fn wrong_prev_hash_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.prev_hash = Bytes32::from([0xFFu8; 32]); // wrong
         assert_eq!(
@@ -5958,7 +3647,7 @@ mod tests {
 
     #[test]
     fn wrong_base_fee_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.base_fee = 9999; // wrong
         assert!(matches!(
@@ -5969,7 +3658,7 @@ mod tests {
 
     #[test]
     fn unknown_utxo_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let fake_utxo = Bytes32::from([0xDEu8; 32]);
         let nullifier = Bytes32::from([0xADu8; 32]);
         let (_, keypair) = make_test_keypair([0x22; 32]);
@@ -6033,7 +3722,7 @@ mod tests {
 
     #[test]
     fn state_unchanged_on_error() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let height_before = state.height;
         let supply_before = state.total_supply;
         let utxos_before = state.utxos.len();
@@ -6074,7 +3763,7 @@ mod tests {
 
     #[test]
     fn locked_utxo_rejected_before_unlock() {
-        let mut state = ChainState::new_genesis();
+        let mut state = canonical_test_genesis();
         let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
         let mut output = dummy_output(0x01, owner_pubkey);
         output.lock_height = 100; // locked until height 100
@@ -6254,18 +3943,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_slash_double_precommit_reduces_stake_5pct() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x81; 32], 1_000_000);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            950_000
-        );
-    }
-
-    #[test]
     fn membership_proven_slash_uses_bootstrap_snapshot_and_historical_keys() {
         let (mut state, validator_id, keypair) = slash_validator_state([0xD1; 32], 1_000_000);
         state.height = u64::MAX - 1;
@@ -6273,6 +3950,10 @@ mod tests {
             .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
             .unwrap();
         let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
+        state.slash_membership_roots = vec![indra_core::types::slash_membership::SlashMembershipRootRecord {
+            activation_height: snapshot.activation_height,
+            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(&snapshot).unwrap(),
+        }];
         state.consensus_snapshots = vec![snapshot];
         let evidence = SlashEvidenceV2 {
             validator_id,
@@ -6329,6 +4010,10 @@ mod tests {
             .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
             .unwrap();
         let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
+        state.slash_membership_roots = vec![indra_core::types::slash_membership::SlashMembershipRootRecord {
+            activation_height: snapshot.activation_height,
+            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(&snapshot).unwrap(),
+        }];
         state.consensus_snapshots = vec![snapshot];
         let evidence = SlashEvidenceV2 {
             validator_id,
@@ -6467,181 +4152,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_slash_rejects_prevote_conflict() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x82; 32], 1_000_000);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Prevote);
-        let chain_id = state.chain_id.clone();
-        assert!(matches!(
-            apply_slash(&mut state, &evidence, &chain_id),
-            Err(StateError::InvalidSlashEvidence { .. })
-        ));
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            1_000_000
-        );
-    }
-
-    #[test]
-    fn apply_slash_rejects_duplicate_evidence() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x83; 32], 1_000_000);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(
-            apply_slash(&mut state, &evidence, &chain_id),
-            Err(StateError::SlashAlreadyApplied)
-        );
-    }
-
-    #[test]
-    fn apply_slash_rejects_invalid_vote_signature() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x84; 32], 1_000_000);
-        let mut evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        evidence.vote_2.signature.classical_sig = VariableBytes::from_slice(&[0x42; 64]).unwrap();
-        let chain_id = state.chain_id.clone();
-        assert!(matches!(
-            apply_slash(&mut state, &evidence, &chain_id),
-            Err(StateError::InvalidSlashEvidence { .. })
-        ));
-    }
-
-    #[test]
-    fn apply_slash_rejects_nil_votes() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x85; 32], 1_000_000);
-        let evidence = SlashEvidenceV1 {
-            validator_id,
-            vote_1: signed_vote(
-                &keypair,
-                validator_id,
-                7,
-                0,
-                VoteStep::Precommit,
-                Bytes32::ZERO,
-            ),
-            vote_2: signed_vote(
-                &keypair,
-                validator_id,
-                7,
-                0,
-                VoteStep::Precommit,
-                Bytes32::from([0xBB; 32]),
-            ),
-        };
-        let chain_id = state.chain_id.clone();
-        assert!(matches!(
-            apply_slash(&mut state, &evidence, &chain_id),
-            Err(StateError::InvalidSlashEvidence { .. })
-        ));
-    }
-
-    #[test]
-    fn apply_slash_rejects_same_block_hash() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x86; 32], 1_000_000);
-        let hash = Bytes32::from([0xAA; 32]);
-        let evidence = SlashEvidenceV1 {
-            validator_id,
-            vote_1: signed_vote(&keypair, validator_id, 7, 0, VoteStep::Precommit, hash),
-            vote_2: signed_vote(&keypair, validator_id, 7, 0, VoteStep::Precommit, hash),
-        };
-        let chain_id = state.chain_id.clone();
-        assert!(matches!(
-            apply_slash(&mut state, &evidence, &chain_id),
-            Err(StateError::InvalidSlashEvidence { .. })
-        ));
-    }
-
-    #[test]
-    fn apply_slash_rejects_already_slashed_validator() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x87; 32], 1_000_000);
-        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Slashed;
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        assert!(matches!(
-            apply_slash(&mut state, &evidence, &chain_id),
-            Err(StateError::InvalidSlashEvidence { .. })
-        ));
-    }
-
-    #[test]
-    fn apply_slash_burns_stake_reduces_total_supply() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x88; 32], 1_000_000);
-        let before = state.total_supply;
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(state.total_supply, before - 50_000);
-    }
-
-    #[test]
-    fn slash_without_reporter_burns_full_amount() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x89; 32], 1_000_000);
-        let supply_before = state.total_supply;
-        let treasury_before = state.treasury_balance;
-        let utxo_count_before = state.utxos.len();
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(state.total_supply, supply_before - 50_000);
-        assert_eq!(state.treasury_balance, treasury_before);
-        assert_eq!(state.utxos.len(), utxo_count_before);
-    }
-
-    #[test]
-    fn slash_reporter_identity_recovered_without_vrf_verify() {
-        let mut state = ChainState::new_genesis();
-        let proposer_id = Bytes32::from([0xA9; 32]);
-        let other_id = Bytes32::from([0xB9; 32]);
-        state
-            .validators
-            .upsert(active_validator(proposer_id))
-            .unwrap();
-        state.validators.upsert(active_validator(other_id)).unwrap();
-
-        let mut block = make_block(&state, vec![]);
-        block.header.proposer_vrf_output = Bytes32::from([0x4D; 32]);
-        block.header.proposer_vrf_proof = VariableBytes::from_slice(&[]).unwrap();
-        block.header.election_result_hash = Some(
-            VrfElectionResult {
-                height: block.header.height,
-                round: block.header.proposer_round,
-                elected_validator_id: proposer_id,
-                elected_vrf_output: block.header.proposer_vrf_output,
-                fallback_used: false,
-                reveal_set_commitment: Bytes32::ZERO,
-            }
-            .hash(),
-        );
-
-        assert_eq!(
-            slash_reporter_validator_id_for_block(&state, &block),
-            Some(proposer_id),
-            "commit-reveal reporter identity must come from QC-attested election_result_hash, not live VRF proof verification"
-        );
-    }
-
-    #[test]
-    fn slash_reporter_identity_no_match_returns_none() {
-        let mut state = ChainState::new_genesis();
-        state
-            .validators
-            .upsert(active_validator(Bytes32::from([0xC1; 32])))
-            .unwrap();
-        state
-            .validators
-            .upsert(active_validator(Bytes32::from([0xC2; 32])))
-            .unwrap();
-
-        let mut block = make_block(&state, vec![]);
-        block.header.proposer_vrf_output = Bytes32::from([0x4E; 32]);
-        block.header.election_result_hash = Some(Bytes32::from([0xEE; 32]));
-
-        assert_eq!(slash_reporter_validator_id_for_block(&state, &block), None);
-    }
-
-    #[test]
     fn slash_reporter_identity_multiple_match_returns_none() {
         let proposer_id = Bytes32::from([0xD1; 32]);
-        let state = ChainState::new_genesis();
+        let state = canonical_test_genesis();
         let mut block = make_block(&state, vec![]);
         block.header.proposer_vrf_output = Bytes32::from([0x4F; 32]);
         block.header.election_result_hash = Some(
@@ -6664,167 +4177,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reporter_authority_survives_live_registry_removal_and_pays_reward() {
-        let (mut state, accused_id, accused_keypair) =
-            slash_validator_state([0xD2; 32], 10_000_000);
-        let (reporter_public, _) = make_test_keypair([0xD3; 32]);
-        let reporter_id = Bytes32::from(indra_crypto::sha256(&reporter_public.classical_pk.0));
-        let mut reporter = active_validator(reporter_id);
-        reporter.hybrid_classical_pk = Some(reporter_public.classical_pk.0);
-        reporter.hybrid_pq_pk = Some(reporter_public.pq_pk.as_slice().to_vec());
-        reporter.vrf_pk = Some(indra_crypto::VrfKeypair::from_seed(&[0xD4; 32]).public_key());
-        state.validators.upsert(reporter).unwrap();
-        state.consensus_snapshots = vec![state.build_consensus_snapshot(1, 0).unwrap()];
-        state.validators.remove(&reporter_id);
-
-        let mut block = make_block(&state, vec![]);
-        block.header.proposer_vrf_output = Bytes32::from([0x51; 32]);
-        block.header.election_result_hash = Some(
-            VrfElectionResult {
-                height: block.header.height,
-                round: block.header.proposer_round,
-                elected_validator_id: reporter_id,
-                elected_vrf_output: block.header.proposer_vrf_output,
-                fallback_used: false,
-                reveal_set_commitment: Bytes32::ZERO,
-            }
-            .hash(),
-        );
-
-        let resolved = slash_reporter_pubkey_for_block_at_gate(&state, &block, 1)
-            .unwrap()
-            .expect("snapshot-authorized reporter");
-        assert_eq!(resolved, reporter_public);
-
-        let evidence = slash_evidence(&accused_keypair, accused_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        let replay_initial = state.clone();
-        let accounting = apply_slash_at_height_with_accounting(
-            &mut state,
-            &evidence,
-            &chain_id,
-            block.header.height,
-            Some(&resolved),
-        )
-        .unwrap();
-        assert!(accounting.reporter_reward > 0);
-        assert!(state.utxos.all_entries().any(|entry| {
-            entry.output.value_spark == accounting.reporter_reward
-                && entry.output.owner_pubkey == reporter_public
-        }));
-        let mut replay = replay_initial;
-        let replay_reporter = slash_reporter_pubkey_for_block_at_gate(&replay, &block, 1)
-            .unwrap()
-            .expect("snapshot-authorized reporter during replay");
-        let replay_accounting = apply_slash_at_height_with_accounting(
-            &mut replay,
-            &evidence,
-            &chain_id,
-            block.header.height,
-            Some(&replay_reporter),
-        )
-        .unwrap();
-        assert_eq!(replay_accounting, accounting);
-        assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
-        assert_eq!(
-            crate::compute_state_root(&replay),
-            crate::compute_state_root(&state)
-        );
-    }
-
-    #[test]
-    fn snapshot_reporter_lookup_fails_closed_and_legacy_path_is_unchanged() {
-        let mut state = ChainState::new_genesis();
-        let (proposer_public, _) = make_test_keypair([0xD5; 32]);
-        let proposer_id = Bytes32::from(indra_crypto::sha256(&proposer_public.classical_pk.0));
-        let mut proposer = active_validator(proposer_id);
-        proposer.hybrid_classical_pk = Some(proposer_public.classical_pk.0);
-        proposer.hybrid_pq_pk = Some(proposer_public.pq_pk.as_slice().to_vec());
-        state.validators.upsert(proposer).unwrap();
-        let mut block = make_block(&state, vec![]);
-        block.header.proposer_vrf_output = Bytes32::from([0x52; 32]);
-        block.header.election_result_hash = Some(
-            VrfElectionResult {
-                height: block.header.height,
-                round: block.header.proposer_round,
-                elected_validator_id: proposer_id,
-                elected_vrf_output: block.header.proposer_vrf_output,
-                fallback_used: false,
-                reveal_set_commitment: Bytes32::ZERO,
-            }
-            .hash(),
-        );
-
-        assert!(matches!(
-            slash_reporter_pubkey_for_block_at_gate(&state, &block, 1),
-            Err(StateError::InvalidConsensusSnapshot(_))
-        ));
-        assert_eq!(
-            slash_reporter_pubkey_for_block_at_gate(&state, &block, 2).unwrap(),
-            Some(proposer_public),
-            "legacy live reporter identity and payout-key behavior must remain unchanged"
-        );
-    }
-
-    #[test]
-    fn slash_reporter_reward_is_50_percent() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x97; 32], 10_000_000);
-        let (reporter_pubkey, _) = make_test_keypair([0xA1; 32]);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        let supply_before = state.total_supply;
-
-        let accounting = apply_slash_at_height_with_accounting(
-            &mut state,
-            &evidence,
-            &chain_id,
-            9,
-            Some(&reporter_pubkey),
-        )
-        .unwrap();
-
-        assert_eq!(accounting.slash_amount, 500_000);
-        assert_eq!(accounting.reporter_reward, 250_000);
-        assert_eq!(accounting.burned, 250_000);
-        assert_eq!(state.total_supply, supply_before - 250_000);
-    }
-
-    #[test]
-    fn slash_creates_utxo_for_reporter() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x98; 32], 10_000_000);
-        let (reporter_pubkey, _) = make_test_keypair([0xA2; 32]);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let evidence_hash = compute_slash_evidence_hash(&evidence);
-        let blinding = derive_slash_reward_blinding(&evidence_hash, 9);
-        let chain_id = state.chain_id.clone();
-
-        apply_slash_at_height(&mut state, &evidence, &chain_id, 9, Some(&reporter_pubkey)).unwrap();
-
-        let reward = state
-            .utxos
-            .all_entries()
-            .find(|entry| {
-                entry.created_height == 9
-                    && entry.output.owner_pubkey == reporter_pubkey
-                    && entry.output.value_spark == 250_000
-            })
-            .expect("reporter reward UTXO must exist");
-        assert!(indra_crypto::verify_opening(
-            &PedersenCommitment(reward.output.commitment.compressed_point.0),
-            &PedersenOpening {
-                value: 250_000,
-                blinding,
-            }
-        )
-        .is_ok());
-        assert!(indra_crypto::verify_range(
-            &reward.output.commitment.compressed_point.0,
-            reward.output.range_proof.as_slice(),
-        )
-        .is_ok());
-    }
-
-    #[test]
     fn slash_reward_utxo_blinding_is_deterministic() {
         let hash = Bytes32::from([0xC7; 32]);
         assert_eq!(
@@ -6835,405 +4187,5 @@ mod tests {
             derive_slash_reward_blinding(&hash, 123),
             derive_slash_reward_blinding(&hash, 124)
         );
-    }
-
-    #[test]
-    fn slash_reward_below_dust_limit_burns_entirely() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x99; 32], 1_000_000);
-        let (reporter_pubkey, _) = make_test_keypair([0xA3; 32]);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        let supply_before = state.total_supply;
-        let utxo_count_before = state.utxos.len();
-
-        let accounting = apply_slash_at_height_with_accounting(
-            &mut state,
-            &evidence,
-            &chain_id,
-            9,
-            Some(&reporter_pubkey),
-        )
-        .unwrap();
-
-        assert_eq!(accounting.slash_amount, 50_000);
-        assert_eq!(accounting.reporter_reward, 0);
-        assert_eq!(accounting.burned, 50_000);
-        assert_eq!(state.total_supply, supply_before - 50_000);
-        assert_eq!(state.utxos.len(), utxo_count_before);
-    }
-
-    #[test]
-    fn treasury_no_longer_receives_slash_reporter_reward() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x9A; 32], 10_000_000);
-        let (reporter_pubkey, _) = make_test_keypair([0xA4; 32]);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        let treasury_before = state.treasury_balance;
-
-        apply_slash_at_height(&mut state, &evidence, &chain_id, 9, Some(&reporter_pubkey)).unwrap();
-
-        assert_eq!(state.treasury_balance, treasury_before);
-    }
-
-    #[test]
-    fn total_supply_invariant_after_slash_with_reporter() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x9B; 32], 10_000_000);
-        let (reporter_pubkey, _) = make_test_keypair([0xA5; 32]);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        let supply_before = state.total_supply;
-        let treasury_before = state.treasury_balance;
-
-        let accounting = apply_slash_at_height_with_accounting(
-            &mut state,
-            &evidence,
-            &chain_id,
-            9,
-            Some(&reporter_pubkey),
-        )
-        .unwrap();
-
-        assert_eq!(
-            accounting.slash_amount,
-            accounting.burned + accounting.reporter_reward
-        );
-        assert_eq!(state.total_supply, supply_before - accounting.burned);
-        assert_eq!(state.treasury_balance, treasury_before);
-        let reporter_utxo_total: u64 = state
-            .utxos
-            .all_entries()
-            .filter(|entry| entry.output.owner_pubkey == reporter_pubkey)
-            .map(|entry| entry.output.value_spark)
-            .sum();
-        assert_eq!(reporter_utxo_total, accounting.reporter_reward);
-    }
-
-    #[test]
-    fn apply_slash_reduces_staked_bonds_proportionally() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x8A; 32], 1_000_000);
-        let bond_id = Bytes32::from([0xB1; 32]);
-        let (owner, _) = make_test_keypair([0x91; 32]);
-        state.staked_bonds.insert(
-            bond_id,
-            StakeBondEntry {
-                utxo_id: bond_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: 200_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: dummy_output(0x20, owner).into(),
-            },
-        );
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(
-            state.staked_bonds.get(&bond_id).unwrap().amount_spark,
-            190_000
-        );
-    }
-
-    #[test]
-    fn apply_slash_leaves_delegator_bond_accounting_unchanged() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x8B; 32], 1_000_000);
-        let delegator_id = Bytes32::from([0xD2; 32]);
-        let bond_id = Bytes32::from([0xB2; 32]);
-        let (owner, _) = make_test_keypair([0x92; 32]);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 200_000, 0)
-            .unwrap();
-        state.staked_bonds.insert(
-            bond_id,
-            StakeBondEntry {
-                utxo_id: bond_id,
-                validator_id,
-                delegator_id,
-                amount_spark: 200_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    delegator_id,
-                ),
-                original_output: dummy_output(0x21, owner).into(),
-            },
-        );
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash(&mut state, &evidence, &chain_id).unwrap();
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .staked_spark,
-            200_000
-        );
-    }
-
-    #[test]
-    fn self_unstake_before_slash_evidence_does_not_reduce_slash_amount() {
-        let original_bond = 1_000_000u64;
-        let (mut state, validator_id, keypair) = slash_validator_state([0x8F; 32], 0);
-        let bond_id = Bytes32::from([0xC1; 32]);
-        let (owner, _) = make_test_keypair([0x93; 32]);
-        state.staked_bonds.insert(
-            bond_id,
-            StakeBondEntry {
-                utxo_id: bond_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: original_bond,
-                bonded_epoch: 0,
-                unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: output_with_value(original_bond, owner, 0x22).into(),
-            },
-        );
-
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash_at_height(
-            &mut state,
-            &evidence,
-            &chain_id,
-            EPOCH_DURATION_BLOCKS + 1,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(
-            state.staked_bonds.get(&bond_id).unwrap().amount_spark,
-            950_000,
-            "unbonding self-bond must remain slashable for pre-unbonding equivocation"
-        );
-        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 50_000);
-    }
-
-    #[test]
-    fn height_precise_same_epoch_unstake_after_infraction_is_monetarily_slashed() {
-        let original_bond = 1_000_000u64;
-        let (mut state, validator_id, keypair) = slash_validator_state([0xA1; 32], 0);
-        let bond_id = Bytes32::from([0xD1; 32]);
-        let (owner, _) = make_test_keypair([0xA2; 32]);
-        state.staked_bonds.insert(
-            bond_id,
-            StakeBondEntry {
-                utxo_id: bond_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: original_bond,
-                bonded_epoch: 0,
-                unbonding_end_epoch: Some(UNBONDING_PERIOD_EPOCHS),
-                unbonding_precision: StakeBondUnbondingPrecision::HeightPrecise {
-                    unbonding_start_height: Some(8),
-                },
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: output_with_value(original_bond, owner, 0x31).into(),
-            },
-        );
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash_at_height(&mut state, &evidence, &chain_id, 9, None).unwrap();
-        assert_eq!(
-            state.staked_bonds.get(&bond_id).unwrap().amount_spark,
-            950_000
-        );
-    }
-
-    #[test]
-    fn slash_predicate_uses_height_for_precise_bonds_and_epoch_for_legacy_bonds() {
-        let (owner, _) = make_test_keypair([0xA3; 32]);
-        let base = StakeBondEntry {
-            utxo_id: Bytes32::from([0xD2; 32]),
-            validator_id: Bytes32::from([0xA4; 32]),
-            delegator_id: Bytes32::from([0xA4; 32]),
-            amount_spark: 1_000,
-            bonded_epoch: 0,
-            unbonding_end_epoch: Some(UNBONDING_PERIOD_EPOCHS),
-            unbonding_precision: StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: Some(7),
-            },
-            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                Bytes32::from([0xA4; 32]),
-            ),
-            original_output: output_with_value(1_000, owner, 0x32).into(),
-        };
-        assert!(!self_bond_is_slashable_at_height(&base, 8).unwrap());
-
-        let mut exact = base.clone();
-        exact.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
-            unbonding_start_height: Some(8),
-        };
-        assert!(self_bond_is_slashable_at_height(&exact, 8).unwrap());
-
-        let mut legacy_same_epoch = base.clone();
-        legacy_same_epoch.unbonding_precision = StakeBondUnbondingPrecision::LegacyEpochOnly;
-        assert!(self_bond_is_slashable_at_height(&legacy_same_epoch, 8).unwrap());
-
-        let later_epoch_height = EPOCH_DURATION_BLOCKS + 7;
-        let mut later_precise = base.clone();
-        later_precise.unbonding_end_epoch = Some(1 + UNBONDING_PERIOD_EPOCHS);
-        later_precise.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
-            unbonding_start_height: Some(later_epoch_height),
-        };
-        assert!(self_bond_is_slashable_at_height(&later_precise, 8).unwrap());
-        let mut later_legacy = later_precise.clone();
-        later_legacy.unbonding_precision = StakeBondUnbondingPrecision::LegacyEpochOnly;
-        assert!(self_bond_is_slashable_at_height(&later_legacy, 8).unwrap());
-
-        let infraction_in_epoch_one = EPOCH_DURATION_BLOCKS + 7;
-        assert!(!self_bond_is_slashable_at_height(&base, infraction_in_epoch_one).unwrap());
-        assert!(
-            !self_bond_is_slashable_at_height(&legacy_same_epoch, infraction_in_epoch_one).unwrap()
-        );
-    }
-
-    #[test]
-    fn self_unstake_after_evidence_window_is_not_slashable() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x90; 32], 1_000_000);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        let too_late_height =
-            (SLASH_EVIDENCE_WINDOW_EPOCHS + 1).saturating_mul(EPOCH_DURATION_BLOCKS);
-
-        assert!(matches!(
-            apply_slash_at_height(&mut state, &evidence, &chain_id, too_late_height, None),
-            Err(StateError::InvalidSlashEvidence { reason })
-                if reason.contains("outside evidence window")
-        ));
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            1_000_000
-        );
-    }
-
-    #[test]
-    fn slash_covers_both_active_and_unbonding_bonds_within_window() {
-        let active_bond = 600_000u64;
-        let unbonding_bond = 400_000u64;
-        let (mut state, validator_id, keypair) = slash_validator_state([0x91; 32], active_bond);
-        let active_bond_id = Bytes32::from([0xC2; 32]);
-        let unbonding_bond_id = Bytes32::from([0xC3; 32]);
-        let (owner_active, _) = make_test_keypair([0x94; 32]);
-        let (owner_unbonding, _) = make_test_keypair([0x95; 32]);
-        state.staked_bonds.insert(
-            active_bond_id,
-            StakeBondEntry {
-                utxo_id: active_bond_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: active_bond,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: output_with_value(active_bond, owner_active, 0x23).into(),
-            },
-        );
-        state.staked_bonds.insert(
-            unbonding_bond_id,
-            StakeBondEntry {
-                utxo_id: unbonding_bond_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: unbonding_bond,
-                bonded_epoch: 0,
-                unbonding_end_epoch: Some(1 + UNBONDING_PERIOD_EPOCHS),
-                unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: output_with_value(unbonding_bond, owner_unbonding, 0x24).into(),
-            },
-        );
-
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let chain_id = state.chain_id.clone();
-        apply_slash_at_height(
-            &mut state,
-            &evidence,
-            &chain_id,
-            EPOCH_DURATION_BLOCKS + 1,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&active_bond_id)
-                .unwrap()
-                .amount_spark,
-            570_000
-        );
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&unbonding_bond_id)
-                .unwrap()
-                .amount_spark,
-            380_000
-        );
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            570_000,
-            "active stake should track only the active bond slash"
-        );
-        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK - 50_000);
-    }
-
-    #[test]
-    fn apply_block_with_slash_evidence_full_flow() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x8C; 32], 1_000_000);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let mut block = make_block(&state, vec![]);
-        block.slashing_evidence = vec![evidence.clone()];
-        apply_block(&mut state, &block, 0).unwrap();
-        assert!(state
-            .applied_slash_hashes
-            .contains(&compute_slash_evidence_hash(&evidence)));
-        assert!(matches!(
-            state.validators.get(&validator_id).unwrap().status,
-            ValidatorStatus::Slashed
-        ));
-    }
-
-    #[test]
-    fn apply_block_rejects_duplicate_slash_in_same_block() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x8D; 32], 1_000_000);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        let mut block = make_block(&state, vec![]);
-        block.slashing_evidence = vec![evidence.clone(), evidence];
-        assert_eq!(
-            apply_block(&mut state, &block, 0),
-            Err(StateError::DuplicateSlashEvidence)
-        );
-    }
-
-    #[test]
-    fn applied_slash_hashes_change_state_root() {
-        let (mut state, validator_id, keypair) = slash_validator_state([0x8E; 32], 1_000_000);
-        let before = crate::state_root::compute_state_root(&state);
-        let evidence = slash_evidence(&keypair, validator_id, VoteStep::Precommit);
-        state
-            .applied_slash_hashes
-            .insert(compute_slash_evidence_hash(&evidence));
-        assert_ne!(before, crate::state_root::compute_state_root(&state));
     }
 }

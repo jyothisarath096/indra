@@ -13,15 +13,16 @@ use indra_core::types::{
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
         MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES,
+        MINIMUM_VALIDATOR_BOND_SPARK,
         TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
 use indra_crypto::{
     commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
-    PaymentBlindingNoteV1, PqKeypair,
+    PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
 };
-use indra_state::{apply_block, ChainState, StateError};
+use indra_state::{apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus};
 use rand::{rngs::StdRng, SeedableRng};
 
 fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
@@ -36,6 +37,43 @@ fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
         },
         keypair,
     )
+}
+
+fn finalized_genesis() -> ChainState {
+    let mut state = ChainState::new_genesis();
+    let seed = [0xF0; 32];
+    let (public, _) = keypair(seed);
+    let validator_id = Bytes32::from(sha256(&public.classical_pk.0));
+    state
+        .validators
+        .upsert(ValidatorEntry {
+            validator_id,
+            name: "audit-fixture-validator".into(),
+            hybrid_classical_pk: Some(public.classical_pk.0),
+            hybrid_pq_pk: Some(public.pq_pk.as_slice().to_vec()),
+            vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+            stake_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: 0,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: 1,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: Some(public.classical_pk.0),
+            cold_hybrid_pq_pk: Some(public.pq_pk.as_slice().try_into().unwrap()),
+            cold_key_version: 1,
+            cold_nonce: 0,
+        })
+        .unwrap();
+    state.finalize_genesis().unwrap();
+    state
 }
 
 fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> HybridSignature {
@@ -195,7 +233,6 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
         },
         transactions,
         slashing_evidence: vec![],
-        slashing_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],
@@ -355,7 +392,7 @@ fn t02_duplicate_utxo_spend_within_single_transaction_inputs_is_rejected() {
 
 #[test]
 fn legitimate_single_spend_still_works_after_duplicate_utxo_fix() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (owner_pubkey, owner_keypair) = keypair([0x44; 32]);
     let input_value = 10_000_000_000u64;
     let input_blinding = [0x13; 32];

@@ -14,11 +14,9 @@ use indra_core::types::slash_membership::{
     compute_slash_membership_root, SlashMembershipRootRecord, MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
 };
 
-use indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT;
 use indra_core::types::primitives::{
-    consensus_snapshot_active, Bytes32, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
-    GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES,
-    MAX_DELEGATION_RETURN_EVENTS,
+    Bytes32, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
+    INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
 };
 
 use crate::{
@@ -208,30 +206,19 @@ impl Encode for ChainState {
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
         encode_delegation_return_events(&self.delegation_return_events, buf);
-        let retired_present = !self.retired_cold_classical_components.is_empty()
-            || !self.retired_cold_pq_components.is_empty();
-        let snapshot_present = consensus_snapshot_active(self.height);
-        if !self.delegator_identities.is_empty() || retired_present || snapshot_present {
-            encode_delegator_identity_registry(&self.delegator_identities, buf);
+        encode_delegator_identity_registry(&self.delegator_identities, buf);
+        encode_retired_cold_components(
+            &self.retired_cold_classical_components,
+            &self.retired_cold_pq_components,
+            buf,
+        );
+        encode_list(&self.consensus_snapshots, buf);
+        self.reward_economic_snapshot.is_some().encode(buf);
+        if let Some(snapshot) = &self.reward_economic_snapshot {
+            snapshot.encode(buf);
         }
-        if retired_present || snapshot_present {
-            encode_retired_cold_components(
-                &self.retired_cold_classical_components,
-                &self.retired_cold_pq_components,
-                buf,
-            );
-        }
-        if consensus_snapshot_active(self.height) {
-            encode_list(&self.consensus_snapshots, buf);
-            self.reward_economic_snapshot.is_some().encode(buf);
-            if let Some(snapshot) = &self.reward_economic_snapshot {
-                snapshot.encode(buf);
-            }
-        }
-        if indra_core::types::primitives::slash_membership_proof_active(self.height) {
-            encode_list(&self.slash_membership_roots, buf);
-            encode_tombstones(&self.evicted_validator_tombstones, buf);
-        }
+        encode_list(&self.slash_membership_roots, buf);
+        encode_tombstones(&self.evicted_validator_tombstones, buf);
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
     }
@@ -256,41 +243,20 @@ impl Encode for ChainState {
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
             + delegation_return_events_encoded_len(&self.delegation_return_events)
-            + if self.delegator_identities.is_empty()
-                && self.retired_cold_classical_components.is_empty()
-                && self.retired_cold_pq_components.is_empty()
-                && !consensus_snapshot_active(self.height)
-            {
-                0
-            } else {
-                delegator_identity_registry_encoded_len(&self.delegator_identities)
-            }
-            + if consensus_snapshot_active(self.height) {
-                8 + self.retired_cold_classical_components.len() * 32
-                    + self.retired_cold_pq_components.len() * indra_crypto::PQ_PK_BYTES
-            } else {
-                retired_cold_components_encoded_len(
-                    &self.retired_cold_classical_components,
-                    &self.retired_cold_pq_components,
-                )
-            }
-            + if consensus_snapshot_active(self.height) {
-                list_encoded_len(&self.consensus_snapshots)
-                    + 1
-                    + self
-                        .reward_economic_snapshot
-                        .as_ref()
-                        .map(Encode::encoded_len)
-                        .unwrap_or(0)
-            } else {
-                0
-            }
-            + if indra_core::types::primitives::slash_membership_proof_active(self.height) {
-                list_encoded_len(&self.slash_membership_roots)
-                    + tombstones_encoded_len(&self.evicted_validator_tombstones)
-            } else {
-                0
-            }
+            + delegator_identity_registry_encoded_len(&self.delegator_identities)
+            + retired_cold_components_encoded_len(
+                &self.retired_cold_classical_components,
+                &self.retired_cold_pq_components,
+            )
+            + list_encoded_len(&self.consensus_snapshots)
+            + 1
+            + self
+                .reward_economic_snapshot
+                .as_ref()
+                .map(Encode::encoded_len)
+                .unwrap_or(0)
+            + list_encoded_len(&self.slash_membership_roots)
+            + tombstones_encoded_len(&self.evicted_validator_tombstones)
     }
 }
 
@@ -329,19 +295,13 @@ impl Decode for ChainState {
         } else {
             (PersistentOrdSet::new(), PersistentOrdSet::new())
         };
-        let consensus_snapshots = if consensus_snapshot_active(height) {
+        let consensus_snapshots = {
             let snapshots = decode_list(r, 2, "chain_state.consensus_snapshots")?;
             validate_consensus_snapshot_collection(&snapshots, height)?;
             snapshots
-        } else {
-            Vec::new()
         };
-        let reward_economic_snapshot = if consensus_snapshot_active(height) {
-            if bool::decode(r)? {
-                Some(RewardEconomicSnapshot::decode(r)?)
-            } else {
-                None
-            }
+        let reward_economic_snapshot = if bool::decode(r)? {
+            Some(RewardEconomicSnapshot::decode(r)?)
         } else {
             None
         };
@@ -350,44 +310,29 @@ impl Decode for ChainState {
             reward_economic_snapshot.as_ref(),
             height,
         )?;
-        let slash_membership_roots =
-            if indra_core::types::primitives::slash_membership_proof_active(height) {
-                let roots = decode_list(
-                    r,
-                    MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
-                    "chain_state.slash_membership_roots",
-                )?;
-                validate_slash_membership_root_history(&roots, height)?;
-                for snapshot in &consensus_snapshots {
-                    if snapshot.activation_height
-                        >= indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
-                    {
-                        let record = roots
-                            .iter()
-                            .find(|record| record.activation_height == snapshot.activation_height)
-                            .ok_or_else(|| {
-                                IndraError::InvalidSlashMembershipProof(
-                                    "retained full snapshot has no matching membership root"
-                                        .to_string(),
-                                )
-                            })?;
-                        if compute_slash_membership_root(snapshot)? != record.membership_root {
-                            return Err(IndraError::InvalidSlashMembershipProof(
-                                "retained full snapshot membership root mismatch".to_string(),
-                            ));
-                        }
-                    }
-                }
-                roots
-            } else {
-                Vec::new()
-            };
+        let slash_membership_roots = decode_list(
+            r,
+            MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
+            "chain_state.slash_membership_roots",
+        )?;
+        validate_slash_membership_root_history(&slash_membership_roots, height)?;
+        for snapshot in &consensus_snapshots {
+            let record = slash_membership_roots
+                .iter()
+                .find(|record| record.activation_height == snapshot.activation_height)
+                .ok_or_else(|| {
+                    IndraError::InvalidSlashMembershipProof(
+                        "retained full snapshot has no matching membership root".to_string(),
+                    )
+                })?;
+            if compute_slash_membership_root(snapshot)? != record.membership_root {
+                return Err(IndraError::InvalidSlashMembershipProof(
+                    "retained full snapshot membership root mismatch".to_string(),
+                ));
+            }
+        }
         let evicted_validator_tombstones =
-            if indra_core::types::primitives::slash_membership_proof_active(height) {
-                decode_tombstones(r, &staked_bonds, &validators, height)?
-            } else {
-                PersistentOrdMap::new()
-            };
+            decode_tombstones(r, &staked_bonds, &validators, height)?;
         Ok(Self {
             chain_id,
             height,
@@ -485,13 +430,13 @@ impl ChainState {
             fee_reward_pool: u64::decode(r)?,
             utxos: UtxoSet::decode_legacy_at_height(r, height)?,
             nullifiers: NullifierSet::decode_at_height(r, height)?,
-            validators: ValidatorSet::decode_legacy(r, schema_version)?,
+            validators: ValidatorSet::decode(r)?,
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
             slash_membership_roots: Vec::new(),
             evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::decode_legacy(r)?,
-            staked_bonds: decode_bond_map_legacy(r)?,
+            staked_bonds: decode_bond_map(r)?,
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
             retired_cold_classical_components: PersistentOrdSet::new(),
@@ -550,9 +495,7 @@ impl ChainState {
 
     /// Ensure the derived StateCommitmentV2 cache exists at `height`.
     pub fn ensure_state_commitment_v2(&mut self, height: u64) {
-        let crossing_snapshot_gate =
-            consensus_snapshot_active(height) && !consensus_snapshot_active(self.height);
-        if self.state_commitment_v2.is_none() || crossing_snapshot_gate {
+        if self.state_commitment_v2.is_none() {
             self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
         }
     }
@@ -574,34 +517,17 @@ impl ChainState {
     /// Resolve the one authoritative snapshot for a governed consensus height.
     ///
     /// This is exactly the retained snapshot with the greatest activation
-    /// height not greater than `height`. Pre-gate callers receive an explicit
-    /// error and must remain on the separate legacy consensus path.
+    /// height not greater than `height`.
     pub fn snapshot_for_consensus_height(
         &self,
         height: u64,
     ) -> Result<&ConsensusSnapshot, crate::error::ConsensusSnapshotLookupError> {
-        self.snapshot_for_consensus_height_at_gate(height, CONSENSUS_SNAPSHOT_HEIGHT)
-    }
-
-    pub(crate) fn snapshot_for_consensus_height_at_gate(
-        &self,
-        height: u64,
-        gate_height: u64,
-    ) -> Result<&ConsensusSnapshot, crate::error::ConsensusSnapshotLookupError> {
-        use crate::error::ConsensusSnapshotLookupError;
-
-        if height < gate_height {
-            return Err(ConsensusSnapshotLookupError::PreGateHeight {
-                height,
-                gate_height,
-            });
-        }
         validate_retained_consensus_snapshots_for_lookup(&self.consensus_snapshots)?;
         self.consensus_snapshots
             .iter()
             .rev()
             .find(|snapshot| snapshot.activation_height <= height)
-            .ok_or(ConsensusSnapshotLookupError::NoSnapshotForHeight { height })
+            .ok_or(crate::error::ConsensusSnapshotLookupError::NoSnapshotForHeight { height })
     }
 
     /// Build the immutable snapshot selected by the current final registry state.
@@ -772,11 +698,8 @@ impl ChainState {
         Ok((consensus, economic))
     }
 
-    /// Install the genesis snapshot when the global gate is configured at height 1.
-    pub fn initialize_genesis_consensus_snapshot(&mut self) -> crate::error::StateResult<()> {
-        if !consensus_snapshot_active(1) {
-            return Ok(());
-        }
+    /// Finalize genesis authority after the validator set has been populated.
+    pub fn finalize_genesis(&mut self) -> crate::error::StateResult<()> {
         if self.height != 0 || !self.consensus_snapshots.is_empty() {
             return Err(crate::error::StateError::InvalidConsensusSnapshot(
                 "genesis snapshot initialization requires pristine height-zero snapshot state"
@@ -785,8 +708,15 @@ impl ChainState {
         }
         let snapshot = self.build_genesis_consensus_snapshot()?;
         let economic = self.build_reward_economic_snapshot(&snapshot)?;
+        let membership = SlashMembershipRootRecord {
+            activation_height: snapshot.activation_height,
+            membership_root: compute_slash_membership_root(&snapshot).map_err(|error| {
+                crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+            })?,
+        };
         self.install_consensus_snapshot(snapshot)?;
         self.reward_economic_snapshot = Some(economic);
+        self.append_slash_membership_root(membership)?;
         self.rebuild_state_commitment_v2(1);
         Ok(())
     }
@@ -804,14 +734,6 @@ impl ChainState {
                 "snapshot creation requires the fully applied epoch-boundary state".to_string(),
             ));
         }
-        let activation_height = boundary_height.checked_add(1).ok_or_else(|| {
-            crate::error::StateError::InvalidConsensusSnapshot(
-                "snapshot activation height overflow".to_string(),
-            )
-        })?;
-        if !consensus_snapshot_active(activation_height) {
-            return Ok(());
-        }
         self.rotate_consensus_snapshot_after_boundary(boundary_height)
     }
 
@@ -826,57 +748,17 @@ impl ChainState {
         })?;
         let snapshot = self.build_consensus_snapshot(activation_height, boundary_height)?;
         let economic = self.build_reward_economic_snapshot(&snapshot)?;
-        let membership_record = if activation_height
-            > indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT
-        {
-            Some(SlashMembershipRootRecord {
-                activation_height,
-                membership_root: compute_slash_membership_root(&snapshot).map_err(|error| {
-                    crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
-                })?,
-            })
-        } else {
-            None
-        };
-        self.install_consensus_snapshot(snapshot)?;
-        self.reward_economic_snapshot = Some(economic);
-        if let Some(record) = membership_record {
-            self.append_slash_membership_root(record)?;
-            self.prune_slash_membership_roots(boundary_height)?;
-        }
-        Ok(())
-    }
-
-    /// Insert the bootstrap root into block `G` post-state.
-    pub(crate) fn bootstrap_slash_membership_root(
-        &mut self,
-        height: u64,
-    ) -> crate::error::StateResult<()> {
-        use indra_core::types::primitives::hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT;
-        if height != SLASH_MEMBERSHIP_PROOF_HEIGHT {
-            return Ok(());
-        }
-        if !self.slash_membership_roots.is_empty() {
-            return Err(crate::error::StateError::InvalidConsensusSnapshot(
-                "slash membership bootstrap requires empty root history".to_string(),
-            ));
-        }
-        let snapshot = self
-            .consensus_snapshots
-            .iter()
-            .find(|snapshot| snapshot.activation_height == height)
-            .ok_or_else(|| {
-                crate::error::StateError::InvalidConsensusSnapshot(
-                    "slash membership bootstrap snapshot is missing".to_string(),
-                )
-            })?;
-        let record = SlashMembershipRootRecord {
-            activation_height: height,
-            membership_root: compute_slash_membership_root(snapshot).map_err(|error| {
+        let membership_record = SlashMembershipRootRecord {
+            activation_height,
+            membership_root: compute_slash_membership_root(&snapshot).map_err(|error| {
                 crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
             })?,
         };
-        self.append_slash_membership_root(record)
+        self.install_consensus_snapshot(snapshot)?;
+        self.reward_economic_snapshot = Some(economic);
+        self.append_slash_membership_root(membership_record)?;
+        self.prune_slash_membership_roots(boundary_height)?;
+        Ok(())
     }
 
     fn append_slash_membership_root(
@@ -1187,9 +1069,6 @@ fn validate_reward_economic_pairing(
     economic: Option<&RewardEconomicSnapshot>,
     height: u64,
 ) -> IndraResult<()> {
-    if !consensus_snapshot_active(height) {
-        return Ok(());
-    }
     let economic = economic.ok_or_else(|| {
         IndraError::InvalidRewardEconomicSnapshot(
             "post-gate state is missing its reward economic snapshot".to_string(),
@@ -1210,18 +1089,7 @@ fn validate_slash_membership_root_history(
     roots: &[SlashMembershipRootRecord],
     state_height: u64,
 ) -> IndraResult<()> {
-    use indra_core::types::primitives::{
-        hard_forks::SLASH_MEMBERSHIP_PROOF_HEIGHT, slash_membership_proof_active,
-        SLASH_EVIDENCE_WINDOW_EPOCHS,
-    };
-    if !slash_membership_proof_active(state_height) {
-        if !roots.is_empty() {
-            return Err(IndraError::InvalidSlashMembershipProof(
-                "pre-gate state contains slash membership roots".to_string(),
-            ));
-        }
-        return Ok(());
-    }
+    use indra_core::types::primitives::SLASH_EVIDENCE_WINDOW_EPOCHS;
     if roots.is_empty() {
         return Err(IndraError::InvalidSlashMembershipProof(
             "post-gate state is missing slash membership root history".to_string(),
@@ -1235,9 +1103,9 @@ fn validate_slash_membership_root_history(
         });
     }
     for (index, root) in roots.iter().enumerate() {
-        if root.activation_height < SLASH_MEMBERSHIP_PROOF_HEIGHT {
+        if root.activation_height == 0 {
             return Err(IndraError::InvalidSlashMembershipProof(
-                "root activation precedes slash membership gate".to_string(),
+                "root activation height must be nonzero".to_string(),
             ));
         }
         if index > 0
@@ -1427,29 +1295,6 @@ fn decode_bond_map(
     Ok(bonds)
 }
 
-fn decode_bond_map_legacy(
-    r: &mut ByteReader<'_>,
-) -> IndraResult<PersistentOrdMap<Bytes32, StakeBondEntry>> {
-    let count = u32::decode(r)? as usize;
-    validate_bond_map_count(count)?;
-    let mut bonds = PersistentOrdMap::new();
-    for _ in 0..count {
-        let key = Bytes32::decode(r)?;
-        let bond = StakeBondEntry::decode_legacy(r)?;
-        if key != bond.utxo_id {
-            return Err(IndraError::InvariantViolation {
-                message: "stake bond map key must match bond utxo_id",
-            });
-        }
-        if bonds.insert(key, bond).is_some() {
-            return Err(IndraError::DuplicateEntries {
-                field: "snapshot.staked_bonds",
-            });
-        }
-    }
-    Ok(bonds)
-}
-
 fn validate_bond_map_count(count: usize) -> IndraResult<()> {
     use indra_core::error::IndraError;
 
@@ -1570,11 +1415,7 @@ fn retired_cold_components_encoded_len(
     classical: &PersistentOrdSet<[u8; 32]>,
     pq: &PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
 ) -> usize {
-    if classical.is_empty() && pq.is_empty() {
-        0
-    } else {
-        8 + classical.len() * 32 + pq.len() * indra_crypto::PQ_PK_BYTES
-    }
+    8 + classical.len() * 32 + pq.len() * indra_crypto::PQ_PK_BYTES
 }
 
 fn decode_retired_cold_components(
@@ -1655,7 +1496,6 @@ mod tests {
             cold_hybrid_classical_pk: None,
             cold_hybrid_pq_pk: None,
             cold_key_version: 0,
-            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
             cold_nonce: 0,
         }
     }
@@ -1670,6 +1510,7 @@ mod tests {
             .validators
             .upsert(snapshot_validator(2, 21, 3_000_000_000))
             .unwrap();
+        state.finalize_genesis().unwrap();
         state
     }
 
@@ -1689,28 +1530,6 @@ mod tests {
         assert!(state.consensus_snapshots.is_empty());
     }
 
-    #[test]
-    fn pre_gate_chain_state_encoding_omits_eviction_tombstones_byte_identically() {
-        let mut baseline = ChainState::new_genesis();
-        baseline.height = u64::MAX - 1;
-        let mut with_inert_field = baseline.clone();
-        let validator_id = Bytes32::from([0xE0; 32]);
-        with_inert_field.evicted_validator_tombstones.insert(
-            validator_id,
-            crate::validator::EvictedValidatorTombstoneV1 {
-                validator_id,
-                eviction_height: u64::MAX - 2,
-                eviction_epoch: crate::epoch::epoch_for_height(u64::MAX - 2),
-                last_classical_vote_pk: [0xE1; 32],
-                last_pq_vote_pk: [0xE2; indra_crypto::PQ_PK_BYTES],
-                last_vrf_pk: [0xE3; 32],
-                cold_custody: None,
-                retained_bonds: Vec::new(),
-            },
-        );
-        assert_eq!(baseline.encode_to_vec(), with_inert_field.encode_to_vec());
-        assert_eq!(baseline.encoded_len(), with_inert_field.encoded_len());
-    }
 
     #[test]
     fn consensus_snapshot_storage_round_trips_with_exact_two_retained() {
@@ -1730,10 +1549,14 @@ mod tests {
         let bootstrap_economic = state.build_reward_economic_snapshot(&bootstrap).unwrap();
         state.consensus_snapshots = vec![state.consensus_snapshots[1].clone(), bootstrap.clone()];
         state.reward_economic_snapshot = Some(bootstrap_economic);
-        state.slash_membership_roots = vec![SlashMembershipRootRecord {
-            activation_height: u64::MAX,
-            membership_root: compute_slash_membership_root(&bootstrap).unwrap(),
-        }];
+        state.slash_membership_roots = state
+            .consensus_snapshots
+            .iter()
+            .map(|snapshot| SlashMembershipRootRecord {
+                activation_height: snapshot.activation_height,
+                membership_root: compute_slash_membership_root(snapshot).unwrap(),
+            })
+            .collect();
         let tombstone_keys = bootstrap.entries()[0].clone();
         let tombstone_id = Bytes32::from([0xE7; 32]);
         state.evicted_validator_tombstones.insert(
@@ -1751,6 +1574,7 @@ mod tests {
                 retained_bonds: Vec::new(),
             },
         );
+        state.rebuild_state_commitment_v2(u64::MAX);
 
         assert_eq!(state.consensus_snapshots.len(), 2);
         assert_eq!(state.consensus_snapshots[0].activation_height, 901);
@@ -1776,7 +1600,11 @@ mod tests {
             decoded.reward_economic_snapshot,
             state.reward_economic_snapshot
         );
-        assert_eq!(decoded, state);
+        assert_eq!(decoded.encode_to_vec(), bytes);
+        assert_eq!(
+            decoded.state_commitment_v2_root(u64::MAX),
+            state.state_commitment_v2_root(u64::MAX)
+        );
     }
 
     #[test]
@@ -1809,7 +1637,7 @@ mod tests {
         for height in [601, 700, 900] {
             assert_eq!(
                 state
-                    .snapshot_for_consensus_height_at_gate(height, 601)
+                    .snapshot_for_consensus_height(height)
                     .unwrap()
                     .activation_height,
                 601
@@ -1818,7 +1646,7 @@ mod tests {
         for height in [901, 1_000, u64::MAX] {
             assert_eq!(
                 state
-                    .snapshot_for_consensus_height_at_gate(height, 601)
+                    .snapshot_for_consensus_height(height)
                     .unwrap()
                     .activation_height,
                 901
@@ -1836,14 +1664,14 @@ mod tests {
 
         assert_eq!(
             state
-                .snapshot_for_consensus_height_at_gate(300, 1)
+                .snapshot_for_consensus_height(300)
                 .unwrap()
                 .activation_height,
             1
         );
         assert_eq!(
             state
-                .snapshot_for_consensus_height_at_gate(301, 1)
+                .snapshot_for_consensus_height(301)
                 .unwrap()
                 .activation_height,
             301
@@ -1862,7 +1690,7 @@ mod tests {
             .consensus_snapshots
             .push(duplicate.consensus_snapshots[0].clone());
         assert!(matches!(
-            duplicate.snapshot_for_consensus_height_at_gate(601, 601),
+            duplicate.snapshot_for_consensus_height(601),
             Err(ConsensusSnapshotLookupError::InvalidRetainedState { .. })
         ));
 
@@ -1870,14 +1698,18 @@ mod tests {
         uncovered
             .rotate_consensus_snapshot_after_boundary(900)
             .unwrap();
+        uncovered
+            .consensus_snapshots
+            .retain(|snapshot| snapshot.activation_height == 901);
         assert_eq!(
-            uncovered.snapshot_for_consensus_height_at_gate(601, 601),
+            uncovered.snapshot_for_consensus_height(601),
             Err(ConsensusSnapshotLookupError::NoSnapshotForHeight { height: 601 })
         );
 
-        let empty = snapshot_state();
+        let mut empty = snapshot_state();
+        empty.consensus_snapshots.clear();
         assert!(matches!(
-            empty.snapshot_for_consensus_height_at_gate(601, 601),
+            empty.snapshot_for_consensus_height(601),
             Err(ConsensusSnapshotLookupError::InvalidRetainedState { .. })
         ));
     }
@@ -1897,28 +1729,6 @@ mod tests {
         assert!(state.validators.active_count() > 0);
         // A populated live validator registry neither changes the error nor
         // appears anywhere in the lookup return type.
-    }
-
-    #[test]
-    fn snapshot_lookup_explicitly_rejects_pre_gate_heights() {
-        use crate::error::ConsensusSnapshotLookupError;
-
-        let mut state = snapshot_state();
-        state.rotate_consensus_snapshot_after_boundary(600).unwrap();
-        assert_eq!(
-            state.snapshot_for_consensus_height_at_gate(600, 601),
-            Err(ConsensusSnapshotLookupError::PreGateHeight {
-                height: 600,
-                gate_height: 601,
-            })
-        );
-        assert_eq!(
-            state.snapshot_for_consensus_height(0),
-            Err(ConsensusSnapshotLookupError::PreGateHeight {
-                height: 0,
-                gate_height: CONSENSUS_SNAPSHOT_HEIGHT,
-            })
-        );
     }
 
     #[test]
@@ -2087,46 +1897,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_gate_chain_state_bytes_and_roots_ignore_snapshot_field() {
-        let baseline = snapshot_state();
-        let mut with_staged_snapshot = baseline.clone();
-        with_staged_snapshot
-            .consensus_snapshots
-            .push(baseline.build_genesis_consensus_snapshot().unwrap());
-        with_staged_snapshot.reward_economic_snapshot = Some(
-            baseline
-                .build_reward_economic_snapshot(&with_staged_snapshot.consensus_snapshots[0])
-                .unwrap(),
-        );
-        with_staged_snapshot.slash_membership_roots = vec![SlashMembershipRootRecord {
-            activation_height: u64::MAX,
-            membership_root: Bytes32::from([0xCC; 32]),
-        }];
-
-        assert!(!consensus_snapshot_active(baseline.height));
-        assert_eq!(
-            baseline.encode_to_vec(),
-            with_staged_snapshot.encode_to_vec()
-        );
-        assert_eq!(
-            crate::state_root::compute_state_root(&baseline),
-            crate::state_root::compute_state_root(&with_staged_snapshot)
-        );
-        assert!(ChainState::decode_exact(&baseline.encode_to_vec())
-            .unwrap()
-            .consensus_snapshots
-            .is_empty());
-        assert!(ChainState::decode_exact(&baseline.encode_to_vec())
-            .unwrap()
-            .reward_economic_snapshot
-            .is_none());
-        assert!(ChainState::decode_exact(&baseline.encode_to_vec())
-            .unwrap()
-            .slash_membership_roots
-            .is_empty());
-    }
-
-    #[test]
     fn genesis_has_no_blocks() {
         assert!(!ChainState::new_genesis().has_blocks());
     }
@@ -2159,19 +1929,15 @@ mod tests {
     }
 
     fn test_bond(byte: u8) -> StakeBondEntry {
-        StakeBondEntry {
-            utxo_id: Bytes32::from([byte; 32]),
-            validator_id: Bytes32::from([0xA0 | byte; 32]),
-            delegator_id: Bytes32::from([0xD0 | byte; 32]),
-            amount_spark: 1_000_000,
-            bonded_epoch: 7,
-            unbonding_end_epoch: None,
-            unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
-            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                Bytes32::from([0xD0 | byte; 32]),
-            ),
-            original_output: test_output(byte).into(),
-        }
+        StakeBondEntry::new(
+            Bytes32::from([byte; 32]),
+            Bytes32::from([0xA0 | byte; 32]),
+            Bytes32::from([0xD0 | byte; 32]),
+            1_000_000,
+            7,
+            test_output(byte),
+            1,
+        )
     }
 
     fn encode_bond_map_btree(bonds: &BTreeMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
@@ -2284,162 +2050,6 @@ mod tests {
         assert_eq!(decoded, bonds);
     }
 
-    #[test]
-    fn mixed_legacy_and_height_precise_bond_map_checkpoint_round_trip_is_deterministic() {
-        let mut state = ChainState::new_genesis();
-        let legacy = StakeBondEntry::new_for_test_with_compact_activation(
-            Bytes32::from([0x21; 32]),
-            Bytes32::from([0xA1; 32]),
-            Bytes32::from([0xD1; 32]),
-            1_000_000,
-            7,
-            test_output(0x21),
-            9,
-            10,
-        );
-        let compact = StakeBondEntry::new_for_test_with_compact_activation(
-            Bytes32::from([0x22; 32]),
-            Bytes32::from([0xA2; 32]),
-            Bytes32::from([0xD2; 32]),
-            1_000_000,
-            8,
-            test_output(0x22),
-            10,
-            10,
-        );
-        let fully_compact = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
-            Bytes32::from([0x23; 32]),
-            Bytes32::from([0xA3; 32]),
-            Bytes32::from([0xD3; 32]),
-            1_000_000,
-            9,
-            test_output(0x23),
-            20,
-            10,
-            20,
-        );
-        let mut height_precise = StakeBondEntry::new_for_test_with_all_activations(
-            Bytes32::from([0x24; 32]),
-            Bytes32::from([0xA4; 32]),
-            Bytes32::from([0xD4; 32]),
-            1_000_000,
-            10,
-            test_output(0x24),
-            100,
-            10,
-            20,
-            100,
-        );
-        height_precise
-            .begin_unbonding(100, indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS)
-            .unwrap();
-        assert!(legacy.original_output.range_proof.is_some());
-        assert!(legacy.original_output.owner_pubkey.is_some());
-        assert!(compact.original_output.range_proof.is_none());
-        assert!(compact.original_output.owner_pubkey.is_some());
-        assert!(fully_compact.original_output.range_proof.is_none());
-        assert!(fully_compact.original_output.owner_pubkey.is_none());
-        state.staked_bonds.insert(legacy.utxo_id, legacy);
-        state.staked_bonds.insert(compact.utxo_id, compact);
-        state
-            .staked_bonds
-            .insert(fully_compact.utxo_id, fully_compact);
-        state
-            .staked_bonds
-            .insert(height_precise.utxo_id, height_precise);
-
-        let encoded = state.encode_to_vec();
-        let decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
-        let independently_decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
-        assert_eq!(decoded, state);
-        assert_eq!(independently_decoded.encode_to_vec(), encoded);
-        assert_eq!(
-            crate::state_root::compute_state_root(&decoded),
-            crate::state_root::compute_state_root(&state)
-        );
-        assert_eq!(
-            crate::state_commitment::StateCommitmentV2::from_state(&decoded, u64::MAX).root(),
-            crate::state_commitment::StateCommitmentV2::from_state(&state, u64::MAX).root()
-        );
-    }
-
-    #[test]
-    fn independent_bond_replays_across_height_precision_gate_are_byte_identical() {
-        fn replay() -> ChainState {
-            const TEST_GATE: u64 = 100;
-            let mut state = ChainState::new_genesis();
-            let legacy = StakeBondEntry::new_for_test_with_all_activations(
-                Bytes32::from([0x31; 32]),
-                Bytes32::from([0xA1; 32]),
-                Bytes32::from([0xD1; 32]),
-                1_000_000,
-                0,
-                test_output(0x31),
-                TEST_GATE - 1,
-                u64::MAX,
-                u64::MAX,
-                TEST_GATE,
-            );
-            let mut precise = StakeBondEntry::new_for_test_with_all_activations(
-                Bytes32::from([0x32; 32]),
-                Bytes32::from([0xA2; 32]),
-                Bytes32::from([0xD2; 32]),
-                1_000_000,
-                0,
-                test_output(0x32),
-                TEST_GATE,
-                u64::MAX,
-                u64::MAX,
-                TEST_GATE,
-            );
-            precise
-                .begin_unbonding(
-                    TEST_GATE + 1,
-                    indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS,
-                )
-                .unwrap();
-            state.staked_bonds.insert(legacy.utxo_id, legacy);
-            state.staked_bonds.insert(precise.utxo_id, precise);
-            state.height = TEST_GATE + 1;
-            state.rebuild_state_commitment_v2(state.height);
-            state
-        }
-
-        let first = replay();
-        let second = replay();
-        assert_eq!(first.encode_to_vec(), second.encode_to_vec());
-        assert_eq!(
-            crate::state_root::compute_state_root(&first),
-            crate::state_root::compute_state_root(&second)
-        );
-        assert_eq!(
-            first.state_commitment_v2_root(first.height),
-            second.state_commitment_v2_root(second.height)
-        );
-    }
-
-    #[test]
-    fn staked_bond_persistent_encoding_matches_legacy_btree_encoding() {
-        let mut legacy = BTreeMap::new();
-        let mut persistent = PersistentOrdMap::new();
-        for byte in [0x03, 0x01, 0x02] {
-            let bond = test_bond(byte);
-            legacy.insert(bond.utxo_id, bond.clone());
-            persistent.insert(bond.utxo_id, bond);
-        }
-
-        let mut legacy_bytes = Vec::new();
-        encode_bond_map_btree(&legacy, &mut legacy_bytes);
-        let mut persistent_bytes = Vec::new();
-        encode_bond_map(&persistent, &mut persistent_bytes);
-        assert_eq!(persistent_bytes, legacy_bytes);
-
-        let mut state = ChainState::new_genesis();
-        state.staked_bonds = persistent;
-        let encoded = state.encode_to_vec();
-        let decoded = ChainState::decode(&mut ByteReader::new(&encoded)).unwrap();
-        assert_eq!(decoded, state);
-    }
 
     #[test]
     fn staked_bond_persistent_encoding_is_insertion_order_independent() {
@@ -2646,43 +2256,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn empty_delegator_identity_registry_preserves_chain_state_encoding() {
-        let mut state = ChainState::new_genesis();
-        state.height = 42;
-        state.staking_nonces.insert(Bytes32::from([0x44; 32]), 7);
-        state.applied_slash_hashes.insert(Bytes32::from([0x55; 32]));
 
-        let old_bytes = encode_chain_state_without_delegator_identities(&state);
-        let new_bytes = state.encode_to_vec();
-        assert!(state.delegator_identities.is_empty());
-        assert_eq!(new_bytes, old_bytes);
-        assert_eq!(new_bytes.len(), state.encoded_len());
-
-        let decoded = ChainState::decode_exact(&old_bytes).unwrap();
-        assert_eq!(decoded, state);
-        assert!(decoded.delegator_identities.is_empty());
-    }
-
-    #[test]
-    fn chain_state_round_trips_optional_delegator_identity_registry_tail() {
-        let mut state = ChainState::new_genesis();
-        state
-            .delegator_identities
-            .insert(Bytes32::from([0xD2; 32]), test_hybrid_pubkey(0x12));
-        state
-            .delegator_identities
-            .insert(Bytes32::from([0xD1; 32]), test_hybrid_pubkey(0x11));
-
-        let without_registry = encode_chain_state_without_delegator_identities(&state);
-        let encoded = state.encode_to_vec();
-        assert!(encoded.len() > without_registry.len());
-        assert!(encoded.starts_with(&without_registry));
-        assert_eq!(encoded.len(), state.encoded_len());
-
-        let decoded = ChainState::decode_exact(&encoded).unwrap();
-        assert_eq!(decoded, state);
-    }
 
     #[test]
     fn applied_slash_hash_persistent_encoding_matches_legacy_hashset_encoding() {
@@ -2728,7 +2302,7 @@ mod tests {
 
     #[test]
     fn chain_state_migrated_clone_matches_deep_materialized_oracle() {
-        let mut state = ChainState::new_genesis();
+        let mut state = snapshot_state();
         state.height = 1;
         state.utxos.insert(test_output(0x11), 1, 0, 0).unwrap();
         state.nullifiers.insert(Bytes32::from([0x22; 32]));
@@ -2804,7 +2378,7 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
+                unbonding_start_height: None,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     delegator_id,
                 ),
@@ -2932,7 +2506,7 @@ mod tests {
                 amount_spark: 1_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
+                unbonding_start_height: None,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     id_from_index(index + 1_000_000),
                 ),

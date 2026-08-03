@@ -7,9 +7,9 @@ use indra_core::{
     codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
-        delegator_bond_accounting_active, Bytes32 as CoreBytes32,
-        COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-        SCHEMA_VERSION, SCHEMA_VERSION_GENESIS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        Bytes32 as CoreBytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
+        NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -567,13 +567,10 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let s = &state.chain;
     let tip = hex::encode(s.tip_hash.0);
     let active_validators = s.validators.active_count();
-    let total_staked_spark = s.validators.total_selectable_self_stake().saturating_add(
-        if delegator_bond_accounting_active(s.height) {
-            s.total_active_delegated_bond_stake()
-        } else {
-            s.delegations.total_staked()
-        },
-    );
+    let total_staked_spark = s
+        .validators
+        .total_selectable_self_stake()
+        .saturating_add(s.total_active_delegated_bond_stake());
     let max_active_validators =
         indra_core::types::primitives::max_active_validators(total_staked_spark);
     let effective_min_stake_spark = s
@@ -1680,7 +1677,7 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
     };
 
     Ok(format!(
-        r#"{{"validator_id":"{id}","name":"{name}","stake":{stake},"status":"{status}","epoch_joined":{epoch},"hybrid_classical_pk":"{classical_pk}","hybrid_pq_pk":"{pq_pk}","cold_hybrid_classical_pk":{cold_classical_pk},"cold_hybrid_pq_pk":{cold_pq_pk},"cold_key_version":{cold_version},"cold_key_status":"{cold_status}","cold_nonce":{cold_nonce}}}"#,
+        r#"{{"validator_id":"{id}","name":"{name}","stake":{stake},"status":"{status}","epoch_joined":{epoch},"hybrid_classical_pk":"{classical_pk}","hybrid_pq_pk":"{pq_pk}","cold_hybrid_classical_pk":{cold_classical_pk},"cold_hybrid_pq_pk":{cold_pq_pk},"cold_key_version":{cold_version},"cold_nonce":{cold_nonce}}}"#,
         id = id_hex,
         name = validator.name,
         stake = validator.stake_spark,
@@ -1704,10 +1701,6 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
             .map(|pk| format!(r#""{}""#, hex::encode(pk)))
             .unwrap_or_else(|| "null".to_string()),
         cold_version = validator.cold_key_version,
-        cold_status = match validator.cold_key_status {
-            indra_state::ColdKeyStatus::Unenrolled => "unenrolled",
-            indra_state::ColdKeyStatus::Active => "active",
-        },
         cold_nonce = validator.cold_nonce,
     ))
 }
@@ -1805,33 +1798,17 @@ fn get_delegations(params: &[String], state: &NodeState<'_>) -> RpcResult<String
         .map(|entry| {
             let (staked_spark, active_bonds, unbonding_bonds) =
                 rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
-            let precise = delegator_bond_accounting_active(state.chain.height);
-            let unbonding = if precise {
-                active_bonds == 0 && unbonding_bonds > 0
-            } else {
-                entry.unbonding_end_epoch.is_some()
-            };
-            if precise {
-                format!(
-                    r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-                    hex::encode(entry.delegator_id.0),
-                    staked_spark,
-                    entry.pending_rewards,
-                    if unbonding { "true" } else { "false" },
-                    entry.unbonding_end_epoch.unwrap_or(0),
-                    active_bonds,
-                    unbonding_bonds,
-                )
-            } else {
-                format!(
-                    r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{}}}"#,
-                    hex::encode(entry.delegator_id.0),
-                    entry.staked_spark,
-                    entry.pending_rewards,
-                    if entry.unbonding_end_epoch.is_some() { "true" } else { "false" },
-                    entry.unbonding_end_epoch.unwrap_or(0),
-                )
-            }
+            let unbonding = active_bonds == 0 && unbonding_bonds > 0;
+            format!(
+                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                hex::encode(entry.delegator_id.0),
+                staked_spark,
+                entry.pending_rewards,
+                if unbonding { "true" } else { "false" },
+                entry.unbonding_end_epoch.unwrap_or(0),
+                active_bonds,
+                unbonding_bonds,
+            )
         })
         .collect();
     let bonds: Vec<String> = state
@@ -1883,22 +1860,13 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 .unwrap_or_else(|| ("unknown".to_string(), 1_000));
             let (active_stake, active_bonds, unbonding_bonds) =
                 rpc_delegator_bond_status(state.chain, validator_id, &entry.delegator_id);
-            let precise = delegator_bond_accounting_active(state.chain.height);
-            let unbonding = if precise {
-                active_bonds == 0 && unbonding_bonds > 0
-            } else {
-                entry.unbonding_end_epoch.is_some()
-            };
+            let unbonding = active_bonds == 0 && unbonding_bonds > 0;
             let unbonding_end = entry
                 .unbonding_end_epoch
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "null".to_string());
 
-            total_staked = total_staked.saturating_add(if precise {
-                active_stake
-            } else {
-                entry.staked_spark
-            });
+            total_staked = total_staked.saturating_add(active_stake);
             total_rewards = total_rewards.saturating_add(entry.pending_rewards);
             if unbonding {
                 unbonding_positions = unbonding_positions.saturating_add(1);
@@ -1906,33 +1874,19 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 active_positions = active_positions.saturating_add(1);
             }
 
-            positions.push(if precise {
-                format!(
-                    r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-                    hex::encode(validator_id.0),
-                    validator_name,
-                    active_stake,
-                    entry.pending_rewards,
-                    entry.rewards_last_epoch,
-                    if unbonding { "true" } else { "false" },
-                    unbonding_end,
-                    commission_bps,
-                    active_bonds,
-                    unbonding_bonds,
-                )
-            } else {
-                format!(
-                    r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{}}}"#,
-                    hex::encode(validator_id.0),
-                    validator_name,
-                    entry.staked_spark,
-                    entry.pending_rewards,
-                    entry.rewards_last_epoch,
-                    if unbonding { "true" } else { "false" },
-                    unbonding_end,
-                    commission_bps,
-                )
-            });
+            positions.push(format!(
+                r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                hex::encode(validator_id.0),
+                validator_name,
+                active_stake,
+                entry.pending_rewards,
+                entry.rewards_last_epoch,
+                if unbonding { "true" } else { "false" },
+                unbonding_end,
+                commission_bps,
+                active_bonds,
+                unbonding_bonds,
+            ));
         }
     }
 
@@ -2092,45 +2046,24 @@ fn get_validator_delegators(params: &[String], state: &NodeState<'_>) -> RpcResu
     {
         let (active_stake, active_bonds, unbonding_bonds) =
             rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
-        let precise = delegator_bond_accounting_active(state.chain.height);
-        let unbonding = if precise {
-            active_bonds == 0 && unbonding_bonds > 0
-        } else {
-            entry.unbonding_end_epoch.is_some()
-        };
+        let unbonding = active_bonds == 0 && unbonding_bonds > 0;
         let unbonding_end = entry
             .unbonding_end_epoch
             .map(|epoch| epoch.to_string())
             .unwrap_or_else(|| "null".to_string());
-        total_delegated = total_delegated.saturating_add(if precise {
-            active_stake
-        } else {
-            entry.staked_spark
-        });
+        total_delegated = total_delegated.saturating_add(active_stake);
         total_rewards = total_rewards.saturating_add(entry.pending_rewards);
-        delegators.push(if precise {
-            format!(
-                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-                hex::encode(entry.delegator_id.0),
-                active_stake,
-                entry.pending_rewards,
-                if unbonding { "true" } else { "false" },
-                unbonding_end,
-                entry.rewards_last_epoch,
-                active_bonds,
-                unbonding_bonds,
-            )
-        } else {
-            format!(
-                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{}}}"#,
-                hex::encode(entry.delegator_id.0),
-                entry.staked_spark,
-                entry.pending_rewards,
-                if unbonding { "true" } else { "false" },
-                unbonding_end,
-                entry.rewards_last_epoch,
-            )
-        });
+        delegators.push(format!(
+            r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+            hex::encode(entry.delegator_id.0),
+            active_stake,
+            entry.pending_rewards,
+            if unbonding { "true" } else { "false" },
+            unbonding_end,
+            entry.rewards_last_epoch,
+            active_bonds,
+            unbonding_bonds,
+        ));
     }
 
     Ok(format!(
@@ -2281,11 +2214,7 @@ fn get_epoch_info(state: &NodeState<'_>) -> RpcResult<String> {
         .chain
         .validators
         .total_selectable_self_stake()
-        .saturating_add(if delegator_bond_accounting_active(state.chain.height) {
-            state.chain.total_active_delegated_bond_stake()
-        } else {
-            state.chain.delegations.total_staked()
-        });
+        .saturating_add(state.chain.total_active_delegated_bond_stake());
     let phase = indra_core::types::primitives::validator_set_phase(total_staked);
     let max_validators = indra_core::types::primitives::max_active_validators(total_staked);
     Ok(format!(
@@ -2720,7 +2649,7 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
             .map(|addr| format!(r#""{}""#, json_escape(addr)))
             .unwrap_or_else(|| "null".to_string());
         entries.push(format!(
-            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","network_addr":{},"cold_hybrid_classical_pk":{},"cold_hybrid_pq_pk":{},"cold_key_version":{},"cold_key_status":"{}","cold_nonce":{}}}"#,
+            r#"{{"validator_id":"{}","name":"{}","stake":{},"status":"active","commission_bps":{},"pending_rewards":{},"epoch_joined":{},"hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","network_addr":{},"cold_hybrid_classical_pk":{},"cold_hybrid_pq_pk":{},"cold_key_version":{},"cold_nonce":{}}}"#,
             id_hex,
             json_escape(&v.name),
             v.stake_spark,
@@ -2737,10 +2666,6 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
                 .map(|pk| format!(r#""{}""#, hex::encode(pk)))
                 .unwrap_or_else(|| "null".to_string()),
             v.cold_key_version,
-            match v.cold_key_status {
-                indra_state::ColdKeyStatus::Unenrolled => "unenrolled",
-                indra_state::ColdKeyStatus::Active => "active",
-            },
             v.cold_nonce,
         ));
     }
@@ -2962,7 +2887,6 @@ mod tests {
             },
             transactions: Vec::new(),
             slashing_evidence: Vec::new(),
-            slashing_evidence_v2: Vec::new(),
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
             vrf_reveals: Vec::new(),
@@ -3088,7 +3012,7 @@ mod tests {
             amount_spark: 1_000_000,
             bonded_epoch: 7,
             unbonding_end_epoch: None,
-            unbonding_precision: indra_state::StakeBondUnbondingPrecision::LegacyEpochOnly,
+            unbonding_start_height: None,
             custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
@@ -3478,54 +3402,6 @@ mod tests {
     }
 
     #[test]
-    fn explain_utxo_provenance_authorized_classifies_slash_reporter_reward() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let evidence = SlashEvidenceV1 {
-            validator_id: Bytes32::from([0x61; 32]),
-            vote_1: VoteV1 {
-                height: 9,
-                round: 0,
-                step: VoteStep::Precommit,
-                block_hash: Bytes32::from([0x62; 32]),
-                validator_id: Bytes32::from([0x61; 32]),
-                election_result_hash: None,
-                signature: dummy_signature(0x63),
-            },
-            vote_2: VoteV1 {
-                height: 9,
-                round: 0,
-                step: VoteStep::Precommit,
-                block_hash: Bytes32::from([0x64; 32]),
-                validator_id: Bytes32::from([0x61; 32]),
-                election_result_hash: None,
-                signature: dummy_signature(0x65),
-            },
-        };
-        let evidence_hash = Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()));
-        let blinding = derive_slash_reward_blinding(&evidence_hash, height);
-        let utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(2_000, blinding), height, STAKING_TX_IDX, 0)
-            .unwrap();
-        engine
-            .blocks
-            .get_mut(&height)
-            .unwrap()
-            .slashing_evidence
-            .push(evidence);
-
-        let result = explain(&engine, utxo_id);
-        assert!(
-            result.contains(r#""category":"slash_reporter_reward""#),
-            "{result}"
-        );
-        assert!(result.contains(r#""recoverable":true"#), "{result}");
-        assert!(result.contains(r#""evidence_hash":"#), "{result}");
-    }
-
-    #[test]
     fn explain_utxo_provenance_authorized_classifies_governance_change_and_refund() {
         let mut engine = block_backed_engine();
         let height = 2;
@@ -3847,60 +3723,6 @@ mod tests {
     }
 
     #[test]
-    fn rpc_exposes_network_addr_field() {
-        let mut engine = make_state("vna");
-        for (byte, addr) in [(0x31, Some("203.0.113.31:30303")), (0x32, None)] {
-            engine
-                .validators
-                .upsert(indra_state::ValidatorEntry {
-                    validator_id: indra_core::Bytes32::from([byte; 32]),
-                    name: format!("validator-{byte}"),
-                    hybrid_classical_pk: None,
-                    hybrid_pq_pk: None,
-                    vrf_pk: None,
-                    stake_spark: 1_000_000,
-                    status: indra_state::ValidatorStatus::Active,
-                    registered_epoch: 0,
-                    last_active_epoch: 0,
-                    pending_rewards: 0,
-                    rewards_last_epoch: 0,
-                    self_report_count: 0,
-                    commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
-                    pending_commission_bps: None,
-                    pending_commission_effective_epoch: None,
-                    min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
-                    auto_delegate_to: None,
-                    network_addr: addr.map(str::to_string),
-                    network_addr_last_updated_epoch: addr.map(|_| 1),
-                    cold_hybrid_classical_pk: (byte == 0x31).then_some([0x51; 32]),
-                    cold_hybrid_pq_pk: (byte == 0x31).then_some([0x52; indra_crypto::PQ_PK_BYTES]),
-                    cold_key_version: u64::from(byte == 0x31),
-                    cold_key_status: if byte == 0x31 {
-                        indra_state::ColdKeyStatus::Active
-                    } else {
-                        indra_state::ColdKeyStatus::Unenrolled
-                    },
-                    cold_nonce: if byte == 0x31 { 9 } else { 0 },
-                })
-                .unwrap();
-        }
-        let state = NodeState::read_only(&engine);
-        let result = get_validator_set(&state).unwrap();
-
-        assert!(result.contains(r#""network_addr":"203.0.113.31:30303""#));
-        assert!(result.contains(r#""network_addr":null"#));
-        assert!(result.contains(&format!(
-            r#""cold_hybrid_classical_pk":"{}""#,
-            hex::encode([0x51; 32])
-        )));
-        assert!(result.contains(r#""cold_key_version":1"#));
-        assert!(result.contains(r#""cold_key_status":"active""#));
-        assert!(result.contains(r#""cold_nonce":9"#));
-        assert!(result.contains(r#""cold_hybrid_classical_pk":null"#));
-        assert!(result.contains(r#""cold_key_status":"unenrolled""#));
-    }
-
-    #[test]
     fn rpc_exposes_delegation_return_events_for_delegator() {
         let mut engine = make_state("dre");
         let delegator_id = indra_core::Bytes32::from([0x41; 32]);
@@ -4217,7 +4039,6 @@ mod tests {
                 cold_hybrid_classical_pk: None,
                 cold_hybrid_pq_pk: None,
                 cold_key_version: 0,
-                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
                 cold_nonce: 0,
             })
             .unwrap();
@@ -4246,7 +4067,6 @@ mod tests {
                 cold_hybrid_classical_pk: None,
                 cold_hybrid_pq_pk: None,
                 cold_key_version: 0,
-                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
                 cold_nonce: 0,
             })
             .unwrap();

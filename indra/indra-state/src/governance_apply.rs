@@ -6,10 +6,7 @@ use indra_core::types::{
         compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
         GovernanceOpV2, GovernancePayload,
     },
-    primitives::{
-        delegator_bond_accounting_active, delegator_identity_registry_active,
-        validator_cold_key_enforcement_active, Bytes32,
-    },
+    primitives::Bytes32,
     transaction::OutputV1,
 };
 use indra_crypto::{commit, prove_range, sha256, verify_hybrid};
@@ -29,7 +26,7 @@ use crate::{
         resolve_active_validator_cold_pubkey, resolve_delegator_identity_for_redelegation,
         IdentityError,
     },
-    validator::{ColdKeyStatus, ValidatorStatus},
+    validator::ValidatorStatus,
     ChainState,
 };
 
@@ -45,7 +42,7 @@ pub fn apply_governance_op(
         .map_err(|error| StateError::InvalidGovernanceOp {
             reason: error.to_string(),
         })?;
-    let identity_registry_active = delegator_identity_registry_active(current_height);
+    let identity_registry_active = true;
     let cold_authorized = verify_governance_sig(
         state,
         op,
@@ -406,17 +403,10 @@ fn apply_redelegate(
         .iter()
         .find(|entry| {
             entry.delegator_id == op.signer_id
-                && (!delegator_bond_accounting_active(current_height)
-                    || active_delegated_bond_stake(state, from_validator, &op.signer_id) > 0)
-                && (delegator_bond_accounting_active(current_height)
-                    || entry.unbonding_end_epoch.is_none())
+                && active_delegated_bond_stake(state, from_validator, &op.signer_id) > 0
         })
         .ok_or(StateError::DelegatorNotFound)?;
-    let active_stake = if delegator_bond_accounting_active(current_height) {
-        active_delegated_bond_stake(state, from_validator, &op.signer_id)
-    } else {
-        entry.staked_spark
-    };
+    let active_stake = active_delegated_bond_stake(state, from_validator, &op.signer_id);
     if amount_spark > active_stake {
         return invalid("redelegation exceeds active delegated stake");
     }
@@ -579,23 +569,7 @@ fn verify_governance_sig(
             | GovernancePayload::Reveal { .. }
             | GovernancePayload::Cancel { .. }
     );
-    let active_cold_validator = cold_designated
-        && state
-            .validators
-            .get(&op.signer_id)
-            .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Active);
-    if cold_designated
-        && validator_cold_key_enforcement_active(current_height)
-        && state
-            .validators
-            .get(&op.signer_id)
-            .is_some_and(|validator| validator.cold_key_status == ColdKeyStatus::Unenrolled)
-    {
-        return invalid(
-            "unenrolled validator governance authority is frozen after VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT; complete EnrollValidatorColdKey",
-        );
-    }
-
+    let active_cold_validator = cold_designated && state.validators.get(&op.signer_id).is_some();
     if active_cold_validator {
         let authorization = op.cold_authorization().ok_or_else(|| {
             StateError::InvalidGovernanceOp {
@@ -965,6 +939,34 @@ mod tests {
     }
 
     fn sign_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair, chain_id: &str) {
+        if matches!(
+            op.payload,
+            GovernancePayload::Propose { .. }
+                | GovernancePayload::Commit { .. }
+                | GovernancePayload::Reveal { .. }
+                | GovernancePayload::Cancel { .. }
+        ) {
+            let cold_nonce = op.nonce;
+            set_cold_authorization(op, cold_nonce);
+            sign_cold_governance_op(op, keypair, chain_id);
+            return;
+        }
+        let domain = governance_signing_domain(
+            op.action_type,
+            op.signer_id,
+            op.nonce,
+            &op.payload,
+            chain_id,
+        );
+        let msg_hash = sha256(&domain);
+        let sig = keypair.sign(&msg_hash).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
+    fn sign_hot_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair, chain_id: &str) {
         let domain = governance_signing_domain(
             op.action_type,
             op.signer_id,
@@ -990,7 +992,6 @@ mod tests {
         validator.cold_hybrid_classical_pk = Some(public.classical.0);
         validator.cold_hybrid_pq_pk = Some(public.pq.0);
         validator.cold_key_version = 1;
-        validator.cold_key_status = ColdKeyStatus::Active;
         validator.cold_nonce = 0;
     }
 
@@ -1093,49 +1094,6 @@ mod tests {
         op
     }
 
-    fn enroll_cold_key_op(
-        validator_id: Bytes32,
-        hot: &HybridKeypair,
-        cold: &HybridKeypair,
-        nonce: u64,
-    ) -> StakingOp {
-        let public = cold.public_key();
-        let mut op = StakingOp {
-            body: StakingOpBody::EnrollValidatorColdKey {
-                validator_id,
-                cold_pubkey: ColdHybridPubKey {
-                    classical_pk: Bytes32::from(public.classical.0),
-                    pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
-                },
-                cold_signature: Some(dummy_sig()),
-            },
-            nonce,
-            signature: dummy_sig(),
-        };
-        let message = op
-            .enroll_validator_cold_key_dual_signing_bytes(DEFAULT_CHAIN_ID)
-            .unwrap()
-            .unwrap();
-        let hot_signature = hot.sign(&message).unwrap();
-        op.signature = HybridSignature {
-            classical_sig: VariableBytes::from_slice(&hot_signature.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&hot_signature.pq.0).unwrap(),
-        };
-        let cold_signature = cold.sign(&message).unwrap();
-        let StakingOpBody::EnrollValidatorColdKey {
-            cold_signature: slot,
-            ..
-        } = &mut op.body
-        else {
-            unreachable!()
-        };
-        *slot = Some(HybridSignature {
-            classical_sig: VariableBytes::from_slice(&cold_signature.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&cold_signature.pq.0).unwrap(),
-        });
-        op
-    }
-
     fn install_governance_validator(state: &mut ChainState, pubkey: &HybridPubKey) -> Bytes32 {
         let validator_id = pubkey_to_id(pubkey);
         state
@@ -1160,10 +1118,9 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: None,
-                cold_hybrid_pq_pk: None,
-                cold_key_version: 0,
-                cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+                cold_hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                cold_hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().try_into().unwrap()),
+                cold_key_version: 1,
                 cold_nonce: 0,
             })
             .unwrap();
@@ -1353,17 +1310,18 @@ mod tests {
         amount_spark: u64,
         byte: u8,
     ) {
-        let bond = StakeBondEntry::new_for_test_with_compact_activation(
+        let bond = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
             bond_utxo_id,
             validator_id,
             delegator_id,
             amount_spark,
             0,
             deposit_output(owner_pubkey, amount_spark),
-            0,
-            u64::MAX,
+            2,
+            1,
+            2,
         );
-        assert!(bond.original_output.range_proof.is_some());
+        assert!(bond.original_output.range_proof.is_none());
         state.staked_bonds.insert(bond_utxo_id, bond);
         state
             .delegations
@@ -1399,52 +1357,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn governance_redelegation_pre_identity_gate_uses_first_matching_active_bond() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xA0; 32]);
-        let to_validator = Bytes32::from([0xA1; 32]);
-        let proposal_id = Bytes32::from([0xA2; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (first_pubkey, first_keypair) = mixed_keypair(0xA3, 0xA4);
-        let (second_pubkey, _) = mixed_keypair(0xA3, 0xA5);
-        let delegator_id = pubkey_to_id(&first_pubkey);
-        assert_eq!(pubkey_to_id(&second_pubkey), delegator_id);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x01; 32]),
-            from_validator,
-            delegator_id,
-            first_pubkey,
-            1_000,
-            0x01,
-        );
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x02; 32]),
-            from_validator,
-            delegator_id,
-            second_pubkey,
-            1_000,
-            0x02,
-        );
-
-        let op = redelegate_op(
-            delegator_id,
-            &first_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-
-        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
-
-        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
-        assert_eq!(proposal.redelegations.len(), 1);
-        assert!(state.delegator_identities.is_empty());
-    }
 
     #[test]
     fn governance_redelegation_post_identity_gate_registry_entry_verifies() {
@@ -1814,196 +1726,6 @@ mod tests {
     }
 
     #[test]
-    fn hot_cold_capstone_full_and_late_enrollment_lifecycles_compose() {
-        let replay = || {
-            let mut state = ChainState::new_genesis();
-            let (hot_pubkey, hot) = keypair(0x50);
-            let validator_id = install_governance_validator(&mut state, &hot_pubkey);
-            let (_, cold_v1) = mixed_keypair(0x51, 0x52);
-            let enroll = enroll_cold_key_op(validator_id, &hot, &cold_v1, 1);
-            apply_staking_op(&mut state, &enroll, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-
-            let mut commission_v1 = StakingOp {
-                body: StakingOpBody::SetCommission {
-                    validator_id,
-                    new_commission_bps: 900,
-                    cold_authorization: Some(ColdStakingAuthorization {
-                        cold_key_version: 1,
-                        cold_nonce: 1,
-                    }),
-                },
-                nonce: 0,
-                signature: dummy_sig(),
-            };
-            sign_cold_staking_op(&mut commission_v1, &cold_v1, DEFAULT_CHAIN_ID);
-            apply_staking_op(&mut state, &commission_v1, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-
-            let proposal_id = Bytes32::from([0x53; 32]);
-            let reveal_nonce = Bytes32::from([0x54; 32]);
-            let vote = 1;
-            let mut proposal = proposal_record(
-                proposal_id,
-                hot_pubkey,
-                GovernableAction::SetMinDelegationSpark {
-                    value: DUST_LIMIT_SPARK,
-                },
-                ProposalPhase::Commit,
-            );
-            proposal.proposer_id = validator_id;
-            proposal.snapshot1 = Some(crate::governance::GovernanceSnapshot {
-                weights: [(validator_id, 1_000)].into_iter().collect(),
-                total_stake: 1_000,
-            });
-            state.governance.proposals.insert(proposal_id, proposal);
-            let mut commit = GovernanceOpV2 {
-                action_type: GovernanceActionType::CommitVote,
-                signer_id: validator_id,
-                nonce: 0,
-                payload: GovernancePayload::Commit {
-                    proposal_id,
-                    commit_hash: governance_vote_commit_hash(
-                        proposal_id,
-                        validator_id,
-                        vote,
-                        reveal_nonce,
-                    ),
-                    cold_authorization: Some(ColdGovernanceAuthorization {
-                        cold_key_version: 1,
-                        cold_nonce: 2,
-                    }),
-                },
-                signature: dummy_sig(),
-            };
-            sign_cold_governance_op(&mut commit, &cold_v1, DEFAULT_CHAIN_ID);
-            apply_governance_op(&mut state, &commit, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-
-            let (_, cold_v2) = mixed_keypair(0x55, 0x56);
-            let rotation = rotate_cold_key_op(validator_id, &cold_v1, &cold_v2, 1, 3);
-            apply_staking_op(&mut state, &rotation, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-            state
-                .governance
-                .proposals
-                .get_mut(&proposal_id)
-                .unwrap()
-                .phase = ProposalPhase::Reveal;
-            let mut reveal = GovernanceOpV2 {
-                action_type: GovernanceActionType::RevealVote,
-                signer_id: validator_id,
-                nonce: 0,
-                payload: GovernancePayload::Reveal {
-                    proposal_id,
-                    vote,
-                    nonce: reveal_nonce,
-                    cold_authorization: Some(ColdGovernanceAuthorization {
-                        cold_key_version: 2,
-                        cold_nonce: 1,
-                    }),
-                },
-                signature: dummy_sig(),
-            };
-            sign_cold_governance_op(&mut reveal, &cold_v2, DEFAULT_CHAIN_ID);
-            apply_governance_op(&mut state, &reveal, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-            let mut commission_v2 = StakingOp {
-                body: StakingOpBody::SetCommission {
-                    validator_id,
-                    new_commission_bps: 950,
-                    cold_authorization: Some(ColdStakingAuthorization {
-                        cold_key_version: 2,
-                        cold_nonce: 2,
-                    }),
-                },
-                nonce: 0,
-                signature: dummy_sig(),
-            };
-            sign_cold_staking_op(&mut commission_v2, &cold_v2, DEFAULT_CHAIN_ID);
-            apply_staking_op(&mut state, &commission_v2, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-
-            let (late_hot_pubkey, late_hot) = keypair(0x57);
-            let late_id = install_governance_validator(&mut state, &late_hot_pubkey);
-            crate::epoch::enforce_validator_cold_key_enrollment(&mut state, u64::MAX);
-            assert_eq!(
-                state.validators.get(&late_id).unwrap().status,
-                ValidatorStatus::Registered
-            );
-            let legacy = propose_op(late_id, &late_hot, late_hot_pubkey, Bytes32::ZERO, 1);
-            assert!(
-                apply_governance_op(&mut state, &legacy, 0, u64::MAX, DEFAULT_CHAIN_ID).is_err()
-            );
-            let (_, late_cold) = mixed_keypair(0x58, 0x59);
-            let late_enroll = enroll_cold_key_op(late_id, &late_hot, &late_cold, 1);
-            apply_staking_op(&mut state, &late_enroll, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-            state
-                .validators
-                .select_active_set(&state.delegations, 0, u64::MAX);
-            assert_eq!(
-                state.validators.get(&late_id).unwrap().status,
-                ValidatorStatus::Active
-            );
-            let mut late_commission = StakingOp {
-                body: StakingOpBody::SetCommission {
-                    validator_id: late_id,
-                    new_commission_bps: 975,
-                    cold_authorization: Some(ColdStakingAuthorization {
-                        cold_key_version: 1,
-                        cold_nonce: 1,
-                    }),
-                },
-                nonce: 0,
-                signature: dummy_sig(),
-            };
-            sign_cold_staking_op(&mut late_commission, &late_cold, DEFAULT_CHAIN_ID);
-            apply_staking_op(&mut state, &late_commission, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-
-            assert!(state.governance.proposals[&proposal_id]
-                .reveals
-                .contains_key(&validator_id));
-            assert_eq!(
-                state
-                    .validators
-                    .get(&validator_id)
-                    .unwrap()
-                    .cold_key_version,
-                2
-            );
-            assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 2);
-            state
-        };
-
-        let first = replay();
-        let second = replay();
-        assert_eq!(first, second);
-        assert_eq!(
-            crate::compute_state_root(&first),
-            crate::compute_state_root(&second)
-        );
-    }
-
-    #[test]
-    fn enforcement_freezes_unenrolled_validator_governance_authority() {
-        let mut state = ChainState::new_genesis();
-        let (hot_pubkey, hot) = keypair(0x47);
-        let validator_id = install_governance_validator(&mut state, &hot_pubkey);
-        let enforcement =
-            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
-        crate::epoch::enforce_validator_cold_key_enrollment(&mut state, enforcement);
-        let mut commit = GovernanceOpV2 {
-            action_type: GovernanceActionType::CommitVote,
-            signer_id: validator_id,
-            nonce: 1,
-            payload: GovernancePayload::Commit {
-                proposal_id: Bytes32::from([0x48; 32]),
-                commit_hash: Bytes32::from([0x49; 32]),
-                cold_authorization: None,
-            },
-            signature: dummy_sig(),
-        };
-        sign_governance_op(&mut commit, &hot, DEFAULT_CHAIN_ID);
-        let err =
-            apply_governance_op(&mut state, &commit, 0, enforcement, DEFAULT_CHAIN_ID).unwrap_err();
-        assert!(err.to_string().contains("governance authority is frozen"));
-    }
-
-    #[test]
     fn active_validator_governance_rejects_both_hot_bypass_shapes() {
         let mut state = ChainState::new_genesis();
         let (hot_pubkey, hot_keypair) = keypair(0xD5);
@@ -2021,7 +1743,7 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut legacy_hot, &hot_keypair, DEFAULT_CHAIN_ID);
+        sign_hot_governance_op(&mut legacy_hot, &hot_keypair, DEFAULT_CHAIN_ID);
         assert!(matches!(
             apply_governance_op(&mut state, &legacy_hot, 0, u64::MAX, DEFAULT_CHAIN_ID),
             Err(StateError::InvalidGovernanceOp { reason })
@@ -2077,54 +1799,6 @@ mod tests {
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
     }
 
-    #[test]
-    fn validator_cold_enrollment_does_not_change_delegator_redelegate_authority() {
-        let mut state = ChainState::new_genesis();
-        let (validator_pubkey, _) = keypair(0xDC);
-        let enrolled_validator = install_governance_validator(&mut state, &validator_pubkey);
-        let (_, cold_keypair) = keypair(0xDD);
-        activate_cold_key(&mut state, enrolled_validator, &cold_keypair);
-        let from_validator = Bytes32::from([0xDE; 32]);
-        let to_validator = Bytes32::from([0xDF; 32]);
-        let proposal_id = Bytes32::from([0xE0; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (delegator_pubkey, delegator_keypair) = keypair(0xE1);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0xE2; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey,
-            1_000,
-            0xE2,
-        );
-        let op = redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-        apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-        assert_eq!(
-            state.governance.proposals[&proposal_id].redelegations[0].delegator_id,
-            delegator_id
-        );
-        assert_eq!(
-            state
-                .validators
-                .get(&enrolled_validator)
-                .unwrap()
-                .cold_nonce,
-            0
-        );
-    }
 
     #[test]
     fn mixed_hot_cold_governance_and_staking_replay_is_deterministic() {
@@ -2169,7 +1843,7 @@ mod tests {
             .utxos
             .insert(deposit_output(legacy_pubkey.clone(), 1_000), 0, 0, 2)
             .unwrap();
-        let legacy_propose = propose_op_with_action(
+        let mut legacy_propose = propose_op_with_action(
             legacy_id,
             &legacy_keypair,
             legacy_pubkey,
@@ -2177,6 +1851,14 @@ mod tests {
             1,
             GovernableAction::SetSlashLivenessThresholdEpochs { value: 2 },
         );
+        if let GovernancePayload::Propose {
+            cold_authorization, ..
+        } = &mut legacy_propose.payload
+        {
+            *cold_authorization = None;
+        }
+        legacy_propose.nonce = 1;
+        sign_hot_governance_op(&mut legacy_propose, &legacy_keypair, DEFAULT_CHAIN_ID);
 
         let replay = |state: &mut ChainState| {
             apply_governance_op(state, &cold_propose, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
@@ -2186,7 +1868,7 @@ mod tests {
             assert!(matches!(
                 error,
                 StateError::InvalidGovernanceOp { reason }
-                    if reason.contains("governance authority is frozen")
+                    if reason.contains("hot fallback is prohibited")
             ));
         };
         let mut first = base.clone();
@@ -2238,108 +1920,7 @@ mod tests {
         assert_eq!(proposal.redelegations[0].delegator_id, delegator_id);
     }
 
-    #[test]
-    fn governance_redelegation_post_identity_gate_unambiguous_legacy_fallback_verifies_and_populates(
-    ) {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xAA; 32]);
-        let to_validator = Bytes32::from([0xAB; 32]);
-        let proposal_id = Bytes32::from([0xAC; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (delegator_pubkey, delegator_keypair) = keypair(0xAD);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x04; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey.clone(),
-            1_000,
-            0x04,
-        );
-        assert!(state.delegator_identities.is_empty());
 
-        let op = redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-
-        apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-
-        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
-        assert_eq!(proposal.redelegations.len(), 1);
-        assert_eq!(
-            state.delegator_identities.get(&delegator_id),
-            Some(&delegator_pubkey)
-        );
-    }
-
-    #[test]
-    fn governance_redelegation_post_identity_gate_rejects_ambiguous_legacy_bonds() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xAE; 32]);
-        let to_validator = Bytes32::from([0xAF; 32]);
-        let proposal_id = Bytes32::from([0xB0; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (first_pubkey, first_keypair) = mixed_keypair(0xB1, 0xB2);
-        let (second_pubkey, _) = mixed_keypair(0xB1, 0xB3);
-        let delegator_id = pubkey_to_id(&first_pubkey);
-        assert_eq!(pubkey_to_id(&second_pubkey), delegator_id);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x05; 32]),
-            from_validator,
-            delegator_id,
-            first_pubkey,
-            1_000,
-            0x05,
-        );
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x06; 32]),
-            from_validator,
-            delegator_id,
-            second_pubkey,
-            1_000,
-            0x06,
-        );
-        let op = redelegate_op(
-            delegator_id,
-            &first_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-        let mut old_behavior = state.clone();
-        apply_governance_op(&mut old_behavior, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
-        assert_eq!(
-            old_behavior
-                .governance
-                .proposals
-                .get(&proposal_id)
-                .unwrap()
-                .redelegations
-                .len(),
-            1
-        );
-
-        let before = state.clone();
-        let err = apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap_err();
-
-        assert!(matches!(
-            err,
-            StateError::InvalidGovernanceOp { reason }
-                if reason.contains("delegator identity has ambiguous legacy pubkeys")
-        ));
-        assert_eq!(state, before);
-    }
 
     #[test]
     fn governance_redelegation_post_identity_gate_rejects_unresolvable_identity() {

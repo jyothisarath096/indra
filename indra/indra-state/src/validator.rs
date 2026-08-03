@@ -9,8 +9,7 @@ use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, 
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
-        compact_bond_pubkey_omission_active, compact_stake_bond_active, max_active_validators,
-        muldiv, self_unstake_height_precision_active, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
+        max_active_validators, muldiv, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
         MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
         MAX_VALIDATOR_NETWORK_ADDR_LEN, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION,
         SCHEMA_VERSION_GENESIS, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
@@ -22,7 +21,31 @@ use indra_core::types::{
 use crate::error::{StateError, StateResult};
 use crate::persistent::PersistentOrdMap;
 
-const VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS: u8 = SCHEMA_VERSION + 1;
+const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 1;
+const STAKE_BOND_FORMAT_VERSION: u8 = 1;
+
+fn unsupported_schema(struct_name: &'static str, version: u8) -> IndraError {
+    IndraError::UnsupportedSchemaVersion {
+        struct_name,
+        version,
+        max_supported: SCHEMA_VERSION,
+    }
+}
+
+fn decode_bytes32_with_first(
+    r: &mut ByteReader<'_>,
+    first_byte: Option<u8>,
+) -> IndraResult<Bytes32> {
+    match first_byte {
+        Some(first) => {
+            let mut bytes = [0u8; 32];
+            bytes[0] = first;
+            bytes[1..].copy_from_slice(r.read_bytes(31)?);
+            Ok(Bytes32::from(bytes))
+        }
+        None => Bytes32::decode(r),
+    }
+}
 
 /// Consensus ceiling for active delegator entries under one validator.
 ///
@@ -36,18 +59,6 @@ pub const MAX_DELEGATORS_PER_VALIDATOR: usize = 100_000;
 /// This intentionally matches the live write cap so state that can be accepted
 /// during normal operation can always be decoded later from persisted snapshots.
 pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDATOR;
-
-const STAKE_BOND_COMPACT_MARKER: u8 = u8::MAX;
-const STAKE_BOND_FULLY_COMPACT_MARKER: u8 = u8::MAX - 1;
-const STAKE_BOND_CUSTODY_LEGACY_MARKER: u8 = u8::MAX - 2;
-const STAKE_BOND_CUSTODY_COMPACT_MARKER: u8 = u8::MAX - 3;
-const STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER: u8 = u8::MAX - 4;
-const STAKE_BOND_HEIGHT_LEGACY_MARKER: u8 = u8::MAX - 5;
-const STAKE_BOND_HEIGHT_COMPACT_MARKER: u8 = u8::MAX - 6;
-const STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER: u8 = u8::MAX - 7;
-const STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER: u8 = u8::MAX - 8;
-const STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER: u8 = u8::MAX - 9;
-const STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER: u8 = u8::MAX - 10;
 
 /// Maximum unresolved validator self-bonds migrated by one enrollment.
 pub const MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS: usize = 4_096;
@@ -231,40 +242,6 @@ impl Decode for ValidatorStatus {
     }
 }
 
-/// Enrollment status of a validator's independent cold authorization key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColdKeyStatus {
-    /// No cold key is registered.
-    Unenrolled,
-    /// A complete cold hybrid key is registered and active.
-    Active,
-}
-
-impl Encode for ColdKeyStatus {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        match self {
-            Self::Unenrolled => 0u8.encode(buf),
-            Self::Active => 1u8.encode(buf),
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        1
-    }
-}
-
-impl Decode for ColdKeyStatus {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        match u8::decode(r)? {
-            0 => Ok(Self::Unenrolled),
-            1 => Ok(Self::Active),
-            _ => Err(IndraError::InvariantViolation {
-                message: "invalid cold key status discriminator",
-            }),
-        }
-    }
-}
-
 /// A single validator's entry in the validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorEntry {
@@ -314,22 +291,15 @@ pub struct ValidatorEntry {
     pub cold_hybrid_classical_pk: Option<[u8; 32]>,
     /// ML-DSA-87 component of the independent cold authorization key.
     pub cold_hybrid_pq_pk: Option<[u8; indra_crypto::PQ_PK_BYTES]>,
-    /// Monotonic cold-key generation; zero exactly while unenrolled.
+    /// Monotonic cold-key generation.
     pub cold_key_version: u64,
-    /// Cold-key enrollment state.
-    pub cold_key_status: ColdKeyStatus,
     /// Replay-protection nonce for cold-authorized operations.
     pub cold_nonce: u64,
 }
 
 impl Encode for ValidatorEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
-        let has_cold_state = self.has_cold_key_state();
-        if has_cold_state {
-            VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS.encode(buf);
-        } else {
-            SCHEMA_VERSION.encode(buf);
-        }
+        VALIDATOR_ENTRY_FORMAT_VERSION.encode(buf);
         self.validator_id.encode(buf);
         let name_bytes = self.name.as_bytes();
         (name_bytes.len() as u32).encode(buf);
@@ -381,19 +351,16 @@ impl Encode for ValidatorEntry {
         if let Some(epoch) = self.network_addr_last_updated_epoch {
             epoch.encode(buf);
         }
-        if has_cold_state {
-            self.cold_hybrid_classical_pk.is_some().encode(buf);
-            if let Some(pk) = self.cold_hybrid_classical_pk {
-                buf.extend_from_slice(&pk);
-            }
-            self.cold_hybrid_pq_pk.is_some().encode(buf);
-            if let Some(pk) = self.cold_hybrid_pq_pk {
-                buf.extend_from_slice(&pk);
-            }
-            self.cold_key_version.encode(buf);
-            self.cold_key_status.encode(buf);
-            self.cold_nonce.encode(buf);
+        self.cold_hybrid_classical_pk.is_some().encode(buf);
+        if let Some(pk) = self.cold_hybrid_classical_pk {
+            buf.extend_from_slice(&pk);
         }
+        self.cold_hybrid_pq_pk.is_some().encode(buf);
+        if let Some(pk) = self.cold_hybrid_pq_pk {
+            buf.extend_from_slice(&pk);
+        }
+        self.cold_key_version.encode(buf);
+        self.cold_nonce.encode(buf);
     }
 
     fn encoded_len(&self) -> usize {
@@ -436,115 +403,34 @@ impl Encode for ValidatorEntry {
                 .unwrap_or(0)
             + 1
             + self.network_addr_last_updated_epoch.map(|_| 8).unwrap_or(0)
-            + if self.has_cold_key_state() {
-                1 + self.cold_hybrid_classical_pk.map(|_| 32).unwrap_or(0)
-                    + 1
-                    + self
-                        .cold_hybrid_pq_pk
-                        .map(|_| indra_crypto::PQ_PK_BYTES)
-                        .unwrap_or(0)
-                    + 8
-                    + 1
-                    + 8
-            } else {
-                0
-            }
+            + 1
+            + self.cold_hybrid_classical_pk.map(|_| 32).unwrap_or(0)
+            + 1
+            + self
+                .cold_hybrid_pq_pk
+                .map(|_| indra_crypto::PQ_PK_BYTES)
+                .unwrap_or(0)
+            + 8
+            + 8
     }
 }
 
 impl Decode for ValidatorEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let marker = u8::decode(r)?;
-        match marker {
-            SCHEMA_VERSION_GENESIS => decode_validator_entry_v1(r, None),
-            SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS => decode_validator_entry_v3(r, None),
-            SCHEMA_VERSION => decode_validator_entry_v4(r, None),
-            VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS => decode_validator_entry_v5(r, None),
-            other if r.remaining() == 0 => Err(unsupported_schema("ValidatorEntry", other)),
-            first_byte => decode_validator_entry_v1(r, Some(first_byte)),
+        let version = u8::decode(r)?;
+        if version != VALIDATOR_ENTRY_FORMAT_VERSION {
+            return Err(IndraError::UnsupportedSchemaVersion {
+                struct_name: "ValidatorEntry",
+                version,
+                max_supported: VALIDATOR_ENTRY_FORMAT_VERSION,
+            });
         }
+        decode_validator_entry_fields(r)
     }
 }
 
-fn unsupported_schema(struct_name: &'static str, version: u8) -> IndraError {
-    IndraError::UnsupportedSchemaVersion {
-        struct_name,
-        version,
-        max_supported: SCHEMA_VERSION,
-    }
-}
-
-fn decode_bytes32_with_first(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<Bytes32> {
-    match first_byte {
-        Some(first) => {
-            let mut bytes = [0u8; 32];
-            bytes[0] = first;
-            bytes[1..].copy_from_slice(r.read_bytes(31)?);
-            Ok(Bytes32::from(bytes))
-        }
-        None => Bytes32::decode(r),
-    }
-}
-
-fn decode_validator_entry_v1(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, false, false, false, false)
-}
-
-fn decode_validator_entry_v2(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, false, false, false)
-}
-
-fn decode_validator_entry_v3(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, true, false, false)
-}
-
-fn decode_validator_entry_v4(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, true, true, false)
-}
-
-fn decode_validator_entry_v5(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<ValidatorEntry> {
-    decode_validator_entry_fields(r, first_byte, true, true, true, true)
-}
-
-impl ValidatorEntry {
-    /// Decode the legacy unversioned schema V1 layout.
-    pub fn decode_legacy_v1(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        decode_validator_entry_v1(r, None)
-    }
-
-    /// Decode the legacy unversioned schema V2 layout used before version bytes.
-    pub fn decode_legacy_v2(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        decode_validator_entry_v2(r, None)
-    }
-}
-
-fn decode_validator_entry_fields(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-    has_auto_delegate_to: bool,
-    has_pending_commission: bool,
-    has_network_addr: bool,
-    has_cold_keys: bool,
-) -> IndraResult<ValidatorEntry> {
-    let validator_id = decode_bytes32_with_first(r, first_byte)?;
+fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<ValidatorEntry> {
+    let validator_id = Bytes32::decode(r)?;
     let name_len = u32::decode(r)? as usize;
     let name_bytes = r.read_bytes(name_len)?;
     let name =
@@ -591,28 +477,23 @@ fn decode_validator_entry_fields(
     let rewards_last_epoch = u64::decode(r)?;
     let self_report_count = u32::decode(r)?;
     let commission_bps = u32::decode(r)?;
-    let (pending_commission_bps, pending_commission_effective_epoch) = if has_pending_commission {
-        let pending_bps = if bool::decode(r)? {
-            Some(u16::decode(r)?)
-        } else {
-            None
-        };
-        let pending_epoch = if bool::decode(r)? {
-            Some(u64::decode(r)?)
-        } else {
-            None
-        };
-        (pending_bps, pending_epoch)
+    let pending_commission_bps = if bool::decode(r)? {
+        Some(u16::decode(r)?)
     } else {
-        (None, None)
+        None
+    };
+    let pending_commission_effective_epoch = if bool::decode(r)? {
+        Some(u64::decode(r)?)
+    } else {
+        None
     };
     let min_delegation_spark = u64::decode(r)?;
-    let auto_delegate_to = if has_auto_delegate_to && bool::decode(r)? {
+    let auto_delegate_to = if bool::decode(r)? {
         Some(Bytes32::decode(r)?)
     } else {
         None
     };
-    let (network_addr, network_addr_last_updated_epoch) = if has_network_addr {
+    let (network_addr, network_addr_last_updated_epoch) = {
         let network_addr = if bool::decode(r)? {
             let len = u16::decode(r)? as usize;
             if len > MAX_VALIDATOR_NETWORK_ADDR_LEN {
@@ -636,48 +517,31 @@ fn decode_validator_entry_fields(
             None
         };
         (network_addr, last_updated)
-    } else {
-        (None, None)
     };
-    let (
-        cold_hybrid_classical_pk,
-        cold_hybrid_pq_pk,
-        cold_key_version,
-        cold_key_status,
-        cold_nonce,
-    ) = if has_cold_keys {
-        let classical = if bool::decode(r)? {
-            Some(
-                r.read_bytes(32)?
-                    .try_into()
-                    .map_err(|_| IndraError::InvariantViolation {
-                        message: "invalid cold classical pk length in snapshot",
-                    })?,
-            )
-        } else {
-            None
-        };
-        let pq = if bool::decode(r)? {
-            Some(
-                r.read_bytes(indra_crypto::PQ_PK_BYTES)?
-                    .try_into()
-                    .map_err(|_| IndraError::InvariantViolation {
-                        message: "invalid cold PQ pk length in snapshot",
-                    })?,
-            )
-        } else {
-            None
-        };
-        (
-            classical,
-            pq,
-            u64::decode(r)?,
-            ColdKeyStatus::decode(r)?,
-            u64::decode(r)?,
+    let cold_hybrid_classical_pk = if bool::decode(r)? {
+        Some(
+            r.read_bytes(32)?
+                .try_into()
+                .map_err(|_| IndraError::InvariantViolation {
+                    message: "invalid cold classical pk length in snapshot",
+                })?,
         )
     } else {
-        (None, None, 0, ColdKeyStatus::Unenrolled, 0)
+        None
     };
+    let cold_hybrid_pq_pk = if bool::decode(r)? {
+        Some(
+            r.read_bytes(indra_crypto::PQ_PK_BYTES)?
+                .try_into()
+                .map_err(|_| IndraError::InvariantViolation {
+                    message: "invalid cold PQ pk length in snapshot",
+                })?,
+        )
+    } else {
+        None
+    };
+    let cold_key_version = u64::decode(r)?;
+    let cold_nonce = u64::decode(r)?;
 
     Ok(ValidatorEntry {
         validator_id,
@@ -702,26 +566,13 @@ fn decode_validator_entry_fields(
         cold_hybrid_classical_pk,
         cold_hybrid_pq_pk,
         cold_key_version,
-        cold_key_status,
         cold_nonce,
     })
 }
 
 impl ValidatorEntry {
-    /// True when the additive cold-key serialization tail must be present.
-    pub fn has_cold_key_state(&self) -> bool {
-        self.cold_hybrid_classical_pk.is_some()
-            || self.cold_hybrid_pq_pk.is_some()
-            || self.cold_key_version != 0
-            || self.cold_key_status != ColdKeyStatus::Unenrolled
-            || self.cold_nonce != 0
-    }
-
-    /// Append the canonical cold-key projection when it is non-default.
+    /// Append the canonical cold-key projection.
     pub(crate) fn append_cold_key_commitment(&self, value: &mut Vec<u8>) {
-        if !self.has_cold_key_state() {
-            return;
-        }
         value.extend_from_slice(b"INDRA-VALIDATOR-COLD-KEY-V1");
         value.push(u8::from(self.cold_hybrid_classical_pk.is_some()));
         if let Some(pk) = self.cold_hybrid_classical_pk {
@@ -732,7 +583,6 @@ impl ValidatorEntry {
             value.extend_from_slice(&pk);
         }
         value.extend_from_slice(&self.cold_key_version.to_le_bytes());
-        self.cold_key_status.encode(value);
         value.extend_from_slice(&self.cold_nonce.to_le_bytes());
     }
 
@@ -953,36 +803,6 @@ impl ValidatorSet {
         }
     }
 
-    /// Decode a legacy unversioned validator set.
-    pub fn decode_legacy(r: &mut ByteReader<'_>, schema_version: u8) -> IndraResult<Self> {
-        let count = u32::decode(r)? as usize;
-        if count > MAX_VALIDATORS {
-            return Err(IndraError::LengthExceeded {
-                field: "snapshot.validators",
-                max: MAX_VALIDATORS,
-                actual: count,
-            });
-        }
-        let mut set = Self::new();
-        for _ in 0..count {
-            let validator = if schema_version <= SCHEMA_VERSION_GENESIS {
-                ValidatorEntry::decode_legacy_v1(r)?
-            } else {
-                ValidatorEntry::decode_legacy_v2(r)?
-            };
-            if set
-                .validators
-                .insert(validator.validator_id, validator)
-                .is_some()
-            {
-                return Err(IndraError::DuplicateEntries {
-                    field: "snapshot.validators",
-                });
-            }
-        }
-        Ok(set)
-    }
-
     /// Number of validator registry entries across all lifecycle statuses.
     pub fn len(&self) -> usize {
         self.validators.len()
@@ -1013,8 +833,7 @@ impl ValidatorSet {
 
     /// Total self-stake eligible for selection under the rules at `height`.
     pub fn total_selectable_self_stake_at_height(&self, height: u64) -> u64 {
-        let cold_enforced =
-            indra_core::types::primitives::validator_cold_key_enforcement_active(height);
+        let _ = height;
         self.validators
             .values()
             .filter(|v| {
@@ -1022,7 +841,6 @@ impl ValidatorSet {
                     v.status,
                     ValidatorStatus::Active | ValidatorStatus::Registered
                 ) && v.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK
-                    && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
             })
             .fold(0u64, |acc, v| acc.saturating_add(v.stake_spark))
     }
@@ -1100,8 +918,7 @@ impl ValidatorSet {
         height: u64,
     ) {
         let max_active = max_active_validators(total_staked_spark);
-        let cold_enforced =
-            indra_core::types::primitives::validator_cold_key_enforcement_active(height);
+        let _ = height;
         let mut candidates: Vec<(Bytes32, u64)> = self
             .validators
             .values()
@@ -1110,7 +927,6 @@ impl ValidatorSet {
                     v.status,
                     ValidatorStatus::Active | ValidatorStatus::Registered
                 ) && v.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK
-                    && (!cold_enforced || v.cold_key_status == ColdKeyStatus::Active)
             })
             .map(|v| (v.validator_id, v.stake_spark))
             .collect();
@@ -1168,30 +984,22 @@ mod tests {
             cold_hybrid_classical_pk: None,
             cold_hybrid_pq_pk: None,
             cold_key_version: 0,
-            cold_key_status: ColdKeyStatus::Unenrolled,
             cold_nonce: 0,
         }
     }
 
     #[test]
-    fn validator_cold_fields_roundtrip_and_unenrolled_bytes_stay_legacy() {
-        let unenrolled = make_validator(1, 10_000, 2);
-        let legacy_bytes = unenrolled.encode_to_vec();
-        assert_eq!(legacy_bytes[0], SCHEMA_VERSION);
-        assert_eq!(
-            ValidatorEntry::decode_exact(&legacy_bytes).unwrap(),
-            unenrolled
-        );
+    fn validator_cold_fields_roundtrip_in_canonical_format() {
+        let base = make_validator(1, 10_000, 2);
 
         let (classical, pq) = hybrid_components(0x41);
-        let mut active = unenrolled.clone();
+        let mut active = base;
         active.cold_hybrid_classical_pk = Some(classical);
         active.cold_hybrid_pq_pk = Some(pq);
         active.cold_key_version = 1;
-        active.cold_key_status = ColdKeyStatus::Active;
         active.cold_nonce = 7;
         let encoded = active.encode_to_vec();
-        assert_eq!(encoded[0], VALIDATOR_ENTRY_SCHEMA_VERSION_COLD_KEYS);
+        assert_eq!(encoded[0], VALIDATOR_ENTRY_FORMAT_VERSION);
         assert_eq!(ValidatorEntry::decode_exact(&encoded).unwrap(), active);
     }
 
@@ -1231,7 +1039,6 @@ mod tests {
         a.cold_hybrid_classical_pk = Some(cold_a_classical);
         a.cold_hybrid_pq_pk = Some(cold_a_pq);
         a.cold_key_version = 1;
-        a.cold_key_status = ColdKeyStatus::Active;
         let mut b = make_validator(2, 10_000, 0);
         let b_id = b.validator_id;
         let (hot_b_classical, hot_b_pq) = hybrid_components(0x41);
@@ -1259,7 +1066,6 @@ mod tests {
         a.cold_hybrid_classical_pk = Some(classical);
         a.cold_hybrid_pq_pk = Some(pq);
         a.cold_key_version = 1;
-        a.cold_key_status = ColdKeyStatus::Active;
         let b = make_validator(2, 10_000, 0);
         let b_id = b.validator_id;
         let mut set = ValidatorSet::new();
@@ -1355,16 +1161,6 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn validator_entry_v1_decodes_with_auto_delegate_none() {
-        let mut validator = make_validator(0x42, 10_000, 3);
-        validator.auto_delegate_to = Some(Bytes32::from([0x99; 32]));
-        let bytes = encode_legacy_validator_v1(&validator);
-        let decoded = ValidatorEntry::decode_exact(&bytes).unwrap();
-        assert_eq!(decoded.validator_id, validator.validator_id);
-        assert_eq!(decoded.last_active_epoch, validator.last_active_epoch);
-        assert_eq!(decoded.auto_delegate_to, None);
-    }
 
     #[test]
     fn validator_entry_v2_round_trips_with_auto_delegate_some() {
@@ -1388,34 +1184,6 @@ mod tests {
         assert_eq!(decoded.network_addr_last_updated_epoch, Some(7));
     }
 
-    #[test]
-    fn validator_entry_v3_decodes_network_address_defaults_none() {
-        let validator = make_validator(0x45, 10_000, 3);
-        let mut bytes = validator.encode_to_vec();
-        bytes[0] = SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS;
-        // v4 appends network_addr presence and last_updated presence booleans
-        // after the v3 layout. Removing them models a persisted v3 validator.
-        bytes.truncate(bytes.len() - 2);
-
-        let decoded = ValidatorEntry::decode_exact(&bytes).unwrap();
-        assert_eq!(decoded.validator_id, validator.validator_id);
-        assert_eq!(decoded.auto_delegate_to, None);
-        assert_eq!(decoded.network_addr, None);
-        assert_eq!(decoded.network_addr_last_updated_epoch, None);
-    }
-
-    #[test]
-    fn validator_entry_unsupported_version_errors_clearly() {
-        let err = ValidatorEntry::decode_exact(&[99]).unwrap_err();
-        assert!(matches!(
-            err,
-            IndraError::UnsupportedSchemaVersion {
-                struct_name: "ValidatorEntry",
-                version: 99,
-                max_supported: SCHEMA_VERSION
-            }
-        ));
-    }
 
     #[test]
     fn delegation_map_decode_rejects_excessive_delegator_count() {
@@ -1672,54 +1440,10 @@ pub struct StakeBondOutput {
 }
 
 impl StakeBondOutput {
-    /// Convert to a full `OutputV1` only when this legacy record retained a proof.
-    pub fn to_legacy_output(&self) -> Option<OutputV1> {
-        Some(OutputV1 {
-            value_spark: self.value_spark,
-            commitment: self.commitment,
-            owner_pubkey: self.owner_pubkey.clone()?,
-            range_proof: self.range_proof.clone()?,
-            lock_height: self.lock_height,
-        })
-    }
-
-    fn encode_legacy(&self, buf: &mut Vec<u8>) {
-        self.to_legacy_output()
-            .expect("legacy stake bond output must retain a range proof")
-            .encode(buf);
-    }
-
-    fn encode_compact(&self, buf: &mut Vec<u8>) {
-        self.value_spark.encode(buf);
-        self.commitment.encode(buf);
-        self.owner_pubkey
-            .as_ref()
-            .expect("range-proof-compact stake bond output must retain an owner pubkey")
-            .encode(buf);
-        self.lock_height.encode(buf);
-    }
-
     fn encode_fully_compact(&self, buf: &mut Vec<u8>) {
         self.value_spark.encode(buf);
         self.commitment.encode(buf);
         self.lock_height.encode(buf);
-    }
-
-    fn legacy_encoded_len(&self) -> usize {
-        self.to_legacy_output()
-            .expect("legacy stake bond output must retain a range proof")
-            .encoded_len()
-    }
-
-    fn compact_encoded_len(&self) -> usize {
-        self.value_spark.encoded_len()
-            + self.commitment.encoded_len()
-            + self
-                .owner_pubkey
-                .as_ref()
-                .expect("range-proof-compact stake bond output must retain an owner pubkey")
-                .encoded_len()
-            + self.lock_height.encoded_len()
     }
 
     fn fully_compact_encoded_len(&self) -> usize {
@@ -1741,30 +1465,11 @@ impl From<OutputV1> for StakeBondOutput {
     }
 }
 
-impl From<StakeBondOutput> for OutputV1 {
-    fn from(output: StakeBondOutput) -> Self {
-        output
-            .to_legacy_output()
-            .expect("cannot convert compact stake bond output into full OutputV1")
-    }
-}
-
 /// A UTXO that has been bonded as delegation stake.
 ///
 /// Active bonds earn rewards and count toward delegation totals. Unbonding
 /// bonds are retained until their release epoch, then restored as spendable
 /// UTXOs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StakeBondUnbondingPrecision {
-    /// Bond created before height-precise unbonding activated.
-    LegacyEpochOnly,
-    /// Bond created under the height-precise encoding family.
-    HeightPrecise {
-        /// Inclusion height of the operation that began unbonding.
-        unbonding_start_height: Option<u64>,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A UTXO-backed stake bond retained in canonical chain state.
 pub struct StakeBondEntry {
@@ -1780,8 +1485,8 @@ pub struct StakeBondEntry {
     pub bonded_epoch: u64,
     /// None while active; Some(epoch) while unbonding.
     pub unbonding_end_epoch: Option<u64>,
-    /// Bond-local unbonding precision, fixed permanently at bond creation.
-    pub unbonding_precision: StakeBondUnbondingPrecision,
+    /// Inclusion height of the operation that began unbonding.
+    pub unbonding_start_height: Option<u64>,
     /// Consensus owner role used when protocol code recreates this bond.
     pub custody_owner: StakeBondCustodyOwner,
     /// Original UTXO output metadata, needed to reinsert when unbonding completes.
@@ -1994,7 +1699,7 @@ impl Decode for StakeBondCustodyOwner {
 
 impl Encode for StakeBondEntry {
     fn encode(&self, buf: &mut Vec<u8>) {
-        self.encoding_marker().encode(buf);
+        STAKE_BOND_FORMAT_VERSION.encode(buf);
         self.utxo_id.encode(buf);
         self.validator_id.encode(buf);
         self.delegator_id.encode(buf);
@@ -2004,35 +1709,12 @@ impl Encode for StakeBondEntry {
         if let Some(epoch) = self.unbonding_end_epoch {
             epoch.encode(buf);
         }
-        if let StakeBondUnbondingPrecision::HeightPrecise {
-            unbonding_start_height,
-        } = self.unbonding_precision
-        {
-            unbonding_start_height.is_some().encode(buf);
-            if let Some(height) = unbonding_start_height {
-                height.encode(buf);
-            }
+        self.unbonding_start_height.is_some().encode(buf);
+        if let Some(height) = self.unbonding_start_height {
+            height.encode(buf);
         }
-        if self.has_explicit_custody_owner() {
-            self.custody_owner.encode(buf);
-        }
-        match self.encoding_marker() {
-            SCHEMA_VERSION
-            | STAKE_BOND_CUSTODY_LEGACY_MARKER
-            | STAKE_BOND_HEIGHT_LEGACY_MARKER
-            | STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER => self.original_output.encode_legacy(buf),
-            STAKE_BOND_COMPACT_MARKER
-            | STAKE_BOND_CUSTODY_COMPACT_MARKER
-            | STAKE_BOND_HEIGHT_COMPACT_MARKER
-            | STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER => self.original_output.encode_compact(buf),
-            STAKE_BOND_FULLY_COMPACT_MARKER
-            | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER
-            | STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER
-            | STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER => {
-                self.original_output.encode_fully_compact(buf)
-            }
-            _ => unreachable!("stake bond encoding marker is constrained"),
-        }
+        self.custody_owner.encode(buf);
+        self.original_output.encode_fully_compact(buf);
     }
 
     fn encoded_len(&self) -> usize {
@@ -2043,120 +1725,78 @@ impl Encode for StakeBondEntry {
             + self.bonded_epoch.encoded_len()
             + 1
             + self.unbonding_end_epoch.map(|_| 8).unwrap_or(0)
-            + match self.unbonding_precision {
-                StakeBondUnbondingPrecision::LegacyEpochOnly => 0,
-                StakeBondUnbondingPrecision::HeightPrecise {
-                    unbonding_start_height,
-                } => 1 + unbonding_start_height.map(|_| 8).unwrap_or(0),
-            }
-            + if self.has_explicit_custody_owner() {
-                33
-            } else {
-                0
-            }
-            + match self.encoding_marker() {
-                SCHEMA_VERSION
-                | STAKE_BOND_CUSTODY_LEGACY_MARKER
-                | STAKE_BOND_HEIGHT_LEGACY_MARKER
-                | STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER => {
-                    self.original_output.legacy_encoded_len()
-                }
-                STAKE_BOND_COMPACT_MARKER
-                | STAKE_BOND_CUSTODY_COMPACT_MARKER
-                | STAKE_BOND_HEIGHT_COMPACT_MARKER
-                | STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER => {
-                    self.original_output.compact_encoded_len()
-                }
-                STAKE_BOND_FULLY_COMPACT_MARKER
-                | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER
-                | STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER
-                | STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER => {
-                    self.original_output.fully_compact_encoded_len()
-                }
-                _ => unreachable!("stake bond encoding marker is constrained"),
-            }
+            + 1
+            + self.unbonding_start_height.map(|_| 8).unwrap_or(0)
+            + 33
+            + self.original_output.fully_compact_encoded_len()
     }
 }
 
 impl Decode for StakeBondEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let marker = u8::decode(r)?;
-        match marker {
-            SCHEMA_VERSION_GENESIS
-            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
-            | SCHEMA_VERSION => decode_stake_bond_entry_fields(r, None),
-            STAKE_BOND_COMPACT_MARKER => decode_compact_stake_bond_entry_fields(r),
-            STAKE_BOND_FULLY_COMPACT_MARKER => decode_fully_compact_stake_bond_entry_fields(r),
-            STAKE_BOND_CUSTODY_LEGACY_MARKER => {
-                decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::Legacy)
-            }
-            STAKE_BOND_CUSTODY_COMPACT_MARKER => {
-                decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::Compact)
-            }
-            STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
-                decode_stake_bond_entry_fields_with_custody(r, BondOutputShape::FullyCompact)
-            }
-            STAKE_BOND_HEIGHT_LEGACY_MARKER => {
-                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Legacy, false)
-            }
-            STAKE_BOND_HEIGHT_COMPACT_MARKER => {
-                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Compact, false)
-            }
-            STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER => {
-                decode_height_precise_stake_bond_entry_fields(
-                    r,
-                    BondOutputShape::FullyCompact,
-                    false,
-                )
-            }
-            STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER => {
-                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Legacy, true)
-            }
-            STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER => {
-                decode_height_precise_stake_bond_entry_fields(r, BondOutputShape::Compact, true)
-            }
-            STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER => {
-                decode_height_precise_stake_bond_entry_fields(
-                    r,
-                    BondOutputShape::FullyCompact,
-                    true,
-                )
-            }
-            other if r.remaining() == 0 => Err(unsupported_schema("StakeBondEntry", other)),
-            first_byte => decode_stake_bond_entry_fields(r, Some(first_byte)),
+        let version = u8::decode(r)?;
+        if version != STAKE_BOND_FORMAT_VERSION {
+            return Err(IndraError::UnsupportedSchemaVersion {
+                struct_name: "StakeBondEntry",
+                version,
+                max_supported: STAKE_BOND_FORMAT_VERSION,
+            });
         }
+        let utxo_id = Bytes32::decode(r)?;
+        let validator_id = Bytes32::decode(r)?;
+        let delegator_id = Bytes32::decode(r)?;
+        let amount_spark = u64::decode(r)?;
+        let bonded_epoch = u64::decode(r)?;
+        let unbonding_end_epoch = bool::decode(r)?.then(|| u64::decode(r)).transpose()?;
+        let unbonding_start_height = bool::decode(r)?.then(|| u64::decode(r)).transpose()?;
+        let custody_owner = StakeBondCustodyOwner::decode(r)?;
+        let original_output = StakeBondOutput {
+            value_spark: u64::decode(r)?,
+            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
+            owner_pubkey: None,
+            range_proof: None,
+            lock_height: u64::decode(r)?,
+        };
+        let bond = Self {
+            utxo_id,
+            validator_id,
+            delegator_id,
+            amount_spark,
+            bonded_epoch,
+            unbonding_end_epoch,
+            unbonding_start_height,
+            custody_owner,
+            original_output,
+        };
+        bond.validate_unbonding_precision()?;
+        Ok(bond)
     }
 }
 
 impl StakeBondEntry {
     /// Validate the bond-local relationship between unbonding height and epoch.
     pub fn validate_unbonding_precision(&self) -> IndraResult<()> {
-        match self.unbonding_precision {
-            StakeBondUnbondingPrecision::LegacyEpochOnly => Ok(()),
-            StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height,
-            } => {
-                if self.unbonding_end_epoch.is_some() != unbonding_start_height.is_some() {
-                    return Err(IndraError::InvariantViolation {
+        {
+            if self.unbonding_end_epoch.is_some() != self.unbonding_start_height.is_some() {
+                return Err(IndraError::InvariantViolation {
                         message: "height-precise stake bond must carry unbonding end epoch and start height together".into(),
                     });
-                }
-                if let (Some(end_epoch), Some(start_height)) =
-                    (self.unbonding_end_epoch, unbonding_start_height)
-                {
-                    let expected = crate::epoch::epoch_for_height(start_height)
-                        .checked_add(UNBONDING_PERIOD_EPOCHS)
-                        .ok_or_else(|| IndraError::InvariantViolation {
-                            message: "height-precise stake bond unbonding epoch overflow".into(),
-                        })?;
-                    if end_epoch != expected {
-                        return Err(IndraError::InvariantViolation {
+            }
+            if let (Some(end_epoch), Some(start_height)) =
+                (self.unbonding_end_epoch, self.unbonding_start_height)
+            {
+                let expected = crate::epoch::epoch_for_height(start_height)
+                    .checked_add(UNBONDING_PERIOD_EPOCHS)
+                    .ok_or_else(|| IndraError::InvariantViolation {
+                        message: "height-precise stake bond unbonding epoch overflow".into(),
+                    })?;
+                if end_epoch != expected {
+                    return Err(IndraError::InvariantViolation {
                             message: "height-precise stake bond unbonding end epoch does not match start height".into(),
                         });
-                    }
                 }
-                Ok(())
             }
+            Ok(())
         }
     }
 
@@ -2171,749 +1811,20 @@ impl StakeBondEntry {
                 "bond is already unbonding".into(),
             ));
         }
-        if matches!(
-            self.unbonding_precision,
-            StakeBondUnbondingPrecision::HeightPrecise { .. }
-        ) {
-            let expected = crate::epoch::epoch_for_height(current_height)
-                .checked_add(UNBONDING_PERIOD_EPOCHS)
-                .ok_or(StateError::InvariantViolation {
-                    message: "height-precise stake-bond unbonding epoch overflow",
-                })?;
-            if unbonding_end_epoch != expected {
-                return Err(StateError::InvariantViolation {
-                    message: "height-precise stake-bond unbonding end mismatch",
-                });
-            }
-            self.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: Some(current_height),
-            };
+        let expected = crate::epoch::epoch_for_height(current_height)
+            .checked_add(UNBONDING_PERIOD_EPOCHS)
+            .ok_or(StateError::InvariantViolation {
+                message: "height-precise stake-bond unbonding epoch overflow",
+            })?;
+        if unbonding_end_epoch != expected {
+            return Err(StateError::InvariantViolation {
+                message: "height-precise stake-bond unbonding end mismatch",
+            });
         }
+        self.unbonding_start_height = Some(current_height);
         self.unbonding_end_epoch = Some(unbonding_end_epoch);
         Ok(())
     }
-
-    fn encoding_marker(&self) -> u8 {
-        let explicit = self.has_explicit_custody_owner();
-        let height_precise = matches!(
-            self.unbonding_precision,
-            StakeBondUnbondingPrecision::HeightPrecise { .. }
-        );
-        match (
-            self.original_output.range_proof.is_some(),
-            self.original_output.owner_pubkey.is_some(),
-            explicit,
-            height_precise,
-        ) {
-            (true, true, false, false) => SCHEMA_VERSION,
-            (false, true, false, false) => STAKE_BOND_COMPACT_MARKER,
-            (false, false, false, false) => STAKE_BOND_FULLY_COMPACT_MARKER,
-            (true, true, true, false) => STAKE_BOND_CUSTODY_LEGACY_MARKER,
-            (false, true, true, false) => STAKE_BOND_CUSTODY_COMPACT_MARKER,
-            (false, false, true, false) => STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER,
-            (true, true, false, true) => STAKE_BOND_HEIGHT_LEGACY_MARKER,
-            (false, true, false, true) => STAKE_BOND_HEIGHT_COMPACT_MARKER,
-            (false, false, false, true) => STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER,
-            (true, true, true, true) => STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER,
-            (false, true, true, true) => STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER,
-            (false, false, true, true) => STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER,
-            (true, false, _, _) => {
-                panic!("stake bond cannot retain a range proof without an owner pubkey")
-            }
-        }
-    }
-
-    fn has_explicit_custody_owner(&self) -> bool {
-        self.custody_owner != StakeBondCustodyOwner::DelegatorIdentity(self.delegator_id)
-    }
-
-    /// Decode the legacy unversioned stake bond layout.
-    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        decode_stake_bond_entry_fields(r, None)
-    }
-}
-
-#[cfg(test)]
-mod stake_bond_entry_tests {
-    use super::*;
-    use indra_core::codec::Decode;
-    use indra_core::types::crypto::{CommitmentV1, HybridPubKey};
-    use indra_core::types::primitives::hard_forks::{
-        COMPACT_BOND_PUBKEY_OMISSION_HEIGHT, COMPACT_STAKE_BOND_HEIGHT,
-    };
-
-    fn output(byte: u8, proof_len: usize) -> OutputV1 {
-        OutputV1 {
-            value_spark: 1_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
-            },
-            owner_pubkey: HybridPubKey {
-                classical_pk: Bytes32::from([byte.wrapping_add(1); 32]),
-                pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(2); 2_592]).unwrap(),
-            },
-            range_proof: VariableBytes::from_slice(&vec![byte.wrapping_add(3); proof_len]).unwrap(),
-            lock_height: 17,
-        }
-    }
-
-    fn legacy_bond(byte: u8) -> StakeBondEntry {
-        StakeBondEntry::new(
-            Bytes32::from([byte; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            3,
-            output(byte, 674),
-            COMPACT_STAKE_BOND_HEIGHT.saturating_sub(1),
-        )
-    }
-
-    fn compact_bond(byte: u8) -> StakeBondEntry {
-        StakeBondEntry::new(
-            Bytes32::from([byte; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            3,
-            output(byte, 674),
-            COMPACT_STAKE_BOND_HEIGHT,
-        )
-    }
-
-    fn fully_compact_bond(byte: u8) -> StakeBondEntry {
-        StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
-            Bytes32::from([byte; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            3,
-            output(byte, 674),
-            20,
-            10,
-            20,
-        )
-    }
-
-    fn encode_old_layout(bond: &StakeBondEntry) -> Vec<u8> {
-        let mut buf = Vec::new();
-        SCHEMA_VERSION.encode(&mut buf);
-        bond.utxo_id.encode(&mut buf);
-        bond.validator_id.encode(&mut buf);
-        bond.delegator_id.encode(&mut buf);
-        bond.amount_spark.encode(&mut buf);
-        bond.bonded_epoch.encode(&mut buf);
-        bond.unbonding_end_epoch.is_some().encode(&mut buf);
-        if let Some(epoch) = bond.unbonding_end_epoch {
-            epoch.encode(&mut buf);
-        }
-        bond.original_output
-            .to_legacy_output()
-            .unwrap()
-            .encode(&mut buf);
-        buf
-    }
-
-    fn encode_range_proof_compact_layout(bond: &StakeBondEntry) -> Vec<u8> {
-        let mut buf = Vec::new();
-        STAKE_BOND_COMPACT_MARKER.encode(&mut buf);
-        bond.utxo_id.encode(&mut buf);
-        bond.validator_id.encode(&mut buf);
-        bond.delegator_id.encode(&mut buf);
-        bond.amount_spark.encode(&mut buf);
-        bond.bonded_epoch.encode(&mut buf);
-        bond.unbonding_end_epoch.is_some().encode(&mut buf);
-        if let Some(epoch) = bond.unbonding_end_epoch {
-            epoch.encode(&mut buf);
-        }
-        bond.original_output.value_spark.encode(&mut buf);
-        bond.original_output.commitment.encode(&mut buf);
-        bond.original_output
-            .owner_pubkey
-            .as_ref()
-            .unwrap()
-            .encode(&mut buf);
-        bond.original_output.lock_height.encode(&mut buf);
-        buf
-    }
-
-    fn encode_existing_marker_layout_manually(bond: &StakeBondEntry, marker: u8) -> Vec<u8> {
-        let mut buf = Vec::new();
-        marker.encode(&mut buf);
-        bond.utxo_id.encode(&mut buf);
-        bond.validator_id.encode(&mut buf);
-        bond.delegator_id.encode(&mut buf);
-        bond.amount_spark.encode(&mut buf);
-        bond.bonded_epoch.encode(&mut buf);
-        bond.unbonding_end_epoch.is_some().encode(&mut buf);
-        if let Some(epoch) = bond.unbonding_end_epoch {
-            epoch.encode(&mut buf);
-        }
-        if matches!(
-            marker,
-            STAKE_BOND_CUSTODY_LEGACY_MARKER
-                | STAKE_BOND_CUSTODY_COMPACT_MARKER
-                | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER
-        ) {
-            bond.custody_owner.encode(&mut buf);
-        }
-        match marker {
-            SCHEMA_VERSION | STAKE_BOND_CUSTODY_LEGACY_MARKER => {
-                bond.original_output.encode_legacy(&mut buf)
-            }
-            STAKE_BOND_COMPACT_MARKER | STAKE_BOND_CUSTODY_COMPACT_MARKER => {
-                bond.original_output.encode_compact(&mut buf)
-            }
-            STAKE_BOND_FULLY_COMPACT_MARKER | STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER => {
-                bond.original_output.encode_fully_compact(&mut buf)
-            }
-            _ => unreachable!(),
-        }
-        buf
-    }
-
-    #[test]
-    fn legacy_stake_bond_encoding_is_byte_identical() {
-        let bond = legacy_bond(0x11);
-        assert!(bond.original_output.range_proof.is_some());
-        assert!(bond.original_output.owner_pubkey.is_some());
-        let encoded = bond.encode_to_vec();
-        assert_eq!(encoded, encode_old_layout(&bond));
-        let decoded = StakeBondEntry::decode(&mut ByteReader::new(&encoded)).unwrap();
-        assert_eq!(decoded, bond);
-        assert_eq!(decoded.encode_to_vec(), encoded);
-    }
-
-    #[test]
-    fn compact_stake_bond_encoding_omits_range_proof_and_round_trips() {
-        let bond = compact_bond(0x12);
-        assert!(bond.original_output.range_proof.is_none());
-        assert!(bond.original_output.owner_pubkey.is_some());
-        let encoded = bond.encode_to_vec();
-        assert_eq!(encoded[0], STAKE_BOND_COMPACT_MARKER);
-        assert_eq!(encoded, encode_range_proof_compact_layout(&bond));
-        assert_eq!(
-            encoded.len(),
-            encode_old_layout(&legacy_bond(0x12)).len() - (4 + 674)
-        );
-        let decoded = StakeBondEntry::decode(&mut ByteReader::new(&encoded)).unwrap();
-        assert_eq!(decoded, bond);
-        assert_eq!(decoded.encode_to_vec(), encoded);
-    }
-
-    #[test]
-    fn fully_compact_bond_encoding_omits_range_proof_and_owner_pubkey_and_round_trips() {
-        let bond = fully_compact_bond(0x16);
-        assert!(bond.original_output.range_proof.is_none());
-        assert!(bond.original_output.owner_pubkey.is_none());
-        let encoded = bond.encode_to_vec();
-        assert_eq!(encoded[0], STAKE_BOND_FULLY_COMPACT_MARKER);
-        assert_eq!(
-            encoded.len(),
-            encode_old_layout(&legacy_bond(0x16)).len() - (4 + 674) - (4 + 2_624)
-        );
-        let decoded = StakeBondEntry::decode(&mut ByteReader::new(&encoded)).unwrap();
-        assert_eq!(decoded, bond);
-        assert_eq!(decoded.encode_to_vec(), encoded);
-    }
-
-    #[test]
-    fn mutating_legacy_bond_after_compact_activation_keeps_stored_proof() {
-        let mut bond = legacy_bond(0x13);
-        let before = bond.original_output.range_proof.clone();
-        bond.amount_spark = bond.amount_spark.saturating_sub(25);
-        bond.unbonding_end_epoch = Some(99);
-        assert_eq!(bond.original_output.range_proof, before);
-        let decoded = StakeBondEntry::decode(&mut ByteReader::new(&bond.encode_to_vec())).unwrap();
-        assert_eq!(decoded.original_output.range_proof, before);
-    }
-
-    #[test]
-    fn compact_bond_measured_encoding_saves_range_proof_payload_and_length_prefix() {
-        let legacy = legacy_bond(0x14);
-        let compact = compact_bond(0x14);
-        assert_eq!(
-            legacy.encoded_len().saturating_sub(compact.encoded_len()),
-            4 + 674
-        );
-    }
-
-    #[test]
-    fn fully_compact_bond_measured_encoding_saves_range_proof_and_owner_pubkey() {
-        let legacy = legacy_bond(0x15);
-        let range_only = compact_bond(0x15);
-        let fully_compact = fully_compact_bond(0x15);
-        assert_eq!(
-            legacy
-                .encoded_len()
-                .saturating_sub(range_only.encoded_len()),
-            678
-        );
-        assert_eq!(
-            range_only
-                .encoded_len()
-                .saturating_sub(fully_compact.encoded_len()),
-            2_628
-        );
-        assert_eq!(
-            legacy
-                .encoded_len()
-                .saturating_sub(fully_compact.encoded_len()),
-            3_306
-        );
-    }
-
-    #[test]
-    fn fully_compact_bond_scale_savings_capacity_curve() {
-        let legacy = legacy_bond(0x17).encoded_len();
-        let fully_compact = fully_compact_bond(0x17).encoded_len();
-        let per_bond = legacy.saturating_sub(fully_compact);
-        assert_eq!(per_bond, 3_306);
-        for bonds in [1_000_000usize, 10_000_000, 150_000_000] {
-            assert_eq!(
-                legacy
-                    .saturating_mul(bonds)
-                    .saturating_sub(fully_compact.saturating_mul(bonds)),
-                per_bond.saturating_mul(bonds)
-            );
-        }
-    }
-
-    #[test]
-    fn realistic_mixed_population_capacity_curve_matches_measured_bond_shapes() {
-        let legacy_bond_bytes = legacy_bond(0x18).encoded_len();
-        let range_compact_bond_bytes = compact_bond(0x18).encoded_len();
-        let fully_compact_bond_bytes = fully_compact_bond(0x18).encoded_len();
-        assert_eq!(
-            legacy_bond_bytes.saturating_sub(range_compact_bond_bytes),
-            678
-        );
-        assert_eq!(
-            range_compact_bond_bytes.saturating_sub(fully_compact_bond_bytes),
-            2_628
-        );
-        assert_eq!(
-            legacy_bond_bytes.saturating_sub(fully_compact_bond_bytes),
-            3_306
-        );
-
-        // Scenario: a network some time after both gates, with old legacy
-        // bonds draining, live range-proof-compact bonds still present, and
-        // most newly-created bonds fully compact.
-        const LEGACY_PCT: usize = 10;
-        const RANGE_COMPACT_PCT: usize = 30;
-        const FULLY_COMPACT_PCT: usize = 60;
-        assert_eq!(LEGACY_PCT + RANGE_COMPACT_PCT + FULLY_COMPACT_PCT, 100);
-
-        for bonds in [100_000usize, 1_000_000, 10_000_000] {
-            let legacy_count = bonds * LEGACY_PCT / 100;
-            let range_compact_count = bonds * RANGE_COMPACT_PCT / 100;
-            let fully_compact_count = bonds - legacy_count - range_compact_count;
-            let original_total = legacy_bond_bytes.saturating_mul(bonds);
-            let realistic_mixed_total = legacy_bond_bytes
-                .saturating_mul(legacy_count)
-                .saturating_add(range_compact_bond_bytes.saturating_mul(range_compact_count))
-                .saturating_add(fully_compact_bond_bytes.saturating_mul(fully_compact_count));
-            let theoretical_best_total = fully_compact_bond_bytes.saturating_mul(bonds);
-
-            assert!(realistic_mixed_total < original_total);
-            assert!(theoretical_best_total < realistic_mixed_total);
-            assert_eq!(
-                original_total.saturating_sub(realistic_mixed_total),
-                bonds.saturating_mul(2_187)
-            );
-            assert_eq!(
-                original_total.saturating_sub(theoretical_best_total),
-                bonds.saturating_mul(3_306)
-            );
-        }
-    }
-
-    #[test]
-    fn bond_shape_replay_is_deterministic_across_range_and_pubkey_omission_boundaries() {
-        fn replay() -> Vec<Vec<u8>> {
-            [
-                COMPACT_STAKE_BOND_HEIGHT - 1,
-                COMPACT_STAKE_BOND_HEIGHT,
-                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT - 1,
-                COMPACT_BOND_PUBKEY_OMISSION_HEIGHT,
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(index, height)| {
-                let byte = 0x30u8.wrapping_add(index as u8);
-                StakeBondEntry::new(
-                    Bytes32::from([byte; 32]),
-                    Bytes32::from([0xA0; 32]),
-                    Bytes32::from([0xD0; 32]),
-                    1_000,
-                    height,
-                    output(byte, 674),
-                    height,
-                )
-                .encode_to_vec()
-            })
-            .collect()
-        }
-
-        let first = replay();
-        let second = replay();
-        assert_eq!(first, second);
-        assert_eq!(first[0][0], SCHEMA_VERSION);
-        assert_eq!(first[1][0], STAKE_BOND_COMPACT_MARKER);
-        assert_eq!(first[2][0], STAKE_BOND_COMPACT_MARKER);
-        assert_eq!(first[3][0], STAKE_BOND_FULLY_COMPACT_MARKER);
-    }
-
-    #[test]
-    fn all_six_height_precise_bond_markers_round_trip() {
-        let cases = [
-            (false, false, STAKE_BOND_HEIGHT_LEGACY_MARKER),
-            (true, false, STAKE_BOND_HEIGHT_COMPACT_MARKER),
-            (true, true, STAKE_BOND_HEIGHT_FULLY_COMPACT_MARKER),
-            (false, false, STAKE_BOND_HEIGHT_CUSTODY_LEGACY_MARKER),
-            (true, false, STAKE_BOND_HEIGHT_CUSTODY_COMPACT_MARKER),
-            (true, true, STAKE_BOND_HEIGHT_CUSTODY_FULLY_COMPACT_MARKER),
-        ];
-        for (index, (compact, omit_key, expected_marker)) in cases.into_iter().enumerate() {
-            let height = 100;
-            let mut bond = StakeBondEntry::new_for_test_with_all_activations(
-                Bytes32::from([0x40 + index as u8; 32]),
-                Bytes32::from([0xA0; 32]),
-                Bytes32::from([0xD0; 32]),
-                1_000,
-                0,
-                output(0x50 + index as u8, 674),
-                height,
-                if compact { height } else { height + 1 },
-                if omit_key { height } else { height + 1 },
-                height,
-            );
-            if index >= 3 {
-                bond.custody_owner =
-                    StakeBondCustodyOwner::ValidatorColdIdentity(Bytes32::from([0xCC; 32]));
-            }
-            let encoded = bond.encode_to_vec();
-            assert_eq!(encoded[0], expected_marker);
-            assert_eq!(StakeBondEntry::decode_exact(&encoded).unwrap(), bond);
-        }
-    }
-
-    #[test]
-    fn every_existing_bond_marker_remains_byte_identical() {
-        let mut cases = vec![
-            legacy_bond(0x61),
-            compact_bond(0x62),
-            fully_compact_bond(0x63),
-        ];
-        for index in 0..3 {
-            let mut explicit = cases[index].clone();
-            explicit.custody_owner =
-                StakeBondCustodyOwner::ValidatorColdIdentity(Bytes32::from([0xC0; 32]));
-            cases.push(explicit);
-        }
-        let markers = [
-            SCHEMA_VERSION,
-            STAKE_BOND_COMPACT_MARKER,
-            STAKE_BOND_FULLY_COMPACT_MARKER,
-            STAKE_BOND_CUSTODY_LEGACY_MARKER,
-            STAKE_BOND_CUSTODY_COMPACT_MARKER,
-            STAKE_BOND_CUSTODY_FULLY_COMPACT_MARKER,
-        ];
-        for (bond, marker) in cases.iter().zip(markers) {
-            assert_eq!(bond.encoding_marker(), marker);
-            assert_eq!(
-                bond.encode_to_vec(),
-                encode_existing_marker_layout_manually(bond, marker)
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_height_precise_combinations_fail_closed_on_decode() {
-        let mut missing_end = StakeBondEntry::new_for_test_with_all_activations(
-            Bytes32::from([0x71; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            0,
-            output(0x71, 674),
-            100,
-            101,
-            101,
-            100,
-        );
-        missing_end.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
-            unbonding_start_height: Some(100),
-        };
-        assert!(StakeBondEntry::decode_exact(&missing_end.encode_to_vec()).is_err());
-
-        let mut wrong_end = missing_end;
-        wrong_end.unbonding_end_epoch = Some(UNBONDING_PERIOD_EPOCHS + 9);
-        assert!(StakeBondEntry::decode_exact(&wrong_end.encode_to_vec()).is_err());
-    }
-
-    #[test]
-    fn height_precision_capability_is_fixed_at_creation() {
-        let legacy = StakeBondEntry::new_for_test_with_all_activations(
-            Bytes32::from([0x72; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            0,
-            output(0x72, 674),
-            99,
-            1_000,
-            1_000,
-            100,
-        );
-        let precise = StakeBondEntry::new_for_test_with_all_activations(
-            Bytes32::from([0x73; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            0,
-            output(0x73, 674),
-            100,
-            1_000,
-            1_000,
-            100,
-        );
-        assert_eq!(
-            legacy.unbonding_precision,
-            StakeBondUnbondingPrecision::LegacyEpochOnly
-        );
-        assert_eq!(
-            precise.unbonding_precision,
-            StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: None
-            }
-        );
-    }
-
-    #[test]
-    fn begin_unbonding_populates_height_only_for_height_precise_bonds() {
-        let mut legacy = legacy_bond(0x74);
-        legacy
-            .begin_unbonding(123, UNBONDING_PERIOD_EPOCHS)
-            .unwrap();
-        assert_eq!(
-            legacy.unbonding_precision,
-            StakeBondUnbondingPrecision::LegacyEpochOnly
-        );
-
-        let mut precise = StakeBondEntry::new_for_test_with_all_activations(
-            Bytes32::from([0x75; 32]),
-            Bytes32::from([0xA0; 32]),
-            Bytes32::from([0xD0; 32]),
-            1_000,
-            0,
-            output(0x75, 674),
-            123,
-            1_000,
-            1_000,
-            100,
-        );
-        precise
-            .begin_unbonding(123, UNBONDING_PERIOD_EPOCHS)
-            .unwrap();
-        assert_eq!(
-            precise.unbonding_precision,
-            StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: Some(123)
-            }
-        );
-    }
-}
-
-fn decode_stake_bond_entry_fields(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<StakeBondEntry> {
-    let utxo_id = decode_bytes32_with_first(r, first_byte)?;
-    let validator_id = Bytes32::decode(r)?;
-    let delegator_id = Bytes32::decode(r)?;
-    Ok(StakeBondEntry {
-        utxo_id,
-        validator_id,
-        delegator_id,
-        amount_spark: u64::decode(r)?,
-        bonded_epoch: u64::decode(r)?,
-        unbonding_end_epoch: if bool::decode(r)? {
-            Some(u64::decode(r)?)
-        } else {
-            None
-        },
-        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-        custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
-        original_output: OutputV1::decode(r)?.into(),
-    })
-}
-
-fn decode_compact_stake_bond_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<StakeBondEntry> {
-    let utxo_id = Bytes32::decode(r)?;
-    let validator_id = Bytes32::decode(r)?;
-    let delegator_id = Bytes32::decode(r)?;
-    Ok(StakeBondEntry {
-        utxo_id,
-        validator_id,
-        delegator_id,
-        amount_spark: u64::decode(r)?,
-        bonded_epoch: u64::decode(r)?,
-        unbonding_end_epoch: if bool::decode(r)? {
-            Some(u64::decode(r)?)
-        } else {
-            None
-        },
-        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-        custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
-        original_output: StakeBondOutput {
-            value_spark: u64::decode(r)?,
-            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: Some(indra_core::types::crypto::HybridPubKey::decode(r)?),
-            range_proof: None,
-            lock_height: u64::decode(r)?,
-        },
-    })
-}
-
-fn decode_fully_compact_stake_bond_entry_fields(
-    r: &mut ByteReader<'_>,
-) -> IndraResult<StakeBondEntry> {
-    let utxo_id = Bytes32::decode(r)?;
-    let validator_id = Bytes32::decode(r)?;
-    let delegator_id = Bytes32::decode(r)?;
-    Ok(StakeBondEntry {
-        utxo_id,
-        validator_id,
-        delegator_id,
-        amount_spark: u64::decode(r)?,
-        bonded_epoch: u64::decode(r)?,
-        unbonding_end_epoch: if bool::decode(r)? {
-            Some(u64::decode(r)?)
-        } else {
-            None
-        },
-        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-        custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
-        original_output: StakeBondOutput {
-            value_spark: u64::decode(r)?,
-            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: None,
-            range_proof: None,
-            lock_height: u64::decode(r)?,
-        },
-    })
-}
-
-enum BondOutputShape {
-    Legacy,
-    Compact,
-    FullyCompact,
-}
-
-fn decode_stake_bond_entry_fields_with_custody(
-    r: &mut ByteReader<'_>,
-    shape: BondOutputShape,
-) -> IndraResult<StakeBondEntry> {
-    let utxo_id = Bytes32::decode(r)?;
-    let validator_id = Bytes32::decode(r)?;
-    let delegator_id = Bytes32::decode(r)?;
-    let amount_spark = u64::decode(r)?;
-    let bonded_epoch = u64::decode(r)?;
-    let unbonding_end_epoch = if bool::decode(r)? {
-        Some(u64::decode(r)?)
-    } else {
-        None
-    };
-    let custody_owner = StakeBondCustodyOwner::decode(r)?;
-    let original_output = match shape {
-        BondOutputShape::Legacy => OutputV1::decode(r)?.into(),
-        BondOutputShape::Compact => StakeBondOutput {
-            value_spark: u64::decode(r)?,
-            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: Some(indra_core::types::crypto::HybridPubKey::decode(r)?),
-            range_proof: None,
-            lock_height: u64::decode(r)?,
-        },
-        BondOutputShape::FullyCompact => StakeBondOutput {
-            value_spark: u64::decode(r)?,
-            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: None,
-            range_proof: None,
-            lock_height: u64::decode(r)?,
-        },
-    };
-    Ok(StakeBondEntry {
-        utxo_id,
-        validator_id,
-        delegator_id,
-        amount_spark,
-        bonded_epoch,
-        unbonding_end_epoch,
-        unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-        custody_owner,
-        original_output,
-    })
-}
-
-fn decode_height_precise_stake_bond_entry_fields(
-    r: &mut ByteReader<'_>,
-    shape: BondOutputShape,
-    explicit_custody: bool,
-) -> IndraResult<StakeBondEntry> {
-    let utxo_id = Bytes32::decode(r)?;
-    let validator_id = Bytes32::decode(r)?;
-    let delegator_id = Bytes32::decode(r)?;
-    let amount_spark = u64::decode(r)?;
-    let bonded_epoch = u64::decode(r)?;
-    let unbonding_end_epoch = if bool::decode(r)? {
-        Some(u64::decode(r)?)
-    } else {
-        None
-    };
-    let unbonding_start_height = if bool::decode(r)? {
-        Some(u64::decode(r)?)
-    } else {
-        None
-    };
-    let custody_owner = if explicit_custody {
-        StakeBondCustodyOwner::decode(r)?
-    } else {
-        StakeBondCustodyOwner::DelegatorIdentity(delegator_id)
-    };
-    let original_output = match shape {
-        BondOutputShape::Legacy => OutputV1::decode(r)?.into(),
-        BondOutputShape::Compact => StakeBondOutput {
-            value_spark: u64::decode(r)?,
-            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: Some(indra_core::types::crypto::HybridPubKey::decode(r)?),
-            range_proof: None,
-            lock_height: u64::decode(r)?,
-        },
-        BondOutputShape::FullyCompact => StakeBondOutput {
-            value_spark: u64::decode(r)?,
-            commitment: indra_core::types::crypto::CommitmentV1::decode(r)?,
-            owner_pubkey: None,
-            range_proof: None,
-            lock_height: u64::decode(r)?,
-        },
-    };
-    let bond = StakeBondEntry {
-        utxo_id,
-        validator_id,
-        delegator_id,
-        amount_spark,
-        bonded_epoch,
-        unbonding_end_epoch,
-        unbonding_precision: StakeBondUnbondingPrecision::HeightPrecise {
-            unbonding_start_height,
-        },
-        custody_owner,
-        original_output,
-    };
-    bond.validate_unbonding_precision()?;
-    Ok(bond)
 }
 
 impl StakeBondEntry {
@@ -2925,16 +1836,11 @@ impl StakeBondEntry {
         amount_spark: u64,
         bonded_epoch: u64,
         original_output: OutputV1,
-        current_height: u64,
+        _current_height: u64,
     ) -> Self {
         let mut original_output: StakeBondOutput = original_output.into();
-        if compact_stake_bond_active(current_height) {
-            original_output.range_proof = None;
-        }
-        if compact_bond_pubkey_omission_active(current_height) {
-            original_output.range_proof = None;
-            original_output.owner_pubkey = None;
-        }
+        original_output.range_proof = None;
+        original_output.owner_pubkey = None;
         Self {
             utxo_id,
             validator_id,
@@ -2942,13 +1848,7 @@ impl StakeBondEntry {
             amount_spark,
             bonded_epoch,
             unbonding_end_epoch: None,
-            unbonding_precision: if self_unstake_height_precision_active(current_height) {
-                StakeBondUnbondingPrecision::HeightPrecise {
-                    unbonding_start_height: None,
-                }
-            } else {
-                StakeBondUnbondingPrecision::LegacyEpochOnly
-            },
+            unbonding_start_height: None,
             custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
         }
@@ -2963,23 +1863,17 @@ impl StakeBondEntry {
         bonded_epoch: u64,
         original_output: OutputV1,
         current_height: u64,
-        compact_activation_height: u64,
+        _compact_activation_height: u64,
     ) -> Self {
-        let mut original_output: StakeBondOutput = original_output.into();
-        if current_height >= compact_activation_height {
-            original_output.range_proof = None;
-        }
-        Self {
+        Self::new(
             utxo_id,
             validator_id,
             delegator_id,
             amount_spark,
             bonded_epoch,
-            unbonding_end_epoch: None,
-            unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-            custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
             original_output,
-        }
+            current_height,
+        )
     }
 
     #[cfg(test)]
@@ -2991,44 +1885,10 @@ impl StakeBondEntry {
         bonded_epoch: u64,
         original_output: OutputV1,
         current_height: u64,
-        compact_activation_height: u64,
-        pubkey_omission_height: u64,
+        _compact_activation_height: u64,
+        _pubkey_omission_height: u64,
     ) -> Self {
-        let mut original_output: StakeBondOutput = original_output.into();
-        if current_height >= compact_activation_height {
-            original_output.range_proof = None;
-        }
-        if current_height >= pubkey_omission_height {
-            original_output.range_proof = None;
-            original_output.owner_pubkey = None;
-        }
-        Self {
-            utxo_id,
-            validator_id,
-            delegator_id,
-            amount_spark,
-            bonded_epoch,
-            unbonding_end_epoch: None,
-            unbonding_precision: StakeBondUnbondingPrecision::LegacyEpochOnly,
-            custody_owner: StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
-            original_output,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test_with_all_activations(
-        utxo_id: Bytes32,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-        bonded_epoch: u64,
-        original_output: OutputV1,
-        current_height: u64,
-        compact_activation_height: u64,
-        pubkey_omission_height: u64,
-        height_precision_activation_height: u64,
-    ) -> Self {
-        let mut bond = Self::new_for_test_with_compact_and_pubkey_activation(
+        Self::new(
             utxo_id,
             validator_id,
             delegator_id,
@@ -3036,15 +1896,61 @@ impl StakeBondEntry {
             bonded_epoch,
             original_output,
             current_height,
-            compact_activation_height,
-            pubkey_omission_height,
-        );
-        if current_height >= height_precision_activation_height {
-            bond.unbonding_precision = StakeBondUnbondingPrecision::HeightPrecise {
-                unbonding_start_height: None,
-            };
-        }
-        bond
+        )
+    }
+}
+
+#[cfg(test)]
+mod canonical_stake_bond_tests {
+    use super::*;
+    use indra_core::codec::{Decode, Encode};
+    use indra_core::types::crypto::{CommitmentV1, HybridPubKey};
+
+    fn bond() -> StakeBondEntry {
+        StakeBondEntry::new(
+            Bytes32::from([1; 32]),
+            Bytes32::from([2; 32]),
+            Bytes32::from([3; 32]),
+            1_000,
+            0,
+            OutputV1 {
+                value_spark: 1_000,
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::from([4; 32]),
+                },
+                owner_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from([5; 32]),
+                    pq_pk: VariableBytes::from_slice(&[6; 32]).unwrap(),
+                },
+                range_proof: VariableBytes::from_slice(&[7; 64]).unwrap(),
+                lock_height: 0,
+            },
+            1,
+        )
+    }
+
+    #[test]
+    fn canonical_stake_bond_roundtrips_and_omits_proof_and_pubkey() {
+        let bond = bond();
+        assert!(bond.original_output.range_proof.is_none());
+        assert!(bond.original_output.owner_pubkey.is_none());
+        let encoded = bond.encode_to_vec();
+        assert_eq!(encoded[0], STAKE_BOND_FORMAT_VERSION);
+        assert_eq!(StakeBondEntry::decode_exact(&encoded).unwrap(), bond);
+    }
+
+    #[test]
+    fn noncanonical_stake_bond_marker_fails_closed() {
+        let mut encoded = bond().encode_to_vec();
+        encoded[0] = u8::MAX;
+        assert!(StakeBondEntry::decode_exact(&encoded).is_err());
+    }
+
+    #[test]
+    fn unbonding_height_and_epoch_must_be_present_together() {
+        let mut malformed = bond();
+        malformed.unbonding_start_height = Some(300);
+        assert!(StakeBondEntry::decode_exact(&malformed.encode_to_vec()).is_err());
     }
 }
 

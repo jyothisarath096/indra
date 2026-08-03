@@ -109,10 +109,33 @@ pub fn default_governance_mempool_capacity() -> usize {
 impl NodeConfig {
     /// Create a default configuration for local testing.
     pub fn local_test(data_dir: PathBuf) -> Self {
+        let genesis_path = data_dir.join("genesis.toml");
+        std::fs::create_dir_all(&data_dir).expect("create local-test data directory");
+        if !genesis_path.exists() {
+            let hot = indra_crypto::HybridKeypair::new(
+                indra_crypto::ClassicalKeypair::from_seed(&[0x42; 32]),
+                indra_crypto::PqKeypair::from_seed(&[0x43; 32]).unwrap(),
+            );
+            let cold =
+                indra_crypto::ColdHybridKeypair::from_independent_seeds([0x44; 32], [0x45; 32])
+                    .unwrap();
+            let hot_public = hot.public_key();
+            let cold_public = cold.public_key();
+            let cold_public = cold_public.as_complete_hybrid();
+            let vrf_public = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]).public_key();
+            let validator_id = indra_crypto::sha256(&hot_public.classical.0);
+            let contents = format!(
+                "[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = \"1000000000000\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = \"1\"\ncold_nonce = \"0\"\n",
+                hex::encode(validator_id), hex::encode(hot_public.classical.0),
+                hex::encode(hot_public.pq.0), hex::encode(vrf_public),
+                hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
+            );
+            std::fs::write(&genesis_path, contents).expect("write local-test genesis");
+        }
         let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
         Self {
             data_dir,
-            genesis_path: None,
+            genesis_path: Some(genesis_path.to_string_lossy().to_string()),
             validator_seed: Some([0x42u8; 32]),
             vrf_seed: Some([0x42u8; 32]),
             pq_sk: None,

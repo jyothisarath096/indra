@@ -7,11 +7,11 @@ use crate::{
     types::{
         governance::GovernanceOpV2,
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
-            MAX_ACTIVE_VALIDATORS, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+            Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, MAX_ACTIVE_VALIDATORS,
+            MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
             MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
         },
-        slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1},
+        slashing::SlashEvidenceV2,
         staking::StakingOp,
         transaction::TransactionV1,
         vrf_election::VrfRevealEvidence,
@@ -150,7 +150,7 @@ impl Encode for BlockHeaderV1 {
 impl Decode for BlockHeaderV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let protocol_version = ProtocolVersion::decode(r)?;
-        if protocol_version.0 < crate::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET {
+        if protocol_version.0 != BLOCK_FORMAT_VERSION {
             return Err(crate::error::IndraError::UnsupportedVersion {
                 version: protocol_version.0,
             });
@@ -187,10 +187,8 @@ pub struct BlockV1 {
     pub header: BlockHeaderV1,
     /// Transactions (0–200).
     pub transactions: Vec<TransactionV1>,
-    /// Slash evidence (0–10).
-    pub slashing_evidence: Vec<SlashEvidenceV1>,
-    /// Versioned slash evidence used by protocol version 8 and later.
-    pub slashing_evidence_v2: Vec<SlashEvidenceEnvelopeV2>,
+    /// Membership-proven slash evidence (0–3).
+    pub slashing_evidence: Vec<SlashEvidenceV2>,
     /// Governance operations (0–5).
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Staking operations (0–10).
@@ -208,11 +206,7 @@ impl Encode for BlockV1 {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.header.encode(buf);
         encode_list(&self.transactions, buf);
-        if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP {
-            encode_list(&self.slashing_evidence_v2, buf);
-        } else {
-            encode_list(&self.slashing_evidence, buf);
-        }
+        encode_list(&self.slashing_evidence, buf);
         encode_list(&self.governance_ops, buf);
         encode_list(&self.staking_ops, buf);
         encode_list(&self.vrf_reveals, buf);
@@ -220,11 +214,7 @@ impl Encode for BlockV1 {
     fn encoded_len(&self) -> usize {
         self.header.encoded_len()
             + list_encoded_len(&self.transactions)
-            + if self.header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP {
-                list_encoded_len(&self.slashing_evidence_v2)
-            } else {
-                list_encoded_len(&self.slashing_evidence)
-            }
+            + list_encoded_len(&self.slashing_evidence)
             + list_encoded_len(&self.governance_ops)
             + list_encoded_len(&self.staking_ops)
             + list_encoded_len(&self.vrf_reveals)
@@ -234,25 +224,12 @@ impl Encode for BlockV1 {
 impl Decode for BlockV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let header = BlockHeaderV1::decode(r)?;
-        let use_slash_membership_body =
-            header.protocol_version.0 >= BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP;
         let transactions = decode_list(r, MAX_TX_PER_BLOCK, "transactions")?;
-        let (slashing_evidence, slashing_evidence_v2) = if use_slash_membership_body {
-            (
-                Vec::new(),
-                decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence_v2")?,
-            )
-        } else {
-            (
-                decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence")?,
-                Vec::new(),
-            )
-        };
+        let slashing_evidence = decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence")?;
         Ok(Self {
             header,
             transactions,
             slashing_evidence,
-            slashing_evidence_v2,
             governance_ops: decode_list(r, MAX_GOV_OPS_PER_BLOCK, "governance_ops")?,
             staking_ops: decode_list(r, MAX_STAKING_OPS_PER_BLOCK, "staking_ops")?,
             vrf_reveals: decode_list(r, MAX_ACTIVE_VALIDATORS, "vrf_reveals")?,
@@ -281,13 +258,6 @@ impl BlockV1 {
 mod tests {
     use super::*;
     use crate::codec::Decode;
-    use crate::types::primitives::{
-        BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
-        BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING,
-        BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT,
-        BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP, BLOCK_PROTOCOL_VERSION_REVEAL_SET,
-        BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT, BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
-    };
 
     fn dummy_header() -> BlockHeaderV1 {
         BlockHeaderV1 {
@@ -313,40 +283,6 @@ mod tests {
     fn header_round_trip() {
         let h = dummy_header();
         assert_eq!(h, BlockHeaderV1::decode_exact(&h.encode_to_vec()).unwrap());
-    }
-
-    #[test]
-    fn old_header_encoding_without_value_hash_and_polc_still_decodes() {
-        let h = dummy_header();
-        let mut legacy = Vec::new();
-        h.protocol_version.encode(&mut legacy);
-        h.height.encode(&mut legacy);
-        h.prev_hash.encode(&mut legacy);
-        h.timestamp.encode(&mut legacy);
-        h.state_root.encode(&mut legacy);
-        h.validator_set_root.encode(&mut legacy);
-        h.mempool_set_root.encode(&mut legacy);
-        h.base_fee.encode(&mut legacy);
-        h.proposer_round.encode(&mut legacy);
-        h.proposer_vrf_output.encode(&mut legacy);
-        h.proposer_vrf_proof.encode(&mut legacy);
-        h.quorum_certificate.encode(&mut legacy);
-
-        let decoded = BlockHeaderV1::decode_exact(&legacy).unwrap();
-        assert_eq!(decoded.protocol_version, h.protocol_version);
-        assert_eq!(decoded.height, h.height);
-        assert_eq!(decoded.prev_hash, h.prev_hash);
-        assert_eq!(decoded.timestamp, h.timestamp);
-        assert_eq!(decoded.state_root, h.state_root);
-        assert_eq!(decoded.validator_set_root, h.validator_set_root);
-        assert_eq!(decoded.mempool_set_root, h.mempool_set_root);
-        assert_eq!(decoded.value_hash, Bytes32::ZERO);
-        assert_eq!(decoded.base_fee, h.base_fee);
-        assert_eq!(decoded.proposer_round, h.proposer_round);
-        assert_eq!(decoded.proposer_vrf_output, h.proposer_vrf_output);
-        assert_eq!(decoded.proposer_vrf_proof, h.proposer_vrf_proof);
-        assert_eq!(decoded.quorum_certificate, h.quorum_certificate);
-        assert_eq!(decoded.polc_round, NO_POLC_ROUND);
     }
 
     #[test]
@@ -403,186 +339,10 @@ mod tests {
             header: dummy_header(),
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
         };
         assert_eq!(b, BlockV1::decode_exact(&b.encode_to_vec()).unwrap());
-    }
-
-    #[test]
-    fn protocol_v8_block_round_trips_versioned_slash_body() {
-        let mut header = dummy_header();
-        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP);
-        let block = BlockV1 {
-            header,
-            transactions: vec![],
-            slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            vrf_reveals: vec![],
-        };
-        assert_eq!(
-            BlockV1::decode_exact(&block.encode_to_vec()).unwrap(),
-            block
-        );
-    }
-
-    #[test]
-    fn version_seven_binary_rejects_slash_membership_version_at_header_decode() {
-        let mut header = dummy_header();
-        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP);
-        let bytes = header.encode_to_vec();
-        let mut reader = ByteReader::new(&bytes);
-        let version = reader.read_u16_le().unwrap();
-        assert!(version > BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP);
-        assert_eq!(
-            Err::<(), _>(crate::error::IndraError::UnsupportedVersion { version }),
-            Err(crate::error::IndraError::UnsupportedVersion {
-                version: BLOCK_PROTOCOL_VERSION_SLASH_MEMBERSHIP,
-            })
-        );
-        assert_eq!(BlockHeaderV1::decode_exact(&bytes).unwrap(), header);
-    }
-
-    #[test]
-    fn old_binary_decode_rejects_post_activation_block() {
-        let mut h = dummy_header();
-        h.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_REVEAL_SET);
-        let legacy_body = BlockV1 {
-            header: h.clone(),
-            transactions: vec![],
-            slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            vrf_reveals: vec![],
-        };
-        let mut bytes = Vec::new();
-        h.encode(&mut bytes);
-        encode_list(&legacy_body.transactions, &mut bytes);
-        encode_list(&legacy_body.slashing_evidence, &mut bytes);
-        encode_list(&legacy_body.governance_ops, &mut bytes);
-        encode_list(&legacy_body.staking_ops, &mut bytes);
-
-        assert!(
-            BlockV1::decode_exact(&bytes).is_err(),
-            "post-activation block protocol version must not decode without the reveal evidence body field"
-        );
-    }
-
-    #[test]
-    fn reveal_only_binary_rejects_consensus_snapshot_version_at_header_decode() {
-        fn decode_as_reveal_only_binary(bytes: &[u8]) -> crate::error::IndraResult<()> {
-            let mut reader = ByteReader::new(bytes);
-            let version = reader.read_u16_le()?;
-            if version != crate::types::primitives::PROTOCOL_VERSION
-                && version != BLOCK_PROTOCOL_VERSION_REVEAL_SET
-            {
-                return Err(crate::error::IndraError::UnsupportedVersion { version });
-            }
-            Ok(())
-        }
-
-        let mut header = dummy_header();
-        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT);
-        let bytes = header.encode_to_vec();
-
-        assert_eq!(
-            decode_as_reveal_only_binary(&bytes),
-            Err(crate::error::IndraError::UnsupportedVersion {
-                version: BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT,
-            }),
-            "the pre-snapshot binary's strict version allow-list must reject cleanly at header decode"
-        );
-        assert_eq!(
-            BlockHeaderV1::decode_exact(&bytes).unwrap(),
-            header,
-            "the upgraded binary must decode the same version-3 header"
-        );
-    }
-
-    #[test]
-    fn version_three_binary_rejects_height_precision_version_at_header_decode() {
-        fn decode_as_version_three_binary(bytes: &[u8]) -> crate::error::IndraResult<()> {
-            let mut reader = ByteReader::new(bytes);
-            let version = reader.read_u16_le()?;
-            if version != crate::types::primitives::PROTOCOL_VERSION
-                && version != crate::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET
-                && version != BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
-            {
-                return Err(crate::error::IndraError::UnsupportedVersion { version });
-            }
-            Ok(())
-        }
-
-        let mut header = dummy_header();
-        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT);
-        let bytes = header.encode_to_vec();
-        assert_eq!(
-            decode_as_version_three_binary(&bytes),
-            Err(crate::error::IndraError::UnsupportedVersion {
-                version: BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT,
-            })
-        );
-        assert_eq!(BlockHeaderV1::decode_exact(&bytes).unwrap(), header);
-    }
-
-    #[test]
-    fn version_four_binary_rejects_epoch_transition_version_at_header_decode() {
-        fn decode_as_version_four_binary(bytes: &[u8]) -> crate::error::IndraResult<()> {
-            let mut reader = ByteReader::new(bytes);
-            let version = reader.read_u16_le()?;
-            if version != crate::types::primitives::PROTOCOL_VERSION
-                && version != crate::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET
-                && version != BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
-                && version != BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
-            {
-                return Err(crate::error::IndraError::UnsupportedVersion { version });
-            }
-            Ok(())
-        }
-
-        let mut header = dummy_header();
-        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT);
-        let bytes = header.encode_to_vec();
-        assert_eq!(
-            decode_as_version_four_binary(&bytes),
-            Err(crate::error::IndraError::UnsupportedVersion {
-                version: BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT,
-            })
-        );
-        assert_eq!(BlockHeaderV1::decode_exact(&bytes).unwrap(), header);
-    }
-
-    #[test]
-    fn version_six_binary_rejects_live_bond_cap_version_at_header_decode() {
-        fn decode_as_version_six_binary(bytes: &[u8]) -> crate::error::IndraResult<()> {
-            let mut reader = ByteReader::new(bytes);
-            let version = reader.read_u16_le()?;
-            if version != crate::types::primitives::PROTOCOL_VERSION
-                && version != crate::types::primitives::BLOCK_PROTOCOL_VERSION_REVEAL_SET
-                && version != BLOCK_PROTOCOL_VERSION_CONSENSUS_SNAPSHOT
-                && version != BLOCK_PROTOCOL_VERSION_SELF_UNSTAKE_HEIGHT
-                && version != BLOCK_PROTOCOL_VERSION_EPOCH_TRANSITION_CONTEXT
-                && version != BLOCK_PROTOCOL_VERSION_DELEGATOR_BOND_ACCOUNTING
-            {
-                return Err(crate::error::IndraError::UnsupportedVersion { version });
-            }
-            Ok(())
-        }
-
-        let mut header = dummy_header();
-        header.protocol_version = ProtocolVersion(BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP);
-        let bytes = header.encode_to_vec();
-        assert_eq!(
-            decode_as_version_six_binary(&bytes),
-            Err(crate::error::IndraError::UnsupportedVersion {
-                version: BLOCK_PROTOCOL_VERSION_LIVE_BOND_COUNT_CAP,
-            })
-        );
-        assert_eq!(BlockHeaderV1::decode_exact(&bytes).unwrap(), header);
     }
 }

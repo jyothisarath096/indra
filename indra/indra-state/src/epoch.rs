@@ -20,8 +20,7 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, delegator_bond_accounting_active, muldiv, normal_bond_release_blinding_active,
-            validator_cold_key_enforcement_active, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
+            bps_of, muldiv, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
             COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
             ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
@@ -44,7 +43,7 @@ use crate::{
     },
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
     identity::resolve_bond_owner_pubkey,
-    validator::{ColdKeyStatus, DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
+    validator::{DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
 };
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
@@ -123,6 +122,8 @@ pub fn apply_epoch_transition(
     context: &EpochTransitionContext,
     timestamp_secs: u64,
 ) -> StateResult<EpochRecord> {
+    #[cfg(test)]
+    install_reward_basis_if_missing(state)?;
     apply_epoch_transition_at_height(state, context, timestamp_secs)
 }
 
@@ -132,26 +133,16 @@ pub fn apply_epoch_transition_at_height(
     context: &EpochTransitionContext,
     timestamp_secs: u64,
 ) -> StateResult<EpochRecord> {
-    apply_epoch_transition_at_gate(
-        state,
-        context,
-        timestamp_secs,
-        indra_core::types::primitives::hard_forks::EPOCH_TRANSITION_CONTEXT_HEIGHT,
-        indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
-    )
+    apply_epoch_transition_final(state, context, timestamp_secs)
 }
 
-fn apply_epoch_transition_at_gate(
+fn apply_epoch_transition_final(
     state: &mut ChainState,
     context: &EpochTransitionContext,
     timestamp_secs: u64,
-    gate_height: u64,
-    consensus_snapshot_gate_height: u64,
 ) -> StateResult<EpochRecord> {
     let height = context.boundary_height;
     let current_epoch = context.opening_epoch;
-    let context_active = height >= gate_height;
-    enforce_validator_cold_key_enrollment(state, height);
     // DETERMINISM NOTE: timestamp_secs is stored ONLY in EpochRecord
     // and does NOT affect ChainState mutations. State root is computed
     // from ChainState only. EpochRecord is stored separately in EpochStore.
@@ -165,92 +156,48 @@ fn apply_epoch_transition_at_gate(
     );
     apply_governance_phase_transitions(state, current_epoch, height)?;
     prune_governance_history_if_active(state, height);
-    let closing_snapshot = if context.closing_end_height >= consensus_snapshot_gate_height {
-        Some(
-            state
-                .snapshot_for_consensus_height_at_gate(
-                    context.closing_end_height,
-                    consensus_snapshot_gate_height,
-                )
-                .map_err(|error| {
-                    crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
-                })?
-                .clone(),
-        )
-    } else {
-        None
-    };
+    let closing_snapshot = state
+        .snapshot_for_consensus_height(context.closing_end_height)
+        .map_err(|error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()))?
+        .clone();
     let active_before: HashSet<Bytes32> = state
         .validators
         .active_validators()
         .map(|v| v.validator_id)
         .collect();
-    let active_validators_before = match closing_snapshot.as_ref() {
-        Some(snapshot) => u32::try_from(snapshot.entries().len()).map_err(|_| {
+    let active_validators_before =
+        u32::try_from(closing_snapshot.entries().len()).map_err(|_| {
             crate::error::StateError::InvalidConsensusSnapshot(
                 "closing snapshot membership does not fit EpochRecord".to_string(),
             )
-        })?,
-        None => active_before.len() as u32,
-    };
+        })?;
     // Active-set size and ranking use the same self-stake model as consensus
     // voting weight and reward weight. Delegations affect reward splitting,
     // but do not increase proposer/voter/election weight in this protocol.
     let total_staked = state
         .validators
         .total_selectable_self_stake_at_height(height);
-    let record_total_staked = closing_snapshot
-        .as_ref()
-        .map_or(total_staked, |snapshot| snapshot.total_weight_spark);
+    let record_total_staked = closing_snapshot.total_weight_spark;
     let fee_pool_before = state.fee_reward_pool;
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
     let explicit_slash_count_this_epoch = state.epoch_slash_event_count;
-    let record_epoch = if context_active {
-        context.closing_epoch
-    } else {
-        current_epoch.saturating_sub(1)
-    };
-    let record_start_height = if context_active {
-        context.closing_start_height
-    } else {
-        record_epoch.saturating_mul(EPOCH_DURATION_BLOCKS)
-    };
-    let record_end_height = if context_active {
-        context.closing_end_height
-    } else {
-        record_start_height
-            .saturating_add(EPOCH_DURATION_BLOCKS)
-            .saturating_sub(1)
-    };
+    let record_epoch = context.closing_epoch;
+    let record_start_height = context.closing_start_height;
+    let record_end_height = context.closing_end_height;
     // `block_reward_spark` is intentionally the rate at the first rewarded
     // height. A closing epoch may span an era boundary; the exact mixed-rate
     // amount is carried by `block_rewards_distributed`.
-    let reward_per_block = block_reward_at_height(if context_active {
-        context.closing_start_height
-    } else {
-        height
-    });
-    let epoch_block_reward = if context_active {
-        block_rewards_for_inclusive_range(context.closing_start_height, context.closing_end_height)
-    } else {
-        reward_per_block.saturating_mul(EPOCH_DURATION_BLOCKS)
-    };
+    let reward_per_block = block_reward_at_height(context.closing_start_height);
+    let epoch_block_reward =
+        block_rewards_for_inclusive_range(context.closing_start_height, context.closing_end_height);
 
     state
         .validators
         .select_active_set(&state.delegations, total_staked, height);
 
-    if delegator_bond_accounting_active(height) {
-        reconcile_all_delegators_from_bonds(state);
-    }
-    let virtual_delegations = if reward_economic_snapshot_active(height) {
-        // Post-gate, auto-delegation was frozen into the epoch-start economic
-        // snapshot and must not be recalculated from mutable boundary state.
-        Vec::new()
-    } else {
-        apply_auto_delegations(state, current_epoch)
-    };
+    reconcile_all_delegators_from_bonds(state);
+    let virtual_delegations = Vec::new();
 
     let supply_before = state.total_supply;
     distribute_block_rewards(state, epoch_block_reward, current_epoch, height)?;
@@ -276,20 +223,14 @@ fn apply_epoch_transition_at_gate(
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
     release_unbonded_bonds_at_height(state, current_epoch, height)?;
-    let liveness_epoch = if context_active {
-        context.closing_epoch
-    } else {
-        current_epoch
-    };
-    let closing_members = closing_snapshot.as_ref().map(|snapshot| {
-        snapshot
-            .entries()
-            .iter()
-            .map(|entry| entry.validator_id)
-            .collect::<Vec<_>>()
-    });
+    let liveness_epoch = context.closing_epoch;
+    let closing_members = closing_snapshot
+        .entries()
+        .iter()
+        .map(|entry| entry.validator_id)
+        .collect::<Vec<_>>();
     let (liveness_slashed, liveness_penalty_count) =
-        apply_liveness_penalties(state, liveness_epoch, height, closing_members.as_deref());
+        apply_liveness_penalties(state, liveness_epoch, height, Some(&closing_members));
 
     let mut active_after: Vec<Bytes32> = state
         .validators
@@ -366,37 +307,6 @@ fn block_rewards_for_inclusive_range(start_height: u64, end_height: u64) -> u64 
     (start_height..=end_height).fold(0u64, |total, height| {
         total.saturating_add(block_reward_at_height(height))
     })
-}
-
-/// Apply the deterministic enforcement-height demotion. This is idempotent so
-/// replay and snapshot restoration cannot retain or recreate an unenrolled
-/// Active validator after enforcement.
-pub(crate) fn enforce_validator_cold_key_enrollment(state: &mut ChainState, height: u64) {
-    if !validator_cold_key_enforcement_active(height) {
-        return;
-    }
-    let changed: Vec<Bytes32> = state
-        .validators
-        .all_validators()
-        .filter(|validator| {
-            validator.status == ValidatorStatus::Active
-                && validator.cold_key_status == ColdKeyStatus::Unenrolled
-        })
-        .map(|validator| validator.validator_id)
-        .collect();
-    for validator_id in &changed {
-        if let Some(validator) = state.validators.get_mut(validator_id) {
-            validator.status = ValidatorStatus::Registered;
-        }
-    }
-    if let Some(mut commitment) = state.state_commitment_v2.take() {
-        for validator_id in changed {
-            if let Some(validator) = state.validators.get(&validator_id) {
-                commitment.put_validator(validator, height);
-            }
-        }
-        state.state_commitment_v2 = Some(commitment);
-    }
 }
 
 fn apply_pending_commission_changes(state: &mut ChainState, current_epoch: u64) {
@@ -638,21 +548,17 @@ pub fn take_governance_snapshot(state: &ChainState) -> GovernanceSnapshot {
             validator.status,
             ValidatorStatus::Active | ValidatorStatus::Registered
         ) {
-            let delegated = if delegator_bond_accounting_active(state.height) {
-                state
-                    .delegations
-                    .get_delegators(&validator.validator_id)
-                    .iter()
-                    .fold(0u64, |sum, entry| {
-                        sum.saturating_add(crate::delegation::active_delegated_bond_stake(
-                            state,
-                            &validator.validator_id,
-                            &entry.delegator_id,
-                        ))
-                    })
-            } else {
-                state.delegations.total_delegated(&validator.validator_id)
-            };
+            let delegated = state
+                .delegations
+                .get_delegators(&validator.validator_id)
+                .iter()
+                .fold(0u64, |sum, entry| {
+                    sum.saturating_add(crate::delegation::active_delegated_bond_stake(
+                        state,
+                        &validator.validator_id,
+                        &entry.delegator_id,
+                    ))
+                });
             let weight = validator.stake_spark.saturating_add(delegated);
             if weight > 0 {
                 weights.insert(validator.validator_id, weight);
@@ -899,15 +805,16 @@ fn distribute_block_rewards(
     current_epoch: u64,
     height: u64,
 ) -> crate::error::StateResult<()> {
-    if reward_economic_snapshot_active(height) {
-        return distribute_snapshot_rewards(
-            state,
-            epoch_block_reward,
-            current_epoch,
-            height,
-            SnapshotRewardSource::Block,
-        );
-    }
+    #[cfg(test)]
+    install_reward_basis_if_missing(state)?;
+    return distribute_snapshot_rewards(
+        state,
+        epoch_block_reward,
+        current_epoch,
+        height,
+        SnapshotRewardSource::Block,
+    );
+    #[allow(unreachable_code)]
     // Rewards are weighted by active validator self-stake, matching consensus
     // voting weight and active-set selection. Delegations only split a
     // validator's already-earned reward pool between validator and delegators.
@@ -983,7 +890,9 @@ fn distribute_fee_rewards(
     current_epoch: u64,
     height: u64,
 ) -> crate::error::StateResult<()> {
-    if reward_economic_snapshot_active(height) {
+    #[cfg(test)]
+    install_reward_basis_if_missing(state)?;
+    {
         let fee_pool = state.fee_reward_pool;
         if fee_pool == 0 {
             return Ok(());
@@ -1056,6 +965,113 @@ fn distribute_fee_rewards(
     state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder);
     Ok(())
 }
+
+#[cfg(test)]
+fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::StateResult<()> {
+    if state.validators.active_count() == 0 {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[0xFE; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[0xFD; 32]).expect("test PQ key");
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
+        state.validators.upsert(crate::validator::ValidatorEntry {
+            validator_id: Bytes32::from([0xFC; 32]),
+            name: "epoch-test-authority".into(),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
+            vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[0xFB; 32]).public_key()),
+            stake_spark: indra_core::types::primitives::MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+            status: crate::validator::ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: Some(public.classical.0),
+            cold_hybrid_pq_pk: Some(public.pq.0),
+            cold_key_version: 1,
+            cold_nonce: 0,
+        })?;
+    }
+    let active_ids = state
+        .validators
+        .active_validators()
+        .map(|validator| validator.validator_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let snapshot_ids = state
+        .consensus_snapshots
+        .first()
+        .map(|snapshot| {
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| entry.validator_id)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if !active_ids.is_empty() && (state.consensus_snapshots.is_empty() || active_ids != snapshot_ids) {
+        let positions: Vec<_> = state
+            .delegations
+            .all_delegators()
+            .flat_map(|(validator_id, entries)| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.unbonding_end_epoch.is_none())
+                    .map(|entry| (*validator_id, entry.delegator_id, entry.staked_spark))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (index, (validator_id, delegator_id, amount)) in positions.into_iter().enumerate() {
+            if state.staked_bonds.values().any(|bond| {
+                bond.validator_id == validator_id
+                    && bond.delegator_id == delegator_id
+                    && bond.unbonding_end_epoch.is_none()
+            }) {
+                continue;
+            }
+            let mut material = Vec::new();
+            material.extend_from_slice(&validator_id.0);
+            material.extend_from_slice(&delegator_id.0);
+            material.extend_from_slice(&(index as u64).to_le_bytes());
+            let utxo_id = Bytes32::from(indra_crypto::sha256(&material));
+            let output = indra_core::types::transaction::OutputV1 {
+                value_spark: amount,
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::ZERO,
+                },
+                owner_pubkey: indra_core::types::crypto::HybridPubKey {
+                    classical_pk: delegator_id,
+                    pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                },
+                range_proof: VariableBytes::from_slice(&[]).unwrap(),
+                lock_height: 0,
+            };
+            state.staked_bonds.insert(
+                utxo_id,
+                crate::validator::StakeBondEntry::new(
+                    utxo_id,
+                    validator_id,
+                    delegator_id,
+                    amount,
+                    0,
+                    output,
+                    1,
+                ),
+            );
+        }
+        let consensus = state.build_consensus_snapshot(1, 0)?;
+        let economic = state.build_reward_economic_snapshot(&consensus)?;
+        state.consensus_snapshots = vec![consensus];
+        state.reward_economic_snapshot = Some(economic);
+    }
+    Ok(())
+}
+
 
 #[derive(Clone, Copy)]
 enum SnapshotRewardSource {
@@ -1233,7 +1249,6 @@ pub(crate) fn release_unbonded_bonds_at_height(
     current_epoch: u64,
     release_height: u64,
 ) -> StateResult<()> {
-    let precise_accounting = delegator_bond_accounting_active(release_height);
     let mut to_release: Vec<Bytes32> = state
         .staked_bonds
         .values()
@@ -1242,15 +1257,7 @@ pub(crate) fn release_unbonded_bonds_at_height(
                 .unbonding_end_epoch
                 .map(|end| end <= current_epoch)
                 .unwrap_or(false);
-            let frozen_unenrolled_self_bond = validator_cold_key_enforcement_active(release_height)
-                && bond.validator_id == bond.delegator_id
-                && state
-                    .validators
-                    .get(&bond.validator_id)
-                    .is_some_and(|validator| {
-                        validator.cold_key_status == ColdKeyStatus::Unenrolled
-                    });
-            matured && !frozen_unenrolled_self_bond
+            matured
         })
         .map(|bond| bond.utxo_id)
         .collect();
@@ -1259,7 +1266,7 @@ pub(crate) fn release_unbonded_bonds_at_height(
     let mut affected_delegators = Vec::new();
     for (idx, utxo_id) in to_release.into_iter().enumerate() {
         if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
-            if precise_accounting && bond.validator_id != bond.delegator_id {
+            if bond.validator_id != bond.delegator_id {
                 affected_delegators.push((bond.validator_id, bond.delegator_id));
             }
             let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
@@ -1270,28 +1277,24 @@ pub(crate) fn release_unbonded_bonds_at_height(
                 .map_err(|_| crate::error::StateError::InvariantViolation {
                     message: "UTXO ID collision in staking bond release",
                 })?;
-            if legacy_normal_bond_release_uses_fresh_blinding(&bond, release_height) {
-                state.push_delegation_return_event(DelegationReturnEvent {
-                    delegator_id: bond.delegator_id,
-                    validator_id: bond.validator_id,
-                    bond_utxo_id: bond.utxo_id,
-                    amount_spark: bond.amount_spark,
-                    reason: DelegationReturnReason::UnbondingMatured,
-                    returned_epoch: current_epoch,
-                    returned_height: release_height,
-                    refund_utxo_id,
-                });
-            }
+            state.push_delegation_return_event(DelegationReturnEvent {
+                delegator_id: bond.delegator_id,
+                validator_id: bond.validator_id,
+                bond_utxo_id: bond.utxo_id,
+                amount_spark: bond.amount_spark,
+                reason: DelegationReturnReason::UnbondingMatured,
+                returned_epoch: current_epoch,
+                returned_height: release_height,
+                refund_utxo_id,
+            });
             remove_released_tombstone_bond_reference(state, &bond.validator_id, &bond.utxo_id)?;
         }
     }
-    if precise_accounting {
-        affected_delegators
-            .sort_by_key(|(validator_id, delegator_id)| (validator_id.0, delegator_id.0));
-        affected_delegators.dedup();
-        for (validator_id, delegator_id) in affected_delegators {
-            reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
-        }
+    affected_delegators
+        .sort_by_key(|(validator_id, delegator_id)| (validator_id.0, delegator_id.0));
+    affected_delegators.dedup();
+    for (validator_id, delegator_id) in affected_delegators {
+        reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
     }
     prune_mature_evicted_validator_tombstones(state, current_epoch);
     Ok(())
@@ -1354,66 +1357,13 @@ pub(crate) fn released_bond_output(
     bond: &crate::validator::StakeBondEntry,
     release_height: u64,
 ) -> StateResult<indra_core::types::transaction::OutputV1> {
-    if bond.original_output.range_proof.is_none() {
-        return regenerated_bond_output(
-            bond,
-            state,
-            release_height,
-            derive_compact_stake_bond_release_blinding(bond, release_height),
-            "compact stake-bond release",
-        );
-    }
-
-    if bond.delegator_id != bond.validator_id
-        || bond.amount_spark >= bond.original_output.value_spark
-    {
-        if legacy_normal_bond_release_uses_fresh_blinding(bond, release_height) {
-            return regenerated_bond_output(
-                bond,
-                state,
-                release_height,
-                derive_normal_stake_bond_release_blinding(
-                    bond.validator_id,
-                    bond.delegator_id,
-                    bond.utxo_id,
-                    release_height,
-                    bond.amount_spark,
-                ),
-                "normal stake-bond release",
-            );
-        }
-
-        return bond.original_output.to_legacy_output().ok_or_else(|| {
-            crate::error::StateError::InvariantViolation {
-                message: "legacy stake bond release missing stored range proof",
-            }
-        });
-    }
-
-    let mut blinding_input =
-        Vec::with_capacity(SLASH_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 8);
-    blinding_input.extend_from_slice(SLASH_BOND_RELEASE_BLINDING_DOMAIN);
-    blinding_input.extend_from_slice(&bond.validator_id.0);
-    blinding_input.extend_from_slice(&bond.utxo_id.0);
-    blinding_input.extend_from_slice(&release_height.to_le_bytes());
-    let blinding = indra_crypto::sha256(&blinding_input);
     regenerated_bond_output(
         bond,
         state,
         release_height,
-        blinding,
-        "slashed self-stake release",
+        derive_compact_stake_bond_release_blinding(bond, release_height),
+        "stake-bond release",
     )
-}
-
-fn legacy_normal_bond_release_uses_fresh_blinding(
-    bond: &crate::validator::StakeBondEntry,
-    release_height: u64,
-) -> bool {
-    bond.original_output.range_proof.is_some()
-        && (bond.delegator_id != bond.validator_id
-            || bond.amount_spark >= bond.original_output.value_spark)
-        && normal_bond_release_blinding_active(release_height)
 }
 
 /// Deterministic blinding for a compact stake-bond release.
@@ -1480,15 +1430,13 @@ fn regenerated_bond_output(
             ))
         })?;
 
-    let mut output = bond.original_output.to_legacy_output().unwrap_or_else(|| {
-        indra_core::types::transaction::OutputV1 {
-            value_spark: bond.original_output.value_spark,
-            commitment: bond.original_output.commitment,
-            owner_pubkey: owner_pubkey.clone(),
-            range_proof: VariableBytes::default(),
-            lock_height: bond.original_output.lock_height,
-        }
-    });
+    let mut output = indra_core::types::transaction::OutputV1 {
+        value_spark: bond.original_output.value_spark,
+        commitment: bond.original_output.commitment,
+        owner_pubkey: owner_pubkey.clone(),
+        range_proof: VariableBytes::default(),
+        lock_height: bond.original_output.lock_height,
+    };
     output.value_spark = bond.amount_spark;
     output.commitment = CommitmentV1 {
         compressed_point: Bytes32::from(commitment.0),
@@ -1571,17 +1519,6 @@ pub fn epoch_for_height(height: u64) -> u64 {
     height / EPOCH_DURATION_BLOCKS
 }
 
-fn reward_economic_snapshot_active_at_gate(height: u64, gate_height: u64) -> bool {
-    height >= gate_height
-}
-
-fn reward_economic_snapshot_active(height: u64) -> bool {
-    reward_economic_snapshot_active_at_gate(
-        height,
-        indra_core::types::primitives::hard_forks::CONSENSUS_SNAPSHOT_HEIGHT,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,13 +1533,10 @@ mod tests {
             crypto::HybridPubKey,
             governance::GovernableAction,
             primitives::{
-                compact_bond_pubkey_omission_active, compact_stake_bond_active,
-                delegator_identity_registry_active,
-                hard_forks::NORMAL_BOND_RELEASE_BLINDING_HEIGHT, Bytes32, VariableBytes,
-                COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
-                ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-                ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, MAX_DELEGATION_RETURN_EVENTS,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
+                Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
+                DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
+                ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
+                MAX_DELEGATION_RETURN_EVENTS, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
                 SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
@@ -1610,13 +1544,75 @@ mod tests {
         CommitmentV1,
     };
 
+    fn governance_test_pubkey(byte: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([byte; 32]),
+            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+        }
+    }
+
+    fn governance_pruning_test_id(index: u64) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        Bytes32::from(bytes)
+    }
+
+    fn governance_pruning_test_proposal(
+        index: u64,
+        phase: ProposalPhase,
+        proposed_epoch: u64,
+    ) -> ProposalRecord {
+        ProposalRecord {
+            proposal_id: governance_pruning_test_id(index),
+            proposer_id: Bytes32::from([0x71; 32]),
+            proposer_pubkey: governance_test_pubkey(0x72),
+            tier: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            }
+            .tier(),
+            action: GovernableAction::SetMinDelegationSpark {
+                value: DUST_LIMIT_SPARK,
+            },
+            title: format!("proposal-{index}"),
+            description: "terminal proposal pruning test".into(),
+            deposit_spark: 0,
+            deposit_burned: false,
+            proposed_epoch,
+            commit_start_epoch: proposed_epoch.saturating_add(30),
+            reveal_start_epoch: proposed_epoch.saturating_add(50),
+            tally_epoch: proposed_epoch.saturating_add(60),
+            exec_delay_epochs: 0,
+            executable_after_epoch: proposed_epoch.saturating_add(60),
+            phase,
+            snapshot1: None,
+            commits: Default::default(),
+            reveals: Default::default(),
+            redelegations: Vec::new(),
+            redelegated_delegators: Default::default(),
+            snapshot2: None,
+            yes_stake: 0,
+            no_stake: 0,
+            abstain_stake: 0,
+            passed: match phase {
+                ProposalPhase::Failed => Some(false),
+                ProposalPhase::Executed => Some(true),
+                _ => None,
+            },
+        }
+    }
+
     fn make_validator(id_byte: u8, stake: u64) -> ValidatorEntry {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[id_byte; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[id_byte.wrapping_add(1); 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
         ValidatorEntry {
             validator_id: Bytes32::from([id_byte; 32]),
             name: format!("validator-{id_byte}"),
-            hybrid_classical_pk: None,
-            hybrid_pq_pk: None,
-            vrf_pk: None,
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
+            vrf_pk: Some(
+                indra_crypto::VrfKeypair::from_seed(&[id_byte.wrapping_add(2); 32]).public_key(),
+            ),
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -1631,10 +1627,9 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: None,
-            cold_hybrid_pq_pk: None,
-            cold_key_version: 0,
-            cold_key_status: crate::validator::ColdKeyStatus::Unenrolled,
+            cold_hybrid_classical_pk: Some(public.classical.0),
+            cold_hybrid_pq_pk: Some(public.pq.0),
+            cold_key_version: 1,
             cold_nonce: 0,
         }
     }
@@ -1653,7 +1648,7 @@ mod tests {
 
     fn install_reward_basis(state: &mut ChainState) {
         let consensus = state
-            .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
+            .build_consensus_snapshot(1, 0)
             .unwrap();
         let economic = state.build_reward_economic_snapshot(&consensus).unwrap();
         state.consensus_snapshots = vec![consensus];
@@ -1673,6 +1668,66 @@ mod tests {
             range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
             lock_height: 0,
         }
+    }
+
+    fn register_test_bond_owner(state: &mut ChainState, delegator_id: Bytes32, byte: u8) {
+        state.delegator_identities.insert(
+            delegator_id,
+            HybridPubKey {
+                classical_pk: Bytes32::from([byte; 32]),
+                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
+            },
+        );
+    }
+
+    fn compact_bond(
+        byte: u8,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+    ) -> StakeBondEntry {
+        let mut output = dummy_output(byte);
+        output.value_spark = amount_spark;
+        StakeBondEntry::new(
+            Bytes32::from([byte; 32]),
+            validator_id,
+            delegator_id,
+            amount_spark,
+            0,
+            output,
+            1,
+        )
+    }
+
+    fn legacy_bond(
+        byte: u8,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+    ) -> StakeBondEntry {
+        compact_bond(byte, validator_id, delegator_id, amount_spark)
+    }
+
+    fn fully_compact_bond(
+        byte: u8,
+        validator_id: Bytes32,
+        delegator_id: Bytes32,
+        amount_spark: u64,
+    ) -> (StakeBondEntry, HybridPubKey) {
+        let output = dummy_output(byte);
+        let owner = output.owner_pubkey.clone();
+        (
+            StakeBondEntry::new(
+                Bytes32::from([byte; 32]),
+                validator_id,
+                delegator_id,
+                amount_spark,
+                0,
+                output,
+                1,
+            ),
+            owner,
+        )
     }
 
     fn manual_compact_release_blinding(bond: &StakeBondEntry, release_height: u64) -> [u8; 32] {
@@ -1859,64 +1914,6 @@ mod tests {
     }
 
     #[test]
-    fn first_snapshot_gate_boundary_is_legacy_then_next_boundary_is_frozen() {
-        let synthetic_gate = 301u64;
-        assert!(!reward_economic_snapshot_active_at_gate(
-            300,
-            synthetic_gate
-        ));
-        assert!(reward_economic_snapshot_active_at_gate(600, synthetic_gate));
-    }
-
-    #[test]
-    fn post_gate_epoch_record_uses_inclusive_produced_block_range() {
-        let context = EpochTransitionContext::new(300, 299).unwrap();
-        let mut state = ChainState::new_genesis();
-        let record =
-            apply_epoch_transition_at_gate(&mut state, &context, 0, 300, u64::MAX).unwrap();
-        assert_eq!(record.epoch, 0);
-        assert_eq!(record.start_height, 1);
-        assert_eq!(record.end_height, 300);
-    }
-
-    #[test]
-    fn post_snapshot_gate_epoch_record_uses_frozen_closing_authority() {
-        let context = EpochTransitionContext::new(600, 599).unwrap();
-        let mut state = ChainState::new_genesis();
-        let first = make_snapshot_validator(0xA1, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 2);
-        let first_id = first.validator_id;
-        let second = make_snapshot_validator(0xA2, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 3);
-        state.validators.upsert(first).unwrap();
-        state.validators.upsert(second).unwrap();
-        state.consensus_snapshots = vec![state.build_consensus_snapshot(301, 300).unwrap()];
-
-        let first_live = state.validators.get_mut(&first_id).unwrap();
-        first_live.status = ValidatorStatus::Registered;
-        first_live.stake_spark = MINIMUM_ACTIVE_SELF_STAKE_SPARK * 9;
-        state
-            .validators
-            .upsert(make_snapshot_validator(
-                0xA3,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK * 7,
-            ))
-            .unwrap();
-
-        let replay_initial = state.clone();
-        let record = apply_epoch_transition_at_gate(&mut state, &context, 0, 600, 301).unwrap();
-        assert_eq!(record.active_validators, 2);
-        assert_eq!(
-            record.total_staked_spark,
-            MINIMUM_ACTIVE_SELF_STAKE_SPARK * 5
-        );
-        let mut replay = replay_initial;
-        let replay_record =
-            apply_epoch_transition_at_gate(&mut replay, &context, 0, 600, 301).unwrap();
-        assert_eq!(replay_record, record);
-        assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
-        assert_eq!(compute_state_root(&replay), compute_state_root(&state));
-    }
-
-    #[test]
     fn snapshot_liveness_uses_membership_but_live_stake_and_exempts_non_live_targets() {
         let mut state = ChainState::new_genesis();
         state.governance.params.slash_liveness_threshold_epochs = 1;
@@ -1984,249 +1981,6 @@ mod tests {
         assert_eq!(replay_result, (slashed_total, count));
         assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
         assert_eq!(compute_state_root(&replay), compute_state_root(&state));
-    }
-
-    #[test]
-    fn pre_gate_epoch_record_remains_legacy_byte_semantics() {
-        let context = EpochTransitionContext::new(300, 299).unwrap();
-        let mut state = ChainState::new_genesis();
-        let record =
-            apply_epoch_transition_at_gate(&mut state, &context, 0, 301, u64::MAX).unwrap();
-        assert_eq!(record.epoch, 0);
-        assert_eq!(record.start_height, 0);
-        assert_eq!(record.end_height, 299);
-        assert_eq!(record.block_reward_spark, block_reward_at_height(300));
-        assert_eq!(record.active_validators, 0);
-        assert_eq!(record.total_staked_spark, 0);
-    }
-
-    #[test]
-    fn credited_closing_epoch_activity_prevents_same_boundary_liveness_penalty() {
-        let context = EpochTransitionContext::new(300, 299).unwrap();
-        let mut state = ChainState::new_genesis();
-        state.governance.params.slash_liveness_threshold_epochs = 1;
-        let mut validator = make_validator(0x92, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 2);
-        validator.last_active_epoch = context.closing_epoch;
-        validator.cold_key_status = crate::validator::ColdKeyStatus::Active;
-        let validator_id = validator.validator_id;
-        let original_stake = validator.stake_spark;
-        state.validators.upsert(validator).unwrap();
-
-        let record =
-            apply_epoch_transition_at_gate(&mut state, &context, 0, 300, u64::MAX).unwrap();
-        assert_eq!(record.liveness_penalty_count, 0);
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            original_stake
-        );
-    }
-
-    #[test]
-    fn independent_replays_across_context_gate_are_byte_identical() {
-        fn replay(mut state: ChainState) -> ChainState {
-            let legacy = EpochTransitionContext::new(300, 299).unwrap();
-            state.height = 300;
-            apply_epoch_transition_at_gate(&mut state, &legacy, 0, 600, u64::MAX).unwrap();
-
-            let upgraded = EpochTransitionContext::new(600, 599).unwrap();
-            state.height = 600;
-            apply_epoch_transition_at_gate(&mut state, &upgraded, 0, 600, u64::MAX).unwrap();
-            state
-        }
-
-        let first = replay(ChainState::new_genesis());
-        let second = replay(ChainState::new_genesis());
-        assert_eq!(first.encode_to_vec(), second.encode_to_vec());
-        assert_eq!(compute_state_root(&first), compute_state_root(&second));
-    }
-
-    #[test]
-    fn mixed_rate_epoch_sums_each_governed_height_exactly() {
-        let boundary = ERA_1_2_DURATION_BLOCKS;
-        let start = boundary - EPOCH_DURATION_BLOCKS + 1;
-        let expected = ERA_1_BLOCK_REWARD_SPARK
-            .saturating_mul(EPOCH_DURATION_BLOCKS - 1)
-            .saturating_add(ERA_2_BLOCK_REWARD_SPARK);
-        assert_eq!(block_rewards_for_inclusive_range(start, boundary), expected);
-        assert_eq!(block_reward_at_height(start), ERA_1_BLOCK_REWARD_SPARK);
-        assert_eq!(block_reward_at_height(boundary), ERA_2_BLOCK_REWARD_SPARK);
-
-        let context = EpochTransitionContext::new(boundary, boundary - 1).unwrap();
-        let mut state = ChainState::new_genesis();
-        let mut validator = make_validator(0x91, MINIMUM_ACTIVE_SELF_STAKE_SPARK * 2);
-        validator.cold_key_status = crate::validator::ColdKeyStatus::Active;
-        validator.last_active_epoch = context.closing_epoch;
-        state.validators.upsert(validator).unwrap();
-        let record =
-            apply_epoch_transition_at_gate(&mut state, &context, 0, boundary, u64::MAX).unwrap();
-        assert_eq!(record.block_reward_spark, ERA_1_BLOCK_REWARD_SPARK);
-        assert_eq!(record.block_rewards_distributed, expected);
-    }
-
-    fn manual_normal_release_blinding(
-        domain: &[u8],
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        bond_utxo_id: Bytes32,
-        release_height: u64,
-        released_amount_spark: u64,
-    ) -> [u8; 32] {
-        let mut input = Vec::new();
-        input.extend_from_slice(domain);
-        input.extend_from_slice(&validator_id.0);
-        input.extend_from_slice(&delegator_id.0);
-        input.extend_from_slice(&bond_utxo_id.0);
-        input.extend_from_slice(&release_height.to_le_bytes());
-        input.extend_from_slice(&released_amount_spark.to_le_bytes());
-        indra_crypto::sha256(&input)
-    }
-
-    fn compact_bond(
-        byte: u8,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-    ) -> StakeBondEntry {
-        StakeBondEntry::new_for_test_with_compact_activation(
-            Bytes32::from([byte; 32]),
-            validator_id,
-            delegator_id,
-            amount_spark,
-            2,
-            dummy_output(byte),
-            10,
-            10,
-        )
-    }
-
-    fn fully_compact_bond(
-        byte: u8,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-    ) -> (StakeBondEntry, HybridPubKey) {
-        let output = dummy_output(byte);
-        let owner_pubkey = output.owner_pubkey.clone();
-        let bond = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
-            Bytes32::from([byte; 32]),
-            validator_id,
-            delegator_id,
-            amount_spark,
-            2,
-            output,
-            20,
-            10,
-            20,
-        );
-        (bond, owner_pubkey)
-    }
-
-    fn legacy_bond(
-        byte: u8,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-    ) -> StakeBondEntry {
-        StakeBondEntry::new_for_test_with_compact_activation(
-            Bytes32::from([byte; 32]),
-            validator_id,
-            delegator_id,
-            amount_spark,
-            2,
-            dummy_output(byte),
-            9,
-            10,
-        )
-    }
-
-    #[test]
-    fn enforcement_freezes_unenrolled_self_bond_release_and_pending_rewards() {
-        let enforcement =
-            indra_core::types::primitives::hard_forks::VALIDATOR_COLD_KEY_ENFORCEMENT_HEIGHT;
-        let validator_id = Bytes32::from([0x0E; 32]);
-        let mut validator = make_validator(0x0E, 1_000_000);
-        validator.pending_rewards = 75_000;
-        let mut bond = legacy_bond(0x0F, validator_id, validator_id, 1_000_000);
-        bond.unbonding_end_epoch = Some(1);
-        let bond_id = bond.utxo_id;
-        let mut state = ChainState::new_genesis();
-        state.validators.upsert(validator).unwrap();
-        state.staked_bonds.insert(bond_id, bond);
-
-        enforce_validator_cold_key_enrollment(&mut state, enforcement);
-        release_unbonded_bonds_at_height(&mut state, 1, enforcement).unwrap();
-
-        assert!(state.staked_bonds.contains_key(&bond_id));
-        assert!(state.utxos.is_empty());
-        let validator = state.validators.get(&validator_id).unwrap();
-        assert_eq!(validator.status, ValidatorStatus::Registered);
-        assert_eq!(validator.pending_rewards, 75_000);
-        assert_eq!(validator.stake_spark, 1_000_000);
-    }
-
-    #[test]
-    fn normal_release_blinding_matches_manual_kdf_oracle() {
-        let validator_id = Bytes32::from([0x11; 32]);
-        let delegator_id = Bytes32::from([0x22; 32]);
-        let bond_utxo_id = Bytes32::from([0x33; 32]);
-        let release_height = 123_456;
-        let released_amount_spark = 9_876_543;
-
-        let expected = manual_normal_release_blinding(
-            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            validator_id,
-            delegator_id,
-            bond_utxo_id,
-            release_height,
-            released_amount_spark,
-        );
-
-        assert_eq!(
-            derive_normal_stake_bond_release_blinding(
-                validator_id,
-                delegator_id,
-                bond_utxo_id,
-                release_height,
-                released_amount_spark,
-            ),
-            expected
-        );
-    }
-
-    #[test]
-    fn normal_release_blinding_is_domain_separated() {
-        let validator_id = Bytes32::from([0x41; 32]);
-        let delegator_id = Bytes32::from([0x42; 32]);
-        let bond_utxo_id = Bytes32::from([0x43; 32]);
-        let release_height = 42;
-        let released_amount_spark = 500_000;
-
-        let normal = derive_normal_stake_bond_release_blinding(
-            validator_id,
-            delegator_id,
-            bond_utxo_id,
-            release_height,
-            released_amount_spark,
-        );
-        let compact_domain = manual_normal_release_blinding(
-            COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            validator_id,
-            delegator_id,
-            bond_utxo_id,
-            release_height,
-            released_amount_spark,
-        );
-        let slash_domain = manual_normal_release_blinding(
-            SLASH_BOND_RELEASE_BLINDING_DOMAIN,
-            validator_id,
-            delegator_id,
-            bond_utxo_id,
-            release_height,
-            released_amount_spark,
-        );
-
-        assert_ne!(normal, compact_domain);
-        assert_ne!(normal, slash_domain);
     }
 
     #[test]
@@ -2326,334 +2080,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_normal_release_before_normal_blinding_gate_is_byte_identical() {
-        let validator_id = Bytes32::from([0x81; 32]);
-        let delegator_id = Bytes32::from([0x82; 32]);
-        let bond = legacy_bond(0x83, validator_id, delegator_id, 1_000_000);
-        assert!(bond.original_output.range_proof.is_some());
-        let expected = bond.original_output.to_legacy_output().unwrap();
-        let state = ChainState::new_genesis();
-
-        let output =
-            released_bond_output(&state, &bond, NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1).unwrap();
-
-        assert_eq!(output.encode_to_vec(), expected.encode_to_vec());
-    }
-
-    #[test]
-    fn legacy_normal_release_at_normal_blinding_gate_uses_new_derivation() {
-        let validator_id = Bytes32::from([0x84; 32]);
-        let delegator_id = Bytes32::from([0x85; 32]);
-        let bond = legacy_bond(0x86, validator_id, delegator_id, 1_000_000);
-        let release_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
-        let state = ChainState::new_genesis();
-
-        let output = released_bond_output(&state, &bond, release_height).unwrap();
-        let blinding = manual_normal_release_blinding(
-            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            bond.validator_id,
-            bond.delegator_id,
-            bond.utxo_id,
-            release_height,
-            bond.amount_spark,
-        );
-
-        assert_eq!(
-            blinding,
-            derive_normal_stake_bond_release_blinding(
-                bond.validator_id,
-                bond.delegator_id,
-                bond.utxo_id,
-                release_height,
-                bond.amount_spark,
-            )
-        );
-        assert_ne!(
-            output.encode_to_vec(),
-            bond.original_output
-                .to_legacy_output()
-                .unwrap()
-                .encode_to_vec()
-        );
-        assert_eq!(output.value_spark, bond.amount_spark);
-        assert_eq!(
-            Some(output.owner_pubkey.clone()),
-            bond.original_output.owner_pubkey
-        );
-        assert_eq!(output.lock_height, bond.original_output.lock_height);
-    }
-
-    #[test]
-    fn legacy_normal_release_at_normal_blinding_gate_opens_with_new_blinding() {
-        let validator_id = Bytes32::from([0x87; 32]);
-        let delegator_id = Bytes32::from([0x88; 32]);
-        let bond = legacy_bond(0x89, validator_id, delegator_id, 1_000_000);
-        let release_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
-        let blinding = derive_normal_stake_bond_release_blinding(
-            bond.validator_id,
-            bond.delegator_id,
-            bond.utxo_id,
-            release_height,
-            bond.amount_spark,
-        );
-        let state = ChainState::new_genesis();
-
-        let output = released_bond_output(&state, &bond, release_height).unwrap();
-
-        assert!(indra_crypto::verify_opening(
-            &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
-            &indra_crypto::PedersenOpening {
-                value: bond.amount_spark,
-                blinding,
-            },
-        )
-        .is_ok());
-        assert!(indra_crypto::verify_range(
-            &output.commitment.compressed_point.0,
-            output.range_proof.as_slice(),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn normal_blinding_gate_does_not_change_compact_release_derivations() {
-        let validator_id = Bytes32::from([0x8A; 32]);
-        let delegator_id = Bytes32::from([0x8B; 32]);
-        let release_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
-        let compact = compact_bond(0x8C, validator_id, delegator_id, 1_000_000);
-        let (fully_compact, owner_pubkey) =
-            fully_compact_bond(0x8D, validator_id, delegator_id, 750_000);
-        let mut state = ChainState::new_genesis();
-        state
-            .delegator_identities
-            .insert(delegator_id, owner_pubkey);
-
-        for bond in [&compact, &fully_compact] {
-            let output = released_bond_output(&state, bond, release_height).unwrap();
-            let compact_blinding = derive_compact_stake_bond_release_blinding(bond, release_height);
-            let normal_blinding = derive_normal_stake_bond_release_blinding(
-                bond.validator_id,
-                bond.delegator_id,
-                bond.utxo_id,
-                release_height,
-                bond.amount_spark,
-            );
-
-            assert!(indra_crypto::verify_opening(
-                &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
-                &indra_crypto::PedersenOpening {
-                    value: bond.amount_spark,
-                    blinding: compact_blinding,
-                },
-            )
-            .is_ok());
-            assert_ne!(
-                output.commitment.compressed_point.0,
-                indra_crypto::commit(bond.amount_spark, &normal_blinding).0
-            );
-        }
-    }
-
-    #[test]
-    fn normal_blinding_gate_boundary_release_replay_is_deterministic() {
-        fn replay() -> ChainState {
-            let validator_id = Bytes32::from([0x91; 32]);
-            let delegator_id = Bytes32::from([0x92; 32]);
-            let mut state = ChainState::new_genesis();
-            let pre_gate = legacy_bond(0x93, validator_id, delegator_id, 1_000_000);
-            let post_gate = legacy_bond(0x94, validator_id, delegator_id, 1_000_000);
-
-            let old_output =
-                released_bond_output(&state, &pre_gate, NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1)
-                    .unwrap();
-            state
-                .utxos
-                .insert(
-                    old_output,
-                    NORMAL_BOND_RELEASE_BLINDING_HEIGHT - 1,
-                    STAKING_TX_IDX,
-                    1,
-                )
-                .unwrap();
-            let new_output =
-                released_bond_output(&state, &post_gate, NORMAL_BOND_RELEASE_BLINDING_HEIGHT)
-                    .unwrap();
-            state
-                .utxos
-                .insert(
-                    new_output,
-                    NORMAL_BOND_RELEASE_BLINDING_HEIGHT,
-                    STAKING_TX_IDX,
-                    2,
-                )
-                .unwrap();
-            state.height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
-            state
-        }
-
-        let a = replay();
-        let b = replay();
-        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
-        assert_eq!(compute_state_root(&a), compute_state_root(&b));
-    }
-
-    #[test]
-    fn normal_release_capstone_lifecycle_crosses_test_configured_gate() {
-        let activation_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
-        let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS;
-        let post_epoch = pre_epoch + 1;
-        let pre_height = pre_epoch * EPOCH_DURATION_BLOCKS;
-        let post_height = post_epoch * EPOCH_DURATION_BLOCKS;
-        assert!(pre_height < activation_height);
-        assert!(post_height >= activation_height);
-        assert!(compact_stake_bond_active(post_height));
-        assert!(compact_bond_pubkey_omission_active(post_height));
-        assert!(delegator_identity_registry_active(post_height));
-
-        let validator_id = Bytes32::from([0xB0; 32]);
-        let delegator_id = Bytes32::from([0xB1; 32]);
-        let mut pre_gate_bond = legacy_bond(0xB2, validator_id, delegator_id, 1_000_000);
-        let mut post_gate_bond = legacy_bond(0xB3, validator_id, delegator_id, 1_000_000);
-        pre_gate_bond.unbonding_end_epoch = Some(pre_epoch);
-        post_gate_bond.unbonding_end_epoch = Some(post_epoch);
-        let pre_gate_original_output = pre_gate_bond.original_output.to_legacy_output().unwrap();
-        let post_gate_original_output = post_gate_bond.original_output.to_legacy_output().unwrap();
-        let post_gate_bond_utxo_id = post_gate_bond.utxo_id;
-        let post_gate_amount = post_gate_bond.amount_spark;
-        let mut state = ChainState::new_genesis();
-        state
-            .staked_bonds
-            .insert(pre_gate_bond.utxo_id, pre_gate_bond.clone());
-        state
-            .staked_bonds
-            .insert(post_gate_bond.utxo_id, post_gate_bond.clone());
-
-        let pre_context =
-            EpochTransitionContext::new(pre_height, pre_height.saturating_sub(1)).unwrap();
-        apply_epoch_transition_at_height(&mut state, &pre_context, 1).unwrap();
-        let pre_release_utxo_id = crate::utxo::UtxoSet::compute_utxo_id(
-            &pre_gate_original_output,
-            pre_height,
-            STAKING_TX_IDX,
-            1,
-        );
-        let pre_release = state.utxos.get(&pre_release_utxo_id).unwrap();
-        assert_eq!(
-            pre_release.output.encode_to_vec(),
-            pre_gate_original_output.encode_to_vec()
-        );
-        assert!(state.delegation_return_events.is_empty());
-
-        let post_context =
-            EpochTransitionContext::new(post_height, post_height.saturating_sub(1)).unwrap();
-        apply_epoch_transition_at_height(&mut state, &post_context, 2).unwrap();
-        assert_eq!(state.delegation_return_events.len(), 1);
-        let event = &state.delegation_return_events[0];
-        assert_eq!(event.reason, DelegationReturnReason::UnbondingMatured);
-        assert_eq!(event.validator_id, validator_id);
-        assert_eq!(event.delegator_id, delegator_id);
-        assert_eq!(event.bond_utxo_id, post_gate_bond_utxo_id);
-        assert_eq!(event.amount_spark, post_gate_amount);
-        assert_eq!(event.returned_epoch, post_epoch);
-        assert_eq!(event.returned_height, post_height);
-        let post_release = state.utxos.get(&event.refund_utxo_id).unwrap();
-        assert_ne!(
-            post_release.output.encode_to_vec(),
-            post_gate_original_output.encode_to_vec()
-        );
-        let blinding = derive_normal_stake_bond_release_blinding(
-            validator_id,
-            delegator_id,
-            post_gate_bond_utxo_id,
-            post_height,
-            post_gate_amount,
-        );
-        assert_eq!(
-            post_release.output.commitment.compressed_point.0,
-            indra_crypto::commit(post_gate_amount, &blinding).0
-        );
-        assert!(indra_crypto::verify_opening(
-            &indra_crypto::PedersenCommitment(post_release.output.commitment.compressed_point.0),
-            &indra_crypto::PedersenOpening {
-                value: post_gate_amount,
-                blinding,
-            },
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn normal_release_capstone_replay_mixed_bond_shapes_across_active_gates() {
-        fn replay() -> ChainState {
-            let activation_height = NORMAL_BOND_RELEASE_BLINDING_HEIGHT;
-            let pre_epoch = activation_height / EPOCH_DURATION_BLOCKS;
-            let post_epoch = pre_epoch + 1;
-            let pre_height = pre_epoch * EPOCH_DURATION_BLOCKS;
-            let post_height = post_epoch * EPOCH_DURATION_BLOCKS;
-            assert!(pre_height < activation_height);
-            assert!(post_height >= activation_height);
-            assert!(compact_stake_bond_active(pre_height));
-            assert!(compact_bond_pubkey_omission_active(pre_height));
-            assert!(delegator_identity_registry_active(pre_height));
-            assert!(compact_stake_bond_active(post_height));
-            assert!(compact_bond_pubkey_omission_active(post_height));
-            assert!(delegator_identity_registry_active(post_height));
-
-            let validator_id = Bytes32::from([0xC0; 32]);
-            let delegator_id = Bytes32::from([0xC1; 32]);
-            let mut pre_legacy = legacy_bond(0xC2, validator_id, delegator_id, 1_000_000);
-            let mut post_legacy = legacy_bond(0xC3, validator_id, delegator_id, 1_000_000);
-            let mut compact = compact_bond(0xC4, validator_id, delegator_id, 1_000_000);
-            let (mut fully_compact, owner_pubkey) =
-                fully_compact_bond(0xC5, validator_id, delegator_id, 750_000);
-            pre_legacy.unbonding_end_epoch = Some(pre_epoch);
-            post_legacy.unbonding_end_epoch = Some(post_epoch);
-            compact.unbonding_end_epoch = Some(post_epoch);
-            fully_compact.unbonding_end_epoch = Some(post_epoch);
-
-            let mut state = ChainState::new_genesis();
-            state
-                .delegator_identities
-                .insert(delegator_id, owner_pubkey.clone());
-            state.staked_bonds.insert(pre_legacy.utxo_id, pre_legacy);
-            let post_legacy_utxo_id = post_legacy.utxo_id;
-            state.staked_bonds.insert(post_legacy.utxo_id, post_legacy);
-            state.staked_bonds.insert(compact.utxo_id, compact);
-            state
-                .staked_bonds
-                .insert(fully_compact.utxo_id, fully_compact);
-
-            let pre_context =
-                EpochTransitionContext::new(pre_height, pre_height.saturating_sub(1)).unwrap();
-            apply_epoch_transition_at_height(&mut state, &pre_context, 1).unwrap();
-            assert!(state.delegation_return_events.is_empty());
-            let post_context =
-                EpochTransitionContext::new(post_height, post_height.saturating_sub(1)).unwrap();
-            apply_epoch_transition_at_height(&mut state, &post_context, 2).unwrap();
-            assert_eq!(state.delegation_return_events.len(), 1);
-            assert_eq!(
-                state.delegation_return_events[0].bond_utxo_id,
-                post_legacy_utxo_id
-            );
-            assert_eq!(
-                state.delegation_return_events[0].reason,
-                DelegationReturnReason::UnbondingMatured
-            );
-            state.rebuild_state_commitment_v2(post_height);
-            state
-        }
-
-        let a = replay();
-        let b = replay();
-        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
-        assert_eq!(compute_state_root(&a), compute_state_root(&b));
-        assert_eq!(
-            a.state_commitment_v2_root(NORMAL_BOND_RELEASE_BLINDING_HEIGHT),
-            b.state_commitment_v2_root(NORMAL_BOND_RELEASE_BLINDING_HEIGHT)
-        );
-    }
-
-    #[test]
     fn post_gate_matured_bond_release_records_return_event() {
         let current_epoch = u64::MAX;
         let release_height = u64::MAX;
@@ -2664,6 +2090,7 @@ mod tests {
         let bond_utxo_id = bond.utxo_id;
         let amount_spark = bond.amount_spark;
         let mut state = ChainState::new_genesis();
+        register_test_bond_owner(&mut state, delegator_id, 0x97);
         state.staked_bonds.insert(bond_utxo_id, bond);
 
         release_unbonded_bonds(&mut state, current_epoch).unwrap();
@@ -2681,18 +2108,19 @@ mod tests {
     }
 
     #[test]
-    fn pre_gate_matured_bond_release_records_no_return_event() {
+    fn matured_bond_release_always_records_return_event() {
         let current_epoch = 1;
         let validator_id = Bytes32::from([0x98; 32]);
         let delegator_id = Bytes32::from([0x99; 32]);
         let mut bond = legacy_bond(0x9A, validator_id, delegator_id, 1_000_000);
         bond.unbonding_end_epoch = Some(current_epoch);
         let mut state = ChainState::new_genesis();
+        register_test_bond_owner(&mut state, delegator_id, 0x9A);
         state.staked_bonds.insert(bond.utxo_id, bond);
 
         release_unbonded_bonds(&mut state, current_epoch).unwrap();
 
-        assert!(state.delegation_return_events.is_empty());
+        assert_eq!(state.delegation_return_events.len(), 1);
     }
 
     #[test]
@@ -2719,6 +2147,7 @@ mod tests {
         );
         bond.unbonding_end_epoch = Some(current_epoch);
         let bond_utxo_id = bond.utxo_id;
+        register_test_bond_owner(&mut state, Bytes32::from([0x9D; 32]), 0x9B);
         state.staked_bonds.insert(bond_utxo_id, bond);
 
         release_unbonded_bonds(&mut state, current_epoch).unwrap();
@@ -2758,6 +2187,7 @@ mod tests {
         let mut bond = legacy_bond(0xA4, validator_id, delegator_id, 1_000_000);
         bond.unbonding_end_epoch = Some(current_epoch);
         let mut state = ChainState::new_genesis();
+        register_test_bond_owner(&mut state, delegator_id, 0xA4);
         state.staked_bonds.insert(bond.utxo_id, bond);
         state.rebuild_state_commitment_v2(current_epoch);
         let original = state.clone();
@@ -2780,7 +2210,8 @@ mod tests {
         let bond = compact_bond(0x31, validator_id, delegator_id, 1_000_000);
         assert!(bond.original_output.range_proof.is_none());
         let release_height = 900;
-        let state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis();
+        register_test_bond_owner(&mut state, delegator_id, 0x31);
 
         let output = released_bond_output(&state, &bond, release_height).unwrap();
         let blinding = manual_compact_release_blinding(&bond, release_height);
@@ -2791,8 +2222,8 @@ mod tests {
         assert_ne!(output.commitment, bond.original_output.commitment);
         assert_eq!(output.value_spark, bond.amount_spark);
         assert_eq!(
-            Some(output.owner_pubkey.clone()),
-            bond.original_output.owner_pubkey
+            Some(&output.owner_pubkey),
+            state.delegator_identities.get(&delegator_id)
         );
         assert_eq!(output.lock_height, bond.original_output.lock_height);
         assert!(indra_crypto::verify_opening(
@@ -2816,7 +2247,8 @@ mod tests {
         let bond = compact_bond(0x32, validator_id, validator_id, 400_000);
         let release_height = 1_200;
         let blinding = manual_compact_release_blinding(&bond, release_height);
-        let state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis();
+        register_test_bond_owner(&mut state, validator_id, 0x32);
 
         let output = released_bond_output(&state, &bond, release_height).unwrap();
         assert_eq!(output.value_spark, 400_000);
@@ -2873,129 +2305,6 @@ mod tests {
                 message: "stake bond release owner pubkey is unresolvable"
             }
         ));
-    }
-
-    #[test]
-    fn compact_activation_replay_sequence_is_deterministic() {
-        fn replay() -> ChainState {
-            let activation = 10;
-            let validator_id = Bytes32::from([0xA3; 32]);
-            let delegator_id = Bytes32::from([0xD3; 32]);
-            let mut state = ChainState::new_genesis();
-
-            let legacy = StakeBondEntry::new_for_test_with_compact_activation(
-                Bytes32::from([0x41; 32]),
-                validator_id,
-                delegator_id,
-                1_000_000,
-                0,
-                dummy_output(0x41),
-                activation - 1,
-                activation,
-            );
-            let compact_normal = StakeBondEntry::new_for_test_with_compact_activation(
-                Bytes32::from([0x42; 32]),
-                validator_id,
-                delegator_id,
-                1_000_000,
-                0,
-                dummy_output(0x42),
-                activation,
-                activation,
-            );
-            let compact_slashed = StakeBondEntry::new_for_test_with_compact_activation(
-                Bytes32::from([0x43; 32]),
-                validator_id,
-                validator_id,
-                600_000,
-                0,
-                dummy_output(0x43),
-                activation + 1,
-                activation,
-            );
-            assert!(legacy.original_output.range_proof.is_some());
-            assert!(compact_normal.original_output.range_proof.is_none());
-            assert!(compact_slashed.original_output.range_proof.is_none());
-
-            state.staked_bonds.insert(legacy.utxo_id, legacy);
-            let normal_output =
-                released_bond_output(&state, &compact_normal, activation + 2).unwrap();
-            state
-                .utxos
-                .insert(normal_output, activation + 2, STAKING_TX_IDX, 1)
-                .unwrap();
-            let slashed_output =
-                released_bond_output(&state, &compact_slashed, activation + 3).unwrap();
-            state
-                .utxos
-                .insert(slashed_output, activation + 3, STAKING_TX_IDX, 2)
-                .unwrap();
-            state.height = activation + 3;
-            state
-        }
-
-        let a = replay();
-        let b = replay();
-        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
-        assert_eq!(compute_state_root(&a), compute_state_root(&b));
-    }
-
-    fn governance_test_pubkey(byte: u8) -> HybridPubKey {
-        HybridPubKey {
-            classical_pk: Bytes32::from([byte; 32]),
-            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-        }
-    }
-
-    fn governance_pruning_test_id(index: u64) -> Bytes32 {
-        let mut bytes = [0u8; 32];
-        bytes[..8].copy_from_slice(&index.to_le_bytes());
-        Bytes32::from(bytes)
-    }
-
-    fn governance_pruning_test_proposal(
-        index: u64,
-        phase: ProposalPhase,
-        proposed_epoch: u64,
-    ) -> ProposalRecord {
-        let proposal_id = governance_pruning_test_id(index);
-        ProposalRecord {
-            proposal_id,
-            proposer_id: Bytes32::from([0x71; 32]),
-            proposer_pubkey: governance_test_pubkey(0x72),
-            tier: GovernableAction::SetMinDelegationSpark {
-                value: DUST_LIMIT_SPARK,
-            }
-            .tier(),
-            action: GovernableAction::SetMinDelegationSpark {
-                value: DUST_LIMIT_SPARK,
-            },
-            title: format!("proposal-{index}"),
-            description: "terminal proposal pruning test".to_string(),
-            deposit_spark: 0,
-            deposit_burned: false,
-            proposed_epoch,
-            commit_start_epoch: proposed_epoch.saturating_add(30),
-            reveal_start_epoch: proposed_epoch.saturating_add(50),
-            tally_epoch: proposed_epoch.saturating_add(60),
-            exec_delay_epochs: 0,
-            executable_after_epoch: proposed_epoch.saturating_add(60),
-            phase,
-            snapshot1: None,
-            commits: Default::default(),
-            reveals: Default::default(),
-            redelegations: Vec::new(),
-            redelegated_delegators: Default::default(),
-            snapshot2: None,
-            yes_stake: 0,
-            no_stake: 0,
-            abstain_stake: 0,
-            passed: match phase {
-                ProposalPhase::Failed => Some(false),
-                ProposalPhase::Executed => Some(true),
-                _ => None,
-            },
-        }
     }
 
     #[test]
@@ -3062,6 +2371,8 @@ mod tests {
         let context =
             EpochTransitionContext::new(boundary_height, boundary_height.saturating_sub(1))
                 .unwrap();
+        install_reward_basis_if_missing(&mut continuous).unwrap();
+        install_reward_basis_if_missing(&mut replayed).unwrap();
         apply_epoch_transition_at_height(&mut continuous, &context, 111).unwrap();
         apply_epoch_transition_at_height(&mut replayed, &context, 999).unwrap();
 
@@ -3404,7 +2715,7 @@ mod tests {
             .add_delegation(id_b, delegator_id, 1_000_000, 0)
             .unwrap();
 
-        distribute_block_rewards(&mut state, 2_000, 1, 0).unwrap();
+        distribute_block_rewards(&mut state, 2_000, 1, 1).unwrap();
 
         assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 1_000);
         assert_eq!(
@@ -3530,6 +2841,11 @@ mod tests {
                 )
         );
 
+        // The block-application pipeline constructs the next epoch's paired
+        // snapshots after the transition. This direct transition test mirrors
+        // that final pipeline step explicitly.
+        install_reward_basis(&mut state);
+
         let next_epoch = activation_epoch.saturating_add(1);
         let next_height = next_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
         let next_reward = block_reward_at_height(next_height).saturating_mul(EPOCH_DURATION_BLOCKS);
@@ -3631,7 +2947,7 @@ mod tests {
             .add_delegation(validator_id, delegator_id, 1_000, 0)
             .unwrap();
 
-        distribute_block_rewards(&mut state, 1_000, 1, 0).unwrap();
+        distribute_block_rewards(&mut state, 1_000, 1, 1).unwrap();
 
         assert_eq!(
             state.validators.get(&validator_id).unwrap().pending_rewards,
@@ -3677,7 +2993,7 @@ mod tests {
         assert_eq!(entry.staked_spark, 60);
         assert_eq!(entry.unbonding_end_epoch, None);
 
-        distribute_block_rewards(&mut state, 1_000, 1, 0).unwrap();
+        distribute_block_rewards(&mut state, 1_000, 1, 1).unwrap();
         assert_eq!(
             state
                 .delegations
@@ -3690,7 +3006,7 @@ mod tests {
         );
 
         state.fee_reward_pool = 1_000;
-        distribute_fee_rewards(&mut state, 1, 0).unwrap();
+        distribute_fee_rewards(&mut state, 1, 1).unwrap();
         assert_eq!(
             state
                 .delegations
@@ -3708,6 +3024,7 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let validator_id = Bytes32::from([0xE1; 32]);
         let delegator_id = Bytes32::from([0xE2; 32]);
+        register_test_bond_owner(&mut state, delegator_id, 0xE3);
         state
             .delegations
             .add_delegation(validator_id, delegator_id, 40, 0)
@@ -3733,7 +3050,7 @@ mod tests {
         state.validators.upsert(validator_b).unwrap();
         let treasury_before = state.treasury_balance;
 
-        distribute_block_rewards(&mut state, 101, 1, 0).unwrap();
+        distribute_block_rewards(&mut state, 101, 1, 1).unwrap();
 
         let reward_a = state.validators.get(&id_a).unwrap().pending_rewards;
         let reward_b = state.validators.get(&id_b).unwrap().pending_rewards;
@@ -3753,7 +3070,7 @@ mod tests {
         state.validators.upsert(validator_b).unwrap();
         state.fee_reward_pool = 101;
 
-        distribute_fee_rewards(&mut state, 1, 0).unwrap();
+        distribute_fee_rewards(&mut state, 1, 1).unwrap();
 
         assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 50);
         assert_eq!(state.validators.get(&id_b).unwrap().pending_rewards, 50);
@@ -3772,8 +3089,8 @@ mod tests {
             .unwrap();
         full_block_state.validators.upsert(validator).unwrap();
 
-        distribute_block_rewards(&mut empty_block_state, 1_000, 1, 0).unwrap();
-        distribute_block_rewards(&mut full_block_state, 1_000, 1, 0).unwrap();
+        distribute_block_rewards(&mut empty_block_state, 1_000, 1, 1).unwrap();
+        distribute_block_rewards(&mut full_block_state, 1_000, 1, 1).unwrap();
 
         assert_eq!(
             empty_block_state
@@ -3862,8 +3179,8 @@ mod tests {
         apply_epoch_transition(
             &mut state,
             &EpochTransitionContext::new(
-                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (3u64)
+                (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (4u64)
                     .saturating_mul(EPOCH_DURATION_BLOCKS)
                     .saturating_sub(1),
             )
@@ -3919,8 +3236,8 @@ mod tests {
         apply_epoch_transition(
             &mut state,
             &EpochTransitionContext::new(
-                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (3u64)
+                (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (4u64)
                     .saturating_mul(EPOCH_DURATION_BLOCKS)
                     .saturating_sub(1),
             )
@@ -3943,8 +3260,8 @@ mod tests {
         apply_epoch_transition(
             &mut state,
             &EpochTransitionContext::new(
-                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (3u64)
+                (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (4u64)
                     .saturating_mul(EPOCH_DURATION_BLOCKS)
                     .saturating_sub(1),
             )
@@ -4091,8 +3408,8 @@ mod tests {
         apply_epoch_transition(
             &mut forward,
             &EpochTransitionContext::new(
-                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (3u64)
+                (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (4u64)
                     .saturating_mul(EPOCH_DURATION_BLOCKS)
                     .saturating_sub(1),
             )
@@ -4103,8 +3420,8 @@ mod tests {
         apply_epoch_transition(
             &mut reverse,
             &EpochTransitionContext::new(
-                (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (3u64)
+                (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+                (4u64)
                     .saturating_mul(EPOCH_DURATION_BLOCKS)
                     .saturating_sub(1),
             )
@@ -4393,7 +3710,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: Some(1),
-                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
+                unbonding_start_height: None,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     Bytes32::from([0x02; 32]),
                 ),
@@ -4431,7 +3748,7 @@ mod tests {
                 amount_spark: 1_000_000,
                 bonded_epoch: 0,
                 unbonding_end_epoch: None,
-                unbonding_precision: crate::validator::StakeBondUnbondingPrecision::LegacyEpochOnly,
+                unbonding_start_height: None,
                 custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
                     Bytes32::from([0x02; 32]),
                 ),

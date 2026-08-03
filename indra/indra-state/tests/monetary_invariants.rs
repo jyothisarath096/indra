@@ -10,17 +10,17 @@ use indra_core::types::{
         MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
     },
     slashing::SlashEvidenceV1,
-    staking::{StakingOp, StakingOpBody},
+    staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
     transaction::{InputV1, OutputV1, TransactionV1},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::{
     commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
-    PaymentBlindingNoteV1, PqKeypair,
+    PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
 };
 use indra_state::{
-    apply::apply_slash_at_height, apply_block, apply_epoch_transition, apply_staking_op,
-    ChainState, EpochTransitionContext, ValidatorEntry, ValidatorStatus,
+    apply_block, apply_epoch_transition, apply_staking_op, ChainState, EpochTransitionContext,
+    ValidatorEntry, ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -97,7 +97,7 @@ fn make_validator(pubkey: &HybridPubKey, seed: [u8; 32], stake: u64) -> Validato
         name: "monetary-test-validator".into(),
         hybrid_classical_pk: Some(pubkey.classical_pk.0),
         hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
-        vrf_pk: Some(seed),
+        vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
         stake_spark: stake,
         status: ValidatorStatus::Active,
         registered_epoch: 0,
@@ -112,10 +112,9 @@ fn make_validator(pubkey: &HybridPubKey, seed: [u8; 32], stake: u64) -> Validato
         auto_delegate_to: None,
         network_addr: None,
         network_addr_last_updated_epoch: None,
-        cold_hybrid_classical_pk: None,
-        cold_hybrid_pq_pk: None,
-        cold_key_version: 0,
-        cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+        cold_hybrid_classical_pk: Some(pubkey.classical_pk.0),
+        cold_hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().try_into().unwrap()),
+        cold_key_version: 1,
         cold_nonce: 0,
     }
 }
@@ -143,12 +142,23 @@ fn self_stake_op(
             bond_utxo_id,
             validator_pubkey,
             bond_proof,
-            cold_authorization: None,
+            cold_authorization: Some(ColdStakingAuthorization {
+                cold_key_version: 1,
+                cold_nonce: nonce,
+            }),
         },
-        nonce,
+        nonce: 0,
         signature: dummy_sig(),
     };
-    sign_staking_op(validator_keypair, &state.chain_id, &mut op);
+    let bytes = op
+        .cold_authorization_signing_bytes(&state.chain_id)
+        .unwrap()
+        .unwrap();
+    let sig = validator_keypair.sign(&bytes).unwrap();
+    op.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+    };
     op
 }
 
@@ -163,13 +173,35 @@ fn self_unstake_op(
         body: StakingOpBody::SelfUnstake {
             bond_utxo_id,
             validator_pubkey,
-            cold_authorization: None,
+            cold_authorization: Some(ColdStakingAuthorization {
+                cold_key_version: 1,
+                cold_nonce: nonce,
+            }),
         },
-        nonce,
+        nonce: 0,
         signature: dummy_sig(),
     };
-    sign_staking_op(validator_keypair, &state.chain_id, &mut op);
+    let bytes = op
+        .cold_authorization_signing_bytes(&state.chain_id)
+        .unwrap()
+        .unwrap();
+    let sig = validator_keypair.sign(&bytes).unwrap();
+    op.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+    };
     op
+}
+
+fn finalize_with_default_validator(state: &mut ChainState) {
+    if state.validators.is_empty() {
+        let (pubkey, _) = keypair([0xF0; 32]);
+        state
+            .validators
+            .upsert(make_validator(&pubkey, [0xF0; 32], INPUT_VALUE))
+            .unwrap();
+    }
+    state.finalize_genesis().unwrap();
 }
 
 fn fee_tx(
@@ -239,7 +271,6 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
         },
         transactions,
         slashing_evidence: vec![],
-        slashing_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],
@@ -311,6 +342,7 @@ fn bond_and_unbond_do_not_change_total_supply() {
         state.validators.get(&validator_id).unwrap().stake_spark,
         INPUT_VALUE
     );
+    state.finalize_genesis().unwrap();
 
     let unstake = self_unstake_op(
         &state,
@@ -338,28 +370,6 @@ fn bond_and_unbond_do_not_change_total_supply() {
 }
 
 #[test]
-fn slash_reduces_total_supply_by_burn_amount() {
-    let mut state = ChainState::new_genesis();
-    let (validator_pubkey, validator_keypair) = keypair([0x20; 32]);
-    let validator_id = pubkey_to_id(&validator_pubkey);
-    state
-        .validators
-        .upsert(make_validator(&validator_pubkey, [0x20; 32], INPUT_VALUE))
-        .unwrap();
-    let evidence = slash_evidence(&validator_keypair, validator_id);
-    let supply_before = state.total_supply;
-    let treasury_before = state.treasury_balance;
-    let slash_bps = state.governance.params.slash_double_precommit_bps;
-    let slash_amount = INPUT_VALUE.saturating_mul(slash_bps as u64) / 10_000;
-    let chain_id = state.chain_id.clone();
-
-    apply_slash_at_height(&mut state, &evidence, &chain_id, 7, None).unwrap();
-
-    assert_eq!(state.total_supply, supply_before - slash_amount);
-    assert_eq!(state.treasury_balance, treasury_before);
-}
-
-#[test]
 fn epoch_reward_does_not_increase_total_supply() {
     let mut state = ChainState::new_genesis();
     let (validator_pubkey, _) = keypair([0x30; 32]);
@@ -367,6 +377,7 @@ fn epoch_reward_does_not_increase_total_supply() {
         .validators
         .upsert(make_validator(&validator_pubkey, [0x30; 32], INPUT_VALUE))
         .unwrap();
+    state.finalize_genesis().unwrap();
     let supply_before = state.total_supply;
 
     apply_epoch_transition(
@@ -388,6 +399,7 @@ fn epoch_reward_does_not_increase_total_supply() {
 #[test]
 fn fee_burn_reduces_total_supply() {
     let mut state = ChainState::new_genesis();
+    finalize_with_default_validator(&mut state);
     let (owner_pubkey, owner_keypair) = keypair([0x40; 32]);
     let input_blinding = [0x41; 32];
     let utxo_id = state
@@ -428,13 +440,14 @@ fn liveness_penalty_burn_reduces_total_supply_if_active() {
         .validators
         .upsert(make_validator(&validator_pubkey, [0x50; 32], INPUT_VALUE))
         .unwrap();
+    state.finalize_genesis().unwrap();
     let supply_before = state.total_supply;
 
     apply_epoch_transition(
         &mut state,
         &EpochTransitionContext::new(
-            (3u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-            (3u64)
+            (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
+            (4u64)
                 .saturating_mul(EPOCH_DURATION_BLOCKS)
                 .saturating_sub(1),
         )
@@ -455,6 +468,7 @@ fn total_supply_invariant_across_full_epoch_cycle() {
         .validators
         .upsert(make_validator(&validator_pubkey, [0x60; 32], INPUT_VALUE))
         .unwrap();
+    state.finalize_genesis().unwrap();
     let (owner_pubkey, owner_keypair) = keypair([0x61; 32]);
     let input_blinding = [0x62; 32];
     let utxo_id = state

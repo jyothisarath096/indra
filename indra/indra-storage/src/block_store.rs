@@ -606,7 +606,6 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],

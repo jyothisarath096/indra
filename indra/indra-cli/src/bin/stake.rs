@@ -1,8 +1,9 @@
 //! `indra-stake` — build and submit staking operations.
 
 use indra_cli::{
-    fetch_chain_id, fetch_staking_nonce, reconstruct_keypair, submit_staking_op, BuiltStakingOp,
-    CliError, CliResult, KeysFile, Wallet, WalletEntry,
+    fetch_chain_id, fetch_staking_nonce, load_cold_keys, password_source_from_args,
+    reconstruct_keypair, submit_staking_op, BuiltStakingOp, CliError, CliResult, KeysFile, Wallet,
+    WalletEntry,
 };
 use indra_core::types::{primitives::Bytes32, staking::StakingBondProof};
 #[cfg(test)]
@@ -31,7 +32,6 @@ fn run(args: Vec<String>) -> CliResult<()> {
         "delegate" => run_delegate(&args),
         "undelegate" => run_undelegate(&args),
         "claim-rewards" => run_claim_rewards(&args),
-        "enroll-cold-key" => run_enroll_cold_key(&args),
         "set-commission" => run_set_commission(&args),
         "auto-delegate" => run_auto_delegate(&args),
         "update-network-address" => run_update_network_address(&args),
@@ -54,6 +54,13 @@ fn run_register(args: &[String]) -> CliResult<()> {
     }
     let keys = load_keys(args)?;
     let keypair = reconstruct_keypair(&keys)?;
+    let cold_path = get(args, "--cold-keys")
+        .ok_or_else(|| CliError::Transaction("register requires --cold-keys <path>".into()))?;
+    let cold_keys = load_cold_keys(&cold_path, password_source_from_args(args))
+        .map_err(|e| CliError::Keystore(e.to_string()))?;
+    let cold_keypair = cold_keys
+        .reconstruct()
+        .map_err(|e| CliError::Keystore(e.to_string()))?;
     let commission_bps = parse_commission(args)?;
     let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
@@ -62,11 +69,12 @@ fn run_register(args: &[String]) -> CliResult<()> {
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
-    let built = indra_cli::tx_builder::build_register_validator_op(
+    let built = indra_cli::tx_builder::build_register_validator_op_with_cold(
         commission_bps,
         bond_utxo_id,
         bond_proof,
         &keypair,
+        &cold_keypair,
         keys.public.vrf_pk,
         nonce,
         &chain_id,
@@ -117,59 +125,6 @@ fn run_self_stake(args: &[String]) -> CliResult<()> {
         &[("Bond UTXO", hex::encode(bond_utxo_id.0))],
         Some((&wallet_path, bond_utxo_id)),
     )
-}
-
-fn run_enroll_cold_key(args: &[String]) -> CliResult<()> {
-    if has_help(args) {
-        print_enroll_cold_key_help();
-        return Ok(());
-    }
-    let keys = load_keys(args)?;
-    let hot_keypair = reconstruct_keypair(&keys)?;
-    let validator_id = validator_id_from_keys(&keys);
-    let cold_path = required(args, "--cold-keys")?;
-    let cold_password_path = get(args, "--cold-keys-password-file");
-    let cold_source = match cold_password_path.as_deref() {
-        Some(path) => indra_cli::PasswordSource::File {
-            path: std::path::Path::new(path),
-            reject_permissive: false,
-        },
-        None => indra_cli::PasswordSource::Prompt,
-    };
-    let cold_keys = indra_cli::load_cold_keys(&cold_path, cold_source).map_err(CliError::from)?;
-    let cold_keypair = cold_keys.reconstruct().map_err(CliError::from)?;
-    let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
-    let chain_id = fetch_chain_id(&node_url)?;
-    let nonce = fetch_next_nonce(&node_url, &validator_id)?;
-    let built = indra_cli::tx_builder::build_enroll_validator_cold_key_op(
-        validator_id,
-        &hot_keypair,
-        &cold_keypair,
-        nonce,
-        &chain_id,
-    )?;
-    let details = cold_enrollment_details(validator_id, &cold_keys);
-    finish_op(
-        args,
-        "enroll-cold-key",
-        &built,
-        &validator_id,
-        nonce,
-        &node_url,
-        &details,
-        None,
-    )
-}
-
-fn cold_enrollment_details(
-    validator_id: Bytes32,
-    cold_keys: &indra_cli::ColdKeysFile,
-) -> Vec<(&'static str, String)> {
-    vec![
-        ("Validator", hex::encode(validator_id.0)),
-        ("Cold Ed25519", hex::encode(cold_keys.classical_pk)),
-        ("Cold ML-DSA", hex::encode(&cold_keys.pq_pk)),
-    ]
 }
 
 fn run_self_unstake(args: &[String]) -> CliResult<()> {
@@ -655,7 +610,7 @@ fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
 
 fn print_help() {
     println!(
-        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  enroll-cold-key         Enroll a separate validator cold hybrid key\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
+        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
     );
 }
 
@@ -665,10 +620,6 @@ fn print_register_help() {
 
 fn print_self_stake_help() {
     println!("Usage: indra-stake self-stake --utxo <utxo_id_hex> [--keys keys.json] [--wallet wallet.json] [--node url] [--dry-run]");
-}
-
-fn print_enroll_cold_key_help() {
-    println!("Usage: indra-stake enroll-cold-key --keys keys.json --cold-keys validator-cold-keys.json [--keys-password-file path] [--cold-keys-password-file path] [--node url] [--dry-run]");
 }
 
 fn print_self_unstake_help() {
@@ -817,51 +768,5 @@ mod tests {
 
         assert_eq!(staking_signer_id(&keys).unwrap(), canonical);
         assert_eq!(op.signer_id(), canonical);
-    }
-
-    #[test]
-    fn cold_enrollment_dry_run_details_are_derived_from_real_operation_values() {
-        let hot_keys = generate_from_master_seed("validator".to_string(), [0xE1; 32]).unwrap();
-        let hot_keypair = reconstruct_keypair(&hot_keys).unwrap();
-        let validator_id = validator_id_from_keys(&hot_keys);
-        let cold_keypair =
-            ColdHybridKeypair::from_independent_seeds([0xE4; 32], [0xE5; 32]).unwrap();
-        let cold_public = cold_keypair.public_key();
-        let cold_public = cold_public.as_complete_hybrid();
-        let cold_keys = ColdKeysFile {
-            classical_seed: [0xE4; 32],
-            pq_seed: [0xE5; 32],
-            classical_pk: cold_public.classical.0,
-            pq_pk: cold_public.pq.0.to_vec(),
-        };
-        let built = indra_cli::tx_builder::build_enroll_validator_cold_key_op(
-            validator_id,
-            &hot_keypair,
-            &cold_keypair,
-            73,
-            "indra-testnet-1",
-        )
-        .unwrap();
-        let op = indra_core::types::staking::StakingOp::decode_exact(
-            &hex::decode(&built.op_hex).unwrap(),
-        )
-        .unwrap();
-        let details = cold_enrollment_details(validator_id, &cold_keys);
-
-        assert_eq!(op.nonce, 73);
-        assert_eq!(op.signer_id(), validator_id);
-        assert_eq!(details[0].1, hex::encode(validator_id.0));
-        assert_eq!(details[1].1, hex::encode(cold_public.classical.0));
-        assert_eq!(details[2].1, hex::encode(cold_public.pq.0));
-        assert!(matches!(
-            op.body,
-            indra_core::types::staking::StakingOpBody::EnrollValidatorColdKey {
-                validator_id: encoded_validator,
-                cold_pubkey,
-                cold_signature: Some(_),
-            } if encoded_validator == validator_id
-                && cold_pubkey.classical_pk.0 == cold_public.classical.0
-                && cold_pubkey.pq_pk.as_slice() == cold_public.pq.0
-        ));
     }
 }

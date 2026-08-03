@@ -271,10 +271,6 @@ fn invalid_error(reason: String) -> IndraError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::primitives::{
-        consensus_snapshot_active, consensus_snapshot_height_is_aligned,
-        hard_forks::CONSENSUS_SNAPSHOT_HEIGHT, EPOCH_DURATION_BLOCKS,
-    };
     use indra_crypto::{ClassicalKeypair, PqKeypair, VrfKeypair};
 
     fn entry(id: u8, weight: u64, key_seed: u8) -> ConsensusSnapshotEntry {
@@ -552,28 +548,6 @@ mod tests {
             snapshot.entries()[0].encoded_len(),
             32 + 8 + 32 + PQ_PK_BYTES + 32
         );
-    }
-
-    #[test]
-    fn gate_is_inert_and_alignment_validation_is_exact() {
-        assert_eq!(CONSENSUS_SNAPSHOT_HEIGHT, u64::MAX);
-        assert!(!consensus_snapshot_active(0));
-        assert!(!consensus_snapshot_active(u64::MAX - 1));
-        assert!(consensus_snapshot_active(u64::MAX));
-
-        assert!(consensus_snapshot_height_is_aligned(u64::MAX));
-        assert!(consensus_snapshot_height_is_aligned(1));
-        assert!(consensus_snapshot_height_is_aligned(
-            EPOCH_DURATION_BLOCKS + 1
-        ));
-        assert!(consensus_snapshot_height_is_aligned(
-            EPOCH_DURATION_BLOCKS * 2 + 1
-        ));
-        assert!(!consensus_snapshot_height_is_aligned(0));
-        assert!(!consensus_snapshot_height_is_aligned(EPOCH_DURATION_BLOCKS));
-        assert!(!consensus_snapshot_height_is_aligned(
-            EPOCH_DURATION_BLOCKS + 2
-        ));
     }
 
     #[test]

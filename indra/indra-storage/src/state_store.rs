@@ -633,12 +633,15 @@ mod tests {
     }
 
     fn test_validator() -> ValidatorEntry {
+        let classical = indra_crypto::ClassicalKeypair::from_seed(&[0x41; 32]);
+        let pq = indra_crypto::PqKeypair::from_seed(&[0x42; 32]).unwrap();
+        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
         ValidatorEntry {
             validator_id: Bytes32::from([0x41; 32]),
             name: "validator-one".to_string(),
-            hybrid_classical_pk: Some([0x42; 32]),
-            hybrid_pq_pk: Some(vec![0x43; 80]),
-            vrf_pk: Some([0x44; 32]),
+            hybrid_classical_pk: Some(public.classical.0),
+            hybrid_pq_pk: Some(public.pq.0.to_vec()),
+            vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[0x43; 32]).public_key()),
             stake_spark: 1_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 7,
@@ -653,12 +656,18 @@ mod tests {
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: None,
-            cold_hybrid_pq_pk: None,
-            cold_key_version: 0,
-            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+            cold_hybrid_classical_pk: Some(public.classical.0),
+            cold_hybrid_pq_pk: Some(public.pq.0),
+            cold_key_version: 1,
             cold_nonce: 0,
         }
+    }
+
+    fn finalized_test_state() -> ChainState {
+        let mut state = ChainState::new_genesis();
+        state.validators.upsert(test_validator()).unwrap();
+        state.finalize_genesis().unwrap();
+        state
     }
 
     fn write_snapshot_meta(dir: &Path, state: &ChainState, snapshot_bytes: &[u8]) {
@@ -683,7 +692,7 @@ mod tests {
         let dir = temp_dir("a");
         let store = StateStore::open(&dir).unwrap();
 
-        let mut state = ChainState::new_genesis();
+        let mut state = finalized_test_state();
         state.height = 42;
         state.base_fee = 500;
         state.fee_reward_pool = 777;
@@ -738,10 +747,14 @@ mod tests {
             )
             .unwrap(),
         );
-        continuous.slash_membership_roots = vec![SlashMembershipRootRecord {
-            activation_height: u64::MAX,
-            membership_root: compute_slash_membership_root(&current).unwrap(),
-        }];
+        continuous.slash_membership_roots = continuous
+            .consensus_snapshots
+            .iter()
+            .map(|snapshot| SlashMembershipRootRecord {
+                activation_height: snapshot.activation_height,
+                membership_root: compute_slash_membership_root(snapshot).unwrap(),
+            })
+            .collect();
         let tombstone_id = Bytes32::from([0xD0; 32]);
         continuous.evicted_validator_tombstones.insert(
             tombstone_id,
@@ -784,31 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn pre_cold_key_snapshot_roundtrips_with_unenrolled_defaults() {
-        let mut original = ChainState::new_genesis();
-        original.height = 43;
-        original.validators.upsert(test_validator()).unwrap();
-        let bytes = serialise_chain_state(&original);
-        let decoded = deserialise_chain_state(&bytes, original.height)
-            .unwrap()
-            .unwrap();
-        let validator = decoded.validators.get(&Bytes32::from([0x41; 32])).unwrap();
-        assert_eq!(validator.cold_hybrid_classical_pk, None);
-        assert_eq!(validator.cold_hybrid_pq_pk, None);
-        assert_eq!(validator.cold_key_version, 0);
-        assert_eq!(
-            validator.cold_key_status,
-            indra_state::ColdKeyStatus::Unenrolled
-        );
-        assert_eq!(validator.cold_nonce, 0);
-        assert_eq!(serialise_chain_state(&decoded), bytes);
-    }
-
-    #[test]
-    fn v3_snapshot_round_trips() {
+    fn canonical_snapshot_round_trips() {
         let dir = temp_dir("v3_round_trip");
         let store = StateStore::open(&dir).unwrap();
-        let mut state = ChainState::new_genesis();
+        let mut state = finalized_test_state();
         state.height = 123;
         state.treasury_balance = 456;
         state.rebuild_state_commitment_v2(state.height);
@@ -820,30 +812,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_sidecar_verification_succeeds_for_real_pre_activation_snapshot() {
-        let dir = temp_dir("pre_activation_migrated_sidecar");
+    fn snapshot_sidecar_verification_succeeds_for_canonical_snapshot() {
+        let dir = temp_dir("canonical_sidecar");
         let store = StateStore::open(&dir).unwrap();
-        let mut state = ChainState::new_genesis();
+        let mut state = finalized_test_state();
         state.height = 0;
         state.tip_hash = Bytes32::from([0x99; 32]);
-        state.validators.upsert(test_validator()).unwrap();
 
         store.save(&state).unwrap();
 
-        let snapshot_path = dir.join(format!("state_{}.snap", state.height));
-        let mut snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
-        // Outer snapshot payload byte 0 is the snapshot format; byte 1 is the
-        // stored ChainState schema version. Mark it as v3 so startup exercises
-        // the migrate-then-verify path against a historical sidecar root.
-        snapshot_bytes[13] =
-            indra_core::types::primitives::SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS;
-        std::fs::write(&snapshot_path, &snapshot_bytes).unwrap();
-        write_snapshot_meta(&dir, &state, &snapshot_bytes);
-
-        assert_eq!(
-            store.schema_version().unwrap(),
-            Some(indra_core::types::primitives::SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS)
-        );
+        assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
         let loaded = store.load_latest().unwrap().unwrap();
         assert_eq!(loaded.height, state.height);
         assert_eq!(compute_state_root(&loaded), compute_state_root(&state));
@@ -855,7 +833,7 @@ mod tests {
     fn backup_for_schema_migration_copies_state_store_files() {
         let dir = temp_dir("migration_backup");
         let store = StateStore::open(&dir).unwrap();
-        let mut state = ChainState::new_genesis();
+        let mut state = finalized_test_state();
         state.height = 12;
         state.validators.upsert(test_validator()).unwrap();
         store.save(&state).unwrap();
@@ -874,7 +852,7 @@ mod tests {
     fn snapshot_with_wrong_state_root_is_rejected() {
         let dir = temp_dir("bad_meta_state_root");
         let store = StateStore::open(&dir).unwrap();
-        let mut state = ChainState::new_genesis();
+        let mut state = finalized_test_state();
         state.height = 7;
         store.save(&state).unwrap();
 
@@ -894,7 +872,7 @@ mod tests {
     fn snapshot_with_wrong_tip_hash_is_rejected() {
         let dir = temp_dir("bad_meta_tip_hash");
         let store = StateStore::open(&dir).unwrap();
-        let mut state = ChainState::new_genesis();
+        let mut state = finalized_test_state();
         state.height = 8;
         state.tip_hash = Bytes32::from([0xAB; 32]);
         store.save(&state).unwrap();
@@ -941,9 +919,9 @@ mod tests {
         let dir = temp_dir("c");
         let store = StateStore::open(&dir).unwrap();
 
-        let mut s1 = ChainState::new_genesis();
+        let mut s1 = finalized_test_state();
         s1.height = 10;
-        let mut s2 = ChainState::new_genesis();
+        let mut s2 = finalized_test_state();
         s2.height = 20;
 
         store.save(&s1).unwrap();
@@ -963,6 +941,8 @@ mod tests {
         let store = StateStore::open(&dir).unwrap();
 
         let mut state = ChainState::new_genesis();
+        state.validators.upsert(test_validator()).unwrap();
+        state.finalize_genesis().unwrap();
         state.height = 512;
         state.tip_hash = Bytes32::from([0x11; 32]);
         state.base_fee = 4242;
@@ -993,35 +973,6 @@ mod tests {
             .unwrap();
         state.nullifiers.insert(Bytes32::from([0x31; 32]));
 
-        state
-            .validators
-            .upsert(ValidatorEntry {
-                validator_id: Bytes32::from([0x41; 32]),
-                name: "validator-one".to_string(),
-                hybrid_classical_pk: Some([0x42; 32]),
-                hybrid_pq_pk: Some(vec![0x43; 80]),
-                vrf_pk: Some([0x44; 32]),
-                stake_spark: 1_000_000,
-                status: ValidatorStatus::Active,
-                registered_epoch: 7,
-                last_active_epoch: 7,
-                pending_rewards: 12,
-                rewards_last_epoch: 6,
-                self_report_count: 1,
-                commission_bps: 900,
-                pending_commission_bps: None,
-                pending_commission_effective_epoch: None,
-                min_delegation_spark: DUST_LIMIT_SPARK,
-                auto_delegate_to: None,
-                network_addr: None,
-                network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: None,
-                cold_hybrid_pq_pk: None,
-                cold_key_version: 0,
-                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
-                cold_nonce: 0,
-            })
-            .unwrap();
         state
             .delegations
             .add_delegation(
@@ -1070,7 +1021,6 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -1090,7 +1040,7 @@ mod tests {
         let dir = temp_dir("next_state_root");
         let store = StateStore::open(&dir).unwrap();
 
-        let mut original = ChainState::new_genesis();
+        let mut original = finalized_test_state();
         for _ in 1u8..=12u8 {
             let block = make_block(&original);
             apply_block(&mut original, &block, 0).unwrap();

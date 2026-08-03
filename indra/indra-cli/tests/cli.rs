@@ -1,7 +1,7 @@
 //! Integration tests for the CLI tools.
 
 use indra_cli::{
-    build_claim_rewards_op, build_delegate_op, build_register_validator_op,
+    build_claim_rewards_op, build_delegate_op, build_register_validator_op_with_cold,
     build_set_commission_op, build_undelegate_op, generate_from_master_seed,
     generate_from_passphrase,
     genesis_cmd::{build_genesis_config, entry_from_keys},
@@ -270,11 +270,13 @@ fn test_build_and_decode_all_staking_ops() {
     };
     let chain_id = "indra-testnet-1";
     let built = vec![
-        build_register_validator_op(
+        build_register_validator_op_with_cold(
             1_000,
             bond_utxo_id,
             bond_proof.clone(),
             &keypair,
+            &indra_crypto::ColdHybridKeypair::from_independent_seeds([0x91; 32], [0x92; 32])
+                .unwrap(),
             [0xC3; 32],
             1,
             chain_id,

@@ -174,7 +174,6 @@ fn block_with_transactions_round_trip() {
         header: dummy_header(),
         transactions: vec![minimal_tx(), minimal_tx()],
         slashing_evidence: vec![],
-        slashing_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],

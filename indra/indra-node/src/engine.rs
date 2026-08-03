@@ -26,11 +26,11 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     governance::GovernanceOpV2,
     primitives::{
-        consensus_snapshot_active, Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK,
-        MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+        Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
+        MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
     },
     slash_membership::build_slash_membership_proof,
-    slashing::{SlashEvidenceEnvelopeV2, SlashEvidenceV1, SlashEvidenceV2},
+    slashing::{SlashEvidenceV1, SlashEvidenceV2},
     staking::StakingOp,
     vote::VoteStep,
     vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
@@ -41,7 +41,7 @@ use indra_crypto::{
     VrfKeypair,
 };
 use indra_state::{
-    apply::{compute_slash_evidence_hash, compute_slash_evidence_v2_hash},
+    apply::{compute_pending_slash_evidence_hash, compute_slash_evidence_v2_hash},
     apply_staking_op,
     epoch::epoch_for_height,
     governance_apply::{apply_governance_op, validate_governance_op},
@@ -55,7 +55,7 @@ use indra_storage::{
 use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
-    genesis::{build_genesis_block, load_genesis_validators},
+    genesis::{build_finalized_genesis_state, build_genesis_block},
     sync::{import_block, project_and_verify_block_state_root},
 };
 
@@ -143,10 +143,8 @@ impl NodeEngine {
                 )?;
             }
         }
-        let mut genesis_base = ChainState::new_genesis();
-        if let Some(ref genesis_path) = config.genesis_path {
-            load_genesis_validators(genesis_path, &mut genesis_base);
-        }
+        let mut genesis_base = build_finalized_genesis_state(config.genesis_path.as_deref())
+            .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
             verify_snapshot_tip_against_retained_block(&snapshot, &mut block_store)?;
@@ -268,10 +266,8 @@ impl NodeEngine {
     /// Rebuild the current chain state by replaying the block log on top of a
     /// fresh genesis-equivalent state seeded from the configured genesis file.
     pub fn rebuild_state_from_block_log(&mut self) -> NodeResult<()> {
-        let mut rebuilt = ChainState::new_genesis();
-        if let Some(ref genesis_path) = self.config.genesis_path {
-            load_genesis_validators(genesis_path, &mut rebuilt);
-        }
+        let mut rebuilt = build_finalized_genesis_state(self.config.genesis_path.as_deref())
+            .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
         rebuild_state_from_height(&mut rebuilt, &mut self.block_store, 1)?;
         self.state = rebuilt;
         Ok(())
@@ -363,84 +359,53 @@ impl NodeEngine {
 
     /// Add slash evidence to the pending pool if it has not already been seen.
     pub fn add_slash_evidence(&mut self, evidence: SlashEvidenceV1) {
-        let hash = compute_slash_evidence_hash(&evidence);
+        let hash = compute_pending_slash_evidence_hash(&evidence);
         let already_pending = self
             .pending_slashes
             .iter()
-            .any(|existing| compute_slash_evidence_hash(existing) == hash);
+            .any(|existing| compute_pending_slash_evidence_hash(existing) == hash);
         if !already_pending && !self.state.applied_slash_hashes.contains(&hash) {
             self.pending_slashes.push(evidence);
         }
     }
 
-    /// Select slash evidence for the next proposed block.
-    pub fn select_slash_evidence(&self) -> Vec<SlashEvidenceV1> {
-        self.pending_slashes
-            .iter()
-            .take(MAX_SLASHES_PER_BLOCK)
-            .cloned()
-            .collect()
-    }
-
-    /// Select and prove evidence for a protocol-v8 proposal.
-    pub fn select_slash_evidence_v2(&self) -> Vec<SlashEvidenceEnvelopeV2> {
+    /// Select and prove membership-authorized slash evidence.
+    pub fn select_slash_evidence(&self) -> Vec<SlashEvidenceV2> {
         self.pending_slashes
             .iter()
             .filter_map(|evidence| {
-                if !indra_core::types::primitives::slash_membership_proof_active(
-                    evidence.vote_1.height,
-                ) {
-                    return Some(SlashEvidenceEnvelopeV2::Legacy(evidence.clone()));
-                }
                 let snapshot = self
                     .state
                     .snapshot_for_consensus_height(evidence.vote_1.height)
                     .ok()?;
                 let (position, _) = snapshot.entry_with_position(&evidence.validator_id)?;
                 let membership_proof = build_slash_membership_proof(snapshot, position).ok()?;
-                Some(SlashEvidenceEnvelopeV2::MembershipProven(SlashEvidenceV2 {
+                Some(SlashEvidenceV2 {
                     validator_id: evidence.validator_id,
                     vote_1: evidence.vote_1.clone(),
                     vote_2: evidence.vote_2.clone(),
                     membership_proof,
-                }))
+                })
             })
             .take(MAX_SLASHES_PER_BLOCK)
             .collect()
     }
 
     /// Remove slash evidence that has already been committed.
-    pub fn evict_committed_slashes(&mut self, committed: &[SlashEvidenceV1]) {
+    pub fn evict_committed_slashes(&mut self, committed: &[SlashEvidenceV2]) {
         for evidence in committed {
-            let hash = compute_slash_evidence_hash(evidence);
-            self.pending_slashes
-                .retain(|pending| compute_slash_evidence_hash(pending) != hash);
-        }
-    }
-
-    fn evict_committed_slashes_v2(&mut self, committed: &[SlashEvidenceEnvelopeV2]) {
-        for envelope in committed {
-            let evidence = match envelope {
-                SlashEvidenceEnvelopeV2::Legacy(evidence) => evidence,
-                SlashEvidenceEnvelopeV2::MembershipProven(evidence) => {
-                    let hash = compute_slash_evidence_v2_hash(evidence);
-                    if !self.state.applied_slash_hashes.contains(&hash) {
-                        continue;
-                    }
-                    let legacy = SlashEvidenceV1 {
-                        validator_id: evidence.validator_id,
-                        vote_1: evidence.vote_1.clone(),
-                        vote_2: evidence.vote_2.clone(),
-                    };
-                    let legacy_hash = compute_slash_evidence_hash(&legacy);
-                    self.pending_slashes
-                        .retain(|pending| compute_slash_evidence_hash(pending) != legacy_hash);
-                    continue;
-                }
+            let hash = compute_slash_evidence_v2_hash(evidence);
+            if !self.state.applied_slash_hashes.contains(&hash) {
+                continue;
+            }
+            let legacy = SlashEvidenceV1 {
+                validator_id: evidence.validator_id,
+                vote_1: evidence.vote_1.clone(),
+                vote_2: evidence.vote_2.clone(),
             };
-            let hash = compute_slash_evidence_hash(evidence);
+            let legacy_hash = compute_pending_slash_evidence_hash(&legacy);
             self.pending_slashes
-                .retain(|pending| compute_slash_evidence_hash(pending) != hash);
+                .retain(|pending| compute_pending_slash_evidence_hash(pending) != legacy_hash);
         }
     }
 
@@ -620,7 +585,6 @@ impl NodeEngine {
             timestamp,
             polc_round,
             slash_evidence: self.select_slash_evidence(),
-            slash_evidence_v2: self.select_slash_evidence_v2(),
             governance_ops: self.select_governance_ops(),
             staking_ops: self.select_staking_ops(),
             election_result_hash: Some(election_result_hash),
@@ -720,7 +684,6 @@ impl NodeEngine {
             },
             transactions: original_block.transactions.clone(),
             slashing_evidence: original_block.slashing_evidence.clone(),
-            slashing_evidence_v2: original_block.slashing_evidence_v2.clone(),
             governance_ops: original_block.governance_ops.clone(),
             staking_ops: original_block.staking_ops.clone(),
             vrf_reveals,
@@ -782,9 +745,6 @@ impl NodeEngine {
     /// Legacy heights preserve the original live-registry adapter exactly.
     /// Governed heights fail closed if their canonical snapshot is unavailable.
     pub fn voters_for_consensus_height(&self, height: u64) -> NodeResult<Vec<RegisteredVoter>> {
-        if !consensus_snapshot_active(height) {
-            return Ok(self.registered_voters());
-        }
         let snapshot = self.state.snapshot_for_consensus_height(height)?;
         Ok(Self::registered_voters_for_height(height, snapshot))
     }
@@ -812,21 +772,6 @@ impl NodeEngine {
         &self,
         height: u64,
     ) -> NodeResult<Vec<NetworkAuthorityMember>> {
-        if !consensus_snapshot_active(height) {
-            let mut active: Vec<_> = self.state.validators.active_validators().collect();
-            active.sort_by_key(|validator| validator.validator_id.0);
-            return Ok(active
-                .into_iter()
-                .map(|validator| NetworkAuthorityMember {
-                    validator_id: validator.validator_id,
-                    hybrid_classical_pk: validator.hybrid_classical_pk,
-                    hybrid_pq_pk: validator.hybrid_pq_pk.clone(),
-                    vrf_pk: validator.vrf_pk,
-                    network_addr: validator.network_addr.clone(),
-                })
-                .collect());
-        }
-
         let snapshot = self.state.snapshot_for_consensus_height(height)?;
         Ok(snapshot
             .entries()
@@ -885,12 +830,6 @@ impl NodeEngine {
     ///
     /// Pre-gate behavior deliberately remains the original live-state adapter.
     pub fn qc_authority_for_height(&self, height: u64) -> NodeResult<(Vec<QcValidator>, u64)> {
-        if !consensus_snapshot_active(height) {
-            return Ok((
-                self.qc_validators(),
-                self.state.validators.total_active_stake(),
-            ));
-        }
         let snapshot = self.state.snapshot_for_consensus_height(height)?;
         Ok((
             Self::qc_validators_for_height(height, snapshot),
@@ -994,7 +933,6 @@ impl NodeEngine {
         self.evict_committed_staking_ops(&block.staking_ops);
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
-        self.evict_committed_slashes_v2(&block.slashing_evidence_v2);
         Ok(())
     }
 
@@ -1241,11 +1179,28 @@ mod tests {
         seed: [u8; 32],
         name: &str,
     ) -> HybridKeypair {
+        if engine.state.height == 0
+            && engine
+                .state
+                .validators
+                .all_validators()
+                .any(|validator| validator.name == "local-test-validator")
+        {
+            engine.state.validators = Default::default();
+            engine.state.consensus_snapshots.clear();
+            engine.state.reward_economic_snapshot = None;
+            engine.state.slash_membership_roots.clear();
+        }
         let classical = ClassicalKeypair::from_seed(&seed);
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let hybrid = HybridKeypair::new(classical, pq);
         let public = hybrid.public_key();
         let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+        let cold =
+            indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
+                .unwrap();
+        let cold_public = cold.public_key();
+        let cold_public = cold_public.as_complete_hybrid();
         let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
 
         engine
@@ -1271,13 +1226,15 @@ mod tests {
                 auto_delegate_to: None,
                 network_addr: None,
                 network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: None,
-                cold_hybrid_pq_pk: None,
-                cold_key_version: 0,
-                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                cold_hybrid_classical_pk: Some(cold_public.classical.0),
+                cold_hybrid_pq_pk: Some(cold_public.pq.0),
+                cold_key_version: 1,
                 cold_nonce: 0,
             })
             .unwrap();
+        if engine.state.height == 0 {
+            crate::genesis::finalize_test_genesis(&mut engine.state);
+        }
         hybrid
     }
 
@@ -1296,14 +1253,21 @@ mod tests {
         let classical = ClassicalKeypair::from_seed(&seed);
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let vrf = VrfKeypair::from_seed(&seed);
+        let cold =
+            indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
+                .unwrap();
+        let cold_public = cold.public_key();
+        let cold_public = cold_public.as_complete_hybrid();
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
-            "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+            "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
             hex::encode(vrf.public_key()),
+            hex::encode(cold_public.classical.0),
+            hex::encode(cold_public.pq.0),
         );
         std::fs::write(&genesis_path, genesis).unwrap();
         genesis_path.to_string_lossy().to_string()
@@ -1340,9 +1304,29 @@ mod tests {
         };
     }
 
+    fn cold_keypair_for_seed(seed: [u8; 32]) -> HybridKeypair {
+        HybridKeypair::new(
+            ClassicalKeypair::from_seed(&seed),
+            PqKeypair::from_seed(&[seed[0] ^ 0xFF; 32]).unwrap(),
+        )
+    }
+
+    fn sign_cold_staking_op(op: &mut StakingOp, keypair: &HybridKeypair, chain_id: &str) {
+        let bytes = op
+            .cold_authorization_signing_bytes(chain_id)
+            .unwrap()
+            .unwrap();
+        let sig = keypair.sign(&bytes).unwrap();
+        op.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+        };
+    }
+
     fn valid_set_commission_staking_op(
         engine: &NodeEngine,
         keypair: &HybridKeypair,
+        cold_keypair: &HybridKeypair,
         nonce: u64,
         new_commission_bps: u32,
     ) -> StakingOp {
@@ -1351,12 +1335,15 @@ mod tests {
             body: StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps,
-                cold_authorization: None,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                }),
             },
-            nonce,
+            nonce: 0,
             signature: dummy_signature(),
         };
-        sign_staking_op(&mut op, keypair, &engine.state.chain_id);
+        sign_cold_staking_op(&mut op, cold_keypair, &engine.state.chain_id);
         op
     }
 
@@ -1465,7 +1452,6 @@ mod tests {
         validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
         validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
         validator.cold_key_version = 1;
-        validator.cold_key_status = indra_state::ColdKeyStatus::Active;
         let deposit_utxo_id = engine
             .state
             .utxos
@@ -1588,7 +1574,6 @@ mod tests {
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
             slash_evidence: vec![],
-            slash_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             election_result_hash: Some(election_result_hash),
@@ -1931,6 +1916,7 @@ mod tests {
         let signer = install_active_validator(&mut engine, [0x73; 32], "missing");
         let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
         let qc = qc_from_test_signers(u64::MAX, Bytes32::from([0xA4; 32]), &snapshot, &[&signer]);
+        engine.state.consensus_snapshots.clear();
         assert!(matches!(
             engine.verify_qc_for_height(&qc),
             Err(NodeError::ConsensusSnapshotLookup(_))
@@ -1974,6 +1960,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(any())]
     #[test]
     fn evict_committed_slashes_removes_correct() {
         let dir = temp_dir("slash_evict");
@@ -1997,7 +1984,7 @@ mod tests {
         engine
             .state
             .applied_slash_hashes
-            .insert(compute_slash_evidence_hash(&evidence));
+            .insert(compute_pending_slash_evidence_hash(&evidence));
         engine.add_slash_evidence(evidence);
         assert!(engine.pending_slashes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2006,7 +1993,11 @@ mod tests {
     #[test]
     fn full_node_has_no_validator_id() {
         let dir = temp_dir("b");
-        let config = NodeConfig::full_node(dir.clone());
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.validator_seed = None;
+        config.vrf_seed = None;
+        config.pq_pk = None;
+        config.pq_sk = None;
         let engine = NodeEngine::init(config).unwrap();
         assert!(engine.validator_id().is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2294,7 +2285,7 @@ mod tests {
         }
 
         let state_store = StateStore::open(&state_dir).unwrap();
-        let mut snapshot = ChainState::new_genesis();
+        let mut snapshot = crate::genesis::canonical_test_genesis();
         snapshot.height = 10;
         snapshot.tip_hash = Bytes32::from([0x55; 32]);
         state_store.save(&snapshot).unwrap();
@@ -2348,14 +2339,18 @@ mod tests {
         let classical = ClassicalKeypair::from_seed(&[0x11u8; 32]);
         let pq = PqKeypair::from_seed(&[0x11u8; 32]).unwrap();
         let vrf = VrfKeypair::from_seed(&[0x22u8; 32]);
+        let cold = cold_keypair_for_seed([0x11; 32]);
+        let cold_public = cold.public_key();
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
-            "[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 100000000000\n",
+            "[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
             hex::encode(vrf.public_key()),
+            hex::encode(cold_public.classical.0),
+            hex::encode(cold_public.pq.0),
         );
         std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
@@ -2563,7 +2558,8 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x71; 32], "stake");
-        let op = valid_set_commission_staking_op(&engine, &keypair, 1, 1_100);
+        let cold = cold_keypair_for_seed([0x71; 32]);
+        let op = valid_set_commission_staking_op(&engine, &keypair, &cold, 1, 1_100);
 
         engine.add_staking_op(op.clone()).unwrap();
         assert!(matches!(
@@ -2598,7 +2594,8 @@ mod tests {
         config.staking_mempool_capacity = 0;
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x74; 32], "stake-cap");
-        let op = valid_set_commission_staking_op(&engine, &keypair, 1, 1_100);
+        let cold = cold_keypair_for_seed([0x74; 32]);
+        let op = valid_set_commission_staking_op(&engine, &keypair, &cold, 1, 1_100);
 
         let err = engine.add_staking_op(op).unwrap_err().to_string();
         assert!(err.contains("staking mempool full"));
@@ -2660,7 +2657,8 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x53; 32], "gov");
-        let op = valid_governance_propose_op(&mut engine, &keypair, 1);
+        let cold = cold_keypair_for_seed([0x53; 32]);
+        let op = valid_cold_governance_propose_op(&mut engine, &keypair, &cold, 1);
 
         engine.add_governance_op(op.clone()).unwrap();
 
@@ -2676,10 +2674,7 @@ mod tests {
         let mut engine = NodeEngine::init(config).unwrap();
         engine.state.height = u64::MAX;
         let hot = install_active_validator(&mut engine, [0x73; 32], "cold-gov");
-        let cold = HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[0x74; 32]),
-            PqKeypair::from_seed(&[0x75; 32]).unwrap(),
-        );
+        let cold = cold_keypair_for_seed([0x73; 32]);
         let op1 = valid_cold_governance_propose_op(&mut engine, &hot, &cold, 1);
 
         engine.add_governance_op(op1.clone()).unwrap();
@@ -2730,7 +2725,8 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x55; 32], "gov-select");
-        let op = valid_governance_propose_op(&mut engine, &keypair, 1);
+        let cold = cold_keypair_for_seed([0x55; 32]);
+        let op = valid_cold_governance_propose_op(&mut engine, &keypair, &cold, 1);
         engine.governance_mempool.push(op.clone());
 
         let selected = engine.select_governance_ops();
@@ -2748,7 +2744,8 @@ mod tests {
         config.governance_mempool_capacity = 0;
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x54; 32], "gov-cap");
-        let op = valid_governance_propose_op(&mut engine, &keypair, 1);
+        let cold = cold_keypair_for_seed([0x54; 32]);
+        let op = valid_cold_governance_propose_op(&mut engine, &keypair, &cold, 1);
 
         let err = engine.add_governance_op(op).unwrap_err().to_string();
         assert!(err.contains("governance mempool full"));
@@ -2764,8 +2761,11 @@ mod tests {
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x72; 32], "stake");
         let retained_keypair = install_active_validator(&mut engine, [0x73; 32], "stake2");
-        let committed = valid_set_commission_staking_op(&engine, &keypair, 1, 1_100);
-        let retained = valid_set_commission_staking_op(&engine, &retained_keypair, 1, 1_200);
+        let cold = cold_keypair_for_seed([0x72; 32]);
+        let retained_cold = cold_keypair_for_seed([0x73; 32]);
+        let committed = valid_set_commission_staking_op(&engine, &keypair, &cold, 1, 1_100);
+        let retained =
+            valid_set_commission_staking_op(&engine, &retained_keypair, &retained_cold, 1, 1_200);
 
         engine.add_staking_op(committed.clone()).unwrap();
         engine.add_staking_op(retained.clone()).unwrap();

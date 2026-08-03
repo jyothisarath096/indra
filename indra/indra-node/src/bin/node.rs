@@ -4245,16 +4245,22 @@ mod tests {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&seed);
         let pq = indra_crypto::hybrid::PqKeypair::from_seed(&seed).unwrap();
         let vrf = indra_crypto::VrfKeypair::from_seed(&seed);
+        let mut cold_seed = seed;
+        cold_seed[0] ^= 0xFF;
+        let cold_classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&cold_seed);
+        let cold_pq = indra_crypto::hybrid::PqKeypair::from_seed(&cold_seed).unwrap();
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &genesis_path,
             format!(
-                "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+                "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
                 hex::encode(indra_crypto::sha256(&classical.public_key().0)),
                 hex::encode(classical.public_key().0),
                 hex::encode(pq.public_key().0),
                 hex::encode(vrf.public_key()),
+                hex::encode(cold_classical.public_key().0),
+                hex::encode(cold_pq.public_key().0),
             ),
         )
         .unwrap();
@@ -4303,7 +4309,6 @@ mod tests {
                 cold_hybrid_classical_pk: None,
                 cold_hybrid_pq_pk: None,
                 cold_key_version: 0,
-                cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
                 cold_nonce: 0,
             })
             .unwrap();
@@ -4366,12 +4371,12 @@ mod tests {
     }
 
     #[test]
-    fn top_level_proposer_authority_preserves_legacy_live_candidates() {
+    fn top_level_proposer_authority_ignores_live_only_candidates() {
         let (mut driver, dir) = proposer_test_driver([0xD3; 32], "legacy");
         let live_id = add_active_proposer_candidate(&mut driver, [0xD4; 32]);
         let election = proposer_election_for_slot(&driver, 1, 3).unwrap();
 
-        assert!(election
+        assert!(!election
             .candidates
             .iter()
             .any(|candidate| candidate.validator_id == live_id));
@@ -4490,7 +4495,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_network_authority_remains_live_active_only() {
+    fn network_authority_is_snapshot_membership_with_live_addresses() {
         let (mut driver, dir) = proposer_test_driver([0xE4; 32], "network_legacy");
         let local = driver.engine.validator_id().unwrap();
         driver
@@ -4511,16 +4516,10 @@ mod tests {
 
         let config = build_handshake_config(&driver.engine).unwrap().unwrap();
         assert!(config.known_validators.iter().any(|(id, _)| *id == local));
-        assert!(config.known_validators.iter().any(|(id, _)| *id == live));
+        assert!(!config.known_validators.iter().any(|(id, _)| *id == live));
         let mut addrs = on_chain_validator_network_addrs_for_height(&driver.engine, 1).unwrap();
         addrs.sort();
-        assert_eq!(
-            addrs,
-            vec![
-                "203.0.113.64:30303".to_string(),
-                "203.0.113.65:30303".to_string()
-            ]
-        );
+        assert_eq!(addrs, vec!["203.0.113.64:30303".to_string()]);
 
         driver
             .engine
@@ -4530,9 +4529,9 @@ mod tests {
             .unwrap()
             .status = indra_state::ValidatorStatus::Registered;
         let config = build_handshake_config(&driver.engine).unwrap().unwrap();
-        assert!(!config.known_validators.iter().any(|(id, _)| *id == local));
+        assert!(config.known_validators.iter().any(|(id, _)| *id == local));
         assert!(
-            !on_chain_validator_network_addrs_for_height(&driver.engine, 1)
+            on_chain_validator_network_addrs_for_height(&driver.engine, 1)
                 .unwrap()
                 .contains(&"203.0.113.64:30303".to_string())
         );
@@ -5429,7 +5428,6 @@ mod tests {
             },
             transactions: Vec::new(),
             slashing_evidence: Vec::new(),
-            slashing_evidence_v2: Vec::new(),
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
             vrf_reveals: Vec::new(),
@@ -5793,7 +5791,6 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],
@@ -5824,7 +5821,6 @@ mod tests {
             },
             transactions: vec![],
             slashing_evidence: vec![],
-            slashing_evidence_v2: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
             vrf_reveals: vec![],

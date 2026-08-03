@@ -8,8 +8,7 @@ use crate::{
         authorization::AuthorizationEnvelope,
         crypto::{HybridPubKey, HybridSignature},
         primitives::{
-            validator_cold_key_enrollment_active, Bytes32, VariableBytes, SCHEMA_VERSION,
-            SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
+            Bytes32, VariableBytes, SCHEMA_VERSION, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
         },
     },
 };
@@ -642,12 +641,6 @@ impl GovernanceOpV2 {
             });
         }
         if let Some(authorization) = self.cold_authorization() {
-            if !validator_cold_key_enrollment_active(height) {
-                return Err(IndraError::InvariantViolation {
-                    message:
-                        "cold-authorized governance op is unavailable before enrollment height",
-                });
-            }
             if self.nonce != 0 {
                 return Err(IndraError::InvariantViolation {
                     message: "cold-authorized governance op outer nonce must be zero",

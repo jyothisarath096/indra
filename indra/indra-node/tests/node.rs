@@ -46,7 +46,7 @@ fn temp_dir(suffix: &str) -> PathBuf {
 }
 
 fn anchored_genesis_state() -> ChainState {
-    let mut state = ChainState::new_genesis();
+    let mut state = build_genesis_state();
     state.tip_hash = genesis_block_hash();
     state
 }
@@ -118,7 +118,6 @@ fn make_strict_block(
         timestamp: 1_700_000_000 + state.height + 1,
         polc_round: None,
         slash_evidence: vec![],
-        slash_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
@@ -197,7 +196,6 @@ fn install_active_validator(
             cold_hybrid_classical_pk: None,
             cold_hybrid_pq_pk: None,
             cold_key_version: 0,
-            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
             cold_nonce: 0,
         })
         .unwrap();
@@ -210,7 +208,18 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
     let hybrid = HybridKeypair::new(classical, pq);
     let public = hybrid.public_key();
     let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
+        .unwrap();
+    let cold_public = cold.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
     let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+
+    if state.height == 0 {
+        state.validators = Default::default();
+        state.consensus_snapshots.clear();
+        state.reward_economic_snapshot = None;
+        state.slash_membership_roots.clear();
+    }
 
     state
         .validators
@@ -234,13 +243,15 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: None,
-            cold_hybrid_pq_pk: None,
-            cold_key_version: 0,
-            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+            cold_hybrid_classical_pk: Some(cold_public.classical.0),
+            cold_hybrid_pq_pk: Some(cold_public.pq.0),
+            cold_key_version: 1,
             cold_nonce: 0,
         })
         .unwrap();
+    if state.height == 0 {
+        state.finalize_genesis().unwrap();
+    }
     hybrid
 }
 
@@ -249,15 +260,21 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
     let classical = ClassicalKeypair::from_seed(&seed);
     let pq = PqKeypair::from_seed(&seed).unwrap();
     let vrf = VrfKeypair::from_seed(&seed);
+    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
+        .unwrap();
+    let cold_public = cold.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
     let validator_id = indra_crypto::sha256(&classical.public_key().0);
     let genesis_path = dir.join("genesis.toml");
     let genesis = format!(
-        "[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nstake = 1000000\n",
+        "[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
         name,
         hex::encode(validator_id),
         hex::encode(classical.public_key().0),
         hex::encode(pq.public_key().0),
         hex::encode(vrf.public_key()),
+        hex::encode(cold_public.classical.0),
+        hex::encode(cold_public.pq.0),
     );
     std::fs::write(&genesis_path, genesis).unwrap();
     genesis_path.to_string_lossy().to_string()
@@ -592,7 +609,7 @@ fn snapshot_and_restore() {
 
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
-    let mut state = ChainState::new_genesis();
+    let mut state = build_genesis_state();
     state.height = 300;
     state.base_fee = 999;
 

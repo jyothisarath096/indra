@@ -6,7 +6,7 @@
 
 use indra_core::types::{crypto::HybridPubKey, primitives::Bytes32};
 
-use crate::validator::{ColdKeyStatus, StakeBondCustodyOwner};
+use crate::validator::StakeBondCustodyOwner;
 use crate::ChainState;
 
 /// Successful identity-check result for operations that submit a full pubkey.
@@ -102,12 +102,6 @@ pub(crate) fn resolve_active_validator_cold_pubkey(
             delegator_id: *validator_id,
         });
     };
-    if validator.cold_key_status != ColdKeyStatus::Active {
-        return Err(IdentityError::UnresolvableIdentity {
-            validator_id: Some(*validator_id),
-            delegator_id: *validator_id,
-        });
-    }
     let classical =
         validator
             .cold_hybrid_classical_pk
@@ -367,81 +361,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_single_legacy_bond_accepts_matching_submitted_pubkey() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = id(0x20);
-        let delegator_id = id(0x13);
-        let owner = pubkey(0x13, 0xA3);
-        let bond = legacy_bond(id(0x80), validator_id, delegator_id, owner.clone(), 0x80);
-        state.staked_bonds.insert(bond.utxo_id, bond);
 
-        assert_eq!(
-            resolve_and_check_identity(&delegator_id, &owner, &state),
-            Ok(IdentityCheckOutcome::LegacyBondMatch)
-        );
-    }
 
-    #[test]
-    fn resolve_single_legacy_bond_rejects_different_submitted_pubkey() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = id(0x21);
-        let delegator_id = id(0x14);
-        let bond = legacy_bond(
-            id(0x81),
-            validator_id,
-            delegator_id,
-            pubkey(0x14, 0xA4),
-            0x81,
-        );
-        state.staked_bonds.insert(bond.utxo_id, bond);
 
-        assert_eq!(
-            resolve_and_check_identity(&delegator_id, &pubkey(0x14, 0xB4), &state),
-            Err(IdentityError::LegacyPubkeyMismatch { delegator_id })
-        );
-    }
-
-    #[test]
-    fn resolve_multiple_agreeing_legacy_bonds_accepts_matching_submitted_pubkey() {
-        let mut state = ChainState::new_genesis();
-        let delegator_id = id(0x15);
-        let owner = pubkey(0x15, 0xA5);
-        for (index, validator_byte) in [0x30u8, 0x31, 0x32].into_iter().enumerate() {
-            let utxo_id = id(0x90 + index as u8);
-            let bond = legacy_bond(
-                utxo_id,
-                id(validator_byte),
-                delegator_id,
-                owner.clone(),
-                0x90 + index as u8,
-            );
-            state.staked_bonds.insert(bond.utxo_id, bond);
-        }
-
-        assert_eq!(
-            resolve_and_check_identity(&delegator_id, &owner, &state),
-            Ok(IdentityCheckOutcome::LegacyBondMatch)
-        );
-    }
-
-    #[test]
-    fn resolve_conflicting_legacy_bonds_reject_even_when_submitted_matches_one() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = id(0x22);
-        let delegator_id = id(0x16);
-        let first = pubkey(0x16, 0xA6);
-        let second = pubkey(0x16, 0xB6);
-        let first_bond = legacy_bond(id(0x91), validator_id, delegator_id, first.clone(), 0x91);
-        let second_bond = legacy_bond(id(0x92), validator_id, delegator_id, second, 0x92);
-        state.staked_bonds.insert(first_bond.utxo_id, first_bond);
-        state.staked_bonds.insert(second_bond.utxo_id, second_bond);
-
-        assert_eq!(
-            resolve_and_check_identity(&delegator_id, &first, &state),
-            Err(IdentityError::AmbiguousLegacyPubkeys { delegator_id })
-        );
-    }
 
     #[test]
     fn resolve_ignores_compact_bonds_when_registry_is_absent() {
@@ -459,20 +381,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bond_owner_resolution_prefers_embedded_pubkey() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = id(0x27);
-        let delegator_id = id(0x1C);
-        let owner = pubkey(0x1C, 0xAC);
-        let registry_owner = pubkey(0x1C, 0xBC);
-        state
-            .delegator_identities
-            .insert(delegator_id, registry_owner);
-        let bond = compact_bond(id(0x98), validator_id, delegator_id, owner.clone(), 0x98);
-
-        assert_eq!(resolve_bond_owner_pubkey(&bond, &state), Ok(owner));
-    }
 
     #[test]
     fn fully_compact_bond_owner_resolution_uses_registry_or_fails_loudly() {
@@ -524,68 +432,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn redelegation_resolution_uses_unambiguous_active_legacy_bond() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = id(0x25);
-        let delegator_id = id(0x19);
-        let owner = pubkey(0x19, 0xA9);
-        let bond = legacy_bond(id(0x95), validator_id, delegator_id, owner.clone(), 0x95);
-        state.staked_bonds.insert(bond.utxo_id, bond);
 
-        assert_eq!(
-            resolve_delegator_identity_for_redelegation(&validator_id, &delegator_id, &state),
-            Ok(owner)
-        );
-    }
-
-    #[test]
-    fn redelegation_resolution_rejects_missing_or_ambiguous_legacy_state() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = id(0x26);
-        let missing_delegator_id = id(0x1A);
-
-        assert_eq!(
-            resolve_delegator_identity_for_redelegation(
-                &validator_id,
-                &missing_delegator_id,
-                &state
-            ),
-            Err(IdentityError::UnresolvableIdentity {
-                validator_id: Some(validator_id),
-                delegator_id: missing_delegator_id
-            })
-        );
-
-        let ambiguous_delegator_id = id(0x1B);
-        let first_bond = legacy_bond(
-            id(0x96),
-            validator_id,
-            ambiguous_delegator_id,
-            pubkey(0x1B, 0xAA),
-            0x96,
-        );
-        let second_bond = legacy_bond(
-            id(0x97),
-            validator_id,
-            ambiguous_delegator_id,
-            pubkey(0x1B, 0xBB),
-            0x97,
-        );
-        state.staked_bonds.insert(first_bond.utxo_id, first_bond);
-        state.staked_bonds.insert(second_bond.utxo_id, second_bond);
-
-        assert_eq!(
-            resolve_delegator_identity_for_redelegation(
-                &validator_id,
-                &ambiguous_delegator_id,
-                &state
-            ),
-            Err(IdentityError::AmbiguousLegacyPubkeys {
-                delegator_id: ambiguous_delegator_id
-            })
-        );
-    }
 
     #[test]
     fn redelegation_resolution_ignores_unbonding_legacy_bonds() {

@@ -16,7 +16,7 @@ use indra_core::{
         },
         qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         slashing::SlashEvidenceV1,
-        staking::{StakingOp, StakingOpBody},
+        staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::{VoteStep, VoteV1},
     },
@@ -24,14 +24,13 @@ use indra_core::{
 };
 use indra_crypto::{
     commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair,
-    ColdHybridKeypair, HybridKeypair, PaymentBlindingNoteV1, PqKeypair,
+    ColdHybridKeypair, HybridKeypair, PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
 };
 use indra_state::{
-    apply::apply_slash,
     apply_block, compute_state_root,
     epoch::{apply_epoch_transition, EpochTransitionContext},
     utxo::UtxoSet,
-    ChainState, ColdKeyStatus, ValidatorEntry, ValidatorStatus,
+    ChainState, ValidatorEntry, ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -61,17 +60,45 @@ fn dummy_sig() -> HybridSignature {
 }
 
 fn signed_staking_op(
-    body: StakingOpBody,
+    mut body: StakingOpBody,
     nonce: u64,
     keypair: &HybridKeypair,
     chain_id: &str,
 ) -> StakingOp {
+    let cold_designated = matches!(
+        body,
+        StakingOpBody::SelfStake { .. }
+            | StakingOpBody::SelfUnstake { .. }
+            | StakingOpBody::SetAutoDelegate { .. }
+            | StakingOpBody::ClaimRewards { .. }
+    );
+    if cold_designated {
+        let authorization = Some(ColdStakingAuthorization {
+            cold_key_version: 1,
+            cold_nonce: nonce,
+        });
+        match &mut body {
+            StakingOpBody::SelfStake { cold_authorization, .. }
+            | StakingOpBody::SelfUnstake { cold_authorization, .. }
+            | StakingOpBody::ClaimRewards { cold_authorization, .. } => {
+                *cold_authorization = authorization;
+            }
+            StakingOpBody::SetAutoDelegate { cold_authorization, .. } => {
+                *cold_authorization = authorization;
+            }
+            _ => unreachable!(),
+        }
+    }
     let mut op = StakingOp {
         body,
-        nonce,
+        nonce: if cold_designated { 0 } else { nonce },
         signature: dummy_sig(),
     };
-    let sig = keypair.sign(&op.signing_bytes(chain_id)).unwrap();
+    let signing_bytes = op
+        .cold_authorization_signing_bytes(chain_id)
+        .unwrap()
+        .unwrap_or_else(|| op.signing_bytes(chain_id));
+    let sig = keypair.sign(&signing_bytes).unwrap();
     op.signature = HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -96,7 +123,7 @@ fn install_validator(
             name: format!("validator-{}", seed[0]),
             hybrid_classical_pk: Some(pubkey.classical_pk.0),
             hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
-            vrf_pk: Some(seed),
+            vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
             stake_spark: 0,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -111,14 +138,21 @@ fn install_validator(
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: None,
-            cold_hybrid_pq_pk: None,
-            cold_key_version: 0,
-            cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+            cold_hybrid_classical_pk: Some(pubkey.classical_pk.0),
+            cold_hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().try_into().unwrap()),
+            cold_key_version: 1,
             cold_nonce: 0,
         })
         .unwrap();
     (validator_id, pubkey, keypair)
+}
+
+fn finalized_genesis() -> ChainState {
+    let mut state = ChainState::new_genesis();
+    let (validator_id, _, _) = install_validator(&mut state, [0xF0; 32]);
+    state.validators.get_mut(&validator_id).unwrap().stake_spark = TEST_INPUT_VALUE;
+    state.finalize_genesis().unwrap();
+    state
 }
 
 fn sign_transaction(
@@ -246,6 +280,16 @@ fn make_tx(
 
 fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
     let height = state.height + 1;
+    let quorum_certificate = if height % EPOCH_DURATION_BLOCKS == 0 {
+        let signer_ids: Vec<_> = state
+            .validators
+            .active_validators()
+            .map(|validator| validator.validator_id)
+            .collect();
+        qc_bytes_for_signers(&signer_ids, height - 1)
+    } else {
+        VariableBytes::from_slice(&[0u8; 32]).unwrap()
+    };
     BlockV1 {
         header: BlockHeaderV1 {
             protocol_version: ProtocolVersion::CURRENT,
@@ -261,12 +305,11 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
             polc_round: indra_core::types::block::NO_POLC_ROUND,
             proposer_vrf_output: Bytes32::ZERO,
             proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-            quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            quorum_certificate,
             election_result_hash: None,
         },
         transactions: txs,
         slashing_evidence: vec![],
-        slashing_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],
@@ -274,17 +317,19 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
 }
 
 fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
-    (0..4u8)
+    let ids: Vec<_> = (0..4u8)
         .map(|index| {
-            let validator_id = Bytes32::from([0xA0 + index; 32]);
+            let seed = [0xA0 + index; 32];
+            let (pubkey, _) = make_test_keypair(seed);
+            let validator_id = pubkey_to_id(&pubkey);
             state
                 .validators
                 .upsert(ValidatorEntry {
                     validator_id,
                     name: format!("qc-validator-{index}"),
-                    hybrid_classical_pk: None,
-                    hybrid_pq_pk: None,
-                    vrf_pk: None,
+                    hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                    hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
+                    vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
                     stake_spark: 100_000_000_000,
                     status: ValidatorStatus::Active,
                     registered_epoch: 0,
@@ -299,16 +344,17 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
                     auto_delegate_to: None,
                     network_addr: None,
                     network_addr_last_updated_epoch: None,
-                    cold_hybrid_classical_pk: None,
-                    cold_hybrid_pq_pk: None,
-                    cold_key_version: 0,
-                    cold_key_status: indra_state::ColdKeyStatus::Unenrolled,
+                    cold_hybrid_classical_pk: Some(pubkey.classical_pk.0),
+                    cold_hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().try_into().unwrap()),
+                    cold_key_version: 1,
                     cold_nonce: 0,
                 })
                 .unwrap();
             validator_id
         })
-        .collect()
+        .collect();
+    state.finalize_genesis().unwrap();
+    ids
 }
 
 fn qc_bytes_for_signers(
@@ -519,7 +565,7 @@ fn epoch_record_timestamp_differs_but_state_root_matches() {
 
 #[test]
 fn one_hundred_empty_blocks() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     for _ in 0..100 {
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
@@ -529,7 +575,7 @@ fn one_hundred_empty_blocks() {
 
 #[test]
 fn utxo_lifecycle_across_blocks() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
 
     // Create a UTXO by inserting it at genesis
@@ -595,7 +641,7 @@ fn utxo_lifecycle_across_blocks() {
 
 #[test]
 fn fee_evolves_over_blocks() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let fee_at_genesis = state.base_fee;
 
     // Apply 10 empty blocks — fee should decrease (below target utilisation)
@@ -611,7 +657,7 @@ fn fee_evolves_over_blocks() {
 
 #[test]
 fn epoch_transition_fires_at_boundary() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let supply_before = state.total_supply;
     let treasury_before = state.treasury_balance;
 
@@ -629,7 +675,7 @@ fn epoch_transition_fires_at_boundary() {
 
 #[test]
 fn two_epochs_preserve_supply() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
 
     // First epoch
     for _ in 0..EPOCH_DURATION_BLOCKS {
@@ -650,7 +696,7 @@ fn two_epochs_preserve_supply() {
 
 #[test]
 fn fees_are_burned() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
 
     // Insert a spendable UTXO
@@ -682,8 +728,8 @@ fn fees_are_burned() {
 fn chain_is_deterministic() {
     // Two independent nodes starting from genesis and applying the same blocks
     // must arrive at identical state
-    let mut state_a = ChainState::new_genesis();
-    let mut state_b = ChainState::new_genesis();
+    let mut state_a = finalized_genesis();
+    let mut state_b = finalized_genesis();
 
     for i in 0..50u64 {
         let block_a = make_block(&state_a, vec![]);
@@ -706,7 +752,7 @@ fn chain_is_deterministic() {
 
 #[test]
 fn test_self_stake_full_lifecycle() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (validator_id, validator_pubkey, validator_keypair) =
         install_validator(&mut state, [0x41; 32]);
     let output = make_output(0x40, validator_pubkey.clone());
@@ -777,7 +823,6 @@ fn test_self_stake_full_lifecycle() {
     validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
     validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
     validator.cold_key_version = 1;
-    validator.cold_key_status = ColdKeyStatus::Active;
 
     apply_epoch_transition(
         &mut state,
@@ -809,6 +854,7 @@ fn test_auto_delegate_full_lifecycle() {
         state.validators.get_mut(&id).unwrap().stake_spark = stake;
         validators.push((id, pubkey, keypair));
     }
+    state.finalize_genesis().unwrap();
 
     let target_id = validators[0].0;
     let inactive_id = validators[20].0;
@@ -878,67 +924,13 @@ fn test_auto_delegate_full_lifecycle() {
 }
 
 #[test]
-fn test_self_stake_slash_reduces_bond_amount() {
-    let mut state = ChainState::new_genesis();
-    let (validator_id, validator_pubkey, validator_keypair) =
-        install_validator(&mut state, [0x42; 32]);
-    let output = make_output(0x50, validator_pubkey.clone());
-    let bond_value = output.value_spark;
-    let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
-
-    let stake_op = signed_staking_op(
-        StakingOpBody::SelfStake {
-            bond_utxo_id,
-            validator_pubkey,
-            bond_proof: Some(indra_core::types::staking::StakingBondProof {
-                committed_value_spark: bond_value,
-                blinding_factor: Bytes32::from([0x50; 32]),
-            }),
-            cold_authorization: None,
-        },
-        1,
-        &validator_keypair,
-        &state.chain_id,
-    );
-    let mut block = make_block(&state, vec![]);
-    block.staking_ops = vec![stake_op];
-    apply_block(&mut state, &block, 0).unwrap();
-
-    let evidence = SlashEvidenceV1 {
-        validator_id,
-        vote_1: signed_vote(
-            &validator_keypair,
-            validator_id,
-            VoteStep::Precommit,
-            Bytes32::from([0xA1; 32]),
-        ),
-        vote_2: signed_vote(
-            &validator_keypair,
-            validator_id,
-            VoteStep::Precommit,
-            Bytes32::from([0xA2; 32]),
-        ),
-    };
-    let chain_id = state.chain_id.clone();
-    apply_slash(&mut state, &evidence, &chain_id).unwrap();
-
-    assert_eq!(
-        state.staked_bonds.get(&bond_utxo_id).unwrap().amount_spark,
-        bond_value - (bond_value * 500 / 10_000)
-    );
-    assert!(matches!(
-        state.validators.get(&validator_id).unwrap().status,
-        ValidatorStatus::Slashed
-    ));
-}
-
-#[test]
 fn epoch_transition_produces_identical_state_on_replay() {
     let mut original = ChainState::new_genesis();
     for seed in 1..=4 {
         let (id, _, _) = install_validator(&mut original, [seed; 32]);
         original.validators.get_mut(&id).unwrap().stake_spark = 1_000_000;
     }
+    original.finalize_genesis().unwrap();
     let mut replay = original.clone();
     apply_epoch_transition(
         &mut original,

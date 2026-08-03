@@ -95,8 +95,8 @@ mod handle_tests {
             crypto::HybridPubKey,
             governance::{GovernanceOpV2, GovernancePayload},
             primitives::{
-                block_protocol_version_for_height, Bytes32, ProtocolVersion, VariableBytes,
-                DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+                Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID,
+                TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
             },
             staking::{StakingOp, StakingOpBody},
             transaction::TransactionV1,
@@ -420,7 +420,7 @@ mod handle_tests {
         let height = state.height + 1;
         BlockV1 {
             header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(block_protocol_version_for_height(height)),
+                protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
                 height,
                 prev_hash: state.tip_hash,
                 timestamp: 1_700_000_000 + height,

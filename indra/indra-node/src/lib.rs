@@ -47,7 +47,10 @@ pub use config_file::{KeysData, NodeConfigFile};
 pub use driver::{ConsensusDriver, DriverAction, DriverEvent};
 pub use engine::NodeEngine;
 pub use error::{NodeError, NodeResult};
-pub use genesis::{build_genesis_block, build_genesis_state, load_genesis_validators};
+pub use genesis::{
+    build_finalized_genesis_state, build_genesis_block, build_genesis_state,
+    load_genesis_validators,
+};
 pub use metrics::{start_metrics_server, start_observer_metrics_server, MetricsState};
 pub use net_driver::{action_to_message, message_to_event};
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};

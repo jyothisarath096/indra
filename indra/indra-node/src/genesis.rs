@@ -6,7 +6,8 @@
 //! - A zeroed QC (no previous block to certify)
 //! - The initial base fee
 //!
-//! The genesis state is produced by `ChainState::new_genesis()`.
+//! Canonical genesis state is assembled and finalized by this module. Direct
+//! `ChainState::new_genesis()` use is only an intermediate builder state.
 
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1},
@@ -18,7 +19,7 @@ use indra_core::types::{
     transaction::OutputV1,
 };
 use indra_crypto::{commit, derive_genesis_utxo_blinding, prove_range, sha256};
-use indra_state::{ChainState, ColdKeyStatus};
+use indra_state::ChainState;
 use rand::{rngs::StdRng, SeedableRng};
 
 const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
@@ -47,7 +48,6 @@ pub fn build_genesis_block() -> BlockV1 {
         },
         transactions: vec![],
         slashing_evidence: vec![],
-        slashing_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],
@@ -61,20 +61,86 @@ pub fn genesis_block_hash() -> Bytes32 {
     Bytes32::from(sha256(&block.header.encode_to_vec()))
 }
 
-/// Build the initial chain state (genesis state).
+/// Build the canonical local genesis state.
+///
+/// The returned value is fully finalized: all genesis-native authority
+/// snapshots and commitments are present.
 pub fn build_genesis_state() -> ChainState {
-    let state = ChainState::new_genesis();
+    use indra_crypto::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+    use indra_state::{ValidatorEntry, ValidatorStatus};
+
+    let mut state = ChainState::new_genesis();
+    let hot = HybridKeypair::new(
+        ClassicalKeypair::from_seed(&[0xD1; 32]),
+        PqKeypair::from_seed(&[0xD2; 32]).unwrap(),
+    );
+    let hot_public = hot.public_key();
+    let cold = ColdHybridKeypair::from_independent_seeds([0xD3; 32], [0xD4; 32]).unwrap();
+    let cold_public = cold.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
+    let vrf_pk = VrfKeypair::from_seed(&[0xD5; 32]).public_key();
+    let validator_id = Bytes32::from(sha256(&hot_public.classical.0));
+    state
+        .validators
+        .upsert(ValidatorEntry {
+            validator_id,
+            name: "canonical-local-genesis".into(),
+            hybrid_classical_pk: Some(hot_public.classical.0),
+            hybrid_pq_pk: Some(hot_public.pq.0.to_vec()),
+            vrf_pk: Some(vrf_pk),
+            stake_spark: 1_000_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: Some(cold_public.classical.0),
+            cold_hybrid_pq_pk: Some(cold_public.pq.0),
+            cold_key_version: 1,
+            cold_nonce: 0,
+        })
+        .unwrap();
+    state.finalize_genesis().unwrap();
     assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
     assert!(state.total_supply <= HARD_CAP_SPARK);
     assert_eq!(state.fee_reward_pool, 0);
     state
 }
 
+/// Rebuild all genesis-native authority structures after a test has assembled
+/// or amended its height-zero validator set.
+#[cfg(test)]
+pub(crate) fn finalize_test_genesis(state: &mut ChainState) {
+    assert_eq!(state.height, 0, "test genesis must remain at height zero");
+    state.consensus_snapshots.clear();
+    state.reward_economic_snapshot = None;
+    state.slash_membership_roots.clear();
+    state.finalize_genesis().unwrap();
+}
+
+/// Construct a complete one-validator genesis for tests that do not care about
+/// a particular authority identity but still exercise canonical state logic.
+#[cfg(test)]
+pub(crate) fn canonical_test_genesis() -> ChainState {
+    build_genesis_state()
+}
+
 /// Load validator entries from a genesis.toml file.
 ///
 /// Reads each [[validators]] section and registers them in the
 /// provided ChainState validator set with Active status.
-pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::ChainState) {
+pub fn load_genesis_validators(
+    genesis_path: &str,
+    state: &mut indra_state::ChainState,
+) -> Result<(), String> {
     use indra_core::types::primitives::Bytes32;
     use indra_state::{ValidatorEntry, ValidatorStatus};
 
@@ -90,13 +156,8 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         hex::decode(hex).ok()
     }
 
-    let content = match std::fs::read_to_string(genesis_path) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("[genesis] cannot read {}: {}", genesis_path, e);
-            return;
-        }
-    };
+    let content = std::fs::read_to_string(genesis_path)
+        .map_err(|error| format!("cannot read {genesis_path}: {error}"))?;
 
     for line in content.lines() {
         let line = line.trim();
@@ -161,20 +222,25 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
     );
 
     for v in &validators {
-        let id_hex = match v.get("validator_id") {
-            Some(s) => s.clone(),
-            None => continue,
-        };
-        let stake_str = v.get("stake").cloned().unwrap_or_else(|| "0".to_string());
-        let stake: u64 = stake_str.trim().parse().unwrap_or(0);
-        let name = v.get("name").cloned().unwrap_or_default();
+        let id_hex = v
+            .get("validator_id")
+            .cloned()
+            .ok_or_else(|| "genesis validator is missing validator_id".to_string())?;
+        let stake_str = v
+            .get("stake")
+            .ok_or_else(|| format!("genesis validator {id_hex} is missing stake"))?;
+        let stake: u64 = stake_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("genesis validator {id_hex} has invalid stake"))?;
+        let name = v
+            .get("name")
+            .cloned()
+            .ok_or_else(|| format!("genesis validator {id_hex} is missing name"))?;
 
         let id_bytes = match hex::decode(&id_hex) {
             Ok(b) if b.len() == 32 => b,
-            _ => {
-                eprintln!("[genesis] Invalid validator_id for {}: {}", name, id_hex);
-                continue;
-            }
+            _ => return Err(format!("invalid validator_id for {name}: {id_hex}")),
         };
 
         let mut arr = [0u8; 32];
@@ -184,9 +250,23 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
         let entry = ValidatorEntry {
             validator_id,
             name: name.clone(),
-            hybrid_classical_pk: parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
-            hybrid_pq_pk: parse_vec_hex(v.get("hybrid_pq_pk")),
-            vrf_pk: parse_fixed_hex::<32>(v.get("vrf_pk")),
+            hybrid_classical_pk: Some(
+                parse_fixed_hex::<32>(v.get("hybrid_classical_pk")).ok_or_else(|| {
+                    format!("genesis validator {name} has missing/malformed hybrid_classical_pk")
+                })?,
+            ),
+            hybrid_pq_pk: Some(
+                parse_vec_hex(v.get("hybrid_pq_pk"))
+                    .filter(|key| key.len() == indra_crypto::PQ_PK_BYTES)
+                    .ok_or_else(|| {
+                        format!("genesis validator {name} has missing/malformed hybrid_pq_pk")
+                    })?,
+            ),
+            vrf_pk: Some(
+                parse_fixed_hex::<32>(v.get("vrf_pk")).ok_or_else(|| {
+                    format!("genesis validator {name} has missing/malformed vrf_pk")
+                })?,
+            ),
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -201,25 +281,37 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: parse_fixed_hex::<32>(v.get("cold_hybrid_classical_pk")),
-            cold_hybrid_pq_pk: parse_fixed_hex::<{ indra_crypto::PQ_PK_BYTES }>(
-                v.get("cold_hybrid_pq_pk"),
+            cold_hybrid_classical_pk: Some(
+                parse_fixed_hex::<32>(v.get("cold_hybrid_classical_pk")).ok_or_else(|| {
+                    format!(
+                        "genesis validator {name} has missing/malformed cold_hybrid_classical_pk"
+                    )
+                })?,
+            ),
+            cold_hybrid_pq_pk: Some(
+                parse_fixed_hex::<{ indra_crypto::PQ_PK_BYTES }>(v.get("cold_hybrid_pq_pk"))
+                    .ok_or_else(|| {
+                        format!("genesis validator {name} has missing/malformed cold_hybrid_pq_pk")
+                    })?,
             ),
             cold_key_version: v
                 .get("cold_key_version")
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
-            cold_key_status: match v.get("cold_key_status").map(String::as_str) {
-                Some("active") => ColdKeyStatus::Active,
-                _ => ColdKeyStatus::Unenrolled,
-            },
+                .ok_or_else(|| {
+                    format!("genesis validator {name} has missing/malformed cold_key_version")
+                })?,
             cold_nonce: v
                 .get("cold_nonce")
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+                .ok_or_else(|| {
+                    format!("genesis validator {name} has missing/malformed cold_nonce")
+                })?,
         };
 
-        let _ = state.validators.upsert(entry);
+        state
+            .validators
+            .upsert(entry)
+            .map_err(|error| error.to_string())?;
         if let (Some(classical_pk), Some(hybrid_pq_pk)) = (
             parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
             parse_vec_hex(v.get("hybrid_pq_pk")),
@@ -257,6 +349,21 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut indra_state::Chai
     }
     // NOTE: validator stake is bonded in ValidatorEntry only.
     // Liquid allocations are handled separately from validator bonding state.
+    Ok(())
+}
+
+/// Construct and finalize genesis from the configured validator manifest.
+/// Every production startup/replay path must use this constructor rather than
+/// treating `ChainState::new_genesis()` as a valid canonical state.
+pub fn build_finalized_genesis_state(genesis_path: Option<&str>) -> Result<ChainState, String> {
+    let mut state = ChainState::new_genesis();
+    if let Some(path) = genesis_path {
+        load_genesis_validators(path, &mut state)?;
+    }
+    state
+        .finalize_genesis()
+        .map_err(|error| error.to_string())?;
+    Ok(state)
 }
 
 /// Load optional P2P seed peer hints from a genesis.toml file.
@@ -333,21 +440,27 @@ mod tests {
         let classical_pk = [0x42u8; 32];
         let validator_id = Bytes32::from(sha256(&classical_pk));
         let pq_pk = vec![0x24u8; 2592];
+        let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds([0x51; 32], [0x52; 32])
+            .unwrap();
+        let cold_public = cold.public_key();
+        let cold_public = cold_public.as_complete_hybrid();
         let mut state = ChainState::new_genesis();
         let path = std::env::temp_dir().join(format!(
             "indra-genesis-blinding-test-{}.toml",
             std::process::id()
         ));
         let contents = format!(
-            "chain_id = \"test\"\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = \"100000000000\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\n",
+            "chain_id = \"test\"\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = \"100000000000\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
             hex::encode(validator_id.0),
             hex::encode(classical_pk),
             hex::encode(&pq_pk),
-            hex::encode([0x11u8; 32])
+            hex::encode([0x11u8; 32]),
+            hex::encode(cold_public.classical.0),
+            hex::encode(cold_public.pq.0),
         );
         std::fs::write(&path, contents).unwrap();
 
-        load_genesis_validators(path.to_str().unwrap(), &mut state);
+        load_genesis_validators(path.to_str().unwrap(), &mut state).unwrap();
         let _ = std::fs::remove_file(&path);
 
         let entry = state

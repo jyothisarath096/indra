@@ -305,29 +305,78 @@ pub fn build_self_stake_op(
 }
 
 /// Build and sign a validator registration staking operation.
-pub fn build_register_validator_op(
+pub fn build_register_validator_op_with_cold(
     commission_bps: u32,
     bond_utxo_id: Bytes32,
     bond_proof: StakingBondProof,
     keypair: &HybridKeypair,
+    cold_keypair: &ColdHybridKeypair,
     vrf_pk: [u8; 32],
     nonce: u64,
     chain_id: &str,
 ) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::RegisterValidator {
+    let cold_public = cold_keypair.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
+    let cold_pubkey = ColdHybridPubKey {
+        classical_pk: Bytes32::from(cold_public.classical.0),
+        pq_pk: VariableBytes::from_slice(&cold_public.pq.0)
+            .map_err(|_| CliError::Transaction("cold PQ public key too large".into()))?,
+    };
+    let mut op = StakingOp {
+        body: StakingOpBody::RegisterValidator {
             commission_bps,
             bond_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
             bond_proof: Some(bond_proof),
-            cold_pubkey: None,
-            cold_signature: None,
+            cold_pubkey: Some(cold_pubkey),
+            cold_signature: Some(dummy_signature()?),
         },
-        keypair,
         nonce,
-        chain_id,
-    )
+        signature: dummy_signature()?,
+    };
+    let message = op
+        .register_validator_dual_signing_bytes(chain_id)
+        .map_err(|e| CliError::Transaction(e.to_string()))?
+        .ok_or_else(|| {
+            CliError::Transaction("registration dual-signing message unavailable".into())
+        })?;
+    let hot_sig = keypair
+        .sign(&message)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    let cold_sig = cold_keypair
+        .sign(&message)
+        .map_err(|e| CliError::Crypto(e.to_string()))?;
+    op.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&hot_sig.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&hot_sig.pq.0).unwrap(),
+    };
+    if let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body {
+        *cold_signature = Some(HybridSignature {
+            classical_sig: VariableBytes::from_slice(&cold_sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&cold_sig.pq.0).unwrap(),
+        });
+    }
+    let op_bytes = op.encode_to_vec();
+    Ok(BuiltStakingOp {
+        op_hex: hex::encode(&op_bytes),
+        op_id: hex::encode(sha256(&op_bytes)),
+    })
+}
+
+/// Registration without an independently persisted cold key is unsupported.
+pub fn build_register_validator_op(
+    _commission_bps: u32,
+    _bond_utxo_id: Bytes32,
+    _bond_proof: StakingBondProof,
+    _keypair: &HybridKeypair,
+    _vrf_pk: [u8; 32],
+    _nonce: u64,
+    _chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    Err(CliError::Transaction(
+        "validator registration requires an independent cold keypair".into(),
+    ))
 }
 
 /// Build and sign a delegate staking operation.
@@ -473,67 +522,6 @@ pub fn build_self_unstake_op(
     )
 }
 
-/// Build the canonical first-time validator cold-key enrollment operation.
-pub fn build_enroll_validator_cold_key_op(
-    validator_id: Bytes32,
-    hot_keypair: &HybridKeypair,
-    cold_keypair: &ColdHybridKeypair,
-    nonce: u64,
-    chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    let cold_public = cold_keypair.public_key();
-    let cold_public = cold_public.as_complete_hybrid();
-    let cold_pubkey = ColdHybridPubKey {
-        classical_pk: Bytes32::from(cold_public.classical.0),
-        pq_pk: VariableBytes::from_slice(&cold_public.pq.0)
-            .map_err(|_| CliError::Transaction("cold PQ public key too large".into()))?,
-    };
-    let mut op = StakingOp {
-        body: StakingOpBody::EnrollValidatorColdKey {
-            validator_id,
-            cold_pubkey,
-            cold_signature: None,
-        },
-        nonce,
-        signature: dummy_signature()?,
-    };
-    let message = op
-        .enroll_validator_cold_key_dual_signing_bytes(chain_id)
-        .map_err(|e| CliError::Transaction(e.to_string()))?
-        .ok_or_else(|| CliError::Transaction("missing enrollment signing message".into()))?;
-    let hot_signature = hot_keypair
-        .sign(&message)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
-    let cold_signature = cold_keypair
-        .sign(&message)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
-    op.signature = HybridSignature {
-        classical_sig: VariableBytes::from_slice(&hot_signature.classical.0)
-            .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
-        pq_sig: VariableBytes::from_slice(&hot_signature.pq.0)
-            .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
-    };
-    if let StakingOpBody::EnrollValidatorColdKey {
-        cold_signature: slot,
-        ..
-    } = &mut op.body
-    {
-        *slot = Some(HybridSignature {
-            classical_sig: VariableBytes::from_slice(&cold_signature.classical.0)
-                .map_err(|_| CliError::Transaction("cold classical sig too large".into()))?,
-            pq_sig: VariableBytes::from_slice(&cold_signature.pq.0)
-                .map_err(|_| CliError::Transaction("cold pq sig too large".into()))?,
-        });
-    }
-    op.validate_structure()
-        .map_err(|e| CliError::Transaction(e.to_string()))?;
-    let op_bytes = op.encode_to_vec();
-    Ok(BuiltStakingOp {
-        op_hex: hex::encode(&op_bytes),
-        op_id: hex::encode(sha256(&op_bytes)),
-    })
-}
-
 fn build_signed_staking_op(
     body: StakingOpBody,
     keypair: &HybridKeypair,
@@ -629,6 +617,10 @@ mod tests {
             ClassicalKeypair::from_seed(&[seed; 32]),
             PqKeypair::from_seed(&[seed; 32]).unwrap(),
         )
+    }
+
+    fn test_cold_keypair(seed: u8) -> ColdHybridKeypair {
+        ColdHybridKeypair::from_independent_seeds([seed; 32], [seed.wrapping_add(1); 32]).unwrap()
     }
 
     fn decode_built(built: &BuiltStakingOp) -> StakingOp {
@@ -861,11 +853,12 @@ mod tests {
     fn build_register_validator_op_serialises_and_decodes() {
         let keypair = test_keypair(0x71);
         let bond_utxo_id = Bytes32::from([0xAB; 32]);
-        let built = build_register_validator_op(
+        let built = build_register_validator_op_with_cold(
             1_000,
             bond_utxo_id,
             bond_proof(0xAB, 2_000_000),
             &keypair,
+            &test_cold_keypair(0x91),
             [0xAA; 32],
             9,
             DEFAULT_CHAIN_ID,
@@ -1062,11 +1055,12 @@ mod tests {
         let validator_id = Bytes32::from([0x07; 32]);
         let bond_utxo_id = Bytes32::from([0x08; 32]);
         let ops = vec![
-            build_register_validator_op(
+            build_register_validator_op_with_cold(
                 1_000,
                 bond_utxo_id,
                 bond_proof(0x11, 1_000),
                 &keypair,
+                &test_cold_keypair(0x92),
                 [0x11; 32],
                 42,
                 DEFAULT_CHAIN_ID,
@@ -1122,11 +1116,12 @@ mod tests {
         let validator_id = Bytes32::from([0x09; 32]);
         let bond_utxo_id = Bytes32::from([0x0A; 32]);
         let ops = vec![
-            build_register_validator_op(
+            build_register_validator_op_with_cold(
                 1_000,
                 bond_utxo_id,
                 bond_proof(0x21, 1_000),
                 &keypair,
+                &test_cold_keypair(0x93),
                 [0x12; 32],
                 1,
                 DEFAULT_CHAIN_ID,
@@ -1180,66 +1175,5 @@ mod tests {
                 .any(|b| *b != 0));
             assert!(op.signature.pq_sig.as_slice().iter().any(|b| *b != 0));
         }
-    }
-
-    #[test]
-    fn enroll_cold_key_uses_canonical_message_and_complete_dual_signatures() {
-        let hot_keypair = test_keypair(0xE1);
-        let cold_keypair =
-            ColdHybridKeypair::from_independent_seeds([0xE2; 32], [0xE3; 32]).unwrap();
-        let validator_id = Bytes32::from(sha256(&hot_keypair.public_key().classical.0));
-        let built = build_enroll_validator_cold_key_op(
-            validator_id,
-            &hot_keypair,
-            &cold_keypair,
-            42,
-            DEFAULT_CHAIN_ID,
-        )
-        .unwrap();
-        let op = decode_built(&built);
-        let message = op
-            .enroll_validator_cold_key_dual_signing_bytes(DEFAULT_CHAIN_ID)
-            .unwrap()
-            .unwrap();
-        let hot_signature = CryptoHybridSignature {
-            classical: ClassicalSignature(
-                op.signature.classical_sig.as_slice().try_into().unwrap(),
-            ),
-            pq: PqSignature(op.signature.pq_sig.as_slice().try_into().unwrap()),
-        };
-        let (encoded_cold_pubkey, encoded_cold_signature) = match &op.body {
-            StakingOpBody::EnrollValidatorColdKey {
-                validator_id: encoded_validator_id,
-                cold_pubkey,
-                cold_signature: Some(cold_signature),
-            } => {
-                assert_eq!(*encoded_validator_id, validator_id);
-                (cold_pubkey, cold_signature)
-            }
-            _ => panic!("expected complete cold-key enrollment body"),
-        };
-        let expected_cold_public = cold_keypair.public_key();
-        let expected_cold_public = expected_cold_public.as_complete_hybrid();
-        assert_eq!(
-            encoded_cold_pubkey.classical_pk.0,
-            expected_cold_public.classical.0
-        );
-        assert_eq!(
-            encoded_cold_pubkey.pq_pk.as_slice(),
-            expected_cold_public.pq.0
-        );
-        let cold_signature = CryptoHybridSignature {
-            classical: ClassicalSignature(
-                encoded_cold_signature
-                    .classical_sig
-                    .as_slice()
-                    .try_into()
-                    .unwrap(),
-            ),
-            pq: PqSignature(encoded_cold_signature.pq_sig.as_slice().try_into().unwrap()),
-        };
-        verify_hybrid(&message, &hot_signature, &hot_keypair.public_key()).unwrap();
-        verify_hybrid(&message, &cold_signature, &expected_cold_public).unwrap();
-        assert_eq!(op.nonce, 42);
     }
 }

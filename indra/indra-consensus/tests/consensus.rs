@@ -24,7 +24,7 @@ use indra_crypto::{
     commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
     PaymentBlindingNoteV1, PqKeypair,
 };
-use indra_state::ChainState;
+use indra_state::{ChainState, ValidatorEntry, ValidatorStatus};
 use rand::{rngs::StdRng, SeedableRng};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,6 +161,51 @@ fn mempool_to_block_pipeline() {
     let mut mempool = Mempool::default_config();
     let (owner_pubkey, owner_keypair) = make_user_keypair(0x55);
 
+    // Finalized genesis is mandatory in the pure protocol. The validator must
+    // match the election authority used below so S(1) is complete and usable.
+    let seed = [0x42u8; 32];
+    let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&seed);
+    let vrf_pubkey = vrf_keypair.public_key();
+    let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
+    let hot = HybridKeypair::new(
+        ClassicalKeypair::from_seed(&[0x43; 32]),
+        PqKeypair::from_seed(&[0x44; 32]).unwrap(),
+    );
+    let hot_public = hot.public_key();
+    let cold =
+        indra_crypto::ColdHybridKeypair::from_independent_seeds([0x45; 32], [0x46; 32]).unwrap();
+    let cold_public = cold.public_key();
+    let cold_public = cold_public.as_complete_hybrid();
+    state
+        .validators
+        .upsert(ValidatorEntry {
+            validator_id,
+            name: "consensus-integration".into(),
+            hybrid_classical_pk: Some(hot_public.classical.0),
+            hybrid_pq_pk: Some(hot_public.pq.0.to_vec()),
+            vrf_pk: Some(vrf_pubkey),
+            stake_spark: 1_000_000,
+            status: ValidatorStatus::Active,
+            registered_epoch: 0,
+            last_active_epoch: 0,
+            pending_rewards: 0,
+            rewards_last_epoch: 0,
+            self_report_count: 0,
+            commission_bps: 1_000,
+            pending_commission_bps: None,
+            pending_commission_effective_epoch: None,
+            min_delegation_spark: 1,
+            auto_delegate_to: None,
+            network_addr: None,
+            network_addr_last_updated_epoch: None,
+            cold_hybrid_classical_pk: Some(cold_public.classical.0),
+            cold_hybrid_pq_pk: Some(cold_public.pq.0),
+            cold_key_version: 1,
+            cold_nonce: 0,
+        })
+        .unwrap();
+    state.finalize_genesis().unwrap();
+
     // Seed spendable UTXOs, then submit some transactions that consume them.
     for i in 1..=5u8 {
         let utxo_id = state
@@ -190,10 +235,6 @@ fn mempool_to_block_pipeline() {
     assert_eq!(mempool.len(), 5);
 
     // Set up election with single validator
-    let seed = [0x42u8; 32];
-    let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&seed);
-    let vrf_pubkey = vrf_keypair.public_key();
-    let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
     let election = ProposerElection {
         epoch_seed: Bytes32::from(seed),
         height: 1,
@@ -234,7 +275,6 @@ fn mempool_to_block_pipeline() {
         timestamp: 1_700_000_001,
         polc_round: None,
         slash_evidence: vec![],
-        slash_evidence_v2: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
         election_result_hash: Some(election_result_hash),
