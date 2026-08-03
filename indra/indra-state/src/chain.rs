@@ -20,7 +20,9 @@ use indra_core::types::primitives::{
     MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
     MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
 };
-use indra_core::types::stake_position::{StakePositionV1, UnbondingTrancheV1};
+use indra_core::types::stake_position::{
+    ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTrancheV1,
+};
 use std::collections::BTreeMap;
 
 use crate::{
@@ -31,9 +33,8 @@ use crate::{
     utxo::UtxoSet,
     validator::{
         decode_delegation_return_events, delegation_return_events_encoded_len,
-        encode_delegation_return_events, DelegationMap, DelegationReturnEvent,
-        EvictedValidatorTombstoneV1, StakeBondEntry, ValidatorSet,
-        MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE, MAX_TOTAL_RETAINED_BOND_REFERENCES,
+        encode_delegation_return_events, DelegationReturnEvent, EvictedValidatorTombstoneV2,
+        ValidatorSet,
     },
 };
 
@@ -120,13 +121,8 @@ pub struct ChainState {
     pub slash_membership_roots: Vec<SlashMembershipRootRecord>,
 
     /// Bounded historical/custody records for post-v8 registry evictions.
-    pub evicted_validator_tombstones: PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>,
+    pub evicted_validator_tombstones: PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV2>,
 
-    /// Delegation map: validator_id → delegator entries.
-    pub delegations: DelegationMap,
-
-    /// Stake bonds: UTXOs locked as delegation stake.
-    pub staked_bonds: PersistentOrdMap<Bytes32, StakeBondEntry>,
 
     /// Canonical active/reward staking positions.
     pub stake_positions: PersistentOrdMap<Bytes32, StakePositionV1>,
@@ -211,10 +207,6 @@ impl Encode for ChainState {
         self.nullifiers.encode(buf);
         // Included: validator metadata is needed for proposer election and signature/QC verification.
         self.validators.encode(buf);
-        // Included: delegations affect validator power and epoch transitions.
-        self.delegations.encode(buf);
-        // Included: stake bonds lock UTXOs and drive delegation/unbonding state.
-        encode_bond_map(&self.staked_bonds, buf);
         encode_nonce_map(&self.staking_nonces, buf);
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
@@ -231,9 +223,9 @@ impl Encode for ChainState {
             snapshot.encode(buf);
         }
         encode_list(&self.slash_membership_roots, buf);
-        encode_tombstones(&self.evicted_validator_tombstones, buf);
         encode_stake_positions(&self.stake_positions, buf);
         encode_unbonding_tranches(&self.unbonding_tranches, buf);
+        encode_tombstones(&self.evicted_validator_tombstones, buf);
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
     }
@@ -252,8 +244,6 @@ impl Encode for ChainState {
             + self.utxos.encoded_len()
             + self.nullifiers.encoded_len()
             + self.validators.encoded_len()
-            + self.delegations.encoded_len()
-            + bond_map_encoded_len(&self.staked_bonds)
             + nonce_map_encoded_len(&self.staking_nonces)
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
@@ -292,8 +282,6 @@ impl Decode for ChainState {
         let utxos = UtxoSet::decode_at_height(r, height)?;
         let nullifiers = NullifierSet::decode_at_height(r, height)?;
         let validators = ValidatorSet::decode(r)?;
-        let delegations = DelegationMap::decode(r)?;
-        let staked_bonds = decode_bond_map(r)?;
         let staking_nonces = decode_nonce_map(r)?;
         let applied_slash_hashes = decode_hash_set(r, "snapshot.applied_slash_hashes")?;
         let governance = GovernanceState::decode(r)?;
@@ -348,10 +336,15 @@ impl Decode for ChainState {
                 ));
             }
         }
-        let evicted_validator_tombstones =
-            decode_tombstones(r, &staked_bonds, &validators, height)?;
         let stake_positions = decode_stake_positions(r)?;
         let unbonding_tranches = decode_unbonding_tranches(r)?;
+        let evicted_validator_tombstones = decode_tombstones(
+            r,
+            &stake_positions,
+            &unbonding_tranches,
+            &validators,
+            height,
+        )?;
         let position_tranche_index = validate_and_build_position_tranche_index(
             &chain_id,
             &stake_positions,
@@ -373,8 +366,6 @@ impl Decode for ChainState {
             reward_economic_snapshot,
             slash_membership_roots,
             evicted_validator_tombstones,
-            delegations,
-            staked_bonds,
             stake_positions,
             unbonding_tranches,
             position_tranche_index,
@@ -394,14 +385,13 @@ impl Decode for ChainState {
 }
 
 impl ChainState {
-    /// Sum active delegated principal from authoritative bond records.
+    /// Sum active delegated principal from authoritative staking positions.
     pub fn total_active_delegated_bond_stake(&self) -> u64 {
-        self.staked_bonds
+        self.stake_positions
             .values()
-            .filter(|bond| {
-                bond.validator_id != bond.delegator_id && bond.unbonding_end_epoch.is_none()
-            })
-            .fold(0u64, |sum, bond| sum.saturating_add(bond.amount_spark))
+            .filter(|position| position.validator_id != position.principal_owner_id)
+            .filter_map(|position| position.active)
+            .fold(0u64, |sum, active| sum.saturating_add(active.principal_spark))
     }
 
     /// Create the genesis state (before any block has been applied).
@@ -424,8 +414,6 @@ impl ChainState {
             reward_economic_snapshot: None,
             slash_membership_roots: Vec::new(),
             evicted_validator_tombstones: PersistentOrdMap::new(),
-            delegations: DelegationMap::new(),
-            staked_bonds: PersistentOrdMap::new(),
             stake_positions: PersistentOrdMap::new(),
             unbonding_tranches: PersistentOrdMap::new(),
             position_tranche_index: BTreeMap::new(),
@@ -441,92 +429,6 @@ impl ChainState {
             epoch_slashed_spark: 0,
             epoch_slash_event_count: 0,
         }
-    }
-
-    /// Decode a legacy unversioned snapshot payload at the supplied schema version.
-    pub fn decode_legacy_snapshot(r: &mut ByteReader<'_>, schema_version: u8) -> IndraResult<Self> {
-        let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
-        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
-            .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
-        let height = u64::decode(r)?;
-        Ok(Self {
-            chain_id,
-            height,
-            tip_hash: Bytes32::decode(r)?,
-            base_fee: u64::decode(r)?,
-            total_supply: u64::decode(r)?,
-            treasury_balance: u64::decode(r)?,
-            burn_buffer: u64::decode(r)?,
-            fee_reward_pool: u64::decode(r)?,
-            utxos: UtxoSet::decode_legacy_at_height(r, height)?,
-            nullifiers: NullifierSet::decode_at_height(r, height)?,
-            validators: ValidatorSet::decode(r)?,
-            consensus_snapshots: Vec::new(),
-            reward_economic_snapshot: None,
-            slash_membership_roots: Vec::new(),
-            evicted_validator_tombstones: PersistentOrdMap::new(),
-            delegations: DelegationMap::decode_legacy(r)?,
-            staked_bonds: decode_bond_map(r)?,
-            stake_positions: PersistentOrdMap::new(),
-            unbonding_tranches: PersistentOrdMap::new(),
-            position_tranche_index: BTreeMap::new(),
-            staking_nonces: decode_nonce_map(r)?,
-            delegator_identities: PersistentOrdMap::new(),
-            retired_cold_classical_components: PersistentOrdSet::new(),
-            retired_cold_pq_components: PersistentOrdSet::new(),
-            applied_slash_hashes: if r.remaining() > 0 {
-                decode_hash_set(r, "snapshot.applied_slash_hashes")?
-            } else {
-                PersistentOrdSet::new()
-            },
-            governance: GovernanceState::new(),
-            delegation_return_events: Vec::new(),
-            state_commitment_v2: None,
-            epoch_fees_burned: 0,
-            epoch_slashed_spark: 0,
-            epoch_slash_event_count: 0,
-        })
-    }
-
-    /// Decode a schema-v2 versioned snapshot payload that predates governance.
-    pub fn decode_schema_v2_snapshot(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
-        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
-            .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
-        let height = u64::decode(r)?;
-        Ok(Self {
-            chain_id,
-            height,
-            tip_hash: Bytes32::decode(r)?,
-            base_fee: u64::decode(r)?,
-            total_supply: u64::decode(r)?,
-            treasury_balance: u64::decode(r)?,
-            burn_buffer: u64::decode(r)?,
-            fee_reward_pool: u64::decode(r)?,
-            utxos: UtxoSet::decode_at_height(r, height)?,
-            nullifiers: NullifierSet::decode_at_height(r, height)?,
-            validators: ValidatorSet::decode(r)?,
-            consensus_snapshots: Vec::new(),
-            reward_economic_snapshot: None,
-            slash_membership_roots: Vec::new(),
-            evicted_validator_tombstones: PersistentOrdMap::new(),
-            delegations: DelegationMap::decode(r)?,
-            staked_bonds: decode_bond_map(r)?,
-            stake_positions: PersistentOrdMap::new(),
-            unbonding_tranches: PersistentOrdMap::new(),
-            position_tranche_index: BTreeMap::new(),
-            staking_nonces: decode_nonce_map(r)?,
-            delegator_identities: PersistentOrdMap::new(),
-            retired_cold_classical_components: PersistentOrdSet::new(),
-            retired_cold_pq_components: PersistentOrdSet::new(),
-            applied_slash_hashes: decode_hash_set(r, "snapshot.applied_slash_hashes")?,
-            governance: GovernanceState::new(),
-            delegation_return_events: Vec::new(),
-            state_commitment_v2: None,
-            epoch_fees_burned: 0,
-            epoch_slashed_spark: 0,
-            epoch_slash_event_count: 0,
-        })
     }
 
     /// Ensure the derived StateCommitmentV2 cache exists at `height`.
@@ -645,91 +547,53 @@ impl ChainState {
         self.build_consensus_snapshot(1, 0)
     }
 
-    /// Build the epoch-start reward basis paired exactly with `consensus_snapshot`.
+    /// Build the frozen epoch-start economic authority from active positions.
     pub fn build_reward_economic_snapshot(
         &self,
         consensus_snapshot: &ConsensusSnapshot,
     ) -> crate::error::StateResult<RewardEconomicSnapshot> {
-        use std::collections::BTreeMap;
-
         let mut principals: BTreeMap<Bytes32, BTreeMap<Bytes32, (u64, u64)>> = BTreeMap::new();
         for member in consensus_snapshot.entries() {
             principals.insert(member.validator_id, BTreeMap::new());
         }
-
-        // Real delegation is derived only from authoritative active bond records.
-        for bond in self.staked_bonds.values().filter(|bond| {
-            bond.validator_id != bond.delegator_id && bond.unbonding_end_epoch.is_none()
-        }) {
-            if let Some(delegators) = principals.get_mut(&bond.validator_id) {
-                let (bonded, _) = delegators.entry(bond.delegator_id).or_default();
-                *bonded = bonded.checked_add(bond.amount_spark).ok_or_else(|| {
-                    crate::error::StateError::InvalidRewardEconomicSnapshot(
-                        "bonded delegator principal overflows u64".to_string(),
-                    )
-                })?;
+        for position in self.stake_positions.values() {
+            let Some(active) = position.active else { continue };
+            if position.principal_owner_id == position.validator_id { continue; }
+            if let Some(owners) = principals.get_mut(&position.validator_id) {
+                let (bonded, _) = owners.entry(position.principal_owner_id).or_default();
+                *bonded = bonded.checked_add(active.principal_spark).ok_or_else(||
+                    crate::error::StateError::InvalidRewardEconomicSnapshot("delegated principal overflow".into()))?;
             }
         }
-
-        // Virtual auto-delegation is frozen separately because it is credited
-        // to ValidatorEntry.pending_rewards, never DelegatorEntry.pending_rewards.
-        for source in self.validators.all_validators().filter(|validator| {
-            matches!(
-                validator.status,
-                crate::validator::ValidatorStatus::Registered
-            ) && validator.auto_delegate_to.is_some()
-                && validator.stake_spark > 0
-        }) {
-            let target_id = source.auto_delegate_to.expect("filter checked target");
-            if let Some(delegators) = principals.get_mut(&target_id) {
-                let (_, auto) = delegators.entry(source.validator_id).or_default();
-                *auto = auto.checked_add(source.stake_spark).ok_or_else(|| {
-                    crate::error::StateError::InvalidRewardEconomicSnapshot(
-                        "auto-delegated principal overflows u64".to_string(),
-                    )
-                })?;
+        for source in self.validators.all_validators().filter(|v|
+            matches!(v.status, crate::validator::ValidatorStatus::Registered) && v.auto_delegate_to.is_some()) {
+            let Some(position) = self.stake_positions.values().find(|p|
+                p.validator_id == source.validator_id && p.principal_owner_id == source.validator_id) else { continue };
+            let Some(active) = position.active else { continue };
+            if let Some(owners) = principals.get_mut(&source.auto_delegate_to.expect("filtered")) {
+                let (_, auto) = owners.entry(source.validator_id).or_default();
+                *auto = auto.checked_add(active.principal_spark).ok_or_else(||
+                    crate::error::StateError::InvalidRewardEconomicSnapshot("auto-delegated principal overflow".into()))?;
             }
         }
-
-        let frozen_bound = self.governance.params.max_commission_bps;
+        let bound = self.governance.params.max_commission_bps;
         let mut validators = Vec::with_capacity(consensus_snapshot.entries().len());
         for member in consensus_snapshot.entries() {
-            let validator = self.validators.get(&member.validator_id).ok_or_else(|| {
-                crate::error::StateError::InvalidRewardEconomicSnapshot(format!(
-                    "consensus member {} missing from validator registry",
-                    member.validator_id
-                ))
-            })?;
-            let delegators = principals
-                .remove(&member.validator_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(delegator_id, (bonded, auto))| {
-                    RewardEconomicDelegatorEntry::new(delegator_id, bonded, auto).map_err(|error| {
-                        crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
-                    })
-                })
+            let validator = self.validators.get(&member.validator_id).ok_or_else(||
+                crate::error::StateError::InvalidRewardEconomicSnapshot("snapshot validator missing".into()))?;
+            let owners = principals.remove(&member.validator_id).unwrap_or_default().into_iter()
+                .map(|(id, (bonded, auto))| RewardEconomicDelegatorEntry::new(id, bonded, auto)
+                    .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string())))
                 .collect::<Result<Vec<_>, _>>()?;
-            validators.push(
-                RewardEconomicValidatorEntry::new(
-                    member.validator_id,
-                    validator.commission_bps,
-                    delegators,
-                    frozen_bound,
-                )
-                .map_err(|error| {
-                    crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
-                })?,
-            );
+            validators.push(RewardEconomicValidatorEntry::new(member.validator_id, validator.commission_bps, owners, bound)
+                .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string()))?);
         }
-        RewardEconomicSnapshot::new(
-            consensus_snapshot.activation_height,
-            consensus_snapshot.source_boundary_height,
-            frozen_bound,
-            validators,
-        )
-        .map_err(|error| crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string()))
+        RewardEconomicSnapshot::new(consensus_snapshot.activation_height,
+            consensus_snapshot.source_boundary_height, bound, validators)
+            .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string()))
     }
+
+
 
     /// Resolve exactly paired consensus and reward authority for `height`.
     pub fn reward_economic_snapshot_for_height(
@@ -760,6 +624,37 @@ impl ChainState {
                     .to_string(),
             ));
         }
+        if !self.unbonding_tranches.is_empty() {
+            return Err(crate::error::StateError::InvalidRewardEconomicSnapshot(
+                "genesis cannot contain unbonding tranches".into(),
+            ));
+        }
+        self.stake_positions = PersistentOrdMap::new();
+        let active: Vec<(Bytes32, u64)> = self
+            .validators
+            .active_validators()
+            .map(|validator| (validator.validator_id, validator.stake_spark))
+            .collect();
+        for (validator_id, principal_spark) in active {
+            let position = StakePositionV1::new(
+                validator_id,
+                validator_id,
+                PositionCustodyV1::ValidatorColdIdentity { validator_id },
+                Some(ActiveStakeAggregateV1::new(principal_spark, 0, 0).map_err(|error| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+                })?),
+                0,
+                0,
+            )
+            .map_err(|error| crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string()))?;
+            // Genesis finalization is the authority for the self-position. Test
+            // builders may deliberately amend the height-zero validator set and
+            // finalize again; replace the same deterministic position atomically.
+            self.stake_positions.insert(position.position_id, position);
+        }
+        self.rebuild_position_tranche_index().map_err(|error| {
+            crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+        })?;
         let snapshot = self.build_genesis_consensus_snapshot()?;
         let economic = self.build_reward_economic_snapshot(&snapshot)?;
         let membership = SlashMembershipRootRecord {
@@ -966,10 +861,10 @@ fn validate_reward_economic_membership(
 }
 
 fn encode_tombstones(
-    tombstones: &PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>,
+    tombstones: &PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV2>,
     buf: &mut Vec<u8>,
 ) {
-    1u8.encode(buf);
+    2u8.encode(buf);
     (tombstones.len() as u32).encode(buf);
     for tombstone in tombstones.values() {
         tombstone.encode(buf);
@@ -977,32 +872,33 @@ fn encode_tombstones(
 }
 
 fn tombstones_encoded_len(
-    tombstones: &PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>,
+    tombstones: &PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV2>,
 ) -> usize {
     1 + 4 + tombstones.values().map(Encode::encoded_len).sum::<usize>()
 }
 
 fn decode_tombstones(
     reader: &mut ByteReader<'_>,
-    staked_bonds: &PersistentOrdMap<Bytes32, StakeBondEntry>,
+    stake_positions: &PersistentOrdMap<Bytes32, StakePositionV1>,
+    unbonding_tranches: &PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
     validators: &ValidatorSet,
     state_height: u64,
-) -> IndraResult<PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>> {
+) -> IndraResult<PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV2>> {
     let version = u8::decode(reader)?;
-    if version != 1 {
+    if version != 2 {
         return Err(IndraError::UnsupportedVersion {
             version: version.into(),
         });
     }
-    let tombstones: Vec<EvictedValidatorTombstoneV1> = decode_list(
+    let tombstones: Vec<EvictedValidatorTombstoneV2> = decode_list(
         reader,
         indra_core::types::primitives::MAX_VALIDATORS,
         "chain_state.evicted_validator_tombstones",
     )?;
     let mut result = PersistentOrdMap::new();
     let mut previous_validator_id = None;
-    let mut seen_bonds = PersistentOrdSet::new();
-    let mut total_references = 0usize;
+    let mut seen_positions = PersistentOrdSet::new();
+    let mut seen_tranches = PersistentOrdSet::new();
     for tombstone in tombstones {
         if previous_validator_id.is_some_and(|previous| previous >= tombstone.validator_id) {
             return Err(IndraError::InvalidSlashMembershipProof(
@@ -1016,7 +912,6 @@ fn decode_tombstones(
         }
         if tombstone.eviction_height > state_height
             || tombstone.eviction_epoch != crate::epoch::epoch_for_height(tombstone.eviction_height)
-            || tombstone.retained_bonds.len() > MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE
         {
             return Err(IndraError::InvalidSlashMembershipProof(
                 "malformed evicted-validator tombstone".to_string(),
@@ -1056,49 +951,48 @@ fn decode_tombstones(
                 },
             )?;
         }
-        total_references = total_references
-            .checked_add(tombstone.retained_bonds.len())
-            .ok_or_else(|| {
-                IndraError::InvalidSlashMembershipProof(
-                    "tombstone reference count overflow".to_string(),
-                )
-            })?;
-        if total_references > MAX_TOTAL_RETAINED_BOND_REFERENCES {
-            return Err(IndraError::LengthExceeded {
-                field: "tombstone bond references",
-                max: MAX_TOTAL_RETAINED_BOND_REFERENCES,
-                actual: total_references,
-            });
-        }
-        let mut previous_bond_id = None;
         let mut requires_cold_custody = false;
-        for reference in &tombstone.retained_bonds {
-            if previous_bond_id.is_some_and(|previous| previous >= reference.bond_utxo_id)
-                || !seen_bonds.insert(reference.bond_utxo_id)
-            {
+        for position_id in &tombstone.retained_position_ids {
+            if !seen_positions.insert(*position_id) {
                 return Err(IndraError::InvalidSlashMembershipProof(
-                    "tombstone bond references are duplicated or non-canonical".to_string(),
+                    "position is retained by multiple tombstones".to_string(),
                 ));
             }
-            let bond = staked_bonds.get(&reference.bond_utxo_id).ok_or_else(|| {
+            let position = stake_positions.get(position_id).ok_or_else(|| {
                 IndraError::InvalidSlashMembershipProof(
-                    "tombstone references a missing bond".to_string(),
+                    "tombstone references a missing position".to_string(),
                 )
             })?;
-            if bond.validator_id != tombstone.validator_id
-                || bond.delegator_id != reference.delegator_id
-                || bond.unbonding_end_epoch != Some(reference.unbonding_end_epoch)
-            {
+            if position.validator_id != tombstone.validator_id {
                 return Err(IndraError::InvalidSlashMembershipProof(
-                    "tombstone bond reference does not match canonical bond".to_string(),
+                    "tombstone position owner mismatch".to_string(),
                 ));
             }
             requires_cold_custody |= matches!(
-                bond.custody_owner,
-                crate::validator::StakeBondCustodyOwner::ValidatorColdIdentity(id)
+                position.custody,
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity { validator_id: id }
                     if id == tombstone.validator_id
             );
-            previous_bond_id = Some(reference.bond_utxo_id);
+        }
+        for tranche_id in &tombstone.retained_tranche_ids {
+            if !seen_tranches.insert(*tranche_id) {
+                return Err(IndraError::InvalidSlashMembershipProof(
+                    "tranche is retained by multiple tombstones".to_string(),
+                ));
+            }
+            let tranche = unbonding_tranches.get(tranche_id).ok_or_else(|| {
+                IndraError::InvalidSlashMembershipProof(
+                    "tombstone references a missing tranche".to_string(),
+                )
+            })?;
+            if !tombstone
+                .retained_position_ids
+                .contains(&tranche.position_id)
+            {
+                return Err(IndraError::InvalidSlashMembershipProof(
+                    "tombstone tranche points outside retained positions".to_string(),
+                ));
+            }
         }
         if requires_cold_custody && tombstone.cold_custody.is_none() {
             return Err(IndraError::InvalidSlashMembershipProof(
@@ -1108,10 +1002,12 @@ fn decode_tombstones(
         previous_validator_id = Some(tombstone.validator_id);
         result.insert(tombstone.validator_id, tombstone);
     }
-    for bond in staked_bonds.values() {
-        if result.contains_key(&bond.validator_id) && !seen_bonds.contains(&bond.utxo_id) {
+    for position in stake_positions.values() {
+        if result.contains_key(&position.validator_id)
+            && !seen_positions.contains(&position.position_id)
+        {
             return Err(IndraError::InvalidSlashMembershipProof(
-                "evicted-validator bond is missing its unique tombstone reference".to_string(),
+                "evicted-validator position is missing its unique tombstone reference".to_string(),
             ));
         }
     }
@@ -1309,57 +1205,6 @@ fn decode_hash_set(
         }
     }
     Ok(hashes)
-}
-
-fn encode_bond_map(bonds: &PersistentOrdMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
-    (bonds.len() as u32).encode(buf);
-    for (utxo_id, bond) in bonds {
-        utxo_id.encode(buf);
-        bond.encode(buf);
-    }
-}
-
-fn bond_map_encoded_len(bonds: &PersistentOrdMap<Bytes32, StakeBondEntry>) -> usize {
-    4 + bonds
-        .iter()
-        .map(|(utxo_id, bond)| utxo_id.encoded_len() + bond.encoded_len())
-        .sum::<usize>()
-}
-
-fn decode_bond_map(
-    r: &mut ByteReader<'_>,
-) -> IndraResult<PersistentOrdMap<Bytes32, StakeBondEntry>> {
-    let count = u32::decode(r)? as usize;
-    validate_bond_map_count(count)?;
-    let mut bonds = PersistentOrdMap::new();
-    for _ in 0..count {
-        let key = Bytes32::decode(r)?;
-        let bond = StakeBondEntry::decode(r)?;
-        if key != bond.utxo_id {
-            return Err(IndraError::InvariantViolation {
-                message: "stake bond map key must match bond utxo_id",
-            });
-        }
-        if bonds.insert(key, bond).is_some() {
-            return Err(IndraError::DuplicateEntries {
-                field: "snapshot.staked_bonds",
-            });
-        }
-    }
-    Ok(bonds)
-}
-
-fn validate_bond_map_count(count: usize) -> IndraResult<()> {
-    use indra_core::error::IndraError;
-
-    if count > MAX_STAKED_BONDS_DECODE {
-        return Err(IndraError::LengthExceeded {
-            field: "snapshot.staked_bonds",
-            max: MAX_STAKED_BONDS_DECODE,
-            actual: count,
-        });
-    }
-    Ok(())
 }
 
 fn encode_stake_positions(
@@ -1838,7 +1683,7 @@ mod tests {
         let tombstone_id = Bytes32::from([0xE7; 32]);
         state.evicted_validator_tombstones.insert(
             tombstone_id,
-            crate::validator::EvictedValidatorTombstoneV1 {
+            crate::validator::EvictedValidatorTombstoneV2 {
                 validator_id: tombstone_id,
                 eviction_height: u64::MAX - 1,
                 eviction_epoch: crate::epoch::epoch_for_height(u64::MAX - 1),
@@ -1847,8 +1692,9 @@ mod tests {
                 last_vrf_pk: tombstone_keys.vrf_pk,
                 cold_custody: None,
                 // Empty is a valid later lifecycle state after all originally
-                // retained bonds have canonically matured or been slashed.
-                retained_bonds: Vec::new(),
+                // retained positions and tranches have matured or been slashed.
+                retained_position_ids: Vec::new(),
+                retained_tranche_ids: Vec::new(),
             },
         );
         state.rebuild_state_commitment_v2(u64::MAX);
@@ -2205,25 +2051,7 @@ mod tests {
         }
     }
 
-    fn test_bond(byte: u8) -> StakeBondEntry {
-        StakeBondEntry::new(
-            Bytes32::from([byte; 32]),
-            Bytes32::from([0xA0 | byte; 32]),
-            Bytes32::from([0xD0 | byte; 32]),
-            1_000_000,
-            7,
-            test_output(byte),
-            1,
-        )
-    }
 
-    fn encode_bond_map_btree(bonds: &BTreeMap<Bytes32, StakeBondEntry>, buf: &mut Vec<u8>) {
-        (bonds.len() as u32).encode(buf);
-        for (utxo_id, bond) in bonds {
-            utxo_id.encode(buf);
-            bond.encode(buf);
-        }
-    }
 
     fn encode_nonce_map_btree(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
         (nonces.len() as u32).encode(buf);
@@ -2233,33 +2061,6 @@ mod tests {
         }
     }
 
-    fn encode_chain_state_without_delegator_identities(state: &ChainState) -> Vec<u8> {
-        let mut buf = Vec::new();
-        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
-            .unwrap_or_default()
-            .encode(&mut buf);
-        state.height.encode(&mut buf);
-        state.tip_hash.encode(&mut buf);
-        state.base_fee.encode(&mut buf);
-        state.total_supply.encode(&mut buf);
-        state.treasury_balance.encode(&mut buf);
-        state.burn_buffer.encode(&mut buf);
-        state.fee_reward_pool.encode(&mut buf);
-        state.utxos.encode(&mut buf);
-        state.nullifiers.encode(&mut buf);
-        state.validators.encode(&mut buf);
-        state.delegations.encode(&mut buf);
-        encode_bond_map(&state.staked_bonds, &mut buf);
-        encode_nonce_map(&state.staking_nonces, &mut buf);
-        encode_hash_set(&state.applied_slash_hashes, &mut buf);
-        state.governance.encode(&mut buf);
-        encode_delegation_return_events(&state.delegation_return_events, &mut buf);
-        buf
-    }
-
-    fn encode_chain_state_without_identity_tails(state: &ChainState) -> Vec<u8> {
-        encode_chain_state_without_delegator_identities(state)
-    }
 
     fn encode_hash_set_hashset(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
         let mut entries: Vec<_> = hashes.iter().copied().collect();
@@ -2270,82 +2071,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn staked_bond_decode_cap_is_derived_from_validator_delegator_caps() {
-        let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(1_000);
-        assert!(
-            MAX_STAKED_BONDS_DECODE > old_placeholder_cap,
-            "corrected cap must accept states above the old placeholder ceiling"
-        );
-        assert_eq!(
-            MAX_STAKED_BONDS_DECODE,
-            MAX_VALIDATORS.saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR)
-        );
-        assert!(validate_bond_map_count(old_placeholder_cap + 1).is_ok());
-    }
 
-    #[test]
-    fn staked_bond_decode_no_longer_rejects_count_above_old_placeholder_cap() {
-        let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(1_000);
-        let mut bytes = Vec::new();
-        ((old_placeholder_cap + 1) as u32).encode(&mut bytes);
 
-        let err = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap_err();
-        assert!(
-            matches!(err, IndraError::UnexpectedEof { .. }),
-            "count above old placeholder cap should pass the staked_bonds cap guard and fail only because this synthetic stream has no entries; got {err:?}"
-        );
-    }
 
-    #[test]
-    fn staked_bond_decode_rejects_count_above_corrected_cap_cleanly() {
-        let mut bytes = Vec::new();
-        ((MAX_STAKED_BONDS_DECODE + 1) as u32).encode(&mut bytes);
 
-        let err = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap_err();
-        assert!(matches!(
-            err,
-            IndraError::LengthExceeded {
-                field: "snapshot.staked_bonds",
-                max: MAX_STAKED_BONDS_DECODE,
-                actual
-            } if actual == MAX_STAKED_BONDS_DECODE + 1
-        ));
-    }
-
-    #[test]
-    fn staked_bond_encode_decode_round_trip_uses_same_cap_path() {
-        let mut bonds = PersistentOrdMap::new();
-        let bond_a = test_bond(0x01);
-        let bond_b = test_bond(0x02);
-        bonds.insert(bond_a.utxo_id, bond_a);
-        bonds.insert(bond_b.utxo_id, bond_b);
-
-        let mut bytes = Vec::new();
-        encode_bond_map(&bonds, &mut bytes);
-        let decoded = decode_bond_map(&mut ByteReader::new(&bytes)).unwrap();
-        assert_eq!(decoded, bonds);
-    }
-
-    #[test]
-    fn staked_bond_persistent_encoding_is_insertion_order_independent() {
-        let mut forward = PersistentOrdMap::new();
-        let mut reverse = PersistentOrdMap::new();
-        for byte in [0x01, 0x02, 0x03, 0x04] {
-            let bond = test_bond(byte);
-            forward.insert(bond.utxo_id, bond);
-        }
-        for byte in [0x04, 0x03, 0x02, 0x01] {
-            let bond = test_bond(byte);
-            reverse.insert(bond.utxo_id, bond);
-        }
-
-        let mut forward_bytes = Vec::new();
-        encode_bond_map(&forward, &mut forward_bytes);
-        let mut reverse_bytes = Vec::new();
-        encode_bond_map(&reverse, &mut reverse_bytes);
-        assert_eq!(forward_bytes, reverse_bytes);
-    }
 
     #[test]
     fn staking_nonce_decode_cap_is_derived_from_staking_signer_capacity() {
@@ -2574,302 +2303,6 @@ mod tests {
         assert_eq!(forward_bytes, reverse_bytes);
     }
 
-    #[test]
-    fn chain_state_migrated_clone_matches_deep_materialized_oracle() {
-        let mut state = snapshot_state();
-        state.height = 1;
-        state.utxos.insert(test_output(0x11), 1, 0, 0).unwrap();
-        state.nullifiers.insert(Bytes32::from([0x22; 32]));
-        state
-            .staked_bonds
-            .insert(Bytes32::from([0x33; 32]), test_bond(0x33));
-        state.staking_nonces.insert(Bytes32::from([0x44; 32]), 7);
-        state.applied_slash_hashes.insert(Bytes32::from([0x55; 32]));
-        state.push_delegation_return_event(DelegationReturnEvent {
-            delegator_id: Bytes32::from([0x66; 32]),
-            validator_id: Bytes32::from([0x77; 32]),
-            bond_utxo_id: Bytes32::from([0x88; 32]),
-            amount_spark: 123,
-            reason: crate::validator::DelegationReturnReason::ValidatorEvicted,
-            returned_epoch: 9,
-            returned_height: state.height,
-            refund_utxo_id: Bytes32::from([0x99; 32]),
-        });
-        state.rebuild_state_commitment_v2(state.height);
 
-        let migrated_clone = state.clone();
-        let deep_materialized = ChainState::decode_exact(&state.encode_to_vec()).unwrap();
 
-        assert_eq!(
-            migrated_clone.encode_to_vec(),
-            deep_materialized.encode_to_vec()
-        );
-        assert_eq!(
-            crate::state_root::compute_state_roots(&migrated_clone),
-            crate::state_root::compute_state_roots(&deep_materialized)
-        );
-        assert_eq!(migrated_clone, state);
-    }
-
-    #[test]
-    #[ignore = "release-mode fix #6 capstone whole-ChainState clone benchmark; run with --release --ignored --nocapture"]
-    fn fix6_capstone_whole_chain_state_clone_benchmark() {
-        use std::{hint::black_box, time::Instant};
-
-        fn id_from_index(domain: u8, index: usize) -> Bytes32 {
-            let mut bytes = [0u8; 32];
-            bytes[0] = domain;
-            bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
-            Bytes32::from(bytes)
-        }
-
-        fn heavy_output(index: usize) -> OutputV1 {
-            let byte = (index as u8).wrapping_add(1);
-            OutputV1 {
-                value_spark: 1_000,
-                commitment: CommitmentV1 {
-                    compressed_point: id_from_index(0xC0, index),
-                },
-                owner_pubkey: HybridPubKey {
-                    classical_pk: id_from_index(0xA0, index),
-                    pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(2); 2_592]).unwrap(),
-                },
-                range_proof: VariableBytes::from_slice(&vec![byte.wrapping_add(3); 674]).unwrap(),
-                lock_height: 0,
-            }
-        }
-
-        fn heavy_bond(
-            index: usize,
-            validator_id: Bytes32,
-            delegator_id: Bytes32,
-        ) -> StakeBondEntry {
-            let utxo_id = id_from_index(0xB0, index);
-            StakeBondEntry {
-                utxo_id,
-                validator_id,
-                delegator_id,
-                amount_spark: 1_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_start_height: None,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    delegator_id,
-                ),
-                original_output: heavy_output(index).into(),
-            }
-        }
-
-        fn populate_state(size: usize, heavy_bond_count: usize) -> ChainState {
-            let mut state = ChainState::new_genesis();
-            state.height = 1;
-            let validator_count = size.clamp(1, 10_000);
-            for index in 0..size {
-                let validator_id = id_from_index(0x70, index % validator_count);
-                let delegator_id = id_from_index(0xD0, index);
-                state
-                    .delegations
-                    .add_delegation(validator_id, delegator_id, 1_000, 0)
-                    .unwrap();
-                state.staking_nonces.insert(delegator_id, index as u64);
-                if index < heavy_bond_count {
-                    let bond = heavy_bond(index, validator_id, delegator_id);
-                    state.staked_bonds.insert(bond.utxo_id, bond);
-                }
-            }
-            for index in 0..size.min(30_000) {
-                state
-                    .applied_slash_hashes
-                    .insert(id_from_index(0xE0, index));
-            }
-            for index in 0..size.min(MAX_DELEGATION_RETURN_EVENTS) {
-                state.push_delegation_return_event(DelegationReturnEvent {
-                    delegator_id: id_from_index(0xD0, index),
-                    validator_id: id_from_index(0x70, index % validator_count),
-                    bond_utxo_id: id_from_index(0xB0, index),
-                    amount_spark: 1_000,
-                    reason: crate::validator::DelegationReturnReason::ValidatorEvicted,
-                    returned_epoch: index as u64 / 100,
-                    returned_height: state.height,
-                    refund_utxo_id: id_from_index(0xF0, index),
-                });
-            }
-            state.rebuild_state_commitment_v2(state.height);
-            state
-        }
-
-        let sizes = std::env::var("INDRA_FIX6_CAPSTONE_CLONE_BENCH_SIZES")
-            .unwrap_or_else(|_| "100000,1000000".to_string())
-            .split(',')
-            .map(|part| part.trim().parse::<usize>().unwrap())
-            .collect::<Vec<_>>();
-        let heavy_bond_limit = std::env::var("INDRA_FIX6_CAPSTONE_HEAVY_BOND_LIMIT")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or(1_000_000);
-
-        eprintln!(
-            "[fix6-capstone] original Step 0: normal import/commit ≈7 clone-equivalents and ≈11.6-11.9s at 1M delegators before the clone-cost arc"
-        );
-
-        for size in sizes {
-            let heavy_bonds = size.min(heavy_bond_limit);
-            let setup_start = Instant::now();
-            let state = populate_state(size, heavy_bonds);
-            let setup = setup_start.elapsed();
-
-            let whole_clone_start = Instant::now();
-            let whole_clone = state.clone();
-            let whole_clone_elapsed = whole_clone_start.elapsed();
-            black_box(&whole_clone);
-
-            let slash_hash_clone_start = Instant::now();
-            let slash_hash_clone = state.applied_slash_hashes.clone();
-            let slash_hash_clone_elapsed = slash_hash_clone_start.elapsed();
-            black_box(&slash_hash_clone);
-
-            let event_clone_start = Instant::now();
-            let event_clone = state.delegation_return_events.clone();
-            let event_clone_elapsed = event_clone_start.elapsed();
-            black_box(&event_clone);
-
-            println!(
-                "fix6_capstone_chainstate_clone delegators={size} heavy_bonds={heavy_bonds} setup={setup:?} whole_chainstate_clone={whole_clone_elapsed:?} applied_slash_hashes_clone={slash_hash_clone_elapsed:?} delegation_return_events_clone={event_clone_elapsed:?}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "release-mode Stage 2a field-clone benchmark; run explicitly with --release --ignored --nocapture"]
-    fn stage2a_persistent_bonds_and_nonces_clone_benchmark() {
-        use std::{hint::black_box, time::Instant};
-
-        fn id_from_index(index: usize) -> Bytes32 {
-            let mut bytes = [0u8; 32];
-            for (dst, src) in bytes
-                .iter_mut()
-                .zip((index as u64).to_le_bytes().into_iter())
-            {
-                *dst = src;
-            }
-            Bytes32::from(bytes)
-        }
-
-        fn heavy_output(index: usize) -> OutputV1 {
-            let byte = (index as u8).wrapping_add(1);
-            OutputV1 {
-                value_spark: 1_000,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::from([byte; 32]),
-                },
-                owner_pubkey: HybridPubKey {
-                    classical_pk: Bytes32::from([byte.wrapping_add(1); 32]),
-                    pq_pk: VariableBytes::from_slice(&vec![byte.wrapping_add(2); 2_592]).unwrap(),
-                },
-                range_proof: VariableBytes::from_slice(&vec![byte.wrapping_add(3); 674]).unwrap(),
-                lock_height: 0,
-            }
-        }
-
-        fn heavy_bond(index: usize) -> StakeBondEntry {
-            let utxo_id = id_from_index(index);
-            StakeBondEntry {
-                utxo_id,
-                validator_id: Bytes32::from([0x55; 32]),
-                delegator_id: id_from_index(index + 1_000_000),
-                amount_spark: 1_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_start_height: None,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    id_from_index(index + 1_000_000),
-                ),
-                original_output: heavy_output(index).into(),
-            }
-        }
-
-        fn legacy_bonds(size: usize) -> BTreeMap<Bytes32, StakeBondEntry> {
-            let mut map = BTreeMap::new();
-            for index in 0..size {
-                let bond = heavy_bond(index);
-                map.insert(bond.utxo_id, bond);
-            }
-            map
-        }
-
-        fn persistent_bonds(size: usize) -> PersistentOrdMap<Bytes32, StakeBondEntry> {
-            let mut map = PersistentOrdMap::new();
-            for index in 0..size {
-                let bond = heavy_bond(index);
-                map.insert(bond.utxo_id, bond);
-            }
-            map
-        }
-
-        fn legacy_nonces(size: usize) -> BTreeMap<Bytes32, u64> {
-            let mut map = BTreeMap::new();
-            for index in 0..size {
-                map.insert(id_from_index(index), index as u64);
-            }
-            map
-        }
-
-        fn persistent_nonces(size: usize) -> PersistentOrdMap<Bytes32, u64> {
-            let mut map = PersistentOrdMap::new();
-            for index in 0..size {
-                map.insert(id_from_index(index), index as u64);
-            }
-            map
-        }
-
-        // This is intentionally ignored and release-only: debug timings for
-        // million-entry heavy bond maps are dominated by instrumentation and are
-        // not meaningful for validator deployment decisions.
-        for size in [100_000usize, 1_000_000usize] {
-            let legacy = legacy_bonds(size);
-            let start = Instant::now();
-            let legacy_clone = legacy.clone();
-            black_box(&legacy_clone);
-            let legacy_bond_clone = start.elapsed();
-            drop(legacy_clone);
-            drop(legacy);
-
-            let persistent = persistent_bonds(size);
-            let start = Instant::now();
-            let persistent_clone = persistent.clone();
-            black_box(&persistent_clone);
-            let persistent_bond_clone = start.elapsed();
-            drop(persistent_clone);
-            drop(persistent);
-
-            let legacy = legacy_nonces(size);
-            let start = Instant::now();
-            let legacy_clone = legacy.clone();
-            black_box(&legacy_clone);
-            let legacy_nonce_clone = start.elapsed();
-            drop(legacy_clone);
-            drop(legacy);
-
-            let persistent = persistent_nonces(size);
-            let start = Instant::now();
-            let persistent_clone = persistent.clone();
-            black_box(&persistent_clone);
-            let persistent_nonce_clone = start.elapsed();
-            drop(persistent_clone);
-            drop(persistent);
-
-            println!(
-                "stage2a_persistent_bonds_and_nonces_clone size={size} legacy_bonds_clone={legacy_bond_clone:?} persistent_bonds_clone={persistent_bond_clone:?} legacy_nonces_clone={legacy_nonce_clone:?} persistent_nonces_clone={persistent_nonce_clone:?}"
-            );
-
-            assert!(
-                persistent_bond_clone < legacy_bond_clone,
-                "persistent staked_bonds clone should be cheaper than legacy BTreeMap clone at size {size}"
-            );
-            assert!(
-                persistent_nonce_clone < legacy_nonce_clone,
-                "persistent staking_nonces clone should be cheaper than legacy BTreeMap clone at size {size}"
-            );
-        }
-    }
 }

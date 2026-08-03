@@ -22,15 +22,12 @@ use crate::{
     epoch::epoch_for_height,
     error::{StateError, StateResult},
     identity::{
-        resolve_active_validator_cold_pubkey, resolve_and_check_identity,
-        resolve_bond_owner_pubkey, IdentityCheckOutcome, IdentityError,
+        resolve_active_validator_cold_pubkey, resolve_and_check_identity, IdentityCheckOutcome,
+        IdentityError,
     },
     validator::{
-        validate_new_validator_cold_key, validate_validator_cold_key, DelegationReturnEvent,
-        DelegationReturnReason, EvictedBondReferenceV1, EvictedColdCustodyV1,
-        EvictedValidatorTombstoneV1, StakeBondCustodyOwner, StakeBondEntry, ValidatorEntry,
-        ValidatorStatus, MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS, MAX_DELEGATORS_PER_VALIDATOR,
-        MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE, MAX_TOTAL_RETAINED_BOND_REFERENCES,
+        validate_new_validator_cold_key, validate_validator_cold_key, EvictedColdCustodyV1,
+        ValidatorEntry, ValidatorStatus,
     },
 };
 
@@ -66,7 +63,11 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::ClaimRewards { .. }
             | StakingOpBody::SetCommission { .. }
             | StakingOpBody::SelfStake { .. }
-            | StakingOpBody::SelfUnstake { .. }
+            | StakingOpBody::ExitStakePosition {
+                custody:
+                    indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity { .. },
+                ..
+            }
             | StakingOpBody::SetAutoDelegate { .. }
     );
     let active_cold_validator = cold_designated && state.validators.get(&signer_id).is_some();
@@ -177,15 +178,24 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         }
         StakingOpBody::Delegate {
             delegator_pubkey, ..
-        }
-        | StakingOpBody::Undelegate {
-            delegator_pubkey, ..
         } => {
             verify_staking_sig(
                 &signing_bytes,
                 &op.signature,
                 &delegator_pubkey.classical_pk.0,
                 delegator_pubkey.pq_pk.as_slice(),
+            )?;
+        }
+        StakingOpBody::ExitStakePosition { .. } if !active_cold_validator => {
+            let owner = state
+                .delegator_identities
+                .get(&signer_id)
+                .ok_or_else(|| StateError::InvalidStakingOp("missing delegator identity".into()))?;
+            verify_staking_sig(
+                &signing_bytes,
+                &op.signature,
+                &owner.classical_pk.0,
+                owner.pq_pk.as_slice(),
             )?;
         }
         StakingOpBody::ClaimRewards {
@@ -248,9 +258,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         }
         StakingOpBody::SelfStake {
             validator_pubkey, ..
-        }
-        | StakingOpBody::SelfUnstake {
-            validator_pubkey, ..
         } if !active_cold_validator => {
             verify_staking_sig(
                 &signing_bytes,
@@ -262,7 +269,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
         StakingOpBody::ClaimRewards { .. }
         | StakingOpBody::SetCommission { .. }
         | StakingOpBody::SelfStake { .. }
-        | StakingOpBody::SelfUnstake { .. }
+        | StakingOpBody::ExitStakePosition { .. }
         | StakingOpBody::SetAutoDelegate { .. } => {}
         StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     }
@@ -284,19 +291,9 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             true,
             Some(MAX_LIVE_BONDS_PER_VALIDATOR),
         ),
-        StakingOpBody::Undelegate {
-            validator_id,
-            bond_utxo_id,
-            delegator_pubkey,
-        } => apply_undelegate(
-            state,
-            validator_id,
-            *bond_utxo_id,
-            delegator_pubkey,
-            current_height,
-            identity_registry_active,
-            true,
-        ),
+        StakingOpBody::ExitStakePosition { .. } => {
+            crate::stake_positions::exit_stake_position(state, op, current_height).map(|_| ())
+        }
         StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey,
@@ -356,17 +353,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             current_height,
             identity_registry_active,
             Some(MAX_LIVE_BONDS_PER_VALIDATOR),
-        ),
-        StakingOpBody::SelfUnstake {
-            bond_utxo_id,
-            validator_pubkey,
-            ..
-        } => apply_self_unstake(
-            state,
-            *bond_utxo_id,
-            validator_pubkey,
-            current_height,
-            identity_registry_active,
         ),
         StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     };
@@ -699,12 +685,6 @@ fn apply_register_validator(
         }
     }
 
-    if state.staked_bonds.contains_key(&bond_utxo_id) {
-        return Err(StateError::InvalidStakingOp(
-            "registration bond UTXO is already bonded as stake".into(),
-        ));
-    }
-
     let utxo_entry = state
         .utxos
         .get(&bond_utxo_id)
@@ -746,14 +726,6 @@ fn apply_register_validator(
         evict_validator_for_registry_replacement(state, lowest_id, current_epoch, current_height)?;
     }
 
-    let original_output = utxo_entry.output;
-    let spent = state.utxos.spend_at_height(&bond_utxo_id, current_height);
-    if spent.is_none() {
-        return Err(StateError::InvariantViolation {
-            message: "registration bond UTXO disappeared during validator registration",
-        });
-    }
-
     let entry = ValidatorEntry {
         validator_id,
         name: hex::encode(&validator_id.0[..8]),
@@ -783,20 +755,23 @@ fn apply_register_validator(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_validator(&entry, current_height);
     }
-    let mut bond = StakeBondEntry::new(
+    let proof = bond_proof.ok_or_else(|| {
+        StateError::InvalidStakingOp("registration position requires a bond opening".into())
+    })?;
+    crate::stake_positions::deposit_stake_position(
+        state,
+        validator_id,
+        validator_id,
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        },
         bond_utxo_id,
-        validator_id,
-        validator_id,
-        amount_spark,
-        epoch_for_height(current_height),
-        original_output,
+        crate::stake_positions::PositionDepositOpeningV1 {
+            principal_spark: amount_spark,
+            blinding: proof.blinding_factor.0,
+        },
         current_height,
-    );
-    bond.custody_owner = StakeBondCustodyOwner::ValidatorColdIdentity(validator_id);
-    state.staked_bonds.insert(bond_utxo_id, bond.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_staked_bond(&bond_utxo_id, &bond);
-    }
+    )?;
     check_or_insert_validator_identity(state, &validator_id, validator_pubkey)?;
     Ok(())
 }
@@ -831,7 +806,7 @@ fn build_evicted_validator_tombstone(
     state: &ChainState,
     validator_id: Bytes32,
     current_height: u64,
-) -> StateResult<EvictedValidatorTombstoneV1> {
+) -> StateResult<crate::tranche_tombstone::TrancheEvictionPlanV2> {
     if state.evicted_validator_tombstones.len() >= MAX_VALIDATORS {
         return Err(StateError::TombstoneCapacityExceeded);
     }
@@ -858,46 +833,15 @@ fn build_evicted_validator_tombstone(
         .map_err(|_| StateError::TombstoneCapacityExceeded)?;
     indra_crypto::validate_vrf_public_key(&vrf)
         .map_err(|_| StateError::TombstoneCapacityExceeded)?;
-    let mut bonds: Vec<StakeBondEntry> = state
-        .staked_bonds
-        .values()
-        .filter(|bond| bond.validator_id == validator_id)
-        .cloned()
-        .collect();
-    bonds.sort_by_key(|bond| bond.utxo_id.0);
-    if bonds.is_empty() || bonds.len() > MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE {
-        return Err(StateError::TombstoneCapacityExceeded);
-    }
-    let existing_references: usize = state
-        .evicted_validator_tombstones
-        .values()
-        .map(|tombstone| tombstone.retained_bonds.len())
-        .sum();
-    if existing_references
-        .checked_add(bonds.len())
-        .is_none_or(|total| total > MAX_TOTAL_RETAINED_BOND_REFERENCES)
-    {
-        return Err(StateError::TombstoneCapacityExceeded);
-    }
-    let requires_cold = bonds.iter().any(|bond| {
-        matches!(
-            bond.custody_owner,
-            StakeBondCustodyOwner::ValidatorColdIdentity(id) if id == validator_id
-        )
+    let cold_custody = Some(EvictedColdCustodyV1 {
+        classical_pk: validator
+            .cold_hybrid_classical_pk
+            .ok_or(StateError::TombstoneCapacityExceeded)?,
+        pq_pk: validator
+            .cold_hybrid_pq_pk
+            .ok_or(StateError::TombstoneCapacityExceeded)?,
+        key_version: validator.cold_key_version,
     });
-    let cold_custody = if requires_cold {
-        Some(EvictedColdCustodyV1 {
-            classical_pk: validator
-                .cold_hybrid_classical_pk
-                .ok_or(StateError::TombstoneCapacityExceeded)?,
-            pq_pk: validator
-                .cold_hybrid_pq_pk
-                .ok_or(StateError::TombstoneCapacityExceeded)?,
-            key_version: validator.cold_key_version,
-        })
-    } else {
-        None
-    };
     if let Some(cold) = &cold_custody {
         indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(
             cold.classical_pk,
@@ -906,28 +850,48 @@ fn build_evicted_validator_tombstone(
         indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(cold.pq_pk))
             .map_err(|_| StateError::TombstoneCapacityExceeded)?;
     }
-    let current_epoch = epoch_for_height(current_height);
-    let unbonding_end = current_epoch
-        .checked_add(UNBONDING_PERIOD_EPOCHS)
-        .ok_or(StateError::TombstoneCapacityExceeded)?;
-    let retained_bonds = bonds
+    let positions = state
+        .stake_positions
         .iter()
-        .map(|bond| EvictedBondReferenceV1 {
-            bond_utxo_id: bond.utxo_id,
-            delegator_id: bond.delegator_id,
-            unbonding_end_epoch: bond.unbonding_end_epoch.unwrap_or(unbonding_end),
-        })
+        .map(|(id, position)| (*id, position.clone()))
         .collect();
-    Ok(EvictedValidatorTombstoneV1 {
+    let tranches = state
+        .unbonding_tranches
+        .iter()
+        .map(|(id, tranche)| (*id, tranche.clone()))
+        .collect();
+    let plan = crate::tranche_tombstone::plan_tranche_native_eviction_v2(
+        &state.chain_id,
         validator_id,
-        eviction_height: current_height,
-        eviction_epoch: current_epoch,
-        last_classical_vote_pk: classical,
-        last_pq_vote_pk: pq,
-        last_vrf_pk: vrf,
-        cold_custody,
-        retained_bonds,
-    })
+        current_height,
+        crate::tranche_tombstone::TombstoneAuthorityV2 {
+            classical_vote_pk: classical,
+            pq_vote_pk: pq,
+            vrf_pk: vrf,
+            cold_custody,
+        },
+        &positions,
+        &tranches,
+    )?;
+    let mut tombstones = state
+        .evicted_validator_tombstones
+        .iter()
+        .map(|(id, tombstone)| (*id, tombstone.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    tombstones.insert(validator_id, plan.tombstone.clone());
+    let live_ids = state
+        .validators
+        .all_validators()
+        .filter(|validator| validator.validator_id != validator_id)
+        .map(|validator| validator.validator_id)
+        .collect();
+    crate::tranche_tombstone::validate_all_tombstone_references_v2(
+        &tombstones,
+        &plan.positions,
+        &plan.tranches,
+        &live_ids,
+    )?;
+    Ok(plan)
 }
 
 fn evict_validator_for_registry_replacement(
@@ -946,105 +910,17 @@ fn evict_validator_to_tombstone(
     current_height: u64,
 ) -> StateResult<()> {
     let current_epoch = epoch_for_height(current_height);
-    let tombstone = build_evicted_validator_tombstone(state, validator_id, current_height)?;
-    let validator = state
-        .validators
-        .get(&validator_id)
-        .cloned()
-        .ok_or(StateError::ValidatorNotFound)?;
-    let delegators = state.delegations.get_delegators(&validator_id).to_vec();
-    let validator_reward_owner = validator_public_key(&validator)?;
-    let mut delegator_reward_owners = Vec::with_capacity(delegators.len());
-    for entry in &delegators {
-        let owner = if entry.pending_rewards >= DUST_LIMIT_SPARK {
-            let bond = state
-                .staked_bonds
-                .values()
-                .find(|bond| {
-                    bond.validator_id == validator_id && bond.delegator_id == entry.delegator_id
-                })
-                .ok_or(StateError::InvariantViolation {
-                    message: "delegator reward has no retained bond during tombstone preflight",
-                })?;
-            Some(resolve_bond_owner_pubkey(bond, state).map_err(|_| {
-                StateError::InvariantViolation {
-                    message:
-                        "delegator reward owner could not be resolved during tombstone preflight",
-                }
-            })?)
-        } else {
-            None
-        };
-        delegator_reward_owners.push(owner);
-    }
-    if validator.pending_rewards > 0 {
-        payout_or_burn_pending_reward(
-            state,
-            &validator_id,
-            &validator_id,
-            validator.pending_rewards,
-            validator_reward_owner,
-            current_height,
-        )?;
-    }
-    for (entry, preflight_owner) in delegators.iter().zip(delegator_reward_owners) {
-        if entry.pending_rewards == 0 {
-            continue;
-        }
-        if let Some(owner) = preflight_owner {
-            payout_or_burn_pending_reward(
-                state,
-                &validator_id,
-                &entry.delegator_id,
-                entry.pending_rewards,
-                owner,
-                current_height,
-            )?;
-        } else if entry.pending_rewards >= DUST_LIMIT_SPARK {
-            return Err(StateError::InvariantViolation {
-                message: "delegator reward could not be paid during tombstone eviction",
-            });
-        }
-    }
-    let removed_delegators = state.delegations.take_delegators(&validator_id);
-    debug_assert_eq!(removed_delegators, delegators);
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        for entry in &delegators {
-            commitment.delete_delegator(&validator_id, &entry.delegator_id);
-        }
-    }
-    let unbonding_end = current_epoch.checked_add(UNBONDING_PERIOD_EPOCHS).ok_or(
-        StateError::InvariantViolation {
-            message: "eviction unbonding epoch overflow",
-        },
-    )?;
-    for reference in &tombstone.retained_bonds {
-        let mut bond = state
-            .staked_bonds
-            .get(&reference.bond_utxo_id)
-            .cloned()
-            .ok_or(StateError::InvariantViolation {
-                message: "preflighted eviction bond disappeared",
-            })?;
-        if bond.unbonding_end_epoch.is_none() {
-            bond.begin_unbonding(current_height, unbonding_end)?;
-        }
-        let updated = bond.clone();
-        state
-            .staked_bonds
-            .insert(reference.bond_utxo_id, updated.clone());
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_staked_bond(&reference.bond_utxo_id, &updated);
-        }
-    }
+    let plan = build_evicted_validator_tombstone(state, validator_id, current_height)?;
     state.validators.remove(&validator_id);
+    state.stake_positions = plan.positions.into_iter().collect();
+    state.unbonding_tranches = plan.tranches.into_iter().collect();
+    state
+        .rebuild_position_tranche_index()
+        .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
     state
         .evicted_validator_tombstones
-        .insert(validator_id, tombstone.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.delete_validator(&validator_id);
-        commitment.put_evicted_validator_tombstone(&tombstone);
-    }
+        .insert(validator_id, plan.tombstone);
+    state.rebuild_state_commitment_v2(current_height);
     Ok(())
 }
 
@@ -1132,9 +1008,9 @@ fn enforce_validator_bond_capacity(
         return Ok(());
     };
     let count = state
-        .staked_bonds
+        .stake_positions
         .values()
-        .filter(|bond| bond.validator_id == *validator_id)
+        .filter(|position| position.validator_id == *validator_id)
         .take(cap)
         .count();
     if validator_bond_capacity_reached(count, cap) {
@@ -1177,12 +1053,6 @@ fn apply_delegate(
         .min_delegation_spark
         .max(state.governance.params.min_delegation_spark);
 
-    if state.staked_bonds.contains_key(&bond_utxo_id) {
-        return Err(StateError::InvalidStakingOp(
-            "UTXO is already bonded as stake".into(),
-        ));
-    }
-
     let utxo_entry = state
         .utxos
         .get(&bond_utxo_id)
@@ -1219,55 +1089,25 @@ fn apply_delegate(
         )));
     }
 
-    let current_epoch = epoch_for_height(current_height);
-    let delegators = state.delegations.get_delegators(validator_id);
-    let existing_delegator = delegators
-        .iter()
-        .any(|entry| entry.delegator_id == delegator_id);
-    if !existing_delegator && delegators.len() >= MAX_DELEGATORS_PER_VALIDATOR {
-        return Err(StateError::InvalidStakingOp(format!(
-            "validator delegator count at maximum ({MAX_DELEGATORS_PER_VALIDATOR})"
-        )));
-    }
-
-    let original_output = utxo_entry.output;
-    let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
-
-    let bond = StakeBondEntry::new(
-        bond_utxo_id,
+    let proof = bond_proof.ok_or_else(|| {
+        StateError::InvalidStakingOp("position deposit requires a bond opening".into())
+    })?;
+    crate::stake_positions::deposit_stake_position(
+        state,
         *validator_id,
         delegator_id,
-        amount_spark,
-        current_epoch,
-        original_output,
+        indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity { delegator_id },
+        bond_utxo_id,
+        crate::stake_positions::PositionDepositOpeningV1 {
+            principal_spark: amount_spark,
+            blinding: proof.blinding_factor.0,
+        },
         current_height,
-    );
-    state.staked_bonds.insert(bond_utxo_id, bond.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_staked_bond(&bond_utxo_id, &bond);
-    }
-
-    state
-        .delegations
-        .add_delegation(*validator_id, delegator_id, amount_spark, current_epoch)
-        .map_err(|reason| StateError::InvalidStakingOp(reason.into()))?;
-    if bond_accounting_active {
-        reconcile_delegator_from_bonds(state, validator_id, &delegator_id);
-    }
-    if let (Some(commitment), Some(delegator)) = (
-        state.state_commitment_v2.as_mut(),
-        state
-            .delegations
-            .get_delegators(validator_id)
-            .iter()
-            .find(|entry| entry.delegator_id == delegator_id),
-    ) {
-        commitment.put_delegator(validator_id, delegator);
-    }
+    )?;
 
     if matches!(
         identity_outcome,
-        Some(IdentityCheckOutcome::NoPriorRecord | IdentityCheckOutcome::LegacyBondMatch)
+        Some(IdentityCheckOutcome::NoPriorRecord)
     ) {
         state
             .delegator_identities
@@ -1297,113 +1137,6 @@ fn identity_error_to_state_error(error: IdentityError) -> StateError {
     }
 }
 
-/// Begin undelegating from a validator.
-///
-/// Stake enters unbonding for UNBONDING_PERIOD_EPOCHS epochs.
-/// During unbonding, stake earns no rewards and cannot be redelegated.
-fn apply_undelegate(
-    state: &mut ChainState,
-    validator_id: &Bytes32,
-    bond_utxo_id: Bytes32,
-    delegator_pubkey: &HybridPubKey,
-    current_height: u64,
-    identity_registry_active: bool,
-    bond_accounting_active: bool,
-) -> StateResult<()> {
-    let delegator_id = pubkey_to_id(delegator_pubkey);
-
-    let mut bond = state
-        .staked_bonds
-        .get(&bond_utxo_id)
-        .cloned()
-        .ok_or_else(|| StateError::InvalidStakingOp("stake bond not found".into()))?;
-    if bond.delegator_id != delegator_id {
-        return Err(StateError::InvalidStakingOp(
-            "bond does not belong to delegator".into(),
-        ));
-    }
-    let identity_outcome = if identity_registry_active {
-        let outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
-            .map_err(identity_error_to_state_error)?;
-        if matches!(outcome, IdentityCheckOutcome::NoPriorRecord) {
-            let owner_pubkey = resolve_bond_owner_pubkey(&bond, state).map_err(|_| {
-                StateError::InvalidStakingOp(format!(
-                    "delegator identity bond owner is unresolvable for {delegator_id}"
-                ))
-            })?;
-            if owner_pubkey != *delegator_pubkey {
-                return Err(StateError::InvalidStakingOp(format!(
-                    "delegator identity bond owner pubkey mismatch for {delegator_id}"
-                )));
-            }
-        }
-        Some(outcome)
-    } else {
-        None
-    };
-    if bond.validator_id != *validator_id {
-        return Err(StateError::InvalidStakingOp(
-            "bond not staked with this validator".into(),
-        ));
-    }
-    if bond.unbonding_end_epoch.is_some() {
-        return Err(StateError::InvalidStakingOp(
-            "bond is already unbonding".into(),
-        ));
-    }
-
-    let current_epoch = epoch_for_height(current_height);
-    let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
-    bond.begin_unbonding(current_height, unbonding_end)?;
-    let amount_spark = bond.amount_spark;
-    let updated_bond = bond.clone();
-    state
-        .staked_bonds
-        .insert(bond_utxo_id, updated_bond.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
-    }
-
-    if bond_accounting_active {
-        let active_stake_spark = active_delegated_bond_stake(state, validator_id, &delegator_id);
-        state
-            .delegations
-            .begin_undelegate_from_bonds(
-                validator_id,
-                &delegator_id,
-                active_stake_spark,
-                unbonding_end,
-            )
-            .map_err(|e| StateError::InvalidStakingOp(e.into()))?;
-    } else {
-        state
-            .delegations
-            .begin_undelegate(validator_id, &delegator_id, amount_spark, unbonding_end)
-            .map_err(|e| StateError::InvalidStakingOp(e.into()))?;
-    }
-    if let (Some(commitment), Some(delegator)) = (
-        state.state_commitment_v2.as_mut(),
-        state
-            .delegations
-            .get_delegators(validator_id)
-            .iter()
-            .find(|entry| entry.delegator_id == delegator_id),
-    ) {
-        commitment.put_delegator(validator_id, delegator);
-    }
-    if matches!(
-        identity_outcome,
-        Some(IdentityCheckOutcome::NoPriorRecord | IdentityCheckOutcome::LegacyBondMatch)
-    ) {
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_delegator_identity(&delegator_id, delegator_pubkey);
-        }
-    }
-    Ok(())
-}
 
 pub(crate) fn active_delegated_bond_stake(
     state: &ChainState,
@@ -1411,59 +1144,17 @@ pub(crate) fn active_delegated_bond_stake(
     delegator_id: &Bytes32,
 ) -> u64 {
     state
-        .staked_bonds
+        .stake_positions
         .values()
-        .filter(|bond| {
-            bond.validator_id == *validator_id
-                && bond.delegator_id == *delegator_id
-                && bond.validator_id != bond.delegator_id
-                && bond.unbonding_end_epoch.is_none()
+        .filter(|position| {
+            position.validator_id == *validator_id
+                && position.principal_owner_id == *delegator_id
+                && position.validator_id != position.principal_owner_id
         })
-        .fold(0u64, |sum, bond| sum.saturating_add(bond.amount_spark))
+        .filter_map(|position| position.active)
+        .fold(0u64, |sum, active| sum.saturating_add(active.principal_spark))
 }
 
-pub(crate) fn reconcile_delegator_from_bonds(
-    state: &mut ChainState,
-    validator_id: &Bytes32,
-    delegator_id: &Bytes32,
-) {
-    let mut active = 0u64;
-    let mut latest_unbonding_end = None;
-    let mut has_any = false;
-    for bond in state.staked_bonds.values().filter(|bond| {
-        bond.validator_id == *validator_id
-            && bond.delegator_id == *delegator_id
-            && bond.validator_id != bond.delegator_id
-    }) {
-        has_any = true;
-        match bond.unbonding_end_epoch {
-            None => active = active.saturating_add(bond.amount_spark),
-            Some(end) => {
-                latest_unbonding_end =
-                    Some(latest_unbonding_end.map_or(end, |old: u64| old.max(end)))
-            }
-        }
-    }
-    state.delegations.reconcile_from_bonds(
-        validator_id,
-        delegator_id,
-        active,
-        latest_unbonding_end,
-        has_any,
-    );
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        if let Some(entry) = state
-            .delegations
-            .get_delegators(validator_id)
-            .iter()
-            .find(|entry| entry.delegator_id == *delegator_id)
-        {
-            commitment.put_delegator(validator_id, entry);
-        } else {
-            commitment.delete_delegator(validator_id, delegator_id);
-        }
-    }
-}
 
 /// Bond a validator-owned UTXO as validator self-stake.
 fn apply_self_stake(
@@ -1490,12 +1181,6 @@ fn apply_self_stake(
         return Err(StateError::ValidatorNotActive);
     }
     enforce_validator_bond_capacity(state, &validator_id, bond_count_cap)?;
-
-    if state.staked_bonds.contains_key(&bond_utxo_id) {
-        return Err(StateError::InvalidStakingOp(
-            "UTXO is already bonded as stake".into(),
-        ));
-    }
 
     let utxo_entry = state
         .utxos
@@ -1524,23 +1209,23 @@ fn apply_self_stake(
         )));
     }
 
-    let current_epoch = epoch_for_height(current_height);
-    let original_output = utxo_entry.output;
-    let _ = state.utxos.spend_at_height(&bond_utxo_id, current_height);
-    let mut bond = StakeBondEntry::new(
+    let proof = bond_proof.ok_or_else(|| {
+        StateError::InvalidStakingOp("self-position deposit requires a bond opening".into())
+    })?;
+    crate::stake_positions::deposit_stake_position(
+        state,
+        validator_id,
+        validator_id,
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        },
         bond_utxo_id,
-        validator_id,
-        validator_id,
-        amount_spark,
-        current_epoch,
-        original_output,
+        crate::stake_positions::PositionDepositOpeningV1 {
+            principal_spark: amount_spark,
+            blinding: proof.blinding_factor.0,
+        },
         current_height,
-    );
-    bond.custody_owner = StakeBondCustodyOwner::ValidatorColdIdentity(validator_id);
-    state.staked_bonds.insert(bond_utxo_id, bond.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_staked_bond(&bond_utxo_id, &bond);
-    }
+    )?;
     let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
         v.stake_spark = v.stake_spark.saturating_add(amount_spark);
@@ -1554,84 +1239,6 @@ fn apply_self_stake(
     Ok(())
 }
 
-/// Begin unbonding validator self-stake.
-fn apply_self_unstake(
-    state: &mut ChainState,
-    bond_utxo_id: Bytes32,
-    validator_pubkey: &HybridPubKey,
-    current_height: u64,
-    identity_registry_active: bool,
-) -> StateResult<()> {
-    let validator_id = pubkey_to_id(validator_pubkey);
-    let validator = state
-        .validators
-        .get(&validator_id)
-        .ok_or(StateError::ValidatorNotFound)?;
-    if identity_registry_active {
-        check_validator_identity_consistency(state, &validator_id, validator_pubkey)?;
-    }
-    if !matches!(
-        validator.status,
-        ValidatorStatus::Active | ValidatorStatus::Registered
-    ) {
-        return Err(StateError::ValidatorNotActive);
-    }
-
-    let mut bond = state
-        .staked_bonds
-        .get(&bond_utxo_id)
-        .cloned()
-        .ok_or_else(|| StateError::InvalidStakingOp("self-stake bond not found".into()))?;
-    if bond.delegator_id != validator_id {
-        return Err(StateError::InvalidStakingOp(
-            "bond is not validator self-stake".into(),
-        ));
-    }
-    if bond.validator_id != validator_id {
-        return Err(StateError::InvalidStakingOp(
-            "bond not staked with this validator".into(),
-        ));
-    }
-    if bond.unbonding_end_epoch.is_some() {
-        return Err(StateError::InvalidStakingOp(
-            "bond is already unbonding".into(),
-        ));
-    }
-
-    let current_epoch = epoch_for_height(current_height);
-    let unbonding_end = current_epoch + UNBONDING_PERIOD_EPOCHS;
-    let amount_spark = bond.amount_spark;
-    bond.begin_unbonding(current_height, unbonding_end)?;
-    let updated_bond = bond.clone();
-    state
-        .staked_bonds
-        .insert(bond_utxo_id, updated_bond.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_staked_bond(&bond_utxo_id, &updated_bond);
-    }
-    let mut updated_validator = None;
-    if let Some(v) = state.validators.get_mut(&validator_id) {
-        v.stake_spark = v.stake_spark.saturating_sub(amount_spark);
-        if matches!(v.status, ValidatorStatus::Active)
-            && v.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK
-        {
-            eprintln!(
-                "[staking] validator {} self-stake {} below active minimum {}; demoting to Registered",
-                hex::encode(&validator_id.0[..4]),
-                v.stake_spark,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK
-            );
-            v.status = ValidatorStatus::Registered;
-        }
-        updated_validator = Some(v.clone());
-    }
-    if let (Some(commitment), Some(validator)) =
-        (state.state_commitment_v2.as_mut(), updated_validator)
-    {
-        commitment.put_validator(&validator, current_height);
-    }
-    Ok(())
-}
 
 fn check_or_insert_validator_identity(
     state: &mut ChainState,
@@ -1706,19 +1313,21 @@ fn apply_claim_rewards(
     identity_registry_active: bool,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
-
-    let delegation_claim = state
-        .delegations
-        .get_delegators(validator_id)
-        .iter()
-        .find(|entry| entry.delegator_id == delegator_id)
-        .map(|entry| entry.pending_rewards);
-    let validator_claim = state
-        .validators
-        .get(validator_id)
-        .filter(|validator| validator.validator_id == delegator_id)
-        .map(|validator| validator.pending_rewards);
-    let claim_from_validator = delegation_claim.is_none() && validator_claim.is_some();
+    let claim_from_validator = *validator_id == delegator_id;
+    let custody = if claim_from_validator {
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id: *validator_id,
+        }
+    } else {
+        indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity { delegator_id }
+    };
+    let position_id =
+        indra_core::types::stake_position::derive_position_id(*validator_id, delegator_id, custody);
+    let claimed = state
+        .stake_positions
+        .get(&position_id)
+        .map(|position| position.pending_rewards_spark)
+        .ok_or(StateError::DelegatorNotFound)?;
     let payout_pubkey = if claim_from_validator {
         resolve_active_validator_cold_pubkey(state, validator_id).map_err(|_| {
             StateError::InvariantViolation {
@@ -1729,9 +1338,6 @@ fn apply_claim_rewards(
         delegator_pubkey.clone()
     };
 
-    let claimed = delegation_claim
-        .or(validator_claim)
-        .ok_or(StateError::DelegatorNotFound)?;
     if claimed == 0 {
         return Ok(());
     }
@@ -1757,32 +1363,19 @@ fn apply_claim_rewards(
     } else {
         None
     };
-    if claim_from_validator {
-        let mut updated_validator = None;
-        if let Some(validator) = state.validators.get_mut(validator_id) {
-            validator.pending_rewards = 0;
-            updated_validator = Some(validator.clone());
-        }
-        if let (Some(commitment), Some(validator)) =
-            (state.state_commitment_v2.as_mut(), updated_validator)
-        {
-            commitment.put_validator(&validator, current_height);
-        }
-    } else if let Some(updated_entry) =
-        state
-            .delegations
-            .update_delegator(validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = 0;
-                entry.clone()
-            })
-    {
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_delegator(validator_id, &updated_entry);
-        }
+    let mut position = state
+        .stake_positions
+        .get(&position_id)
+        .cloned()
+        .ok_or(StateError::DelegatorNotFound)?;
+    position.pending_rewards_spark = 0;
+    state.stake_positions.insert(position_id, position.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_stake_position(&position);
     }
     if matches!(
         identity_outcome,
-        Some(IdentityCheckOutcome::NoPriorRecord | IdentityCheckOutcome::LegacyBondMatch)
+        Some(IdentityCheckOutcome::NoPriorRecord)
     ) {
         state
             .delegator_identities
@@ -1849,34 +1442,15 @@ fn check_claim_owner_identity_for_first_record(
         };
     }
 
-    let mut owner_pubkey: Option<HybridPubKey> = None;
-    for bond in state.staked_bonds.values().filter(|bond| {
-        bond.validator_id == *validator_id
-            && bond.delegator_id == *delegator_id
-            && bond.unbonding_end_epoch.is_none()
-    }) {
-        let resolved_pubkey = resolve_bond_owner_pubkey(bond, state).map_err(|_| {
+    let owner_pubkey = state
+        .delegator_identities
+        .get(delegator_id)
+        .ok_or_else(|| {
             StateError::InvalidStakingOp(format!(
                 "delegator identity claim owner is unresolvable for {delegator_id}"
             ))
         })?;
-        match &owner_pubkey {
-            Some(existing) if existing != &resolved_pubkey => {
-                return Err(StateError::InvalidStakingOp(format!(
-                    "delegator identity has ambiguous claim owner pubkeys for {delegator_id}"
-                )));
-            }
-            Some(_) => {}
-            None => owner_pubkey = Some(resolved_pubkey),
-        }
-    }
-
-    let owner_pubkey = owner_pubkey.ok_or_else(|| {
-        StateError::InvalidStakingOp(format!(
-            "delegator identity claim owner is unresolvable for {delegator_id}"
-        ))
-    })?;
-    if owner_pubkey != *submitted_pubkey {
+    if owner_pubkey != submitted_pubkey {
         return Err(StateError::InvalidStakingOp(format!(
             "delegator identity claim owner pubkey mismatch for {delegator_id}"
         )));
@@ -2040,7 +1614,7 @@ mod tests {
     use super::*;
     use crate::{
         chain::ChainState,
-        validator::{ValidatorEntry, ValidatorStatus},
+        validator::{DelegationReturnEvent, DelegationReturnReason, ValidatorEntry, ValidatorStatus},
     };
     use indra_core::codec::Encode;
     use indra_core::types::{
@@ -2266,11 +1840,18 @@ mod tests {
             | StakingOpBody::SelfStake {
                 cold_authorization, ..
             }
-            | StakingOpBody::SelfUnstake {
-                cold_authorization, ..
-            }
             | StakingOpBody::SetAutoDelegate {
                 cold_authorization, ..
+            } => {
+                *cold_authorization = Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                });
+            }
+            StakingOpBody::ExitStakePosition {
+                custody: indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity { .. },
+                cold_authorization,
+                ..
             } => {
                 *cold_authorization = Some(indra_core::types::staking::ColdStakingAuthorization {
                     cold_key_version: 1,
@@ -2283,7 +1864,9 @@ mod tests {
             &body,
             StakingOpBody::SetCommission { .. }
                 | StakingOpBody::SelfStake { .. }
-                | StakingOpBody::SelfUnstake { .. }
+                | StakingOpBody::ExitStakePosition {
+                    custody: indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity { .. }, ..
+                }
                 | StakingOpBody::SetAutoDelegate { .. }
         );
         let mut op = StakingOp {
@@ -2366,7 +1949,7 @@ mod tests {
             | StakingOpBody::SelfStake {
                 cold_authorization, ..
             }
-            | StakingOpBody::SelfUnstake {
+            | StakingOpBody::ExitStakePosition {
                 cold_authorization, ..
             }
             | StakingOpBody::SetAutoDelegate {
@@ -2535,54 +2118,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn st03_attack_is_closed() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0xE5);
-        let delegator_keypair = keypair(0xE6);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id =
-            insert_mismatched_public_value_utxo(&mut state, pubkey, 100, 1_000_000, 0xE7);
-
-        let chain_id = state.chain_id.clone();
-        let correct_opening_wrong_public = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                bond_utxo_id,
-                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-                bond_proof: Some(bond_proof(1_000_000, 0xE7)),
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        assert_eq!(
-            apply_staking_op(&mut state, &correct_opening_wrong_public, &chain_id, 1),
-            Err(StateError::StakingBondValueMismatch {
-                public_value: 100,
-                committed_value: 1_000_000,
-            })
-        );
-        assert!(state.utxos.contains(&bond_utxo_id));
-
-        let public_value_wrong_opening = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                bond_utxo_id,
-                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-                bond_proof: Some(bond_proof(100, 0xE7)),
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        assert_eq!(
-            apply_staking_op(&mut state, &public_value_wrong_opening, &chain_id, 1),
-            Err(StateError::StakingBondCommitmentMismatch)
-        );
-        assert!(state.utxos.contains(&bond_utxo_id));
-        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    }
 
     fn delegate_op(
         state: &ChainState,
@@ -2608,15 +2143,25 @@ mod tests {
     fn undelegate_op(
         state: &ChainState,
         validator_id: Bytes32,
-        bond_utxo_id: Bytes32,
+        _bond_utxo_id: Bytes32,
         delegator_keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
+        let delegator_id = pubkey_to_id(&pubkey_from_keypair(delegator_keypair));
+        let position = state
+            .stake_positions
+            .values()
+            .find(|position| {
+                position.validator_id == validator_id
+                    && position.principal_owner_id == delegator_id
+            })
+            .expect("delegation must have created a position");
         signed_op(
-            StakingOpBody::Undelegate {
-                validator_id,
-                bond_utxo_id,
-                delegator_pubkey: pubkey_from_keypair(delegator_keypair),
+            StakingOpBody::ExitStakePosition {
+                position_id: position.position_id,
+                amount_spark: position.active.expect("active position").principal_spark,
+                custody: position.custody,
+                cold_authorization: None,
             },
             nonce,
             delegator_keypair,
@@ -2664,14 +2209,24 @@ mod tests {
 
     fn self_unstake_op(
         state: &ChainState,
-        bond_utxo_id: Bytes32,
+        _bond_utxo_id: Bytes32,
         validator_keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
+        let validator_id = pubkey_to_id(&pubkey_from_keypair(validator_keypair));
+        let position = state
+            .stake_positions
+            .values()
+            .find(|position| {
+                position.validator_id == validator_id
+                    && position.principal_owner_id == validator_id
+            })
+            .expect("self stake must have created a position");
         signed_op(
-            StakingOpBody::SelfUnstake {
-                bond_utxo_id,
-                validator_pubkey: pubkey_from_keypair(validator_keypair),
+            StakingOpBody::ExitStakePosition {
+                position_id: position.position_id,
+                amount_spark: position.active.expect("active position").principal_spark,
+                custody: position.custody,
                 cold_authorization: None,
             },
             nonce,
@@ -2718,144 +2273,11 @@ mod tests {
         )
     }
 
-    #[test]
-    fn delegate_bonds_utxo_and_removes_from_spendable() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x10);
 
-        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
 
-        assert!(!state.utxos.contains(&bond_utxo_id));
-        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
-        assert_eq!(state.delegations.total_delegated(&validator_id), 1_000_000);
-    }
 
-    #[test]
-    fn delegate_pre_identity_gate_does_not_populate_registry() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x24);
-        let delegator_keypair = keypair(0x25);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, delegator_pubkey, 1_000_000, 0x25);
-        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
 
-        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, false).unwrap();
 
-        assert!(!state.delegator_identities.contains_key(&delegator_id));
-        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
-    }
-
-    #[test]
-    fn delegate_post_identity_gate_new_identity_succeeds_and_populates_registry() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x26);
-        let delegator_keypair = keypair(0x27);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        let bond_utxo_id =
-            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x27);
-        state.rebuild_state_commitment_v2(u64::MAX);
-        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-
-        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true).unwrap();
-
-        assert_eq!(
-            state.delegator_identities.get(&delegator_id),
-            Some(&delegator_pubkey)
-        );
-        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
-        let warm_root = state.state_commitment_v2_root(u64::MAX);
-        state.rebuild_state_commitment_v2(u64::MAX);
-        assert_eq!(state.state_commitment_v2_root(u64::MAX), warm_root);
-    }
-
-    #[test]
-    fn delegate_post_identity_gate_registered_match_succeeds_without_changing_registry() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x28);
-        let delegator_keypair = keypair(0x29);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        let before = state.delegator_identities.clone();
-        let bond_utxo_id =
-            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x29);
-        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-
-        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true).unwrap();
-
-        assert_eq!(state.delegator_identities, before);
-        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
-    }
-
-    #[test]
-    fn delegate_post_identity_gate_rejects_classical_key_only_pq_substitution_attack() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x2A);
-        let legitimate_keypair = mixed_keypair(0x2B, 0x2C);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let delegator_id = pubkey_to_id(&legitimate_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, legitimate_pubkey);
-
-        let attacker_keypair = mixed_keypair(0x2B, 0x2D);
-        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, attacker_pubkey, 1_000_000, 0x2D);
-        let op = delegate_op(&state, validator_id, bond_utxo_id, &attacker_keypair, 1);
-        let chain_id = state.chain_id.clone();
-
-        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert!(state.utxos.contains(&bond_utxo_id));
-        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    }
-
-    #[test]
-    fn delegate_post_identity_gate_legacy_bonds_matching_submitted_key_populate_registry() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x2E);
-        let delegator_keypair = keypair(0x2F);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        let first_bond =
-            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x2F);
-        let first = delegate_op(&state, validator_id, first_bond, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-        apply_staking_op_with_identity_activation(&mut state, &first, &chain_id, 1, false).unwrap();
-        assert!(state.delegator_identities.is_empty());
-
-        let second_bond =
-            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0x30);
-        let second = delegate_op(&state, validator_id, second_bond, &delegator_keypair, 2);
-        apply_staking_op_with_identity_activation(&mut state, &second, &chain_id, 1, true).unwrap();
-
-        assert_eq!(
-            state.delegator_identities.get(&delegator_id),
-            Some(&delegator_pubkey)
-        );
-        assert!(state.staked_bonds.contains_key(&second_bond));
-    }
 
     #[test]
     fn delegate_without_proof_fails_at_activation() {
@@ -2884,52 +2306,7 @@ mod tests {
         assert!(state.utxos.contains(&bond_utxo_id));
     }
 
-    #[test]
-    fn delegate_mismatch_does_not_spend_utxo() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x19);
 
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                bond_utxo_id,
-                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-                bond_proof: Some(bond_proof(1_000_000, 0x1A)),
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::StakingBondCommitmentMismatch)
-        );
-        assert!(state.utxos.contains(&bond_utxo_id));
-        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    }
-
-    #[test]
-    fn delegate_rejects_mismatched_public_value_commitment() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id =
-            insert_mismatched_public_value_utxo(&mut state, pubkey, 1_000_000, 500_000, 0x30);
-
-        let op = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::StakingBondCommitmentMismatch)
-        );
-        assert!(state.utxos.contains(&bond_utxo_id));
-        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    }
 
     #[test]
     fn register_validator_rejects_mismatched_public_value_commitment() {
@@ -2971,42 +2348,6 @@ mod tests {
         assert!(state.validators.get(&validator_id).is_none());
     }
 
-    #[test]
-    fn self_stake_rejects_mismatched_public_value_commitment() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x22);
-        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_mismatched_self_stake_utxo(
-            &mut state,
-            validator_pubkey,
-            2_000_000,
-            1_000_000,
-            0x23,
-        );
-
-        let op = signed_op(
-            StakingOpBody::SelfStake {
-                bond_utxo_id,
-                validator_pubkey: pubkey_from_keypair(&validator_keypair),
-                bond_proof: Some(bond_proof(1_000_000, 0x23)),
-                cold_authorization: None,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::StakingBondValueMismatch {
-                public_value: 2_000_000,
-                committed_value: 1_000_000,
-            })
-        );
-        assert!(state.utxos.contains(&bond_utxo_id));
-        assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    }
 
     #[test]
     fn commission_change_is_not_immediate() {
@@ -3066,23 +2407,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn delegate_rejects_already_bonded_utxo() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x12);
-
-        let first = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        let second = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
 
     #[test]
     fn delegate_rejects_below_minimum() {
@@ -3105,433 +2429,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn undelegate_sets_unbonding_epoch() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x14);
 
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
-        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
-        apply_staking_op(&mut state, &undelegate, &chain_id, 1).unwrap();
 
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .unwrap()
-                .unbonding_end_epoch,
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-        assert_eq!(state.delegations.total_delegated(&validator_id), 0);
-    }
 
-    #[test]
-    fn per_bond_accounting_preserves_active_remainder_and_allows_later_exit() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x81);
-        let delegator_keypair = keypair(0x82);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&pubkey);
-        let bond_60 = insert_delegator_utxo(&mut state, pubkey.clone(), 60_000_000, 0x83);
-        let bond_40 = insert_delegator_utxo(&mut state, pubkey.clone(), 40_000_000, 0x84);
-        let chain_id = state.chain_id.clone();
-        for (nonce, bond) in [(1, bond_60), (2, bond_40)] {
-            let op = delegate_op(&state, validator_id, bond, &delegator_keypair, nonce);
-            apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-        }
-
-        apply_undelegate(&mut state, &validator_id, bond_40, &pubkey, 2, false, true).unwrap();
-        let entry = state
-            .delegations
-            .get_delegators(&validator_id)
-            .iter()
-            .find(|entry| entry.delegator_id == delegator_id)
-            .unwrap();
-        assert_eq!(entry.staked_spark, 60_000_000);
-        assert_eq!(entry.unbonding_end_epoch, None);
-        assert_eq!(state.delegations.total_delegated(&validator_id), 60_000_000);
-
-        // A fresh bond is aggregated as active rather than inheriting a stale
-        // lifecycle flag from the independently-unbonding bond.
-        let bond_20 = insert_delegator_utxo(&mut state, pubkey.clone(), 20_000_000, 0x85);
-        let op = delegate_op(&state, validator_id, bond_20, &delegator_keypair, 3);
-        let StakingOpBody::Delegate {
-            bond_proof,
-            delegator_pubkey,
-            ..
-        } = &op.body
-        else {
-            unreachable!()
-        };
-        apply_delegate(
-            &mut state,
-            &validator_id,
-            bond_20,
-            delegator_pubkey,
-            bond_proof.as_ref(),
-            3,
-            false,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            active_delegated_bond_stake(&state, &validator_id, &delegator_id),
-            80_000_000
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .unbonding_end_epoch,
-            None
-        );
-
-        // The original still-active bond can independently begin unbonding.
-        apply_undelegate(&mut state, &validator_id, bond_60, &pubkey, 4, false, true).unwrap();
-        assert_eq!(
-            active_delegated_bond_stake(&state, &validator_id, &delegator_id),
-            20_000_000
-        );
-    }
-
-    #[test]
-    fn live_bond_cap_does_not_block_exit_or_maturity_paths() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xA1);
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let delegator_keypair = keypair(0xA2);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-
-        let delegated_bond =
-            insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0xA3);
-        let delegate = delegate_op(&state, validator_id, delegated_bond, &delegator_keypair, 1);
-        let StakingOpBody::Delegate { bond_proof, .. } = &delegate.body else {
-            unreachable!()
-        };
-        apply_delegate(
-            &mut state,
-            &validator_id,
-            delegated_bond,
-            &delegator_pubkey,
-            bond_proof.as_ref(),
-            1,
-            false,
-            true,
-            Some(2),
-        )
-        .unwrap();
-
-        let self_bond =
-            insert_self_stake_utxo(&mut state, validator_pubkey.clone(), 1_000_000, 0xA4);
-        let self_stake = self_stake_op(&state, self_bond, &validator_keypair, 1);
-        let StakingOpBody::SelfStake { bond_proof, .. } = &self_stake.body else {
-            unreachable!()
-        };
-        apply_self_stake(
-            &mut state,
-            self_bond,
-            &validator_pubkey,
-            bond_proof.as_ref(),
-            1,
-            false,
-            Some(2),
-        )
-        .unwrap();
-        assert!(matches!(
-            enforce_validator_bond_capacity(&state, &validator_id, Some(2)),
-            Err(StateError::ValidatorBondCountAtMaximum { max: 2, .. })
-        ));
-
-        // The cap is creation-only: both exit paths remain available at the
-        // limit and normal maturity removes the records so capacity recovers.
-        apply_undelegate(
-            &mut state,
-            &validator_id,
-            delegated_bond,
-            &delegator_pubkey,
-            2,
-            false,
-            true,
-        )
-        .unwrap();
-        apply_self_unstake(&mut state, self_bond, &validator_pubkey, 2, false).unwrap();
-        state
-            .delegator_identities
-            .insert(pubkey_to_id(&delegator_pubkey), delegator_pubkey.clone());
-        crate::epoch::release_unbonded_bonds_at_height(&mut state, UNBONDING_PERIOD_EPOCHS, 2)
-            .unwrap();
-        assert!(!state.staked_bonds.contains_key(&delegated_bond));
-        assert!(!state.staked_bonds.contains_key(&self_bond));
-        assert!(enforce_validator_bond_capacity(&state, &validator_id, Some(2)).is_ok());
-    }
-
-    #[test]
-    fn live_bond_cap_replay_is_deterministic_across_activation_modes() {
-        fn replay() -> (Vec<u8>, Bytes32) {
-            let mut state = ChainState::new_genesis();
-            let (validator_id, _) = make_active_validator(&mut state, 0xB1);
-            let delegator_keypair = keypair(0xB2);
-            let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-
-            // Legacy/pre-gate mode permits creation without consulting a cap.
-            for (nonce, seed) in [(1, 0xB3), (2, 0xB4)] {
-                let bond =
-                    insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, seed);
-                let op = delegate_op(&state, validator_id, bond, &delegator_keypair, nonce);
-                let StakingOpBody::Delegate { bond_proof, .. } = &op.body else {
-                    unreachable!()
-                };
-                apply_delegate(
-                    &mut state,
-                    &validator_id,
-                    bond,
-                    &delegator_pubkey,
-                    bond_proof.as_ref(),
-                    nonce,
-                    false,
-                    true,
-                    None,
-                )
-                .unwrap();
-            }
-
-            // Post-gate mode deterministically rejects the next creation when
-            // the test-sized limit is reached, without altering consensus state.
-            let rejected_bond =
-                insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0xB5);
-            let rejected = delegate_op(&state, validator_id, rejected_bond, &delegator_keypair, 3);
-            let before = state.clone();
-            let StakingOpBody::Delegate { bond_proof, .. } = &rejected.body else {
-                unreachable!()
-            };
-            assert!(matches!(
-                apply_delegate(
-                    &mut state,
-                    &validator_id,
-                    rejected_bond,
-                    &delegator_pubkey,
-                    bond_proof.as_ref(),
-                    3,
-                    false,
-                    true,
-                    Some(2),
-                ),
-                Err(StateError::ValidatorBondCountAtMaximum { max: 2, .. })
-            ));
-            assert_eq!(state, before);
-            (state.encode_to_vec(), crate::compute_state_root(&state))
-        }
-
-        let first = replay();
-        let second = replay();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn undelegate_pre_identity_gate_ignores_registry_mismatch_and_behaves_as_before() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x35);
-        let legitimate_keypair = mixed_keypair(0x36, 0x37);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let attacker_keypair = mixed_keypair(0x36, 0x38);
-        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        let delegator_id = pubkey_to_id(&legitimate_pubkey);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
-        state
-            .delegator_identities
-            .insert(delegator_id, legitimate_pubkey.clone());
-
-        let bond_utxo_id = insert_delegator_utxo(&mut state, legitimate_pubkey, 1_000_000, 0x35);
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &legitimate_keypair, 1);
-        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, false)
-            .unwrap();
-
-        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &attacker_keypair, 2);
-        apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 1, false)
-            .unwrap();
-
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-    }
-
-    #[test]
-    fn undelegate_post_identity_gate_registered_match_succeeds_without_changing_registry() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x39);
-        let delegator_keypair = keypair(0x3A);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-
-        let bond_utxo_id = insert_delegator_utxo(&mut state, delegator_pubkey, 1_000_000, 0x39);
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, true)
-            .unwrap();
-        let before = state.delegator_identities.clone();
-
-        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
-        apply_staking_op_with_identity_activation(&mut state, &undelegate, &chain_id, 1, true)
-            .unwrap();
-
-        assert_eq!(state.delegator_identities, before);
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-    }
-
-    #[test]
-    fn undelegate_post_identity_gate_rejects_classical_key_only_pq_substitution_attack() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x3B);
-        let legitimate_keypair = mixed_keypair(0x3C, 0x3D);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let delegator_id = pubkey_to_id(&legitimate_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, legitimate_pubkey.clone());
-        let attacker_keypair = mixed_keypair(0x3C, 0x3E);
-        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
-
-        let bond_utxo_id =
-            insert_delegator_utxo(&mut state, legitimate_pubkey.clone(), 1_000_000, 0x3B);
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &legitimate_keypair, 1);
-        apply_staking_op_with_identity_activation(&mut state, &delegate, &chain_id, 1, true)
-            .unwrap();
-
-        let mut before_attack_reference = state.clone();
-        let attack = signed_op(
-            StakingOpBody::Undelegate {
-                validator_id,
-                bond_utxo_id,
-                delegator_pubkey: attacker_pubkey,
-            },
-            2,
-            &attacker_keypair,
-            &state.chain_id,
-        );
-        apply_staking_op_with_identity_activation(
-            &mut before_attack_reference,
-            &attack,
-            &chain_id,
-            1,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            before_attack_reference
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-
-        let err =
-            apply_staking_op_with_identity_activation(&mut state, &attack, &chain_id, 1, true)
-                .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .and_then(|bond| bond.unbonding_end_epoch),
-            None
-        );
-    }
-
-    #[test]
-    fn undelegate_rejects_wrong_delegator() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let wrong_keypair = keypair(0x03);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x15);
-
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
-        let undelegate = undelegate_op(&state, validator_id, bond_utxo_id, &wrong_keypair, 1);
-
-        assert!(matches!(
-            apply_staking_op(&mut state, &undelegate, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
-
-    #[test]
-    fn undelegate_rejects_already_unbonding() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x16);
-
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
-        let first = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 2);
-        let second = undelegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 3);
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
-
-    #[test]
-    fn self_stake_bonds_validator_utxo_and_increases_stake() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
-        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x30);
-
-        let op = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-
-        assert!(!state.utxos.contains(&bond_utxo_id));
-        let bond = state.staked_bonds.get(&bond_utxo_id).unwrap();
-        assert_eq!(bond.validator_id, validator_id);
-        assert_eq!(bond.delegator_id, validator_id);
-        assert_eq!(bond.amount_spark, 2_000_000);
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            2_000_000
-        );
-    }
 
     #[test]
     fn validator_self_stake_post_identity_gate_rejects_same_classical_different_pq_pubkey() {
@@ -3572,32 +2472,6 @@ mod tests {
         assert_eq!(state, before);
     }
 
-    #[test]
-    fn validator_self_bond_post_identity_gate_matches_validator_entry_and_registry() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x57);
-        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        state
-            .delegator_identities
-            .insert(validator_id, pubkey.clone());
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x57);
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op_with_identity_activation(&mut state, &stake, &chain_id, 1, true).unwrap();
-        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        apply_staking_op_with_identity_activation(&mut state, &unstake, &chain_id, 1, true)
-            .unwrap();
-
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .unwrap()
-                .unbonding_end_epoch,
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-    }
 
     #[test]
     fn validator_self_stake_post_identity_gate_rejects_registry_mismatch() {
@@ -3628,47 +2502,6 @@ mod tests {
         assert_eq!(state, before);
     }
 
-    #[test]
-    fn validator_self_unstake_post_identity_gate_rejects_validator_entry_mismatch_even_if_registry_matches(
-    ) {
-        let mut state = ChainState::new_genesis();
-        let legitimate_keypair = mixed_keypair(0x5B, 0x5C);
-        let attacker_keypair = mixed_keypair(0x5B, 0x5D);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        let validator_id = pubkey_to_id(&legitimate_pubkey);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), validator_id);
-        insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x5B);
-        state
-            .delegator_identities
-            .insert(validator_id, attacker_pubkey.clone());
-        let bond_utxo_id =
-            insert_self_stake_utxo(&mut state, legitimate_pubkey.clone(), 2_000_000, 0x5B);
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &legitimate_keypair, 1);
-        apply_staking_op_with_identity_activation(&mut state, &stake, &chain_id, 1, false).unwrap();
-        let op = signed_op(
-            StakingOpBody::SelfUnstake {
-                bond_utxo_id,
-                validator_pubkey: attacker_pubkey,
-                cold_authorization: None,
-            },
-            2,
-            &attacker_keypair,
-            &state.chain_id,
-        );
-        let before = state.clone();
-
-        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("validator identity stored pubkey mismatch")
-        ));
-        assert_eq!(state, before);
-    }
 
     #[test]
     fn self_stake_without_proof_fails_at_activation() {
@@ -3779,22 +2612,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn self_stake_rejects_already_bonded_utxo() {
-        let mut state = ChainState::new_genesis();
-        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x35);
-
-        let chain_id = state.chain_id.clone();
-        let first = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        let second = self_stake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
 
     #[test]
     fn self_stake_rejects_invalid_signature() {
@@ -3821,150 +2638,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn self_unstake_sets_unbonding_and_reduces_stake() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
-        state.validators.get_mut(&validator_id).unwrap().stake_spark = 0;
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x37);
 
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
 
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&bond_utxo_id)
-                .unwrap()
-                .unbonding_end_epoch,
-            Some(UNBONDING_PERIOD_EPOCHS)
-        );
-        assert_eq!(state.validators.get(&validator_id).unwrap().stake_spark, 0);
-    }
 
-    #[test]
-    fn self_unstake_below_active_minimum_demotes_validator() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x24);
-        state.validators.get_mut(&validator_id).unwrap().stake_spark =
-            MINIMUM_ACTIVE_SELF_STAKE_SPARK - 1;
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x25);
 
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-        let before = state.validators.get(&validator_id).unwrap().stake_spark;
-        assert!(before >= MINIMUM_ACTIVE_SELF_STAKE_SPARK);
 
-        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
-
-        let validator = state.validators.get(&validator_id).unwrap();
-        assert!(validator.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK);
-        assert!(matches!(validator.status, ValidatorStatus::Registered));
-    }
-
-    #[test]
-    fn self_unstake_above_active_minimum_keeps_validator_active() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x26);
-        state.validators.get_mut(&validator_id).unwrap().stake_spark =
-            MINIMUM_ACTIVE_SELF_STAKE_SPARK + 5_000_000;
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x27);
-
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
-
-        let validator = state.validators.get(&validator_id).unwrap();
-        assert!(validator.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK);
-        assert!(matches!(validator.status, ValidatorStatus::Active));
-    }
-
-    #[test]
-    fn registered_validator_self_unstake_remains_registered() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x28);
-        {
-            let validator = state.validators.get_mut(&validator_id).unwrap();
-            validator.status = ValidatorStatus::Registered;
-            validator.stake_spark = 0;
-        }
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x29);
-
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
-
-        let validator = state.validators.get(&validator_id).unwrap();
-        assert_eq!(validator.stake_spark, 0);
-        assert!(matches!(validator.status, ValidatorStatus::Registered));
-    }
-
-    #[test]
-    fn self_unstake_rejects_non_self_bond() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let bond_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x38);
-        let chain_id = state.chain_id.clone();
-        let delegate = delegate_op(&state, validator_id, bond_utxo_id, &delegator_keypair, 1);
-        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
-
-        let unstake = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        assert!(matches!(
-            apply_staking_op(&mut state, &unstake, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
-
-    #[test]
-    fn self_unstake_rejects_wrong_validator() {
-        let mut state = ChainState::new_genesis();
-        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
-        let (_, wrong_validator_keypair) = make_active_validator(&mut state, 0x02);
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x39);
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-
-        let unstake = self_unstake_op(&state, bond_utxo_id, &wrong_validator_keypair, 1);
-        assert!(matches!(
-            apply_staking_op(&mut state, &unstake, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
-
-    #[test]
-    fn self_unstake_rejects_already_unbonding() {
-        let mut state = ChainState::new_genesis();
-        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_self_stake_utxo(&mut state, pubkey, 2_000_000, 0x3A);
-        let chain_id = state.chain_id.clone();
-        let stake = self_stake_op(&state, bond_utxo_id, &validator_keypair, 1);
-        apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-        let first = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 2);
-        let second = self_unstake_op(&state, bond_utxo_id, &validator_keypair, 3);
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
 
     #[test]
     fn apply_staking_op_rejects_wrong_nonce() {
@@ -4035,389 +2713,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn claim_rewards_creates_utxo() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-
-        let op = signed_op(
-            StakingOpBody::ClaimRewards {
-                validator_id,
-                delegator_pubkey,
-                cold_authorization: None,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        let before = state.utxos.len();
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 42).unwrap();
-        assert_eq!(state.utxos.len(), before + 1);
-    }
-
-    #[test]
-    fn claim_rewards_zeroes_pending_rewards() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        let op = signed_op(
-            StakingOpBody::ClaimRewards {
-                validator_id,
-                delegator_pubkey,
-                cold_authorization: None,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 42).unwrap();
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-    }
-
-    #[test]
-    fn claim_rewards_below_dust_rejected() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK - 1;
-            })
-            .unwrap();
-        let op = signed_op(
-            StakingOpBody::ClaimRewards {
-                validator_id,
-                delegator_pubkey,
-                cold_authorization: None,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert!(matches!(
-            apply_staking_op(&mut state, &op, &chain_id, 42),
-            Err(StateError::InvalidStakingOp(_))
-        ));
-    }
-
-    #[test]
-    fn claim_rewards_pre_identity_gate_ignores_registry_mismatch_and_behaves_as_before() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x49);
-        let legitimate_keypair = mixed_keypair(0x4A, 0x4B);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let attacker_keypair = mixed_keypair(0x4A, 0x4C);
-        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        let delegator_id = pubkey_to_id(&legitimate_pubkey);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
-        state
-            .delegator_identities
-            .insert(delegator_id, legitimate_pubkey);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-
-        let before_utxos = state.utxos.len();
-        let claim = claim_rewards_op(&state, validator_id, &attacker_keypair, 1);
-        let chain_id = state.chain_id.clone();
-        apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, false)
-            .unwrap();
-
-        assert_eq!(state.utxos.len(), before_utxos + 1);
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-    }
-
-    #[test]
-    fn claim_rewards_post_identity_gate_registered_match_pays_legitimate_claimant() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x4D);
-        let delegator_keypair = keypair(0x4E);
-        let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-
-        let before_utxos = state.utxos.len();
-        let claim = claim_rewards_op(&state, validator_id, &delegator_keypair, 1);
-        let chain_id = state.chain_id.clone();
-        apply_staking_op_with_identity_activation(&mut state, &claim, &chain_id, 42, true).unwrap();
-
-        assert_eq!(state.utxos.len(), before_utxos + 1);
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-        assert_eq!(
-            state.delegator_identities.get(&delegator_id),
-            Some(&delegator_pubkey)
-        );
-    }
-
-    #[test]
-    fn claim_rewards_post_identity_gate_rejects_direct_theft_pq_substitution_attack() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x4F);
-        let legitimate_keypair = mixed_keypair(0x50, 0x51);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let delegator_id = pubkey_to_id(&legitimate_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, legitimate_pubkey);
-        let attacker_keypair = mixed_keypair(0x50, 0x52);
-        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), delegator_id);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-
-        let attack = claim_rewards_op(&state, validator_id, &attacker_keypair, 1);
-        let before_utxos = state.utxos.len();
-        let mut before_attack_reference = state.clone();
-        let chain_id = state.chain_id.clone();
-        apply_staking_op_with_identity_activation(
-            &mut before_attack_reference,
-            &attack,
-            &chain_id,
-            42,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            before_attack_reference
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            0
-        );
-        assert_eq!(before_attack_reference.utxos.len(), before_utxos + 1);
-
-        let err =
-            apply_staking_op_with_identity_activation(&mut state, &attack, &chain_id, 42, true)
-                .unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(state.utxos.len(), before_utxos);
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            DUST_LIMIT_SPARK
-        );
-    }
-
-    #[test]
-    fn claim_rewards_identity_failure_happens_before_zeroing_or_utxo_creation() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x53);
-        let legitimate_keypair = mixed_keypair(0x54, 0x55);
-        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
-        let delegator_id = pubkey_to_id(&legitimate_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, legitimate_pubkey);
-        let attacker_keypair = mixed_keypair(0x54, 0x56);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000_000, 0)
-            .unwrap();
-        state
-            .delegations
-            .update_delegator(&validator_id, &delegator_id, |entry| {
-                entry.pending_rewards = DUST_LIMIT_SPARK;
-            })
-            .unwrap();
-        let before = state.clone();
-        let attack = claim_rewards_op(&state, validator_id, &attacker_keypair, 1);
-        let chain_id = state.chain_id.clone();
-
-        let err =
-            apply_staking_op_with_identity_activation(&mut state, &attack, &chain_id, 42, true)
-                .unwrap_err();
-
-        assert!(matches!(
-            err,
-            StateError::InvalidStakingOp(message)
-                if message.contains("delegator identity registry pubkey mismatch")
-        ));
-        assert_eq!(state, before);
-    }
-
-    #[test]
-    fn apply_register_validator_sets_vrf_key() {
-        let mut state = ChainState::new_genesis();
-        let validator_keypair = keypair(0x04);
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let validator_id = pubkey_to_id(&validator_pubkey);
-        let bond_utxo_id = insert_registration_utxo(
-            &mut state,
-            validator_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA0,
-        );
-        let vrf_pk = [0xA5; 32];
-        let op = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id,
-                validator_pubkey,
-                vrf_pk,
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA0)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().vrf_pk,
-            Some(vrf_pk)
-        );
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().stake_spark,
-            MINIMUM_VALIDATOR_BOND_SPARK
-        );
-        assert!(state.staked_bonds.contains_key(&bond_utxo_id));
-        assert!(!state.utxos.contains(&bond_utxo_id));
-    }
-
-    #[test]
-    fn register_validator_post_identity_gate_populates_registry() {
-        let mut state = ChainState::new_genesis();
-        let validator_keypair = keypair(0xB1);
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let validator_id = pubkey_to_id(&validator_pubkey);
-        let bond_utxo_id = insert_registration_utxo(
-            &mut state,
-            validator_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xB1,
-        );
-        let op = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id,
-                validator_pubkey: validator_pubkey.clone(),
-                vrf_pk: [0xB1; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xB1)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-
-        apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true).unwrap();
-
-        assert_eq!(
-            state.delegator_identities.get(&validator_id),
-            Some(&validator_pubkey)
-        );
-    }
 
     #[test]
     fn register_validator_post_identity_gate_rejects_preexisting_registry_mismatch() {
@@ -4644,52 +2939,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_register_validator_rejects_duplicate() {
-        let mut state = ChainState::new_genesis();
-        let validator_keypair = keypair(0x04);
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let bond_utxo_id = insert_registration_utxo(
-            &mut state,
-            validator_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA1,
-        );
-        let first = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id,
-                validator_pubkey: validator_pubkey.clone(),
-                vrf_pk: [0xA5; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA1)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let second = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: Bytes32::ZERO,
-                validator_pubkey,
-                vrf_pk: [0x5A; 32],
-                bond_proof: None,
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            2,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert_eq!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::ValidatorAlreadyRegistered)
-        );
-    }
 
     #[test]
     fn registration_without_bond_is_rejected() {
@@ -4782,225 +3031,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn registration_rejects_duplicate_vrf_pk() {
-        let mut state = ChainState::new_genesis();
-        let first_keypair = keypair(0x46);
-        let first_pubkey = pubkey_from_keypair(&first_keypair);
-        let first_bond = insert_registration_utxo(
-            &mut state,
-            first_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA3,
-        );
-        let second_keypair = keypair(0x47);
-        let second_pubkey = pubkey_from_keypair(&second_keypair);
-        let second_bond = insert_registration_utxo(
-            &mut state,
-            second_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA4,
-        );
-        let duplicate_vrf = [0xDD; 32];
-        let first = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: first_bond,
-                validator_pubkey: first_pubkey,
-                vrf_pk: duplicate_vrf,
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA3)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &first_keypair,
-            &state.chain_id,
-        );
-        let second = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: second_bond,
-                validator_pubkey: second_pubkey,
-                vrf_pk: duplicate_vrf,
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA4)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &second_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::DuplicateValidatorKey { reason })
-                if reason.contains("vrf_pk")
-        ));
-    }
 
-    #[test]
-    fn registration_rejects_duplicate_classical_pk() {
-        let mut state = ChainState::new_genesis();
-        let first_keypair = keypair(0x48);
-        let first_pubkey = pubkey_from_keypair(&first_keypair);
-        let first_bond = insert_registration_utxo(
-            &mut state,
-            first_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA5,
-        );
-        let second_keypair = mixed_keypair(0x48, 0x49);
-        let second_pubkey = pubkey_from_keypair(&second_keypair);
-        let second_bond = insert_registration_utxo(
-            &mut state,
-            second_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA6,
-        );
-        let first = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: first_bond,
-                validator_pubkey: first_pubkey,
-                vrf_pk: [0x48; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA5)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &first_keypair,
-            &state.chain_id,
-        );
-        let second = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: second_bond,
-                validator_pubkey: second_pubkey,
-                vrf_pk: [0x49; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA6)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            2,
-            &second_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::ValidatorAlreadyRegistered)
-        ));
-    }
 
-    #[test]
-    fn registration_rejects_duplicate_pq_pk() {
-        let mut state = ChainState::new_genesis();
-        let first_keypair = keypair(0x4A);
-        let first_pubkey = pubkey_from_keypair(&first_keypair);
-        let first_bond = insert_registration_utxo(
-            &mut state,
-            first_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA7,
-        );
-        let second_keypair = mixed_keypair(0x4B, 0x4A);
-        let second_pubkey = pubkey_from_keypair(&second_keypair);
-        let second_bond = insert_registration_utxo(
-            &mut state,
-            second_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA8,
-        );
-        let first = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: first_bond,
-                validator_pubkey: first_pubkey,
-                vrf_pk: [0x4A; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA7)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &first_keypair,
-            &state.chain_id,
-        );
-        let second = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: second_bond,
-                validator_pubkey: second_pubkey,
-                vrf_pk: [0x4B; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA8)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &second_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        assert!(matches!(
-            apply_staking_op(&mut state, &second, &chain_id, 1),
-            Err(StateError::DuplicateValidatorKey { reason })
-                if reason.contains("hybrid_pq_pk")
-        ));
-    }
 
-    #[test]
-    fn registration_with_all_unique_keys_succeeds() {
-        let mut state = ChainState::new_genesis();
-        let first_keypair = keypair(0x4C);
-        let first_pubkey = pubkey_from_keypair(&first_keypair);
-        let first_bond = insert_registration_utxo(
-            &mut state,
-            first_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xA9,
-        );
-        let second_keypair = keypair(0x4D);
-        let second_pubkey = pubkey_from_keypair(&second_keypair);
-        let second_bond = insert_registration_utxo(
-            &mut state,
-            second_pubkey.clone(),
-            MINIMUM_VALIDATOR_BOND_SPARK,
-            0xAA,
-        );
-        let first = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: first_bond,
-                validator_pubkey: first_pubkey,
-                vrf_pk: [0x4C; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xA9)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &first_keypair,
-            &state.chain_id,
-        );
-        let second = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                bond_utxo_id: second_bond,
-                validator_pubkey: second_pubkey,
-                vrf_pk: [0x4D; 32],
-                bond_proof: Some(bond_proof(MINIMUM_VALIDATOR_BOND_SPARK, 0xAA)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            1,
-            &second_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        apply_staking_op(&mut state, &first, &chain_id, 1).unwrap();
-        apply_staking_op(&mut state, &second, &chain_id, 1).unwrap();
-    }
 
     #[test]
     fn set_auto_delegate_stores_target() {
@@ -5111,104 +3144,8 @@ mod tests {
         Bytes32::from(bytes)
     }
 
-    fn insert_registry_entry_for_cap_test(
-        state: &mut ChainState,
-        index: usize,
-        stake: u64,
-    ) -> Bytes32 {
-        let validator_id = raw_id(0x44, index);
-        let pk_byte = (index % 200) as u8;
-        let pubkey = raw_pubkey(pk_byte);
-        let bond_utxo_id = raw_id(0x55, index);
-        state
-            .validators
-            .upsert(ValidatorEntry {
-                validator_id,
-                name: format!("cap-{index}"),
-                hybrid_classical_pk: Some(pubkey.classical_pk.0),
-                hybrid_pq_pk: Some(vec![pk_byte; indra_crypto::PQ_PK_BYTES]),
-                vrf_pk: Some(raw_id(0x66, index).0),
-                stake_spark: stake,
-                status: ValidatorStatus::Registered,
-                registered_epoch: 0,
-                last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
-                self_report_count: 0,
-                commission_bps: 1_000,
-                pending_commission_bps: None,
-                pending_commission_effective_epoch: None,
-                min_delegation_spark: DUST_LIMIT_SPARK,
-                auto_delegate_to: None,
-                network_addr: None,
-                network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: None,
-                cold_hybrid_pq_pk: None,
-                cold_key_version: 0,
-                cold_nonce: 0,
-            })
-            .unwrap();
-        state.staked_bonds.insert(
-            bond_utxo_id,
-            StakeBondEntry {
-                utxo_id: bond_utxo_id,
-                validator_id,
-                delegator_id: validator_id,
-                amount_spark: stake,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_start_height: None,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    validator_id,
-                ),
-                original_output: raw_output(stake, pubkey, (index % 200) as u8).into(),
-            },
-        );
-        validator_id
-    }
 
-    fn fill_registry_to_cap(state: &mut ChainState, lowest_stake: u64) -> Bytes32 {
-        let lowest_id = insert_registry_entry_for_cap_test(state, 0, lowest_stake);
-        for index in 1..MAX_VALIDATORS {
-            insert_registry_entry_for_cap_test(
-                state,
-                index,
-                lowest_stake
-                    .saturating_add(DUST_LIMIT_SPARK.saturating_mul(10))
-                    .saturating_add(index as u64),
-            );
-        }
-        lowest_id
-    }
 
-    fn fill_representable_registry_to_cap(state: &mut ChainState, lowest_stake: u64) -> Bytes32 {
-        let lowest_id = fill_registry_to_cap(state, lowest_stake);
-        let hot = keypair(0xC1).public_key();
-        let cold = keypair(0xC2).public_key();
-        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xC3; 32]).public_key();
-        let validator_ids: Vec<_> = state
-            .validators
-            .all_validators()
-            .map(|validator| validator.validator_id)
-            .collect();
-        for validator_id in validator_ids {
-            let validator = state.validators.get_mut(&validator_id).unwrap();
-            validator.hybrid_classical_pk = Some(hot.classical.0);
-            validator.hybrid_pq_pk = Some(hot.pq.0.to_vec());
-            validator.vrf_pk = Some(vrf);
-            validator.cold_hybrid_classical_pk = Some(cold.classical.0);
-            validator.cold_hybrid_pq_pk = Some(cold.pq.0);
-            validator.cold_key_version = 1;
-        }
-        lowest_id
-    }
-
-    fn mark_cap_registry_entry_cold_active(state: &mut ChainState, validator_id: Bytes32) {
-        let validator = state.validators.get_mut(&validator_id).unwrap();
-        validator.cold_hybrid_classical_pk = validator.hybrid_classical_pk;
-        validator.cold_hybrid_pq_pk = Some([validator_id.0[0]; indra_crypto::PQ_PK_BYTES]);
-        validator.cold_key_version = 1;
-    }
 
     fn install_valid_cap_registry_keys(state: &mut ChainState, validator_id: Bytes32, seed: u8) {
         let hot = keypair(seed);
@@ -5276,199 +3213,9 @@ mod tests {
         (op, bond_utxo_id, validator_id)
     }
 
-    fn full_registry_fallback_fixture(
-    ) -> (ChainState, StakingOp, Bytes32, Bytes32, Bytes32, Bytes32) {
-        let mut state = ChainState::new_genesis();
-        let lowest_stake =
-            MINIMUM_VALIDATOR_BOND_SPARK.saturating_sub(DUST_LIMIT_SPARK.saturating_mul(20));
-        let frozen_lowest = fill_registry_to_cap(&mut state, lowest_stake);
-        let next_evictable = raw_id(0x44, 1);
-        for index in 1..MAX_VALIDATORS {
-            mark_cap_registry_entry_cold_active(&mut state, raw_id(0x44, index));
-        }
-        install_valid_cap_registry_keys(&mut state, next_evictable, 0xB9);
-        let (op, new_bond, new_validator) =
-            registration_op_with_cold_bond(&mut state, 0xE1, 0xE2, 0xE3, 0xE4);
-        (
-            state,
-            op,
-            frozen_lowest,
-            next_evictable,
-            new_validator,
-            new_bond,
-        )
-    }
 
-    fn synthetic_tombstone(reference_count: usize) -> EvictedValidatorTombstoneV1 {
-        EvictedValidatorTombstoneV1 {
-            validator_id: raw_id(0xA0, 0),
-            eviction_height: u64::MAX - 1,
-            eviction_epoch: epoch_for_height(u64::MAX - 1),
-            last_classical_vote_pk: [0xA1; 32],
-            last_pq_vote_pk: [0xA2; indra_crypto::PQ_PK_BYTES],
-            last_vrf_pk: [0xA3; 32],
-            cold_custody: None,
-            retained_bonds: (0..reference_count)
-                .map(|index| EvictedBondReferenceV1 {
-                    bond_utxo_id: raw_id(0xA4, index),
-                    delegator_id: raw_id(0xA5, index),
-                    unbonding_end_epoch: 1,
-                })
-                .collect(),
-        }
-    }
 
-    #[test]
-    fn post_gate_registry_eviction_retains_bonds_and_frees_live_slot() {
-        let (mut state, op, frozen_lowest, next_evictable, new_validator, _) =
-            full_registry_fallback_fixture();
-        let victim_bond = state
-            .staked_bonds
-            .values()
-            .find(|bond| bond.validator_id == next_evictable)
-            .unwrap()
-            .utxo_id;
-        let chain_id = state.chain_id.clone();
 
-        apply_staking_op(&mut state, &op, &chain_id, u64::MAX).unwrap();
-
-        assert_eq!(state.validators.len(), MAX_VALIDATORS);
-        assert!(state.validators.get(&frozen_lowest).is_some());
-        assert!(state.validators.get(&next_evictable).is_none());
-        assert!(state.validators.get(&new_validator).is_some());
-        let tombstone = state
-            .evicted_validator_tombstones
-            .get(&next_evictable)
-            .expect("eviction must retain a tombstone");
-        assert_eq!(tombstone.retained_bonds.len(), 1);
-        assert_eq!(tombstone.retained_bonds[0].bond_utxo_id, victim_bond);
-        assert_eq!(
-            state
-                .staked_bonds
-                .get(&victim_bond)
-                .unwrap()
-                .unbonding_end_epoch,
-            Some(epoch_for_height(u64::MAX) + UNBONDING_PERIOD_EPOCHS)
-        );
-    }
-
-    #[test]
-    fn post_gate_registration_rejects_tombstoned_validator_id_before_spending_bond() {
-        let mut state = ChainState::new_genesis();
-        let (op, bond_id, validator_id) =
-            registration_op_with_cold_bond(&mut state, 0xC1, 0xC2, 0xC3, 0xC4);
-        let mut tombstone = synthetic_tombstone(0);
-        tombstone.validator_id = validator_id;
-        state
-            .evicted_validator_tombstones
-            .insert(validator_id, tombstone);
-        let chain_id = state.chain_id.clone();
-
-        assert!(matches!(
-            apply_staking_op(&mut state, &op, &chain_id, u64::MAX),
-            Err(StateError::InvalidStakingOp(reason)) if reason.contains("tombstone")
-        ));
-        assert!(state.utxos.contains(&bond_id));
-        assert!(state.validators.get(&validator_id).is_none());
-    }
-
-    #[test]
-    fn tombstone_capacity_skips_lowest_and_fails_when_no_candidate_fits() {
-        let mut state = ChainState::new_genesis();
-        let lowest =
-            insert_registry_entry_for_cap_test(&mut state, 0, MINIMUM_VALIDATOR_BOND_SPARK);
-        let next =
-            insert_registry_entry_for_cap_test(&mut state, 1, MINIMUM_VALIDATOR_BOND_SPARK + 1);
-        mark_cap_registry_entry_cold_active(&mut state, lowest);
-        mark_cap_registry_entry_cold_active(&mut state, next);
-        install_valid_cap_registry_keys(&mut state, lowest, 0xBA);
-        install_valid_cap_registry_keys(&mut state, next, 0xBB);
-        let extra_id = raw_id(0xB0, 0);
-        let mut extra = state
-            .staked_bonds
-            .values()
-            .find(|bond| bond.validator_id == lowest)
-            .unwrap()
-            .clone();
-        extra.utxo_id = extra_id;
-        state.staked_bonds.insert(extra_id, extra);
-        let existing = synthetic_tombstone(MAX_TOTAL_RETAINED_BOND_REFERENCES - 1);
-        state
-            .evicted_validator_tombstones
-            .insert(existing.validator_id, existing);
-
-        assert_eq!(
-            lowest_representable_registry_validator(&state, u64::MAX).unwrap(),
-            (next, MINIMUM_VALIDATOR_BOND_SPARK + 1)
-        );
-
-        let full = synthetic_tombstone(MAX_TOTAL_RETAINED_BOND_REFERENCES);
-        state.evicted_validator_tombstones = crate::persistent::PersistentOrdMap::new();
-        state
-            .evicted_validator_tombstones
-            .insert(full.validator_id, full);
-        assert_eq!(
-            lowest_representable_registry_validator(&state, u64::MAX),
-            Err(StateError::TombstoneCapacityExceeded)
-        );
-    }
-
-    #[test]
-    fn tombstone_bond_matures_on_original_schedule_and_empty_record_waits_for_window() {
-        let mut state = ChainState::new_genesis();
-        let validator_id =
-            insert_registry_entry_for_cap_test(&mut state, 7, MINIMUM_VALIDATOR_BOND_SPARK);
-        let bond_id = state
-            .staked_bonds
-            .values()
-            .find(|bond| bond.validator_id == validator_id)
-            .unwrap()
-            .utxo_id;
-        state.validators.remove(&validator_id);
-        let eviction_height = u64::MAX - 1;
-        let eviction_epoch = epoch_for_height(eviction_height);
-        let maturity_epoch = eviction_epoch + 1;
-        let mut bond = state.staked_bonds.get(&bond_id).unwrap().clone();
-        bond.unbonding_end_epoch = Some(maturity_epoch);
-        state.staked_bonds.insert(bond_id, bond);
-        let mut tombstone = synthetic_tombstone(0);
-        tombstone.validator_id = validator_id;
-        tombstone.eviction_height = eviction_height;
-        tombstone.eviction_epoch = eviction_epoch;
-        tombstone.retained_bonds = vec![EvictedBondReferenceV1 {
-            bond_utxo_id: bond_id,
-            delegator_id: validator_id,
-            unbonding_end_epoch: maturity_epoch,
-        }];
-        state
-            .evicted_validator_tombstones
-            .insert(validator_id, tombstone);
-
-        crate::epoch::release_unbonded_bonds_at_height(&mut state, maturity_epoch - 1, u64::MAX)
-            .unwrap();
-        assert!(state.staked_bonds.contains_key(&bond_id));
-
-        crate::epoch::release_unbonded_bonds_at_height(&mut state, maturity_epoch, u64::MAX)
-            .unwrap();
-        assert!(!state.staked_bonds.contains_key(&bond_id));
-        assert!(state
-            .evicted_validator_tombstones
-            .get(&validator_id)
-            .unwrap()
-            .retained_bonds
-            .is_empty());
-
-        crate::epoch::release_unbonded_bonds_at_height(
-            &mut state,
-            eviction_epoch + indra_core::types::primitives::SLASH_EVIDENCE_WINDOW_EPOCHS + 1,
-            u64::MAX,
-        )
-        .unwrap();
-        assert!(state
-            .evicted_validator_tombstones
-            .get(&validator_id)
-            .is_none());
-    }
 
     #[test]
     fn delegation_return_event_log_prunes_oldest_entries() {
@@ -5498,26 +3245,73 @@ mod tests {
         );
     }
 
+
     #[test]
-    fn validator_owned_ops_do_not_force_remove_specific_delegators() {
+    fn live_delegate_exit_and_maturity_use_positions_end_to_end() {
         let mut state = ChainState::new_genesis();
-        let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xC1);
-        let delegator_keypair = keypair(0xC2);
+        let (validator_id, _) = make_active_validator(&mut state, 0xD1);
+        let delegator_keypair = keypair(0xD2);
         let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
         let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, DUST_LIMIT_SPARK, 0)
-            .unwrap();
+        let deposit_id = insert_delegator_utxo(
+            &mut state,
+            delegator_pubkey.clone(),
+            1_000_000,
+            0xD3,
+        );
         let chain_id = state.chain_id.clone();
-        let op = set_auto_delegate_op(&state, validator_id, Bytes32::ZERO, &validator_keypair, 1);
+        let delegate = delegate_op(&state, validator_id, deposit_id, &delegator_keypair, 1);
+        apply_staking_op(&mut state, &delegate, &chain_id, 1).unwrap();
 
-        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+        assert!(!state.utxos.contains(&deposit_id));
+        let position = state
+            .stake_positions
+            .values()
+            .find(|position| {
+                position.validator_id == validator_id
+                    && position.principal_owner_id == delegator_id
+            })
+            .cloned()
+            .unwrap();
+        assert_eq!(position.active.unwrap().principal_spark, 1_000_000);
 
-        assert!(state
-            .delegations
-            .get_delegators(&validator_id)
-            .iter()
-            .any(|entry| entry.delegator_id == delegator_id));
+        let exit = signed_op(
+            StakingOpBody::ExitStakePosition {
+                position_id: position.position_id,
+                amount_spark: 400_000,
+                custody: position.custody,
+                cold_authorization: None,
+            },
+            2,
+            &delegator_keypair,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &exit, &chain_id, 2).unwrap();
+        assert_eq!(
+            state
+                .stake_positions
+                .get(&position.position_id)
+                .unwrap()
+                .active
+                .unwrap()
+                .principal_spark,
+            600_000
+        );
+        let tranche = state.unbonding_tranches.values().next().cloned().unwrap();
+        assert_eq!(tranche.principal_spark, 400_000);
+        let indra_core::types::stake_position::UnbondingTimingV1::HeightPrecise {
+            end_epoch,
+            ..
+        } = tranche.timing;
+        let release_height =
+            end_epoch * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+        let refunds = crate::stake_positions::release_matured_position_tranches(
+            &mut state,
+            release_height,
+        )
+        .unwrap();
+        assert_eq!(refunds.len(), 1);
+        assert!(state.unbonding_tranches.is_empty());
+        assert_eq!(state.utxos.get(&refunds[0]).unwrap().output.value_spark, 400_000);
     }
 }

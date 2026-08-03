@@ -542,10 +542,7 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
         .saturating_add(s.total_active_delegated_bond_stake());
     let max_active_validators =
         indra_core::types::primitives::max_active_validators(total_staked_spark);
-    let effective_min_stake_spark = s
-        .validators
-        .effective_min_active_stake(&s.delegations)
-        .unwrap_or(0);
+    let effective_min_stake_spark = s.validators.effective_min_active_stake().unwrap_or(0);
     let validator_set_phase =
         indra_core::types::primitives::validator_set_phase(total_staked_spark);
     let mempool_size = state.mempool_size;
@@ -1649,20 +1646,22 @@ fn get_validator_self_stake(params: &[String], state: &NodeState<'_>) -> RpcResu
     let mut total_spark = 0u64;
     let bonds: Vec<String> = state
         .chain
-        .staked_bonds
+        .stake_positions
         .values()
-        .filter(|bond| {
-            bond.validator_id == validator_id
-                && bond.delegator_id == validator_id
-                && bond.unbonding_end_epoch.is_none()
+        .filter(|position| {
+            position.validator_id == validator_id
+                && position.principal_owner_id == validator_id
+                && position.active.is_some()
         })
-        .map(|bond| {
-            total_spark = total_spark.saturating_add(bond.amount_spark);
+        .map(|position| {
+            let active = position.active.expect("filtered active position");
+            total_spark = total_spark.saturating_add(active.principal_spark);
             format!(
-                r#"{{"bond_utxo_id":"{}","amount_spark":{},"bonded_epoch":{}}}"#,
-                hex::encode(bond.utxo_id.0),
-                bond.amount_spark,
-                bond.bonded_epoch,
+                r#"{{"position_id":"{}","amount_spark":{},"first_contribution_height":{},"last_contribution_height":{}}}"#,
+                hex::encode(position.position_id.0),
+                active.principal_spark,
+                active.first_contribution_height,
+                active.last_contribution_height,
             )
         })
         .collect();
@@ -1713,18 +1712,21 @@ fn get_delegations(params: &[String], state: &NodeState<'_>) -> RpcResult<String
     let validator_id = parse_hex32_param(params, "validator_id")?;
     let entries: Vec<String> = state
         .chain
-        .delegations
-        .get_delegators(&validator_id)
-        .iter()
-        .map(|entry| {
+        .stake_positions
+        .values()
+        .filter(|position| {
+            position.validator_id == validator_id
+                && position.principal_owner_id != validator_id
+        })
+        .map(|position| {
             let (staked_spark, active_bonds, unbonding_bonds, earliest_end, latest_end) =
-                rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
+                rpc_delegator_bond_status(state.chain, &validator_id, &position.principal_owner_id);
             let unbonding = active_bonds == 0 && unbonding_bonds > 0;
             format!(
                 r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-                hex::encode(entry.delegator_id.0),
+                hex::encode(position.principal_owner_id.0),
                 staked_spark,
-                entry.pending_rewards,
+                position.pending_rewards_spark,
                 if unbonding { "true" } else { "false" },
                 optional_u64_json(earliest_end),
                 optional_u64_json(latest_end),
@@ -1734,17 +1736,18 @@ fn get_delegations(params: &[String], state: &NodeState<'_>) -> RpcResult<String
         })
         .collect();
     let bonds: Vec<String> = state
-            .chain
-        .staked_bonds
+        .chain
+        .stake_positions
         .values()
-        .filter(|bond| bond.validator_id == validator_id && bond.unbonding_end_epoch.is_none())
-        .map(|bond| {
+        .filter(|position| position.validator_id == validator_id && position.active.is_some())
+        .map(|position| {
+            let active = position.active.expect("filtered active position");
             format!(
-                r#"{{"bond_utxo_id":"{}","delegator_id":"{}","amount_spark":{},"bonded_epoch":{}}}"#,
-                hex::encode(bond.utxo_id.0),
-                hex::encode(bond.delegator_id.0),
-                bond.amount_spark,
-                bond.bonded_epoch,
+                r#"{{"position_id":"{}","delegator_id":"{}","amount_spark":{},"first_contribution_height":{}}}"#,
+                hex::encode(position.position_id.0),
+                hex::encode(position.principal_owner_id.0),
+                active.principal_spark,
+                active.first_contribution_height,
             )
         })
         .collect();
@@ -1768,11 +1771,13 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
     let mut active_positions = 0u64;
     let mut unbonding_positions = 0u64;
 
-    for (validator_id, entries) in state.chain.delegations.all_delegators() {
-        for entry in entries {
-            if entry.delegator_id != delegator_id {
-                continue;
-            }
+    for position in state.chain.stake_positions.values() {
+        if position.principal_owner_id != delegator_id
+            || position.validator_id == position.principal_owner_id
+        {
+            continue;
+        }
+        let validator_id = &position.validator_id;
 
             let (validator_name, commission_bps) = state
                 .chain
@@ -1781,11 +1786,11 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 .map(|validator| (validator.name.clone(), validator.commission_bps))
                 .unwrap_or_else(|| ("unknown".to_string(), 1_000));
             let (active_stake, active_bonds, unbonding_bonds, earliest_end, latest_end) =
-                rpc_delegator_bond_status(state.chain, validator_id, &entry.delegator_id);
+                rpc_delegator_bond_status(state.chain, validator_id, &position.principal_owner_id);
             let unbonding = active_bonds == 0 && unbonding_bonds > 0;
 
             total_staked = total_staked.saturating_add(active_stake);
-            total_rewards = total_rewards.saturating_add(entry.pending_rewards);
+            total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
             if unbonding {
                 unbonding_positions = unbonding_positions.saturating_add(1);
             } else {
@@ -1797,8 +1802,8 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 hex::encode(validator_id.0),
                 validator_name,
                 active_stake,
-                entry.pending_rewards,
-                entry.rewards_last_epoch,
+                position.pending_rewards_spark,
+                position.rewards_last_epoch,
                 if unbonding { "true" } else { "false" },
                 optional_u64_json(earliest_end),
                 optional_u64_json(latest_end),
@@ -1806,7 +1811,6 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 active_bonds,
                 unbonding_bonds,
             ));
-        }
     }
 
     Ok(format!(
@@ -1825,34 +1829,33 @@ fn rpc_delegator_bond_status(
     validator_id: &Bytes32,
     delegator_id: &Bytes32,
 ) -> (u64, u64, u64, Option<u64>, Option<u64>) {
+    let Some(position) = state.stake_positions.values().find(|position| {
+        position.validator_id == *validator_id
+            && position.principal_owner_id == *delegator_id
+            && position.validator_id != position.principal_owner_id
+    }) else {
+        return (0, 0, 0, None, None);
+    };
+    let active_stake = position.active.map_or(0, |active| active.principal_spark);
+    let active_count = u64::from(position.active.is_some());
     state
-        .staked_bonds
-        .values()
-        .filter(|bond| {
-            bond.validator_id == *validator_id
-                && bond.delegator_id == *delegator_id
-                && bond.validator_id != bond.delegator_id
-        })
+        .tranche_ids_for_position(&position.position_id)
+        .iter()
+        .filter_map(|id| state.unbonding_tranches.get(id))
         .fold(
-            (0u64, 0u64, 0u64, None, None),
-            |(stake, active, unbonding, earliest, latest), bond| {
-                if let Some(end) = bond.unbonding_end_epoch {
-                    (
-                        stake,
-                        active,
-                        unbonding.saturating_add(1),
-                        Some(earliest.map_or(end, |value: u64| value.min(end))),
-                        Some(latest.map_or(end, |value: u64| value.max(end))),
-                    )
-                } else {
-                    (
-                        stake.saturating_add(bond.amount_spark),
-                        active.saturating_add(1),
-                        unbonding,
-                        earliest,
-                        latest,
-                    )
-                }
+            (active_stake, active_count, 0u64, None, None),
+            |(stake, active, unbonding, earliest, latest), tranche| {
+                let indra_core::types::stake_position::UnbondingTimingV1::HeightPrecise {
+                    end_epoch: end,
+                    ..
+                } = tranche.timing;
+                (
+                    stake,
+                    active,
+                    unbonding.saturating_add(1),
+                    Some(earliest.map_or(end, |value: u64| value.min(end))),
+                    Some(latest.map_or(end, |value: u64| value.max(end))),
+                )
             },
         )
 }
@@ -1926,11 +1929,14 @@ fn get_delegator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
     let mut claimable = Vec::new();
     let mut total_rewards = 0u64;
 
-    for (validator_id, entries) in state.chain.delegations.all_delegators() {
-        for entry in entries {
-            if entry.delegator_id != delegator_id || entry.pending_rewards == 0 {
-                continue;
-            }
+    for position in state.chain.stake_positions.values() {
+        if position.principal_owner_id != delegator_id
+            || position.validator_id == position.principal_owner_id
+            || position.pending_rewards_spark == 0
+        {
+            continue;
+        }
+        let validator_id = &position.validator_id;
 
             let validator_name = state
                 .chain
@@ -1938,14 +1944,13 @@ fn get_delegator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
                 .get(validator_id)
                 .map(|validator| validator.name.clone())
                 .unwrap_or_else(|| "unknown".to_string());
-            total_rewards = total_rewards.saturating_add(entry.pending_rewards);
+            total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
             claimable.push(format!(
                 r#"{{"validator_id":"{}","validator_name":"{}","pending_rewards":{}}}"#,
                 hex::encode(validator_id.0),
                 validator_name,
-                entry.pending_rewards,
+                position.pending_rewards_spark,
             ));
-        }
     }
 
     Ok(format!(
@@ -1971,27 +1976,30 @@ fn get_validator_delegators(params: &[String], state: &NodeState<'_>) -> RpcResu
     let mut total_rewards = 0u64;
     let mut delegators = Vec::new();
 
-    for entry in state
+    for position in state
         .chain
-        .delegations
-        .get_delegators(&validator_id)
-        .iter()
+        .stake_positions
+        .values()
+        .filter(|position| {
+            position.validator_id == validator_id
+                && position.principal_owner_id != validator_id
+        })
         .take(1_000)
     {
         let (active_stake, active_bonds, unbonding_bonds, earliest_end, latest_end) =
-            rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
+            rpc_delegator_bond_status(state.chain, &validator_id, &position.principal_owner_id);
         let unbonding = active_bonds == 0 && unbonding_bonds > 0;
         total_delegated = total_delegated.saturating_add(active_stake);
-        total_rewards = total_rewards.saturating_add(entry.pending_rewards);
+        total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
         delegators.push(format!(
             r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-            hex::encode(entry.delegator_id.0),
+            hex::encode(position.principal_owner_id.0),
             active_stake,
-            entry.pending_rewards,
+            position.pending_rewards_spark,
             if unbonding { "true" } else { "false" },
             optional_u64_json(earliest_end),
             optional_u64_json(latest_end),
-            entry.rewards_last_epoch,
+            position.rewards_last_epoch,
             active_bonds,
             unbonding_bonds,
         ));
@@ -2003,7 +2011,10 @@ fn get_validator_delegators(params: &[String], state: &NodeState<'_>) -> RpcResu
         validator_name,
         total_delegated,
         total_rewards,
-        state.chain.delegations.get_delegators(&validator_id).len(),
+        state.chain.stake_positions.values().filter(|position| {
+            position.validator_id == validator_id
+                && position.principal_owner_id != validator_id
+        }).count(),
         delegators.join(","),
     ))
 }
@@ -2013,17 +2024,18 @@ fn get_stake_bonds(params: &[String], state: &NodeState<'_>) -> RpcResult<String
     let delegator_hex = first_param(params, "delegator_id")?;
     let delegator_id = parse_hex32_value(&delegator_hex, "delegator_id")?;
     let bonds: Vec<String> = state
-            .chain
-        .staked_bonds
+        .chain
+        .stake_positions
         .values()
-        .filter(|bond| bond.delegator_id == delegator_id && bond.unbonding_end_epoch.is_none())
-        .map(|bond| {
+        .filter(|position| position.principal_owner_id == delegator_id && position.active.is_some())
+        .map(|position| {
+            let active = position.active.expect("filtered active position");
             format!(
-                r#"{{"bond_utxo_id":"{}","validator_id":"{}","amount_spark":{},"bonded_epoch":{},"unbonding":false}}"#,
-                hex::encode(bond.utxo_id.0),
-                hex::encode(bond.validator_id.0),
-                bond.amount_spark,
-                bond.bonded_epoch,
+                r#"{{"position_id":"{}","validator_id":"{}","amount_spark":{},"first_contribution_height":{},"unbonding":false}}"#,
+                hex::encode(position.position_id.0),
+                hex::encode(position.validator_id.0),
+                active.principal_spark,
+                active.first_contribution_height,
             )
         })
         .collect();
@@ -2053,34 +2065,21 @@ fn get_delegator_identity_debug(params: &[String], state: &NodeState<'_>) -> Rpc
 
 /// `indra_getStakeBondDebug` — admin-only compact-format check for one stake bond.
 fn get_stake_bond_debug(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let bond_utxo_id = parse_hex32_param(params, "bond_utxo_id")?;
-    let bond = state.chain.staked_bonds.get(&bond_utxo_id).ok_or_else(|| {
+    let position_id = parse_hex32_param(params, "position_id")?;
+    let position = state.chain.stake_positions.get(&position_id).ok_or_else(|| {
         RpcError::NotFound(format!(
-            "stake bond {} not found",
-            hex::encode(bond_utxo_id.0)
+            "stake position {} not found",
+            hex::encode(position_id.0)
         ))
     })?;
     Ok(format!(
-        r#"{{"bond_utxo_id":"{}","compact":{},"has_range_proof":{},"has_owner_pubkey":{},"bonded_epoch":{},"validator_id":"{}","delegator_id":"{}"}}"#,
-        hex::encode(bond.utxo_id.0),
-        if bond.original_output.range_proof.is_none() {
-            "true"
-        } else {
-            "false"
-        },
-        if bond.original_output.range_proof.is_some() {
-            "true"
-        } else {
-            "false"
-        },
-        if bond.original_output.owner_pubkey.is_some() {
-            "true"
-        } else {
-            "false"
-        },
-        bond.bonded_epoch,
-        hex::encode(bond.validator_id.0),
-        hex::encode(bond.delegator_id.0),
+        r#"{{"position_id":"{}","validator_id":"{}","principal_owner_id":"{}","active_principal_spark":{},"pending_rewards_spark":{},"tranche_count":{}}}"#,
+        hex::encode(position.position_id.0),
+        hex::encode(position.validator_id.0),
+        hex::encode(position.principal_owner_id.0),
+        position.active.map_or(0, |active| active.principal_spark),
+        position.pending_rewards_spark,
+        state.chain.tranche_ids_for_position(&position.position_id).len(),
     ))
 }
 
@@ -2516,14 +2515,17 @@ fn get_validator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
         .unwrap_or(0);
     let delegator_rewards: Vec<String> = state
         .chain
-        .delegations
-        .get_delegators(&validator_id)
-        .iter()
-        .map(|entry| {
+        .stake_positions
+        .values()
+        .filter(|position| {
+            position.validator_id == validator_id
+                && position.principal_owner_id != validator_id
+        })
+        .map(|position| {
             format!(
                 r#"{{"delegator_id":"{}","pending_rewards":{}}}"#,
-                hex::encode(entry.delegator_id.0),
-                entry.pending_rewards,
+                hex::encode(position.principal_owner_id.0),
+                position.pending_rewards_spark,
             )
         })
         .collect();
@@ -2724,7 +2726,6 @@ mod tests {
         apply_staking_op,
         governance::{ProposalPhase, ProposalRecord},
         validator::{DelegationReturnEvent, DelegationReturnReason},
-        validator::{StakeBondEntry, StakeBondOutput},
         ChainState,
     };
     use std::collections::BTreeMap;
@@ -2897,94 +2898,7 @@ mod tests {
         explain_utxo_provenance_authorized(&params, &state).unwrap()
     }
 
-    fn test_bond(byte: u8, compact: bool) -> StakeBondEntry {
-        let utxo_id = Bytes32::from([byte; 32]);
-        let validator_id = Bytes32::from([byte.wrapping_add(1); 32]);
-        let delegator_id = Bytes32::from([byte.wrapping_add(2); 32]);
-        let mut original_output: StakeBondOutput = test_output(byte).into();
-        if compact {
-            original_output.range_proof = None;
-        }
-        StakeBondEntry {
-            utxo_id,
-            validator_id,
-            delegator_id,
-            amount_spark: 1_000_000,
-            bonded_epoch: 7,
-            unbonding_end_epoch: None,
-            unbonding_start_height: None,
-            custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
-            original_output,
-        }
-    }
 
-    #[test]
-    fn rpc_bond_status_reports_mixed_position_from_individual_bonds() {
-        let mut chain = ChainState::new_genesis();
-        chain.height = u64::MAX;
-        let mut active = test_bond(0x91, false);
-        active.amount_spark = 60;
-        chain
-            .delegations
-            .add_delegation(active.validator_id, active.delegator_id, 60, 0)
-            .unwrap();
-        chain.staked_bonds.insert(active.utxo_id, active.clone());
-        assert_eq!(
-            rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id),
-            (60, 1, 0, None, None)
-        );
-        let active_only = get_delegations(
-            &[format!(r#""{}""#, hex::encode(active.validator_id.0))],
-            &NodeState::read_only(&chain),
-        )
-        .unwrap();
-        assert!(active_only.contains("\"earliest_unbonding_end_epoch\":null"));
-        assert!(active_only.contains("\"latest_unbonding_end_epoch\":null"));
-
-        let mut exiting = test_bond(0x92, false);
-        exiting.validator_id = active.validator_id;
-        exiting.delegator_id = active.delegator_id;
-        exiting.amount_spark = 40;
-        exiting.unbonding_end_epoch = Some(1008);
-        let mut later_exiting = test_bond(0x93, false);
-        later_exiting.validator_id = active.validator_id;
-        later_exiting.delegator_id = active.delegator_id;
-        later_exiting.amount_spark = 20;
-        later_exiting.unbonding_end_epoch = Some(1017);
-        chain.staked_bonds.insert(exiting.utxo_id, exiting);
-        assert_eq!(
-            rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id),
-            (60, 1, 1, Some(1008), Some(1008))
-        );
-        let one_unbonding = get_delegations(
-            &[format!(r#""{}""#, hex::encode(active.validator_id.0))],
-            &NodeState::read_only(&chain),
-        )
-        .unwrap();
-        assert!(one_unbonding.contains("\"earliest_unbonding_end_epoch\":1008"));
-        assert!(one_unbonding.contains("\"latest_unbonding_end_epoch\":1008"));
-        chain
-            .staked_bonds
-            .insert(later_exiting.utxo_id, later_exiting);
-
-        assert_eq!(
-            rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id,),
-            (60, 1, 2, Some(1008), Some(1017))
-        );
-
-        let state = NodeState::read_only(&chain);
-        let validator_param = format!(r#""{}""#, hex::encode(active.validator_id.0));
-        let delegator_param = format!(r#""{}""#, hex::encode(active.delegator_id.0));
-        for response in [
-            get_delegations(&[validator_param.clone()], &state).unwrap(),
-            get_delegator_positions(&[delegator_param], &state).unwrap(),
-            get_validator_delegators(&[validator_param], &state).unwrap(),
-        ] {
-            assert!(response.contains("\"earliest_unbonding_end_epoch\":1008"));
-            assert!(response.contains("\"latest_unbonding_end_epoch\":1017"));
-            assert!(!response.contains("\"unbonding_end_epoch\""));
-        }
-    }
 
     fn block_backed_engine() -> BlockBackedEngine {
         let mut chain = ChainState::new_genesis();
@@ -3708,52 +3622,6 @@ mod tests {
         assert!(!result.contains(r#""amount_spark":456"#));
     }
 
-    #[test]
-    fn stake_bond_debug_reports_legacy_and_compact_without_sensitive_material() {
-        let mut engine = make_state("sbd");
-        let legacy = test_bond(0x51, false);
-        let compact = test_bond(0x61, true);
-        let mut fully_compact = test_bond(0x71, true);
-        fully_compact.original_output.owner_pubkey = None;
-        let legacy_id = legacy.utxo_id;
-        let compact_id = compact.utxo_id;
-        let fully_compact_id = fully_compact.utxo_id;
-        engine.staked_bonds.insert(legacy_id, legacy);
-        engine.staked_bonds.insert(compact_id, compact);
-        engine.staked_bonds.insert(fully_compact_id, fully_compact);
-        let state = NodeState::read_only(&engine);
-
-        let legacy_result = get_stake_bond_debug(&[hex::encode(legacy_id.0)], &state).unwrap();
-        assert!(
-            legacy_result.contains(&format!(r#""bond_utxo_id":"{}""#, hex::encode(legacy_id.0)))
-        );
-        assert!(legacy_result.contains(r#""compact":false"#));
-        assert!(legacy_result.contains(r#""has_range_proof":true"#));
-        assert!(legacy_result.contains(r#""has_owner_pubkey":true"#));
-        assert!(legacy_result.contains(r#""bonded_epoch":7"#));
-        assert!(legacy_result.contains(&format!(r#""validator_id":"{}""#, hex::encode([0x52; 32]))));
-        assert!(legacy_result.contains(&format!(r#""delegator_id":"{}""#, hex::encode([0x53; 32]))));
-        assert!(!legacy_result.contains("commitment"));
-        assert!(!legacy_result.contains("classical_pk"));
-        assert!(!legacy_result.contains("pq_pk"));
-
-        let compact_result = get_stake_bond_debug(&[hex::encode(compact_id.0)], &state).unwrap();
-        assert!(compact_result.contains(r#""compact":true"#));
-        assert!(compact_result.contains(r#""has_range_proof":false"#));
-        assert!(compact_result.contains(r#""has_owner_pubkey":true"#));
-        assert!(!compact_result.contains("commitment"));
-        assert!(!compact_result.contains("classical_pk"));
-        assert!(!compact_result.contains("pq_pk"));
-
-        let fully_compact_result =
-            get_stake_bond_debug(&[hex::encode(fully_compact_id.0)], &state).unwrap();
-        assert!(fully_compact_result.contains(r#""compact":true"#));
-        assert!(fully_compact_result.contains(r#""has_range_proof":false"#));
-        assert!(fully_compact_result.contains(r#""has_owner_pubkey":false"#));
-        assert!(!fully_compact_result.contains("commitment"));
-        assert!(!fully_compact_result.contains("classical_pk"));
-        assert!(!fully_compact_result.contains("pq_pk"));
-    }
 
     #[test]
     fn delegator_identity_debug_reports_absent_or_registered_pubkey() {
@@ -3840,54 +3708,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stake_bond_debug_is_admin_gated() {
-        let mut engine = make_state("sbd-admin");
-        let legacy = test_bond(0x71, false);
-        let legacy_id = legacy.utxo_id;
-        engine.staked_bonds.insert(legacy_id, legacy);
-        let state = NodeState::read_only(&engine);
-        let params = [hex::encode(legacy_id.0)];
-
-        let read_only = dispatch_with_admin(
-            "indra_getStakeBondDebug",
-            &params,
-            &state,
-            RpcMode::ReadOnly,
-            true,
-            true,
-        );
-        assert!(matches!(
-            read_only,
-            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
-        ));
-
-        let no_token = dispatch_with_admin(
-            "indra_getStakeBondDebug",
-            &params,
-            &state,
-            RpcMode::Full,
-            false,
-            false,
-        );
-        assert!(matches!(
-            no_token,
-            DispatchResult::Ready(Err(RpcError::Forbidden(_)))
-        ));
-
-        let admin = dispatch_with_admin(
-            "indra_getStakeBondDebug",
-            &params,
-            &state,
-            RpcMode::Full,
-            true,
-            true,
-        );
-        assert!(matches!(
-            admin,
-            DispatchResult::Ready(Ok(result)) if result.contains(r#""compact":false"#)
-        ));
-    }
 
     #[test]
     fn consensus_snapshot_observability_is_admin_gated_and_reports_retained_authority() {

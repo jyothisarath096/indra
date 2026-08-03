@@ -10,7 +10,7 @@
 //! Explicit scope boundary: this commitment fixes the per-block
 //! validator/delegation/staking root rebuild. It does not fix the current
 //! full-state `clone()` used for block projection, the linear
-//! `DelegationMap` Vec lookup under a single validator, or the inherently
+//! validator-map lookup under a single validator, or the inherently
 //! O(touched delegators) reward distribution pass.
 
 use indra_core::{
@@ -29,8 +29,7 @@ use indra_crypto::sha256;
 use crate::{
     persistent::PersistentAuthTree,
     validator::{
-        DelegationReturnEvent, DelegatorEntry, EvictedValidatorTombstoneV1, StakeBondEntry,
-        ValidatorEntry,
+        DelegationReturnEvent, EvictedValidatorTombstoneV2, ValidatorEntry,
     },
     ChainState,
 };
@@ -75,22 +74,11 @@ impl StateCommitmentV2 {
                 validator_value_hash(validator, height),
             ));
         }
-        for (validator_id, delegators) in state.delegations.all_delegators() {
-            for delegator in delegators {
-                leaves.push((
-                    delegator_key(validator_id, &delegator.delegator_id),
-                    delegator_value_hash(delegator),
-                ));
-            }
-        }
         for (signer_id, nonce) in &state.staking_nonces {
             leaves.push((
                 staking_nonce_key(signer_id),
                 staking_nonce_value_hash(signer_id, *nonce),
             ));
-        }
-        for (utxo_id, bond) in &state.staked_bonds {
-            leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
         }
         for position in state.stake_positions.values() {
             leaves.push(stake_position_commitment_leaf(position));
@@ -175,18 +163,6 @@ impl StateCommitmentV2 {
         self.tree.delete(validator_key(validator_id));
     }
 
-    /// Insert or replace a delegator leaf.
-    pub fn put_delegator(&mut self, validator_id: &Bytes32, delegator: &DelegatorEntry) {
-        self.tree.insert(
-            delegator_key(validator_id, &delegator.delegator_id),
-            delegator_value_hash(delegator),
-        );
-    }
-
-    /// Delete a delegator leaf.
-    pub fn delete_delegator(&mut self, validator_id: &Bytes32, delegator_id: &Bytes32) {
-        self.tree.delete(delegator_key(validator_id, delegator_id));
-    }
 
     /// Insert or replace a staking nonce leaf.
     pub fn put_staking_nonce(&mut self, signer_id: &Bytes32, nonce: u64) {
@@ -201,16 +177,6 @@ impl StateCommitmentV2 {
         self.tree.delete(staking_nonce_key(signer_id));
     }
 
-    /// Insert or replace a staked-bond leaf.
-    pub fn put_staked_bond(&mut self, utxo_id: &Bytes32, bond: &StakeBondEntry) {
-        self.tree
-            .insert(staked_bond_key(utxo_id), staked_bond_value_hash(bond));
-    }
-
-    /// Delete a staked-bond leaf.
-    pub fn delete_staked_bond(&mut self, utxo_id: &Bytes32) {
-        self.tree.delete(staked_bond_key(utxo_id));
-    }
 
     /// Insert or replace a canonical stake-position leaf.
     pub fn put_stake_position(&mut self, position: &StakePositionV1) {
@@ -272,7 +238,7 @@ impl StateCommitmentV2 {
     }
 
     /// Insert or replace an evicted-validator tombstone leaf.
-    pub fn put_evicted_validator_tombstone(&mut self, tombstone: &EvictedValidatorTombstoneV1) {
+    pub fn put_evicted_validator_tombstone(&mut self, tombstone: &EvictedValidatorTombstoneV2) {
         self.tree.insert(
             evicted_validator_tombstone_key(&tombstone.validator_id),
             evicted_validator_tombstone_value_hash(tombstone),
@@ -362,8 +328,20 @@ fn evicted_validator_tombstone_key(validator_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_EVICTED_VALIDATOR_TOMBSTONE, &validator_id.0)
 }
 
-fn evicted_validator_tombstone_value_hash(tombstone: &EvictedValidatorTombstoneV1) -> [u8; 32] {
-    let mut value = b"INDRA-EVICTED-VALIDATOR-TOMBSTONE-v1".to_vec();
+fn evicted_validator_tombstone_value_hash(tombstone: &EvictedValidatorTombstoneV2) -> [u8; 32] {
+    evicted_validator_tombstone_v2_value_hash(tombstone)
+}
+
+/// Canonical key for the final tranche-native tombstone occupying domain `0x0D`.
+pub fn evicted_validator_tombstone_v2_key(validator_id: &Bytes32) -> [u8; 32] {
+    derive_key(DOMAIN_EVICTED_VALIDATOR_TOMBSTONE, &validator_id.0)
+}
+
+/// Domain-separated value hash for a final tranche-native tombstone.
+pub fn evicted_validator_tombstone_v2_value_hash(
+    tombstone: &EvictedValidatorTombstoneV2,
+) -> [u8; 32] {
+    let mut value = b"INDRA-EVICTED-VALIDATOR-TOMBSTONE-v2".to_vec();
     tombstone.encode(&mut value);
     sha256(&value)
 }
@@ -463,16 +441,6 @@ pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> 
     sha256(&value)
 }
 
-pub(crate) fn delegator_value_hash(delegator: &DelegatorEntry) -> [u8; 32] {
-    let mut value = Vec::new();
-    value.extend_from_slice(&delegator.delegator_id.0);
-    value.extend_from_slice(&delegator.staked_spark.to_le_bytes());
-    value.extend_from_slice(&delegator.pending_rewards.to_le_bytes());
-    value.extend_from_slice(&delegator.rewards_last_epoch.to_le_bytes());
-    value.extend_from_slice(&delegator.unbonding_end_epoch.unwrap_or(0).to_le_bytes());
-    value.push(u8::from(delegator.unbonding_end_epoch.is_some()));
-    sha256(&value)
-}
 
 fn staking_nonce_value_hash(signer_id: &Bytes32, nonce: u64) -> [u8; 32] {
     let mut value = Vec::with_capacity(40);
@@ -481,11 +449,6 @@ fn staking_nonce_value_hash(signer_id: &Bytes32, nonce: u64) -> [u8; 32] {
     sha256(&value)
 }
 
-fn staked_bond_value_hash(bond: &StakeBondEntry) -> [u8; 32] {
-    let mut value = Vec::new();
-    bond.encode(&mut value);
-    sha256(&value)
-}
 
 fn slash_hash_value_hash(hash: &Bytes32) -> [u8; 32] {
     sha256(&hash.0)
@@ -718,19 +681,6 @@ mod tests {
         }
     }
 
-    fn bond(utxo_id: Bytes32, validator_id: Bytes32, delegator_id: Bytes32) -> StakeBondEntry {
-        StakeBondEntry {
-            utxo_id,
-            validator_id,
-            delegator_id,
-            amount_spark: 7_000,
-            bonded_epoch: 3,
-            unbonding_end_epoch: None,
-            unbonding_start_height: None,
-            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(delegator_id),
-            original_output: output(0xAA, 7_000).into(),
-        }
-    }
 
     fn pubkey(byte: u8) -> HybridPubKey {
         HybridPubKey {
@@ -747,22 +697,11 @@ mod tests {
                 validator_value_hash(validator, height),
             ));
         }
-        for (validator_id, delegators) in state.delegations.all_delegators() {
-            for delegator in delegators {
-                leaves.push((
-                    delegator_key(validator_id, &delegator.delegator_id),
-                    delegator_value_hash(delegator),
-                ));
-            }
-        }
         for (signer_id, nonce) in &state.staking_nonces {
             leaves.push((
                 staking_nonce_key(signer_id),
                 staking_nonce_value_hash(signer_id, *nonce),
             ));
-        }
-        for (utxo_id, bond) in &state.staked_bonds {
-            leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
         }
         for hash in &state.applied_slash_hashes {
             leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
@@ -820,22 +759,11 @@ mod tests {
                 validator_value_hash(validator, height),
             ));
         }
-        for (validator_id, delegators) in state.delegations.all_delegators() {
-            for delegator in delegators {
-                leaves.push((
-                    delegator_key(validator_id, &delegator.delegator_id),
-                    delegator_value_hash(delegator),
-                ));
-            }
-        }
         for (signer_id, nonce) in &state.staking_nonces {
             leaves.push((
                 staking_nonce_key(signer_id),
                 staking_nonce_value_hash(signer_id, *nonce),
             ));
-        }
-        for (utxo_id, bond) in &state.staked_bonds {
-            leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
         }
         for hash in &state.applied_slash_hashes {
             leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
@@ -875,57 +803,6 @@ mod tests {
         sha256(&value)
     }
 
-    fn synthetic_delegation_state(size: usize, height: u64) -> ChainState {
-        let validator = validator(0x99);
-        let validator_id = validator.validator_id;
-        let mut state = ChainState::new_genesis();
-        state.validators.upsert(validator).unwrap();
-        for index in 0..size {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 0xD0;
-            bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
-            state.delegations.push_delegator_for_test(
-                validator_id,
-                DelegatorEntry {
-                    delegator_id: Bytes32::from(bytes),
-                    staked_spark: 1_000,
-                    pending_rewards: (index % 17) as u64,
-                    rewards_last_epoch: (index % 11) as u64,
-                    unbonding_end_epoch: (index % 97 == 0).then_some(100 + index as u64),
-                },
-            );
-        }
-        state.finalize_genesis().unwrap();
-        state.height = height;
-        state
-    }
-
-    fn synthetic_commitment_leaves(size: usize, height: u64) -> Vec<([u8; 32], [u8; 32])> {
-        let validator = validator(0x99);
-        let validator_id = validator.validator_id;
-        let mut leaves = Vec::with_capacity(size.saturating_add(1));
-        leaves.push((
-            validator_key(&validator_id),
-            validator_value_hash(&validator, height),
-        ));
-        for index in 0..size {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 0xD0;
-            bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
-            let delegator = DelegatorEntry {
-                delegator_id: Bytes32::from(bytes),
-                staked_spark: 1_000,
-                pending_rewards: (index % 17) as u64,
-                rewards_last_epoch: (index % 11) as u64,
-                unbonding_end_epoch: (index % 97 == 0).then_some(100 + index as u64),
-            };
-            leaves.push((
-                delegator_key(&validator_id, &delegator.delegator_id),
-                delegator_value_hash(&delegator),
-            ));
-        }
-        leaves
-    }
 
     #[test]
     fn validator_leaf_commits_cold_state_but_not_uncommitted_display_name() {
@@ -1068,23 +945,6 @@ mod tests {
         assert_eq!(state.state_commitment_v2_root(height), baseline_root);
     }
 
-    #[test]
-    fn empty_delegator_identity_registry_preserves_pre_stage2_root() {
-        let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
-        let validator = validator(0x70);
-        state.validators.upsert(validator.clone()).unwrap();
-        state.staking_nonces.insert(id(0x71), 12);
-        let bond_id = id(0x72);
-        state
-            .staked_bonds
-            .insert(bond_id, bond(bond_id, validator.validator_id, id(0x73)));
-        assert!(state.delegator_identities.is_empty());
-
-        let pre_stage2_root = pre_identity_state_commitment_v2_root(&state, height);
-        let post_stage2_root = StateCommitmentV2::from_state(&state, height).root();
-        assert_eq!(post_stage2_root, pre_stage2_root);
-    }
 
     #[test]
     fn state_commitment_v2_domain_bytes_do_not_collide() {
@@ -1199,7 +1059,7 @@ mod tests {
         state.height = height;
         let baseline = StateCommitmentV2::from_state(&state, height).root();
         let validator_id = id(0xED);
-        let tombstone = EvictedValidatorTombstoneV1 {
+        let tombstone = EvictedValidatorTombstoneV2 {
             validator_id,
             eviction_height: height - 1,
             eviction_epoch: crate::epoch::epoch_for_height(height - 1),
@@ -1207,7 +1067,8 @@ mod tests {
             last_pq_vote_pk: [0x02; indra_crypto::PQ_PK_BYTES],
             last_vrf_pk: [0x03; 32],
             cold_custody: None,
-            retained_bonds: Vec::new(),
+            retained_position_ids: Vec::new(),
+            retained_tranche_ids: Vec::new(),
         };
         state
             .evicted_validator_tombstones
@@ -1222,210 +1083,6 @@ mod tests {
         assert_eq!(incremental.root(), baseline);
     }
 
-    #[test]
-    fn state_commitment_v2_incremental_matches_rebuild_after_each_category() {
-        let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
-        state.rebuild_state_commitment_v2(height);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        let validator = validator(0x11);
-        state.validators.upsert(validator.clone()).unwrap();
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .put_validator(&validator, height);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        let delegator = DelegatorEntry {
-            delegator_id: id(0x22),
-            staked_spark: 500,
-            pending_rewards: 9,
-            rewards_last_epoch: 2,
-            unbonding_end_epoch: None,
-        };
-        state
-            .delegations
-            .add_delegation(validator.validator_id, delegator.delegator_id, 500, 2)
-            .unwrap();
-        if let Some(entry) = state
-            .delegations
-            .get_delegators(&validator.validator_id)
-            .first()
-        {
-            state
-                .state_commitment_v2
-                .as_mut()
-                .unwrap()
-                .put_delegator(&validator.validator_id, entry);
-        }
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        state.staking_nonces.insert(id(0x33), 4);
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .put_staking_nonce(&id(0x33), 4);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        let bond_id = id(0x44);
-        let bond = bond(bond_id, validator.validator_id, delegator.delegator_id);
-        state.staked_bonds.insert(bond_id, bond.clone());
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .put_staked_bond(&bond_id, &bond);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        let slash_hash = id(0x55);
-        state.applied_slash_hashes.insert(slash_hash);
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .put_slash_hash(&slash_hash);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        let event = DelegationReturnEvent {
-            delegator_id: delegator.delegator_id,
-            validator_id: validator.validator_id,
-            bond_utxo_id: bond_id,
-            amount_spark: 100,
-            reason: crate::validator::DelegationReturnReason::ValidatorEvicted,
-            returned_epoch: 9,
-            returned_height: height,
-            refund_utxo_id: id(0x66),
-        };
-        state.push_delegation_return_event(event);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        let identity_id = id(0x77);
-        let identity_pubkey = pubkey(0x78);
-        state
-            .delegator_identities
-            .insert(identity_id, identity_pubkey.clone());
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .put_delegator_identity(&identity_id, &identity_pubkey);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .delete_delegator(&validator.validator_id, &delegator.delegator_id);
-        state
-            .delegations
-            .remove_virtual_delegation(&validator.validator_id, &delegator.delegator_id);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            legacy_state_commitment_v2_root(&state, height)
-        );
-    }
-
-    #[test]
-    fn height_precise_bond_incremental_root_matches_rebuild_before_and_after_unstake() {
-        let height = 100;
-        let bond_id = id(0xE4);
-        let mut precise = bond(bond_id, id(0xE5), id(0xE5));
-        precise.unbonding_start_height = None;
-        let mut state = ChainState::new_genesis();
-        state.staked_bonds.insert(bond_id, precise.clone());
-        state.rebuild_state_commitment_v2(height);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-
-        precise
-            .begin_unbonding(height, UNBONDING_PERIOD_EPOCHS)
-            .unwrap();
-        state.staked_bonds.insert(bond_id, precise.clone());
-        state
-            .state_commitment_v2
-            .as_mut()
-            .unwrap()
-            .put_staked_bond(&bond_id, &precise);
-        assert_eq!(
-            state.state_commitment_v2_root(height),
-            StateCommitmentV2::from_state(&state, height).root()
-        );
-    }
-
-    #[test]
-    fn state_commitment_v2_persistent_tree_matches_legacy_oracle_roots() {
-        for size in [0usize, 1, 17, 257] {
-            let height = u64::MAX;
-            let mut state = synthetic_delegation_state(size, height);
-            state.rebuild_state_commitment_v2(height);
-            assert_eq!(
-                state.state_commitment_v2_root(height),
-                legacy_state_commitment_v2_root(&state, height),
-                "persistent StateCommitmentV2 root diverged from legacy compressed oracle at size {size}"
-            );
-        }
-    }
 
     #[test]
     fn state_commitment_v2_rebuild_after_decode_is_deterministic() {
@@ -1444,113 +1101,4 @@ mod tests {
         assert_eq!(decoded.state_commitment_v2_root(height), root_before);
     }
 
-    #[test]
-    #[ignore = "synthetic StateCommitmentV2 scale benchmark; run explicitly with --ignored --nocapture"]
-    fn state_commitment_v2_synthetic_benchmark() {
-        let sizes = std::env::var("INDRA_STATE_COMMITMENT_BENCH_SIZES")
-            .unwrap_or_else(|_| "100000".to_string())
-            .split(',')
-            .filter_map(|part| part.trim().parse::<usize>().ok())
-            .collect::<Vec<_>>();
-        let height = u64::MAX;
-
-        eprintln!(
-            "[state-commitment-v2-bench] old full-root baselines from Step 0: 100k≈107ms, 1M≈1.03s, 5M≈5.19s"
-        );
-
-        for size in sizes {
-            let mut state = synthetic_delegation_state(size, height);
-            let validator_id = state
-                .validators
-                .all_validators()
-                .next()
-                .unwrap()
-                .validator_id;
-
-            let init_start = Instant::now();
-            state.rebuild_state_commitment_v2(height);
-            let init = init_start.elapsed();
-            assert_eq!(
-                state.state_commitment_v2_root(height),
-                legacy_state_commitment_v2_root(&state, height)
-            );
-
-            let first_delegator_id = state
-                .delegations
-                .get_delegators(&validator_id)
-                .first()
-                .unwrap()
-                .delegator_id;
-            let updated = state
-                .delegations
-                .update_delegator(&validator_id, &first_delegator_id, |entry| {
-                    entry.pending_rewards = entry.pending_rewards.saturating_add(1);
-                    entry.clone()
-                })
-                .unwrap();
-            let update_start = Instant::now();
-            state
-                .state_commitment_v2
-                .as_mut()
-                .unwrap()
-                .put_delegator(&validator_id, &updated);
-            let update = update_start.elapsed();
-
-            let root_start = Instant::now();
-            let mut root = Bytes32::ZERO;
-            for _ in 0..1_000 {
-                root = state.state_commitment_v2_root(height);
-            }
-            let root_reads = root_start.elapsed();
-
-            eprintln!(
-                "[state-commitment-v2-bench] delegators={size} init={:?} single_update={:?} root_read_avg={:?} root={}",
-                init,
-                update,
-                root_reads / 1_000,
-                hex::encode(root.0)
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "release-mode StateCommitmentV2 tree-clone benchmark; run with --release --ignored --nocapture"]
-    fn state_commitment_v2_persistent_tree_clone_benchmark() {
-        let sizes = std::env::var("INDRA_STATE_COMMITMENT_V2_CLONE_BENCH_SIZES")
-            .unwrap_or_else(|_| "100000,1000000,10000000".to_string())
-            .split(',')
-            .filter_map(|part| part.trim().parse::<usize>().ok())
-            .collect::<Vec<_>>();
-        let height = u64::MAX;
-
-        for size in sizes {
-            let legacy_build_start = Instant::now();
-            let legacy_tree =
-                CompressedAuthTree::from_pairs(synthetic_commitment_leaves(size, height)).unwrap();
-            let legacy_build = legacy_build_start.elapsed();
-
-            let persistent_build_start = Instant::now();
-            let persistent_commitment = StateCommitmentV2 {
-                tree: PersistentAuthTree::from_pairs(synthetic_commitment_leaves(size, height))
-                    .unwrap(),
-            };
-            let persistent_build = persistent_build_start.elapsed();
-            let persistent_root = persistent_commitment.root();
-            assert_eq!(Bytes32::from(legacy_tree.root()), persistent_root);
-
-            let legacy_clone_start = Instant::now();
-            let legacy_clone = legacy_tree.clone();
-            let legacy_clone_elapsed = legacy_clone_start.elapsed();
-            assert_eq!(Bytes32::from(legacy_clone.root()), persistent_root);
-
-            let persistent_clone_start = Instant::now();
-            let persistent_clone = persistent_commitment.clone();
-            let persistent_clone_elapsed = persistent_clone_start.elapsed();
-            assert_eq!(persistent_clone.root(), persistent_root);
-
-            println!(
-                "stage2d_state_commitment_v2_clone delegators={size} legacy_build={legacy_build:?} persistent_build={persistent_build:?} legacy_compressed_tree_clone={legacy_clone_elapsed:?} persistent_auth_tree_clone={persistent_clone_elapsed:?}"
-            );
-        }
-    }
 }

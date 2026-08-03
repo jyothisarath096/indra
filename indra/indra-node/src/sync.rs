@@ -786,7 +786,7 @@ mod tests {
     };
     use indra_state::{
         apply_block, compute_state_root, compute_state_roots, compute_validator_set_root,
-        validator::StakeBondEntry, ValidatorEntry, ValidatorStatus,
+        ValidatorEntry, ValidatorStatus,
     };
     use indra_storage::StateStore;
     use std::path::PathBuf;
@@ -1310,89 +1310,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "realistic live-import root verification benchmark; run explicitly with --ignored --nocapture"]
-    fn project_and_verify_block_state_root_realistic_benchmark() {
-        use std::time::Instant;
-
-        fn realistic_state(staked_bonds: usize) -> ChainState {
-            let mut state = ChainState::new_genesis();
-            let validator_id = Bytes32::from([0x75; 32]);
-            let pq_pk = VariableBytes::from_slice(&vec![0x99; 2_592]).unwrap();
-            let range_proof = VariableBytes::from_slice(&vec![0xAA; 674]).unwrap();
-            for index in 0..staked_bonds {
-                let mut id_bytes = [0u8; 32];
-                for (dst, src) in id_bytes
-                    .iter_mut()
-                    .zip((index as u64).to_le_bytes().into_iter())
-                {
-                    *dst = src;
-                }
-                let utxo_id = Bytes32::from(id_bytes);
-                state.staked_bonds.insert(
-                    utxo_id,
-                    StakeBondEntry {
-                        utxo_id,
-                        validator_id,
-                        delegator_id: Bytes32::from([0x66; 32]),
-                        amount_spark: 1_000,
-                        bonded_epoch: 0,
-                        unbonding_end_epoch: None,
-                        unbonding_start_height: None,
-                        custody_owner: indra_state::StakeBondCustodyOwner::DelegatorIdentity(
-                            Bytes32::from([0x66; 32]),
-                        ),
-                        original_output: OutputV1 {
-                            value_spark: 1_000,
-                            commitment: CommitmentV1 {
-                                compressed_point: Bytes32::from([0x77; 32]),
-                            },
-                            owner_pubkey: HybridPubKey {
-                                classical_pk: Bytes32::from([0x88; 32]),
-                                pq_pk: pq_pk.clone(),
-                            },
-                            range_proof: range_proof.clone(),
-                            lock_height: 0,
-                        }
-                        .into(),
-                    },
-                );
-            }
-            state
-        }
-
-        for size in [100_000usize, 1_000_000usize] {
-            let state = realistic_state(size);
-            let mut block = make_block(&state);
-            let mut expected_projection = state.clone();
-            apply_block(&mut expected_projection, &block, 0).unwrap();
-            let expected_roots = compute_state_roots(&expected_projection);
-            block.header.state_root = expected_roots.state_root;
-            block.header.validator_set_root = expected_roots.validator_set_root;
-            block.header.value_hash = block.compute_value_hash(expected_projection.total_supply);
-
-            let start = Instant::now();
-            let mut old_projection = state.clone();
-            let old_epoch_record = apply_block(&mut old_projection, &block, 0).unwrap();
-            let old_state_root = compute_state_root(&old_projection);
-            let old_validator_set_root = compute_validator_set_root(&old_projection);
-            let old_value_hash = block.compute_value_hash(old_projection.total_supply);
-            let old_elapsed = start.elapsed();
-
-            let start = Instant::now();
-            let optimized = project_and_verify_block_state_root(&block, &state, 0).unwrap();
-            let optimized_elapsed = start.elapsed();
-
-            assert_eq!(optimized.epoch_record, old_epoch_record);
-            assert_eq!(optimized.state, old_projection);
-            assert_eq!(optimized.state_root, old_state_root);
-            assert_eq!(optimized.validator_set_root, old_validator_set_root);
-            assert_eq!(optimized.value_hash, old_value_hash);
-            println!(
-                "project_and_verify_block_state_root_realistic size={size} old_two_call={old_elapsed:?} optimized_paired={optimized_elapsed:?}"
-            );
-        }
-    }
 
     #[test]
     fn live_import_projection_commit_preserves_epoch_record_timestamp() {
@@ -1543,78 +1460,7 @@ mod tests {
             .contains("block failed during pre-apply root verification"));
     }
 
-    #[test]
-    #[ignore = "synthetic import projection clone-cost benchmark; run explicitly with --ignored --nocapture"]
-    fn import_projection_clone_cost_benchmark() {
-        use std::time::Instant;
 
-        let sizes = std::env::var("INDRA_IMPORT_PROJECTION_BENCH_SIZES")
-            .unwrap_or_else(|_| "100000".to_string())
-            .split(',')
-            .filter_map(|part| part.trim().parse::<usize>().ok())
-            .collect::<Vec<_>>();
-
-        eprintln!(
-            "[import-projection-bench] original Step 0 baseline: normal import/commit ≈7 clone-equivalents, 1M delegators ≈11.6-11.9s"
-        );
-        eprintln!(
-            "[import-projection-bench] Round A current baseline before this patch: empty import ≈3 clone-equivalents; after this patch: ≈2 clone-equivalents"
-        );
-
-        for size in sizes {
-            let setup_start = Instant::now();
-            let state = synthetic_delegation_state(size);
-            let setup_elapsed = setup_start.elapsed();
-            let block = make_block(&state);
-
-            let projection_start = Instant::now();
-            let projection = project_and_verify_block_state_root(&block, &state, 0).unwrap();
-            let projection_elapsed = projection_start.elapsed();
-            assert_eq!(projection.state.height, block.header.height);
-            assert_eq!(projection.state_root, block.header.state_root);
-            assert_eq!(
-                projection.validator_set_root,
-                block.header.validator_set_root
-            );
-            assert_eq!(projection.value_hash, block.header.value_hash);
-
-            let inbound_proposal_clone_start = Instant::now();
-            let mut inbound_projected_state = state.clone();
-            let inbound_clone_elapsed = inbound_proposal_clone_start.elapsed();
-            apply_block(&mut inbound_projected_state, &block, 0).unwrap();
-            assert_eq!(inbound_projected_state.height, block.header.height);
-
-            let direct_clone_start = Instant::now();
-            let direct_clone = state.clone();
-            let direct_clone_elapsed = direct_clone_start.elapsed();
-            std::hint::black_box(direct_clone);
-            eprintln!(
-                "[import-projection-bench] delegators={size} setup={:?} sync_project_and_verify={projection_elapsed:?} inbound_proposal_clone_only={inbound_clone_elapsed:?} direct_chainstate_clone={direct_clone_elapsed:?}",
-                setup_elapsed
-            );
-        }
-    }
-
-    fn synthetic_delegation_state(delegators: usize) -> ChainState {
-        let mut state = ChainState::new_genesis();
-        state.height = 1;
-        let buckets = delegators.clamp(1, 10_000);
-        for index in 0..delegators {
-            let bucket = index % buckets;
-            let mut validator = [0u8; 32];
-            validator[0] = 0xB0;
-            validator[8..16].copy_from_slice(&(bucket as u64).to_be_bytes());
-            let mut delegator = [0u8; 32];
-            delegator[0] = 0xD0;
-            delegator[8..16].copy_from_slice(&(index as u64).to_be_bytes());
-            state
-                .delegations
-                .add_delegation(Bytes32::from(validator), Bytes32::from(delegator), 1_000, 0)
-                .unwrap();
-        }
-        state.rebuild_state_commitment_v2(state.height);
-        state
-    }
 
     #[test]
     fn import_chain_of_blocks() {

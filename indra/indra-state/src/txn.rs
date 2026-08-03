@@ -26,10 +26,7 @@ use crate::{
     persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::{UtxoEntry, UtxoSet},
-    validator::{
-        DelegationMap, DelegationReturnEvent, EvictedValidatorTombstoneV1, StakeBondEntry,
-        ValidatorSet,
-    },
+    validator::{DelegationReturnEvent, EvictedValidatorTombstoneV2, ValidatorSet},
 };
 use indra_core::types::crypto::HybridPubKey;
 
@@ -53,8 +50,6 @@ enum UndoEntry {
     UtxoInserted(Bytes32),
     NullifierInserted(Bytes32),
     Validators(ValidatorSet),
-    Delegations(DelegationMap),
-    StakedBonds(PersistentOrdMap<Bytes32, StakeBondEntry>),
     PositionState {
         positions: PersistentOrdMap<Bytes32, StakePositionV1>,
         tranches: PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
@@ -72,7 +67,7 @@ enum UndoEntry {
     ConsensusSnapshots(Vec<ConsensusSnapshot>),
     RewardEconomicSnapshot(Option<RewardEconomicSnapshot>),
     SlashMembershipRoots(Vec<SlashMembershipRootRecord>),
-    EvictedValidatorTombstones(PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV1>),
+    EvictedValidatorTombstones(PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV2>),
 }
 
 #[cfg(test)]
@@ -90,8 +85,6 @@ pub(crate) struct StateTxn<'a> {
     height: u64,
     scalars_recorded: bool,
     validators_recorded: bool,
-    delegations_recorded: bool,
-    staked_bonds_recorded: bool,
     position_state_recorded: bool,
     staking_nonces_recorded: bool,
     slash_hashes_recorded: bool,
@@ -121,8 +114,6 @@ impl<'a> StateTxn<'a> {
             height,
             scalars_recorded: false,
             validators_recorded: false,
-            delegations_recorded: false,
-            staked_bonds_recorded: false,
             position_state_recorded: false,
             staking_nonces_recorded: false,
             slash_hashes_recorded: false,
@@ -188,8 +179,6 @@ impl<'a> StateTxn<'a> {
     /// staking helpers.
     pub(crate) fn snapshot_staking_scope(&mut self) {
         self.snapshot_validators();
-        self.snapshot_delegations();
-        self.snapshot_staked_bonds();
         self.snapshot_position_state();
         self.snapshot_staking_nonces();
         self.snapshot_utxos();
@@ -215,7 +204,6 @@ impl<'a> StateTxn<'a> {
     /// Record the slashing mutation surface before applying slash evidence.
     pub(crate) fn snapshot_slashing_scope(&mut self) {
         self.snapshot_validators();
-        self.snapshot_staked_bonds();
         self.snapshot_position_state();
         self.snapshot_slash_hashes();
         self.snapshot_evicted_validator_tombstones();
@@ -235,8 +223,6 @@ impl<'a> StateTxn<'a> {
     /// Record the epoch transition mutation surface.
     pub(crate) fn snapshot_epoch_scope(&mut self) {
         self.snapshot_validators();
-        self.snapshot_delegations();
-        self.snapshot_staked_bonds();
         self.snapshot_position_state();
         self.snapshot_governance();
         self.snapshot_utxos();
@@ -425,25 +411,6 @@ impl<'a> StateTxn<'a> {
         }
     }
 
-    fn snapshot_delegations(&mut self) {
-        if !self.delegations_recorded {
-            let snapshot = measure_undo_recording(|| self.state.delegations.clone());
-            self.undo.push(UndoEntry::Delegations(snapshot));
-            self.delegations_recorded = true;
-        }
-    }
-
-    fn snapshot_staked_bonds(&mut self) {
-        if !self.staked_bonds_recorded {
-            // `PersistentOrdMap::clone()` is an O(1) root-handle copy; the
-            // coarse staking snapshot remains the same rollback boundary, but
-            // no longer deep-copies every bonded position.
-            let snapshot = measure_undo_recording(|| self.state.staked_bonds.clone());
-            self.undo.push(UndoEntry::StakedBonds(snapshot));
-            self.staked_bonds_recorded = true;
-        }
-    }
-
     /// Record the isolated canonical position/tranche mutation surface.
     pub(crate) fn snapshot_position_state(&mut self) {
         if !self.position_state_recorded {
@@ -597,8 +564,6 @@ impl<'a> StateTxn<'a> {
                         .remove_for_rollback_at_height(&nullifier, self.height);
                 }
                 UndoEntry::Validators(validators) => self.state.validators = validators,
-                UndoEntry::Delegations(delegations) => self.state.delegations = delegations,
-                UndoEntry::StakedBonds(staked_bonds) => self.state.staked_bonds = staked_bonds,
                 UndoEntry::PositionState {
                     positions,
                     tranches,
@@ -744,7 +709,6 @@ pub(crate) fn timing() -> StateTxnTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validator::DelegatorEntry;
     use indra_core::{
         codec::Encode,
         types::{
@@ -771,111 +735,8 @@ mod tests {
         }
     }
 
-    fn test_bond(byte: u8) -> StakeBondEntry {
-        StakeBondEntry {
-            utxo_id: Bytes32::from([byte; 32]),
-            validator_id: Bytes32::from([0xA0 | byte; 32]),
-            delegator_id: Bytes32::from([0xD0 | byte; 32]),
-            amount_spark: 1_000_000,
-            bonded_epoch: 7,
-            unbonding_end_epoch: None,
-            unbonding_start_height: None,
-            custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                Bytes32::from([0xD0 | byte; 32]),
-            ),
-            original_output: test_output(byte).into(),
-        }
-    }
 
-    #[test]
-    fn persistent_bond_and_nonce_snapshots_restore_after_failpoint() {
-        let mut state = ChainState::new_genesis();
-        let original_bond = test_bond(0x01);
-        let original_bond_id = original_bond.utxo_id;
-        state
-            .staked_bonds
-            .insert(original_bond_id, original_bond.clone());
-        state.staking_nonces.insert(Bytes32::from([0x11; 32]), 7);
-        let original = state.clone();
 
-        set_fail_after_mutation(Some(1));
-        {
-            let mut txn = StateTxn::begin(&mut state, 1);
-            txn.snapshot_staking_scope();
-            txn.state_mut().staked_bonds.remove(&original_bond_id);
-            txn.state_mut()
-                .staked_bonds
-                .insert(Bytes32::from([0x02; 32]), test_bond(0x02));
-            txn.state_mut()
-                .staking_nonces
-                .insert(Bytes32::from([0x11; 32]), 8);
-            txn.state_mut()
-                .staking_nonces
-                .insert(Bytes32::from([0x22; 32]), 1);
-            let tombstone_id = Bytes32::from([0x33; 32]);
-            txn.state_mut().evicted_validator_tombstones.insert(
-                tombstone_id,
-                crate::validator::EvictedValidatorTombstoneV1 {
-                    validator_id: tombstone_id,
-                    eviction_height: 1,
-                    eviction_epoch: 0,
-                    last_classical_vote_pk: [0x34; 32],
-                    last_pq_vote_pk: [0x35; indra_crypto::PQ_PK_BYTES],
-                    last_vrf_pk: [0x36; 32],
-                    cold_custody: None,
-                    retained_bonds: Vec::new(),
-                },
-            );
-            assert!(txn.after_mutation().is_err());
-        }
-        set_fail_after_mutation(None);
-
-        assert_eq!(state, original);
-        assert_eq!(
-            state.staked_bonds.get(&original_bond_id),
-            Some(&original_bond)
-        );
-        assert_eq!(
-            state.staking_nonces.get(&Bytes32::from([0x11; 32])),
-            Some(&7)
-        );
-        assert!(state.staked_bonds.get(&Bytes32::from([0x02; 32])).is_none());
-        assert!(state
-            .staking_nonces
-            .get(&Bytes32::from([0x22; 32]))
-            .is_none());
-    }
-
-    #[test]
-    fn rollback_restores_height_precise_bond_and_prior_commitment_root() {
-        let height = 100;
-        let mut state = ChainState::new_genesis();
-        let mut original_bond = test_bond(0x03);
-        original_bond.unbonding_start_height = None;
-        let bond_id = original_bond.utxo_id;
-        state.staked_bonds.insert(bond_id, original_bond.clone());
-        state.rebuild_state_commitment_v2(height);
-        let root_before = state.state_commitment_v2_root(height);
-
-        set_fail_after_mutation(Some(1));
-        {
-            let mut txn = StateTxn::begin(&mut state, height);
-            txn.snapshot_staking_scope();
-            let mut unbonding = original_bond.clone();
-            unbonding
-                .begin_unbonding(
-                    height,
-                    indra_core::types::primitives::UNBONDING_PERIOD_EPOCHS,
-                )
-                .unwrap();
-            txn.state_mut().staked_bonds.insert(bond_id, unbonding);
-            assert!(txn.after_mutation().is_err());
-        }
-        set_fail_after_mutation(None);
-
-        assert_eq!(state.staked_bonds.get(&bond_id), Some(&original_bond));
-        assert_eq!(state.state_commitment_v2_root(height), root_before);
-    }
 
     #[test]
     fn rollback_restores_slash_membership_root_history_and_commitment() {
@@ -965,58 +826,4 @@ mod tests {
         assert_eq!(state, original);
     }
 
-    #[test]
-    fn delegation_side_index_restores_through_staking_scope_rollback() {
-        let validator_id = Bytes32::from([0xA1; 32]);
-        let delegator_id = Bytes32::from([0xD1; 32]);
-        let added_delegator_id = Bytes32::from([0xD2; 32]);
-        let mut state = ChainState::new_genesis();
-        state.delegations.push_delegator_for_test(
-            validator_id,
-            DelegatorEntry {
-                delegator_id,
-                staked_spark: 1_000,
-                pending_rewards: 7,
-                rewards_last_epoch: 3,
-                unbonding_end_epoch: None,
-            },
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &delegator_id),
-            7
-        );
-        let original = state.clone();
-
-        set_fail_after_mutation(Some(1));
-        {
-            let mut txn = StateTxn::begin(&mut state, 1);
-            txn.snapshot_staking_scope();
-            txn.state_mut()
-                .delegations
-                .add_delegation(validator_id, added_delegator_id, 500, 4)
-                .unwrap();
-            assert!(txn.after_mutation().is_err());
-        }
-        set_fail_after_mutation(None);
-
-        assert_eq!(state, original);
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &delegator_id),
-            7
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &added_delegator_id),
-            0
-        );
-        assert_eq!(
-            state.delegations.encode_to_vec(),
-            original.delegations.encode_to_vec()
-        );
-    }
 }

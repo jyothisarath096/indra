@@ -1,11 +1,13 @@
 //! `indra-stake` — build and submit staking operations.
 
 use indra_cli::{
-    fetch_chain_id, fetch_staking_nonce, load_cold_keys, password_source_from_args,
-    reconstruct_keypair, submit_staking_op, BuiltStakingOp, CliError, CliResult, KeysFile, Wallet,
-    WalletEntry,
+    fetch_chain_id, fetch_staking_nonce, fetch_validator_cold_replay, load_cold_keys,
+    password_source_from_args, reconstruct_keypair, submit_staking_op, BuiltStakingOp, CliError,
+    CliResult, KeysFile, PasswordSource, StakePositionExitSigner, Wallet, WalletEntry,
 };
-use indra_core::types::{primitives::Bytes32, staking::StakingBondProof};
+use indra_core::types::{
+    primitives::Bytes32, stake_position::PositionCustodyV1, staking::StakingBondProof,
+};
 #[cfg(test)]
 use indra_core::{
     codec::{Decode, Encode},
@@ -133,20 +135,48 @@ fn run_self_unstake(args: &[String]) -> CliResult<()> {
         return Ok(());
     }
     let keys = load_keys(args)?;
-    let keypair = reconstruct_keypair(&keys)?;
-    let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
+    let position_id = parse_required_bytes32(args, "--position-id")?;
+    let amount_spark = parse_exit_amount(args)?;
     let signer_id = staking_signer_id(&keys)?;
+    let cold_path = get(args, "--cold-keys")
+        .ok_or_else(|| CliError::MissingArgument("missing required flag: --cold-keys".into()))?;
+    let cold_password_path = get(args, "--cold-keys-password-file");
+    let cold_password = if let Some(path) = cold_password_path.as_deref() {
+        PasswordSource::File {
+            path: std::path::Path::new(path),
+            reject_permissive: false,
+        }
+    } else {
+        PasswordSource::Prompt
+    };
+    let cold_keys = load_cold_keys(&cold_path, cold_password)
+        .map_err(|e| CliError::Keystore(e.to_string()))?;
+    let cold_keypair = cold_keys
+        .reconstruct()
+        .map_err(|e| CliError::Keystore(e.to_string()))?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
-    let nonce = fetch_next_nonce(&node_url, &signer_id)?;
-    let built =
-        indra_cli::tx_builder::build_self_unstake_op(bond_utxo_id, &keypair, nonce, &chain_id)?;
+    let (cold_key_version, cold_nonce) =
+        fetch_validator_cold_replay(&node_url, &hex::encode(signer_id.0))?;
+    let built = indra_cli::tx_builder::build_exit_stake_position_op(
+        position_id,
+        amount_spark,
+        PositionCustodyV1::ValidatorColdIdentity {
+            validator_id: signer_id,
+        },
+        StakePositionExitSigner::ValidatorCold {
+            keypair: &cold_keypair,
+            cold_key_version,
+            cold_nonce,
+        },
+        &chain_id,
+    )?;
     finish_op(
         args,
         "self-unstake",
         &built,
         &signer_id,
-        nonce,
+        cold_nonce,
         &node_url,
         &[(
             "Note",
@@ -201,17 +231,22 @@ fn run_undelegate(args: &[String]) -> CliResult<()> {
     }
     let keys = load_keys(args)?;
     let keypair = reconstruct_keypair(&keys)?;
-    let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
-    let validator_id = parse_required_bytes32(args, "--validator")?;
+    let position_id = parse_required_bytes32(args, "--position-id")?;
+    let amount_spark = parse_exit_amount(args)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
-    let built = indra_cli::tx_builder::build_undelegate_op(
-        validator_id,
-        bond_utxo_id,
-        &keypair,
-        nonce,
+    let built = indra_cli::tx_builder::build_exit_stake_position_op(
+        position_id,
+        amount_spark,
+        PositionCustodyV1::DelegatorIdentity {
+            delegator_id: signer_id,
+        },
+        StakePositionExitSigner::Delegator {
+            keypair: &keypair,
+            nonce,
+        },
         &chain_id,
     )?;
     finish_op(
@@ -222,7 +257,7 @@ fn run_undelegate(args: &[String]) -> CliResult<()> {
         nonce,
         &node_url,
         &[
-            ("Validator", hex::encode(validator_id.0)),
+            ("Position", hex::encode(position_id.0)),
             (
                 "Note",
                 "UTXO returns after 60 epochs (approximately 30 days)".to_string(),
@@ -571,6 +606,10 @@ fn parse_required_bytes32(args: &[String], flag: &str) -> CliResult<Bytes32> {
     parse_bytes32(flag, &required(args, flag)?)
 }
 
+fn parse_exit_amount(args: &[String]) -> CliResult<u64> {
+    indra_cli::parse_indra_amount_to_spark(&required(args, "--amount")?, "--amount")
+}
+
 fn parse_bytes32(flag: &str, value: &str) -> CliResult<Bytes32> {
     let bytes = hex::decode(value)
         .map_err(|e| CliError::InvalidHex(format!("invalid hex for {}: {}", flag, e)))?;
@@ -623,7 +662,7 @@ fn print_self_stake_help() {
 }
 
 fn print_self_unstake_help() {
-    println!("Usage: indra-stake self-unstake --utxo <utxo_id_hex> [--keys keys.json] [--node url] [--dry-run]");
+    println!("Usage: indra-stake self-unstake --position-id <position_id_hex> --amount <indra> --cold-keys <path> [--keys keys.json] [--cold-keys-password-file path] [--node url] [--dry-run]");
 }
 
 fn print_delegate_help() {
@@ -631,7 +670,7 @@ fn print_delegate_help() {
 }
 
 fn print_undelegate_help() {
-    println!("Usage: indra-stake undelegate --utxo <utxo_id_hex> --validator <validator_hex> [--keys keys.json] [--node url] [--dry-run]");
+    println!("Usage: indra-stake undelegate --position-id <position_id_hex> --amount <indra> [--keys keys.json] [--node url] [--dry-run]");
 }
 
 fn print_claim_rewards_help() {

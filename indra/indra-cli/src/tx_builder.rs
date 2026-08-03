@@ -18,7 +18,8 @@ use indra_core::{
             Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES,
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
         },
-        staking::{StakingBondProof, StakingOp, StakingOpBody},
+        stake_position::PositionCustodyV1,
+        staking::{ColdStakingAuthorization, StakingBondProof, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
@@ -87,6 +88,26 @@ pub struct BuiltStakingOp {
     pub op_hex: String,
     /// SHA-256 of the serialised operation.
     pub op_id: String,
+}
+
+/// Key material and replay namespace for a canonical position exit.
+pub enum StakePositionExitSigner<'a> {
+    /// Ordinary delegator authorization through the staking nonce namespace.
+    Delegator {
+        /// Delegator identity keypair.
+        keypair: &'a HybridKeypair,
+        /// Next ordinary staking nonce.
+        nonce: u64,
+    },
+    /// Validator self-position authorization through the cold-role namespace.
+    ValidatorCold {
+        /// Independent validator cold-role keypair.
+        keypair: &'a ColdHybridKeypair,
+        /// Currently registered cold-key version.
+        cold_key_version: u64,
+        /// Next nonce in that cold-key version's namespace.
+        cold_nonce: u64,
+    },
 }
 
 /// Build and sign a transaction.
@@ -401,24 +422,66 @@ pub fn build_delegate_op(
     )
 }
 
-/// Build and sign an undelegate staking operation.
-pub fn build_undelegate_op(
-    validator_id: Bytes32,
-    bond_utxo_id: Bytes32,
-    delegator_keypair: &HybridKeypair,
-    nonce: u64,
+/// Build and sign a canonical active-position exit.
+pub fn build_exit_stake_position_op(
+    position_id: Bytes32,
+    amount_spark: u64,
+    custody: PositionCustodyV1,
+    signer: StakePositionExitSigner<'_>,
     chain_id: &str,
 ) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::Undelegate {
-            validator_id,
-            bond_utxo_id,
-            delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
-        },
-        delegator_keypair,
-        nonce,
-        chain_id,
-    )
+    match (custody, signer) {
+        (
+            custody @ PositionCustodyV1::DelegatorIdentity { .. },
+            StakePositionExitSigner::Delegator { keypair, nonce },
+        ) => build_signed_staking_op(
+            StakingOpBody::ExitStakePosition {
+                position_id,
+                amount_spark,
+                custody,
+                cold_authorization: None,
+            },
+            keypair,
+            nonce,
+            chain_id,
+        ),
+        (
+            custody @ PositionCustodyV1::ValidatorColdIdentity { .. },
+            StakePositionExitSigner::ValidatorCold {
+                keypair,
+                cold_key_version,
+                cold_nonce,
+            },
+        ) => {
+            let mut op = StakingOp {
+                body: StakingOpBody::ExitStakePosition {
+                    position_id,
+                    amount_spark,
+                    custody,
+                    cold_authorization: Some(ColdStakingAuthorization {
+                        cold_key_version,
+                        cold_nonce,
+                    }),
+                },
+                nonce: 0,
+                signature: dummy_signature()?,
+            };
+            op.validate_structure()
+                .map_err(|e| CliError::Transaction(e.to_string()))?;
+            let message = op
+                .cold_authorization_signing_bytes(chain_id)
+                .map_err(|e| CliError::Transaction(e.to_string()))?
+                .ok_or_else(|| CliError::Transaction("missing cold authorization message".into()))?;
+            let signature = keypair
+                .sign(&message)
+                .map_err(|e| CliError::Crypto(e.to_string()))?;
+            op.signature = wire_hybrid_signature(&signature)?;
+            encode_built_staking_op(op)
+        }
+        _ => Err(CliError::Transaction(
+            "position custody and exit signer role do not match".into(),
+        )),
+    }
 }
 
 /// Build and sign a claim-rewards staking operation.
@@ -503,25 +566,6 @@ pub fn build_update_network_address_op(
     build_signed_staking_op(body, keypair, nonce, chain_id)
 }
 
-/// Build and sign a validator self-unstake operation.
-pub fn build_self_unstake_op(
-    bond_utxo_id: Bytes32,
-    validator_keypair: &HybridKeypair,
-    nonce: u64,
-    chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::SelfUnstake {
-            bond_utxo_id,
-            validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
-            cold_authorization: None,
-        },
-        validator_keypair,
-        nonce,
-        chain_id,
-    )
-}
-
 fn build_signed_staking_op(
     body: StakingOpBody,
     keypair: &HybridKeypair,
@@ -536,12 +580,20 @@ fn build_signed_staking_op(
     let sig = keypair
         .sign(&op.signing_bytes(chain_id))
         .map_err(|e| CliError::Crypto(e.to_string()))?;
-    op.signature = HybridSignature {
+    op.signature = wire_hybrid_signature(&sig)?;
+    encode_built_staking_op(op)
+}
+
+fn wire_hybrid_signature(sig: &indra_crypto::hybrid::HybridSignature) -> CliResult<HybridSignature> {
+    Ok(HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0)
             .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
         pq_sig: VariableBytes::from_slice(&sig.pq.0)
             .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
-    };
+    })
+}
+
+fn encode_built_staking_op(op: StakingOp) -> CliResult<BuiltStakingOp> {
     let op_bytes = op.encode_to_vec();
     Ok(BuiltStakingOp {
         op_hex: hex::encode(&op_bytes),
@@ -828,24 +880,35 @@ mod tests {
     }
 
     #[test]
-    fn build_self_unstake_op_serialises_signed_operation() {
-        let (_, seed, _, _) = make_wallet_with_funds();
-        let pq = PqKeypair::from_seed(&seed).unwrap();
-        let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
-        let bond_utxo_id = Bytes32::from([0xA6; 32]);
-
-        let built = build_self_unstake_op(bond_utxo_id, &keypair, 8, DEFAULT_CHAIN_ID).unwrap();
+    fn build_validator_cold_position_exit_serialises_signed_operation() {
+        let cold = test_cold_keypair(0x73);
+        let validator_id = Bytes32::from([0xA6; 32]);
+        let position_id = Bytes32::from([0xA7; 32]);
+        let built = build_exit_stake_position_op(
+            position_id,
+            700_000,
+            PositionCustodyV1::ValidatorColdIdentity { validator_id },
+            StakePositionExitSigner::ValidatorCold {
+                keypair: &cold,
+                cold_key_version: 2,
+                cold_nonce: 8,
+            },
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
         let bytes = hex::decode(&built.op_hex).unwrap();
         let op = StakingOp::decode_exact(&bytes).unwrap();
 
         assert_eq!(built.op_id.len(), 64);
-        assert_eq!(op.nonce, 8);
+        assert_eq!(op.nonce, 0);
         assert!(matches!(
             op.body,
-            StakingOpBody::SelfUnstake {
-                bond_utxo_id: id,
-                ..
-            } if id == bond_utxo_id
+            StakingOpBody::ExitStakePosition {
+                position_id: id,
+                amount_spark: 700_000,
+                custody: PositionCustodyV1::ValidatorColdIdentity { validator_id: v },
+                cold_authorization: Some(ColdStakingAuthorization { cold_key_version: 2, cold_nonce: 8 }),
+            } if id == position_id && v == validator_id
         ));
     }
 
@@ -903,20 +966,26 @@ mod tests {
     }
 
     #[test]
-    fn build_undelegate_op_serialises_and_decodes() {
+    fn build_delegator_position_exit_serialises_and_decodes() {
         let keypair = test_keypair(0x73);
-        let validator_id = Bytes32::from([0x03; 32]);
-        let bond_utxo_id = Bytes32::from([0x04; 32]);
-        let built = build_undelegate_op(validator_id, bond_utxo_id, &keypair, 11, DEFAULT_CHAIN_ID)
-            .unwrap();
+        let delegator_id = Bytes32::from([0x03; 32]);
+        let position_id = Bytes32::from([0x04; 32]);
+        let built = build_exit_stake_position_op(
+            position_id,
+            400_000,
+            PositionCustodyV1::DelegatorIdentity { delegator_id },
+            StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 11 },
+            DEFAULT_CHAIN_ID,
+        ).unwrap();
         let op = decode_built(&built);
         assert!(matches!(
             op.body,
-            StakingOpBody::Undelegate {
-                validator_id: v,
-                bond_utxo_id: b,
+            StakingOpBody::ExitStakePosition {
+                position_id: id,
+                amount_spark: 400_000,
+                custody: PositionCustodyV1::DelegatorIdentity { delegator_id: d },
                 ..
-            } if v == validator_id && b == bond_utxo_id
+            } if id == position_id && d == delegator_id
         ));
     }
 
@@ -1074,7 +1143,6 @@ mod tests {
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_self_unstake_op(bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_delegate_op(
                 validator_id,
                 bond_utxo_id,
@@ -1084,8 +1152,12 @@ mod tests {
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_undelegate_op(validator_id, bond_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID)
-                .unwrap(),
+            build_exit_stake_position_op(
+                Bytes32::from([0x31; 32]), 1_000,
+                PositionCustodyV1::DelegatorIdentity { delegator_id: validator_id },
+                StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 42 },
+                DEFAULT_CHAIN_ID,
+            ).unwrap(),
             build_claim_rewards_op(validator_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_set_commission_op(validator_id, 1_100, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_set_auto_delegate_op(
@@ -1135,7 +1207,6 @@ mod tests {
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_self_unstake_op(bond_utxo_id, &keypair, 3, DEFAULT_CHAIN_ID).unwrap(),
             build_delegate_op(
                 validator_id,
                 bond_utxo_id,
@@ -1145,7 +1216,12 @@ mod tests {
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_undelegate_op(validator_id, bond_utxo_id, &keypair, 5, DEFAULT_CHAIN_ID).unwrap(),
+            build_exit_stake_position_op(
+                Bytes32::from([0x32; 32]), 1_000,
+                PositionCustodyV1::DelegatorIdentity { delegator_id: validator_id },
+                StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 5 },
+                DEFAULT_CHAIN_ID,
+            ).unwrap(),
             build_claim_rewards_op(validator_id, &keypair, 6, DEFAULT_CHAIN_ID).unwrap(),
             build_set_commission_op(validator_id, 1_200, &keypair, 7, DEFAULT_CHAIN_ID).unwrap(),
             build_set_auto_delegate_op(

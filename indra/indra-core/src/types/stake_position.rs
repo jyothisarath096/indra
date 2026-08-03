@@ -4,8 +4,7 @@ use crate::{
     codec::{ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        crypto::HybridSignature,
-        primitives::{Bytes32, VariableBytes, EPOCH_DURATION_BLOCKS, UNBONDING_PERIOD_EPOCHS},
+        primitives::{Bytes32, EPOCH_DURATION_BLOCKS, UNBONDING_PERIOD_EPOCHS},
         staking::StakingOp,
     },
 };
@@ -21,8 +20,6 @@ pub const UNBONDING_TIMING_FORMAT_V1: u8 = 1;
 pub const UNBONDING_TRANCHE_FORMAT_V1: u8 = 1;
 /// Canonical `PositionCustodyV1` marker.
 pub const POSITION_CUSTODY_FORMAT_V1: u8 = 1;
-/// Canonical `StakePositionExitIntentV1` marker.
-pub const STAKE_POSITION_EXIT_INTENT_FORMAT_V1: u8 = 1;
 
 /// Position-identifier hash domain.
 pub const POSITION_ID_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-v1";
@@ -30,8 +27,8 @@ pub const POSITION_ID_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-v1";
 pub const TRANCHE_ID_DOMAIN_V1: &[u8] = b"INDRA-UNBONDING-TRANCHE-v1";
 /// Staking-operation intent identifier hash domain.
 pub const STAKING_OP_ID_V2_DOMAIN: &[u8] = b"INDRA-STAKING-OP-ID-v2";
-/// Domain for the standalone Stage 2 position-exit authorization.
-pub const STAKE_POSITION_EXIT_SIGNING_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-EXIT-v1";
+/// Synthetic creation identity for protocol-forced eviction tranches.
+pub const EVICTION_TRANCHE_CREATION_DOMAIN_V1: &[u8] = b"INDRA-EVICTION-TRANCHE-CREATION-v1";
 
 const CUSTODY_DELEGATOR: u8 = 1;
 const CUSTODY_VALIDATOR_COLD: u8 = 2;
@@ -513,123 +510,33 @@ impl Decode for UnbondingTrancheV1 {
     }
 }
 
-/// Standalone signed authorization for an isolated position exit.
-///
-/// This intentionally remains outside `StakingOpBody` until the live staking
-/// dispatcher is migrated in a later stage. Its signature binds the chain,
-/// nonce, exact position, exact amount, and immutable custody role.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StakePositionExitIntentV1 {
-    /// Position whose active principal is being reduced.
-    pub position_id: Bytes32,
-    /// Exact amount entering a new immutable tranche.
-    pub amount_spark: u64,
-    /// Custody role that must authorize the exit.
-    pub custody: PositionCustodyV1,
-    /// Monotonic replay-protection nonce in the principal owner's namespace.
-    pub nonce: u64,
-    /// Hybrid signature over `signing_bytes(chain_id)`.
-    pub signature: HybridSignature,
-}
-
-impl StakePositionExitIntentV1 {
-    /// Construct an unsigned intent for signing.
-    pub fn unsigned(
-        position_id: Bytes32,
-        amount_spark: u64,
-        custody: PositionCustodyV1,
-        nonce: u64,
-    ) -> IndraResult<Self> {
-        if amount_spark == 0 {
-            return invalid("position exit amount is zero");
-        }
-        Ok(Self {
-            position_id,
-            amount_spark,
-            custody,
-            nonce,
-            signature: HybridSignature {
-                classical_sig: VariableBytes::default(),
-                pq_sig: VariableBytes::default(),
-            },
-        })
-    }
-
-    /// Canonical bytes covered by the hybrid signature.
-    pub fn signing_bytes(&self, chain_id: &str) -> IndraResult<Vec<u8>> {
-        let chain = chain_id.as_bytes();
-        let chain_len = u16::try_from(chain.len())
-            .map_err(|_| invalid_error("position exit chain ID exceeds u16"))?;
-        let mut bytes = Vec::with_capacity(
-            STAKE_POSITION_EXIT_SIGNING_DOMAIN_V1.len()
-                + 2
-                + chain.len()
-                + 8
-                + 32
-                + 8
-                + self.custody.encoded_len(),
-        );
-        bytes.extend_from_slice(STAKE_POSITION_EXIT_SIGNING_DOMAIN_V1);
-        chain_len.encode(&mut bytes);
-        bytes.extend_from_slice(chain);
-        self.nonce.encode(&mut bytes);
-        self.position_id.encode(&mut bytes);
-        self.amount_spark.encode(&mut bytes);
-        self.custody.encode(&mut bytes);
-        Ok(bytes)
-    }
-
-    /// Stable v2 intent ID, deliberately independent of the signature bytes.
-    pub fn staking_op_id_v2(&self, chain_id: &str) -> IndraResult<Bytes32> {
-        staking_intent_id_v2(&self.signing_bytes(chain_id)?)
-    }
-
-    /// Validate locally decidable structure before signature verification.
-    pub fn validate(&self) -> IndraResult<()> {
-        if self.amount_spark == 0 {
-            return invalid("position exit amount is zero");
-        }
-        Ok(())
-    }
-}
-
-impl Encode for StakePositionExitIntentV1 {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        STAKE_POSITION_EXIT_INTENT_FORMAT_V1.encode(buf);
-        self.position_id.encode(buf);
-        self.amount_spark.encode(buf);
-        self.custody.encode(buf);
-        self.nonce.encode(buf);
-        self.signature.encode(buf);
-    }
-
-    fn encoded_len(&self) -> usize {
-        1 + 32 + 8 + self.custody.encoded_len() + 8 + self.signature.encoded_len()
-    }
-}
-
-impl Decode for StakePositionExitIntentV1 {
-    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
-        require_version(
-            u8::decode(reader)?,
-            STAKE_POSITION_EXIT_INTENT_FORMAT_V1,
-            "StakePositionExitIntentV1",
-        )?;
-        let value = Self {
-            position_id: Bytes32::decode(reader)?,
-            amount_spark: u64::decode(reader)?,
-            custody: PositionCustodyV1::decode(reader)?,
-            nonce: u64::decode(reader)?,
-            signature: HybridSignature::decode(reader)?,
-        };
-        value.validate()?;
-        Ok(value)
-    }
-}
-
 /// Hash the canonical chain-bound signed intent, deliberately excluding its signature.
 pub fn staking_op_id_v2(op: &StakingOp, chain_id: &str) -> IndraResult<Bytes32> {
     staking_intent_id_v2(&op.signing_bytes(chain_id))
+}
+
+/// Derive the canonical synthetic operation identity for one forced eviction tranche.
+pub fn eviction_tranche_creation_id_v1(
+    chain_id: &str,
+    validator_id: Bytes32,
+    eviction_height: u64,
+    position_id: Bytes32,
+    principal_spark: u64,
+) -> IndraResult<Bytes32> {
+    let chain = chain_id.as_bytes();
+    let chain_len = u16::try_from(chain.len())
+        .map_err(|_| invalid_error("eviction tranche chain ID exceeds u16"))?;
+    let mut material = Vec::with_capacity(
+        EVICTION_TRANCHE_CREATION_DOMAIN_V1.len() + 2 + chain.len() + 32 + 8 + 32 + 8,
+    );
+    material.extend_from_slice(EVICTION_TRANCHE_CREATION_DOMAIN_V1);
+    chain_len.encode(&mut material);
+    material.extend_from_slice(chain);
+    validator_id.encode(&mut material);
+    eviction_height.encode(&mut material);
+    position_id.encode(&mut material);
+    principal_spark.encode(&mut material);
+    Ok(Bytes32::from(sha256(&material)))
 }
 
 fn staking_intent_id_v2(signing_bytes: &[u8]) -> IndraResult<Bytes32> {
@@ -1051,38 +958,113 @@ mod tests {
     }
 
     #[test]
-    fn standalone_exit_intent_binds_amount_nonce_position_custody_and_chain() {
+    fn live_exit_operation_binds_amount_nonce_position_custody_and_chain() {
         let custody = PositionCustodyV1::DelegatorIdentity {
             delegator_id: id(2),
         };
-        let mut intent = StakePositionExitIntentV1::unsigned(id(1), 50, custody, 7).unwrap();
-        intent.signature = dummy_signature(3);
-        let baseline = intent.staking_op_id_v2("chain-a").unwrap();
-        let decoded = StakePositionExitIntentV1::decode_exact(&intent.encode_to_vec()).unwrap();
+        let intent = operation(
+            StakingOpBody::ExitStakePosition {
+                position_id: id(1),
+                amount_spark: 50,
+                custody,
+                cold_authorization: None,
+            },
+            7,
+            3,
+        );
+        let baseline = staking_op_id_v2(&intent, "chain-a").unwrap();
+        let decoded = StakingOp::decode_exact(&intent.encode_to_vec()).unwrap();
         assert_eq!(decoded, intent);
-        assert_eq!(decoded.staking_op_id_v2("chain-a").unwrap(), baseline);
+        assert_eq!(staking_op_id_v2(&decoded, "chain-a").unwrap(), baseline);
         let mut signature_changed = intent.clone();
         signature_changed.signature = dummy_signature(4);
         assert_eq!(
-            signature_changed.staking_op_id_v2("chain-a").unwrap(),
+            staking_op_id_v2(&signature_changed, "chain-a").unwrap(),
             baseline
         );
-        assert_ne!(intent.staking_op_id_v2("chain-b").unwrap(), baseline);
+        assert_ne!(staking_op_id_v2(&intent, "chain-b").unwrap(), baseline);
         let mut amount = intent.clone();
-        amount.amount_spark += 1;
-        assert_ne!(amount.staking_op_id_v2("chain-a").unwrap(), baseline);
+        let StakingOpBody::ExitStakePosition { amount_spark, .. } = &mut amount.body else {
+            unreachable!()
+        };
+        *amount_spark += 1;
+        assert_ne!(staking_op_id_v2(&amount, "chain-a").unwrap(), baseline);
         let mut nonce = intent.clone();
         nonce.nonce += 1;
-        assert_ne!(nonce.staking_op_id_v2("chain-a").unwrap(), baseline);
+        assert_ne!(staking_op_id_v2(&nonce, "chain-a").unwrap(), baseline);
         let mut position = intent.clone();
-        position.position_id = id(9);
-        assert_ne!(position.staking_op_id_v2("chain-a").unwrap(), baseline);
+        let StakingOpBody::ExitStakePosition { position_id, .. } = &mut position.body else {
+            unreachable!()
+        };
+        *position_id = id(9);
+        assert_ne!(staking_op_id_v2(&position, "chain-a").unwrap(), baseline);
         let mut other_custody = intent.clone();
-        other_custody.custody = PositionCustodyV1::ValidatorColdIdentity {
+        let StakingOpBody::ExitStakePosition {
+            custody: changed_custody,
+            ..
+        } = &mut other_custody.body
+        else {
+            unreachable!()
+        };
+        *changed_custody = PositionCustodyV1::ValidatorColdIdentity {
             validator_id: id(2),
         };
-        assert_ne!(other_custody.staking_op_id_v2("chain-a").unwrap(), baseline);
-        assert!(StakePositionExitIntentV1::unsigned(id(1), 0, custody, 1).is_err());
+        assert_ne!(
+            staking_op_id_v2(&other_custody, "chain-a").unwrap(),
+            baseline
+        );
+
+        let zero = operation(
+            StakingOpBody::ExitStakePosition {
+                position_id: id(1),
+                amount_spark: 0,
+                custody,
+                cold_authorization: None,
+            },
+            1,
+            1,
+        );
+        assert!(zero.validate_structure().is_err());
+    }
+
+    #[test]
+    fn eviction_creation_id_is_domain_separated_and_field_sensitive() {
+        let base = eviction_tranche_creation_id_v1("chain-a", id(1), 300, id(2), 50).unwrap();
+        assert_ne!(
+            base,
+            eviction_tranche_creation_id_v1("chain-b", id(1), 300, id(2), 50).unwrap()
+        );
+        assert_ne!(
+            base,
+            eviction_tranche_creation_id_v1("chain-a", id(3), 300, id(2), 50).unwrap()
+        );
+        assert_ne!(
+            base,
+            eviction_tranche_creation_id_v1("chain-a", id(1), 301, id(2), 50).unwrap()
+        );
+        assert_ne!(
+            base,
+            eviction_tranche_creation_id_v1("chain-a", id(1), 300, id(4), 50).unwrap()
+        );
+        assert_ne!(
+            base,
+            eviction_tranche_creation_id_v1("chain-a", id(1), 300, id(2), 51).unwrap()
+        );
+        assert_ne!(
+            base,
+            staking_op_id_v2(
+                &operation(
+                    StakingOpBody::UpdateNetworkAddress {
+                        validator_id: id(1),
+                        network_addr: None,
+                    },
+                    300,
+                    1,
+                ),
+                "chain-a"
+            )
+            .unwrap()
+        );
     }
 
     #[test]

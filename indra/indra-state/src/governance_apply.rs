@@ -397,13 +397,13 @@ fn apply_redelegate(
     } else {
         None
     };
-    let entry = state
-        .delegations
-        .get_delegators(from_validator)
-        .iter()
-        .find(|entry| {
-            entry.delegator_id == op.signer_id
-                && active_delegated_bond_stake(state, from_validator, &op.signer_id) > 0
+    state
+        .stake_positions
+        .values()
+        .find(|position| {
+            position.validator_id == *from_validator
+                && position.principal_owner_id == op.signer_id
+                && position.active.is_some()
         })
         .ok_or(StateError::DelegatorNotFound)?;
     let active_stake = active_delegated_bond_stake(state, from_validator, &op.signer_id);
@@ -725,15 +725,18 @@ fn delegation_pubkey(
     validator_id: &Bytes32,
     delegator_id: &Bytes32,
 ) -> StateResult<HybridPubKey> {
+    let has_active_position = state.stake_positions.values().any(|position| {
+        &position.validator_id == validator_id
+            && &position.principal_owner_id == delegator_id
+            && position.active.is_some()
+    });
+    if !has_active_position {
+        return Err(StateError::DelegatorNotFound);
+    }
     state
-        .staked_bonds
-        .values()
-        .find(|bond| {
-            &bond.validator_id == validator_id
-                && &bond.delegator_id == delegator_id
-                && bond.unbonding_end_epoch.is_none()
-        })
-        .and_then(|bond| bond.original_output.owner_pubkey.clone())
+        .delegator_identities
+        .get(delegator_id)
+        .cloned()
         .ok_or(StateError::DelegatorNotFound)
 }
 
@@ -900,7 +903,7 @@ mod tests {
     };
     use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
-    use crate::{delegation::apply_staking_op, validator::StakeBondEntry};
+    use crate::delegation::apply_staking_op;
 
     fn keypair(seed: u8) -> (HybridPubKey, HybridKeypair) {
         let seed = [seed; 32];
@@ -1301,101 +1304,6 @@ mod tests {
         state.governance.proposals.insert(proposal_id, proposal);
     }
 
-    fn install_legacy_redelegation_bond(
-        state: &mut ChainState,
-        bond_utxo_id: Bytes32,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        owner_pubkey: HybridPubKey,
-        amount_spark: u64,
-        byte: u8,
-    ) {
-        let bond = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
-            bond_utxo_id,
-            validator_id,
-            delegator_id,
-            amount_spark,
-            0,
-            deposit_output(owner_pubkey, amount_spark),
-            2,
-            1,
-            2,
-        );
-        assert!(bond.original_output.range_proof.is_none());
-        state.staked_bonds.insert(bond_utxo_id, bond);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, amount_spark, 0)
-            .unwrap_or_else(|err| panic!("legacy redelegation bond {byte:#x} failed: {err}"));
-    }
-
-    fn install_fully_compact_redelegation_bond(
-        state: &mut ChainState,
-        bond_utxo_id: Bytes32,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        owner_pubkey: HybridPubKey,
-        amount_spark: u64,
-    ) {
-        let bond = StakeBondEntry::new_for_test_with_compact_and_pubkey_activation(
-            bond_utxo_id,
-            validator_id,
-            delegator_id,
-            amount_spark,
-            0,
-            deposit_output(owner_pubkey, amount_spark),
-            2,
-            1,
-            2,
-        );
-        assert!(bond.original_output.range_proof.is_none());
-        assert!(bond.original_output.owner_pubkey.is_none());
-        state.staked_bonds.insert(bond_utxo_id, bond);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, amount_spark, 0)
-            .unwrap();
-    }
-
-    #[test]
-    fn governance_redelegation_post_identity_gate_registry_entry_verifies() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xA6; 32]);
-        let to_validator = Bytes32::from([0xA7; 32]);
-        let proposal_id = Bytes32::from([0xA8; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (delegator_pubkey, delegator_keypair) = keypair(0xA9);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x03; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey.clone(),
-            1_000,
-            0x03,
-        );
-        let before_registry = state.delegator_identities.clone();
-
-        let op = redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-
-        apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-
-        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
-        assert_eq!(proposal.redelegations.len(), 1);
-        assert_eq!(state.delegator_identities, before_registry);
-    }
 
     #[test]
     fn active_validator_cold_governance_authorizes_all_discretionary_actions() {
@@ -1880,148 +1788,8 @@ mod tests {
         assert!(first.governance.gov_nonces.get(&active_id).is_none());
     }
 
-    #[test]
-    fn governance_redelegation_post_identity_gate_fully_compact_bond_uses_registry_pubkey() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xA9; 32]);
-        let to_validator = Bytes32::from([0xAA; 32]);
-        let proposal_id = Bytes32::from([0xAB; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (delegator_pubkey, delegator_keypair) = keypair(0xAC);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegator_identities
-            .insert(delegator_id, delegator_pubkey.clone());
-        install_fully_compact_redelegation_bond(
-            &mut state,
-            Bytes32::from([0x33; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey.clone(),
-            1_000,
-        );
 
-        let op = redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
 
-        apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-
-        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
-        assert_eq!(proposal.redelegations.len(), 1);
-        assert_eq!(proposal.redelegations[0].delegator_id, delegator_id);
-    }
-
-    #[test]
-    fn governance_redelegation_post_identity_gate_rejects_unresolvable_identity() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xB4; 32]);
-        let to_validator = Bytes32::from([0xB5; 32]);
-        let proposal_id = Bytes32::from([0xB6; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (delegator_pubkey, delegator_keypair) = keypair(0xB7);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        state
-            .delegations
-            .add_delegation(from_validator, delegator_id, 1_000, 0)
-            .unwrap();
-
-        let op = redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            500,
-            1,
-        );
-        let before = state.clone();
-
-        let err = apply_governance_op(&mut state, &op, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap_err();
-
-        assert!(matches!(
-            err,
-            StateError::InvalidGovernanceOp { reason }
-                if reason.contains("delegator identity is unresolvable")
-        ));
-        assert_eq!(state, before);
-    }
-
-    #[test]
-    fn per_bond_redelegation_accepts_genuinely_active_remainder() {
-        let mut state = ChainState::new_genesis();
-        let from_validator = Bytes32::from([0xC1; 32]);
-        let to_validator = Bytes32::from([0xC2; 32]);
-        let proposal_id = Bytes32::from([0xC3; 32]);
-        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
-        let (delegator_pubkey, delegator_keypair) = keypair(0xC4);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0xC5; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey.clone(),
-            60,
-            0xC5,
-        );
-        install_legacy_redelegation_bond(
-            &mut state,
-            Bytes32::from([0xC6; 32]),
-            from_validator,
-            delegator_id,
-            delegator_pubkey,
-            40,
-            0xC6,
-        );
-        let exiting_id = Bytes32::from([0xC6; 32]);
-        let mut exiting = state.staked_bonds.get(&exiting_id).unwrap().clone();
-        exiting.unbonding_end_epoch = Some(1008);
-        state.staked_bonds.insert(exiting_id, exiting);
-        state
-            .delegations
-            .update_delegator(&from_validator, &delegator_id, |entry| {
-                entry.staked_spark = 60;
-                entry.unbonding_end_epoch = Some(1008);
-            });
-        let op = redelegate_op(
-            delegator_id,
-            &delegator_keypair,
-            proposal_id,
-            from_validator,
-            to_validator,
-            50,
-            1,
-        );
-
-        apply_redelegate(
-            &mut state,
-            &op,
-            &proposal_id,
-            &from_validator,
-            &to_validator,
-            50,
-            false,
-            u64::MAX,
-        )
-        .unwrap();
-        assert_eq!(
-            state
-                .governance
-                .proposals
-                .get(&proposal_id)
-                .unwrap()
-                .redelegations
-                .len(),
-            1
-        );
-    }
 
     #[test]
     fn governance_proposal_rejects_deposit_utxo_not_owned_by_proposer() {

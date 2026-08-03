@@ -16,8 +16,9 @@ use indra_core::{
         },
         stake_position::{
             derive_position_id, derive_tranche_id, ActiveStakeAggregateV1, PositionCustodyV1,
-            StakePositionExitIntentV1, StakePositionV1, UnbondingTimingV1, UnbondingTrancheV1,
+            StakePositionV1, UnbondingTimingV1, UnbondingTrancheV1,
         },
+        staking::{StakingOp, StakingOpBody},
         transaction::OutputV1,
     },
 };
@@ -142,16 +143,26 @@ pub fn deposit_stake_position(
 /// Move authorized active principal into one immutable exact-height tranche.
 pub fn exit_stake_position(
     state: &mut ChainState,
-    intent: &StakePositionExitIntentV1,
+    op: &StakingOp,
     current_height: u64,
 ) -> StateResult<Bytes32> {
-    intent.validate().map_err(invalid_position)?;
+    let StakingOpBody::ExitStakePosition {
+        position_id,
+        amount_spark,
+        custody,
+        ..
+    } = op.body
+    else {
+        return Err(StateError::InvalidStakingOp(
+            "expected stake-position exit operation".into(),
+        ));
+    };
     let position = state
         .stake_positions
-        .get(&intent.position_id)
+        .get(&position_id)
         .cloned()
         .ok_or_else(|| StateError::InvalidStakingOp("unknown stake position".to_string()))?;
-    if intent.custody != position.custody {
+    if custody != position.custody {
         return Err(StateError::InvalidStakingOp(
             "position exit custody does not match position".to_string(),
         ));
@@ -159,35 +170,20 @@ pub fn exit_stake_position(
     let active = position
         .active
         .ok_or_else(|| StateError::InvalidStakingOp("position has no active principal".into()))?;
-    if intent.amount_spark > active.principal_spark {
+    if amount_spark > active.principal_spark {
         return Err(StateError::InvalidStakingOp(
             "position exit exceeds active principal".to_string(),
         ));
     }
-    let remaining = active.principal_spark - intent.amount_spark;
+    let remaining = active.principal_spark - amount_spark;
     if remaining != 0 && remaining < DUST_LIMIT_SPARK {
         return Err(StateError::BelowDustLimit {
             limit: DUST_LIMIT_SPARK,
         });
     }
-    let expected_nonce = state
-        .staking_nonces
-        .get(&position.principal_owner_id)
-        .copied()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| StateError::InvalidStakingOp("position nonce overflow".to_string()))?;
-    if intent.nonce != expected_nonce {
-        return Err(StateError::StakingNonceInvalid {
-            expected: expected_nonce,
-            got: intent.nonce,
-        });
-    }
-    verify_exit_authorization(state, &position, intent)?;
     preflight_exit_capacity(state, &position, remaining == 0)?;
 
-    let creation_op_id = intent
-        .staking_op_id_v2(&state.chain_id)
+    let creation_op_id = indra_core::types::stake_position::staking_op_id_v2(op, &state.chain_id)
         .map_err(invalid_position)?;
     let timing = UnbondingTimingV1::height_precise(current_height).map_err(invalid_position)?;
     let tranche_id = derive_tranche_id(
@@ -195,7 +191,7 @@ pub fn exit_stake_position(
         creation_op_id,
         0,
         timing,
-        intent.amount_spark,
+        amount_spark,
     );
     if state.unbonding_tranches.contains_key(&tranche_id) {
         return Err(StateError::InvalidStakingOp(
@@ -206,15 +202,15 @@ pub fn exit_stake_position(
         chain_id: state.chain_id.as_bytes(),
         position_id: position.position_id.0,
         tranche_id: tranche_id.0,
-        principal_spark: intent.amount_spark,
+        principal_spark: amount_spark,
         start_height: current_height,
         creation_op_id: creation_op_id.0,
     })
     .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
-    let source_commitment = indra_crypto::commit(intent.amount_spark, &source_blinding);
+    let source_commitment = indra_crypto::commit(amount_spark, &source_blinding);
     let tranche = UnbondingTrancheV1::new(
         position.position_id,
-        intent.amount_spark,
+        amount_spark,
         source_commitment,
         timing,
         position.custody,
@@ -227,7 +223,6 @@ pub fn exit_stake_position(
             message: "precomputed tranche ID differs from canonical tranche",
         });
     }
-    let principal_owner_id = position.principal_owner_id;
     let mut updated_position = position;
     updated_position.active = if remaining == 0 {
         None
@@ -242,11 +237,42 @@ pub fn exit_stake_position(
         )
     };
 
+    let updated_validator = match updated_position.custody {
+        PositionCustodyV1::ValidatorColdIdentity { validator_id } => {
+            let mut validator = state
+                .validators
+                .get(&validator_id)
+                .cloned()
+                .ok_or(StateError::ValidatorNotFound)?;
+            validator.stake_spark = validator.stake_spark.checked_sub(amount_spark).ok_or(
+                StateError::InvariantViolation {
+                    message: "self-position exit exceeds validator stake cache",
+                },
+            )?;
+            if validator.status == crate::validator::ValidatorStatus::Active
+                && validator.stake_spark
+                    < indra_core::types::primitives::MINIMUM_ACTIVE_SELF_STAKE_SPARK
+            {
+                validator.status = crate::validator::ValidatorStatus::Registered;
+            }
+            Some(validator)
+        }
+        PositionCustodyV1::DelegatorIdentity { .. } => None,
+    };
     let mut txn = StateTxn::begin(state, current_height);
+    txn.snapshot_staking_scope();
     txn.ensure_state_commitment_v2()?;
     txn.put_stake_position(updated_position)?;
     txn.put_unbonding_tranche(tranche)?;
-    txn.set_position_nonce(principal_owner_id, expected_nonce)?;
+    if let Some(validator) = updated_validator {
+        txn.state_mut()
+            .validators
+            .upsert(validator.clone())
+            ?;
+        if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
+            commitment.put_validator(&validator, current_height);
+        }
+    }
     txn.commit();
     Ok(tranche_id)
 }
@@ -334,34 +360,72 @@ pub fn release_matured_position_tranches(
                         .tranche_ids_for_position(&tranche.position_id)
                         .is_empty()
             });
+        let tombstone_owner = txn
+            .state()
+            .evicted_validator_tombstones
+            .iter()
+            .find(|(_, tombstone)| {
+                tombstone
+                    .retained_tranche_ids
+                    .binary_search(&tranche.tranche_id)
+                    .is_ok()
+            })
+            .map(|(validator_id, _)| *validator_id);
+        if let Some(validator_id) = tombstone_owner {
+            let mut tombstone = txn
+                .state()
+                .evicted_validator_tombstones
+                .get(&validator_id)
+                .cloned()
+                .ok_or(StateError::InvariantViolation {
+                    message: "mature tranche tombstone disappeared",
+                })?;
+            let has_other_retained = tombstone.retained_tranche_ids.iter().any(|id| {
+                *id != tranche.tranche_id
+                    && txn
+                        .state()
+                        .unbonding_tranches
+                        .get(id)
+                        .is_some_and(|other| other.position_id == tranche.position_id)
+            });
+            crate::tranche_tombstone::clear_matured_tranche_reference_v2(
+                &mut tombstone,
+                tranche.tranche_id,
+                tranche.position_id,
+                remove_position,
+                has_other_retained,
+            )?;
+            txn.state_mut()
+                .evicted_validator_tombstones
+                .insert(validator_id, tombstone.clone());
+            if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
+                commitment.put_evicted_validator_tombstone(&tombstone);
+            }
+        }
         if remove_position {
             txn.delete_stake_position(&tranche.position_id)?;
         }
     }
+    let current_epoch = release_height / indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+    let prunable = txn
+        .state()
+        .evicted_validator_tombstones
+        .iter()
+        .filter(|(_, tombstone)| {
+            crate::tranche_tombstone::tombstone_is_prunable_v2(tombstone, current_epoch)
+        })
+        .map(|(validator_id, _)| *validator_id)
+        .collect::<Vec<_>>();
+    for validator_id in prunable {
+        txn.state_mut()
+            .evicted_validator_tombstones
+            .remove(&validator_id);
+        if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
+            commitment.delete_evicted_validator_tombstone(&validator_id);
+        }
+    }
     txn.commit();
     Ok(output_ids)
-}
-
-fn verify_exit_authorization(
-    state: &ChainState,
-    position: &StakePositionV1,
-    intent: &StakePositionExitIntentV1,
-) -> StateResult<()> {
-    let public = resolve_position_owner(state, position)?
-        .to_crypto_pubkey()
-        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-    let signature = intent
-        .signature
-        .to_crypto_sig()
-        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-    let signing_bytes = intent
-        .signing_bytes(&state.chain_id)
-        .map_err(invalid_position)?;
-    indra_crypto::verify_hybrid(&signing_bytes, &signature, &public).map_err(|error| {
-        StateError::StakingOpSignatureInvalid {
-            reason: error.to_string(),
-        }
-    })
 }
 
 fn resolve_position_owner(
@@ -375,19 +439,26 @@ fn resolve_position_owner(
             .cloned()
             .ok_or_else(|| StateError::InvalidStakingOp("missing delegator identity".to_string())),
         PositionCustodyV1::ValidatorColdIdentity { validator_id } => {
-            let validator = state
-                .validators
-                .get(&validator_id)
-                .ok_or(StateError::ValidatorNotFound)?;
-            let classical = validator.cold_hybrid_classical_pk.ok_or_else(|| {
-                StateError::InvalidStakingOp("missing validator cold identity".to_string())
-            })?;
-            let pq = validator.cold_hybrid_pq_pk.as_ref().ok_or_else(|| {
-                StateError::InvalidStakingOp("missing validator cold identity".to_string())
-            })?;
+            let (classical, pq) = if let Some(validator) = state.validators.get(&validator_id) {
+                (
+                    validator.cold_hybrid_classical_pk.ok_or_else(|| {
+                        StateError::InvalidStakingOp("missing validator cold identity".to_string())
+                    })?,
+                    validator.cold_hybrid_pq_pk.clone().ok_or_else(|| {
+                        StateError::InvalidStakingOp("missing validator cold identity".to_string())
+                    })?,
+                )
+            } else {
+                let cold = state
+                    .evicted_validator_tombstones
+                    .get(&validator_id)
+                    .and_then(|tombstone| tombstone.cold_custody.as_ref())
+                    .ok_or(StateError::ValidatorNotFound)?;
+                (cold.classical_pk, cold.pq_pk)
+            };
             Ok(HybridPubKey {
                 classical_pk: Bytes32::from(classical),
-                pq_pk: VariableBytes::from_slice(pq).map_err(|_| {
+                pq_pk: VariableBytes::from_slice(&pq).map_err(|_| {
                     StateError::InvalidStakingOp("invalid validator cold identity".to_string())
                 })?,
             })
@@ -646,18 +717,25 @@ mod tests {
         owner_id: Bytes32,
         amount: u64,
         nonce: u64,
-    ) -> StakePositionExitIntentV1 {
+    ) -> StakingOp {
         let custody = PositionCustodyV1::DelegatorIdentity {
             delegator_id: owner_id,
         };
-        let mut intent =
-            StakePositionExitIntentV1::unsigned(position_id, amount, custody, nonce).unwrap();
-        intent.signature = wire_signature(
-            &keys
-                .sign(&intent.signing_bytes(&state.chain_id).unwrap())
-                .unwrap(),
-        );
-        intent
+        let mut op = StakingOp {
+            body: StakingOpBody::ExitStakePosition {
+                position_id,
+                amount_spark: amount,
+                custody,
+                cold_authorization: None,
+            },
+            nonce,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::default(),
+                pq_sig: VariableBytes::default(),
+            },
+        };
+        op.signature = wire_signature(&keys.sign(&op.signing_bytes(&state.chain_id)).unwrap());
+        op
     }
 
     #[test]
@@ -778,10 +856,9 @@ mod tests {
             .unwrap()
             .active
             .is_none());
-        assert_eq!(
-            state.tranche_ids_for_position(&position_id),
-            &[first, second]
-        );
+        let mut expected_ids = vec![first, second];
+        expected_ids.sort();
+        assert_eq!(state.tranche_ids_for_position(&position_id), expected_ids);
 
         let end_epoch = match frozen.timing {
             UnbondingTimingV1::HeightPrecise { end_epoch, .. } => end_epoch,

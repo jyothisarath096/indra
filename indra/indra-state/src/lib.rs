@@ -50,6 +50,7 @@ pub mod smt;
 pub mod stake_positions;
 pub mod state_commitment;
 pub mod state_root;
+pub mod tranche_tombstone;
 pub(crate) mod txn;
 pub mod utxo;
 pub mod validator;
@@ -63,8 +64,8 @@ pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
 pub use governance_apply::apply_governance_op;
 pub use identity::{
-    resolve_and_check_identity, resolve_bond_owner_pubkey,
-    resolve_delegator_identity_for_redelegation, IdentityCheckOutcome, IdentityError,
+    resolve_and_check_identity, resolve_delegator_identity_for_redelegation,
+    IdentityCheckOutcome, IdentityError,
 };
 pub use nullifier::NullifierSet;
 pub use persistent::{
@@ -80,11 +81,15 @@ pub use stake_positions::{
 };
 pub use state_commitment::StateCommitmentV2;
 pub use state_root::{compute_state_root, compute_state_roots, compute_validator_set_root};
+pub use tranche_tombstone::{
+    clear_matured_tranche_reference_v2, first_representable_tranche_eviction_v2,
+    plan_tranche_native_eviction_v2, slashable_self_targets_v2, tombstone_is_prunable_v2,
+    validate_all_tombstone_references_v2, validate_tombstone_references_v2, TombstoneAuthorityV2,
+    TrancheEvictionPlanV2,
+};
 pub use utxo::{UtxoEntry, UtxoSet};
 pub use validator::{
-    validate_new_validator_cold_key, validate_validator_cold_key, EvictedBondReferenceV1,
-    EvictedColdCustodyV1, EvictedValidatorTombstoneV1, StakeBondCustodyOwner, ValidatedColdKey,
-    ValidatorEntry, ValidatorSet, ValidatorStatus, MAX_RETAINED_BOND_REFERENCES_PER_TOMBSTONE,
-    MAX_TOTAL_RETAINED_BOND_REFERENCES,
+    validate_new_validator_cold_key, validate_validator_cold_key, EvictedColdCustodyV1,
+    ValidatedColdKey, ValidatorEntry, ValidatorSet, ValidatorStatus,
 };
-pub use validator::{DelegationReturnEvent, DelegationReturnReason, DelegatorEntry};
+pub use validator::{DelegationReturnEvent, DelegationReturnReason};

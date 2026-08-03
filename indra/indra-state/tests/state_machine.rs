@@ -68,7 +68,6 @@ fn signed_staking_op(
     let cold_designated = matches!(
         body,
         StakingOpBody::SelfStake { .. }
-            | StakingOpBody::SelfUnstake { .. }
             | StakingOpBody::SetAutoDelegate { .. }
             | StakingOpBody::ClaimRewards { .. }
     );
@@ -78,20 +77,9 @@ fn signed_staking_op(
             cold_nonce: nonce,
         });
         match &mut body {
-            StakingOpBody::SelfStake {
-                cold_authorization, ..
-            }
-            | StakingOpBody::SelfUnstake {
-                cold_authorization, ..
-            }
-            | StakingOpBody::ClaimRewards {
-                cold_authorization, ..
-            } => {
-                *cold_authorization = authorization;
-            }
-            StakingOpBody::SetAutoDelegate {
-                cold_authorization, ..
-            } => {
+            StakingOpBody::SelfStake { cold_authorization, .. }
+            | StakingOpBody::ClaimRewards { cold_authorization, .. }
+            | StakingOpBody::SetAutoDelegate { cold_authorization, .. } => {
                 *cold_authorization = authorization;
             }
             _ => unreachable!(),
@@ -113,6 +101,7 @@ fn signed_staking_op(
     };
     op
 }
+
 
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
@@ -758,99 +747,6 @@ fn chain_is_deterministic() {
     }
 }
 
-#[test]
-fn test_self_stake_full_lifecycle() {
-    let mut state = finalized_genesis();
-    let (validator_id, validator_pubkey, validator_keypair) =
-        install_validator(&mut state, [0x41; 32]);
-    let output = make_output(0x40, validator_pubkey.clone());
-    let bond_value = output.value_spark;
-    let bond_utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
-
-    let stake_op = signed_staking_op(
-        StakingOpBody::SelfStake {
-            bond_utxo_id,
-            validator_pubkey: validator_pubkey.clone(),
-            bond_proof: Some(indra_core::types::staking::StakingBondProof {
-                committed_value_spark: bond_value,
-                blinding_factor: Bytes32::from([0x40; 32]),
-            }),
-            cold_authorization: None,
-        },
-        1,
-        &validator_keypair,
-        &state.chain_id,
-    );
-    let mut stake_block = make_block(&state, vec![]);
-    stake_block.staking_ops = vec![stake_op];
-    apply_block(&mut state, &stake_block, 0).unwrap();
-
-    assert!(!state.utxos.contains(&bond_utxo_id));
-    assert_eq!(
-        state.validators.get(&validator_id).unwrap().stake_spark,
-        bond_value
-    );
-    assert_eq!(
-        state.staked_bonds.get(&bond_utxo_id).unwrap().delegator_id,
-        validator_id
-    );
-
-    let unstake_op = signed_staking_op(
-        StakingOpBody::SelfUnstake {
-            bond_utxo_id,
-            validator_pubkey,
-            cold_authorization: None,
-        },
-        2,
-        &validator_keypair,
-        &state.chain_id,
-    );
-    let mut unstake_block = make_block(&state, vec![]);
-    unstake_block.staking_ops = vec![unstake_op];
-    apply_block(&mut state, &unstake_block, 0).unwrap();
-
-    assert_eq!(state.validators.get(&validator_id).unwrap().stake_spark, 0);
-    assert_eq!(
-        state
-            .staked_bonds
-            .get(&bond_utxo_id)
-            .unwrap()
-            .unbonding_end_epoch,
-        Some(UNBONDING_PERIOD_EPOCHS)
-    );
-
-    // The real 21-day unbonding period matures at height 302,400, after cold-key
-    // enforcement. Model enrollment during that long unbonding window so this
-    // test covers normal self-stake release rather than the separately-tested
-    // unenrolled-custody freeze. The height-1/2 operations above intentionally
-    // remain legacy hot-authorized operations.
-    let cold_keypair = ColdHybridKeypair::from_independent_seeds([0x42; 32], [0x43; 32]).unwrap();
-    let cold_public = cold_keypair.public_key();
-    let cold_public = cold_public.as_complete_hybrid();
-    let validator = state.validators.get_mut(&validator_id).unwrap();
-    validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
-    validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
-    validator.cold_key_version = 1;
-
-    apply_epoch_transition(
-        &mut state,
-        &EpochTransitionContext::new(
-            (UNBONDING_PERIOD_EPOCHS).saturating_mul(EPOCH_DURATION_BLOCKS),
-            (UNBONDING_PERIOD_EPOCHS)
-                .saturating_mul(EPOCH_DURATION_BLOCKS)
-                .saturating_sub(1),
-        )
-        .unwrap(),
-        0,
-    )
-    .unwrap();
-    assert!(!state.staked_bonds.contains_key(&bond_utxo_id));
-    assert_eq!(state.utxos.len(), 1);
-    assert!(state
-        .utxos
-        .all_entries()
-        .any(|entry| entry.output.value_spark == bond_value));
-}
 
 #[test]
 fn test_auto_delegate_full_lifecycle() {
@@ -866,6 +762,13 @@ fn test_auto_delegate_full_lifecycle() {
 
     let target_id = validators[0].0;
     let inactive_id = validators[20].0;
+    let inactive_position_id = indra_core::types::stake_position::derive_position_id(
+        inactive_id,
+        inactive_id,
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id: inactive_id,
+        },
+    );
     let inactive_pubkey = validators[20].1.clone();
     let inactive_keypair = &validators[20].2;
     let chain_id = state.chain_id.clone();
@@ -897,12 +800,20 @@ fn test_auto_delegate_full_lifecycle() {
             0,
         )
         .unwrap();
-        let rewards = state.validators.get(&inactive_id).unwrap().pending_rewards;
+        let rewards = state
+            .stake_positions
+            .get(&inactive_position_id)
+            .unwrap()
+            .pending_rewards_spark;
         assert!(rewards > previous_rewards);
         previous_rewards = rewards;
     }
 
-    let claimed = state.validators.get(&inactive_id).unwrap().pending_rewards;
+    let claimed = state
+        .stake_positions
+        .get(&inactive_position_id)
+        .unwrap()
+        .pending_rewards_spark;
     assert!(claimed >= DUST_LIMIT_SPARK);
     let utxos_before = state.utxos.len();
     let chain_id = state.chain_id.clone();
@@ -921,7 +832,11 @@ fn test_auto_delegate_full_lifecycle() {
     apply_block(&mut state, &claim_block, 0).unwrap();
 
     assert_eq!(
-        state.validators.get(&inactive_id).unwrap().pending_rewards,
+        state
+            .stake_positions
+            .get(&inactive_position_id)
+            .unwrap()
+            .pending_rewards_spark,
         0
     );
     assert_eq!(state.utxos.len(), utxos_before + 1);

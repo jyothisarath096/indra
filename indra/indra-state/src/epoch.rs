@@ -35,29 +35,17 @@ use rand::SeedableRng;
 
 use crate::{
     chain::ChainState,
-    delegation::reconcile_delegator_from_bonds,
     error::StateResult,
     governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
         GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS, MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS,
     },
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
-    identity::resolve_bond_owner_pubkey,
     validator::{DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
 };
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
 pub const EPOCHS_PER_YEAR: u64 = BLOCKS_PER_YEAR / EPOCH_DURATION_BLOCKS;
-
-#[derive(Debug, Clone, Copy)]
-struct AutoDelegationSnapshot {
-    delegator_id: Bytes32,
-    target_id: Bytes32,
-    amount_spark: u64,
-    previous_staked_spark: u64,
-    previous_pending_rewards: u64,
-    had_existing_entry: bool,
-}
 
 /// Immutable, derived facts for one epoch-boundary state transition.
 ///
@@ -192,13 +180,7 @@ fn apply_epoch_transition_final(
     let epoch_block_reward =
         block_rewards_for_inclusive_range(context.closing_start_height, context.closing_end_height);
 
-    state
-        .validators
-        .select_active_set(&state.delegations, total_staked, height);
-
-    reconcile_all_delegators_from_bonds(state);
-    let virtual_delegations = Vec::new();
-
+    state.validators.select_active_set(total_staked, height);
     let supply_before = state.total_supply;
     distribute_block_rewards(state, epoch_block_reward, current_epoch, height)?;
 
@@ -215,14 +197,13 @@ fn apply_epoch_transition_final(
 
     distribute_fee_rewards(state, current_epoch, height)?;
     let fee_rewards_distributed = fee_pool_before.saturating_sub(state.fee_reward_pool);
-    remove_auto_delegations(state, &virtual_delegations, current_epoch, height);
     // This boundary pays the epoch that just elapsed. Activate a due
     // commission only after both reward sources and virtual auto-delegation
     // accounting have used the rate that governed that elapsed epoch.
     apply_pending_commission_changes(state, current_epoch);
     state.validators.expire_stale_rewards(current_epoch);
     release_unbonded_validators(state, current_epoch);
-    release_unbonded_bonds_at_height(state, current_epoch, height)?;
+    crate::stake_positions::release_matured_position_tranches(state, height)?;
     let liveness_epoch = context.closing_epoch;
     let closing_members = closing_snapshot
         .entries()
@@ -285,22 +266,6 @@ fn apply_epoch_transition_final(
     state.epoch_slash_event_count = 0;
     state.rebuild_state_commitment_v2(height);
     Ok(record)
-}
-
-fn reconcile_all_delegators_from_bonds(state: &mut ChainState) {
-    let positions: Vec<(Bytes32, Bytes32)> = state
-        .delegations
-        .all_delegators()
-        .flat_map(|(validator_id, entries)| {
-            entries
-                .iter()
-                .map(|entry| (*validator_id, entry.delegator_id))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    for (validator_id, delegator_id) in positions {
-        reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
-    }
 }
 
 fn block_rewards_for_inclusive_range(start_height: u64, end_height: u64) -> u64 {
@@ -549,15 +514,15 @@ pub fn take_governance_snapshot(state: &ChainState) -> GovernanceSnapshot {
             ValidatorStatus::Active | ValidatorStatus::Registered
         ) {
             let delegated = state
-                .delegations
-                .get_delegators(&validator.validator_id)
-                .iter()
-                .fold(0u64, |sum, entry| {
-                    sum.saturating_add(crate::delegation::active_delegated_bond_stake(
-                        state,
-                        &validator.validator_id,
-                        &entry.delegator_id,
-                    ))
+                .stake_positions
+                .values()
+                .filter(|position| {
+                    position.validator_id == validator.validator_id
+                        && position.principal_owner_id != validator.validator_id
+                })
+                .filter_map(|position| position.active)
+                .fold(0u64, |sum, active| {
+                    sum.saturating_add(active.principal_spark)
                 });
             let weight = validator.stake_spark.saturating_add(delegated);
             if weight > 0 {
@@ -656,122 +621,6 @@ pub fn tally_votes(proposal: &ProposalRecord) -> (u64, u64, u64) {
     (yes, no, abstain)
 }
 
-fn apply_auto_delegations(
-    state: &mut ChainState,
-    current_epoch: u64,
-) -> Vec<AutoDelegationSnapshot> {
-    let mut virtual_delegations: Vec<(Bytes32, Bytes32, u64)> = state
-        .validators
-        .all_validators()
-        .filter(|v| {
-            matches!(v.status, ValidatorStatus::Registered)
-                && v.auto_delegate_to.is_some()
-                && v.stake_spark > 0
-        })
-        .filter_map(|v| {
-            let target_id = v.auto_delegate_to?;
-            let target = state.validators.get(&target_id)?;
-            if !target.is_active() {
-                return None;
-            }
-            Some((v.validator_id, target_id, v.stake_spark))
-        })
-        .collect();
-    virtual_delegations.sort_by_key(|(delegator_id, target_id, _)| (target_id.0, delegator_id.0));
-
-    let mut snapshots = Vec::with_capacity(virtual_delegations.len());
-    for (delegator_id, target_id, amount_spark) in &virtual_delegations {
-        let (previous_staked_spark, previous_pending_rewards, had_existing_entry) = state
-            .delegations
-            .get_delegators(target_id)
-            .iter()
-            .find(|entry| entry.delegator_id == *delegator_id)
-            .map(|entry| (entry.staked_spark, entry.pending_rewards, true))
-            .unwrap_or((0, 0, false));
-        if let Err(reason) = state.delegations.add_delegation(
-            *target_id,
-            *delegator_id,
-            *amount_spark,
-            current_epoch,
-        ) {
-            eprintln!(
-                "[epoch] auto-delegation skipped: validator {} -> {} ({})",
-                hex::encode(&delegator_id.0[..4]),
-                hex::encode(&target_id.0[..4]),
-                reason,
-            );
-            continue;
-        }
-        snapshots.push(AutoDelegationSnapshot {
-            delegator_id: *delegator_id,
-            target_id: *target_id,
-            amount_spark: *amount_spark,
-            previous_staked_spark,
-            previous_pending_rewards,
-            had_existing_entry,
-        });
-        eprintln!(
-            "[epoch] auto-delegation: validator {} -> {} ({} Spark)",
-            hex::encode(&delegator_id.0[..4]),
-            hex::encode(&target_id.0[..4]),
-            amount_spark,
-        );
-    }
-
-    snapshots
-}
-
-fn remove_auto_delegations(
-    state: &mut ChainState,
-    virtual_delegations: &[AutoDelegationSnapshot],
-    current_epoch: u64,
-    height: u64,
-) {
-    for snapshot in virtual_delegations {
-        let accumulated = state
-            .delegations
-            .get_delegator_reward(&snapshot.target_id, &snapshot.delegator_id);
-        let reward_delta = accumulated.saturating_sub(snapshot.previous_pending_rewards);
-        let total_staked = snapshot
-            .previous_staked_spark
-            .saturating_add(snapshot.amount_spark);
-        let virtual_reward = if total_staked == 0 {
-            0
-        } else {
-            proportional_reward(reward_delta, snapshot.amount_spark, total_staked, height)
-        };
-        if virtual_reward > 0 {
-            if let Some(v) = state.validators.get_mut(&snapshot.delegator_id) {
-                v.pending_rewards = v.pending_rewards.saturating_add(virtual_reward);
-                v.rewards_last_epoch = current_epoch;
-            }
-            eprintln!(
-                "[epoch] auto-delegation reward: validator {} earned {} Spark",
-                hex::encode(&snapshot.delegator_id.0[..4]),
-                virtual_reward,
-            );
-        }
-        if snapshot.had_existing_entry {
-            let _ = state.delegations.update_delegator(
-                &snapshot.target_id,
-                &snapshot.delegator_id,
-                |entry| {
-                    let real_reward = reward_delta.saturating_sub(virtual_reward);
-                    entry.staked_spark = snapshot.previous_staked_spark;
-                    entry.pending_rewards = snapshot
-                        .previous_pending_rewards
-                        .saturating_add(real_reward);
-                    entry.rewards_last_epoch = current_epoch;
-                },
-            );
-        } else {
-            state
-                .delegations
-                .remove_virtual_delegation(&snapshot.target_id, &snapshot.delegator_id);
-        }
-    }
-}
-
 fn saturation_adjusted_reward(
     raw_reward: u64,
     validator_stake: u64,
@@ -807,82 +656,13 @@ fn distribute_block_rewards(
 ) -> crate::error::StateResult<()> {
     #[cfg(test)]
     install_reward_basis_if_missing(state)?;
-    return distribute_snapshot_rewards(
+    distribute_snapshot_rewards(
         state,
         epoch_block_reward,
         current_epoch,
         height,
         SnapshotRewardSource::Block,
-    );
-    #[allow(unreachable_code)]
-    // Rewards are weighted by active validator self-stake, matching consensus
-    // voting weight and active-set selection. Delegations only split a
-    // validator's already-earned reward pool between validator and delegators.
-    let total_stake = state.validators.total_active_stake();
-    if total_stake == 0 || epoch_block_reward == 0 {
-        return Ok(());
-    }
-
-    let mut active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
-        .validators
-        .active_validators()
-        .map(|v| (v.validator_id, v.stake_spark))
-        .collect();
-    active.sort_by_key(|(id, _)| id.0);
-    let active_validator_count = active.len() as u64;
-    let mut distributed = 0u64;
-
-    for (id, stake) in &active {
-        let raw_reward = proportional_reward(epoch_block_reward, *stake, total_stake, height);
-        let adjusted_reward = saturation_adjusted_reward(
-            raw_reward,
-            *stake,
-            total_stake,
-            active_validator_count,
-            height,
-        );
-
-        let commission_bps = state
-            .validators
-            .get(id)
-            .map(|v| v.commission_bps)
-            .unwrap_or(1_000);
-        eprintln!(
-            "[epoch] validator {} reward={} Spark commission={}bps",
-            hex::encode(&id.0[..4]),
-            adjusted_reward,
-            commission_bps,
-        );
-        let delegated = state.delegations.total_delegated(id);
-
-        let (validator_share, delegator_pool) = if delegated == 0 {
-            (adjusted_reward, 0)
-        } else {
-            let commission = bps_of(adjusted_reward, commission_bps);
-            (commission, adjusted_reward.saturating_sub(commission))
-        };
-
-        if let Some(entry) = state.validators.get_mut(id) {
-            entry.pending_rewards = entry.pending_rewards.saturating_add(validator_share);
-            entry.rewards_last_epoch = current_epoch;
-            distributed = distributed.saturating_add(validator_share);
-        }
-
-        let remainder =
-            state
-                .delegations
-                .distribute_rewards(id, delegator_pool, current_epoch, height);
-        distributed = distributed.saturating_add(delegator_pool.saturating_sub(remainder));
-    }
-
-    // Monetary policy for block-reward dust: any deterministic remainder
-    // from proportional rounding, saturation adjustment, or delegator reward
-    // splitting is routed to treasury. Rewards are pre-minted, so this does
-    // not increase total_supply; it only makes formerly-unallocated dust
-    // explicit and auditable.
-    let reward_remainder = epoch_block_reward.saturating_sub(distributed);
-    state.treasury_balance = state.treasury_balance.saturating_add(reward_remainder);
-    Ok(())
+    )
 }
 
 fn distribute_fee_rewards(
@@ -892,78 +672,22 @@ fn distribute_fee_rewards(
 ) -> crate::error::StateResult<()> {
     #[cfg(test)]
     install_reward_basis_if_missing(state)?;
-    {
-        let fee_pool = state.fee_reward_pool;
-        if fee_pool == 0 {
-            return Ok(());
-        }
-        state.fee_reward_pool = 0;
-        let result = distribute_snapshot_rewards(
-            state,
-            fee_pool,
-            current_epoch,
-            height,
-            SnapshotRewardSource::Fee,
-        );
-        if result.is_err() {
-            state.fee_reward_pool = fee_pool;
-        }
-        return result;
-    }
     let fee_pool = state.fee_reward_pool;
     if fee_pool == 0 {
         return Ok(());
     }
-
-    // Fee rewards use the same self-stake weighting as block rewards.
-    let total_stake = state.validators.total_active_stake();
-    if total_stake == 0 {
-        return Ok(());
-    }
-
     state.fee_reward_pool = 0;
-
-    let mut active: Vec<(indra_core::types::primitives::Bytes32, u64)> = state
-        .validators
-        .active_validators()
-        .map(|v| (v.validator_id, v.stake_spark))
-        .collect();
-    active.sort_by_key(|(id, _)| id.0);
-
-    let mut distributed = 0u64;
-
-    for (id, stake) in &active {
-        let reward = proportional_reward(fee_pool, *stake, total_stake, height);
-        let commission_bps = state
-            .validators
-            .get(id)
-            .map(|v| v.commission_bps)
-            .unwrap_or(1_000);
-        let delegated = state.delegations.total_delegated(id);
-
-        let (validator_share, delegator_pool) = if delegated == 0 {
-            (reward, 0)
-        } else {
-            let commission = bps_of(reward, commission_bps);
-            (commission, reward.saturating_sub(commission))
-        };
-
-        if let Some(entry) = state.validators.get_mut(id) {
-            entry.pending_rewards = entry.pending_rewards.saturating_add(validator_share);
-            entry.rewards_last_epoch = current_epoch;
-            distributed = distributed.saturating_add(validator_share);
-        }
-
-        let remainder =
-            state
-                .delegations
-                .distribute_rewards(id, delegator_pool, current_epoch, height);
-        distributed = distributed.saturating_add(delegator_pool.saturating_sub(remainder));
+    let result = distribute_snapshot_rewards(
+        state,
+        fee_pool,
+        current_epoch,
+        height,
+        SnapshotRewardSource::Fee,
+    );
+    if result.is_err() {
+        state.fee_reward_pool = fee_pool;
     }
-
-    let remainder = fee_pool.saturating_sub(distributed);
-    state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder);
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -1017,55 +741,39 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
     if !active_ids.is_empty()
         && (state.consensus_snapshots.is_empty() || active_ids != snapshot_ids)
     {
-        let positions: Vec<_> = state
-            .delegations
-            .all_delegators()
-            .flat_map(|(validator_id, entries)| {
-                entries
-                    .iter()
-                    .filter(|entry| entry.unbonding_end_epoch.is_none())
-                    .map(|entry| (*validator_id, entry.delegator_id, entry.staked_spark))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for (index, (validator_id, delegator_id, amount)) in positions.into_iter().enumerate() {
-            if state.staked_bonds.values().any(|bond| {
-                bond.validator_id == validator_id
-                    && bond.delegator_id == delegator_id
-                    && bond.unbonding_end_epoch.is_none()
-            }) {
-                continue;
-            }
-            let mut material = Vec::new();
-            material.extend_from_slice(&validator_id.0);
-            material.extend_from_slice(&delegator_id.0);
-            material.extend_from_slice(&(index as u64).to_le_bytes());
-            let utxo_id = Bytes32::from(indra_crypto::sha256(&material));
-            let output = indra_core::types::transaction::OutputV1 {
-                value_spark: amount,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::ZERO,
-                },
-                owner_pubkey: indra_core::types::crypto::HybridPubKey {
-                    classical_pk: delegator_id,
-                    pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                },
-                range_proof: VariableBytes::from_slice(&[]).unwrap(),
-                lock_height: 0,
+        let validator_positions = state
+            .validators
+            .active_validators()
+            .map(|validator| (validator.validator_id, validator.stake_spark))
+            .collect::<Vec<_>>();
+        for (validator_id, principal) in validator_positions {
+            let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id,
             };
-            state.staked_bonds.insert(
-                utxo_id,
-                crate::validator::StakeBondEntry::new(
-                    utxo_id,
-                    validator_id,
-                    delegator_id,
-                    amount,
-                    0,
-                    output,
-                    1,
-                ),
+            let position_id = indra_core::types::stake_position::derive_position_id(
+                validator_id,
+                validator_id,
+                custody,
             );
+            if !state.stake_positions.contains_key(&position_id) {
+                let position = indra_core::types::stake_position::StakePositionV1::new(
+                    validator_id,
+                    validator_id,
+                    custody,
+                    Some(indra_core::types::stake_position::ActiveStakeAggregateV1::new(
+                        principal,
+                        0,
+                        0,
+                    ).map_err(|error| crate::error::StateError::InvalidStakingOp(error.to_string()))?),
+                    0,
+                    0,
+                ).map_err(|error| crate::error::StateError::InvalidStakingOp(error.to_string()))?;
+                state.stake_positions.insert(position.position_id, position);
+            }
         }
+        state.rebuild_position_tranche_index().map_err(|error| {
+            crate::error::StateError::InvalidStakingOp(error.to_string())
+        })?;
         let consensus = state.build_consensus_snapshot(1, 0)?;
         let economic = state.build_reward_economic_snapshot(&consensus)?;
         state.consensus_snapshots = vec![consensus];
@@ -1125,32 +833,32 @@ fn distribute_snapshot_rewards(
         };
         let delegated = economic_entry.total_active_delegated_spark;
         if delegated == 0 {
-            let validator = state
-                .validators
-                .get_mut(&member.validator_id)
-                .ok_or_else(|| {
-                    StateError::InvalidRewardEconomicSnapshot(
-                        "rewarded validator destination is missing".to_string(),
-                    )
-                })?;
-            validator.pending_rewards = validator.pending_rewards.saturating_add(validator_pool);
-            validator.rewards_last_epoch = current_epoch;
+            credit_position_reward(
+                state,
+                member.validator_id,
+                member.validator_id,
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                    validator_id: member.validator_id,
+                },
+                validator_pool,
+                current_epoch,
+            )?;
             distributed = distributed.saturating_add(validator_pool);
             continue;
         }
 
         let commission = bps_of(validator_pool, economic_entry.commission_bps);
         let delegator_pool = validator_pool.saturating_sub(commission);
-        let validator = state
-            .validators
-            .get_mut(&member.validator_id)
-            .ok_or_else(|| {
-                StateError::InvalidRewardEconomicSnapshot(
-                    "rewarded validator destination is missing".to_string(),
-                )
-            })?;
-        validator.pending_rewards = validator.pending_rewards.saturating_add(commission);
-        validator.rewards_last_epoch = current_epoch;
+        credit_position_reward(
+            state,
+            member.validator_id,
+            member.validator_id,
+            indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id: member.validator_id,
+            },
+            commission,
+            current_epoch,
+        )?;
         distributed = distributed.saturating_add(commission);
 
         let mut delegated_distributed = 0u64;
@@ -1171,30 +879,28 @@ fn distribute_snapshot_rewards(
             let bonded_reward = identity_reward.saturating_sub(auto_reward);
 
             if bonded_reward > 0 {
-                state
-                    .delegations
-                    .update_delegator(&member.validator_id, &delegator.delegator_id, |entry| {
-                        entry.pending_rewards = entry.pending_rewards.saturating_add(bonded_reward);
-                        entry.rewards_last_epoch = current_epoch;
-                    })
-                    .ok_or_else(|| {
-                        StateError::InvalidRewardEconomicSnapshot(
-                            "frozen bonded delegator destination is missing".to_string(),
-                        )
-                    })?;
+                credit_position_reward(
+                    state,
+                    member.validator_id,
+                    delegator.delegator_id,
+                    indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                        delegator_id: delegator.delegator_id,
+                    },
+                    bonded_reward,
+                    current_epoch,
+                )?;
             }
             if auto_reward > 0 {
-                let source_validator = state
-                    .validators
-                    .get_mut(&delegator.delegator_id)
-                    .ok_or_else(|| {
-                        StateError::InvalidRewardEconomicSnapshot(
-                            "frozen auto-delegation validator destination is missing".to_string(),
-                        )
-                    })?;
-                source_validator.pending_rewards =
-                    source_validator.pending_rewards.saturating_add(auto_reward);
-                source_validator.rewards_last_epoch = current_epoch;
+                credit_position_reward(
+                    state,
+                    delegator.delegator_id,
+                    delegator.delegator_id,
+                    indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                        validator_id: delegator.delegator_id,
+                    },
+                    auto_reward,
+                    current_epoch,
+                )?;
             }
             delegated_distributed = delegated_distributed.saturating_add(identity_reward);
         }
@@ -1209,6 +915,40 @@ fn distribute_snapshot_rewards(
         SnapshotRewardSource::Fee => {
             state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder)
         }
+    }
+    Ok(())
+}
+
+fn credit_position_reward(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    principal_owner_id: Bytes32,
+    custody: indra_core::types::stake_position::PositionCustodyV1,
+    amount: u64,
+    current_epoch: u64,
+) -> crate::error::StateResult<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let position_id = indra_core::types::stake_position::derive_position_id(
+        validator_id,
+        principal_owner_id,
+        custody,
+    );
+    let mut position = state
+        .stake_positions
+        .get(&position_id)
+        .cloned()
+        .ok_or_else(|| {
+            crate::error::StateError::InvalidRewardEconomicSnapshot(
+                "frozen reward position destination is missing".into(),
+            )
+        })?;
+    position.pending_rewards_spark = position.pending_rewards_spark.saturating_add(amount);
+    position.rewards_last_epoch = current_epoch;
+    state.stake_positions.insert(position_id, position.clone());
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_stake_position(&position);
     }
     Ok(())
 }
@@ -1236,217 +976,8 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
     }
 }
 
-#[cfg(test)]
-fn release_unbonded_bonds(state: &mut ChainState, current_epoch: u64) -> StateResult<()> {
-    release_unbonded_bonds_at_height(
-        state,
-        current_epoch,
-        current_epoch.saturating_mul(EPOCH_DURATION_BLOCKS),
-    )
-}
 
-pub(crate) fn release_unbonded_bonds_at_height(
-    state: &mut ChainState,
-    current_epoch: u64,
-    release_height: u64,
-) -> StateResult<()> {
-    let mut to_release: Vec<Bytes32> = state
-        .staked_bonds
-        .values()
-        .filter(|bond| {
-            let matured = bond
-                .unbonding_end_epoch
-                .map(|end| end <= current_epoch)
-                .unwrap_or(false);
-            matured
-        })
-        .map(|bond| bond.utxo_id)
-        .collect();
-    to_release.sort_by_key(|id| id.0);
 
-    let mut affected_delegators = Vec::new();
-    for (idx, utxo_id) in to_release.into_iter().enumerate() {
-        if let Some(bond) = state.staked_bonds.remove(&utxo_id) {
-            if bond.validator_id != bond.delegator_id {
-                affected_delegators.push((bond.validator_id, bond.delegator_id));
-            }
-            let output_index = u32::try_from(idx).unwrap_or(u32::MAX - 1).saturating_add(1);
-            let output = released_bond_output(state, &bond, release_height)?;
-            let refund_utxo_id = state
-                .utxos
-                .insert(output, release_height, STAKING_TX_IDX, output_index)
-                .map_err(|_| crate::error::StateError::InvariantViolation {
-                    message: "UTXO ID collision in staking bond release",
-                })?;
-            state.push_delegation_return_event(DelegationReturnEvent {
-                delegator_id: bond.delegator_id,
-                validator_id: bond.validator_id,
-                bond_utxo_id: bond.utxo_id,
-                amount_spark: bond.amount_spark,
-                reason: DelegationReturnReason::UnbondingMatured,
-                returned_epoch: current_epoch,
-                returned_height: release_height,
-                refund_utxo_id,
-            });
-            remove_released_tombstone_bond_reference(state, &bond.validator_id, &bond.utxo_id)?;
-        }
-    }
-    affected_delegators
-        .sort_by_key(|(validator_id, delegator_id)| (validator_id.0, delegator_id.0));
-    affected_delegators.dedup();
-    for (validator_id, delegator_id) in affected_delegators {
-        reconcile_delegator_from_bonds(state, &validator_id, &delegator_id);
-    }
-    prune_mature_evicted_validator_tombstones(state, current_epoch);
-    Ok(())
-}
-
-fn remove_released_tombstone_bond_reference(
-    state: &mut ChainState,
-    validator_id: &Bytes32,
-    bond_utxo_id: &Bytes32,
-) -> StateResult<()> {
-    let Some(mut tombstone) = state
-        .evicted_validator_tombstones
-        .get(validator_id)
-        .cloned()
-    else {
-        return Ok(());
-    };
-    let old_len = tombstone.retained_bonds.len();
-    tombstone
-        .retained_bonds
-        .retain(|reference| reference.bond_utxo_id != *bond_utxo_id);
-    if tombstone.retained_bonds.len() + 1 != old_len {
-        return Err(crate::error::StateError::InvariantViolation {
-            message: "released tombstone bond did not have exactly one retained reference",
-        });
-    }
-    state
-        .evicted_validator_tombstones
-        .insert(*validator_id, tombstone.clone());
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_evicted_validator_tombstone(&tombstone);
-    }
-    Ok(())
-}
-
-fn prune_mature_evicted_validator_tombstones(state: &mut ChainState, current_epoch: u64) {
-    let mut prunable: Vec<(u64, Bytes32)> = state
-        .evicted_validator_tombstones
-        .values()
-        .filter(|tombstone| {
-            tombstone.retained_bonds.is_empty()
-                && current_epoch
-                    > tombstone
-                        .eviction_epoch
-                        .saturating_add(SLASH_EVIDENCE_WINDOW_EPOCHS)
-        })
-        .map(|tombstone| (tombstone.eviction_height, tombstone.validator_id))
-        .collect();
-    prunable.sort_by_key(|(height, validator_id)| (*height, validator_id.0));
-    for (_, validator_id) in prunable {
-        state.evicted_validator_tombstones.remove(&validator_id);
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.delete_evicted_validator_tombstone(&validator_id);
-        }
-    }
-}
-
-pub(crate) fn released_bond_output(
-    state: &ChainState,
-    bond: &crate::validator::StakeBondEntry,
-    release_height: u64,
-) -> StateResult<indra_core::types::transaction::OutputV1> {
-    regenerated_bond_output(
-        bond,
-        state,
-        release_height,
-        derive_compact_stake_bond_release_blinding(bond, release_height),
-        "stake-bond release",
-    )
-}
-
-/// Deterministic blinding for a compact stake-bond release.
-///
-/// External wallets can reproduce this as:
-/// `sha256(domain || validator_id || delegator_id || bond_utxo_id ||
-/// release_height_le || released_amount_spark_le)`.
-pub fn derive_compact_stake_bond_release_blinding(
-    bond: &crate::validator::StakeBondEntry,
-    release_height: u64,
-) -> [u8; 32] {
-    let mut blinding_input =
-        Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
-    blinding_input.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-    blinding_input.extend_from_slice(&bond.validator_id.0);
-    blinding_input.extend_from_slice(&bond.delegator_id.0);
-    blinding_input.extend_from_slice(&bond.utxo_id.0);
-    blinding_input.extend_from_slice(&release_height.to_le_bytes());
-    blinding_input.extend_from_slice(&bond.amount_spark.to_le_bytes());
-    indra_crypto::sha256(&blinding_input)
-}
-
-/// Deterministic blinding for a normal stake-bond release.
-///
-/// External wallets can reproduce this as:
-/// `sha256(domain || validator_id || delegator_id || bond_utxo_id ||
-/// release_height_le || released_amount_spark_le)`.
-pub fn derive_normal_stake_bond_release_blinding(
-    validator_id: Bytes32,
-    delegator_id: Bytes32,
-    bond_utxo_id: Bytes32,
-    release_height: u64,
-    released_amount_spark: u64,
-) -> [u8; 32] {
-    let mut blinding_input =
-        Vec::with_capacity(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
-    blinding_input.extend_from_slice(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-    blinding_input.extend_from_slice(&validator_id.0);
-    blinding_input.extend_from_slice(&delegator_id.0);
-    blinding_input.extend_from_slice(&bond_utxo_id.0);
-    blinding_input.extend_from_slice(&release_height.to_le_bytes());
-    blinding_input.extend_from_slice(&released_amount_spark.to_le_bytes());
-    indra_crypto::sha256(&blinding_input)
-}
-
-fn regenerated_bond_output(
-    bond: &crate::validator::StakeBondEntry,
-    state: &ChainState,
-    _release_height: u64,
-    blinding: [u8; 32],
-    context: &str,
-) -> StateResult<indra_core::types::transaction::OutputV1> {
-    let owner_pubkey = resolve_bond_owner_pubkey(bond, state).map_err(|_| {
-        crate::error::StateError::InvariantViolation {
-            message: "stake bond release owner pubkey is unresolvable",
-        }
-    })?;
-    let commitment = indra_crypto::commit(bond.amount_spark, &blinding);
-    let mut rng = rand::rngs::StdRng::from_seed(blinding);
-    let proof =
-        indra_crypto::prove_range(bond.amount_spark, &blinding, &mut rng).map_err(|_| {
-            crate::error::StateError::InvalidStakingOp(format!(
-                "failed to generate range proof for {context}"
-            ))
-        })?;
-
-    let mut output = indra_core::types::transaction::OutputV1 {
-        value_spark: bond.original_output.value_spark,
-        commitment: bond.original_output.commitment,
-        owner_pubkey: owner_pubkey.clone(),
-        range_proof: VariableBytes::default(),
-        lock_height: bond.original_output.lock_height,
-    };
-    output.value_spark = bond.amount_spark;
-    output.commitment = CommitmentV1 {
-        compressed_point: Bytes32::from(commitment.0),
-    };
-    output.owner_pubkey = owner_pubkey;
-    output.range_proof = VariableBytes::from_slice(&proof)
-        .map_err(|_| crate::error::StateError::InvalidStakingOp("range proof too large".into()))?;
-    Ok(output)
-}
 
 fn apply_liveness_penalties(
     state: &mut ChainState,
@@ -1526,7 +1057,7 @@ mod tests {
     use crate::{
         compute_state_root,
         governance::{GovernanceRedelegation, ProposalRecord, VoteCommit, VoteReveal},
-        validator::{StakeBondEntry, ValidatorEntry, ValidatorStatus},
+        validator::{ValidatorEntry, ValidatorStatus},
     };
     use indra_core::{
         codec::Encode,
@@ -1679,66 +1210,8 @@ mod tests {
         );
     }
 
-    fn compact_bond(
-        byte: u8,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-    ) -> StakeBondEntry {
-        let mut output = dummy_output(byte);
-        output.value_spark = amount_spark;
-        StakeBondEntry::new(
-            Bytes32::from([byte; 32]),
-            validator_id,
-            delegator_id,
-            amount_spark,
-            0,
-            output,
-            1,
-        )
-    }
 
-    fn legacy_bond(
-        byte: u8,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-    ) -> StakeBondEntry {
-        compact_bond(byte, validator_id, delegator_id, amount_spark)
-    }
 
-    fn fully_compact_bond(
-        byte: u8,
-        validator_id: Bytes32,
-        delegator_id: Bytes32,
-        amount_spark: u64,
-    ) -> (StakeBondEntry, HybridPubKey) {
-        let output = dummy_output(byte);
-        let owner = output.owner_pubkey.clone();
-        (
-            StakeBondEntry::new(
-                Bytes32::from([byte; 32]),
-                validator_id,
-                delegator_id,
-                amount_spark,
-                0,
-                output,
-                1,
-            ),
-            owner,
-        )
-    }
-
-    fn manual_compact_release_blinding(bond: &StakeBondEntry, release_height: u64) -> [u8; 32] {
-        let mut input = Vec::new();
-        input.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-        input.extend_from_slice(&bond.validator_id.0);
-        input.extend_from_slice(&bond.delegator_id.0);
-        input.extend_from_slice(&bond.utxo_id.0);
-        input.extend_from_slice(&release_height.to_le_bytes());
-        input.extend_from_slice(&bond.amount_spark.to_le_bytes());
-        indra_crypto::sha256(&input)
-    }
 
     #[test]
     fn epoch_transition_context_validates_and_derives_boundary_facts() {
@@ -1759,137 +1232,7 @@ mod tests {
         assert!(EpochTransitionContext::new(300, 298).is_err());
     }
 
-    #[test]
-    fn reward_snapshot_pays_frozen_alice_bob_not_boundary_time_bob_carol() {
-        let target_id = Bytes32::from([1; 32]);
-        let alice = Bytes32::from([0xA1; 32]);
-        let bob = Bytes32::from([0xB1; 32]);
-        let carol = Bytes32::from([0xC1; 32]);
-        let mut state = ChainState::new_genesis();
-        state
-            .validators
-            .upsert(make_snapshot_validator(1, 1_000_000_000))
-            .unwrap();
-        state
-            .delegations
-            .add_delegation(target_id, alice, 60, 0)
-            .unwrap();
-        state
-            .delegations
-            .add_delegation(target_id, bob, 40, 0)
-            .unwrap();
-        let alice_bond = compact_bond(0x31, target_id, alice, 60);
-        let bob_bond = compact_bond(0x32, target_id, bob, 40);
-        state.staked_bonds.insert(alice_bond.utxo_id, alice_bond);
-        state.staked_bonds.insert(bob_bond.utxo_id, bob_bond);
-        install_reward_basis(&mut state);
 
-        // Boundary-time live state now says Bob=40 and Carol=100. The frozen
-        // epoch-start basis must remain Alice=60 and Bob=40.
-        state
-            .delegations
-            .update_delegator(&target_id, &alice, |entry| {
-                entry.staked_spark = 0;
-                entry.unbonding_end_epoch = Some(1008);
-            })
-            .unwrap();
-        state
-            .delegations
-            .add_delegation(target_id, carol, 100, 1)
-            .unwrap();
-        let carol_bond = compact_bond(0x33, target_id, carol, 100);
-        state.staked_bonds.insert(carol_bond.utxo_id, carol_bond);
-
-        distribute_block_rewards(&mut state, 1_000, 1, u64::MAX).unwrap();
-        assert_eq!(
-            state.delegations.get_delegator_reward(&target_id, &alice),
-            540
-        );
-        assert_eq!(
-            state.delegations.get_delegator_reward(&target_id, &bob),
-            360
-        );
-        assert_eq!(
-            state.delegations.get_delegator_reward(&target_id, &carol),
-            0
-        );
-        assert_eq!(
-            state.validators.get(&target_id).unwrap().pending_rewards,
-            100
-        );
-
-        state.fee_reward_pool = 1_000;
-        distribute_fee_rewards(&mut state, 1, u64::MAX).unwrap();
-        assert_eq!(
-            state.delegations.get_delegator_reward(&target_id, &alice),
-            1_080
-        );
-        assert_eq!(
-            state.delegations.get_delegator_reward(&target_id, &bob),
-            720
-        );
-        assert_eq!(
-            state.delegations.get_delegator_reward(&target_id, &carol),
-            0
-        );
-        assert_eq!(
-            state.validators.get(&target_id).unwrap().pending_rewards,
-            200
-        );
-    }
-
-    #[test]
-    fn reward_snapshot_freezes_and_separates_auto_delegation_destination() {
-        let target_id = Bytes32::from([1; 32]);
-        let source_id = Bytes32::from([2; 32]);
-        let mut state = ChainState::new_genesis();
-        state
-            .validators
-            .upsert(make_snapshot_validator(1, 1_000_000_000))
-            .unwrap();
-        let mut source = make_snapshot_validator(2, 40);
-        source.status = ValidatorStatus::Registered;
-        source.auto_delegate_to = Some(target_id);
-        state.validators.upsert(source).unwrap();
-        state
-            .delegations
-            .add_delegation(target_id, source_id, 60, 0)
-            .unwrap();
-        let real_bond = compact_bond(0x34, target_id, source_id, 60);
-        state.staked_bonds.insert(real_bond.utxo_id, real_bond);
-        install_reward_basis(&mut state);
-
-        let frozen = state
-            .reward_economic_snapshot
-            .as_ref()
-            .unwrap()
-            .validator(&target_id)
-            .unwrap()
-            .delegators()[0]
-            .clone();
-        assert_eq!(frozen.bonded_active_principal_spark, 60);
-        assert_eq!(frozen.auto_delegated_principal_spark, 40);
-
-        // A mutable payout-time setting/stake change cannot alter frozen auto principal.
-        let source = state.validators.get_mut(&source_id).unwrap();
-        source.stake_spark = 400;
-        source.auto_delegate_to = None;
-        distribute_block_rewards(&mut state, 1_000, 1, u64::MAX).unwrap();
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&target_id, &source_id),
-            540
-        );
-        assert_eq!(
-            state.validators.get(&source_id).unwrap().pending_rewards,
-            360
-        );
-        assert_eq!(
-            state.validators.get(&target_id).unwrap().pending_rewards,
-            100
-        );
-    }
 
     #[test]
     fn reward_snapshot_pairing_missing_or_mismatched_fails_closed() {
@@ -1931,7 +1274,7 @@ mod tests {
         let tombstoned_id = Bytes32::from([0xB3; 32]);
         state.evicted_validator_tombstones.insert(
             tombstoned_id,
-            crate::validator::EvictedValidatorTombstoneV1 {
+            crate::validator::EvictedValidatorTombstoneV2 {
                 validator_id: tombstoned_id,
                 eviction_height: 300,
                 eviction_epoch: 1,
@@ -1939,7 +1282,8 @@ mod tests {
                 last_pq_vote_pk: [2; indra_crypto::PQ_PK_BYTES],
                 last_vrf_pk: [3; 32],
                 cold_custody: None,
-                retained_bonds: Vec::new(),
+                retained_position_ids: Vec::new(),
+                retained_tranche_ids: Vec::new(),
             },
         );
 
@@ -1982,329 +1326,7 @@ mod tests {
         assert_eq!(compute_state_root(&replay), compute_state_root(&state));
     }
 
-    #[test]
-    fn normal_release_blinding_is_sensitive_to_every_input() {
-        let validator_id = Bytes32::from([0x51; 32]);
-        let delegator_id = Bytes32::from([0x52; 32]);
-        let bond_utxo_id = Bytes32::from([0x53; 32]);
-        let release_height = 77;
-        let released_amount_spark = 123_000;
-        let base = derive_normal_stake_bond_release_blinding(
-            validator_id,
-            delegator_id,
-            bond_utxo_id,
-            release_height,
-            released_amount_spark,
-        );
 
-        assert_ne!(
-            base,
-            derive_normal_stake_bond_release_blinding(
-                Bytes32::from([0x61; 32]),
-                delegator_id,
-                bond_utxo_id,
-                release_height,
-                released_amount_spark,
-            )
-        );
-        assert_ne!(
-            base,
-            derive_normal_stake_bond_release_blinding(
-                validator_id,
-                Bytes32::from([0x62; 32]),
-                bond_utxo_id,
-                release_height,
-                released_amount_spark,
-            )
-        );
-        assert_ne!(
-            base,
-            derive_normal_stake_bond_release_blinding(
-                validator_id,
-                delegator_id,
-                Bytes32::from([0x63; 32]),
-                release_height,
-                released_amount_spark,
-            )
-        );
-        assert_ne!(
-            base,
-            derive_normal_stake_bond_release_blinding(
-                validator_id,
-                delegator_id,
-                bond_utxo_id,
-                release_height + 1,
-                released_amount_spark,
-            )
-        );
-        assert_ne!(
-            base,
-            derive_normal_stake_bond_release_blinding(
-                validator_id,
-                delegator_id,
-                bond_utxo_id,
-                release_height,
-                released_amount_spark + 1,
-            )
-        );
-    }
-
-    #[test]
-    fn normal_release_blinding_is_deterministic() {
-        let validator_id = Bytes32::from([0x71; 32]);
-        let delegator_id = Bytes32::from([0x72; 32]);
-        let bond_utxo_id = Bytes32::from([0x73; 32]);
-        let release_height = 987_654;
-        let released_amount_spark = 321_000;
-
-        let first = derive_normal_stake_bond_release_blinding(
-            validator_id,
-            delegator_id,
-            bond_utxo_id,
-            release_height,
-            released_amount_spark,
-        );
-        for _ in 0..8 {
-            assert_eq!(
-                derive_normal_stake_bond_release_blinding(
-                    validator_id,
-                    delegator_id,
-                    bond_utxo_id,
-                    release_height,
-                    released_amount_spark,
-                ),
-                first
-            );
-        }
-    }
-
-    #[test]
-    fn post_gate_matured_bond_release_records_return_event() {
-        let current_epoch = u64::MAX;
-        let release_height = u64::MAX;
-        let validator_id = Bytes32::from([0x95; 32]);
-        let delegator_id = Bytes32::from([0x96; 32]);
-        let mut bond = legacy_bond(0x97, validator_id, delegator_id, 1_000_000);
-        bond.unbonding_end_epoch = Some(current_epoch);
-        let bond_utxo_id = bond.utxo_id;
-        let amount_spark = bond.amount_spark;
-        let mut state = ChainState::new_genesis();
-        register_test_bond_owner(&mut state, delegator_id, 0x97);
-        state.staked_bonds.insert(bond_utxo_id, bond);
-
-        release_unbonded_bonds(&mut state, current_epoch).unwrap();
-
-        assert_eq!(state.delegation_return_events.len(), 1);
-        let event = &state.delegation_return_events[0];
-        assert_eq!(event.validator_id, validator_id);
-        assert_eq!(event.delegator_id, delegator_id);
-        assert_eq!(event.bond_utxo_id, bond_utxo_id);
-        assert_eq!(event.amount_spark, amount_spark);
-        assert_eq!(event.reason, DelegationReturnReason::UnbondingMatured);
-        assert_eq!(event.returned_epoch, current_epoch);
-        assert_eq!(event.returned_height, release_height);
-        assert!(state.utxos.contains(&event.refund_utxo_id));
-    }
-
-    #[test]
-    fn matured_bond_release_always_records_return_event() {
-        let current_epoch = 1;
-        let validator_id = Bytes32::from([0x98; 32]);
-        let delegator_id = Bytes32::from([0x99; 32]);
-        let mut bond = legacy_bond(0x9A, validator_id, delegator_id, 1_000_000);
-        bond.unbonding_end_epoch = Some(current_epoch);
-        let mut state = ChainState::new_genesis();
-        register_test_bond_owner(&mut state, delegator_id, 0x9A);
-        state.staked_bonds.insert(bond.utxo_id, bond);
-
-        release_unbonded_bonds(&mut state, current_epoch).unwrap();
-
-        assert_eq!(state.delegation_return_events.len(), 1);
-    }
-
-    #[test]
-    fn matured_bond_release_events_follow_bounded_retention() {
-        let mut state = ChainState::new_genesis();
-        for i in 0..MAX_DELEGATION_RETURN_EVENTS {
-            state.push_delegation_return_event(DelegationReturnEvent {
-                delegator_id: Bytes32::from([0xA0; 32]),
-                validator_id: Bytes32::from([0xA1; 32]),
-                bond_utxo_id: Bytes32::from([(i % 251) as u8; 32]),
-                amount_spark: 1,
-                reason: DelegationReturnReason::ValidatorEvicted,
-                returned_epoch: i as u64,
-                returned_height: i as u64,
-                refund_utxo_id: Bytes32::from([0xA2; 32]),
-            });
-        }
-        let current_epoch = u64::MAX;
-        let mut bond = legacy_bond(
-            0x9B,
-            Bytes32::from([0x9C; 32]),
-            Bytes32::from([0x9D; 32]),
-            1_000_000,
-        );
-        bond.unbonding_end_epoch = Some(current_epoch);
-        let bond_utxo_id = bond.utxo_id;
-        register_test_bond_owner(&mut state, Bytes32::from([0x9D; 32]), 0x9B);
-        state.staked_bonds.insert(bond_utxo_id, bond);
-
-        release_unbonded_bonds(&mut state, current_epoch).unwrap();
-
-        assert_eq!(
-            state.delegation_return_events.len(),
-            MAX_DELEGATION_RETURN_EVENTS
-        );
-        assert_eq!(
-            state
-                .delegation_return_events
-                .last()
-                .map(|event| event.reason),
-            Some(DelegationReturnReason::UnbondingMatured)
-        );
-        assert_eq!(
-            state
-                .delegation_return_events
-                .last()
-                .map(|event| event.bond_utxo_id),
-            Some(bond_utxo_id)
-        );
-        assert_eq!(
-            state
-                .delegation_return_events
-                .first()
-                .map(|event| event.returned_epoch),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn matured_bond_release_event_rolls_back_with_epoch_scope() {
-        let current_epoch = u64::MAX;
-        let validator_id = Bytes32::from([0x9E; 32]);
-        let delegator_id = Bytes32::from([0x9F; 32]);
-        let mut bond = legacy_bond(0xA4, validator_id, delegator_id, 1_000_000);
-        bond.unbonding_end_epoch = Some(current_epoch);
-        let mut state = ChainState::new_genesis();
-        register_test_bond_owner(&mut state, delegator_id, 0xA4);
-        state.staked_bonds.insert(bond.utxo_id, bond);
-        state.rebuild_state_commitment_v2(current_epoch);
-        let original = state.clone();
-        let original_root = state.state_commitment_v2_root(current_epoch);
-
-        {
-            let mut txn = crate::txn::StateTxn::begin(&mut state, current_epoch);
-            txn.snapshot_epoch_scope();
-            release_unbonded_bonds(txn.state_mut(), current_epoch).unwrap();
-        }
-
-        assert_eq!(state, original);
-        assert_eq!(state.state_commitment_v2_root(current_epoch), original_root);
-    }
-
-    #[test]
-    fn compact_normal_release_generates_fresh_valid_output_with_documented_blinding() {
-        let validator_id = Bytes32::from([0xA1; 32]);
-        let delegator_id = Bytes32::from([0xD1; 32]);
-        let bond = compact_bond(0x31, validator_id, delegator_id, 1_000_000);
-        assert!(bond.original_output.range_proof.is_none());
-        let release_height = 900;
-        let mut state = ChainState::new_genesis();
-        register_test_bond_owner(&mut state, delegator_id, 0x31);
-
-        let output = released_bond_output(&state, &bond, release_height).unwrap();
-        let blinding = manual_compact_release_blinding(&bond, release_height);
-        assert_eq!(
-            derive_compact_stake_bond_release_blinding(&bond, release_height),
-            blinding
-        );
-        assert_ne!(output.commitment, bond.original_output.commitment);
-        assert_eq!(output.value_spark, bond.amount_spark);
-        assert_eq!(
-            Some(&output.owner_pubkey),
-            state.delegator_identities.get(&delegator_id)
-        );
-        assert_eq!(output.lock_height, bond.original_output.lock_height);
-        assert!(indra_crypto::verify_opening(
-            &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
-            &indra_crypto::PedersenOpening {
-                value: output.value_spark,
-                blinding,
-            },
-        )
-        .is_ok());
-        assert!(indra_crypto::verify_range(
-            &output.commitment.compressed_point.0,
-            output.range_proof.as_slice(),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn compact_slashed_release_generates_fresh_valid_output_with_documented_blinding() {
-        let validator_id = Bytes32::from([0xA2; 32]);
-        let bond = compact_bond(0x32, validator_id, validator_id, 400_000);
-        let release_height = 1_200;
-        let blinding = manual_compact_release_blinding(&bond, release_height);
-        let mut state = ChainState::new_genesis();
-        register_test_bond_owner(&mut state, validator_id, 0x32);
-
-        let output = released_bond_output(&state, &bond, release_height).unwrap();
-        assert_eq!(output.value_spark, 400_000);
-        assert!(indra_crypto::verify_opening(
-            &indra_crypto::PedersenCommitment(output.commitment.compressed_point.0),
-            &indra_crypto::PedersenOpening {
-                value: 400_000,
-                blinding,
-            },
-        )
-        .is_ok());
-        assert!(indra_crypto::verify_range(
-            &output.commitment.compressed_point.0,
-            output.range_proof.as_slice(),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn fully_compact_release_resolves_owner_from_registry() {
-        let validator_id = Bytes32::from([0xA4; 32]);
-        let delegator_id = Bytes32::from([0xD4; 32]);
-        let (bond, owner_pubkey) = fully_compact_bond(0x34, validator_id, delegator_id, 750_000);
-        assert!(bond.original_output.range_proof.is_none());
-        assert!(bond.original_output.owner_pubkey.is_none());
-        let mut state = ChainState::new_genesis();
-        state
-            .delegator_identities
-            .insert(delegator_id, owner_pubkey.clone());
-
-        let output = released_bond_output(&state, &bond, 1_500).unwrap();
-
-        assert_eq!(output.owner_pubkey, owner_pubkey);
-        assert_eq!(output.value_spark, bond.amount_spark);
-        assert!(indra_crypto::verify_range(
-            &output.commitment.compressed_point.0,
-            output.range_proof.as_slice(),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn fully_compact_release_fails_loudly_without_registry_owner() {
-        let validator_id = Bytes32::from([0xA5; 32]);
-        let delegator_id = Bytes32::from([0xD5; 32]);
-        let (bond, _) = fully_compact_bond(0x35, validator_id, delegator_id, 750_000);
-        let state = ChainState::new_genesis();
-
-        let err = released_bond_output(&state, &bond, 1_500).unwrap_err();
-
-        assert!(matches!(
-            err,
-            crate::error::StateError::InvariantViolation {
-                message: "stake bond release owner pubkey is unresolvable"
-            }
-        ));
-    }
 
     #[test]
     fn epoch_boundary_detection() {
@@ -2699,41 +1721,6 @@ mod tests {
         assert_eq!(snapshot2.total_stake, 150);
     }
 
-    #[test]
-    fn rewards_are_weighted_by_self_stake_not_delegations() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let validator_a = make_validator(0xA1, 1_000);
-        let validator_b = make_validator(0xB1, 1_000);
-        let id_a = validator_a.validator_id;
-        let id_b = validator_b.validator_id;
-        let delegator_id = Bytes32::from([0xD1; 32]);
-        state.validators.upsert(validator_a).unwrap();
-        state.validators.upsert(validator_b).unwrap();
-        state
-            .delegations
-            .add_delegation(id_b, delegator_id, 1_000_000, 0)
-            .unwrap();
-
-        distribute_block_rewards(&mut state, 2_000, 1, 1).unwrap();
-
-        assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 1_000);
-        assert_eq!(
-            state.validators.get(&id_b).unwrap().pending_rewards,
-            100,
-            "validator B gets 10% commission from its self-stake-weighted reward pool"
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&id_b)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            900,
-            "delegated stake splits validator B's reward pool but does not increase its size"
-        );
-    }
 
     #[test]
     fn commission_change_takes_effect_after_delay() {
@@ -2779,302 +1766,7 @@ mod tests {
         assert_eq!(after_effective.pending_commission_effective_epoch, None);
     }
 
-    #[test]
-    fn activating_commission_applies_only_to_next_epoch_reward() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let mut validator = make_validator(0xC5, MINIMUM_ACTIVE_SELF_STAKE_SPARK.saturating_mul(2));
-        let validator_id = validator.validator_id;
-        validator.commission_bps = 1_000;
-        validator.pending_commission_bps = Some(2_000);
-        validator.pending_commission_effective_epoch = Some(COMMISSION_CHANGE_DELAY_EPOCHS);
-        state.validators.upsert(validator).unwrap();
-        let delegator_id = Bytes32::from([0xD5; 32]);
-        state
-            .delegations
-            .add_delegation(
-                validator_id,
-                delegator_id,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-                0,
-            )
-            .unwrap();
 
-        let activation_epoch = COMMISSION_CHANGE_DELAY_EPOCHS;
-        let activation_height = activation_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
-        let reward_at_activation =
-            block_reward_at_height(activation_height).saturating_mul(EPOCH_DURATION_BLOCKS);
-        let fee_reward_at_activation = 10_000;
-        state.fee_reward_pool = fee_reward_at_activation;
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (activation_epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (activation_epoch)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        let validator_after_activation = state.validators.get(&validator_id).unwrap();
-        assert_eq!(validator_after_activation.commission_bps, 2_000);
-        let validator_rewards_after_activation = validator_after_activation.pending_rewards;
-        assert_eq!(
-            validator_rewards_after_activation,
-            bps_of(reward_at_activation, 1_000)
-                .saturating_add(bps_of(fee_reward_at_activation, 1_000)),
-            "the activation boundary must pay the elapsed epoch at the old rate"
-        );
-        let delegator_after_activation = state
-            .delegations
-            .get_delegator_reward(&validator_id, &delegator_id);
-        assert_eq!(
-            delegator_after_activation,
-            reward_at_activation
-                .saturating_sub(bps_of(reward_at_activation, 1_000))
-                .saturating_add(
-                    fee_reward_at_activation
-                        .saturating_sub(bps_of(fee_reward_at_activation, 1_000)),
-                )
-        );
-
-        // The block-application pipeline constructs the next epoch's paired
-        // snapshots after the transition. This direct transition test mirrors
-        // that final pipeline step explicitly.
-        install_reward_basis(&mut state);
-
-        let next_epoch = activation_epoch.saturating_add(1);
-        let next_height = next_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
-        let next_reward = block_reward_at_height(next_height).saturating_mul(EPOCH_DURATION_BLOCKS);
-        let next_fee_reward = 20_000;
-        state.fee_reward_pool = next_fee_reward;
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (next_epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (next_epoch)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        assert_eq!(
-            state
-                .validators
-                .get(&validator_id)
-                .unwrap()
-                .pending_rewards
-                .saturating_sub(validator_rewards_after_activation),
-            bps_of(next_reward, 2_000).saturating_add(bps_of(next_fee_reward, 2_000)),
-            "the next epoch reward must use the newly activated rate"
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &delegator_id)
-                .saturating_sub(delegator_after_activation),
-            next_reward
-                .saturating_sub(bps_of(next_reward, 2_000))
-                .saturating_add(next_fee_reward.saturating_sub(bps_of(next_fee_reward, 2_000)))
-        );
-    }
-
-    #[test]
-    fn boundary_without_pending_commission_uses_current_rate() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let mut validator = make_validator(0xC6, MINIMUM_ACTIVE_SELF_STAKE_SPARK.saturating_mul(2));
-        let validator_id = validator.validator_id;
-        validator.commission_bps = 1_250;
-        state.validators.upsert(validator).unwrap();
-        let delegator_id = Bytes32::from([0xD6; 32]);
-        state
-            .delegations
-            .add_delegation(
-                validator_id,
-                delegator_id,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-                0,
-            )
-            .unwrap();
-
-        let epoch = 1;
-        let height = epoch * EPOCH_DURATION_BLOCKS;
-        let reward = block_reward_at_height(height).saturating_mul(EPOCH_DURATION_BLOCKS);
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (epoch)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().pending_rewards,
-            bps_of(reward, 1_250)
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &delegator_id),
-            reward.saturating_sub(bps_of(reward, 1_250))
-        );
-    }
-
-    #[test]
-    fn delegator_rewards_use_pre_change_commission_during_delay() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let mut validator = make_validator(0xC2, 1_000);
-        let validator_id = validator.validator_id;
-        validator.commission_bps = 1_000;
-        validator.pending_commission_bps = Some(2_000);
-        validator.pending_commission_effective_epoch = Some(COMMISSION_CHANGE_DELAY_EPOCHS);
-        state.validators.upsert(validator).unwrap();
-
-        let delegator_id = Bytes32::from([0xD2; 32]);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 1_000, 0)
-            .unwrap();
-
-        distribute_block_rewards(&mut state, 1_000, 1, 1).unwrap();
-
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().pending_rewards,
-            100,
-            "old 10% commission must remain active during the delay window"
-        );
-        assert_eq!(
-            state
-                .delegations
-                .get_delegators(&validator_id)
-                .iter()
-                .find(|entry| entry.delegator_id == delegator_id)
-                .unwrap()
-                .pending_rewards,
-            900
-        );
-    }
-
-    #[test]
-    fn partial_bond_exit_keeps_sixty_unit_active_remainder_rewarded() {
-        let mut state = ChainState::new_genesis();
-        let mut validator = make_validator(0xD7, 1_000);
-        validator.commission_bps = 1_000;
-        let validator_id = validator.validator_id;
-        state.validators.upsert(validator).unwrap();
-        let delegator_id = Bytes32::from([0xD8; 32]);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 100, 0)
-            .unwrap();
-        let active = compact_bond(0xD9, validator_id, delegator_id, 60);
-        let mut exiting = compact_bond(0xDA, validator_id, delegator_id, 40);
-        exiting.unbonding_end_epoch = Some(1008);
-        state.staked_bonds.insert(active.utxo_id, active);
-        state.staked_bonds.insert(exiting.utxo_id, exiting);
-
-        reconcile_all_delegators_from_bonds(&mut state);
-        let entry = state
-            .delegations
-            .get_delegators(&validator_id)
-            .first()
-            .unwrap();
-        assert_eq!(entry.staked_spark, 60);
-        assert_eq!(entry.unbonding_end_epoch, None);
-
-        distribute_block_rewards(&mut state, 1_000, 1, 1).unwrap();
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &delegator_id),
-            900
-        );
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().pending_rewards,
-            100
-        );
-
-        state.fee_reward_pool = 1_000;
-        distribute_fee_rewards(&mut state, 1, 1).unwrap();
-        assert_eq!(
-            state
-                .delegations
-                .get_delegator_reward(&validator_id, &delegator_id),
-            1_800
-        );
-        assert_eq!(
-            state.validators.get(&validator_id).unwrap().pending_rewards,
-            200
-        );
-    }
-
-    #[test]
-    fn precise_accounting_removes_empty_aggregate_after_final_bond_matures() {
-        let mut state = ChainState::new_genesis();
-        let validator_id = Bytes32::from([0xE1; 32]);
-        let delegator_id = Bytes32::from([0xE2; 32]);
-        register_test_bond_owner(&mut state, delegator_id, 0xE3);
-        state
-            .delegations
-            .add_delegation(validator_id, delegator_id, 40, 0)
-            .unwrap();
-        let mut bond = compact_bond(0xE3, validator_id, delegator_id, 40);
-        bond.unbonding_end_epoch = Some(1);
-        state.staked_bonds.insert(bond.utxo_id, bond);
-
-        release_unbonded_bonds_at_height(&mut state, 1, u64::MAX).unwrap();
-
-        assert!(state.staked_bonds.is_empty());
-        assert!(state.delegations.get_delegators(&validator_id).is_empty());
-    }
-
-    #[test]
-    fn block_reward_dust_is_explicitly_routed() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let validator_a = make_validator(0xC3, 1);
-        let validator_b = make_validator(0xC4, 1);
-        let id_a = validator_a.validator_id;
-        let id_b = validator_b.validator_id;
-        state.validators.upsert(validator_a).unwrap();
-        state.validators.upsert(validator_b).unwrap();
-        let treasury_before = state.treasury_balance;
-
-        distribute_block_rewards(&mut state, 101, 1, 1).unwrap();
-
-        let reward_a = state.validators.get(&id_a).unwrap().pending_rewards;
-        let reward_b = state.validators.get(&id_b).unwrap().pending_rewards;
-        let treasury_delta = state.treasury_balance.saturating_sub(treasury_before);
-        assert_eq!(reward_a + reward_b + treasury_delta, 101);
-        assert_eq!(treasury_delta, 1);
-    }
-
-    #[test]
-    fn fee_reward_dust_returns_to_pool() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let validator_a = make_validator(0xC5, 1);
-        let validator_b = make_validator(0xC6, 1);
-        let id_a = validator_a.validator_id;
-        let id_b = validator_b.validator_id;
-        state.validators.upsert(validator_a).unwrap();
-        state.validators.upsert(validator_b).unwrap();
-        state.fee_reward_pool = 101;
-
-        distribute_fee_rewards(&mut state, 1, 1).unwrap();
-
-        assert_eq!(state.validators.get(&id_a).unwrap().pending_rewards, 50);
-        assert_eq!(state.validators.get(&id_b).unwrap().pending_rewards, 50);
-        assert_eq!(state.fee_reward_pool, 1);
-    }
 
     #[test]
     fn proposer_cannot_earn_extra_reward_by_including_more_transactions() {
@@ -3457,45 +2149,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auto_delegation_routes_rewards_when_not_in_active_set() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        for i in 1..=21u8 {
-            let mut validator =
-                make_validator(i, (22u64 - i as u64) * MINIMUM_ACTIVE_SELF_STAKE_SPARK);
-            if i == 21 {
-                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
-            }
-            state.validators.upsert(validator).unwrap();
-        }
-
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (1u64)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        let inactive_id = Bytes32::from([0x15; 32]);
-        let target_id = Bytes32::from([0x01; 32]);
-        let inactive = state.validators.get(&inactive_id).unwrap();
-        let target = state.validators.get(&target_id).unwrap();
-
-        assert_eq!(inactive.status, ValidatorStatus::Registered);
-        assert!(inactive.pending_rewards > 0);
-        assert!(target.pending_rewards > 0);
-        assert!(state
-            .delegations
-            .get_delegators(&target_id)
-            .iter()
-            .all(|entry| entry.delegator_id != inactive_id));
-    }
 
     #[test]
     fn auto_delegation_skipped_if_target_not_active() {
@@ -3577,81 +2230,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auto_delegation_virtual_entry_not_in_state_root_after_transition() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        for i in 1..=21u8 {
-            let mut validator =
-                make_validator(i, (22u64 - i as u64) * MINIMUM_ACTIVE_SELF_STAKE_SPARK);
-            if i == 21 {
-                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
-            }
-            state.validators.upsert(validator).unwrap();
-        }
 
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (1u64)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-        let root_after_first = compute_state_root(&state);
-        let target_id = Bytes32::from([0x01; 32]);
-        let inactive_id = Bytes32::from([0x15; 32]);
-
-        assert!(state
-            .delegations
-            .get_delegators(&target_id)
-            .iter()
-            .all(|entry| entry.delegator_id != inactive_id));
-        assert_eq!(root_after_first, compute_state_root(&state));
-    }
-
-    #[test]
-    fn auto_delegation_preserves_existing_real_delegation() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        for i in 1..=21u8 {
-            let mut validator = make_validator(i, (22u64 - i as u64) * 1_000_000);
-            if i == 21 {
-                validator.auto_delegate_to = Some(Bytes32::from([0x01; 32]));
-            }
-            state.validators.upsert(validator).unwrap();
-        }
-        let target_id = Bytes32::from([0x01; 32]);
-        let inactive_id = Bytes32::from([0x15; 32]);
-        state
-            .delegations
-            .add_delegation(target_id, inactive_id, 123_456, 0)
-            .unwrap();
-
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (1u64)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        let entries = state.delegations.get_delegators(&target_id);
-        let restored = entries
-            .iter()
-            .find(|entry| entry.delegator_id == inactive_id)
-            .unwrap();
-        assert_eq!(restored.staked_spark, 123_456);
-        assert!(restored.pending_rewards > 0);
-        assert!(state.validators.get(&inactive_id).unwrap().pending_rewards > 0);
-    }
 
     #[test]
     fn auto_delegate_to_changes_state_root() {
@@ -3696,79 +2275,5 @@ mod tests {
         assert_eq!(state.total_supply, supply_before);
     }
 
-    #[test]
-    fn unbonded_bonds_released_to_utxo_set() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let utxo_id = Bytes32::from([0xAB; 32]);
-        state.staked_bonds.insert(
-            utxo_id,
-            StakeBondEntry {
-                utxo_id,
-                validator_id: Bytes32::from([0x01; 32]),
-                delegator_id: Bytes32::from([0x02; 32]),
-                amount_spark: 1_000_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: Some(1),
-                unbonding_start_height: None,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    Bytes32::from([0x02; 32]),
-                ),
-                original_output: dummy_output(0x44).into(),
-            },
-        );
 
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (1u64)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        assert!(state.staked_bonds.is_empty());
-        assert_eq!(state.utxos.len(), 1);
-    }
-
-    #[test]
-    fn active_bonds_not_released_early() {
-        let mut state = crate::chain::ChainState::new_genesis();
-        let utxo_id = Bytes32::from([0xAC; 32]);
-        state.staked_bonds.insert(
-            utxo_id,
-            StakeBondEntry {
-                utxo_id,
-                validator_id: Bytes32::from([0x01; 32]),
-                delegator_id: Bytes32::from([0x02; 32]),
-                amount_spark: 1_000_000,
-                bonded_epoch: 0,
-                unbonding_end_epoch: None,
-                unbonding_start_height: None,
-                custody_owner: crate::validator::StakeBondCustodyOwner::DelegatorIdentity(
-                    Bytes32::from([0x02; 32]),
-                ),
-                original_output: dummy_output(0x45).into(),
-            },
-        );
-
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (1u64)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-
-        assert!(state.staked_bonds.contains_key(&utxo_id));
-        assert!(state.utxos.is_empty());
-    }
 }

@@ -162,36 +162,6 @@ fn self_stake_op(
     op
 }
 
-fn self_unstake_op(
-    state: &ChainState,
-    bond_utxo_id: Bytes32,
-    validator_pubkey: HybridPubKey,
-    validator_keypair: &HybridKeypair,
-    nonce: u64,
-) -> StakingOp {
-    let mut op = StakingOp {
-        body: StakingOpBody::SelfUnstake {
-            bond_utxo_id,
-            validator_pubkey,
-            cold_authorization: Some(ColdStakingAuthorization {
-                cold_key_version: 1,
-                cold_nonce: nonce,
-            }),
-        },
-        nonce: 0,
-        signature: dummy_sig(),
-    };
-    let bytes = op
-        .cold_authorization_signing_bytes(&state.chain_id)
-        .unwrap()
-        .unwrap();
-    let sig = validator_keypair.sign(&bytes).unwrap();
-    op.signature = HybridSignature {
-        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-    };
-    op
-}
 
 fn finalize_with_default_validator(state: &mut ChainState) {
     if state.validators.is_empty() {
@@ -310,64 +280,6 @@ fn slash_evidence(keypair: &HybridKeypair, validator_id: Bytes32) -> SlashEviden
     }
 }
 
-#[test]
-fn bond_and_unbond_do_not_change_total_supply() {
-    let mut state = ChainState::new_genesis();
-    let (validator_pubkey, validator_keypair) = keypair([0x10; 32]);
-    let validator_id = pubkey_to_id(&validator_pubkey);
-    state
-        .validators
-        .upsert(make_validator(&validator_pubkey, [0x10; 32], 0))
-        .unwrap();
-    let bond_output = output(
-        INPUT_VALUE,
-        [0x11; 32],
-        validator_pubkey.clone(),
-        [0x12; 32],
-    );
-    let bond_utxo_id = state.utxos.insert(bond_output, 0, 0, 0).unwrap();
-    let supply_before = state.total_supply;
-    let chain_id = state.chain_id.clone();
-
-    let stake = self_stake_op(
-        &state,
-        bond_utxo_id,
-        validator_pubkey.clone(),
-        &validator_keypair,
-        1,
-    );
-    apply_staking_op(&mut state, &stake, &chain_id, 1).unwrap();
-    assert_eq!(state.total_supply, supply_before);
-    assert_eq!(
-        state.validators.get(&validator_id).unwrap().stake_spark,
-        INPUT_VALUE
-    );
-    state.finalize_genesis().unwrap();
-
-    let unstake = self_unstake_op(
-        &state,
-        bond_utxo_id,
-        validator_pubkey,
-        &validator_keypair,
-        2,
-    );
-    apply_staking_op(&mut state, &unstake, &chain_id, 1).unwrap();
-    assert_eq!(state.total_supply, supply_before);
-
-    apply_epoch_transition(
-        &mut state,
-        &EpochTransitionContext::new(
-            (UNBONDING_PERIOD_EPOCHS).saturating_mul(EPOCH_DURATION_BLOCKS),
-            (UNBONDING_PERIOD_EPOCHS)
-                .saturating_mul(EPOCH_DURATION_BLOCKS)
-                .saturating_sub(1),
-        )
-        .unwrap(),
-        0,
-    )
-    .unwrap();
-    assert_eq!(state.total_supply, supply_before);
-}
 
 #[test]
 fn epoch_reward_does_not_increase_total_supply() {

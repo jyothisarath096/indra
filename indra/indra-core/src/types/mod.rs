@@ -26,6 +26,6 @@ pub use reward_economic_snapshot::{
     RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
 };
 pub use stake_position::{
-    staking_op_id_v2, ActiveStakeAggregateV1, PositionCustodyV1, StakePositionExitIntentV1,
+    eviction_tranche_creation_id_v1, staking_op_id_v2, ActiveStakeAggregateV1, PositionCustodyV1,
     StakePositionV1, UnbondingTimingV1, UnbondingTrancheV1,
 };

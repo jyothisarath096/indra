@@ -19,7 +19,7 @@ pub const MAX_REWARD_DELEGATORS_PER_VALIDATOR: usize = 100_000;
 pub struct RewardEconomicDelegatorEntry {
     /// Identity that owns both possible reward channels.
     pub delegator_id: Bytes32,
-    /// Real bonded principal credited to `DelegatorEntry.pending_rewards`.
+    /// Real bonded principal credited to the delegator's canonical stake position.
     pub bonded_active_principal_spark: u64,
     /// Virtual auto-delegated principal credited to `ValidatorEntry.pending_rewards`.
     pub auto_delegated_principal_spark: u64,

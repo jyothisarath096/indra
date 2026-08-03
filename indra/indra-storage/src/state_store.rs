@@ -496,8 +496,8 @@ mod tests {
         Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{
-        apply_block, compute_state_root, compute_validator_set_root, EvictedValidatorTombstoneV1,
-        ValidatorEntry, ValidatorStatus,
+        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
+        ValidatorStatus,
     };
     use std::io::Write;
 
@@ -596,95 +596,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn checkpoint_restore_preserves_exact_retained_consensus_snapshots() {
-        let dir = temp_dir("consensus_snapshot_restore");
-        let store = StateStore::open(&dir).unwrap();
-        let classical = indra_crypto::ClassicalKeypair::from_seed(&[0xC1; 32]);
-        let pq = indra_crypto::PqKeypair::from_seed(&[0xC2; 32]).unwrap();
-        let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
-        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xC3; 32]);
-        let entry = |weight| {
-            ConsensusSnapshotEntry::new(
-                Bytes32::from([0xC0; 32]),
-                weight,
-                public.classical.0,
-                public.pq.0,
-                vrf.public_key(),
-            )
-            .unwrap()
-        };
-
-        let mut continuous = ChainState::new_genesis();
-        continuous.height = u64::MAX;
-        continuous.tip_hash = Bytes32::from([0xCF; 32]);
-        let previous = ConsensusSnapshot::new(901, 900, vec![entry(2_000_000_000)]).unwrap();
-        let current =
-            ConsensusSnapshot::new(u64::MAX, u64::MAX - 1, vec![entry(3_000_000_000)]).unwrap();
-        continuous.consensus_snapshots = vec![previous, current.clone()];
-        continuous.reward_economic_snapshot = Some(
-            RewardEconomicSnapshot::new(
-                u64::MAX,
-                u64::MAX - 1,
-                10_000,
-                vec![RewardEconomicValidatorEntry::new(
-                    Bytes32::from([0xC0; 32]),
-                    0,
-                    vec![],
-                    10_000,
-                )
-                .unwrap()],
-            )
-            .unwrap(),
-        );
-        continuous.slash_membership_roots = continuous
-            .consensus_snapshots
-            .iter()
-            .map(|snapshot| SlashMembershipRootRecord {
-                activation_height: snapshot.activation_height,
-                membership_root: compute_slash_membership_root(snapshot).unwrap(),
-            })
-            .collect();
-        let tombstone_id = Bytes32::from([0xD0; 32]);
-        continuous.evicted_validator_tombstones.insert(
-            tombstone_id,
-            EvictedValidatorTombstoneV1 {
-                validator_id: tombstone_id,
-                eviction_height: u64::MAX - 1,
-                eviction_epoch: (u64::MAX - 1)
-                    / indra_core::types::primitives::EPOCH_DURATION_BLOCKS,
-                last_classical_vote_pk: public.classical.0,
-                last_pq_vote_pk: public.pq.0,
-                last_vrf_pk: vrf.public_key(),
-                cold_custody: None,
-                retained_bonds: Vec::new(),
-            },
-        );
-        continuous.rebuild_state_commitment_v2(continuous.height);
-        let expected_bytes = serialise_chain_state(&continuous);
-        let expected_roots = compute_state_roots(&continuous);
-
-        store.save(&continuous).unwrap();
-        let restored = store.load_latest().unwrap().unwrap();
-
-        assert_eq!(restored.consensus_snapshots.len(), 2);
-        assert_eq!(restored.consensus_snapshots, continuous.consensus_snapshots);
-        assert_eq!(
-            restored.reward_economic_snapshot,
-            continuous.reward_economic_snapshot
-        );
-        assert_eq!(
-            restored.slash_membership_roots,
-            continuous.slash_membership_roots
-        );
-        assert_eq!(
-            restored.evicted_validator_tombstones,
-            continuous.evicted_validator_tombstones
-        );
-        assert_eq!(serialise_chain_state(&restored), expected_bytes);
-        assert_eq!(compute_state_roots(&restored), expected_roots);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn canonical_snapshot_round_trips() {
@@ -818,73 +729,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn complete_snapshot_round_trip() {
-        use indra_core::types::primitives::{Bytes32, DUST_LIMIT_SPARK};
-        use indra_state::{ValidatorEntry, ValidatorStatus};
-
-        let dir = temp_dir("round_trip");
-        let store = StateStore::open(&dir).unwrap();
-
-        let mut state = ChainState::new_genesis();
-        state.validators.upsert(test_validator()).unwrap();
-        state.finalize_genesis().unwrap();
-        state.height = 512;
-        state.tip_hash = Bytes32::from([0x11; 32]);
-        state.base_fee = 4242;
-        state.total_supply = 9_999_999;
-        state.treasury_balance = 123_456;
-        state.burn_buffer = 654_321;
-        state.fee_reward_pool = 888;
-
-        state
-            .utxos
-            .insert(
-                indra_core::types::transaction::OutputV1 {
-                    value_spark: 50_000,
-                    commitment: indra_core::CommitmentV1 {
-                        compressed_point: Bytes32::from([0x21; 32]),
-                    },
-                    owner_pubkey: indra_core::HybridPubKey {
-                        classical_pk: Bytes32::from([0x22; 32]),
-                        pq_pk: indra_core::VariableBytes::from_slice(&[0x23; 64]).unwrap(),
-                    },
-                    range_proof: indra_core::VariableBytes::from_slice(&[0x24; 96]).unwrap(),
-                    lock_height: 77,
-                },
-                512,
-                0,
-                0,
-            )
-            .unwrap();
-        state.nullifiers.insert(Bytes32::from([0x31; 32]));
-
-        state
-            .delegations
-            .add_delegation(
-                Bytes32::from([0x41; 32]),
-                Bytes32::from([0x51; 32]),
-                25_000,
-                7,
-            )
-            .unwrap();
-        state
-            .delegations
-            .begin_undelegate(
-                &Bytes32::from([0x41; 32]),
-                &Bytes32::from([0x51; 32]),
-                5_000,
-                9,
-            )
-            .unwrap();
-        state.rebuild_state_commitment_v2(state.height);
-
-        store.save(&state).unwrap();
-        let loaded = store.load_latest().unwrap().unwrap();
-        assert_eq!(loaded, state);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     fn make_block(state: &ChainState) -> BlockV1 {
         let mut block = BlockV1 {

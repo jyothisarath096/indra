@@ -2,18 +2,17 @@
 
 use indra_cli::{
     build_claim_rewards_op, build_delegate_op, build_register_validator_op_with_cold,
-    build_set_commission_op, build_undelegate_op, generate_from_master_seed,
+    build_exit_stake_position_op, build_set_commission_op, generate_from_master_seed,
     generate_from_passphrase,
     genesis_cmd::{build_genesis_config, entry_from_keys},
     load_cold_keys,
     query::rpc_call,
-    tx_builder::{build_self_stake_op, build_self_unstake_op},
-    PasswordSource,
+    tx_builder::build_self_stake_op, PasswordSource, StakePositionExitSigner,
 };
 use indra_core::{
     codec::Decode,
     types::{
-        primitives::DUST_LIMIT_SPARK,
+        primitives::DUST_LIMIT_SPARK, stake_position::PositionCustodyV1,
         staking::{StakingBondProof, StakingOp},
     },
     Bytes32,
@@ -283,7 +282,6 @@ fn test_build_and_decode_all_staking_ops() {
         )
         .unwrap(),
         build_self_stake_op(bond_utxo_id, bond_proof.clone(), &keypair, 2, chain_id).unwrap(),
-        build_self_unstake_op(bond_utxo_id, &keypair, 3, chain_id).unwrap(),
         build_delegate_op(
             validator_id,
             bond_utxo_id,
@@ -293,7 +291,12 @@ fn test_build_and_decode_all_staking_ops() {
             chain_id,
         )
         .unwrap(),
-        build_undelegate_op(validator_id, bond_utxo_id, &keypair, 5, chain_id).unwrap(),
+        build_exit_stake_position_op(
+            Bytes32::from([0xD4; 32]), 500_000,
+            PositionCustodyV1::DelegatorIdentity { delegator_id: validator_id },
+            StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 5 },
+            chain_id,
+        ).unwrap(),
         build_claim_rewards_op(validator_id, &keypair, 6, chain_id).unwrap(),
         build_set_commission_op(validator_id, 1_250, &keypair, 7, chain_id).unwrap(),
     ];
@@ -301,7 +304,7 @@ fn test_build_and_decode_all_staking_ops() {
     for (idx, op) in built.iter().enumerate() {
         let bytes = hex::decode(&op.op_hex).unwrap();
         let decoded = StakingOp::decode_exact(&bytes).unwrap();
-        assert_eq!(decoded.nonce, idx as u64 + 1);
+        assert_eq!(decoded.nonce, [1, 2, 4, 5, 6, 7][idx]);
         assert!(decoded
             .signature
             .classical_sig
