@@ -76,7 +76,6 @@ pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RPC_PUBLIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum public UTXO/balance scans per minute from one IP.
-pub const UTXO_SCAN_RATE_PER_MIN: u64 = 10;
 
 /// Maximum expensive public read-only calls per minute from one IP.
 pub const RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN: u64 = 30;
@@ -263,14 +262,6 @@ pub fn rpc_rate_limited_response() -> String {
     )
 }
 
-/// Return true when an RPC method triggers a full public UTXO scan.
-pub fn is_utxo_scan_method(method: &str) -> bool {
-    matches!(
-        method,
-        "indra_getLegacyBalanceAuthorized" | "indra_getLegacyUtxosAuthorized"
-    )
-}
-
 /// Public read-only method cost class used for pre-dispatch throttling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcMethodCost {
@@ -283,9 +274,7 @@ pub enum RpcMethodCost {
 /// Classify public read-only methods by expected resource cost.
 pub fn rpc_method_cost(method: &str) -> RpcMethodCost {
     match method {
-        "indra_getLegacyBalanceAuthorized"
-        | "indra_getLegacyUtxosAuthorized"
-        | "indra_getDelegatorPositions"
+        "indra_getDelegatorPositions"
         | "indra_getDelegatorRewards"
         | "indra_getValidatorDelegators"
         | "indra_getStakeBonds"
@@ -779,14 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn old_public_utxo_scan_methods_are_not_rate_limited_as_scan_methods() {
-        assert!(!is_utxo_scan_method("indra_getUtxos"));
-        assert!(!is_utxo_scan_method("indra_getBalance"));
-        assert!(is_utxo_scan_method("indra_getLegacyUtxosAuthorized"));
-        assert!(is_utxo_scan_method("indra_getLegacyBalanceAuthorized"));
-    }
-
-    #[test]
     fn rpc_per_ip_rate_limit_returns_429() {
         let ip = "203.0.113.9".parse().unwrap();
         let limiter = RpcRateLimiter::new();
@@ -831,10 +812,6 @@ mod tests {
     fn rpc_public_expensive_method_classification_is_explicit() {
         assert_eq!(
             rpc_method_cost("indra_getDelegatorPositions"),
-            RpcMethodCost::Expensive
-        );
-        assert_eq!(
-            rpc_method_cost("indra_getLegacyUtxosAuthorized"),
             RpcMethodCost::Expensive
         );
         assert_eq!(
@@ -921,16 +898,6 @@ mod tests {
             -32600,
         );
         assert!(response.contains("batch requests not supported"));
-    }
-
-    #[test]
-    fn utxo_query_is_rate_limited_independently() {
-        let ip = "203.0.113.10".parse().unwrap();
-        let limiter = RpcWindowRateLimiter::new();
-        for _ in 0..UTXO_SCAN_RATE_PER_MIN {
-            assert!(limiter.allow(ip, UTXO_SCAN_RATE_PER_MIN));
-        }
-        assert!(!limiter.allow(ip, UTXO_SCAN_RATE_PER_MIN));
     }
 
     #[test]

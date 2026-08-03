@@ -12,8 +12,6 @@ OutputV1 wallet scans.
 The old unauthenticated address-indexed RPC methods have been replaced by:
 
 - `indra_getLegacyScanChallenge(address)`
-- `indra_getLegacyUtxosAuthorized(address, scan_auth_proof)`
-- `indra_getLegacyBalanceAuthorized(address, scan_auth_proof)`
 
 The authorized methods require a signed ownership proof from the legacy
 address's hybrid spend key before returning address-specific UTXO or balance

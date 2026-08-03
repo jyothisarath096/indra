@@ -3434,7 +3434,6 @@ fn spawn_rpc_listener(
         .global_rate_per_sec
         .zip(policy.global_burst)
         .map(|(rate, burst)| Arc::new(indra_rpc::server::RpcGlobalRateLimiter::new(rate, burst)));
-    let utxo_scan_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
     let expensive_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
     let expensive_global_limiter = Arc::new(indra_rpc::server::RpcGlobalWindowRateLimiter::new());
     let rejection_counters = Arc::new(RpcRejectionCounters::default());
@@ -3468,7 +3467,6 @@ fn spawn_rpc_listener(
                     let rpc_conn_count = Arc::clone(&rpc_conn_count);
                     let rpc_rate_limiter = Arc::clone(&rpc_rate_limiter);
                     let rpc_global_rate_limiter = rpc_global_rate_limiter.clone();
-                    let utxo_scan_limiter = Arc::clone(&utxo_scan_limiter);
                     let expensive_limiter = Arc::clone(&expensive_limiter);
                     let expensive_global_limiter = Arc::clone(&expensive_global_limiter);
                     let rejection_counters = Arc::clone(&rejection_counters);
@@ -3486,7 +3484,6 @@ fn spawn_rpc_listener(
                             peer_ip,
                             &rpc_rate_limiter,
                             rpc_global_rate_limiter.as_deref(),
-                            &utxo_scan_limiter,
                             &expensive_limiter,
                             &expensive_global_limiter,
                             &rejection_counters,
@@ -3573,7 +3570,6 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
             .filter_map(|epoch| self.epoch_records.get(&epoch).cloned())
             .collect())
     }
-
 }
 
 fn snapshot_rpc_state(
@@ -3776,7 +3772,6 @@ fn handle_rpc(
     peer_ip: Option<IpAddr>,
     rate_limiter: &indra_rpc::server::RpcRateLimiter,
     global_rate_limiter: Option<&indra_rpc::server::RpcGlobalRateLimiter>,
-    utxo_scan_limiter: &indra_rpc::server::RpcWindowRateLimiter,
     expensive_limiter: &indra_rpc::server::RpcWindowRateLimiter,
     expensive_global_limiter: &indra_rpc::server::RpcGlobalWindowRateLimiter,
     rejection_counters: &RpcRejectionCounters,
@@ -3981,18 +3976,6 @@ fn handle_rpc(
                 .try_clone()
                 .map(|mut writer| writer.write_all(response.as_bytes()));
             return;
-        }
-    }
-
-    if indra_rpc::server::is_utxo_scan_method(&req.method) {
-        if let Some(ip) = peer_ip {
-            if !utxo_scan_limiter.allow(ip, indra_rpc::server::UTXO_SCAN_RATE_PER_MIN) {
-                let response = indra_rpc::server::rpc_rate_limited_response();
-                let _ = stream
-                    .try_clone()
-                    .map(|mut writer| writer.write_all(response.as_bytes()));
-                return;
-            }
         }
     }
 

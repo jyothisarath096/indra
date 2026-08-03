@@ -25,7 +25,7 @@ fn main() {
 fn usage_and_exit() -> ! {
     eprintln!("Usage:");
     eprintln!("  indra-tx address --keys <keys.json> [--keys-password-file <path>]");
-    eprintln!("  indra-tx balance --keys <keys.json> [--keys-password-file <path>] [--address <hex>] --rpc <url>");
+    eprintln!("  indra-tx balance --keys <keys.json> [--keys-password-file <path>] [--address <hex>] [--wallet <wallet.json>] --rpc <url>");
     eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <INDRA> --rpc <url>");
     std::process::exit(1);
 }
@@ -49,6 +49,7 @@ fn cmd_balance(args: &[String]) {
         std::process::exit(1);
     });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let wallet_path = get_arg(args, "--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
@@ -63,20 +64,8 @@ fn cmd_balance(args: &[String]) {
         );
         std::process::exit(1);
     }
-    let proof = build_auth_or_exit(&rpc, &keys, &address);
-    let raw = indra_cli::rpc_call_raw_params(
-        &rpc,
-        "indra_getLegacyBalanceAuthorized",
-        &[indra_cli::json_string(&address), proof],
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Error querying authorized legacy balance: {}", e);
-        std::process::exit(1);
-    });
-    let balance = parse_balance_response(&raw).unwrap_or_else(|e| {
-        eprintln!("Error parsing authorized balance response: {}", e);
-        std::process::exit(1);
-    });
+    let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
+    let balance = wallet.balance();
     println!(
         "Address: {}\nBalance: {} Spark ({:.8} INDRA)",
         address,
@@ -106,30 +95,7 @@ fn cmd_send(args: &[String]) {
     let pq_sk_bytes = keys.pq_sk.clone();
     let classical_pk = keys.public.hybrid_classical_pk;
     let pq_pk = keys.public.hybrid_pq_pk.clone();
-    let sender_address = hex::encode(sha256(&classical_pk));
-
-    let proof = build_auth_or_exit(&rpc, &keys, &sender_address);
-    let utxos_raw = indra_cli::rpc_call_raw_params(
-        &rpc,
-        "indra_getLegacyUtxosAuthorized",
-        &[indra_cli::json_string(&sender_address), proof],
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Error querying authorized legacy UTXOs: {}", e);
-        std::process::exit(1);
-    });
-    let local_wallet = Wallet::load(&wallet_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Error loading wallet {}: {}. Run indra-wallet-scan to recover or add spendable UTXOs with their blinding factors.",
-            wallet_path, e
-        );
-        std::process::exit(1);
-    });
-    let wallet =
-        spendable_wallet_from_authorized_utxos(&utxos_raw, &local_wallet).unwrap_or_else(|e| {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        });
+    let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
 
     let sender_payment_pubkey = keys
         .payment_keypair
@@ -169,8 +135,7 @@ fn cmd_send(args: &[String]) {
         eprintln!("{}", response);
         std::process::exit(1);
     }
-    if let Err(error) = update_wallet_after_accepted_transaction(&wallet_path, local_wallet, &built)
-    {
+    if let Err(error) = update_wallet_after_accepted_transaction(&wallet_path, wallet, &built) {
         eprintln!(
             "Warning: could not update wallet {}: {}",
             wallet_path, error
@@ -192,15 +157,31 @@ fn parse_send_amount_spark(raw: &str) -> indra_cli::CliResult<u64> {
     indra_cli::parse_indra_amount_to_spark(raw, "--amount")
 }
 
-fn build_auth_or_exit(rpc: &str, keys: &KeysFile, address: &str) -> String {
-    indra_cli::build_legacy_scan_auth_proof(rpc, keys, address).unwrap_or_else(|e| {
-        eprintln!(
-            "Error building legacy scan authorization: {}. \
-             Address-indexed UTXO scans are no longer public; use the owner's keys.json.",
-            e
-        );
+fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet {
+    let mut wallet = Wallet::load(wallet_path).unwrap_or_else(|error| {
+        eprintln!("Error loading wallet {}: {}", wallet_path, error);
         std::process::exit(1);
-    })
+    });
+    let payment_keys = keys.payment_keypairs().cloned().collect::<Vec<_>>();
+    if payment_keys.is_empty() {
+        eprintln!("Error: canonical keystore contains no payment keys");
+        std::process::exit(1);
+    }
+    wallet.set_payment_key_hashes(
+        payment_keys
+            .iter()
+            .map(|keypair| keypair.public_key().hash())
+            .collect(),
+    );
+    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &payment_keys).unwrap_or_else(|error| {
+        eprintln!("Error scanning canonical blocks: {}", error);
+        std::process::exit(1);
+    });
+    wallet.save(wallet_path).unwrap_or_else(|error| {
+        eprintln!("Error saving wallet {}: {}", wallet_path, error);
+        std::process::exit(1);
+    });
+    wallet
 }
 
 fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
@@ -223,102 +204,6 @@ fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
             std::process::exit(1);
         }),
     }
-}
-
-fn parse_balance_response(json: &str) -> Result<u64, String> {
-    required_number(json, "balance")
-}
-
-fn spendable_wallet_from_authorized_utxos(
-    json: &str,
-    local_wallet: &Wallet,
-) -> Result<Wallet, String> {
-    let mut spendable = Wallet::new();
-    let Some(utxos_json) = extract_array(json, "utxos") else {
-        return Err("authorized UTXO response missing required utxos array".to_string());
-    };
-
-    let mut discovered = 0usize;
-    let mut spendable_count = 0usize;
-    let mut pos = 0usize;
-    while let Some(start_rel) = utxos_json[pos..].find('{') {
-        let start = pos + start_rel;
-        let Some(end) = find_matching_brace(utxos_json, start) else {
-            break;
-        };
-        let obj = &utxos_json[start..=end];
-        let Some(utxo_id) = extract_hex_string(obj, "utxo_id") else {
-            return Err("authorized UTXO entry missing required utxo_id".to_string());
-        };
-        let amount = required_number(obj, "amount")?;
-        let created_height = required_number(obj, "created_height")?;
-        let tx_index = required_u32(obj, "tx_index")?;
-        let out_index = required_u32(obj, "out_index")?;
-        let mut utxo_id_arr = [0u8; 32];
-        if utxo_id.len() == 32 {
-            utxo_id_arr.copy_from_slice(&utxo_id);
-            discovered += 1;
-            let utxo_id = Bytes32::from(utxo_id_arr);
-            if let Some(entry) = local_wallet.get(&utxo_id) {
-                if entry.value_spark == amount && !entry.spent {
-                    spendable_count += 1;
-                    spendable.add_utxo(
-                        utxo_id,
-                        amount,
-                        entry.blinding,
-                        created_height,
-                        tx_index,
-                        out_index,
-                    );
-                }
-            }
-        }
-        pos = end + 1;
-    }
-    if discovered > 0 && spendable_count == 0 {
-        return Err(format!(
-            "authorized RPC found {discovered} UTXO(s), but none match an unspent local wallet entry with a known blinding factor; run indra-wallet-scan or add the UTXO with --add-utxo before sending"
-        ));
-    }
-    Ok(spendable)
-}
-
-fn extract_array<'a>(json: &'a str, field: &str) -> Option<&'a str> {
-    let key = format!("\"{}\":", field);
-    let pos = json.find(&key)?;
-    let after = json[pos + key.len()..].trim_start();
-    let after = after.strip_prefix('[')?;
-    let mut depth = 1usize;
-    for (idx, ch) in after.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&after[..idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn find_matching_brace(text: &str, start: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (offset, ch) in text[start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + offset);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn rpc_call(url: &str, method: &str, params: &[String]) -> String {
@@ -374,23 +259,6 @@ fn required_arg(args: &[String], flag: &str) -> String {
     })
 }
 
-fn extract_number(json: &str, field: &str) -> Option<u64> {
-    let key = format!("\"{}\":", field);
-    let pos = json.find(&key)?;
-    let after = json[pos + key.len()..].trim_start();
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-fn required_number(json: &str, field: &str) -> Result<u64, String> {
-    extract_number(json, field).ok_or_else(|| format!("response missing required {field} field"))
-}
-
-fn required_u32(json: &str, field: &str) -> Result<u32, String> {
-    let value = required_number(json, field)?;
-    u32::try_from(value).map_err(|_| format!("response field {field} exceeds u32"))
-}
-
 fn extract_hex_string(json: &str, field: &str) -> Option<Vec<u8>> {
     let key = format!("\"{}\":", field);
     let pos = json.find(&key)?;
@@ -433,63 +301,6 @@ mod tests {
             parse_send_amount_spark("10.5").unwrap(),
             indra_cli::parse_indra_amount_to_spark("10.5", "--amount").unwrap()
         );
-    }
-
-    #[test]
-    fn balance_response_accepts_real_zero_and_rejects_missing_balance() {
-        assert_eq!(
-            parse_balance_response(r#"{"jsonrpc":"2.0","result":{"balance":0},"id":1}"#).unwrap(),
-            0
-        );
-
-        let err = parse_balance_response(r#"{"jsonrpc":"2.0","result":{"height":12},"id":1}"#)
-            .unwrap_err();
-        assert!(err.contains("balance"), "{err}");
-    }
-
-    #[test]
-    fn authorized_utxo_parser_accepts_empty_array_but_rejects_missing_array() {
-        let wallet =
-            spendable_wallet_from_authorized_utxos(r#"{"result":{"utxos":[]}}"#, &Wallet::new())
-                .unwrap();
-        assert_eq!(wallet.balance(), 0);
-
-        let err =
-            spendable_wallet_from_authorized_utxos(r#"{"result":{"count":0}}"#, &Wallet::new())
-                .unwrap_err();
-        assert!(err.contains("utxos array"), "{err}");
-    }
-
-    #[test]
-    fn authorized_utxo_parser_rejects_missing_required_entry_fields() {
-        let json = r#"{"result":{"utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","created_height":0,"tx_index":0,"out_index":0}]}}"#;
-        let err = spendable_wallet_from_authorized_utxos(json, &Wallet::new()).unwrap_err();
-        assert!(err.contains("amount"), "{err}");
-    }
-
-    #[test]
-    fn spendable_wallet_from_nested_utxos_response_uses_local_blinding() {
-        let json = r#"{"jsonrpc":"2.0","result":{"address":"28ce6ab9565c324950a4308ccd1187c473fa737d4e687e12121c04b0e4c8c1b6","utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","amount":1000000000000,"created_height":0,"tx_index":0,"out_index":0,"lock_height":0}]},"id":1}"#;
-        let mut local_wallet = Wallet::new();
-        let utxo_id = Bytes32::from(copy32(
-            &hex::decode("e64a971111111111111111111111111111111111111111111111111111111111")
-                .unwrap(),
-        ));
-        local_wallet.add_utxo(utxo_id, 1_000_000_000_000, [0x42; 32], 0, 0, 0);
-
-        let wallet = spendable_wallet_from_authorized_utxos(json, &local_wallet).unwrap();
-        assert_eq!(wallet.balance(), 1_000_000_000_000);
-        assert_eq!(wallet.get(&utxo_id).unwrap().blinding, [0x42; 32]);
-    }
-
-    #[test]
-    fn rpc_discovered_utxo_without_local_blinding_fails_clearly() {
-        let json = r#"{"jsonrpc":"2.0","result":{"utxos":[{"utxo_id":"e64a971111111111111111111111111111111111111111111111111111111111","amount":1000000000000,"created_height":0,"tx_index":0,"out_index":0}]}}"#;
-        let err = spendable_wallet_from_authorized_utxos(json, &Wallet::new()).unwrap_err();
-
-        assert!(err.contains("authorized RPC found 1 UTXO"));
-        assert!(err.contains("known blinding factor"));
-        assert!(err.contains("indra-wallet-scan"));
     }
 
     #[test]
