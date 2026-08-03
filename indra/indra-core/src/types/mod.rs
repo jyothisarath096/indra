@@ -13,6 +13,7 @@ pub mod reward_economic_snapshot;
 pub mod slash_detector;
 pub mod slash_membership;
 pub mod slashing;
+pub mod stake_position;
 pub mod staking;
 pub mod transaction;
 pub mod vote;
@@ -23,4 +24,8 @@ pub use consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 pub use epoch_record::EpochRecord;
 pub use reward_economic_snapshot::{
     RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
+};
+pub use stake_position::{
+    staking_op_id_v2, ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1,
+    UnbondingTimingV1, UnbondingTrancheV1,
 };

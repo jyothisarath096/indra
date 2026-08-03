@@ -1014,7 +1014,9 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
                 .collect::<std::collections::BTreeSet<_>>()
         })
         .unwrap_or_default();
-    if !active_ids.is_empty() && (state.consensus_snapshots.is_empty() || active_ids != snapshot_ids) {
+    if !active_ids.is_empty()
+        && (state.consensus_snapshots.is_empty() || active_ids != snapshot_ids)
+    {
         let positions: Vec<_> = state
             .delegations
             .all_delegators()
@@ -1071,7 +1073,6 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
     }
     Ok(())
 }
-
 
 #[derive(Clone, Copy)]
 enum SnapshotRewardSource {
@@ -1647,9 +1648,7 @@ mod tests {
     }
 
     fn install_reward_basis(state: &mut ChainState) {
-        let consensus = state
-            .build_consensus_snapshot(1, 0)
-            .unwrap();
+        let consensus = state.build_consensus_snapshot(1, 0).unwrap();
         let economic = state.build_reward_economic_snapshot(&consensus).unwrap();
         state.consensus_snapshots = vec![consensus];
         state.reward_economic_snapshot = Some(economic);

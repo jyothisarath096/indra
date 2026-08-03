@@ -23,6 +23,11 @@ pub const PAYMENT_VERSION_V1: u8 = 1;
 /// BLAKE3 derive-key context for payment blinding factors.
 pub const PAYMENT_BLINDING_CONTEXT_V1: &str = "INDRA-payment-blinding-v1";
 
+/// BLAKE3 derive-key context for a tranche's protocol-owned source commitment.
+pub const TRANCHE_SOURCE_BLINDING_CONTEXT_V1: &str = "INDRA-STAKE-TRANCHE-SOURCE-BLINDING-v1";
+/// SHA-256 domain for a deterministic, publicly reproducible tranche refund.
+pub const TRANCHE_REFUND_BLINDING_DOMAIN_V1: &[u8] = b"INDRA-STAKE-TRANCHE-REFUND-BLINDING-v1";
+
 /// Encoded `PaymentKeypairV1` length.
 pub const PAYMENT_KEYPAIR_V1_ENCODED_LEN: usize = 1 + X25519_SK_BYTES + ML_KEM_SEED_BYTES;
 
@@ -270,6 +275,116 @@ pub struct PaymentBlindingInputsV1<'a> {
     pub note_nonce: [u8; 32],
 }
 
+/// Public canonical inputs to the tranche source-commitment KDF.
+pub struct TrancheSourceBlindingInputsV1<'a> {
+    /// Canonical chain identifier.
+    pub chain_id: &'a [u8],
+    /// Canonical staking-position identifier.
+    pub position_id: [u8; 32],
+    /// Canonical unbonding-tranche identifier.
+    pub tranche_id: [u8; 32],
+    /// Public tranche principal in Spark.
+    pub principal_spark: u64,
+    /// Exact height at which unbonding starts.
+    pub start_height: u64,
+    /// Canonical operation identifier that created the tranche.
+    pub creation_op_id: [u8; 32],
+}
+
+/// Public canonical context for a deterministic tranche refund.
+pub struct TrancheRefundBlindingInputsV1<'a> {
+    /// Canonical chain identifier.
+    pub chain_id: &'a [u8],
+    /// Canonical staking-position identifier.
+    pub position_id: [u8; 32],
+    /// Canonical unbonding-tranche identifier.
+    pub tranche_id: [u8; 32],
+    /// Identity owning the released principal.
+    pub principal_owner_id: [u8; 32],
+    /// Canonical `PositionCustodyV1` bytes.
+    pub custody_encoding: &'a [u8],
+    /// Released principal in Spark.
+    pub principal_spark: u64,
+    /// Exact output-creation height.
+    pub release_height: u64,
+    /// Canonical maturity epoch from the tranche timing.
+    pub end_epoch: u64,
+}
+
+/// Reduce a 32-byte BLAKE3 derive-key output modulo the Ristretto scalar order.
+///
+/// The returned bytes are always the canonical `Scalar::to_bytes()` encoding;
+/// there is no rejection loop.
+fn reduce_blinding(bytes: [u8; 32]) -> [u8; 32] {
+    curve25519_dalek::scalar::Scalar::from_bytes_mod_order(bytes).to_bytes()
+}
+
+fn encode_len_prefixed<'a>(
+    field: &'static str,
+    bytes: &'a [u8],
+    out: &mut Vec<u8>,
+) -> CryptoResult<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| CryptoError::LengthExceeded {
+        field,
+        max: u16::MAX as usize,
+        actual: bytes.len(),
+    })?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Exact source KDF encoding:
+/// `u16_le(chain_len) || chain || position_id || tranche_id || principal_le ||
+/// start_height_le || creation_op_id`, reduced modulo the scalar order.
+pub fn derive_tranche_source_blinding_v1(
+    inputs: &TrancheSourceBlindingInputsV1<'_>,
+) -> CryptoResult<[u8; 32]> {
+    let mut material = Vec::with_capacity(2 + inputs.chain_id.len() + 32 + 32 + 8 + 8 + 32);
+    encode_len_prefixed("chain_id", inputs.chain_id, &mut material)?;
+    material.extend_from_slice(&inputs.position_id);
+    material.extend_from_slice(&inputs.tranche_id);
+    material.extend_from_slice(&inputs.principal_spark.to_le_bytes());
+    material.extend_from_slice(&inputs.start_height.to_le_bytes());
+    material.extend_from_slice(&inputs.creation_op_id);
+    Ok(reduce_blinding(blake3::derive_key(
+        TRANCHE_SOURCE_BLINDING_CONTEXT_V1,
+        &material,
+    )))
+}
+
+/// Exact public refund encoding:
+/// `domain || u16_le(chain_len) || chain || position_id || tranche_id ||
+/// principal_owner_id || custody || principal_le || release_height_le ||
+/// end_epoch_le`, hashed with SHA-256 and reduced modulo the scalar order.
+///
+/// Knowledge of this opening is public. Spend authorization remains protected
+/// by the refund output's hybrid owner key, matching normal bond releases.
+pub fn derive_tranche_refund_blinding_v1(
+    inputs: &TrancheRefundBlindingInputsV1<'_>,
+) -> CryptoResult<[u8; 32]> {
+    let mut material = Vec::with_capacity(
+        TRANCHE_REFUND_BLINDING_DOMAIN_V1.len()
+            + 2
+            + inputs.chain_id.len()
+            + 32
+            + 32
+            + 32
+            + inputs.custody_encoding.len()
+            + 24,
+    );
+    material.extend_from_slice(TRANCHE_REFUND_BLINDING_DOMAIN_V1);
+    encode_len_prefixed("chain_id", inputs.chain_id, &mut material)?;
+    material.extend_from_slice(&inputs.position_id);
+    material.extend_from_slice(&inputs.tranche_id);
+    material.extend_from_slice(&inputs.principal_owner_id);
+    material.extend_from_slice(inputs.custody_encoding);
+    material.extend_from_slice(&inputs.principal_spark.to_le_bytes());
+    material.extend_from_slice(&inputs.release_height.to_le_bytes());
+    material.extend_from_slice(&inputs.end_epoch.to_le_bytes());
+    Ok(reduce_blinding(sha256(&material)))
+}
+
 /// Derive the Stage 1 payment blinding factor using the exact confirmed KDF.
 pub fn derive_payment_blinding_v1(inputs: &PaymentBlindingInputsV1<'_>) -> CryptoResult<[u8; 32]> {
     let chain_id_len =
@@ -440,6 +555,13 @@ pub fn recipient_derive_payment_blinding_v1(
 mod tests {
     use super::*;
 
+    fn direct_scalar_oracle(context: &str, material: &[u8]) -> [u8; 32] {
+        curve25519_dalek::scalar::Scalar::from_bytes_mod_order(blake3::derive_key(
+            context, material,
+        ))
+        .to_bytes()
+    }
+
     fn direct_blinding_oracle(inputs: &PaymentBlindingInputsV1<'_>) -> [u8; 32] {
         let chain_id_len = u16::try_from(inputs.chain_id.len()).unwrap();
         let mut ikm = Vec::new();
@@ -456,6 +578,149 @@ mod tests {
         ikm.extend_from_slice(&inputs.ml_kem_1024_ciphertext);
         ikm.extend_from_slice(&inputs.note_nonce);
         blake3::derive_key(PAYMENT_BLINDING_CONTEXT_V1, &ikm)
+    }
+
+    #[test]
+    fn tranche_source_kdf_matches_independent_exact_encoding_oracle() {
+        let inputs = TrancheSourceBlindingInputsV1 {
+            chain_id: b"indra-mainnet",
+            position_id: [1; 32],
+            tranche_id: [2; 32],
+            principal_spark: 0x0102_0304_0506_0708,
+            start_height: 0x1112_1314_1516_1718,
+            creation_op_id: [3; 32],
+        };
+        let mut material = Vec::new();
+        material.extend_from_slice(&(inputs.chain_id.len() as u16).to_le_bytes());
+        material.extend_from_slice(inputs.chain_id);
+        material.extend_from_slice(&inputs.position_id);
+        material.extend_from_slice(&inputs.tranche_id);
+        material.extend_from_slice(&inputs.principal_spark.to_le_bytes());
+        material.extend_from_slice(&inputs.start_height.to_le_bytes());
+        material.extend_from_slice(&inputs.creation_op_id);
+        assert_eq!(
+            derive_tranche_source_blinding_v1(&inputs).unwrap(),
+            direct_scalar_oracle(TRANCHE_SOURCE_BLINDING_CONTEXT_V1, &material)
+        );
+        let baseline = derive_tranche_source_blinding_v1(&inputs).unwrap();
+        let variants = [
+            TrancheSourceBlindingInputsV1 {
+                chain_id: b"indra-mainnet-x",
+                ..inputs
+            },
+            TrancheSourceBlindingInputsV1 {
+                position_id: [4; 32],
+                ..inputs
+            },
+            TrancheSourceBlindingInputsV1 {
+                tranche_id: [5; 32],
+                ..inputs
+            },
+            TrancheSourceBlindingInputsV1 {
+                principal_spark: inputs.principal_spark + 1,
+                ..inputs
+            },
+            TrancheSourceBlindingInputsV1 {
+                start_height: inputs.start_height + 1,
+                ..inputs
+            },
+            TrancheSourceBlindingInputsV1 {
+                creation_op_id: [6; 32],
+                ..inputs
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                derive_tranche_source_blinding_v1(&variant).unwrap(),
+                baseline
+            );
+        }
+    }
+
+    #[test]
+    fn tranche_refund_kdf_matches_oracle_and_existing_release_pattern() {
+        let inputs = TrancheRefundBlindingInputsV1 {
+            chain_id: b"indra-mainnet",
+            position_id: [2; 32],
+            tranche_id: [3; 32],
+            principal_owner_id: [4; 32],
+            custody_encoding: &[1, 2, 3, 4],
+            principal_spark: 987_654_321,
+            release_height: 123_456,
+            end_epoch: 411,
+        };
+        let mut material = Vec::new();
+        material.extend_from_slice(TRANCHE_REFUND_BLINDING_DOMAIN_V1);
+        material.extend_from_slice(&(inputs.chain_id.len() as u16).to_le_bytes());
+        material.extend_from_slice(inputs.chain_id);
+        material.extend_from_slice(&inputs.position_id);
+        material.extend_from_slice(&inputs.tranche_id);
+        material.extend_from_slice(&inputs.principal_owner_id);
+        material.extend_from_slice(inputs.custody_encoding);
+        material.extend_from_slice(&inputs.principal_spark.to_le_bytes());
+        material.extend_from_slice(&inputs.release_height.to_le_bytes());
+        material.extend_from_slice(&inputs.end_epoch.to_le_bytes());
+        let oracle =
+            curve25519_dalek::scalar::Scalar::from_bytes_mod_order(sha256(&material)).to_bytes();
+        assert_eq!(derive_tranche_refund_blinding_v1(&inputs).unwrap(), oracle);
+        assert_eq!(derive_tranche_refund_blinding_v1(&inputs).unwrap(), oracle);
+
+        // Normal bond release uses this same reviewed public construction:
+        // domain-separated SHA-256 over canonical public fields, followed by
+        // scalar reduction. The domains ensure the two openings cannot alias.
+        let mut bond_material = Vec::new();
+        bond_material.extend_from_slice(b"INDRA-normal-stake-bond-release-v1");
+        bond_material.extend_from_slice(&inputs.position_id);
+        bond_material.extend_from_slice(&inputs.principal_owner_id);
+        bond_material.extend_from_slice(&inputs.tranche_id);
+        bond_material.extend_from_slice(&inputs.release_height.to_le_bytes());
+        bond_material.extend_from_slice(&inputs.principal_spark.to_le_bytes());
+        let bond_opening =
+            curve25519_dalek::scalar::Scalar::from_bytes_mod_order(sha256(&bond_material))
+                .to_bytes();
+        assert_ne!(oracle, bond_opening);
+
+        let baseline = oracle;
+        let variants = [
+            TrancheRefundBlindingInputsV1 {
+                chain_id: b"indra-mainnet-x",
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                position_id: [9; 32],
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                tranche_id: [9; 32],
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                principal_owner_id: [9; 32],
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                custody_encoding: &[1, 2, 3, 5],
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                principal_spark: inputs.principal_spark + 1,
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                release_height: inputs.release_height + 1,
+                ..inputs
+            },
+            TrancheRefundBlindingInputsV1 {
+                end_epoch: inputs.end_epoch + 1,
+                ..inputs
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                derive_tranche_refund_blinding_v1(&variant).unwrap(),
+                baseline
+            );
+        }
     }
 
     fn known_inputs() -> PaymentBlindingInputsV1<'static> {

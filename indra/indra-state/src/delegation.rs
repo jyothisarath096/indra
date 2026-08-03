@@ -2272,12 +2272,10 @@ mod tests {
             | StakingOpBody::SetAutoDelegate {
                 cold_authorization, ..
             } => {
-                *cold_authorization = Some(
-                    indra_core::types::staking::ColdStakingAuthorization {
-                        cold_key_version: 1,
-                        cold_nonce: nonce,
-                    },
-                );
+                *cold_authorization = Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                });
             }
             _ => {}
         }
@@ -2319,7 +2317,9 @@ mod tests {
             .unwrap()
             .unwrap_or_else(|| op.signing_bytes(chain_id));
         let sig = if cold_designated {
-            derived_test_cold_keypair(keypair).sign(&signing_bytes).unwrap()
+            derived_test_cold_keypair(keypair)
+                .sign(&signing_bytes)
+                .unwrap()
         } else {
             keypair.sign(&signing_bytes).unwrap()
         };
@@ -3469,8 +3469,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn undelegate_rejects_wrong_delegator() {
         let mut state = ChainState::new_genesis();
@@ -3534,7 +3532,6 @@ mod tests {
             2_000_000
         );
     }
-
 
     #[test]
     fn validator_self_stake_post_identity_gate_rejects_same_classical_different_pq_pubkey() {
@@ -4345,8 +4342,6 @@ mod tests {
         assert_eq!(state, before);
     }
 
-
-
     #[test]
     fn apply_register_validator_sets_vrf_key() {
         let mut state = ChainState::new_genesis();
@@ -4387,7 +4382,6 @@ mod tests {
         assert!(state.staked_bonds.contains_key(&bond_utxo_id));
         assert!(!state.utxos.contains(&bond_utxo_id));
     }
-
 
     #[test]
     fn register_validator_post_identity_gate_populates_registry() {

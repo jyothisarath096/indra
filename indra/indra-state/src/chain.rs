@@ -1530,7 +1530,6 @@ mod tests {
         assert!(state.consensus_snapshots.is_empty());
     }
 
-
     #[test]
     fn consensus_snapshot_storage_round_trips_with_exact_two_retained() {
         let mut state = snapshot_state();
@@ -2050,7 +2049,6 @@ mod tests {
         assert_eq!(decoded, bonds);
     }
 
-
     #[test]
     fn staked_bond_persistent_encoding_is_insertion_order_independent() {
         let mut forward = PersistentOrdMap::new();
@@ -2255,8 +2253,6 @@ mod tests {
             }
         ));
     }
-
-
 
     #[test]
     fn applied_slash_hash_persistent_encoding_matches_legacy_hashset_encoding() {

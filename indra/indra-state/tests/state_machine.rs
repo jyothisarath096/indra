@@ -78,12 +78,20 @@ fn signed_staking_op(
             cold_nonce: nonce,
         });
         match &mut body {
-            StakingOpBody::SelfStake { cold_authorization, .. }
-            | StakingOpBody::SelfUnstake { cold_authorization, .. }
-            | StakingOpBody::ClaimRewards { cold_authorization, .. } => {
+            StakingOpBody::SelfStake {
+                cold_authorization, ..
+            }
+            | StakingOpBody::SelfUnstake {
+                cold_authorization, ..
+            }
+            | StakingOpBody::ClaimRewards {
+                cold_authorization, ..
+            } => {
                 *cold_authorization = authorization;
             }
-            StakingOpBody::SetAutoDelegate { cold_authorization, .. } => {
+            StakingOpBody::SetAutoDelegate {
+                cold_authorization, ..
+            } => {
                 *cold_authorization = authorization;
             }
             _ => unreachable!(),

@@ -13,8 +13,7 @@ use indra_core::types::{
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
         MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES,
-        MINIMUM_VALIDATOR_BOND_SPARK,
-        TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+        MINIMUM_VALIDATOR_BOND_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };

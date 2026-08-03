@@ -110,7 +110,6 @@ impl indra_rpc::handlers::RpcEngineView for NodeEngine {
             .get_range(to_epoch, limit)
             .map_err(|error| error.to_string())
     }
-
 }
 
 impl indra_rpc::handlers::RpcEngineMut for NodeEngine {

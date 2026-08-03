@@ -32,11 +32,14 @@ pub use mnemonic::{
     DerivedSeeds, MNEMONIC_WORD_COUNT,
 };
 pub use payment::{
-    derive_payment_blinding_v1, payment_x25519_shared_secret, recipient_derive_payment_blinding_v1,
-    sender_derive_payment_blinding_v1, PaymentBlindingInputsV1, PaymentBlindingNoteV1,
-    PaymentKeypairV1, PaymentPubKeyV1, RecipientPaymentBlindingV1, SenderPaymentBlindingV1,
-    PAYMENT_BLINDING_CONTEXT_V1, PAYMENT_KEYPAIR_V1_ENCODED_LEN, PAYMENT_NOTE_V1_ENCODED_LEN,
-    PAYMENT_PUBKEY_V1_ENCODED_LEN, PAYMENT_VERSION_V1,
+    derive_payment_blinding_v1, derive_tranche_refund_blinding_v1,
+    derive_tranche_source_blinding_v1, payment_x25519_shared_secret,
+    recipient_derive_payment_blinding_v1, sender_derive_payment_blinding_v1,
+    PaymentBlindingInputsV1, PaymentBlindingNoteV1, PaymentKeypairV1, PaymentPubKeyV1,
+    RecipientPaymentBlindingV1, SenderPaymentBlindingV1, TrancheRefundBlindingInputsV1,
+    TrancheSourceBlindingInputsV1, PAYMENT_BLINDING_CONTEXT_V1, PAYMENT_KEYPAIR_V1_ENCODED_LEN,
+    PAYMENT_NOTE_V1_ENCODED_LEN, PAYMENT_PUBKEY_V1_ENCODED_LEN, PAYMENT_VERSION_V1,
+    TRANCHE_REFUND_BLINDING_DOMAIN_V1, TRANCHE_SOURCE_BLINDING_CONTEXT_V1,
 };
 pub use payment_address::{
     PaymentAddress, PAYMENT_ADDRESS_DOMAIN, PAYMENT_ADDRESS_TEXT_PREFIX, PAYMENT_ADDRESS_VERSION,

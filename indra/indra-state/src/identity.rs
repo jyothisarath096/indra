@@ -361,10 +361,6 @@ mod tests {
         );
     }
 
-
-
-
-
     #[test]
     fn resolve_ignores_compact_bonds_when_registry_is_absent() {
         let mut state = ChainState::new_genesis();
@@ -380,7 +376,6 @@ mod tests {
             Ok(IdentityCheckOutcome::NoPriorRecord)
         );
     }
-
 
     #[test]
     fn fully_compact_bond_owner_resolution_uses_registry_or_fails_loudly() {
@@ -431,8 +426,6 @@ mod tests {
             Ok(registered)
         );
     }
-
-
 
     #[test]
     fn redelegation_resolution_ignores_unbonding_legacy_bonds() {

@@ -16,9 +16,12 @@
 use indra_core::{
     codec::Encode,
     types::{
-        consensus_snapshot::ConsensusSnapshot, crypto::HybridPubKey, primitives::Bytes32,
+        consensus_snapshot::ConsensusSnapshot,
+        crypto::HybridPubKey,
+        primitives::Bytes32,
         reward_economic_snapshot::RewardEconomicSnapshot,
         slash_membership::SlashMembershipRootRecord,
+        stake_position::{StakePositionV1, UnbondingTrancheV1},
     },
 };
 use indra_crypto::sha256;
@@ -46,6 +49,15 @@ const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
 const DOMAIN_REWARD_ECONOMIC_SNAPSHOT: u8 = 0x0B;
 const DOMAIN_SLASH_MEMBERSHIP_ROOT: u8 = 0x0C;
 const DOMAIN_EVICTED_VALIDATOR_TOMBSTONE: u8 = 0x0D;
+/// Reserved canonical leaf domain for genesis-native staking positions.
+pub const DOMAIN_STAKE_POSITION: u8 = 0x0E;
+/// Reserved canonical leaf domain for exact-height unbonding tranches.
+pub const DOMAIN_UNBONDING_TRANCHE: u8 = 0x0F;
+
+/// Value-hash domain for a canonical staking-position leaf.
+pub const STAKE_POSITION_LEAF_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-LEAF-v1";
+/// Value-hash domain for a canonical unbonding-tranche leaf.
+pub const UNBONDING_TRANCHE_LEAF_DOMAIN_V1: &[u8] = b"INDRA-UNBONDING-TRANCHE-LEAF-v1";
 
 /// Incremental sparse-Merkle commitment to validator/delegation/staking state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -341,6 +353,32 @@ fn derive_key(domain: u8, raw_key: &[u8]) -> [u8; 32] {
     sha256(&data)
 }
 
+/// Pure canonical leaf construction; Stage 1 deliberately does not insert it
+/// into `StateCommitmentV2` or `ChainState`.
+pub fn stake_position_commitment_leaf(position: &StakePositionV1) -> ([u8; 32], [u8; 32]) {
+    let mut value =
+        Vec::with_capacity(STAKE_POSITION_LEAF_DOMAIN_V1.len() + position.encoded_len());
+    value.extend_from_slice(STAKE_POSITION_LEAF_DOMAIN_V1);
+    position.encode(&mut value);
+    (
+        derive_key(DOMAIN_STAKE_POSITION, &position.position_id.0),
+        sha256(&value),
+    )
+}
+
+/// Pure canonical leaf construction; Stage 1 deliberately does not insert it
+/// into `StateCommitmentV2` or `ChainState`.
+pub fn unbonding_tranche_commitment_leaf(tranche: &UnbondingTrancheV1) -> ([u8; 32], [u8; 32]) {
+    let mut value =
+        Vec::with_capacity(UNBONDING_TRANCHE_LEAF_DOMAIN_V1.len() + tranche.encoded_len());
+    value.extend_from_slice(UNBONDING_TRANCHE_LEAF_DOMAIN_V1);
+    tranche.encode(&mut value);
+    (
+        derive_key(DOMAIN_UNBONDING_TRANCHE, &tranche.tranche_id.0),
+        sha256(&value),
+    )
+}
+
 pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> [u8; 32] {
     let include_network_addr = true;
     let mut value = Vec::new();
@@ -470,7 +508,9 @@ mod tests {
             name: format!("validator-{byte}"),
             hybrid_classical_pk: Some(public.classical.0),
             hybrid_pq_pk: Some(public.pq.0.to_vec()),
-            vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[byte.wrapping_add(2); 32]).public_key()),
+            vrf_pk: Some(
+                indra_crypto::VrfKeypair::from_seed(&[byte.wrapping_add(2); 32]).public_key(),
+            ),
             stake_spark: 1_000_000 + byte as u64,
             status: crate::validator::ValidatorStatus::Active,
             registered_epoch: 1,
@@ -1034,6 +1074,8 @@ mod tests {
                 "evicted_validator_tombstone",
                 DOMAIN_EVICTED_VALIDATOR_TOMBSTONE,
             ),
+            ("stake_position", DOMAIN_STAKE_POSITION),
+            ("unbonding_tranche", DOMAIN_UNBONDING_TRANCHE),
         ];
         let mut seen = std::collections::BTreeMap::new();
         for (name, domain) in domains {
@@ -1047,6 +1089,77 @@ mod tests {
         assert_eq!(DOMAIN_REWARD_ECONOMIC_SNAPSHOT, 0x0B);
         assert_eq!(DOMAIN_SLASH_MEMBERSHIP_ROOT, 0x0C);
         assert_eq!(DOMAIN_EVICTED_VALIDATOR_TOMBSTONE, 0x0D);
+        assert_eq!(DOMAIN_STAKE_POSITION, 0x0E);
+        assert_eq!(DOMAIN_UNBONDING_TRANCHE, 0x0F);
+    }
+
+    #[test]
+    fn position_and_tranche_leaf_primitives_are_sensitive_and_cross_domain_separated() {
+        use indra_core::types::stake_position::{
+            ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTimingV1,
+            UnbondingTrancheV1,
+        };
+        let custody = PositionCustodyV1::DelegatorIdentity {
+            delegator_id: id(2),
+        };
+        let position = StakePositionV1::new(
+            id(1),
+            id(2),
+            custody,
+            Some(ActiveStakeAggregateV1::new(1_000, 10, 20).unwrap()),
+            7,
+            3,
+        )
+        .unwrap();
+        let timing = UnbondingTimingV1::height_precise(301).unwrap();
+        let tranche = UnbondingTrancheV1::new(
+            position.position_id,
+            400,
+            indra_crypto::commit(400, &[9; 32]),
+            timing,
+            custody,
+            id(3),
+            0,
+        )
+        .unwrap();
+        let position_leaf = stake_position_commitment_leaf(&position);
+        let tranche_leaf = unbonding_tranche_commitment_leaf(&tranche);
+        assert_ne!(position_leaf.0, tranche_leaf.0);
+        assert_ne!(position_leaf.1, tranche_leaf.1);
+
+        let changed_position = StakePositionV1::new(
+            id(1),
+            id(2),
+            custody,
+            Some(ActiveStakeAggregateV1::new(1_001, 10, 20).unwrap()),
+            7,
+            3,
+        )
+        .unwrap();
+        assert_ne!(
+            stake_position_commitment_leaf(&changed_position),
+            position_leaf
+        );
+        let changed_tranche = UnbondingTrancheV1::new(
+            position.position_id,
+            401,
+            indra_crypto::commit(401, &[9; 32]),
+            timing,
+            custody,
+            id(3),
+            0,
+        )
+        .unwrap();
+        assert_ne!(
+            unbonding_tranche_commitment_leaf(&changed_tranche),
+            tranche_leaf
+        );
+
+        // Even identical raw IDs cannot collide across the allocated key domains.
+        assert_ne!(
+            derive_key(DOMAIN_STAKE_POSITION, &position.position_id.0),
+            derive_key(DOMAIN_UNBONDING_TRANCHE, &position.position_id.0)
+        );
     }
 
     #[test]

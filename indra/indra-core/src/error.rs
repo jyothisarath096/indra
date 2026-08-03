@@ -61,6 +61,10 @@ pub enum IndraError {
     #[error("invalid reward economic snapshot: {0}")]
     InvalidRewardEconomicSnapshot(String),
 
+    /// A canonical staking position or unbonding tranche failed validation.
+    #[error("invalid staking position or tranche: {0}")]
+    InvalidStakePosition(String),
+
     /// A slash-membership root, proof, or evidence envelope failed validation.
     #[error("invalid slash membership proof: {0}")]
     InvalidSlashMembershipProof(String),

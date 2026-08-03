@@ -1357,7 +1357,6 @@ mod tests {
             .unwrap();
     }
 
-
     #[test]
     fn governance_redelegation_post_identity_gate_registry_entry_verifies() {
         let mut state = ChainState::new_genesis();
@@ -1799,7 +1798,6 @@ mod tests {
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
     }
 
-
     #[test]
     fn mixed_hot_cold_governance_and_staking_replay_is_deterministic() {
         let mut base = ChainState::new_genesis();
@@ -1919,8 +1917,6 @@ mod tests {
         assert_eq!(proposal.redelegations.len(), 1);
         assert_eq!(proposal.redelegations[0].delegator_id, delegator_id);
     }
-
-
 
     #[test]
     fn governance_redelegation_post_identity_gate_rejects_unresolvable_identity() {

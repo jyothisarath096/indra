@@ -1161,7 +1161,6 @@ mod tests {
         buf
     }
 
-
     #[test]
     fn validator_entry_v2_round_trips_with_auto_delegate_some() {
         let mut validator = make_validator(0x43, 10_000, 3);
@@ -1183,7 +1182,6 @@ mod tests {
         assert_eq!(decoded.network_addr.as_deref(), Some("203.0.113.44:30303"));
         assert_eq!(decoded.network_addr_last_updated_epoch, Some(7));
     }
-
 
     #[test]
     fn delegation_map_decode_rejects_excessive_delegator_count() {

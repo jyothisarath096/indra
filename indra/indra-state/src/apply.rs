@@ -1329,10 +1329,18 @@ mod tests {
                 cold_nonce,
             });
             match &mut op.payload {
-                GovernancePayload::Propose { cold_authorization, .. }
-                | GovernancePayload::Commit { cold_authorization, .. }
-                | GovernancePayload::Reveal { cold_authorization, .. }
-                | GovernancePayload::Cancel { cold_authorization, .. } => {
+                GovernancePayload::Propose {
+                    cold_authorization, ..
+                }
+                | GovernancePayload::Commit {
+                    cold_authorization, ..
+                }
+                | GovernancePayload::Reveal {
+                    cold_authorization, ..
+                }
+                | GovernancePayload::Cancel {
+                    cold_authorization, ..
+                } => {
                     *cold_authorization = authorization;
                 }
                 _ => unreachable!(),
@@ -1566,11 +1574,7 @@ mod tests {
         let bond_utxo_id = state
             .utxos
             .insert(
-                output_with_value(
-                    MINIMUM_VALIDATOR_BOND_SPARK,
-                    cold_pubkey.clone(),
-                    seed[0],
-                ),
+                output_with_value(MINIMUM_VALIDATOR_BOND_SPARK, cold_pubkey.clone(), seed[0]),
                 0,
                 0,
                 seed[0] as u32,
@@ -2222,10 +2226,14 @@ mod tests {
         let snapshot = state.build_genesis_consensus_snapshot().unwrap();
         state.reward_economic_snapshot =
             Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
-        state.slash_membership_roots = vec![indra_core::types::slash_membership::SlashMembershipRootRecord {
-            activation_height: 1,
-            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(&snapshot).unwrap(),
-        }];
+        state.slash_membership_roots = vec![
+            indra_core::types::slash_membership::SlashMembershipRootRecord {
+                activation_height: 1,
+                membership_root:
+                    indra_core::types::slash_membership::compute_slash_membership_root(&snapshot)
+                        .unwrap(),
+            },
+        ];
         state.consensus_snapshots = vec![snapshot];
         state.rebuild_state_commitment_v2(0);
         let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
@@ -2745,8 +2753,6 @@ mod tests {
         assert!(!candidate.staked_bonds.contains_key(&attack_candidate_utxo));
     }
 
-
-
     #[test]
     fn state_txn_rolls_back_epoch_transition_scope_failpoints() {
         let mut state = canonical_test_genesis();
@@ -2967,10 +2973,16 @@ mod tests {
                 .map(|validator| validator.validator_id)
                 .collect();
             for validator_id in validator_ids {
-                reference.validators.get_mut(&validator_id).unwrap().last_active_epoch =
-                    target_epoch - 1;
-                candidate.validators.get_mut(&validator_id).unwrap().last_active_epoch =
-                    target_epoch - 1;
+                reference
+                    .validators
+                    .get_mut(&validator_id)
+                    .unwrap()
+                    .last_active_epoch = target_epoch - 1;
+                candidate
+                    .validators
+                    .get_mut(&validator_id)
+                    .unwrap()
+                    .last_active_epoch = target_epoch - 1;
             }
             let block = make_block(&reference, vec![]);
             if target_epoch == 2 {
@@ -3470,15 +3482,8 @@ mod tests {
             .utxos
             .insert(output.clone(), EPOCH_DURATION_BLOCKS, STAKING_TX_IDX, 1)
             .unwrap();
-        let mut bond = StakeBondEntry::new(
-            bond_id,
-            validator_id,
-            validator_id,
-            1_000_000,
-            0,
-            output,
-            1,
-        );
+        let mut bond =
+            StakeBondEntry::new(bond_id, validator_id, validator_id, 1_000_000, 0, output, 1);
         bond.unbonding_end_epoch = Some(epoch_for_height(EPOCH_DURATION_BLOCKS));
         state.staked_bonds.insert(bond_id, bond);
         let original = state.clone();
@@ -3950,10 +3955,14 @@ mod tests {
             .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
             .unwrap();
         let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
-        state.slash_membership_roots = vec![indra_core::types::slash_membership::SlashMembershipRootRecord {
-            activation_height: snapshot.activation_height,
-            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(&snapshot).unwrap(),
-        }];
+        state.slash_membership_roots = vec![
+            indra_core::types::slash_membership::SlashMembershipRootRecord {
+                activation_height: snapshot.activation_height,
+                membership_root:
+                    indra_core::types::slash_membership::compute_slash_membership_root(&snapshot)
+                        .unwrap(),
+            },
+        ];
         state.consensus_snapshots = vec![snapshot];
         let evidence = SlashEvidenceV2 {
             validator_id,
@@ -4010,10 +4019,14 @@ mod tests {
             .build_consensus_snapshot(u64::MAX, u64::MAX - 1)
             .unwrap();
         let proof = build_slash_membership_proof(&snapshot, 0).unwrap();
-        state.slash_membership_roots = vec![indra_core::types::slash_membership::SlashMembershipRootRecord {
-            activation_height: snapshot.activation_height,
-            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(&snapshot).unwrap(),
-        }];
+        state.slash_membership_roots = vec![
+            indra_core::types::slash_membership::SlashMembershipRootRecord {
+                activation_height: snapshot.activation_height,
+                membership_root:
+                    indra_core::types::slash_membership::compute_slash_membership_root(&snapshot)
+                        .unwrap(),
+            },
+        ];
         state.consensus_snapshots = vec![snapshot];
         let evidence = SlashEvidenceV2 {
             validator_id,
