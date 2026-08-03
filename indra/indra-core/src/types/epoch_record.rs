@@ -3,9 +3,7 @@
 use crate::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    types::primitives::{
-        Bytes32, MAX_VALIDATORS, SCHEMA_VERSION, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
-    },
+    types::primitives::{Bytes32, MAX_VALIDATORS, SCHEMA_VERSION},
 };
 
 /// A complete summary of one epoch's activity, written at epoch transition.
@@ -90,20 +88,18 @@ impl Encode for EpochRecord {
 impl Decode for EpochRecord {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let schema_version = u8::decode(r)?;
-        if schema_version != SCHEMA_VERSION
-            && schema_version != SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
-        {
+        if schema_version != SCHEMA_VERSION {
             return Err(IndraError::UnsupportedSchemaVersion {
                 struct_name: "EpochRecord",
                 version: schema_version,
                 max_supported: SCHEMA_VERSION,
             });
         }
-        decode_epoch_record_v2(r)
+        decode_epoch_record(r)
     }
 }
 
-fn decode_epoch_record_v2(r: &mut ByteReader<'_>) -> IndraResult<EpochRecord> {
+fn decode_epoch_record(r: &mut ByteReader<'_>) -> IndraResult<EpochRecord> {
     Ok(EpochRecord {
         epoch: u64::decode(r)?,
         start_height: u64::decode(r)?,

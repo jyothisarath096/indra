@@ -77,23 +77,6 @@ pub struct PeerTopologyEntry {
     pub address: String,
 }
 
-/// Read-only schema migration audit record for RPC output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MigrationRecordView {
-    /// Unix timestamp in seconds when the migration ran.
-    pub timestamp_secs: u64,
-    /// Schema version migrated from.
-    pub from_version: u8,
-    /// Schema version migrated to.
-    pub to_version: u8,
-    /// State height at migration time.
-    pub state_height: u64,
-    /// Number of validators migrated.
-    pub validators_migrated: u32,
-    /// Number of UTXOs migrated.
-    pub utxos_migrated: u32,
-}
-
 impl<'a> NodeState<'a> {
     /// Construct a state object with network context.
     pub fn with_network(
@@ -221,10 +204,6 @@ pub trait RpcEngineView {
     }
     /// Return epoch records ending at `to_epoch`, most recent first.
     fn get_epoch_range(&self, _to_epoch: u64, _limit: usize) -> Result<Vec<EpochRecord>, String> {
-        Ok(Vec::new())
-    }
-    /// Return schema migration audit history.
-    fn migration_history(&self) -> Result<Vec<MigrationRecordView>, String> {
         Ok(Vec::new())
     }
 }
@@ -2367,33 +2346,14 @@ fn get_latest_epoch(state: &NodeState<'_>) -> RpcResult<String> {
     }
 }
 
-/// `indra_getSchemaInfo` — returns node schema and migration audit details.
+/// `indra_getSchemaInfo` — returns the canonical node schema.
 fn get_schema_info(state: &NodeState<'_>) -> RpcResult<String> {
-    let history = state
-        .engine
-        .migration_history()
-        .map_err(RpcError::Internal)?;
-    let history_json = history
-        .iter()
-        .map(|record| {
-            format!(
-                "{{\"timestamp_secs\":{},\"from_version\":{},\"to_version\":{},\"state_height\":{},\"validators_migrated\":{},\"utxos_migrated\":{}}}",
-                record.timestamp_secs,
-                record.from_version,
-                record.to_version,
-                record.state_height,
-                record.validators_migrated,
-                record.utxos_migrated
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+    let _ = state;
     Ok(format!(
-        "{{\"schema_version\":{},\"schema_version_genesis\":{},\"node_version\":\"{}\",\"migration_history\":[{}]}}",
+        "{{\"schema_version\":{},\"schema_version_genesis\":{},\"node_version\":\"{}\"}}",
         SCHEMA_VERSION,
         SCHEMA_VERSION_GENESIS,
-        env!("CARGO_PKG_VERSION"),
-        history_json
+        env!("CARGO_PKG_VERSION")
     ))
 }
 

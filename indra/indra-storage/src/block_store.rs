@@ -2,13 +2,8 @@
 //!
 //! ## File format
 //!
-//! Each block entry in the log file:
-//!   v1: [u64 height] [u32 length] [block bytes]
-//!   v2: [u64 height] [u32 length] [block bytes] [u32 crc32]
-//!
-//! The v2 CRC covers the height, length, and block bytes. Legacy v1 and
-//! headerless files are upgraded to v2 on open by atomically rewriting the
-//! retained entries with checksums.
+//! Each block entry is `[u64 height] [u32 length] [block bytes] [u32 crc32]`.
+//! The CRC covers the height, length, and canonical block bytes.
 //!
 //! The index (height → file offset) is rebuilt from the log on startup.
 //! This is O(n) in the number of blocks but fast in practice (< 1s for
@@ -41,9 +36,7 @@ const ENTRY_HEADER_BYTES: usize = 12;
 const ENTRY_CHECKSUM_BYTES: usize = 4;
 const FILE_HEADER_BYTES: u64 = 16;
 const BLOCK_MAGIC: &[u8; 4] = b"INBK";
-const BLOCK_FILE_VERSION_V1: u8 = 1;
-const BLOCK_FILE_VERSION_V2: u8 = 2;
-const BLOCK_FILE_VERSION: u8 = BLOCK_FILE_VERSION_V2;
+const BLOCK_FILE_VERSION: u8 = 1;
 
 /// Pruning configuration for the block store.
 #[derive(Debug, Clone)]
@@ -82,7 +75,6 @@ pub struct BlockStore {
     prune_cfg: PruneConfig,
     lowest_height: u64,
     data_start: u64,
-    format_version: u8,
 }
 
 impl BlockStore {
@@ -99,7 +91,7 @@ impl BlockStore {
             .truncate(false)
             .open(&path)?;
 
-        let (data_start, format_version) = initialise_block_log_header(&mut file)?;
+        let data_start = initialise_block_log_header(&mut file)?;
 
         let mut store = Self {
             path,
@@ -109,16 +101,8 @@ impl BlockStore {
             prune_cfg,
             lowest_height: 0,
             data_start,
-            format_version,
         };
         store.rebuild_index()?;
-        if store.format_version != BLOCK_FILE_VERSION_V2 {
-            eprintln!(
-                "[storage] upgrading legacy block log format v{} to v{} with per-entry checksums",
-                store.format_version, BLOCK_FILE_VERSION_V2
-            );
-            store.rewrite_retained_entries_v2()?;
-        }
         store.log_verified_range();
         Ok(store)
     }
@@ -162,7 +146,7 @@ impl BlockStore {
 
         // Record offset before writing
         let offset = self.file.seek(SeekFrom::End(0))?;
-        write_block_entry_v2(&mut self.file, height, &block.encode_to_vec())?;
+        write_block_entry(&mut self.file, height, &block.encode_to_vec())?;
         self.file.flush()?;
         self.file.sync_all()?;
 
@@ -182,7 +166,7 @@ impl BlockStore {
     /// Read a block by height.
     pub fn get(&mut self, height: u64) -> StorageResult<BlockV1> {
         let offset = self.block_offset(height)?;
-        read_block_at(&mut self.file, height, offset, self.format_version)
+        read_block_at(&mut self.file, height, offset)
     }
 
     /// Read a block by height without mutably borrowing the block store.
@@ -194,7 +178,7 @@ impl BlockStore {
     pub fn get_read_only(&self, height: u64) -> StorageResult<BlockV1> {
         let offset = self.block_offset(height)?;
         let mut file = File::open(&self.path)?;
-        read_block_at(&mut file, height, offset, self.format_version)
+        read_block_at(&mut file, height, offset)
     }
 
     fn block_offset(&self, height: u64) -> StorageResult<u64> {
@@ -238,18 +222,7 @@ impl BlockStore {
             return Ok(());
         }
 
-        if self.format_version >= BLOCK_FILE_VERSION_V2 {
-            self.rewrite_suffix_v2(keep_offset)
-        } else {
-            let mut heights: Vec<u64> = self
-                .index
-                .keys()
-                .copied()
-                .filter(|height| *height >= keep_from_height)
-                .collect();
-            heights.sort_unstable();
-            self.rewrite_heights_v2(heights)
-        }
+        self.rewrite_suffix(keep_offset)
     }
 
     /// Scan the file to rebuild the height→offset index.
@@ -287,13 +260,7 @@ impl BlockStore {
                     })?;
             let length = u32::from_le_bytes(length_bytes) as u64;
 
-            let entry_len = ENTRY_HEADER_BYTES as u64
-                + length
-                + if self.format_version >= BLOCK_FILE_VERSION_V2 {
-                    ENTRY_CHECKSUM_BYTES as u64
-                } else {
-                    0
-                };
+            let entry_len = ENTRY_HEADER_BYTES as u64 + length + ENTRY_CHECKSUM_BYTES as u64;
             if offset + entry_len > file_len {
                 // Truncated entry — stop here and truncate the file
                 self.file.set_len(last_good_offset)?;
@@ -303,18 +270,16 @@ impl BlockStore {
             let mut block_bytes = vec![0u8; length as usize];
             self.file.read_exact(&mut block_bytes)?;
 
-            if self.format_version >= BLOCK_FILE_VERSION_V2 {
-                let mut checksum_bytes = [0u8; ENTRY_CHECKSUM_BYTES];
-                self.file.read_exact(&mut checksum_bytes)?;
-                let expected = u32::from_le_bytes(checksum_bytes);
-                let actual = block_entry_crc(height, length as u32, &block_bytes);
-                if expected != actual {
-                    return Err(StorageError::BlockChecksumMismatch {
-                        height,
-                        expected,
-                        actual,
-                    });
-                }
+            let mut checksum_bytes = [0u8; ENTRY_CHECKSUM_BYTES];
+            self.file.read_exact(&mut checksum_bytes)?;
+            let expected = u32::from_le_bytes(checksum_bytes);
+            let actual = block_entry_crc(height, length as u32, &block_bytes);
+            if expected != actual {
+                return Err(StorageError::BlockChecksumMismatch {
+                    height,
+                    expected,
+                    actual,
+                });
             }
 
             use indra_core::codec::ByteReader;
@@ -354,15 +319,10 @@ impl BlockStore {
             return;
         }
         eprintln!(
-            "[storage] block log verified: heights {}..={}, {} entries, checksums {}",
+            "[storage] block log verified: heights {}..={}, {} entries, checksums valid",
             self.lowest_height,
             self.next_height.saturating_sub(1),
             self.index.len(),
-            if self.format_version >= BLOCK_FILE_VERSION_V2 {
-                "valid"
-            } else {
-                "legacy-unavailable"
-            }
         );
     }
 
@@ -382,51 +342,10 @@ impl BlockStore {
         Ok(())
     }
 
-    fn rewrite_retained_entries_v2(&mut self) -> StorageResult<()> {
-        let mut heights: Vec<u64> = self.index.keys().copied().collect();
-        heights.sort_unstable();
-        self.rewrite_heights_v2(heights)
-    }
-
-    fn rewrite_heights_v2(&mut self, heights: Vec<u64>) -> StorageResult<()> {
-        let mut entries = Vec::with_capacity(heights.len());
-        for height in heights {
-            let block = self.get(height)?;
-            entries.push((height, block.encode_to_vec()));
-        }
-
+    fn rewrite_suffix(&mut self, keep_offset: u64) -> StorageResult<()> {
         let tmp_path = self.path.with_extension("tmp");
         let mut tmp = File::create(&tmp_path)?;
-        write_block_log_header(&mut tmp, BLOCK_FILE_VERSION_V2)?;
-        for (height, block_bytes) in entries {
-            write_block_entry_v2(&mut tmp, height, &block_bytes)?;
-        }
-        tmp.flush()?;
-        tmp.sync_all()?;
-        drop(tmp);
-
-        std::fs::rename(&tmp_path, &self.path)?;
-        if let Some(parent) = self.path.parent() {
-            fsync_dir(parent)?;
-        }
-        self.file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-        let (data_start, format_version) = initialise_block_log_header(&mut self.file)?;
-        self.data_start = data_start;
-        self.format_version = format_version;
-        self.index.clear();
-        self.rebuild_index()?;
-        Ok(())
-    }
-
-    fn rewrite_suffix_v2(&mut self, keep_offset: u64) -> StorageResult<()> {
-        let tmp_path = self.path.with_extension("tmp");
-        let mut tmp = File::create(&tmp_path)?;
-        write_block_log_header(&mut tmp, BLOCK_FILE_VERSION_V2)?;
+        write_block_log_header(&mut tmp)?;
 
         self.file.seek(SeekFrom::Start(keep_offset))?;
         std::io::copy(&mut self.file, &mut tmp)?;
@@ -444,45 +363,45 @@ impl BlockStore {
             .create(true)
             .truncate(false)
             .open(&self.path)?;
-        let (data_start, format_version) = initialise_block_log_header(&mut self.file)?;
-        self.data_start = data_start;
-        self.format_version = format_version;
+        self.data_start = initialise_block_log_header(&mut self.file)?;
         self.index.clear();
         self.rebuild_index()?;
         Ok(())
     }
 }
 
-fn initialise_block_log_header(file: &mut File) -> StorageResult<(u64, u8)> {
+fn initialise_block_log_header(file: &mut File) -> StorageResult<u64> {
     let file_len = file.seek(SeekFrom::End(0))?;
     if file_len == 0 {
         file.seek(SeekFrom::Start(0))?;
-        write_block_log_header(file, BLOCK_FILE_VERSION)?;
+        write_block_log_header(file)?;
         file.flush()?;
-        return Ok((FILE_HEADER_BYTES, BLOCK_FILE_VERSION));
+        return Ok(FILE_HEADER_BYTES);
     }
 
     file.seek(SeekFrom::Start(0))?;
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
-    if &magic == BLOCK_MAGIC {
-        let mut rest = [0u8; 12];
-        file.read_exact(&mut rest)?;
-        if rest[0] != BLOCK_FILE_VERSION_V1 && rest[0] != BLOCK_FILE_VERSION_V2 {
-            return Err(StorageError::Corruption {
-                height: 0,
-                detail: format!("unsupported block store file version {}", rest[0]),
-            });
-        }
-        Ok((FILE_HEADER_BYTES, rest[0]))
-    } else {
-        Ok((0, BLOCK_FILE_VERSION_V1))
+    if &magic != BLOCK_MAGIC {
+        return Err(StorageError::Corruption {
+            height: 0,
+            detail: "block store missing INBK header".to_string(),
+        });
     }
+    let mut rest = [0u8; 12];
+    file.read_exact(&mut rest)?;
+    if rest[0] != BLOCK_FILE_VERSION {
+        return Err(StorageError::Corruption {
+            height: 0,
+            detail: format!("unsupported block store file version {}", rest[0]),
+        });
+    }
+    Ok(FILE_HEADER_BYTES)
 }
 
-fn write_block_log_header(file: &mut File, version: u8) -> StorageResult<()> {
+fn write_block_log_header(file: &mut File) -> StorageResult<()> {
     file.write_all(BLOCK_MAGIC)?;
-    file.write_all(&[version])?;
+    file.write_all(&[BLOCK_FILE_VERSION])?;
     file.write_all(&[0u8; 11])?;
     Ok(())
 }
@@ -495,7 +414,7 @@ fn block_entry_crc(height: u64, len: u32, block_bytes: &[u8]) -> u32 {
     crc32(&bytes)
 }
 
-fn write_block_entry_v2(file: &mut File, height: u64, block_bytes: &[u8]) -> StorageResult<()> {
+fn write_block_entry(file: &mut File, height: u64, block_bytes: &[u8]) -> StorageResult<()> {
     let len = block_bytes.len() as u32;
     file.write_all(&height.to_le_bytes())?;
     file.write_all(&len.to_le_bytes())?;
@@ -504,12 +423,7 @@ fn write_block_entry_v2(file: &mut File, height: u64, block_bytes: &[u8]) -> Sto
     Ok(())
 }
 
-fn read_block_at(
-    file: &mut File,
-    height: u64,
-    offset: u64,
-    format_version: u8,
-) -> StorageResult<BlockV1> {
+fn read_block_at(file: &mut File, height: u64, offset: u64) -> StorageResult<BlockV1> {
     file.seek(SeekFrom::Start(offset))?;
 
     let mut header = [0u8; ENTRY_HEADER_BYTES];
@@ -540,18 +454,16 @@ fn read_block_at(
 
     let mut block_bytes = vec![0u8; length];
     file.read_exact(&mut block_bytes)?;
-    if format_version >= BLOCK_FILE_VERSION_V2 {
-        let mut checksum_bytes = [0u8; ENTRY_CHECKSUM_BYTES];
-        file.read_exact(&mut checksum_bytes)?;
-        let expected = u32::from_le_bytes(checksum_bytes);
-        let actual = block_entry_crc(stored_height, length as u32, &block_bytes);
-        if expected != actual {
-            return Err(StorageError::BlockChecksumMismatch {
-                height,
-                expected,
-                actual,
-            });
-        }
+    let mut checksum_bytes = [0u8; ENTRY_CHECKSUM_BYTES];
+    file.read_exact(&mut checksum_bytes)?;
+    let expected = u32::from_le_bytes(checksum_bytes);
+    let actual = block_entry_crc(stored_height, length as u32, &block_bytes);
+    if expected != actual {
+        return Err(StorageError::BlockChecksumMismatch {
+            height,
+            expected,
+            actual,
+        });
     }
 
     use indra_core::codec::ByteReader;
@@ -668,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn old_headerless_block_store_still_works() {
+    fn headerless_block_store_is_rejected() {
         let path = temp_path("legacy_headerless");
         let block = dummy_block(0, [0u8; 32]);
         let block_bytes = block.encode_to_vec();
@@ -681,12 +593,11 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.get(0).unwrap().header.height, 0);
-        let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.starts_with(BLOCK_MAGIC));
-        assert_eq!(bytes[4], BLOCK_FILE_VERSION_V2);
+        let err = match BlockStore::open(&path, PruneConfig::archive()) {
+            Ok(_) => panic!("expected headerless block store rejection"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("missing INBK header"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -715,11 +626,11 @@ mod tests {
         let path = temp_path("gap");
         {
             let mut file = File::create(&path).unwrap();
-            write_block_log_header(&mut file, BLOCK_FILE_VERSION_V2).unwrap();
+            write_block_log_header(&mut file).unwrap();
             let b0 = dummy_block(0, [0u8; 32]).encode_to_vec();
             let b2 = dummy_block(2, [0u8; 32]).encode_to_vec();
-            write_block_entry_v2(&mut file, 0, &b0).unwrap();
-            write_block_entry_v2(&mut file, 2, &b2).unwrap();
+            write_block_entry(&mut file, 0, &b0).unwrap();
+            write_block_entry(&mut file, 2, &b2).unwrap();
             file.flush().unwrap();
         }
 

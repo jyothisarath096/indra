@@ -807,7 +807,7 @@ fn test_get_schema_info_has_required_fields() {
             assert!(resp.contains("\"schema_version\":4"));
             assert!(resp.contains("\"schema_version_genesis\":1"));
             assert!(resp.contains("\"node_version\""));
-            assert!(resp.contains("\"migration_history\""));
+            assert!(!resp.contains("\"migration_history\""));
         }
         _ => panic!("schema info should be admin-readable on the full listener"),
     }

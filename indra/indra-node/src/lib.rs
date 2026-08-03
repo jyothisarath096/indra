@@ -111,24 +111,6 @@ impl indra_rpc::handlers::RpcEngineView for NodeEngine {
             .map_err(|error| error.to_string())
     }
 
-    fn migration_history(&self) -> Result<Vec<indra_rpc::handlers::MigrationRecordView>, String> {
-        self.migration_log
-            .load_all()
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| indra_rpc::handlers::MigrationRecordView {
-                        timestamp_secs: record.timestamp_secs,
-                        from_version: record.from_version,
-                        to_version: record.to_version,
-                        state_height: record.state_height,
-                        validators_migrated: record.validators_migrated,
-                        utxos_migrated: record.utxos_migrated,
-                    })
-                    .collect()
-            })
-            .map_err(|error| error.to_string())
-    }
 }
 
 impl indra_rpc::handlers::RpcEngineMut for NodeEngine {

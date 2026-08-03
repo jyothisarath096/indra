@@ -25,7 +25,7 @@ use indra_core::{
     types::{primitives::Bytes32, transaction::TransactionV1},
 };
 
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 
 const TAG_SUBMIT: u8 = 0x01;
 const TAG_EVICT: u8 = 0x02;
@@ -123,7 +123,12 @@ impl MempoolWal {
                         entries.push(WalEntry::Evict(Bytes32::from(arr)));
                     }
                 }
-                _ => {} // unknown tag, skip
+                other => {
+                    return Err(StorageError::Corruption {
+                        height: offset,
+                        detail: format!("unknown WAL entry tag 0x{other:02x}"),
+                    });
+                }
             }
 
             offset += ENTRY_OVERHEAD as u64 + length as u64;
@@ -280,6 +285,19 @@ mod tests {
         wal.truncate().unwrap();
         let entries = wal.recover().unwrap();
         assert!(entries.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_tag_fails_closed() {
+        let path = temp_path("unknown_tag");
+        {
+            let mut wal = MempoolWal::open(&path).unwrap();
+            wal.write_entry(0xff, &[1, 2, 3]).unwrap();
+        }
+        let mut wal = MempoolWal::open(&path).unwrap();
+        let err = wal.recover().unwrap_err();
+        assert!(err.to_string().contains("unknown WAL entry tag 0xff"));
         let _ = std::fs::remove_file(&path);
     }
 }

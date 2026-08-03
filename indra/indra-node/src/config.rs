@@ -237,11 +237,6 @@ impl NodeConfig {
         self.data_dir.join("vote_safety.dat")
     }
 
-    /// Path to the schema migration audit log.
-    pub fn migration_log_path(&self) -> PathBuf {
-        self.data_dir.join("migration.log")
-    }
-
     /// Path to the state snapshot directory.
     pub fn state_dir(&self) -> PathBuf {
         self.data_dir.join("state")

@@ -48,8 +48,8 @@ use indra_state::{
     ChainState,
 };
 use indra_storage::{
-    load_chain_manifest, load_last_qc, migration_record, save_chain_manifest, BlockStore,
-    ChainManifest, EpochStore, MigrationLog, StateStore,
+    load_chain_manifest, load_last_qc, save_chain_manifest, BlockStore, ChainManifest, EpochStore,
+    StateStore,
 };
 
 use crate::{
@@ -79,8 +79,6 @@ pub struct NodeEngine {
     pub epoch_store: EpochStore,
     /// State snapshot store.
     pub state_store: StateStore,
-    /// Schema migration audit log.
-    pub migration_log: MigrationLog,
     /// The validator's hybrid keypair (if this is a validator node).
     #[allow(dead_code)] // retained for future local signing flows
     hybrid_keypair: Option<HybridKeypair>,
@@ -127,20 +125,13 @@ impl NodeEngine {
         let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
         let epoch_store = EpochStore::open(config.epoch_log_path())?;
         let state_store = StateStore::open(config.state_dir())?;
-        let migration_log = MigrationLog::open(config.migration_log_path());
         let stored_schema_version = state_store.schema_version()?;
         if let Some(snapshot_version) = stored_schema_version {
-            if snapshot_version > indra_core::types::primitives::SCHEMA_VERSION {
+            if snapshot_version != indra_core::types::primitives::SCHEMA_VERSION {
                 return Err(NodeError::SchemaVersionTooNew {
                     snapshot_version,
                     node_version: indra_core::types::primitives::SCHEMA_VERSION,
                 });
-            }
-            if snapshot_version < indra_core::types::primitives::SCHEMA_VERSION {
-                state_store.backup_for_schema_migration(
-                    snapshot_version,
-                    indra_core::types::primitives::SCHEMA_VERSION,
-                )?;
             }
         }
         let mut genesis_base = build_finalized_genesis_state(config.genesis_path.as_deref())
@@ -148,17 +139,6 @@ impl NodeEngine {
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
             verify_snapshot_tip_against_retained_block(&snapshot, &mut block_store)?;
-            if let Some(from_version) = stored_schema_version {
-                if from_version < indra_core::types::primitives::SCHEMA_VERSION {
-                    let record = migration_record(
-                        &snapshot,
-                        from_version,
-                        indra_core::types::primitives::SCHEMA_VERSION,
-                    );
-                    migration_log.append(&record)?;
-                    state_store.save(&snapshot)?;
-                }
-            }
             let replay_start = snapshot.height.saturating_add(1);
             if !block_store.is_empty() && block_store.lowest_height() > replay_start {
                 return Err(NodeError::SnapshotReplayGap {
@@ -236,7 +216,6 @@ impl NodeEngine {
             block_store,
             epoch_store,
             state_store,
-            migration_log,
             hybrid_keypair,
             vrf_keypair,
             validator_id,
@@ -1080,7 +1059,6 @@ fn validate_manifest_if_present(
     epoch_store: &EpochStore,
 ) -> NodeResult<()> {
     let Some(manifest) = load_chain_manifest(&config.data_dir)? else {
-        eprintln!("[storage] warning: no chain manifest found; accepting legacy storage layout");
         return Ok(());
     };
     if manifest.chain_id != state.chain_id {
@@ -2231,6 +2209,7 @@ mod tests {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
             engine.state.chain_id = "indra-custom-testnet".to_string();
             engine.state_store.save(&engine.state).unwrap();
+            engine.write_chain_manifest().unwrap();
         }
 
         let restarted = NodeEngine::init(config).unwrap();

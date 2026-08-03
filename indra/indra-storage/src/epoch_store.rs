@@ -236,11 +236,11 @@ fn read_file_header(file: &mut File) -> StorageResult<()> {
         });
     }
     let schema_version = header[5];
-    if schema_version > SCHEMA_VERSION {
+    if schema_version != SCHEMA_VERSION {
         return Err(StorageError::Corruption {
             height: 0,
             detail: format!(
-                "epoch store schema version {} exceeds node schema version {}",
+                "epoch store schema version {} does not match node schema version {}",
                 schema_version, SCHEMA_VERSION
             ),
         });
@@ -325,6 +325,25 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("missing INEP header"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn epoch_store_rejects_noncanonical_schema_version() {
+        let path = temp_path("schema_mismatch");
+        {
+            let _store = EpochStore::open(&path).unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[5] = SCHEMA_VERSION.saturating_sub(1);
+        std::fs::write(&path, bytes).unwrap();
+        let err = match EpochStore::open(&path) {
+            Ok(_) => panic!("expected schema mismatch rejection"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("does not match node schema version"));
         let _ = std::fs::remove_file(&path);
     }
 

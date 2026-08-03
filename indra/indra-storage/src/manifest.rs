@@ -42,16 +42,53 @@ pub fn save_chain_manifest(data_dir: &Path, manifest: &ChainManifest) -> Storage
     write_atomic_synced(&tmp, &final_path, &manifest.encode())
 }
 
-/// Load the manifest, returning `None` for pre-manifest legacy nodes.
+/// Load the manifest, returning `None` only when the file does not exist.
 pub fn load_chain_manifest(data_dir: &Path) -> StorageResult<Option<ChainManifest>> {
     let path = manifest_path(data_dir);
     match std::fs::read(&path) {
         Ok(bytes) => ChainManifest::decode(&bytes)
             .map(Some)
             .map_err(|detail| StorageError::ManifestMismatch { detail }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if store_has_committed_data(data_dir)? {
+                Err(StorageError::ManifestMismatch {
+                    detail: "nonempty store is missing chain manifest".to_string(),
+                })
+            } else {
+                Ok(None)
+            }
+        }
         Err(err) => Err(err.into()),
     }
+}
+
+fn store_has_committed_data(data_dir: &Path) -> StorageResult<bool> {
+    for (name, empty_header_len) in [("blocks.log", 16), ("epochs.log", 16)] {
+        let path = data_dir.join(name);
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.len() > empty_header_len => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let state_dir = data_dir.join("state");
+    match std::fs::read_dir(state_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let name = entry?.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".snap") || name == "last_qc.bin" || name == "pending_last_qc.bin"
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(false)
 }
 
 fn manifest_path(data_dir: &Path) -> PathBuf {
@@ -162,5 +199,23 @@ mod tests {
             chain_id: "indra-testnet-1".into(),
         };
         assert_eq!(ChainManifest::decode(&manifest.encode()).unwrap(), manifest);
+    }
+
+    #[test]
+    fn missing_manifest_is_allowed_only_for_pristine_store() {
+        let dir =
+            std::env::temp_dir().join(format!("indra_manifest_pristine_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::write(dir.join("blocks.log"), [0u8; 16]).unwrap();
+        std::fs::write(dir.join("epochs.log"), [0u8; 16]).unwrap();
+        assert!(load_chain_manifest(&dir).unwrap().is_none());
+
+        std::fs::write(dir.join("state").join("last_qc.bin"), [1u8]).unwrap();
+        let err = load_chain_manifest(&dir).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("nonempty store is missing chain manifest"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

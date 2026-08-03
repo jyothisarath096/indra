@@ -9169,6 +9169,10 @@ mod tests {
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
         config.pq_sk = Some(pq.secret_key_bytes());
+        {
+            let mut pristine = NodeEngine::init(config.clone()).unwrap();
+            pristine.write_chain_manifest().unwrap();
+        }
         indra_storage::save_last_qc(&config.state_dir(), &stale_qc_bytes).unwrap();
 
         let mut engine = NodeEngine::init(config).unwrap();

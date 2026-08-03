@@ -3513,7 +3513,6 @@ struct RpcSnapshot {
     requested_block: Option<(u64, indra_core::types::block::BlockV1)>,
     latest_epoch: Option<u64>,
     epoch_records: HashMap<u64, indra_core::EpochRecord>,
-    migration_history: Vec<indra_rpc::handlers::MigrationRecordView>,
 }
 
 impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
@@ -3575,9 +3574,6 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
             .collect())
     }
 
-    fn migration_history(&self) -> Result<Vec<indra_rpc::handlers::MigrationRecordView>, String> {
-        Ok(self.migration_history.clone())
-    }
 }
 
 fn snapshot_rpc_state(
@@ -3614,20 +3610,6 @@ fn snapshot_rpc_state(
         }
         None => HashMap::new(),
     };
-    let migration_history = engine
-        .migration_log
-        .load_all()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|record| indra_rpc::handlers::MigrationRecordView {
-            timestamp_secs: record.timestamp_secs,
-            from_version: record.from_version,
-            to_version: record.to_version,
-            state_height: record.state_height,
-            validators_migrated: record.validators_migrated,
-            utxos_migrated: record.utxos_migrated,
-        })
-        .collect();
     Ok(RpcSnapshot {
         chain: engine.state.clone(),
         mempool_size: engine.mempool.len(),
@@ -3637,7 +3619,6 @@ fn snapshot_rpc_state(
         requested_block,
         latest_epoch,
         epoch_records,
-        migration_history,
     })
 }
 
@@ -5247,7 +5228,6 @@ mod tests {
             requested_block: None,
             latest_epoch: None,
             epoch_records: HashMap::new(),
-            migration_history: Vec::new(),
         };
         let state = indra_rpc::handlers::NodeState::with_network(&snapshot, Vec::new(), 0, 0, 0);
 
@@ -5383,7 +5363,6 @@ mod tests {
             requested_block: Some((height, block)),
             latest_epoch: None,
             epoch_records: HashMap::new(),
-            migration_history: Vec::new(),
         };
         let state = indra_rpc::handlers::NodeState::read_only(&snapshot);
 
@@ -5442,7 +5421,6 @@ mod tests {
             requested_block: Some((1, block)),
             latest_epoch: None,
             epoch_records: HashMap::new(),
-            migration_history: Vec::new(),
         };
         let state = indra_rpc::handlers::NodeState::read_only(&snapshot);
 

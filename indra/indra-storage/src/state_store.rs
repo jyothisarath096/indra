@@ -18,21 +18,17 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
-use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS};
+use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION};
 use indra_state::{compute_state_roots, ChainState};
 
 use crate::atomic::{crc32, write_atomic_synced};
 use crate::error::{StorageError, StorageResult};
-use crate::migration::migrate_chain_state;
 
 /// How often to take a state snapshot (in blocks).
 pub const SNAPSHOT_INTERVAL: u64 = 300;
-const SNAPSHOT_VERSION_V1_SUMMARY: u8 = 0x01;
-const SNAPSHOT_VERSION_V2_COMPLETE: u8 = 0x02;
-const SNAPSHOT_VERSION_V3_VERSIONED: u8 = 0x03;
+const SNAPSHOT_FORMAT_VERSION: u8 = 1;
 const SNAPSHOT_META_MAGIC: &[u8; 4] = b"INSM";
 const SNAPSHOT_META_VERSION: u8 = 1;
 
@@ -149,12 +145,8 @@ impl StateStore {
 
                 let state = deserialise_chain_state(state_bytes, height)
                     .map_err(|e| StorageError::Corruption { height, detail: e })?;
-                if let Some(state) = state {
-                    self.verify_snapshot_meta(&path, &state, crc32(&file_bytes))?;
-                    Ok(Some(state))
-                } else {
-                    Ok(None)
-                }
+                self.verify_snapshot_meta(&path, &state, crc32(&file_bytes))?;
+                Ok(Some(state))
             }
         }
     }
@@ -188,63 +180,26 @@ impl StateStore {
         let mut state_bytes = vec![0u8; length.min(2)];
         f.read_exact(&mut state_bytes)?;
         match state_bytes.as_slice() {
-            [SNAPSHOT_VERSION_V3_VERSIONED, schema_version] => Ok(Some(*schema_version)),
-            [SNAPSHOT_VERSION_V2_COMPLETE, ..] => Ok(Some(SCHEMA_VERSION_GENESIS)),
-            [SNAPSHOT_VERSION_V1_SUMMARY, ..] => Ok(Some(SCHEMA_VERSION_GENESIS)),
-            _ => Ok(None),
-        }
-    }
-
-    /// Create a best-effort rollback point before durable schema migration.
-    ///
-    /// The migration path may subsequently rewrite snapshots using the current
-    /// schema. Keeping a timestamped copy of the current state-store files makes
-    /// rollback possible if migration or post-migration integrity checks fail.
-    pub fn backup_for_schema_migration(
-        &self,
-        from_version: u8,
-        to_version: u8,
-    ) -> StorageResult<Option<PathBuf>> {
-        let Some(snapshot_path) = self.find_latest_snapshot()? else {
-            return Ok(None);
-        };
-        let Some(height) = snapshot_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| {
-                name.trim_start_matches("state_")
-                    .trim_end_matches(".snap")
-                    .parse::<u64>()
-                    .ok()
-            })
-        else {
-            return Ok(None);
-        };
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let backup_dir = self.dir.join(format!(
-            "migration_backup_v{from_version}_to_v{to_version}_h{height}_{timestamp}_{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&backup_dir)?;
-
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                continue;
+            [SNAPSHOT_FORMAT_VERSION, schema_version] if *schema_version == SCHEMA_VERSION => {
+                Ok(Some(*schema_version))
             }
-            let file_name = entry.file_name();
-            fs::copy(entry.path(), backup_dir.join(file_name))?;
+            [format_version, _] if *format_version != SNAPSHOT_FORMAT_VERSION => {
+                Err(StorageError::Corruption {
+                    height,
+                    detail: format!("unsupported snapshot format version {format_version}"),
+                })
+            }
+            [_, schema_version] => Err(StorageError::Corruption {
+                height,
+                detail: format!(
+                    "snapshot schema version {schema_version} does not match node schema version {SCHEMA_VERSION}"
+                ),
+            }),
+            _ => Err(StorageError::Corruption {
+                height,
+                detail: "snapshot payload missing format/schema discriminator".to_string(),
+            }),
         }
-
-        eprintln!(
-            "[migration] backed up state store before schema migration v{from_version}->v{to_version}: {}",
-            backup_dir.display()
-        );
-        Ok(Some(backup_dir))
     }
 
     /// Height of the newest snapshot, if any.
@@ -314,17 +269,19 @@ impl StateStore {
         checksum: u32,
     ) -> StorageResult<()> {
         let meta_path = snapshot_path.with_extension("snap.meta");
-        let meta_bytes = match fs::read(&meta_path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!(
-                    "[storage] warning: snapshot {} has no sidecar metadata; accepting legacy snapshot",
-                    snapshot_path.display()
-                );
-                return Ok(());
+        let meta_bytes = fs::read(&meta_path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                StorageError::Corruption {
+                    height: state.height,
+                    detail: format!(
+                        "snapshot metadata sidecar is missing for {}",
+                        snapshot_path.display()
+                    ),
+                }
+            } else {
+                err.into()
             }
-            Err(err) => return Err(err.into()),
-        };
+        })?;
         let meta =
             SnapshotMeta::decode(&meta_bytes).map_err(|detail| StorageError::Corruption {
                 height: state.height,
@@ -472,12 +429,12 @@ fn hex_bytes(bytes: &[u8]) -> String {
 /// Serialise a complete chain state snapshot.
 ///
 /// Payload format:
-/// - `0x03` version discriminator for the schema-versioned complete-state format
+/// - canonical snapshot format discriminator
 /// - current schema version byte
 /// - canonical `ChainState` encoding
 fn serialise_chain_state(state: &ChainState) -> Vec<u8> {
     let mut buf = Vec::with_capacity(2 + state.encoded_len());
-    buf.push(SNAPSHOT_VERSION_V3_VERSIONED);
+    buf.push(SNAPSHOT_FORMAT_VERSION);
     buf.push(SCHEMA_VERSION);
     state.encode(&mut buf);
     buf
@@ -485,103 +442,36 @@ fn serialise_chain_state(state: &ChainState) -> Vec<u8> {
 
 /// Deserialise a chain state snapshot.
 ///
-/// Returns `Ok(None)` for legacy/incomplete snapshot payloads so startup can
-/// gracefully fall back to full replay when possible.
-fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<Option<ChainState>, String> {
-    if bytes.len() == 72 {
-        eprintln!(
-            "[storage] warning: ignoring legacy unversioned summary snapshot at height {}",
-            file_height
-        );
-        return Ok(None);
-    }
-
-    let Some((&version, payload)) = bytes.split_first() else {
+fn deserialise_chain_state(bytes: &[u8], file_height: u64) -> Result<ChainState, String> {
+    let Some((&format_version, payload)) = bytes.split_first() else {
         return Err("snapshot payload is empty".to_string());
     };
-
-    match version {
-        SNAPSHOT_VERSION_V1_SUMMARY => {
-            eprintln!(
-                "[storage] warning: ignoring legacy v1 summary snapshot at height {}",
-                file_height
-            );
-            Ok(None)
-        }
-        SNAPSHOT_VERSION_V2_COMPLETE => {
-            let (state, schema_version) = decode_legacy_snapshot(payload)
-                .map_err(|e| format!("legacy snapshot decode failed: {e}"))?;
-            let state = if schema_version < SCHEMA_VERSION {
-                migrate_chain_state(state, schema_version)?
-            } else {
-                state
-            };
-            validate_snapshot_state(state, file_height)
-        }
-        SNAPSHOT_VERSION_V3_VERSIONED => {
-            let Some((&schema_version, payload)) = payload.split_first() else {
-                return Err("V3 snapshot missing schema version".to_string());
-            };
-            if schema_version > SCHEMA_VERSION {
-                return Err(format!(
-                    "snapshot schema version {} exceeds node's maximum {} — upgrade your node binary",
-                    schema_version, SCHEMA_VERSION
-                ));
-            }
-            let mut reader = ByteReader::new(payload);
-            let state = if schema_version == 2 {
-                ChainState::decode_schema_v2_snapshot(&mut reader).map_err(|e| e.to_string())?
-            } else {
-                ChainState::decode(&mut reader).map_err(|e| e.to_string())?
-            };
-            if reader.remaining() != 0 {
-                return Err(format!(
-                    "snapshot at height {} has {} trailing bytes",
-                    file_height,
-                    reader.remaining()
-                ));
-            }
-            let state = if schema_version < SCHEMA_VERSION {
-                migrate_chain_state(state, schema_version)?
-            } else {
-                state
-            };
-            validate_snapshot_state(state, file_height)
-        }
-        other => {
-            eprintln!(
-                "[storage] warning: ignoring incompatible snapshot version 0x{other:02x} at height {}",
-                file_height
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn decode_legacy_snapshot(payload: &[u8]) -> Result<(ChainState, u8), String> {
-    let mut reader_v2 = ByteReader::new(payload);
-    if let Ok(state) = ChainState::decode_legacy_snapshot(&mut reader_v2, SCHEMA_VERSION) {
-        if reader_v2.remaining() == 0 {
-            return Ok((state, SCHEMA_VERSION));
-        }
-    }
-
-    let mut reader_v1 = ByteReader::new(payload);
-    let state = ChainState::decode_legacy_snapshot(&mut reader_v1, SCHEMA_VERSION_GENESIS)
-        .map_err(|e| e.to_string())?;
-    if reader_v1.remaining() != 0 {
+    if format_version != SNAPSHOT_FORMAT_VERSION {
         return Err(format!(
-            "legacy snapshot has {} trailing bytes",
-            reader_v1.remaining()
+            "unsupported snapshot format version {format_version}"
         ));
     }
-    Ok((state, SCHEMA_VERSION_GENESIS))
+    let Some((&schema_version, payload)) = payload.split_first() else {
+        return Err("snapshot missing schema version".to_string());
+    };
+    if schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "snapshot schema version {schema_version} does not match node schema version {SCHEMA_VERSION}"
+        ));
+    }
+    let mut reader = ByteReader::new(payload);
+    let state = ChainState::decode(&mut reader).map_err(|e| e.to_string())?;
+    if reader.remaining() != 0 {
+        return Err(format!(
+            "snapshot at height {} has {} trailing bytes",
+            file_height,
+            reader.remaining()
+        ));
+    }
+    validate_snapshot_state(state, file_height)
 }
 
-fn validate_snapshot_state(
-    mut state: ChainState,
-    file_height: u64,
-) -> Result<Option<ChainState>, String> {
+fn validate_snapshot_state(mut state: ChainState, file_height: u64) -> Result<ChainState, String> {
     if state.height != file_height {
         return Err(format!(
             "snapshot height mismatch: file says {}, payload says {}",
@@ -589,7 +479,7 @@ fn validate_snapshot_state(
         ));
     }
     state.rebuild_state_commitment_v2(state.height);
-    Ok(Some(state))
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -830,25 +720,6 @@ mod tests {
     }
 
     #[test]
-    fn backup_for_schema_migration_copies_state_store_files() {
-        let dir = temp_dir("migration_backup");
-        let store = StateStore::open(&dir).unwrap();
-        let mut state = finalized_test_state();
-        state.height = 12;
-        state.validators.upsert(test_validator()).unwrap();
-        store.save(&state).unwrap();
-
-        let backup_dir = store
-            .backup_for_schema_migration(3, SCHEMA_VERSION)
-            .unwrap()
-            .expect("snapshot exists");
-        assert!(backup_dir.join("state_12.snap").exists());
-        assert!(backup_dir.join("state_12.snap.meta").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn snapshot_with_wrong_state_root_is_rejected() {
         let dir = temp_dir("bad_meta_state_root");
         let store = StateStore::open(&dir).unwrap();
@@ -896,13 +767,28 @@ mod tests {
         let mut state = ChainState::new_genesis();
         state.height = 7;
         let mut payload = Vec::new();
-        payload.push(SNAPSHOT_VERSION_V3_VERSIONED);
+        payload.push(SNAPSHOT_FORMAT_VERSION);
         payload.push(255);
         state.encode(&mut payload);
         write_snapshot(&dir, state.height, &payload);
 
         let err = store.load_latest().unwrap_err();
-        assert!(err.to_string().contains("upgrade your node binary"));
+        assert!(err
+            .to_string()
+            .contains("does not match node schema version"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_without_metadata_sidecar_is_rejected() {
+        let dir = temp_dir("missing_sidecar");
+        let store = StateStore::open(&dir).unwrap();
+        let state = finalized_test_state();
+        store.save(&state).unwrap();
+        std::fs::remove_file(dir.join("state_0.snap.meta")).unwrap();
+
+        let err = store.load_latest().unwrap_err();
+        assert!(err.to_string().contains("metadata sidecar is missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1080,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn old_v1_snapshot_rejected_gracefully() {
+    fn unknown_snapshot_format_is_rejected() {
         let dir = temp_dir("old_v1");
         let store = StateStore::open(&dir).unwrap();
         let path = dir.join("state_300.snap");
@@ -1101,7 +987,10 @@ mod tests {
         file.flush().unwrap();
         drop(file);
 
-        assert!(store.load_latest().unwrap().is_none());
+        let err = store.load_latest().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported snapshot format version"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

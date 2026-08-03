@@ -7,7 +7,7 @@
 //! Phase 5 uses simple flat-file storage:
 //!
 //! - **Block store**: append-only log of encoded blocks.
-//!   Each entry is: u64 height || u32 length || block_bytes.
+//!   Each entry is: u64 height || u32 length || block_bytes || CRC32.
 //!   Indexed by a separate height→offset map held in memory.
 //!
 //! - **State store**: periodic snapshots of `ChainState` written
@@ -29,6 +29,13 @@
 //! - No unsafe code.
 //! - All writes are atomic at the OS level (write then rename).
 //! - Incomplete writes are detected and ignored on recovery.
+//!
+//! ## Schema policy before mainnet
+//!
+//! Storage has one canonical format and no migration ladder. Checkpoints made
+//! before the eventual pure-mainnet schema (including the future tranche staking
+//! model) are intentionally disposable; operators must replay from genesis or
+//! start with fresh storage after an incompatible pre-mainnet schema change.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -41,7 +48,6 @@ pub mod block_store;
 pub mod epoch_store;
 pub mod error;
 pub mod manifest;
-pub mod migration;
 pub mod qc_store;
 pub mod state_store;
 pub mod vote_safety;
@@ -51,7 +57,6 @@ pub use block_store::{BlockStore, PruneConfig};
 pub use epoch_store::EpochStore;
 pub use error::{StorageError, StorageResult};
 pub use manifest::{load_chain_manifest, save_chain_manifest, ChainManifest};
-pub use migration::{migrate_chain_state, migration_record, MigrationLog, MigrationRecord};
 pub use qc_store::{
     clear_pending_last_qc, load_last_qc, load_pending_last_qc, save_last_qc, save_pending_last_qc,
 };
