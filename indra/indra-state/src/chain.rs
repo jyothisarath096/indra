@@ -17,7 +17,11 @@ use indra_core::types::slash_membership::{
 use indra_core::types::primitives::{
     Bytes32, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
     INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
+    MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
+    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
 };
+use indra_core::types::stake_position::{StakePositionV1, UnbondingTrancheV1};
+use std::collections::BTreeMap;
 
 use crate::{
     governance::GovernanceState,
@@ -124,6 +128,15 @@ pub struct ChainState {
     /// Stake bonds: UTXOs locked as delegation stake.
     pub staked_bonds: PersistentOrdMap<Bytes32, StakeBondEntry>,
 
+    /// Canonical active/reward staking positions.
+    pub stake_positions: PersistentOrdMap<Bytes32, StakePositionV1>,
+
+    /// Canonical immutable exact-height unbonding tranches.
+    pub unbonding_tranches: PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
+
+    /// Rebuildable non-canonical position-to-tranche lookup index.
+    pub(crate) position_tranche_index: BTreeMap<Bytes32, Vec<Bytes32>>,
+
     /// Monotonic nonces for staking op replay protection.
     pub staking_nonces: PersistentOrdMap<Bytes32, u64>,
 
@@ -219,6 +232,8 @@ impl Encode for ChainState {
         }
         encode_list(&self.slash_membership_roots, buf);
         encode_tombstones(&self.evicted_validator_tombstones, buf);
+        encode_stake_positions(&self.stake_positions, buf);
+        encode_unbonding_tranches(&self.unbonding_tranches, buf);
         // Omitted: transient epoch summary counters and nested SMT caches are intentionally
         // reconstructed/reset by decoders from the serialized canonical entries.
     }
@@ -257,6 +272,8 @@ impl Encode for ChainState {
                 .unwrap_or(0)
             + list_encoded_len(&self.slash_membership_roots)
             + tombstones_encoded_len(&self.evicted_validator_tombstones)
+            + stake_positions_encoded_len(&self.stake_positions)
+            + unbonding_tranches_encoded_len(&self.unbonding_tranches)
     }
 }
 
@@ -333,6 +350,13 @@ impl Decode for ChainState {
         }
         let evicted_validator_tombstones =
             decode_tombstones(r, &staked_bonds, &validators, height)?;
+        let stake_positions = decode_stake_positions(r)?;
+        let unbonding_tranches = decode_unbonding_tranches(r)?;
+        let position_tranche_index = validate_and_build_position_tranche_index(
+            &chain_id,
+            &stake_positions,
+            &unbonding_tranches,
+        )?;
         Ok(Self {
             chain_id,
             height,
@@ -351,6 +375,9 @@ impl Decode for ChainState {
             evicted_validator_tombstones,
             delegations,
             staked_bonds,
+            stake_positions,
+            unbonding_tranches,
+            position_tranche_index,
             staking_nonces,
             delegator_identities,
             retired_cold_classical_components,
@@ -399,6 +426,9 @@ impl ChainState {
             evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::new(),
             staked_bonds: PersistentOrdMap::new(),
+            stake_positions: PersistentOrdMap::new(),
+            unbonding_tranches: PersistentOrdMap::new(),
+            position_tranche_index: BTreeMap::new(),
             staking_nonces: PersistentOrdMap::new(),
             delegator_identities: PersistentOrdMap::new(),
             retired_cold_classical_components: PersistentOrdSet::new(),
@@ -437,6 +467,9 @@ impl ChainState {
             evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::decode_legacy(r)?,
             staked_bonds: decode_bond_map(r)?,
+            stake_positions: PersistentOrdMap::new(),
+            unbonding_tranches: PersistentOrdMap::new(),
+            position_tranche_index: BTreeMap::new(),
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
             retired_cold_classical_components: PersistentOrdSet::new(),
@@ -479,6 +512,9 @@ impl ChainState {
             evicted_validator_tombstones: PersistentOrdMap::new(),
             delegations: DelegationMap::decode(r)?,
             staked_bonds: decode_bond_map(r)?,
+            stake_positions: PersistentOrdMap::new(),
+            unbonding_tranches: PersistentOrdMap::new(),
+            position_tranche_index: BTreeMap::new(),
             staking_nonces: decode_nonce_map(r)?,
             delegator_identities: PersistentOrdMap::new(),
             retired_cold_classical_components: PersistentOrdSet::new(),
@@ -503,6 +539,24 @@ impl ChainState {
     /// Rebuild the derived StateCommitmentV2 cache from canonical state.
     pub fn rebuild_state_commitment_v2(&mut self, height: u64) {
         self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
+    }
+
+    /// Rebuild and validate the non-canonical position-to-tranche index.
+    pub fn rebuild_position_tranche_index(&mut self) -> IndraResult<()> {
+        self.position_tranche_index = validate_and_build_position_tranche_index(
+            &self.chain_id,
+            &self.stake_positions,
+            &self.unbonding_tranches,
+        )?;
+        Ok(())
+    }
+
+    /// Canonically ordered tranche identifiers belonging to `position_id`.
+    pub fn tranche_ids_for_position(&self, position_id: &Bytes32) -> &[Bytes32] {
+        self.position_tranche_index
+            .get(position_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Return the StateCommitmentV2 root, rebuilding from canonical state if
@@ -1306,6 +1360,230 @@ fn validate_bond_map_count(count: usize) -> IndraResult<()> {
         });
     }
     Ok(())
+}
+
+fn encode_stake_positions(
+    positions: &PersistentOrdMap<Bytes32, StakePositionV1>,
+    buf: &mut Vec<u8>,
+) {
+    (positions.len() as u32).encode(buf);
+    for (position_id, position) in positions {
+        position_id.encode(buf);
+        position.encode(buf);
+    }
+}
+
+fn stake_positions_encoded_len(positions: &PersistentOrdMap<Bytes32, StakePositionV1>) -> usize {
+    4 + positions
+        .iter()
+        .map(|(position_id, position)| position_id.encoded_len() + position.encoded_len())
+        .sum::<usize>()
+}
+
+fn decode_stake_positions(
+    reader: &mut ByteReader<'_>,
+) -> IndraResult<PersistentOrdMap<Bytes32, StakePositionV1>> {
+    let count = u32::decode(reader)? as usize;
+    if count > MAX_STAKE_POSITIONS_TOTAL {
+        return Err(IndraError::LengthExceeded {
+            field: "chain_state.stake_positions",
+            max: MAX_STAKE_POSITIONS_TOTAL,
+            actual: count,
+        });
+    }
+    let mut positions = PersistentOrdMap::new();
+    for _ in 0..count {
+        let key = Bytes32::decode(reader)?;
+        let position = StakePositionV1::decode(reader)?;
+        if key != position.position_id {
+            return Err(IndraError::InvalidStakePosition(
+                "stake-position map key does not match canonical position ID".to_string(),
+            ));
+        }
+        if positions.insert(key, position).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "chain_state.stake_positions",
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn encode_unbonding_tranches(
+    tranches: &PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
+    buf: &mut Vec<u8>,
+) {
+    (tranches.len() as u32).encode(buf);
+    for (tranche_id, tranche) in tranches {
+        tranche_id.encode(buf);
+        tranche.encode(buf);
+    }
+}
+
+fn unbonding_tranches_encoded_len(
+    tranches: &PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
+) -> usize {
+    4 + tranches
+        .iter()
+        .map(|(tranche_id, tranche)| tranche_id.encoded_len() + tranche.encoded_len())
+        .sum::<usize>()
+}
+
+fn decode_unbonding_tranches(
+    reader: &mut ByteReader<'_>,
+) -> IndraResult<PersistentOrdMap<Bytes32, UnbondingTrancheV1>> {
+    let count = u32::decode(reader)? as usize;
+    if count > MAX_TRANCHES_TOTAL {
+        return Err(IndraError::LengthExceeded {
+            field: "chain_state.unbonding_tranches",
+            max: MAX_TRANCHES_TOTAL,
+            actual: count,
+        });
+    }
+    let mut tranches = PersistentOrdMap::new();
+    for _ in 0..count {
+        let key = Bytes32::decode(reader)?;
+        let tranche = UnbondingTrancheV1::decode(reader)?;
+        if key != tranche.tranche_id {
+            return Err(IndraError::InvalidStakePosition(
+                "unbonding-tranche map key does not match canonical tranche ID".to_string(),
+            ));
+        }
+        if tranches.insert(key, tranche).is_some() {
+            return Err(IndraError::DuplicateEntries {
+                field: "chain_state.unbonding_tranches",
+            });
+        }
+    }
+    Ok(tranches)
+}
+
+fn validate_and_build_position_tranche_index(
+    chain_id: &str,
+    positions: &PersistentOrdMap<Bytes32, StakePositionV1>,
+    tranches: &PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
+) -> IndraResult<BTreeMap<Bytes32, Vec<Bytes32>>> {
+    if positions.len() > MAX_STAKE_POSITIONS_TOTAL || tranches.len() > MAX_TRANCHES_TOTAL {
+        return Err(IndraError::InvalidStakePosition(
+            "global staking-position capacity exceeded".to_string(),
+        ));
+    }
+
+    let mut positions_per_validator = BTreeMap::<Bytes32, usize>::new();
+    let mut active_positions_per_validator = BTreeMap::<Bytes32, usize>::new();
+    let mut active_positions = 0usize;
+    for (position_id, position) in positions {
+        position.validate()?;
+        if position_id != &position.position_id {
+            return Err(IndraError::InvalidStakePosition(
+                "stake-position map key mismatch".to_string(),
+            ));
+        }
+        let count = positions_per_validator
+            .entry(position.validator_id)
+            .or_default();
+        *count += 1;
+        if *count > MAX_STAKE_POSITIONS_PER_VALIDATOR {
+            return Err(IndraError::InvalidStakePosition(
+                "per-validator stake-position capacity exceeded".to_string(),
+            ));
+        }
+        if position.active.is_some() {
+            active_positions += 1;
+            *active_positions_per_validator
+                .entry(position.validator_id)
+                .or_default() += 1;
+        }
+    }
+
+    let mut index = BTreeMap::<Bytes32, Vec<Bytes32>>::new();
+    let mut tranches_per_validator = BTreeMap::<Bytes32, usize>::new();
+    for (tranche_id, tranche) in tranches {
+        tranche.validate()?;
+        if tranche_id != &tranche.tranche_id {
+            return Err(IndraError::InvalidStakePosition(
+                "unbonding-tranche map key mismatch".to_string(),
+            ));
+        }
+        let position = positions.get(&tranche.position_id).ok_or_else(|| {
+            IndraError::InvalidStakePosition(
+                "unbonding tranche references a missing position".to_string(),
+            )
+        })?;
+        if tranche.custody != position.custody {
+            return Err(IndraError::InvalidStakePosition(
+                "unbonding tranche custody differs from its position".to_string(),
+            ));
+        }
+        let start_height = tranche.timing.start_height();
+        let source_blinding = indra_crypto::derive_tranche_source_blinding_v1(
+            &indra_crypto::TrancheSourceBlindingInputsV1 {
+                chain_id: chain_id.as_bytes(),
+                position_id: tranche.position_id.0,
+                tranche_id: tranche.tranche_id.0,
+                principal_spark: tranche.principal_spark,
+                start_height,
+                creation_op_id: tranche.creation_op_id.0,
+            },
+        )
+        .map_err(|error| IndraError::InvalidStakePosition(error.to_string()))?;
+        if indra_crypto::commit(tranche.principal_spark, &source_blinding)
+            != tranche.source_commitment
+        {
+            return Err(IndraError::InvalidStakePosition(
+                "unbonding tranche source commitment does not match canonical KDF".to_string(),
+            ));
+        }
+        let ids = index.entry(tranche.position_id).or_default();
+        ids.push(*tranche_id);
+        if ids.len() > MAX_TRANCHES_PER_POSITION {
+            return Err(IndraError::InvalidStakePosition(
+                "per-position tranche capacity exceeded".to_string(),
+            ));
+        }
+        let validator_count = tranches_per_validator
+            .entry(position.validator_id)
+            .or_default();
+        *validator_count += 1;
+        if *validator_count > MAX_TRANCHES_PER_VALIDATOR {
+            return Err(IndraError::InvalidStakePosition(
+                "per-validator tranche capacity exceeded".to_string(),
+            ));
+        }
+    }
+
+    if tranches.len().saturating_add(active_positions) > MAX_TRANCHES_TOTAL {
+        return Err(IndraError::InvalidStakePosition(
+            "global final-exit tranche reservation exceeded".to_string(),
+        ));
+    }
+    for (validator_id, active_count) in active_positions_per_validator {
+        let tranche_count = tranches_per_validator
+            .get(&validator_id)
+            .copied()
+            .unwrap_or(0);
+        if tranche_count.saturating_add(active_count) > MAX_TRANCHES_PER_VALIDATOR {
+            return Err(IndraError::InvalidStakePosition(
+                "per-validator final-exit tranche reservation exceeded".to_string(),
+            ));
+        }
+    }
+    for (position_id, position) in positions {
+        let tranche_count = index.get(position_id).map_or(0, Vec::len);
+        let has_tranches = tranche_count != 0;
+        if position.active.is_some() && tranche_count.saturating_add(1) > MAX_TRANCHES_PER_POSITION
+        {
+            return Err(IndraError::InvalidStakePosition(
+                "per-position final-exit tranche reservation exceeded".to_string(),
+            ));
+        }
+        if position.active.is_none() && position.pending_rewards_spark == 0 && !has_tranches {
+            return Err(IndraError::InvalidStakePosition(
+                "empty stake position must not remain canonical".to_string(),
+            ));
+        }
+    }
+    Ok(index)
 }
 
 fn encode_nonce_map(nonces: &PersistentOrdMap<Bytes32, u64>, buf: &mut Vec<u8>) {

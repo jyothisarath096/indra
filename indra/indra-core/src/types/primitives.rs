@@ -31,6 +31,17 @@ pub const MAX_VALIDATORS: usize = 1_500;
 /// Maximum live stake-bond records associated with one validator.
 pub const MAX_LIVE_BONDS_PER_VALIDATOR: usize = 104_096;
 
+/// Maximum canonical staking positions associated with one validator.
+pub const MAX_STAKE_POSITIONS_PER_VALIDATOR: usize = 100_001;
+/// Binding network-wide maximum canonical staking positions.
+pub const MAX_STAKE_POSITIONS_TOTAL: usize = 104_096;
+/// Maximum simultaneously retained unbonding tranches for one position.
+pub const MAX_TRANCHES_PER_POSITION: usize = 64;
+/// Binding per-validator maximum retained unbonding tranches.
+pub const MAX_TRANCHES_PER_VALIDATOR: usize = 104_096;
+/// Binding network-wide maximum retained unbonding tranches.
+pub const MAX_TRANCHES_TOTAL: usize = 104_096;
+
 /// Maximum delegation-return events retained in consensus state.
 ///
 /// This is a fixed rolling log for operator visibility after forced validator

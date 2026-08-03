@@ -92,6 +92,12 @@ impl StateCommitmentV2 {
         for (utxo_id, bond) in &state.staked_bonds {
             leaves.push((staked_bond_key(utxo_id), staked_bond_value_hash(bond)));
         }
+        for position in state.stake_positions.values() {
+            leaves.push(stake_position_commitment_leaf(position));
+        }
+        for tranche in state.unbonding_tranches.values() {
+            leaves.push(unbonding_tranche_commitment_leaf(tranche));
+        }
         for hash in &state.applied_slash_hashes {
             leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
         }
@@ -204,6 +210,30 @@ impl StateCommitmentV2 {
     /// Delete a staked-bond leaf.
     pub fn delete_staked_bond(&mut self, utxo_id: &Bytes32) {
         self.tree.delete(staked_bond_key(utxo_id));
+    }
+
+    /// Insert or replace a canonical stake-position leaf.
+    pub fn put_stake_position(&mut self, position: &StakePositionV1) {
+        let (key, value) = stake_position_commitment_leaf(position);
+        self.tree.insert(key, value);
+    }
+
+    /// Delete a canonical stake-position leaf.
+    pub fn delete_stake_position(&mut self, position_id: &Bytes32) {
+        self.tree
+            .delete(derive_key(DOMAIN_STAKE_POSITION, &position_id.0));
+    }
+
+    /// Insert or replace a canonical unbonding-tranche leaf.
+    pub fn put_unbonding_tranche(&mut self, tranche: &UnbondingTrancheV1) {
+        let (key, value) = unbonding_tranche_commitment_leaf(tranche);
+        self.tree.insert(key, value);
+    }
+
+    /// Delete a canonical unbonding-tranche leaf.
+    pub fn delete_unbonding_tranche(&mut self, tranche_id: &Bytes32) {
+        self.tree
+            .delete(derive_key(DOMAIN_UNBONDING_TRANCHE, &tranche_id.0));
     }
 
     /// Insert a slash-evidence hash leaf.

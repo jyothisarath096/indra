@@ -47,6 +47,7 @@ pub mod identity;
 pub mod nullifier;
 pub mod persistent;
 pub mod smt;
+pub mod stake_positions;
 pub mod state_commitment;
 pub mod state_root;
 pub(crate) mod txn;
@@ -72,6 +73,10 @@ pub use persistent::{
 pub use smt::{
     AuthTreeProof, CompressedAuthTree, CompressedChildKind, CompressedProof, CompressedProofChild,
     CompressedProofStep, MerkleProof, ProofTerminal, SparseMerkleTree, SMT_DEPTH,
+};
+pub use stake_positions::{
+    deposit_stake_position, exit_stake_position, release_matured_position_tranches,
+    PositionDepositOpeningV1,
 };
 pub use state_commitment::StateCommitmentV2;
 pub use state_root::{compute_state_root, compute_state_roots, compute_validator_set_root};

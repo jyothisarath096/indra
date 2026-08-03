@@ -4,7 +4,8 @@ use crate::{
     codec::{ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        primitives::{Bytes32, EPOCH_DURATION_BLOCKS, UNBONDING_PERIOD_EPOCHS},
+        crypto::HybridSignature,
+        primitives::{Bytes32, VariableBytes, EPOCH_DURATION_BLOCKS, UNBONDING_PERIOD_EPOCHS},
         staking::StakingOp,
     },
 };
@@ -20,6 +21,8 @@ pub const UNBONDING_TIMING_FORMAT_V1: u8 = 1;
 pub const UNBONDING_TRANCHE_FORMAT_V1: u8 = 1;
 /// Canonical `PositionCustodyV1` marker.
 pub const POSITION_CUSTODY_FORMAT_V1: u8 = 1;
+/// Canonical `StakePositionExitIntentV1` marker.
+pub const STAKE_POSITION_EXIT_INTENT_FORMAT_V1: u8 = 1;
 
 /// Position-identifier hash domain.
 pub const POSITION_ID_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-v1";
@@ -27,6 +30,8 @@ pub const POSITION_ID_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-v1";
 pub const TRANCHE_ID_DOMAIN_V1: &[u8] = b"INDRA-UNBONDING-TRANCHE-v1";
 /// Staking-operation intent identifier hash domain.
 pub const STAKING_OP_ID_V2_DOMAIN: &[u8] = b"INDRA-STAKING-OP-ID-v2";
+/// Domain for the standalone Stage 2 position-exit authorization.
+pub const STAKE_POSITION_EXIT_SIGNING_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-EXIT-v1";
 
 const CUSTODY_DELEGATOR: u8 = 1;
 const CUSTODY_VALIDATOR_COLD: u8 = 2;
@@ -508,15 +513,132 @@ impl Decode for UnbondingTrancheV1 {
     }
 }
 
+/// Standalone signed authorization for an isolated position exit.
+///
+/// This intentionally remains outside `StakingOpBody` until the live staking
+/// dispatcher is migrated in a later stage. Its signature binds the chain,
+/// nonce, exact position, exact amount, and immutable custody role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StakePositionExitIntentV1 {
+    /// Position whose active principal is being reduced.
+    pub position_id: Bytes32,
+    /// Exact amount entering a new immutable tranche.
+    pub amount_spark: u64,
+    /// Custody role that must authorize the exit.
+    pub custody: PositionCustodyV1,
+    /// Monotonic replay-protection nonce in the principal owner's namespace.
+    pub nonce: u64,
+    /// Hybrid signature over `signing_bytes(chain_id)`.
+    pub signature: HybridSignature,
+}
+
+impl StakePositionExitIntentV1 {
+    /// Construct an unsigned intent for signing.
+    pub fn unsigned(
+        position_id: Bytes32,
+        amount_spark: u64,
+        custody: PositionCustodyV1,
+        nonce: u64,
+    ) -> IndraResult<Self> {
+        if amount_spark == 0 {
+            return invalid("position exit amount is zero");
+        }
+        Ok(Self {
+            position_id,
+            amount_spark,
+            custody,
+            nonce,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::default(),
+                pq_sig: VariableBytes::default(),
+            },
+        })
+    }
+
+    /// Canonical bytes covered by the hybrid signature.
+    pub fn signing_bytes(&self, chain_id: &str) -> IndraResult<Vec<u8>> {
+        let chain = chain_id.as_bytes();
+        let chain_len = u16::try_from(chain.len())
+            .map_err(|_| invalid_error("position exit chain ID exceeds u16"))?;
+        let mut bytes = Vec::with_capacity(
+            STAKE_POSITION_EXIT_SIGNING_DOMAIN_V1.len()
+                + 2
+                + chain.len()
+                + 8
+                + 32
+                + 8
+                + self.custody.encoded_len(),
+        );
+        bytes.extend_from_slice(STAKE_POSITION_EXIT_SIGNING_DOMAIN_V1);
+        chain_len.encode(&mut bytes);
+        bytes.extend_from_slice(chain);
+        self.nonce.encode(&mut bytes);
+        self.position_id.encode(&mut bytes);
+        self.amount_spark.encode(&mut bytes);
+        self.custody.encode(&mut bytes);
+        Ok(bytes)
+    }
+
+    /// Stable v2 intent ID, deliberately independent of the signature bytes.
+    pub fn staking_op_id_v2(&self, chain_id: &str) -> IndraResult<Bytes32> {
+        staking_intent_id_v2(&self.signing_bytes(chain_id)?)
+    }
+
+    /// Validate locally decidable structure before signature verification.
+    pub fn validate(&self) -> IndraResult<()> {
+        if self.amount_spark == 0 {
+            return invalid("position exit amount is zero");
+        }
+        Ok(())
+    }
+}
+
+impl Encode for StakePositionExitIntentV1 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        STAKE_POSITION_EXIT_INTENT_FORMAT_V1.encode(buf);
+        self.position_id.encode(buf);
+        self.amount_spark.encode(buf);
+        self.custody.encode(buf);
+        self.nonce.encode(buf);
+        self.signature.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        1 + 32 + 8 + self.custody.encoded_len() + 8 + self.signature.encoded_len()
+    }
+}
+
+impl Decode for StakePositionExitIntentV1 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        require_version(
+            u8::decode(reader)?,
+            STAKE_POSITION_EXIT_INTENT_FORMAT_V1,
+            "StakePositionExitIntentV1",
+        )?;
+        let value = Self {
+            position_id: Bytes32::decode(reader)?,
+            amount_spark: u64::decode(reader)?,
+            custody: PositionCustodyV1::decode(reader)?,
+            nonce: u64::decode(reader)?,
+            signature: HybridSignature::decode(reader)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 /// Hash the canonical chain-bound signed intent, deliberately excluding its signature.
 pub fn staking_op_id_v2(op: &StakingOp, chain_id: &str) -> IndraResult<Bytes32> {
-    let signing_bytes = op.signing_bytes(chain_id);
+    staking_intent_id_v2(&op.signing_bytes(chain_id))
+}
+
+fn staking_intent_id_v2(signing_bytes: &[u8]) -> IndraResult<Bytes32> {
     let len = u32::try_from(signing_bytes.len())
         .map_err(|_| invalid_error("staking operation signing bytes exceed u32"))?;
     let mut material = Vec::with_capacity(STAKING_OP_ID_V2_DOMAIN.len() + 4 + signing_bytes.len());
     material.extend_from_slice(STAKING_OP_ID_V2_DOMAIN);
     material.extend_from_slice(&len.to_le_bytes());
-    material.extend_from_slice(&signing_bytes);
+    material.extend_from_slice(signing_bytes);
     Ok(Bytes32::from(sha256(&material)))
 }
 
@@ -926,6 +1048,41 @@ mod tests {
         for changed in &delegate_variants {
             assert_ne!(staking_op_id_v2(changed, "chain-a").unwrap(), delegate_id);
         }
+    }
+
+    #[test]
+    fn standalone_exit_intent_binds_amount_nonce_position_custody_and_chain() {
+        let custody = PositionCustodyV1::DelegatorIdentity {
+            delegator_id: id(2),
+        };
+        let mut intent = StakePositionExitIntentV1::unsigned(id(1), 50, custody, 7).unwrap();
+        intent.signature = dummy_signature(3);
+        let baseline = intent.staking_op_id_v2("chain-a").unwrap();
+        let decoded = StakePositionExitIntentV1::decode_exact(&intent.encode_to_vec()).unwrap();
+        assert_eq!(decoded, intent);
+        assert_eq!(decoded.staking_op_id_v2("chain-a").unwrap(), baseline);
+        let mut signature_changed = intent.clone();
+        signature_changed.signature = dummy_signature(4);
+        assert_eq!(
+            signature_changed.staking_op_id_v2("chain-a").unwrap(),
+            baseline
+        );
+        assert_ne!(intent.staking_op_id_v2("chain-b").unwrap(), baseline);
+        let mut amount = intent.clone();
+        amount.amount_spark += 1;
+        assert_ne!(amount.staking_op_id_v2("chain-a").unwrap(), baseline);
+        let mut nonce = intent.clone();
+        nonce.nonce += 1;
+        assert_ne!(nonce.staking_op_id_v2("chain-a").unwrap(), baseline);
+        let mut position = intent.clone();
+        position.position_id = id(9);
+        assert_ne!(position.staking_op_id_v2("chain-a").unwrap(), baseline);
+        let mut other_custody = intent.clone();
+        other_custody.custody = PositionCustodyV1::ValidatorColdIdentity {
+            validator_id: id(2),
+        };
+        assert_ne!(other_custody.staking_op_id_v2("chain-a").unwrap(), baseline);
+        assert!(StakePositionExitIntentV1::unsigned(id(1), 0, custody, 1).is_err());
     }
 
     #[test]

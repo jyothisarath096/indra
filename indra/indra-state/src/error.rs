@@ -38,6 +38,12 @@ pub enum ConsensusSnapshotLookupError {
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StateError {
     // ── Block-level errors ─────────────────────────────────────────────────
+    /// A canonical staking position or tranche capacity invariant would fail.
+    #[error("staking position capacity exceeded: {reason}")]
+    StakePositionCapacityExceeded {
+        /// Exact capacity invariant that rejected the transition.
+        reason: String,
+    },
     /// Block height is not exactly prev_height + 1.
     #[error("invalid block height: expected {expected}, got {actual}")]
     InvalidHeight {

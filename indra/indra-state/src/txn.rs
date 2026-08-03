@@ -10,8 +10,11 @@ use std::time::{Duration, Instant};
 
 use indra_core::{
     types::{
-        consensus_snapshot::ConsensusSnapshot, reward_economic_snapshot::RewardEconomicSnapshot,
-        slash_membership::SlashMembershipRootRecord, transaction::OutputV1,
+        consensus_snapshot::ConsensusSnapshot,
+        reward_economic_snapshot::RewardEconomicSnapshot,
+        slash_membership::SlashMembershipRootRecord,
+        stake_position::{StakePositionV1, UnbondingTrancheV1},
+        transaction::OutputV1,
     },
     Bytes32,
 };
@@ -52,6 +55,11 @@ enum UndoEntry {
     Validators(ValidatorSet),
     Delegations(DelegationMap),
     StakedBonds(PersistentOrdMap<Bytes32, StakeBondEntry>),
+    PositionState {
+        positions: PersistentOrdMap<Bytes32, StakePositionV1>,
+        tranches: PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
+        index: std::collections::BTreeMap<Bytes32, Vec<Bytes32>>,
+    },
     StakingNonces(PersistentOrdMap<Bytes32, u64>),
     SlashHashes(PersistentOrdSet<Bytes32>),
     #[allow(dead_code)]
@@ -84,6 +92,7 @@ pub(crate) struct StateTxn<'a> {
     validators_recorded: bool,
     delegations_recorded: bool,
     staked_bonds_recorded: bool,
+    position_state_recorded: bool,
     staking_nonces_recorded: bool,
     slash_hashes_recorded: bool,
     #[allow(dead_code)]
@@ -114,6 +123,7 @@ impl<'a> StateTxn<'a> {
             validators_recorded: false,
             delegations_recorded: false,
             staked_bonds_recorded: false,
+            position_state_recorded: false,
             staking_nonces_recorded: false,
             slash_hashes_recorded: false,
             delegator_identities_recorded: false,
@@ -180,6 +190,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_validators();
         self.snapshot_delegations();
         self.snapshot_staked_bonds();
+        self.snapshot_position_state();
         self.snapshot_staking_nonces();
         self.snapshot_utxos();
         self.snapshot_delegation_return_events();
@@ -205,6 +216,7 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn snapshot_slashing_scope(&mut self) {
         self.snapshot_validators();
         self.snapshot_staked_bonds();
+        self.snapshot_position_state();
         self.snapshot_slash_hashes();
         self.snapshot_evicted_validator_tombstones();
         self.snapshot_utxos();
@@ -225,6 +237,7 @@ impl<'a> StateTxn<'a> {
         self.snapshot_validators();
         self.snapshot_delegations();
         self.snapshot_staked_bonds();
+        self.snapshot_position_state();
         self.snapshot_governance();
         self.snapshot_utxos();
         self.snapshot_delegation_return_events();
@@ -276,6 +289,85 @@ impl<'a> StateTxn<'a> {
             .nullifiers
             .insert_or_double_spend_at_height(nullifier, self.height)?;
         measure_undo_recording(|| self.undo.push(UndoEntry::NullifierInserted(nullifier)));
+        self.after_mutation()
+    }
+
+    /// Insert or replace one canonical staking position.
+    pub(crate) fn put_stake_position(&mut self, position: StakePositionV1) -> StateResult<()> {
+        self.snapshot_position_state();
+        if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
+            commitment.put_stake_position(&position);
+        }
+        self.state
+            .stake_positions
+            .insert(position.position_id, position);
+        self.after_mutation()
+    }
+
+    /// Delete one canonical staking position.
+    pub(crate) fn delete_stake_position(&mut self, position_id: &Bytes32) -> StateResult<()> {
+        self.snapshot_position_state();
+        if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
+            commitment.delete_stake_position(position_id);
+        }
+        self.state.stake_positions.remove(position_id);
+        self.state.position_tranche_index.remove(position_id);
+        self.after_mutation()
+    }
+
+    /// Insert one immutable unbonding tranche.
+    pub(crate) fn put_unbonding_tranche(&mut self, tranche: UnbondingTrancheV1) -> StateResult<()> {
+        self.snapshot_position_state();
+        if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
+            commitment.put_unbonding_tranche(&tranche);
+        }
+        self.state
+            .unbonding_tranches
+            .insert(tranche.tranche_id, tranche.clone());
+        let ids = self
+            .state
+            .position_tranche_index
+            .entry(tranche.position_id)
+            .or_default();
+        match ids.binary_search(&tranche.tranche_id) {
+            Ok(_) => {}
+            Err(index) => ids.insert(index, tranche.tranche_id),
+        }
+        self.after_mutation()
+    }
+
+    /// Delete one immutable unbonding tranche.
+    pub(crate) fn delete_unbonding_tranche(&mut self, tranche_id: &Bytes32) -> StateResult<()> {
+        self.snapshot_position_state();
+        let position_id = self
+            .state
+            .unbonding_tranches
+            .get(tranche_id)
+            .map(|tranche| tranche.position_id);
+        if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
+            commitment.delete_unbonding_tranche(tranche_id);
+        }
+        self.state.unbonding_tranches.remove(tranche_id);
+        if let Some(position_id) = position_id {
+            if let Some(ids) = self.state.position_tranche_index.get_mut(&position_id) {
+                if let Ok(index) = ids.binary_search(tranche_id) {
+                    ids.remove(index);
+                }
+                if ids.is_empty() {
+                    self.state.position_tranche_index.remove(&position_id);
+                }
+            }
+        }
+        self.after_mutation()
+    }
+
+    /// Set the isolated lifecycle nonce for a principal owner.
+    pub(crate) fn set_position_nonce(&mut self, owner_id: Bytes32, nonce: u64) -> StateResult<()> {
+        self.snapshot_staking_nonces();
+        if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
+            commitment.put_staking_nonce(&owner_id, nonce);
+        }
+        self.state.staking_nonces.insert(owner_id, nonce);
         self.after_mutation()
     }
 
@@ -350,6 +442,19 @@ impl<'a> StateTxn<'a> {
             self.undo.push(UndoEntry::StakedBonds(snapshot));
             self.staked_bonds_recorded = true;
         }
+    }
+
+    /// Record the isolated canonical position/tranche mutation surface.
+    pub(crate) fn snapshot_position_state(&mut self) {
+        if !self.position_state_recorded {
+            self.undo.push(UndoEntry::PositionState {
+                positions: self.state.stake_positions.clone(),
+                tranches: self.state.unbonding_tranches.clone(),
+                index: self.state.position_tranche_index.clone(),
+            });
+            self.position_state_recorded = true;
+        }
+        self.mark_commitment_touched();
     }
 
     fn snapshot_staking_nonces(&mut self) {
@@ -494,6 +599,15 @@ impl<'a> StateTxn<'a> {
                 UndoEntry::Validators(validators) => self.state.validators = validators,
                 UndoEntry::Delegations(delegations) => self.state.delegations = delegations,
                 UndoEntry::StakedBonds(staked_bonds) => self.state.staked_bonds = staked_bonds,
+                UndoEntry::PositionState {
+                    positions,
+                    tranches,
+                    index,
+                } => {
+                    self.state.stake_positions = positions;
+                    self.state.unbonding_tranches = tranches;
+                    self.state.position_tranche_index = index;
+                }
                 UndoEntry::StakingNonces(nonces) => self.state.staking_nonces = nonces,
                 UndoEntry::SlashHashes(hashes) => self.state.applied_slash_hashes = hashes,
                 UndoEntry::DelegatorIdentities(identities) => {
