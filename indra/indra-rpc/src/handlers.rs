@@ -7,8 +7,8 @@ use indra_core::{
     codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
-        Bytes32 as CoreBytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-        NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        Bytes32 as CoreBytes32, EPOCH_DURATION_BLOCKS, MAX_TRANCHES_PER_POSITION,
+        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -19,10 +19,7 @@ use indra_core::{
     },
     Bytes32,
 };
-use indra_state::{
-    epoch::epoch_for_height, validator::DelegationReturnReason, AuthTreeProof, ChainState,
-    ProofTerminal,
-};
+use indra_state::{epoch::epoch_for_height, AuthTreeProof, ChainState, ProofTerminal};
 
 use crate::{
     error::{RpcError, RpcResult},
@@ -306,14 +303,18 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getUtxoProof", RpcMethodAccess::ReadOnly),
     ("indra_getPeers", RpcMethodAccess::ReadOnly),
     ("indra_getStakingNonce", RpcMethodAccess::ReadOnly),
-    ("indra_getDelegations", RpcMethodAccess::ReadOnly),
-    ("indra_getDelegatorPositions", RpcMethodAccess::ReadOnly),
-    ("indra_getDelegationReturnEvents", RpcMethodAccess::ReadOnly),
+    ("indra_getStakePositions", RpcMethodAccess::ReadOnly),
+    ("indra_getStakePosition", RpcMethodAccess::ReadOnly),
+    ("indra_getUnbondingTranches", RpcMethodAccess::ReadOnly),
+    ("indra_getUnbondingTranche", RpcMethodAccess::ReadOnly),
+    (
+        "indra_getValidatorStakePositions",
+        RpcMethodAccess::ReadOnly,
+    ),
+    ("indra_getOwnerStakePositions", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorRewards", RpcMethodAccess::ReadOnly),
-    ("indra_getValidatorDelegators", RpcMethodAccess::ReadOnly),
-    ("indra_getStakeBonds", RpcMethodAccess::ReadOnly),
     ("indra_getDelegatorIdentityDebug", RpcMethodAccess::Admin),
-    ("indra_getStakeBondDebug", RpcMethodAccess::Admin),
+    ("indra_getStakingStateSummary", RpcMethodAccess::Admin),
     ("indra_getConsensusSnapshots", RpcMethodAccess::Admin),
     ("indra_getEpochInfo", RpcMethodAccess::ReadOnly),
     ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
@@ -440,14 +441,15 @@ pub fn dispatch_with_admin(
         "indra_getUtxoProof" => Ready(get_utxo_proof(params, state)),
         "indra_getPeers" => Ready(get_peers(state)),
         "indra_getStakingNonce" => Ready(get_staking_nonce(params, state)),
-        "indra_getDelegations" => Ready(get_delegations(params, state)),
-        "indra_getDelegatorPositions" => Ready(get_delegator_positions(params, state)),
-        "indra_getDelegationReturnEvents" => Ready(get_delegation_return_events(params, state)),
+        "indra_getStakePositions" => Ready(get_stake_positions(params, state)),
+        "indra_getStakePosition" => Ready(get_stake_position(params, state)),
+        "indra_getUnbondingTranches" => Ready(get_unbonding_tranches(params, state)),
+        "indra_getUnbondingTranche" => Ready(get_unbonding_tranche(params, state)),
+        "indra_getValidatorStakePositions" => Ready(get_validator_stake_positions(params, state)),
+        "indra_getOwnerStakePositions" => Ready(get_owner_stake_positions(params, state)),
         "indra_getDelegatorRewards" => Ready(get_delegator_rewards(params, state)),
-        "indra_getValidatorDelegators" => Ready(get_validator_delegators(params, state)),
-        "indra_getStakeBonds" => Ready(get_stake_bonds(params, state)),
         "indra_getDelegatorIdentityDebug" => Ready(get_delegator_identity_debug(params, state)),
-        "indra_getStakeBondDebug" => Ready(get_stake_bond_debug(params, state)),
+        "indra_getStakingStateSummary" => Ready(get_staking_state_summary(state)),
         "indra_getConsensusSnapshots" => Ready(get_consensus_snapshots(state)),
         "indra_getEpochInfo" => Ready(get_epoch_info(state)),
         "indra_getEpochRecord" => Ready(get_epoch_record(params, state)),
@@ -539,7 +541,7 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
     let total_staked_spark = s
         .validators
         .total_selectable_self_stake()
-        .saturating_add(s.total_active_delegated_bond_stake());
+        .saturating_add(s.total_active_delegated_stake());
     let max_active_validators =
         indra_core::types::primitives::max_active_validators(total_staked_spark);
     let effective_min_stake_spark = s.validators.effective_min_active_stake().unwrap_or(0);
@@ -698,11 +700,19 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
             .get_block_by_height(height)
             .map_err(|error| RpcError::Internal(format!("failed to read block: {error}")))?
             .ok_or_else(|| RpcError::NotFound(format!("block {height} is not retained")))?;
+        let protocol_outputs = state
+            .chain
+            .utxos
+            .all_entries()
+            .filter(|entry| entry.created_height == height && entry.tranche_refund.is_some())
+            .map(|entry| format!(r#"{{"utxo_hex":"{}"}}"#, hex::encode(entry.encode_to_vec())))
+            .collect::<Vec<_>>();
         entries.push(format!(
-            r#"{{"height":{},"block_hash":"{}","block_hex":"{}"}}"#,
+            r#"{{"height":{},"block_hash":"{}","block_hex":"{}","protocol_outputs":[{}]}}"#,
             height,
             hex::encode(block.header.block_hash().0),
-            hex::encode(block.encode_to_vec())
+            hex::encode(block.encode_to_vec()),
+            protocol_outputs.join(","),
         ));
     }
     let next_height = last_height
@@ -1067,8 +1077,43 @@ fn classify_staking_provenance(
     entry: &indra_state::utxo::UtxoEntry,
     state: &NodeState<'_>,
 ) -> UtxoProvenanceExplanation {
-    if let Some(explanation) = classify_delegation_return_event(entry, state) {
-        return explanation;
+    if let Some(event) = &entry.tranche_refund {
+        let custody = event.custody.encode_to_vec();
+        let blinding = match indra_crypto::derive_tranche_refund_blinding_v1(
+            &indra_crypto::TrancheRefundBlindingInputsV1 {
+                chain_id: state.chain.chain_id.as_bytes(),
+                position_id: event.position_id.0,
+                tranche_id: event.tranche_id.0,
+                principal_owner_id: event.principal_owner_id.0,
+                custody_encoding: &custody,
+                principal_spark: event.principal_spark,
+                release_height: event.release_height,
+                end_epoch: event.end_epoch,
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => return unrecoverable("tranche_refund", error.to_string()),
+        };
+        if !commitment_matches(entry, &blinding) {
+            return unrecoverable(
+                "tranche_refund",
+                "retained tranche refund provenance does not open this UTXO commitment",
+            );
+        }
+        return recoverable(
+            "tranche_refund",
+            format!(
+                r#"{{"chain_id":"{}","position_id":"{}","tranche_id":"{}","principal_owner_id":"{}","custody_hex":"{}","principal_spark":{},"release_height":{},"end_epoch":{}}}"#,
+                json_escape(&state.chain.chain_id),
+                hex::encode(event.position_id.0),
+                hex::encode(event.tranche_id.0),
+                hex::encode(event.principal_owner_id.0),
+                hex::encode(custody),
+                event.principal_spark,
+                event.release_height,
+                event.end_epoch,
+            ),
+        );
     }
 
     let block = match retained_block(entry.created_height, state) {
@@ -1125,79 +1170,6 @@ fn classify_staking_provenance(
         "staking_protocol_output_unclassified",
         "retained staking provenance did not open this UTXO commitment",
     )
-}
-
-fn classify_delegation_return_event(
-    entry: &indra_state::utxo::UtxoEntry,
-    state: &NodeState<'_>,
-) -> Option<UtxoProvenanceExplanation> {
-    for event in state.chain.delegation_return_events.iter().filter(|event| {
-        event.returned_height == entry.created_height && event.refund_utxo_id == entry.utxo_id
-    }) {
-        match event.reason {
-            DelegationReturnReason::ValidatorEvicted => {
-                let compact = derive_compact_bond_release_blinding(
-                    &event.validator_id,
-                    &event.delegator_id,
-                    &event.bond_utxo_id,
-                    event.returned_height,
-                    event.amount_spark,
-                );
-                if commitment_matches(entry, &compact) {
-                    return Some(recoverable(
-                        "validator_eviction_bond_refund",
-                        delegation_event_context(event, "compact_bond_release"),
-                    ));
-                }
-
-                return Some(unrecoverable(
-                    "legacy_bond_release",
-                    "legacy bond release reused the original output; the blinding is not derivable from retained state and requires local wallet history or an archive/indexer",
-                ));
-            }
-            DelegationReturnReason::UnbondingMatured => {
-                let normal = derive_normal_bond_release_blinding(
-                    &event.validator_id,
-                    &event.delegator_id,
-                    &event.bond_utxo_id,
-                    event.returned_height,
-                    event.amount_spark,
-                );
-                if commitment_matches(entry, &normal) {
-                    return Some(recoverable(
-                        "normal_bond_release",
-                        delegation_event_context(event, "normal_bond_release"),
-                    ));
-                }
-
-                return Some(unrecoverable(
-                    "normal_bond_release",
-                    "matured bond release provenance did not open this UTXO commitment",
-                ));
-            }
-        }
-    }
-
-    for event in state
-        .chain
-        .delegation_return_events
-        .iter()
-        .filter(|event| event.returned_height == entry.created_height)
-    {
-        let reward = derive_staking_reward_blinding(
-            &event.validator_id,
-            &event.delegator_id,
-            event.returned_height,
-        );
-        if commitment_matches(entry, &reward) {
-            return Some(recoverable(
-                "validator_eviction_pending_reward",
-                delegation_event_context(event, "pending_reward_payout"),
-            ));
-        }
-    }
-
-    None
 }
 
 fn classify_governance_change(
@@ -1313,58 +1285,6 @@ fn derive_slash_reward_blinding(evidence_hash: &CoreBytes32, height: u64) -> [u8
     indra_crypto::sha256(&data)
 }
 
-fn derive_compact_bond_release_blinding(
-    validator_id: &CoreBytes32,
-    delegator_id: &CoreBytes32,
-    bond_utxo_id: &CoreBytes32,
-    release_height: u64,
-    amount_spark: u64,
-) -> [u8; 32] {
-    let mut data =
-        Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
-    data.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-    data.extend_from_slice(&validator_id.0);
-    data.extend_from_slice(&delegator_id.0);
-    data.extend_from_slice(&bond_utxo_id.0);
-    data.extend_from_slice(&release_height.to_le_bytes());
-    data.extend_from_slice(&amount_spark.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
-fn derive_normal_bond_release_blinding(
-    validator_id: &CoreBytes32,
-    delegator_id: &CoreBytes32,
-    bond_utxo_id: &CoreBytes32,
-    release_height: u64,
-    amount_spark: u64,
-) -> [u8; 32] {
-    let mut data =
-        Vec::with_capacity(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
-    data.extend_from_slice(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-    data.extend_from_slice(&validator_id.0);
-    data.extend_from_slice(&delegator_id.0);
-    data.extend_from_slice(&bond_utxo_id.0);
-    data.extend_from_slice(&release_height.to_le_bytes());
-    data.extend_from_slice(&amount_spark.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
-#[cfg(test)]
-fn derive_slashed_self_stake_blinding(
-    validator_id: &CoreBytes32,
-    bond_utxo_id: &CoreBytes32,
-    release_height: u64,
-) -> [u8; 32] {
-    use indra_core::types::primitives::SLASH_BOND_RELEASE_BLINDING_DOMAIN;
-
-    let mut data = Vec::with_capacity(SLASH_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 8);
-    data.extend_from_slice(SLASH_BOND_RELEASE_BLINDING_DOMAIN);
-    data.extend_from_slice(&validator_id.0);
-    data.extend_from_slice(&bond_utxo_id.0);
-    data.extend_from_slice(&release_height.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
 fn derive_governance_refund_blinding(proposal_id: &CoreBytes32) -> [u8; 32] {
     indra_crypto::sha256(
         &[
@@ -1382,22 +1302,6 @@ fn derive_governance_change_blinding(proposal_id: &CoreBytes32) -> [u8; 32] {
             proposal_id.0.as_slice(),
         ]
         .concat(),
-    )
-}
-
-fn delegation_event_context(
-    event: &indra_state::DelegationReturnEvent,
-    derivation: &'static str,
-) -> String {
-    format!(
-        r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":{},"amount_spark":{},"derivation":"{}"}}"#,
-        hex::encode(event.validator_id.0),
-        hex::encode(event.delegator_id.0),
-        hex::encode(event.bond_utxo_id.0),
-        event.returned_height,
-        event.returned_epoch,
-        event.amount_spark,
-        derivation,
     )
 }
 
@@ -1707,218 +1611,286 @@ fn get_validator_auto_delegate(params: &[String], state: &NodeState<'_>) -> RpcR
     ))
 }
 
-/// `indra_getDelegations` — returns delegator entries for a validator.
-fn get_delegations(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let validator_id = parse_hex32_param(params, "validator_id")?;
-    let entries: Vec<String> = state
-        .chain
+const RPC_PAGE_DEFAULT: usize = 100;
+const RPC_PAGE_MAX: usize = 1_000;
+
+fn pagination(params: &[String], offset_index: usize) -> RpcResult<(usize, usize)> {
+    let offset = params
+        .get(offset_index)
+        .map(|value| unquote(value).parse::<usize>())
+        .transpose()
+        .map_err(|_| RpcError::InvalidParams("offset must be an unsigned integer".into()))?
+        .unwrap_or(0);
+    let limit = params
+        .get(offset_index + 1)
+        .map(|value| unquote(value).parse::<usize>())
+        .transpose()
+        .map_err(|_| RpcError::InvalidParams("limit must be an unsigned integer".into()))?
+        .unwrap_or(RPC_PAGE_DEFAULT)
+        .min(RPC_PAGE_MAX);
+    Ok((offset, limit))
+}
+
+fn optional_id(params: &[String], index: usize, field: &str) -> RpcResult<Option<Bytes32>> {
+    let Some(value) = params.get(index).map(|value| unquote(value)) else {
+        return Ok(None);
+    };
+    if value.is_empty() || value == "null" {
+        return Ok(None);
+    }
+    parse_hex32_value(&value, field).map(Some)
+}
+
+fn tombstone_retains_position(state: &ChainState, position_id: &Bytes32) -> bool {
+    state
+        .evicted_validator_tombstones
+        .values()
+        .any(|tombstone| {
+            tombstone
+                .retained_position_ids
+                .binary_search(position_id)
+                .is_ok()
+        })
+}
+
+fn tombstone_retains_tranche(state: &ChainState, tranche_id: &Bytes32) -> bool {
+    state
+        .evicted_validator_tombstones
+        .values()
+        .any(|tombstone| {
+            tombstone
+                .retained_tranche_ids
+                .binary_search(tranche_id)
+                .is_ok()
+        })
+}
+
+fn custody_json(custody: indra_core::types::stake_position::PositionCustodyV1) -> String {
+    match custody {
+        indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+            delegator_id,
+        } => {
+            format!(
+                r#"{{"role":"delegator_identity","identity_id":"{}"}}"#,
+                hex::encode(delegator_id.0)
+            )
+        }
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        } => {
+            format!(
+                r#"{{"role":"validator_cold_identity","identity_id":"{}"}}"#,
+                hex::encode(validator_id.0)
+            )
+        }
+    }
+}
+
+fn position_json(
+    position: &indra_core::types::stake_position::StakePositionV1,
+    state: &ChainState,
+) -> String {
+    let tranche_ids = state.tranche_ids_for_position(&position.position_id);
+    let tombstoned = tombstone_retains_position(state, &position.position_id);
+    let slashed = state
+        .validators
+        .get(&position.validator_id)
+        .is_some_and(|validator| validator.status == indra_state::ValidatorStatus::Slashed)
+        && position.validator_id == position.principal_owner_id;
+    let any_mature = tranche_ids.iter().any(|id| {
+        state.unbonding_tranches.get(id).is_some_and(|tranche| {
+            let indra_core::types::stake_position::UnbondingTimingV1::HeightPrecise {
+                end_epoch,
+                ..
+            } = tranche.timing;
+            end_epoch <= state.current_epoch()
+        })
+    });
+    let lifecycle = if tombstoned {
+        "tombstoned"
+    } else if slashed {
+        "slashed"
+    } else if any_mature {
+        "matured_pending_release"
+    } else if position.active.is_some() && tranche_ids.is_empty() {
+        "active"
+    } else if position.active.is_some() {
+        "partially_unbonding"
+    } else {
+        "fully_unbonding"
+    };
+    let active = position.active.map_or_else(
+        || "null".to_string(),
+        |active| format!(
+            r#"{{"principal_spark":{},"first_contribution_height":{},"last_contribution_height":{}}}"#,
+            active.principal_spark, active.first_contribution_height, active.last_contribution_height
+        ),
+    );
+    let final_exit_capacity_remaining =
+        position.active.is_some() && tranche_ids.len() < MAX_TRANCHES_PER_POSITION;
+    format!(
+        r#"{{"position_id":"{}","validator_id":"{}","principal_owner_id":"{}","custody":{},"active":{},"pending_rewards_spark":{},"rewards_last_epoch":{},"tranche_count":{},"final_exit_capacity_remaining":{},"lifecycle":"{}","retention":"{}"}}"#,
+        hex::encode(position.position_id.0),
+        hex::encode(position.validator_id.0),
+        hex::encode(position.principal_owner_id.0),
+        custody_json(position.custody),
+        active,
+        position.pending_rewards_spark,
+        position.rewards_last_epoch,
+        tranche_ids.len(),
+        final_exit_capacity_remaining,
+        lifecycle,
+        if tombstoned { "tombstone" } else { "live" },
+    )
+}
+
+fn tranche_json(
+    tranche: &indra_core::types::stake_position::UnbondingTrancheV1,
+    state: &ChainState,
+) -> String {
+    let indra_core::types::stake_position::UnbondingTimingV1::HeightPrecise {
+        start_height,
+        end_epoch,
+    } = tranche.timing;
+    let maturity_height = end_epoch.saturating_mul(EPOCH_DURATION_BLOCKS);
+    let tombstoned = tombstone_retains_tranche(state, &tranche.tranche_id);
+    format!(
+        r#"{{"tranche_id":"{}","position_id":"{}","principal_spark":{},"custody":{},"timing":"height_precise","start_height":{},"end_epoch":{},"maturity_height":{},"lifecycle":"{}","retention":"{}"}}"#,
+        hex::encode(tranche.tranche_id.0),
+        hex::encode(tranche.position_id.0),
+        tranche.principal_spark,
+        custody_json(tranche.custody),
+        start_height,
+        end_epoch,
+        maturity_height,
+        if end_epoch <= state.current_epoch() {
+            "matured_pending_release"
+        } else {
+            "unbonding"
+        },
+        if tombstoned { "tombstone" } else { "live" },
+    )
+}
+
+fn position_page(
+    state: &ChainState,
+    owner: Option<Bytes32>,
+    validator: Option<Bytes32>,
+    offset: usize,
+    limit: usize,
+) -> String {
+    let matching = state
         .stake_positions
         .values()
         .filter(|position| {
-            position.validator_id == validator_id
-                && position.principal_owner_id != validator_id
+            owner.is_none_or(|id| position.principal_owner_id == id)
+                && validator.is_none_or(|id| position.validator_id == id)
         })
-        .map(|position| {
-            let (staked_spark, active_bonds, unbonding_bonds, earliest_end, latest_end) =
-                rpc_delegator_bond_status(state.chain, &validator_id, &position.principal_owner_id);
-            let unbonding = active_bonds == 0 && unbonding_bonds > 0;
-            format!(
-                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-                hex::encode(position.principal_owner_id.0),
-                staked_spark,
-                position.pending_rewards_spark,
-                if unbonding { "true" } else { "false" },
-                optional_u64_json(earliest_end),
-                optional_u64_json(latest_end),
-                active_bonds,
-                unbonding_bonds,
-            )
-        })
-        .collect();
-    let bonds: Vec<String> = state
-        .chain
-        .stake_positions
-        .values()
-        .filter(|position| position.validator_id == validator_id && position.active.is_some())
-        .map(|position| {
-            let active = position.active.expect("filtered active position");
-            format!(
-                r#"{{"position_id":"{}","delegator_id":"{}","amount_spark":{},"first_contribution_height":{}}}"#,
-                hex::encode(position.position_id.0),
-                hex::encode(position.principal_owner_id.0),
-                active.principal_spark,
-                active.first_contribution_height,
-            )
-        })
-        .collect();
-    Ok(format!(
-        r#"{{"validator_id":"{}","delegations":[{}],"delegators":[{}],"bonds":[{}]}}"#,
-        hex::encode(validator_id.0),
-        entries.join(","),
-        entries.join(","),
-        bonds.join(",")
-    ))
-}
-
-/// `indra_getDelegatorPositions` — returns all delegation positions for a delegator.
-fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let delegator_hex = first_param(params, "delegator_id")?;
-    let delegator_id = parse_hex32_value(&delegator_hex, "delegator_id")?;
-
-    let mut positions = Vec::new();
-    let mut total_staked = 0u64;
-    let mut total_rewards = 0u64;
-    let mut active_positions = 0u64;
-    let mut unbonding_positions = 0u64;
-
-    for position in state.chain.stake_positions.values() {
-        if position.principal_owner_id != delegator_id
-            || position.validator_id == position.principal_owner_id
-        {
-            continue;
-        }
-        let validator_id = &position.validator_id;
-
-            let (validator_name, commission_bps) = state
-                .chain
-                .validators
-                .get(validator_id)
-                .map(|validator| (validator.name.clone(), validator.commission_bps))
-                .unwrap_or_else(|| ("unknown".to_string(), 1_000));
-            let (active_stake, active_bonds, unbonding_bonds, earliest_end, latest_end) =
-                rpc_delegator_bond_status(state.chain, validator_id, &position.principal_owner_id);
-            let unbonding = active_bonds == 0 && unbonding_bonds > 0;
-
-            total_staked = total_staked.saturating_add(active_stake);
-            total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
-            if unbonding {
-                unbonding_positions = unbonding_positions.saturating_add(1);
-            } else {
-                active_positions = active_positions.saturating_add(1);
-            }
-
-            positions.push(format!(
-                r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"commission_bps":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-                hex::encode(validator_id.0),
-                validator_name,
-                active_stake,
-                position.pending_rewards_spark,
-                position.rewards_last_epoch,
-                if unbonding { "true" } else { "false" },
-                optional_u64_json(earliest_end),
-                optional_u64_json(latest_end),
-                commission_bps,
-                active_bonds,
-                unbonding_bonds,
-            ));
-    }
-
-    Ok(format!(
-        r#"{{"delegator_id":"{}","positions":[{}],"total_staked_spark":{},"total_pending_rewards":{},"active_positions":{},"unbonding_positions":{}}}"#,
-        delegator_hex,
-        positions.join(","),
-        total_staked,
-        total_rewards,
-        active_positions,
-        unbonding_positions,
-    ))
-}
-
-fn rpc_delegator_bond_status(
-    state: &ChainState,
-    validator_id: &Bytes32,
-    delegator_id: &Bytes32,
-) -> (u64, u64, u64, Option<u64>, Option<u64>) {
-    let Some(position) = state.stake_positions.values().find(|position| {
-        position.validator_id == *validator_id
-            && position.principal_owner_id == *delegator_id
-            && position.validator_id != position.principal_owner_id
-    }) else {
-        return (0, 0, 0, None, None);
-    };
-    let active_stake = position.active.map_or(0, |active| active.principal_spark);
-    let active_count = u64::from(position.active.is_some());
-    state
-        .tranche_ids_for_position(&position.position_id)
+        .collect::<Vec<_>>();
+    let page = matching
         .iter()
-        .filter_map(|id| state.unbonding_tranches.get(id))
-        .fold(
-            (active_stake, active_count, 0u64, None, None),
-            |(stake, active, unbonding, earliest, latest), tranche| {
-                let indra_core::types::stake_position::UnbondingTimingV1::HeightPrecise {
-                    end_epoch: end,
-                    ..
-                } = tranche.timing;
-                (
-                    stake,
-                    active,
-                    unbonding.saturating_add(1),
-                    Some(earliest.map_or(end, |value: u64| value.min(end))),
-                    Some(latest.map_or(end, |value: u64| value.max(end))),
-                )
-            },
-        )
-}
-
-fn optional_u64_json(value: Option<u64>) -> String {
-    value.map_or_else(|| "null".to_string(), |value| value.to_string())
-}
-
-/// `indra_getDelegationReturnEvents` — returns automatic principal-return events for a delegator.
-///
-/// Params: `["<delegator_id_hex>", "<since_epoch optional>", "<limit optional>"]`
-fn get_delegation_return_events(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let delegator_hex = first_param(params, "delegator_id")?;
-    let delegator_id = parse_hex32_value(&delegator_hex, "delegator_id")?;
-    let since_epoch = if params.len() > 1 {
-        Some(parse_u64_param(params, 1, "since_epoch")?)
-    } else {
-        None
-    };
-    let limit = if params.len() > 2 {
-        parse_u64_param(params, 2, "limit")?.min(1_000) as usize
-    } else {
-        100usize
-    };
-
-    let mut events = Vec::new();
-    for event in state
-        .chain
-        .delegation_return_events
-        .iter()
-        .filter(|event| event.delegator_id == delegator_id)
-        .filter(|event| {
-            since_epoch
-                .map(|epoch| event.returned_epoch >= epoch)
-                .unwrap_or(true)
-        })
-        .rev()
+        .skip(offset)
         .take(limit)
-    {
-        let reason = match event.reason {
-            indra_state::validator::DelegationReturnReason::ValidatorEvicted => "ValidatorEvicted",
-            indra_state::validator::DelegationReturnReason::UnbondingMatured => "UnbondingMatured",
-        };
-        events.push(format!(
-            r#"{{"delegator_id":"{}","validator_id":"{}","bond_utxo_id":"{}","amount_spark":{},"reason":"{}","returned_epoch":{},"returned_height":{},"refund_utxo_id":"{}"}}"#,
-            hex::encode(event.delegator_id.0),
-            hex::encode(event.validator_id.0),
-            hex::encode(event.bond_utxo_id.0),
-            event.amount_spark,
-            reason,
-            event.returned_epoch,
-            event.returned_height,
-            hex::encode(event.refund_utxo_id.0),
-        ));
-    }
-    events.reverse();
+        .map(|position| position_json(position, state))
+        .collect::<Vec<_>>();
+    format!(
+        r#"{{"positions":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
+        page.join(","),
+        offset,
+        limit,
+        matching.len()
+    )
+}
 
-    Ok(format!(
-        r#"{{"delegator_id":"{}","events":[{}],"count":{}}}"#,
-        delegator_hex,
-        events.join(","),
-        events.len(),
+fn get_stake_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let owner = optional_id(params, 0, "owner_id")?;
+    let validator = optional_id(params, 1, "validator_id")?;
+    let (offset, limit) = pagination(params, 2)?;
+    Ok(position_page(state.chain, owner, validator, offset, limit))
+}
+
+fn get_stake_position(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let id = parse_hex32_param(params, "position_id")?;
+    let position = state.chain.stake_positions.get(&id).ok_or_else(|| {
+        RpcError::NotFound(format!("stake position {} not found", hex::encode(id.0)))
+    })?;
+    Ok(position_json(position, state.chain))
+}
+
+fn get_validator_stake_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let validator = parse_hex32_param(params, "validator_id")?;
+    let (offset, limit) = pagination(params, 1)?;
+    Ok(position_page(
+        state.chain,
+        None,
+        Some(validator),
+        offset,
+        limit,
     ))
+}
+
+fn get_owner_stake_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let owner = parse_hex32_param(params, "owner_id")?;
+    let (offset, limit) = pagination(params, 1)?;
+    Ok(position_page(state.chain, Some(owner), None, offset, limit))
+}
+
+fn tranche_page(
+    state: &ChainState,
+    position: Option<Bytes32>,
+    owner: Option<Bytes32>,
+    validator: Option<Bytes32>,
+    offset: usize,
+    limit: usize,
+) -> String {
+    let matching = state
+        .unbonding_tranches
+        .values()
+        .filter(|tranche| {
+            let Some(parent) = state.stake_positions.get(&tranche.position_id) else {
+                return false;
+            };
+            position.is_none_or(|id| tranche.position_id == id)
+                && owner.is_none_or(|id| parent.principal_owner_id == id)
+                && validator.is_none_or(|id| parent.validator_id == id)
+        })
+        .collect::<Vec<_>>();
+    let page = matching
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|tranche| tranche_json(tranche, state))
+        .collect::<Vec<_>>();
+    format!(
+        r#"{{"tranches":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
+        page.join(","),
+        offset,
+        limit,
+        matching.len()
+    )
+}
+
+fn get_unbonding_tranches(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let position = optional_id(params, 0, "position_id")?;
+    let owner = optional_id(params, 1, "owner_id")?;
+    let validator = optional_id(params, 2, "validator_id")?;
+    let (offset, limit) = pagination(params, 3)?;
+    Ok(tranche_page(
+        state.chain,
+        position,
+        owner,
+        validator,
+        offset,
+        limit,
+    ))
+}
+
+fn get_unbonding_tranche(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let id = parse_hex32_param(params, "tranche_id")?;
+    let tranche = state.chain.unbonding_tranches.get(&id).ok_or_else(|| {
+        RpcError::NotFound(format!("unbonding tranche {} not found", hex::encode(id.0)))
+    })?;
+    Ok(tranche_json(tranche, state.chain))
 }
 
 /// `indra_getDelegatorRewards` — returns pending rewards for a delegator.
@@ -1938,19 +1910,19 @@ fn get_delegator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
         }
         let validator_id = &position.validator_id;
 
-            let validator_name = state
-                .chain
-                .validators
-                .get(validator_id)
-                .map(|validator| validator.name.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
-            claimable.push(format!(
-                r#"{{"validator_id":"{}","validator_name":"{}","pending_rewards":{}}}"#,
-                hex::encode(validator_id.0),
-                validator_name,
-                position.pending_rewards_spark,
-            ));
+        let validator_name = state
+            .chain
+            .validators
+            .get(validator_id)
+            .map(|validator| validator.name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
+        claimable.push(format!(
+            r#"{{"validator_id":"{}","validator_name":"{}","pending_rewards":{}}}"#,
+            hex::encode(validator_id.0),
+            validator_name,
+            position.pending_rewards_spark,
+        ));
     }
 
     Ok(format!(
@@ -1958,91 +1930,6 @@ fn get_delegator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
         delegator_hex,
         total_rewards,
         claimable.join(","),
-    ))
-}
-
-/// `indra_getValidatorDelegators` — returns delegator positions for one validator.
-fn get_validator_delegators(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let validator_hex = first_param(params, "validator_id")?;
-    let validator_id = parse_hex32_value(&validator_hex, "validator_id")?;
-    let (validator_name, _) = state
-        .chain
-        .validators
-        .get(&validator_id)
-        .map(|validator| (validator.name.clone(), validator.commission_bps))
-        .unwrap_or_else(|| ("unknown".to_string(), 1_000));
-
-    let mut total_delegated = 0u64;
-    let mut total_rewards = 0u64;
-    let mut delegators = Vec::new();
-
-    for position in state
-        .chain
-        .stake_positions
-        .values()
-        .filter(|position| {
-            position.validator_id == validator_id
-                && position.principal_owner_id != validator_id
-        })
-        .take(1_000)
-    {
-        let (active_stake, active_bonds, unbonding_bonds, earliest_end, latest_end) =
-            rpc_delegator_bond_status(state.chain, &validator_id, &position.principal_owner_id);
-        let unbonding = active_bonds == 0 && unbonding_bonds > 0;
-        total_delegated = total_delegated.saturating_add(active_stake);
-        total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
-        delegators.push(format!(
-            r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
-            hex::encode(position.principal_owner_id.0),
-            active_stake,
-            position.pending_rewards_spark,
-            if unbonding { "true" } else { "false" },
-            optional_u64_json(earliest_end),
-            optional_u64_json(latest_end),
-            position.rewards_last_epoch,
-            active_bonds,
-            unbonding_bonds,
-        ));
-    }
-
-    Ok(format!(
-        r#"{{"validator_id":"{}","validator_name":"{}","total_delegated_spark":{},"total_pending_rewards":{},"delegator_count":{},"delegators":[{}]}}"#,
-        validator_hex,
-        validator_name,
-        total_delegated,
-        total_rewards,
-        state.chain.stake_positions.values().filter(|position| {
-            position.validator_id == validator_id
-                && position.principal_owner_id != validator_id
-        }).count(),
-        delegators.join(","),
-    ))
-}
-
-/// `indra_getStakeBonds` — returns active stake bonds for a delegator.
-fn get_stake_bonds(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let delegator_hex = first_param(params, "delegator_id")?;
-    let delegator_id = parse_hex32_value(&delegator_hex, "delegator_id")?;
-    let bonds: Vec<String> = state
-        .chain
-        .stake_positions
-        .values()
-        .filter(|position| position.principal_owner_id == delegator_id && position.active.is_some())
-        .map(|position| {
-            let active = position.active.expect("filtered active position");
-            format!(
-                r#"{{"position_id":"{}","validator_id":"{}","amount_spark":{},"first_contribution_height":{},"unbonding":false}}"#,
-                hex::encode(position.position_id.0),
-                hex::encode(position.validator_id.0),
-                active.principal_spark,
-                active.first_contribution_height,
-            )
-        })
-        .collect();
-    Ok(format!(
-        r#"{{"delegator_id":"{}","bonds":[{}]}}"#,
-        delegator_hex,
-        bonds.join(",")
     ))
 }
 
@@ -2063,23 +1950,36 @@ fn get_delegator_identity_debug(params: &[String], state: &NodeState<'_>) -> Rpc
     ))
 }
 
-/// `indra_getStakeBondDebug` — admin-only compact-format check for one stake bond.
-fn get_stake_bond_debug(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let position_id = parse_hex32_param(params, "position_id")?;
-    let position = state.chain.stake_positions.get(&position_id).ok_or_else(|| {
-        RpcError::NotFound(format!(
-            "stake position {} not found",
-            hex::encode(position_id.0)
-        ))
-    })?;
+/// `indra_getStakingStateSummary` — admin-only canonical staking-state counts.
+fn get_staking_state_summary(state: &NodeState<'_>) -> RpcResult<String> {
+    let active_principal = state
+        .chain
+        .stake_positions
+        .values()
+        .fold(0u64, |total, position| {
+            total.saturating_add(position.active.map_or(0, |active| active.principal_spark))
+        });
+    let unbonding_principal = state
+        .chain
+        .unbonding_tranches
+        .values()
+        .fold(0u64, |total, tranche| {
+            total.saturating_add(tranche.principal_spark)
+        });
+    let refund_provenance_count = state
+        .chain
+        .utxos
+        .all_entries()
+        .filter(|entry| entry.tranche_refund.is_some())
+        .count();
     Ok(format!(
-        r#"{{"position_id":"{}","validator_id":"{}","principal_owner_id":"{}","active_principal_spark":{},"pending_rewards_spark":{},"tranche_count":{}}}"#,
-        hex::encode(position.position_id.0),
-        hex::encode(position.validator_id.0),
-        hex::encode(position.principal_owner_id.0),
-        position.active.map_or(0, |active| active.principal_spark),
-        position.pending_rewards_spark,
-        state.chain.tranche_ids_for_position(&position.position_id).len(),
+        r#"{{"position_count":{},"tranche_count":{},"tombstone_count":{},"tranche_refund_utxo_count":{},"active_principal_spark":{},"unbonding_principal_spark":{}}}"#,
+        state.chain.stake_positions.len(),
+        state.chain.unbonding_tranches.len(),
+        state.chain.evicted_validator_tombstones.len(),
+        refund_provenance_count,
+        active_principal,
+        unbonding_principal,
     ))
 }
 
@@ -2144,7 +2044,7 @@ fn get_epoch_info(state: &NodeState<'_>) -> RpcResult<String> {
         .chain
         .validators
         .total_selectable_self_stake()
-        .saturating_add(state.chain.total_active_delegated_bond_stake());
+        .saturating_add(state.chain.total_active_delegated_stake());
     let phase = indra_core::types::primitives::validator_set_phase(total_staked);
     let max_validators = indra_core::types::primitives::max_active_validators(total_staked);
     Ok(format!(
@@ -2518,8 +2418,7 @@ fn get_validator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
         .stake_positions
         .values()
         .filter(|position| {
-            position.validator_id == validator_id
-                && position.principal_owner_id != validator_id
+            position.validator_id == validator_id && position.principal_owner_id != validator_id
         })
         .map(|position| {
             format!(
@@ -2713,6 +2612,7 @@ mod tests {
             },
             primitives::{MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES},
             slashing::SlashEvidenceV1,
+            stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
             staking::{StakingOp, StakingOpBody},
             transaction::OutputV1,
             vote::{VoteStep, VoteV1},
@@ -2723,9 +2623,7 @@ mod tests {
         sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1, PqKeypair, VrfKeypair,
     };
     use indra_state::{
-        apply_staking_op,
         governance::{ProposalPhase, ProposalRecord},
-        validator::{DelegationReturnEvent, DelegationReturnReason},
         ChainState,
     };
     use std::collections::BTreeMap;
@@ -2898,8 +2796,6 @@ mod tests {
         explain_utxo_provenance_authorized(&params, &state).unwrap()
     }
 
-
-
     fn block_backed_engine() -> BlockBackedEngine {
         let mut chain = ChainState::new_genesis();
         chain.height = 2;
@@ -2975,285 +2871,6 @@ mod tests {
                 nonce: 1,
                 signature: dummy_signature(0x32),
             });
-
-        let result = explain(&engine, utxo_id);
-        assert!(
-            result.contains(r#""category":"staking_protocol_output_unclassified""#),
-            "{result}"
-        );
-        assert!(result.contains(r#""recoverable":false"#), "{result}");
-    }
-
-    #[test]
-    fn explain_utxo_provenance_authorized_classifies_validator_eviction_outputs() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x41; 32]);
-        let delegator_id = Bytes32::from([0x42; 32]);
-        let bond_utxo_id = Bytes32::from([0x43; 32]);
-        let refund_blinding = derive_compact_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            9_000,
-        );
-        let refund_utxo_id = engine
-            .chain
-            .utxos
-            .insert(
-                owned_output(9_000, refund_blinding),
-                height,
-                STAKING_TX_IDX,
-                1,
-            )
-            .unwrap();
-        engine
-            .chain
-            .delegation_return_events
-            .push(DelegationReturnEvent {
-                delegator_id,
-                validator_id,
-                bond_utxo_id,
-                amount_spark: 9_000,
-                reason: DelegationReturnReason::ValidatorEvicted,
-                returned_epoch: 0,
-                returned_height: height,
-                refund_utxo_id,
-            });
-
-        let reward_blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
-        let reward_utxo_id = engine
-            .chain
-            .utxos
-            .insert(
-                owned_output(1_000, reward_blinding),
-                height,
-                STAKING_TX_IDX,
-                2,
-            )
-            .unwrap();
-
-        let refund = explain(&engine, refund_utxo_id);
-        assert!(
-            refund.contains(r#""category":"validator_eviction_bond_refund""#),
-            "{refund}"
-        );
-        assert!(refund.contains(r#""recoverable":true"#), "{refund}");
-
-        let reward = explain(&engine, reward_utxo_id);
-        assert!(
-            reward.contains(r#""category":"validator_eviction_pending_reward""#),
-            "{reward}"
-        );
-        assert!(reward.contains(r#""recoverable":true"#), "{reward}");
-    }
-
-    #[test]
-    fn explain_utxo_provenance_authorized_classifies_normal_matured_release() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x49; 32]);
-        let delegator_id = Bytes32::from([0x4A; 32]);
-        let bond_utxo_id = Bytes32::from([0x4B; 32]);
-        let amount = 9_000;
-        let blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let refund_utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(amount, blinding), height, STAKING_TX_IDX, 1)
-            .unwrap();
-        engine
-            .chain
-            .delegation_return_events
-            .push(DelegationReturnEvent {
-                delegator_id,
-                validator_id,
-                bond_utxo_id,
-                amount_spark: amount,
-                reason: DelegationReturnReason::UnbondingMatured,
-                returned_epoch: 0,
-                returned_height: height,
-                refund_utxo_id,
-            });
-
-        let result = explain(&engine, refund_utxo_id);
-
-        assert!(
-            result.contains(r#""category":"normal_bond_release""#),
-            "{result}"
-        );
-        assert!(result.contains(r#""recoverable":true"#), "{result}");
-        assert!(
-            result.contains(r#""derivation":"normal_bond_release""#),
-            "{result}"
-        );
-        assert!(
-            result.contains(&format!(
-                r#""bond_utxo_id":"{}""#,
-                hex::encode(bond_utxo_id.0)
-            )),
-            "{result}"
-        );
-    }
-
-    #[test]
-    fn explain_utxo_provenance_authorized_mixed_normal_release_adversarial_block() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x54; 32]);
-        let delegator_id = Bytes32::from([0x55; 32]);
-        let bond_utxo_id = Bytes32::from([0x56; 32]);
-        let amount = 9_000;
-        let blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let refund_utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(amount, blinding), height, STAKING_TX_IDX, 1)
-            .unwrap();
-        engine
-            .chain
-            .delegation_return_events
-            .push(DelegationReturnEvent {
-                delegator_id,
-                validator_id,
-                bond_utxo_id,
-                amount_spark: amount,
-                reason: DelegationReturnReason::UnbondingMatured,
-                returned_epoch: 0,
-                returned_height: height,
-                refund_utxo_id,
-            });
-
-        let wrong_bond_utxo_id = Bytes32::from([0x57; 32]);
-        let malformed_blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let malformed_utxo_id = engine
-            .chain
-            .utxos
-            .insert(
-                owned_output(amount, malformed_blinding),
-                height,
-                STAKING_TX_IDX,
-                2,
-            )
-            .unwrap();
-        engine
-            .chain
-            .delegation_return_events
-            .push(DelegationReturnEvent {
-                delegator_id,
-                validator_id,
-                bond_utxo_id: wrong_bond_utxo_id,
-                amount_spark: amount,
-                reason: DelegationReturnReason::UnbondingMatured,
-                returned_epoch: 0,
-                returned_height: height,
-                refund_utxo_id: malformed_utxo_id,
-            });
-
-        let unrelated_utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(7_000, [0x58; 32]), height, STAKING_TX_IDX, 3)
-            .unwrap();
-
-        let recovered = explain(&engine, refund_utxo_id);
-        assert!(
-            recovered.contains(r#""category":"normal_bond_release""#),
-            "{recovered}"
-        );
-        assert!(recovered.contains(r#""recoverable":true"#), "{recovered}");
-        assert!(
-            recovered.contains(&format!(r#""utxo_id":"{}""#, hex::encode(refund_utxo_id.0))),
-            "{recovered}"
-        );
-
-        let rejected = explain(&engine, malformed_utxo_id);
-        assert!(
-            rejected.contains(r#""category":"normal_bond_release""#),
-            "{rejected}"
-        );
-        assert!(rejected.contains(r#""recoverable":false"#), "{rejected}");
-        assert!(
-            rejected.contains("matured bond release provenance did not open"),
-            "{rejected}"
-        );
-
-        let unclassified = explain(&engine, unrelated_utxo_id);
-        assert!(
-            unclassified.contains(r#""category":"staking_protocol_output_unclassified""#),
-            "{unclassified}"
-        );
-        assert!(
-            unclassified.contains(r#""recoverable":false"#),
-            "{unclassified}"
-        );
-    }
-
-    #[test]
-    fn explain_utxo_provenance_authorized_does_not_misclassify_pre_gate_matured_release() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x4C; 32]);
-        let delegator_id = Bytes32::from([0x4D; 32]);
-        let bond_utxo_id = Bytes32::from([0x4E; 32]);
-        let amount = 9_000;
-        let blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let refund_utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(amount, blinding), height, STAKING_TX_IDX, 1)
-            .unwrap();
-
-        let result = explain(&engine, refund_utxo_id);
-
-        assert!(
-            result.contains(r#""category":"staking_protocol_output_unclassified""#),
-            "{result}"
-        );
-        assert!(result.contains(r#""recoverable":false"#), "{result}");
-        assert!(
-            !result.contains(r#""category":"normal_bond_release""#),
-            "{result}"
-        );
-    }
-
-    #[test]
-    fn explain_utxo_provenance_authorized_reports_slashed_self_stake_release_unrecoverable() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x51; 32]);
-        let bond_utxo_id = Bytes32::from([0x52; 32]);
-        let blinding = derive_slashed_self_stake_blinding(&validator_id, &bond_utxo_id, height);
-        let utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(3_000, blinding), height, STAKING_TX_IDX, 1)
-            .unwrap();
 
         let result = explain(&engine, utxo_id);
         assert!(
@@ -3355,44 +2972,6 @@ mod tests {
             "{refund}"
         );
         assert!(refund.contains(r#""recoverable":true"#), "{refund}");
-    }
-
-    #[test]
-    fn explain_utxo_provenance_authorized_reports_legacy_bond_release_unrecoverable() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x81; 32]);
-        let delegator_id = Bytes32::from([0x82; 32]);
-        let bond_utxo_id = Bytes32::from([0x83; 32]);
-        let utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(9_000, [0x84; 32]), height, STAKING_TX_IDX, 1)
-            .unwrap();
-        engine
-            .chain
-            .delegation_return_events
-            .push(DelegationReturnEvent {
-                delegator_id,
-                validator_id,
-                bond_utxo_id,
-                amount_spark: 9_000,
-                reason: DelegationReturnReason::ValidatorEvicted,
-                returned_epoch: 0,
-                returned_height: height,
-                refund_utxo_id: utxo_id,
-            });
-
-        let result = explain(&engine, utxo_id);
-        assert!(
-            result.contains(r#""category":"legacy_bond_release""#),
-            "{result}"
-        );
-        assert!(result.contains(r#""recoverable":false"#), "{result}");
-        assert!(
-            result.contains("local wallet history or an archive/indexer"),
-            "{result}"
-        );
     }
 
     #[test]
@@ -3585,43 +3164,49 @@ mod tests {
     }
 
     #[test]
-    fn rpc_exposes_delegation_return_events_for_delegator() {
-        let mut engine = make_state("dre");
-        let delegator_id = indra_core::Bytes32::from([0x41; 32]);
-        let validator_id = indra_core::Bytes32::from([0x42; 32]);
-        engine.push_delegation_return_event(indra_state::DelegationReturnEvent {
-            delegator_id,
-            validator_id,
-            bond_utxo_id: indra_core::Bytes32::from([0x43; 32]),
-            amount_spark: 123,
-            reason: indra_state::DelegationReturnReason::ValidatorEvicted,
-            returned_epoch: 7,
-            returned_height: 2_100,
-            refund_utxo_id: indra_core::Bytes32::from([0x44; 32]),
-        });
-        engine.push_delegation_return_event(indra_state::DelegationReturnEvent {
-            delegator_id: indra_core::Bytes32::from([0x45; 32]),
-            validator_id,
-            bond_utxo_id: indra_core::Bytes32::from([0x46; 32]),
-            amount_spark: 456,
-            reason: indra_state::DelegationReturnReason::ValidatorEvicted,
-            returned_epoch: 8,
-            returned_height: 2_400,
-            refund_utxo_id: indra_core::Bytes32::from([0x47; 32]),
-        });
+    fn stake_position_rpc_uses_native_filters_pagination_and_exact_lookup() {
+        let mut engine = make_state("positions");
+        let validator_id = Bytes32::from([0x31; 32]);
+        for byte in [0x41, 0x42] {
+            let owner_id = Bytes32::from([byte; 32]);
+            let position = StakePositionV1::new(
+                validator_id,
+                owner_id,
+                PositionCustodyV1::DelegatorIdentity {
+                    delegator_id: owner_id,
+                },
+                Some(ActiveStakeAggregateV1::new(byte as u64, 1, 2).unwrap()),
+                0,
+                0,
+            )
+            .unwrap();
+            engine
+                .stake_positions
+                .insert(position.position_id, position);
+        }
         let state = NodeState::read_only(&engine);
-        let result = get_delegation_return_events(
-            &[hex::encode(delegator_id.0), "0".into(), "10".into()],
+        let page = get_validator_stake_positions(
+            &[hex::encode(validator_id.0), "1".into(), "1".into()],
             &state,
         )
         .unwrap();
+        assert!(page.contains(r#""offset":1"#));
+        assert!(page.contains(r#""limit":1"#));
+        assert!(page.contains(r#""total_count":2"#));
 
-        assert!(result.contains(r#""reason":"ValidatorEvicted""#));
-        assert!(result.contains(r#""amount_spark":123"#));
-        assert!(result.contains(r#""count":1"#));
-        assert!(!result.contains(r#""amount_spark":456"#));
+        let position_id = engine
+            .stake_positions
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .unwrap();
+        let exact = get_stake_position(&[hex::encode(position_id.0)], &state).unwrap();
+        assert!(exact.contains(&format!(
+            r#""position_id":"{}""#,
+            hex::encode(position_id.0)
+        )));
+        assert!(exact.contains(r#""lifecycle":"active""#));
     }
-
 
     #[test]
     fn delegator_identity_debug_reports_absent_or_registered_pubkey() {
@@ -3707,7 +3292,6 @@ mod tests {
             DispatchResult::Ready(Ok(result)) if result.contains(r#""exists":false"#)
         ));
     }
-
 
     #[test]
     fn consensus_snapshot_observability_is_admin_gated_and_reports_retained_authority() {

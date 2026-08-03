@@ -20,6 +20,8 @@ pub const UNBONDING_TIMING_FORMAT_V1: u8 = 1;
 pub const UNBONDING_TRANCHE_FORMAT_V1: u8 = 1;
 /// Canonical `PositionCustodyV1` marker.
 pub const POSITION_CUSTODY_FORMAT_V1: u8 = 1;
+/// Canonical tranche-refund provenance marker.
+pub const TRANCHE_REFUND_EVENT_FORMAT_V1: u8 = 1;
 
 /// Position-identifier hash domain.
 pub const POSITION_ID_DOMAIN_V1: &[u8] = b"INDRA-STAKE-POSITION-v1";
@@ -109,6 +111,85 @@ impl Decode for PositionCustodyV1 {
             }),
             _ => invalid("unknown position custody tag"),
         }
+    }
+}
+
+/// Canonical recovery context retained for exactly the lifetime of one
+/// unspent tranche-refund UTXO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrancheRefundEventV1 {
+    /// Refund output identified by this provenance record.
+    pub refund_utxo_id: Bytes32,
+    /// Position from which the principal exited.
+    pub position_id: Bytes32,
+    /// Immutable tranche whose maturity created the refund.
+    pub tranche_id: Bytes32,
+    /// Principal owner used by the deterministic refund KDF.
+    pub principal_owner_id: Bytes32,
+    /// Custody role used by the deterministic refund KDF.
+    pub custody: PositionCustodyV1,
+    /// Refunded principal in Spark.
+    pub principal_spark: u64,
+    /// Height at which the refund UTXO was created.
+    pub release_height: u64,
+    /// Canonical tranche maturity epoch.
+    pub end_epoch: u64,
+}
+
+impl TrancheRefundEventV1 {
+    /// Validate the self-contained refund provenance contract.
+    pub fn validate(&self) -> IndraResult<()> {
+        if self.principal_spark == 0 {
+            return invalid("tranche refund principal is zero");
+        }
+        match self.custody {
+            PositionCustodyV1::DelegatorIdentity { delegator_id }
+                if delegator_id == self.principal_owner_id => {}
+            PositionCustodyV1::ValidatorColdIdentity { validator_id }
+                if validator_id == self.principal_owner_id => {}
+            _ => return invalid("tranche refund custody does not match principal owner"),
+        }
+        Ok(())
+    }
+}
+
+impl Encode for TrancheRefundEventV1 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        TRANCHE_REFUND_EVENT_FORMAT_V1.encode(buf);
+        self.refund_utxo_id.encode(buf);
+        self.position_id.encode(buf);
+        self.tranche_id.encode(buf);
+        self.principal_owner_id.encode(buf);
+        self.custody.encode(buf);
+        self.principal_spark.encode(buf);
+        self.release_height.encode(buf);
+        self.end_epoch.encode(buf);
+    }
+
+    fn encoded_len(&self) -> usize {
+        1 + 32 * 4 + self.custody.encoded_len() + 8 * 3
+    }
+}
+
+impl Decode for TrancheRefundEventV1 {
+    fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
+        require_version(
+            u8::decode(reader)?,
+            TRANCHE_REFUND_EVENT_FORMAT_V1,
+            "TrancheRefundEventV1",
+        )?;
+        let value = Self {
+            refund_utxo_id: Bytes32::decode(reader)?,
+            position_id: Bytes32::decode(reader)?,
+            tranche_id: Bytes32::decode(reader)?,
+            principal_owner_id: Bytes32::decode(reader)?,
+            custody: PositionCustodyV1::decode(reader)?,
+            principal_spark: u64::decode(reader)?,
+            release_height: u64::decode(reader)?,
+            end_epoch: u64::decode(reader)?,
+        };
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -1097,5 +1178,39 @@ mod tests {
                 elapsed.as_nanos() / count as u128
             );
         }
+    }
+
+    #[test]
+    fn tranche_refund_event_round_trips_at_exact_size_and_rejects_malformed_data() {
+        let event = TrancheRefundEventV1 {
+            refund_utxo_id: id(1),
+            position_id: id(2),
+            tranche_id: id(3),
+            principal_owner_id: id(4),
+            custody: PositionCustodyV1::DelegatorIdentity {
+                delegator_id: id(4),
+            },
+            principal_spark: 50,
+            release_height: 9_001,
+            end_epoch: 31,
+        };
+        let encoded = event.encode_to_vec();
+        assert_eq!(encoded.len(), 187);
+        assert_eq!(
+            TrancheRefundEventV1::decode(&mut ByteReader::new(&encoded)).unwrap(),
+            event
+        );
+
+        let mut unknown = encoded.clone();
+        unknown[0] = 2;
+        assert!(TrancheRefundEventV1::decode(&mut ByteReader::new(&unknown)).is_err());
+
+        let mut zero_principal = event.clone();
+        zero_principal.principal_spark = 0;
+        assert!(zero_principal.validate().is_err());
+
+        let mut mismatched_owner = event;
+        mismatched_owner.principal_owner_id = id(5);
+        assert!(mismatched_owner.validate().is_err());
     }
 }

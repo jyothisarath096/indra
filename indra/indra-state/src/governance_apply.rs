@@ -1304,7 +1304,6 @@ mod tests {
         state.governance.proposals.insert(proposal_id, proposal);
     }
 
-
     #[test]
     fn active_validator_cold_governance_authorizes_all_discretionary_actions() {
         let mut state = ChainState::new_genesis();
@@ -1787,9 +1786,6 @@ mod tests {
         assert!(first.governance.gov_nonces.get(&legacy_id).is_none());
         assert!(first.governance.gov_nonces.get(&active_id).is_none());
     }
-
-
-
 
     #[test]
     fn governance_proposal_rejects_deposit_utxo_not_owned_by_proposer() {

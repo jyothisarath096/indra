@@ -46,7 +46,6 @@ pub enum IdentityError {
     },
 }
 
-
 pub(crate) fn resolve_active_validator_cold_pubkey(
     state: &ChainState,
     validator_id: &Bytes32,
@@ -147,7 +146,6 @@ mod tests {
         VariableBytes,
     };
 
-
     fn id(byte: u8) -> Bytes32 {
         Bytes32::from([byte; 32])
     }
@@ -170,9 +168,6 @@ mod tests {
             lock_height: 0,
         }
     }
-
-
-
 
     #[test]
     fn resolve_registered_identity_accepts_matching_submitted_pubkey() {
@@ -213,8 +208,4 @@ mod tests {
             Ok(IdentityCheckOutcome::NoPriorRecord)
         );
     }
-
-
-
-
 }

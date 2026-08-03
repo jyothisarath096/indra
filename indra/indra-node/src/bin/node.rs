@@ -5139,7 +5139,7 @@ mod tests {
             "indra_getChainInfo"
         ));
         assert!(!public_light_method_avoids_full_snapshot(
-            "indra_getDelegatorPositions"
+            "indra_getStakePositions"
         ));
     }
 
@@ -5160,19 +5160,14 @@ mod tests {
         let global = indra_rpc::server::RpcGlobalWindowRateLimiter::new();
         for _ in 0..indra_rpc::server::RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN {
             assert!(public_expensive_method_allowed(
-                "indra_getDelegatorPositions",
+                "indra_getStakePositions",
                 Some(ip),
                 &per_ip,
                 &global
             ));
         }
         assert!(
-            !public_expensive_method_allowed(
-                "indra_getDelegatorPositions",
-                Some(ip),
-                &per_ip,
-                &global
-            ),
+            !public_expensive_method_allowed("indra_getStakePositions", Some(ip), &per_ip, &global),
             "the public expensive-method gate should reject before dispatch/snapshot"
         );
         assert!(public_expensive_method_allowed(

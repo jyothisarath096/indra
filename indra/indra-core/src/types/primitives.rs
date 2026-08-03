@@ -65,7 +65,7 @@ pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
 pub const WS_WINDOW_EPOCHS: u64 = 500;
 
 /// Epochs within which a validator must claim rewards before expiry.
-pub const CLAIM_WINDOW_EPOCHS: u64 = 175_200; // ~100 years — rewards never expire in practice
+pub const CLAIM_WINDOW_EPOCHS: u64 = 175_200; // ~10 years — rewards rarely expire in practice
 
 /// Default propose phase timeout (ms).
 pub const T_PROPOSE_MS: u64 = 2_000;

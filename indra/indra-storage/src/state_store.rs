@@ -596,7 +596,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn canonical_snapshot_round_trips() {
         let dir = temp_dir("v3_round_trip");
@@ -728,7 +727,6 @@ mod tests {
         assert_eq!(loaded.height, 20);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     fn make_block(state: &ChainState) -> BlockV1 {
         let mut block = BlockV1 {

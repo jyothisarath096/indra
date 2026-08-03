@@ -265,10 +265,7 @@ pub fn exit_stake_position(
     txn.put_stake_position(updated_position)?;
     txn.put_unbonding_tranche(tranche)?;
     if let Some(validator) = updated_validator {
-        txn.state_mut()
-            .validators
-            .upsert(validator.clone())
-            ?;
+        txn.state_mut().validators.upsert(validator.clone())?;
         if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
             commitment.put_validator(&validator, current_height);
         }
@@ -339,14 +336,39 @@ pub fn release_matured_position_tranches(
         let output_index = u32::try_from(ordinal).map_err(|_| StateError::InvariantViolation {
             message: "mature tranche output ordinal overflow",
         })?;
-        prepared.push((tranche.clone(), output, output_index));
+        let refund_utxo_id = crate::utxo::UtxoSet::compute_utxo_id(
+            &output,
+            release_height,
+            STAKING_TX_IDX,
+            output_index,
+        );
+        let event = indra_core::types::stake_position::TrancheRefundEventV1 {
+            refund_utxo_id,
+            position_id: tranche.position_id,
+            tranche_id: tranche.tranche_id,
+            principal_owner_id: position.principal_owner_id,
+            custody: tranche.custody,
+            principal_spark: tranche.principal_spark,
+            release_height,
+            end_epoch,
+        };
+        event
+            .validate()
+            .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
+        prepared.push((tranche.clone(), output, output_index, event));
     }
 
     let mut txn = StateTxn::begin(state, release_height);
     txn.ensure_state_commitment_v2()?;
     let mut output_ids = Vec::with_capacity(prepared.len());
-    for (tranche, output, output_index) in prepared {
-        output_ids.push(txn.insert_utxo(output, release_height, STAKING_TX_IDX, output_index)?);
+    for (tranche, output, output_index, event) in prepared {
+        output_ids.push(txn.insert_tranche_refund_utxo(
+            output,
+            release_height,
+            STAKING_TX_IDX,
+            output_index,
+            event,
+        )?);
         txn.delete_unbonding_tranche(&tranche.tranche_id)?;
         let remove_position = txn
             .state()

@@ -290,7 +290,7 @@ impl MetricsSnapshot {
         let total_staked = s
             .validators
             .total_selectable_self_stake()
-            .saturating_add(s.total_active_delegated_bond_stake());
+            .saturating_add(s.total_active_delegated_stake());
         let validator_id_hex = engine
             .validator_id()
             .map(|id| hex::encode(&id.0[..4]))

@@ -1,11 +1,14 @@
 //! Canonical block-range wallet discovery for ordinary payment outputs.
 
 use indra_core::{
-    codec::Decode,
-    types::{block::BlockV1, primitives::Bytes32},
+    codec::{Decode, Encode},
+    types::{block::BlockV1, crypto::HybridPubKey, primitives::Bytes32},
 };
-use indra_crypto::{commit, recipient_derive_payment_blinding_v1, sha256, PaymentKeypairV1};
-use indra_state::UtxoSet;
+use indra_crypto::{
+    commit, derive_tranche_refund_blinding_v1, recipient_derive_payment_blinding_v1, sha256,
+    PaymentKeypairV1, TrancheRefundBlindingInputsV1,
+};
+use indra_state::{utxo::UtxoEntry, UtxoSet};
 
 use crate::{fetch_chain_id, json_string, rpc_call_raw_params, Wallet};
 
@@ -15,6 +18,7 @@ pub fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut Wallet,
     payment_keys: &[PaymentKeypairV1],
+    owner_pubkeys: &[HybridPubKey],
 ) -> Result<usize, String> {
     let chain_id = fetch_chain_id(node_url).map_err(|error| error.to_string())?;
     let mut discovered = 0usize;
@@ -44,8 +48,12 @@ pub fn scan_canonical_blocks(
             break;
         }
         let blocks = canonical_blocks_from_rpc(&response)?;
+        let refunds = tranche_refunds_from_rpc(&response)?;
         if blocks.is_empty() {
             break;
+        }
+        for entry in refunds {
+            discovered += scan_tranche_refund(wallet, &entry, owner_pubkeys, chain_id.as_bytes())?;
         }
         for block in blocks {
             if block.header.prev_hash != expected_scan_parent(wallet) {
@@ -63,6 +71,50 @@ pub fn scan_canonical_blocks(
         }
     }
     Ok(discovered)
+}
+
+fn scan_tranche_refund(
+    wallet: &mut Wallet,
+    entry: &UtxoEntry,
+    owner_pubkeys: &[HybridPubKey],
+    chain_id: &[u8],
+) -> Result<usize, String> {
+    let Some(event) = &entry.tranche_refund else {
+        return Ok(0);
+    };
+    if !owner_pubkeys
+        .iter()
+        .any(|owner| owner == &entry.output.owner_pubkey)
+    {
+        return Ok(0);
+    }
+    let custody = event.custody.encode_to_vec();
+    let blinding = derive_tranche_refund_blinding_v1(&TrancheRefundBlindingInputsV1 {
+        chain_id,
+        position_id: event.position_id.0,
+        tranche_id: event.tranche_id.0,
+        principal_owner_id: event.principal_owner_id.0,
+        custody_encoding: &custody,
+        principal_spark: event.principal_spark,
+        release_height: event.release_height,
+        end_epoch: event.end_epoch,
+    })
+    .map_err(|error| format!("tranche refund derivation failed: {error}"))?;
+    if commit(entry.output.value_spark, &blinding).0 != entry.output.commitment.compressed_point.0 {
+        return Err("tranche refund provenance does not open output commitment".to_string());
+    }
+    if wallet.contains(&entry.utxo_id) {
+        return Ok(0);
+    }
+    wallet.add_utxo(
+        entry.utxo_id,
+        entry.output.value_spark,
+        blinding,
+        entry.created_height,
+        entry.tx_index,
+        entry.output_index,
+    );
+    Ok(1)
 }
 
 /// Apply one canonical block to ordinary-payment wallet discovery.
@@ -154,4 +206,106 @@ fn canonical_blocks_from_rpc(json: &str) -> Result<Vec<BlockV1>, String> {
         remaining = &encoded[end + 1..];
     }
     Ok(blocks)
+}
+
+fn tranche_refunds_from_rpc(json: &str) -> Result<Vec<UtxoEntry>, String> {
+    let mut entries = Vec::new();
+    let mut remaining = json;
+    let marker = "\"utxo_hex\":\"";
+    while let Some(start) = remaining.find(marker) {
+        let encoded = &remaining[start + marker.len()..];
+        let end = encoded
+            .find('"')
+            .ok_or_else(|| "unterminated utxo_hex in RPC response".to_string())?;
+        let bytes = hex::decode(&encoded[..end]).map_err(|_| "invalid utxo_hex".to_string())?;
+        let entry = UtxoEntry::decode_exact(&bytes)
+            .map_err(|error| format!("invalid canonical protocol UTXO encoding: {error}"))?;
+        if entry.tranche_refund.is_none() {
+            return Err("canonical protocol output lacks tranche refund provenance".to_string());
+        }
+        entries.push(entry);
+        remaining = &encoded[end + 1..];
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indra_core::{
+        types::{
+            crypto::CommitmentV1,
+            stake_position::{PositionCustodyV1, TrancheRefundEventV1},
+            transaction::OutputV1,
+        },
+        VariableBytes,
+    };
+    use indra_crypto::{derive_tranche_refund_blinding_v1, TrancheRefundBlindingInputsV1};
+
+    #[test]
+    fn canonical_scan_recovers_tranche_refund_from_embedded_provenance() {
+        let chain_id = b"scan-test";
+        let owner_id = Bytes32::from([4; 32]);
+        let custody = PositionCustodyV1::DelegatorIdentity {
+            delegator_id: owner_id,
+        };
+        let custody_encoding = custody.encode_to_vec();
+        let position_id = Bytes32::from([1; 32]);
+        let tranche_id = Bytes32::from([2; 32]);
+        let principal_spark = 50;
+        let release_height = 300;
+        let end_epoch = 1;
+        let blinding = derive_tranche_refund_blinding_v1(&TrancheRefundBlindingInputsV1 {
+            chain_id,
+            position_id: position_id.0,
+            tranche_id: tranche_id.0,
+            principal_owner_id: owner_id.0,
+            custody_encoding: &custody_encoding,
+            principal_spark,
+            release_height,
+            end_epoch,
+        })
+        .unwrap();
+        let owner_pubkey = HybridPubKey {
+            classical_pk: Bytes32::from([7; 32]),
+            pq_pk: VariableBytes::from_slice(&[8; 32]).unwrap(),
+        };
+        let output = OutputV1 {
+            value_spark: principal_spark,
+            commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(commit(principal_spark, &blinding).0),
+            },
+            owner_pubkey: owner_pubkey.clone(),
+            range_proof: VariableBytes::from_slice(&[9]).unwrap(),
+            lock_height: 0,
+        };
+        let refund_utxo_id = UtxoSet::compute_utxo_id(&output, release_height, 0, 0);
+        let entry = UtxoEntry {
+            utxo_id: refund_utxo_id,
+            output,
+            created_height: release_height,
+            tx_index: 0,
+            output_index: 0,
+            tranche_refund: Some(TrancheRefundEventV1 {
+                refund_utxo_id,
+                position_id,
+                tranche_id,
+                principal_owner_id: owner_id,
+                custody,
+                principal_spark,
+                release_height,
+                end_epoch,
+            }),
+        };
+        let mut wallet = Wallet::new();
+        assert_eq!(
+            scan_tranche_refund(&mut wallet, &entry, &[owner_pubkey], chain_id).unwrap(),
+            1
+        );
+        assert_eq!(wallet.balance(), principal_spark);
+        assert_eq!(
+            scan_tranche_refund(&mut wallet, &entry, &[], chain_id).unwrap(),
+            0
+        );
+    }
 }

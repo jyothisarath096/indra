@@ -269,16 +269,19 @@ diagnostics require `X-Admin-Token` on the full listener.
 |--------|-------------|
 | `indra_getValidatorSet` | All active validators |
 | `indra_getValidator` | Single validator by ID |
-| `indra_getValidatorSelfStake` | Self-stake bonds |
-| `indra_getValidatorDelegators` | All delegators to a validator |
+| `indra_getValidatorSelfStake` | Validator self-position summary |
+| `indra_getValidatorStakePositions` | Paginated stake positions targeting a validator |
 | `indra_getValidatorAutoDelegate` | Auto-delegation target |
 
-**Delegation**
+**Stake positions and tranches**
 | Method | Description |
 |--------|-------------|
-| `indra_getDelegatorPositions` | All positions across all validators |
+| `indra_getStakePositions` | Paginated positions, optionally filtered by owner and validator |
+| `indra_getStakePosition` | Exact position lookup by ID |
+| `indra_getUnbondingTranches` | Paginated tranches, optionally filtered by position, owner, and validator |
+| `indra_getUnbondingTranche` | Exact tranche lookup by ID |
+| `indra_getOwnerStakePositions` | Paginated positions controlled by one owner |
 | `indra_getDelegatorRewards` | Pending rewards across all validators |
-| `indra_getDelegations` | Delegations to a specific validator |
 
 **Epoch history**
 | Method | Description |
@@ -314,6 +317,11 @@ distinguish those cases.
 | `indra_sendTransaction` | Submit a signed transaction |
 | `indra_submitStakingOp` | Submit a staking operation |
 | `indra_getStakingNonce` | Replay-protection nonce for staking |
+
+Tranche-refund provenance is committed inside the refund UTXO and remains
+available for exactly that UTXO's unspent lifetime. Canonical block-range wallet
+scanning recovers the deterministic refund opening without a fixed retention
+window.
 
 ---
 

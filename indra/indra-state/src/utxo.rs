@@ -28,6 +28,7 @@ use indra_core::{
             Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
             SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
         },
+        stake_position::TrancheRefundEventV1,
         transaction::OutputV1,
     },
 };
@@ -59,6 +60,9 @@ pub struct UtxoEntry {
     pub tx_index: u32,
     /// Output index within that transaction.
     pub output_index: u32,
+    /// Recovery context for a protocol-created tranche refund. It exists for
+    /// exactly the lifetime of this unspent output and is deleted with it.
+    pub tranche_refund: Option<TrancheRefundEventV1>,
 }
 
 impl Encode for UtxoEntry {
@@ -69,6 +73,10 @@ impl Encode for UtxoEntry {
         self.created_height.encode(buf);
         self.tx_index.encode(buf);
         self.output_index.encode(buf);
+        self.tranche_refund.is_some().encode(buf);
+        if let Some(event) = &self.tranche_refund {
+            event.encode(buf);
+        }
     }
 
     fn encoded_len(&self) -> usize {
@@ -77,6 +85,12 @@ impl Encode for UtxoEntry {
             + self.created_height.encoded_len()
             + self.tx_index.encoded_len()
             + self.output_index.encoded_len()
+            + 1
+            + self
+                .tranche_refund
+                .as_ref()
+                .map(Encode::encoded_len)
+                .unwrap_or(0)
     }
 }
 
@@ -123,6 +137,11 @@ fn decode_utxo_entry_fields(
         created_height: u64::decode(r)?,
         tx_index: u32::decode(r)?,
         output_index: u32::decode(r)?,
+        tranche_refund: if bool::decode(r)? {
+            Some(TrancheRefundEventV1::decode(r)?)
+        } else {
+            None
+        },
     })
 }
 
@@ -186,6 +205,7 @@ impl UtxoSet {
         let mut set = Self::new();
         for _ in 0..count {
             let entry = UtxoEntry::decode(r)?;
+            validate_tranche_refund_entry(&entry)?;
             if set.entries.contains_key(&entry.utxo_id) {
                 return Err(IndraError::DuplicateEntries {
                     field: "snapshot.utxos",
@@ -224,6 +244,7 @@ impl UtxoSet {
         let _ = height;
         for _ in 0..count {
             let entry = UtxoEntry::decode_legacy(r)?;
+            validate_tranche_refund_entry(&entry)?;
             if set.entries.contains_key(&entry.utxo_id) {
                 return Err(IndraError::DuplicateEntries {
                     field: "snapshot.utxos",
@@ -274,11 +295,39 @@ impl UtxoSet {
         tx_index: u32,
         output_index: u32,
     ) -> StateResult<Bytes32> {
+        self.insert_with_tranche_refund(output, height, tx_index, output_index, None)
+    }
+
+    /// Insert an output and bind optional tranche-refund recovery context to
+    /// the same canonical UTXO lifetime.
+    pub fn insert_with_tranche_refund(
+        &mut self,
+        output: OutputV1,
+        height: u64,
+        tx_index: u32,
+        output_index: u32,
+        tranche_refund: Option<TrancheRefundEventV1>,
+    ) -> StateResult<Bytes32> {
         let id = Self::compute_utxo_id(&output, height, tx_index, output_index);
         if self.entries.contains_key(&id) {
             return Err(StateError::InvariantViolation {
                 message: "UTXO ID collision — SHA-256 collision or duplicate block application",
             });
+        }
+        if let Some(event) = &tranche_refund {
+            event
+                .validate()
+                .map_err(|_| StateError::InvariantViolation {
+                    message: "invalid tranche refund provenance",
+                })?;
+            if event.refund_utxo_id != id
+                || event.release_height != height
+                || event.principal_spark != output.value_spark
+            {
+                return Err(StateError::InvariantViolation {
+                    message: "tranche refund provenance does not match its UTXO",
+                });
+            }
         }
         self.entries.insert(
             id,
@@ -288,6 +337,7 @@ impl UtxoSet {
                 created_height: height,
                 tx_index,
                 output_index,
+                tranche_refund,
             },
         );
         let smt_value = self
@@ -378,14 +428,33 @@ impl UtxoSet {
         data.extend_from_slice(&entry.created_height.to_le_bytes());
         data.extend_from_slice(&entry.tx_index.to_le_bytes());
         data.extend_from_slice(&entry.output_index.to_le_bytes());
+        data.push(u8::from(entry.tranche_refund.is_some()));
+        if let Some(event) = &entry.tranche_refund {
+            data.extend_from_slice(&event.encode_to_vec());
+        }
         sha256(&data)
     }
+}
+
+fn validate_tranche_refund_entry(entry: &UtxoEntry) -> IndraResult<()> {
+    if let Some(event) = &entry.tranche_refund {
+        event.validate()?;
+        if event.refund_utxo_id != entry.utxo_id
+            || event.release_height != entry.created_height
+            || event.principal_spark != entry.output.value_spark
+        {
+            return Err(IndraError::InvariantViolation {
+                message: "tranche refund provenance does not match its UTXO",
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::crypto::CommitmentV1;
+    use indra_core::types::{crypto::CommitmentV1, stake_position::PositionCustodyV1};
 
     fn dummy_output(byte: u8) -> OutputV1 {
         OutputV1 {
@@ -424,6 +493,7 @@ mod tests {
             created_height: 1,
             tx_index: 0,
             output_index: 0,
+            tranche_refund: None,
         };
         let b = UtxoEntry {
             utxo_id: Bytes32::from([2; 32]),
@@ -431,6 +501,7 @@ mod tests {
             created_height: 1,
             tx_index: 0,
             output_index: 1,
+            tranche_refund: None,
         };
         let mut first = UtxoSet::new();
         first.restore_for_rollback_at_height(a.clone(), 1);
@@ -442,5 +513,41 @@ mod tests {
         assert_eq!(first.spend_at_height(&a.utxo_id, 1), Some(a.clone()));
         first.restore_for_rollback_at_height(a, 1);
         assert_eq!(first.root_at_height(1), second.root_at_height(1));
+    }
+
+    #[test]
+    fn tranche_refund_provenance_has_exact_utxo_lifetime() {
+        let output = dummy_output(9);
+        let refund_utxo_id = UtxoSet::compute_utxo_id(&output, 300, 7, 1);
+        let owner = Bytes32::from([4; 32]);
+        let event = TrancheRefundEventV1 {
+            refund_utxo_id,
+            position_id: Bytes32::from([1; 32]),
+            tranche_id: Bytes32::from([2; 32]),
+            principal_owner_id: owner,
+            custody: PositionCustodyV1::DelegatorIdentity {
+                delegator_id: owner,
+            },
+            principal_spark: output.value_spark,
+            release_height: 300,
+            end_epoch: 1,
+        };
+        let mut set = UtxoSet::new();
+        assert_eq!(
+            set.insert_with_tranche_refund(output, 300, 7, 1, Some(event.clone()))
+                .unwrap(),
+            refund_utxo_id
+        );
+        let encoded = set.encode_to_vec();
+        let decoded = UtxoSet::decode(&mut ByteReader::new(&encoded)).unwrap();
+        assert_eq!(
+            decoded.get(&refund_utxo_id).unwrap().tranche_refund,
+            Some(event)
+        );
+
+        let removed = set.spend_at_height(&refund_utxo_id, 301).unwrap();
+        assert!(set.get(&refund_utxo_id).is_none());
+        set.restore_for_rollback_at_height(removed, 301);
+        assert!(set.get(&refund_utxo_id).unwrap().tranche_refund.is_some());
     }
 }
