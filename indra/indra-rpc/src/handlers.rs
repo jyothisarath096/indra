@@ -8,8 +8,7 @@ use indra_core::{
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
         Bytes32 as CoreBytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-        NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -301,11 +300,6 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getTransaction", RpcMethodAccess::ReadOnly),
     ("indra_getLegacyScanChallenge", RpcMethodAccess::ReadOnly),
     (
-        "indra_getLegacyBalanceAuthorized",
-        RpcMethodAccess::ReadOnly,
-    ),
-    ("indra_getLegacyUtxosAuthorized", RpcMethodAccess::ReadOnly),
-    (
         "indra_explainUtxoProvenanceAuthorized",
         RpcMethodAccess::ReadOnly,
     ),
@@ -325,7 +319,6 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getEpochRecord", RpcMethodAccess::ReadOnly),
     ("indra_getEpochHistory", RpcMethodAccess::ReadOnly),
     ("indra_getLatestEpoch", RpcMethodAccess::ReadOnly),
-    ("indra_getSchemaInfo", RpcMethodAccess::Admin),
     ("indra_getProposals", RpcMethodAccess::ReadOnly),
     ("indra_getProposal", RpcMethodAccess::ReadOnly),
     ("indra_getProposalVotes", RpcMethodAccess::ReadOnly),
@@ -441,8 +434,6 @@ pub fn dispatch_with_admin(
         "indra_getCanonicalBlocks" => Ready(get_canonical_blocks(params, state)),
         "indra_getTransaction" => Ready(get_transaction(params, state)),
         "indra_getLegacyScanChallenge" => Ready(get_legacy_scan_challenge(params, state)),
-        "indra_getLegacyBalanceAuthorized" => Ready(get_legacy_balance_authorized(params, state)),
-        "indra_getLegacyUtxosAuthorized" => Ready(get_legacy_utxos_authorized(params, state)),
         "indra_explainUtxoProvenanceAuthorized" => {
             Ready(explain_utxo_provenance_authorized(params, state))
         }
@@ -462,7 +453,6 @@ pub fn dispatch_with_admin(
         "indra_getEpochRecord" => Ready(get_epoch_record(params, state)),
         "indra_getEpochHistory" => Ready(get_epoch_history(params, state)),
         "indra_getLatestEpoch" => Ready(get_latest_epoch(state)),
-        "indra_getSchemaInfo" => Ready(get_schema_info(state)),
         "indra_getProposals" => Ready(get_proposals(params, state)),
         "indra_getProposal" => Ready(get_proposal(params, state)),
         "indra_getProposalVotes" => Ready(get_proposal_votes(params, state)),
@@ -982,54 +972,6 @@ fn get_legacy_scan_challenge(params: &[String], state: &NodeState<'_>) -> RpcRes
         r#"{{"address":"{}","challenge":"{}","auth_format_version":1,"note":"sign INDRA legacy UTXO-scan authorization; this is not an OutputV2 view key"}}"#,
         address_hex,
         hex::encode(challenge)
-    ))
-}
-
-/// `indra_getLegacyBalanceAuthorized` — returns total legacy UTXO balance after
-/// the address owner proves possession of the legacy spend key.
-fn get_legacy_balance_authorized(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let (address_hex, address) = authorized_address(params, state)?;
-    let mut balance = 0u64;
-    for entry in state.chain.utxos.all_entries() {
-        let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
-        if owner_address == address {
-            balance = balance.saturating_add(entry.output.value_spark);
-        }
-    }
-    Ok(format!(
-        r#"{{"address":"{}","balance":{},"privacy_note":"{}"}}"#,
-        address_hex, balance, LEGACY_SCAN_PRIVACY_NOTE
-    ))
-}
-
-/// `indra_getLegacyUtxosAuthorized` — returns legacy UTXOs after the address
-/// owner proves possession of the legacy spend key.
-fn get_legacy_utxos_authorized(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let (address_hex, address) = authorized_address(params, state)?;
-    let utxos: Vec<String> = state
-        .chain
-        .utxos
-        .all_entries()
-        .filter(|entry| {
-            indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0) == address
-        })
-        .map(|entry| {
-            format!(
-                r#"{{"utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{}}}"#,
-                hex::encode(entry.utxo_id.0),
-                entry.output.value_spark,
-                entry.created_height,
-                entry.tx_index,
-                entry.output_index,
-                entry.output.lock_height,
-            )
-        })
-        .collect();
-    Ok(format!(
-        r#"{{"address":"{}","utxos":[{}],"privacy_note":"{}"}}"#,
-        address_hex,
-        utxos.join(","),
-        LEGACY_SCAN_PRIVACY_NOTE
     ))
 }
 
@@ -1775,16 +1717,17 @@ fn get_delegations(params: &[String], state: &NodeState<'_>) -> RpcResult<String
         .get_delegators(&validator_id)
         .iter()
         .map(|entry| {
-            let (staked_spark, active_bonds, unbonding_bonds) =
+            let (staked_spark, active_bonds, unbonding_bonds, earliest_end, latest_end) =
                 rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
             let unbonding = active_bonds == 0 && unbonding_bonds > 0;
             format!(
-                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
                 hex::encode(entry.delegator_id.0),
                 staked_spark,
                 entry.pending_rewards,
                 if unbonding { "true" } else { "false" },
-                entry.unbonding_end_epoch.unwrap_or(0),
+                optional_u64_json(earliest_end),
+                optional_u64_json(latest_end),
                 active_bonds,
                 unbonding_bonds,
             )
@@ -1837,13 +1780,9 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
                 .get(validator_id)
                 .map(|validator| (validator.name.clone(), validator.commission_bps))
                 .unwrap_or_else(|| ("unknown".to_string(), 1_000));
-            let (active_stake, active_bonds, unbonding_bonds) =
+            let (active_stake, active_bonds, unbonding_bonds, earliest_end, latest_end) =
                 rpc_delegator_bond_status(state.chain, validator_id, &entry.delegator_id);
             let unbonding = active_bonds == 0 && unbonding_bonds > 0;
-            let unbonding_end = entry
-                .unbonding_end_epoch
-                .map(|epoch| epoch.to_string())
-                .unwrap_or_else(|| "null".to_string());
 
             total_staked = total_staked.saturating_add(active_stake);
             total_rewards = total_rewards.saturating_add(entry.pending_rewards);
@@ -1854,14 +1793,15 @@ fn get_delegator_positions(params: &[String], state: &NodeState<'_>) -> RpcResul
             }
 
             positions.push(format!(
-                r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"unbonding_end_epoch":{},"commission_bps":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+                r#"{{"validator_id":"{}","validator_name":"{}","staked_spark":{},"pending_rewards":{},"rewards_last_epoch":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"commission_bps":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
                 hex::encode(validator_id.0),
                 validator_name,
                 active_stake,
                 entry.pending_rewards,
                 entry.rewards_last_epoch,
                 if unbonding { "true" } else { "false" },
-                unbonding_end,
+                optional_u64_json(earliest_end),
+                optional_u64_json(latest_end),
                 commission_bps,
                 active_bonds,
                 unbonding_bonds,
@@ -1884,7 +1824,7 @@ fn rpc_delegator_bond_status(
     state: &ChainState,
     validator_id: &Bytes32,
     delegator_id: &Bytes32,
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, Option<u64>, Option<u64>) {
     state
         .staked_bonds
         .values()
@@ -1893,17 +1833,32 @@ fn rpc_delegator_bond_status(
                 && bond.delegator_id == *delegator_id
                 && bond.validator_id != bond.delegator_id
         })
-        .fold((0u64, 0u64, 0u64), |(stake, active, unbonding), bond| {
-            if bond.unbonding_end_epoch.is_none() {
-                (
-                    stake.saturating_add(bond.amount_spark),
-                    active.saturating_add(1),
-                    unbonding,
-                )
-            } else {
-                (stake, active, unbonding.saturating_add(1))
-            }
-        })
+        .fold(
+            (0u64, 0u64, 0u64, None, None),
+            |(stake, active, unbonding, earliest, latest), bond| {
+                if let Some(end) = bond.unbonding_end_epoch {
+                    (
+                        stake,
+                        active,
+                        unbonding.saturating_add(1),
+                        Some(earliest.map_or(end, |value: u64| value.min(end))),
+                        Some(latest.map_or(end, |value: u64| value.max(end))),
+                    )
+                } else {
+                    (
+                        stake.saturating_add(bond.amount_spark),
+                        active.saturating_add(1),
+                        unbonding,
+                        earliest,
+                        latest,
+                    )
+                }
+            },
+        )
+}
+
+fn optional_u64_json(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 /// `indra_getDelegationReturnEvents` — returns automatic principal-return events for a delegator.
@@ -2023,22 +1978,19 @@ fn get_validator_delegators(params: &[String], state: &NodeState<'_>) -> RpcResu
         .iter()
         .take(1_000)
     {
-        let (active_stake, active_bonds, unbonding_bonds) =
+        let (active_stake, active_bonds, unbonding_bonds, earliest_end, latest_end) =
             rpc_delegator_bond_status(state.chain, &validator_id, &entry.delegator_id);
         let unbonding = active_bonds == 0 && unbonding_bonds > 0;
-        let unbonding_end = entry
-            .unbonding_end_epoch
-            .map(|epoch| epoch.to_string())
-            .unwrap_or_else(|| "null".to_string());
         total_delegated = total_delegated.saturating_add(active_stake);
         total_rewards = total_rewards.saturating_add(entry.pending_rewards);
         delegators.push(format!(
-            r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
+            r#"{{"delegator_id":"{}","staked_spark":{},"pending_rewards":{},"unbonding":{},"earliest_unbonding_end_epoch":{},"latest_unbonding_end_epoch":{},"rewards_last_epoch":{},"active_bond_count":{},"unbonding_bond_count":{}}}"#,
             hex::encode(entry.delegator_id.0),
             active_stake,
             entry.pending_rewards,
             if unbonding { "true" } else { "false" },
-            unbonding_end,
+            optional_u64_json(earliest_end),
+            optional_u64_json(latest_end),
             entry.rewards_last_epoch,
             active_bonds,
             unbonding_bonds,
@@ -2346,17 +2298,6 @@ fn get_latest_epoch(state: &NodeState<'_>) -> RpcResult<String> {
     }
 }
 
-/// `indra_getSchemaInfo` — returns the canonical node schema.
-fn get_schema_info(state: &NodeState<'_>) -> RpcResult<String> {
-    let _ = state;
-    Ok(format!(
-        "{{\"schema_version\":{},\"schema_version_genesis\":{},\"node_version\":\"{}\"}}",
-        SCHEMA_VERSION,
-        SCHEMA_VERSION_GENESIS,
-        env!("CARGO_PKG_VERSION")
-    ))
-}
-
 fn get_governance_params(state: &NodeState<'_>) -> RpcResult<String> {
     let params = &state.chain.governance.params;
     Ok(format!(
@@ -2374,10 +2315,11 @@ fn get_governance_params(state: &NodeState<'_>) -> RpcResult<String> {
     ))
 }
 
+/// Return active proposals and consensus-retained recent terminal proposals.
+///
+/// `total_count` is the number retained in current node state, not a lifetime
+/// proposal count. Older terminal proposals require an archive/indexer.
 fn get_proposals(_params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    // Returns active proposals plus the consensus-retained recent terminal
-    // history. Older terminal proposals are pruned from ChainState; deep history is an archive
-    // node/indexer concern, matching block-pruning precedent.
     let mut proposals: Vec<_> = state.chain.governance.proposals.values().collect();
     proposals.sort_by_key(|proposal| proposal.proposed_epoch);
     let summaries = proposals
@@ -2395,10 +2337,8 @@ fn get_proposals(_params: &[String], state: &NodeState<'_>) -> RpcResult<String>
 
 fn get_proposal(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let proposal_id = parse_hex32_value(&first_param(params, "proposal_id")?, "proposal_id")?;
-    // A missing proposal may either never have existed or may be an old
-    // terminal proposal pruned by the consensus retention rule. Current RPC
-    // intentionally exposes the retained state view only; archive/indexer
-    // tooling is responsible for deep historical lookup.
+    // NotFound deliberately means either never existed or no longer retained;
+    // ordinary node state cannot distinguish those cases.
     let proposal = state
         .chain
         .governance
@@ -2410,8 +2350,8 @@ fn get_proposal(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 
 fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let proposal_id = parse_hex32_value(&first_param(params, "proposal_id")?, "proposal_id")?;
-    // Same retained-state semantics as `indra_getProposal`: votes for pruned
-    // historical proposals are no longer available from ordinary node state.
+    // Same retained-state semantics: NotFound cannot distinguish never-existed
+    // from pruned historical proposals.
     let proposal = state
         .chain
         .governance
@@ -2984,18 +2924,66 @@ mod tests {
         chain.height = u64::MAX;
         let mut active = test_bond(0x91, false);
         active.amount_spark = 60;
+        chain
+            .delegations
+            .add_delegation(active.validator_id, active.delegator_id, 60, 0)
+            .unwrap();
+        chain.staked_bonds.insert(active.utxo_id, active.clone());
+        assert_eq!(
+            rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id),
+            (60, 1, 0, None, None)
+        );
+        let active_only = get_delegations(
+            &[format!(r#""{}""#, hex::encode(active.validator_id.0))],
+            &NodeState::read_only(&chain),
+        )
+        .unwrap();
+        assert!(active_only.contains("\"earliest_unbonding_end_epoch\":null"));
+        assert!(active_only.contains("\"latest_unbonding_end_epoch\":null"));
+
         let mut exiting = test_bond(0x92, false);
         exiting.validator_id = active.validator_id;
         exiting.delegator_id = active.delegator_id;
         exiting.amount_spark = 40;
         exiting.unbonding_end_epoch = Some(1008);
-        chain.staked_bonds.insert(active.utxo_id, active.clone());
+        let mut later_exiting = test_bond(0x93, false);
+        later_exiting.validator_id = active.validator_id;
+        later_exiting.delegator_id = active.delegator_id;
+        later_exiting.amount_spark = 20;
+        later_exiting.unbonding_end_epoch = Some(1017);
         chain.staked_bonds.insert(exiting.utxo_id, exiting);
+        assert_eq!(
+            rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id),
+            (60, 1, 1, Some(1008), Some(1008))
+        );
+        let one_unbonding = get_delegations(
+            &[format!(r#""{}""#, hex::encode(active.validator_id.0))],
+            &NodeState::read_only(&chain),
+        )
+        .unwrap();
+        assert!(one_unbonding.contains("\"earliest_unbonding_end_epoch\":1008"));
+        assert!(one_unbonding.contains("\"latest_unbonding_end_epoch\":1008"));
+        chain
+            .staked_bonds
+            .insert(later_exiting.utxo_id, later_exiting);
 
         assert_eq!(
             rpc_delegator_bond_status(&chain, &active.validator_id, &active.delegator_id,),
-            (60, 1, 1)
+            (60, 1, 2, Some(1008), Some(1017))
         );
+
+        let state = NodeState::read_only(&chain);
+        let validator_param = format!(r#""{}""#, hex::encode(active.validator_id.0));
+        let delegator_param = format!(r#""{}""#, hex::encode(active.delegator_id.0));
+        for response in [
+            get_delegations(&[validator_param.clone()], &state).unwrap(),
+            get_delegator_positions(&[delegator_param], &state).unwrap(),
+            get_validator_delegators(&[validator_param], &state).unwrap(),
+        ] {
+            assert!(response.contains("\"earliest_unbonding_end_epoch\":1008"));
+            assert!(response.contains("\"latest_unbonding_end_epoch\":1017"));
+            assert!(!response.contains("\"unbonding_end_epoch\""));
+        }
     }
 
     fn block_backed_engine() -> BlockBackedEngine {

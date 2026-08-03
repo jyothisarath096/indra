@@ -319,18 +319,9 @@ Archive nodes retain all blocks.
 
 ### 2.9 State migration framework
 
-INDRA uses a versioned state encoding framework (`SCHEMA_VERSION`)
-that allows protocol upgrades without chain state wipes:
-
-- Every persisted struct carries a version byte
-- Decoders handle both old and new encodings
-- Migration functions transform existing state to new schema on startup
-- A `migration.log` records all migrations for operator audit
-- Admin-gated `indra_getSchemaInfo` RPC exposes current schema version and
-  migration history for operators
-
-The current schema version is 4. This framework is essential for
-mainnet deployments where state wipes are not acceptable.
+INDRA persists one canonical mainnet state schema. Unknown schema or storage
+formats fail closed; nodes do not expose or execute a historical migration
+ladder.
 
 ### 2.10 Discovery and operator trust boundaries
 
@@ -895,16 +886,14 @@ Governance
 Completed governance proposals older than the consensus retention window may
 be pruned from ordinary node state; deep historical governance lookup is an
 archive-node or indexer responsibility, matching block-pruning behavior.
-
-Schema
-  indra_getSchemaInfo        Admin-only schema version and migration history
+`indra_getProposals.total_count` therefore means retained count, not lifetime
+count. `NotFound` cannot distinguish a never-existing proposal from one that
+has already been pruned.
 
 Submission
   indra_sendTransaction      Submit a transaction
   indra_submitStakingOp      Submit a staking operation
-  indra_getLegacyScanChallenge        Ownership challenge for legacy scans
-  indra_getLegacyBalanceAuthorized    Authorized legacy UTXO balance scan
-  indra_getLegacyUtxosAuthorized      Authorized legacy UTXO scan
+  indra_getLegacyScanChallenge        Ownership challenge for protocol-output provenance
   indra_getStakingNonce      Replay-protection nonce for staking ops
   indra_getPeers             Connected validator and observer peers
   indra_getRpcPolicy         Listener mode and admin-token policy, no token value

@@ -297,18 +297,20 @@ diagnostics require `X-Admin-Token` on the full listener.
 | `indra_getGovernanceNonce` | Replay-protection nonce |
 | `indra_submitGovernanceOp` | Submit a governance operation |
 
+`indra_getProposals.total_count` is the count retained in current node state,
+not a lifetime proposal count. A proposal `NotFound` response means either that
+the proposal never existed or that it has been pruned; ordinary nodes cannot
+distinguish those cases.
+
 **Admin/operator**
 | Method | Description |
 |--------|-------------|
-| `indra_getSchemaInfo` | Admin-only schema version and migration history |
 | `indra_getPeerTopology` | Admin-only full peer topology |
 
 **Wallet**
 | Method | Description |
 |--------|-------------|
-| `indra_getLegacyScanChallenge` | Ownership challenge for authorized legacy scans |
-| `indra_getLegacyBalanceAuthorized` | Authorized legacy UTXO balance scan |
-| `indra_getLegacyUtxosAuthorized` | Authorized legacy UTXO scan |
+| `indra_getLegacyScanChallenge` | Ownership challenge for protocol-output provenance |
 | `indra_sendTransaction` | Submit a signed transaction |
 | `indra_submitStakingOp` | Submit a staking operation |
 | `indra_getStakingNonce` | Replay-protection nonce for staking |

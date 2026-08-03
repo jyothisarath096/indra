@@ -134,8 +134,6 @@ cat > indra-rpc/src/lib.rs << 'RUST'
 //! | `indra_getHeight`         | Current chain height                           |
 //! | `indra_getBlock`          | Block by height                                |
 //! | `indra_getTip`            | Current tip hash and height                    |
-//! | `indra_getLegacyBalanceAuthorized` | Authorized legacy UTXO balance scan  |
-//! | `indra_getLegacyUtxosAuthorized`   | Authorized legacy UTXO scan          |
 //! | `indra_getMempoolSize`    | Number of pending transactions                 |
 //! | `indra_sendTransaction`   | Submit a signed transaction                    |
 //! | `indra_getTransaction`    | Look up a transaction by ID                    |
