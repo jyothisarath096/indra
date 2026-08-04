@@ -131,6 +131,25 @@ pub struct ColdKeysFile {
     pub pq_pk: Vec<u8>,
 }
 
+/// Public metadata exposed by either canonical keystore family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyFilePublicMetadata {
+    /// Online/hot validator identity metadata.
+    Hot {
+        /// Operator-assigned validator name.
+        name: String,
+        /// Complete public validator identity.
+        public: ValidatorKeys,
+    },
+    /// Offline validator cold-authority metadata.
+    Cold {
+        /// Ed25519 cold public key.
+        classical_pk: [u8; 32],
+        /// ML-DSA-87 cold public key.
+        pq_pk: Vec<u8>,
+    },
+}
+
 impl ColdKeysFile {
     /// Generate through the role-specific independent-entropy primitive.
     pub fn generate() -> KeystoreResult<Self> {
@@ -460,6 +479,64 @@ pub fn inspect_public_metadata(json: &str) -> KeystoreResult<(String, ValidatorK
     }
 }
 
+/// Inspect either canonical hot or cold keystore without decrypting secrets.
+pub fn inspect_key_file_public_metadata(json: &str) -> KeystoreResult<KeyFilePublicMetadata> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+    if value.get("format").and_then(|value| value.as_str()) == Some(COLD_KEYSTORE_FORMAT) {
+        let version = value
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if version != COLD_KEYSTORE_VERSION as u64 {
+            return Err(KeystoreError::UnsupportedVersion(version));
+        }
+        let public = value.get("public").ok_or_else(|| {
+            KeystoreError::Parse("cold keystore is missing public metadata".into())
+        })?;
+        let classical_pk = public
+            .get("classical_pk")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| KeystoreError::Parse("missing field 'classical_pk'".into()))?;
+        let pq_pk = public
+            .get("pq_pk")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| KeystoreError::Parse("missing field 'pq_pk'".into()))?;
+        let classical_pk = decode_hex_fixed::<32>(classical_pk, "classical_pk")?;
+        let pq_pk = decode_hex(pq_pk, "pq_pk")?;
+        if pq_pk.len() != indra_crypto::PQ_PK_BYTES {
+            return Err(KeystoreError::Parse(format!(
+                "cold pq_pk must be {} bytes, got {}",
+                indra_crypto::PQ_PK_BYTES,
+                pq_pk.len()
+            )));
+        }
+        if value.get("crypto").is_some() {
+            let container: ColdEncryptedContainer =
+                serde_json::from_value(value).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+            container.validate()?;
+        } else if value.get("private").is_some() {
+            let container: ColdPlaintextContainer =
+                serde_json::from_value(value).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+            if container.format != COLD_KEYSTORE_FORMAT
+                || container.version != COLD_KEYSTORE_VERSION
+            {
+                return Err(KeystoreError::Parse("invalid cold keystore format".into()));
+            }
+        } else {
+            return Err(KeystoreError::Parse(
+                "cold keystore contains neither encrypted nor plaintext secret material".into(),
+            ));
+        }
+        return Ok(KeyFilePublicMetadata::Cold {
+            classical_pk,
+            pq_pk,
+        });
+    }
+    let (name, public) = inspect_public_metadata(json)?;
+    Ok(KeyFilePublicMetadata::Hot { name, public })
+}
+
 /// Load keys from disk with a password source.
 pub fn load_keys(path: &str, source: PasswordSource<'_>) -> KeystoreResult<KeysFile> {
     KeysFile::load_with_password(path, source)
@@ -573,6 +650,32 @@ pub fn generate_cold_keys_file(
         None => serde_json::to_string_pretty(&ColdPlaintextContainer::from(&keys))
             .map_err(|e| KeystoreError::Parse(e.to_string()))?,
     };
+    let verified = match password {
+        Some(password) => decrypt_cold_keys(&contents, password)?,
+        None => {
+            let container: ColdPlaintextContainer =
+                serde_json::from_str(&contents).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+            let verified = ColdKeysFile {
+                classical_seed: decode_hex_fixed::<32>(
+                    &container.private.classical_seed,
+                    "classical_seed",
+                )?,
+                pq_seed: decode_hex_fixed::<32>(&container.private.pq_seed, "pq_seed")?,
+                classical_pk: decode_hex_fixed::<32>(
+                    &container.public.classical_pk,
+                    "classical_pk",
+                )?,
+                pq_pk: decode_hex(&container.public.pq_pk, "pq_pk")?,
+            };
+            verified.reconstruct()?;
+            verified
+        }
+    };
+    if verified != keys {
+        return Err(KeystoreError::Crypto(
+            "cold keystore round-trip verification failed".into(),
+        ));
+    }
     write_keys_secure(path_to_str(path)?, &contents)?;
     Ok(keys)
 }
@@ -1432,6 +1535,13 @@ mod tests {
         assert!(!json.contains(&hex::encode(generated.classical_seed)));
         let recovered = decrypt_cold_keys(&json, b"cold-password").unwrap();
         assert_eq!(recovered, generated);
+        assert_eq!(
+            inspect_key_file_public_metadata(&json).unwrap(),
+            KeyFilePublicMetadata::Cold {
+                classical_pk: generated.classical_pk,
+                pq_pk: generated.pq_pk.clone(),
+            }
+        );
         assert_ne!(generated.classical_seed, generated.pq_seed);
         let hot = derive_all_seeds(&[0x42; 32]);
         for cold_seed in [generated.classical_seed, generated.pq_seed] {
@@ -1450,6 +1560,30 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unified_public_inspection_distinguishes_hot_and_cold_schemas() {
+        let hot = fixture();
+        let hot_json = encrypt_plaintext_keys(&hot, b"pw").unwrap();
+        assert_eq!(
+            inspect_key_file_public_metadata(&hot_json).unwrap(),
+            KeyFilePublicMetadata::Hot {
+                name: hot.name.clone(),
+                public: hot.public.clone(),
+            }
+        );
+
+        let cold = ColdKeysFile::generate().unwrap();
+        let cold_json = encrypt_cold_keys(&cold, b"pw").unwrap();
+        let mut malformed: serde_json::Value = serde_json::from_str(&cold_json).unwrap();
+        malformed["public"]
+            .as_object_mut()
+            .unwrap()
+            .remove("classical_pk");
+        let error = inspect_key_file_public_metadata(&malformed.to_string()).unwrap_err();
+        assert!(error.to_string().contains("classical_pk"));
+        assert!(!error.to_string().contains("hybrid_classical_pk"));
     }
 
     #[test]

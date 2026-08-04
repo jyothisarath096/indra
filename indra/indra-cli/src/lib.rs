@@ -57,10 +57,12 @@ pub use keygen::{
     decrypt_encrypted_keys, encrypt_cold_keys, encrypt_plaintext_keys,
     encrypt_plaintext_keys_replace, generate_cold_keys_file, generate_cold_share_ceremony,
     generate_from_master_seed, generate_from_new_mnemonic, generate_from_passphrase,
-    has_secret_value_in_argv, inspect_public_metadata, load_cold_keys, load_keys_for_cli,
-    password_source_from_args, read_cold_share, reconstruct_cold_shares, recover_from_mnemonic,
-    warn_if_key_file_permissive, write_cold_share_secure, write_keys_file_secure, ColdKeysFile,
-    ColdShareCeremony, ColdShareFile, ColdShareManifest, KeysFile, PasswordSource, ValidatorKeys,
+    has_secret_value_in_argv, inspect_key_file_public_metadata, inspect_public_metadata,
+    load_cold_keys, load_keys_for_cli, password_source_from_args, read_cold_share,
+    reconstruct_cold_shares, recover_from_mnemonic, warn_if_key_file_permissive,
+    write_cold_share_secure, write_keys_file_secure, ColdKeysFile, ColdShareCeremony,
+    ColdShareFile, ColdShareManifest, KeyFilePublicMetadata, KeysFile, PasswordSource,
+    ValidatorKeys,
 };
 pub use legacy_scan_auth::{
     build_legacy_scan_auth_proof, fetch_legacy_scan_challenge, json_string, rpc_call_raw_params,

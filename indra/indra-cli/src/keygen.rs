@@ -10,11 +10,12 @@ pub use indra_keystore::{
     check_password_file_permissions, decrypt_encrypted_keys, encrypt_cold_keys,
     encrypt_plaintext_keys, encrypt_plaintext_keys_replace, generate_cold_keys_file,
     generate_cold_share_ceremony, generate_from_master_seed, generate_from_new_mnemonic,
-    generate_from_passphrase, has_secret_value_in_argv, inspect_public_metadata, load_cold_keys,
-    load_keys, read_cold_share, reconstruct_cold_shares, recover_from_mnemonic,
-    warn_if_key_file_permissive, write_cold_share_secure,
+    generate_from_passphrase, has_secret_value_in_argv, inspect_key_file_public_metadata,
+    inspect_public_metadata, load_cold_keys, load_keys, read_cold_share, reconstruct_cold_shares,
+    recover_from_mnemonic, warn_if_key_file_permissive, write_cold_share_secure,
     write_keys_secure as write_keys_file_secure, ColdKeysFile, ColdShareCeremony, ColdShareFile,
-    ColdShareManifest, KeysFile, KeystoreError, PasswordSource, ValidatorKeys,
+    ColdShareManifest, KeyFilePublicMetadata, KeysFile, KeystoreError, PasswordSource,
+    ValidatorKeys,
 };
 
 /// Convert a keystore result into the CLI error type.

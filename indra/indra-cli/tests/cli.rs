@@ -140,6 +140,37 @@ fn keygen_cold_cli_encrypts_preserves_hot_file_and_requires_force_to_overwrite()
         },
     )
     .unwrap();
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args(["inspect", "--keys", cold_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect_stdout = String::from_utf8(inspect.stdout).unwrap();
+    assert!(inspect_stdout.contains("validator cold authority"));
+    assert!(inspect_stdout.contains("PQ PK bytes:"));
+
+    let forbidden_plaintext = dir.join("cold-plaintext.json");
+    let decrypt = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "decrypt",
+            "--keys",
+            cold_path.to_str().unwrap(),
+            "--out",
+            forbidden_plaintext.to_str().unwrap(),
+            "--password-file",
+            password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!decrypt.status.success());
+    assert!(!forbidden_plaintext.exists());
+    assert!(String::from_utf8_lossy(&decrypt.stderr)
+        .contains("plaintext cold-key export is prohibited"));
     assert!(stdout.contains(&hex::encode(loaded.classical_pk)));
     assert!(stdout.contains(&hex::encode(&loaded.pq_pk)));
     #[cfg(unix)]

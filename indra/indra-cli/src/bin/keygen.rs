@@ -244,6 +244,20 @@ fn cmd_decrypt(args: &[String]) {
         eprintln!("Failed to read {}: {}", keys_path, e);
         std::process::exit(1);
     });
+    match indra_cli::inspect_key_file_public_metadata(&json) {
+        Ok(indra_cli::KeyFilePublicMetadata::Hot { .. }) => {}
+        Ok(indra_cli::KeyFilePublicMetadata::Cold { .. }) => {
+            eprintln!(
+                "Failed to decrypt keys: plaintext cold-key export is prohibited; use `cold split` \
+                 for backup or `cold recover` to create an encrypted temporary cold keystore"
+            );
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("Failed to parse keys: {error}");
+            std::process::exit(1);
+        }
+    }
     let password = keygen_password_source_slice(args)
         .resolve(false)
         .unwrap_or_else(|e| {
@@ -270,22 +284,34 @@ fn cmd_inspect(args: &[String]) {
         eprintln!("Failed to read {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let (name, public) = indra_cli::inspect_public_metadata(&json).unwrap_or_else(|e| {
+    let metadata = indra_cli::inspect_key_file_public_metadata(&json).unwrap_or_else(|e| {
         eprintln!("Failed to inspect keys: {}", e);
         std::process::exit(1);
     });
-    println!("Validator Name: {}", name);
-    println!("Validator ID:   {}", hex::encode(public.validator_id));
-    println!(
-        "Classical PK:   {}",
-        hex::encode(public.hybrid_classical_pk)
-    );
-    println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
-    println!("VRF PK:         {}", hex::encode(public.vrf_pk));
-    if let Some(payment_pubkey) = &public.payment_pubkey {
-        println!("Payment PK:     {}", hex::encode(payment_pubkey.encode()));
-    } else {
-        println!("Payment PK:     <absent>");
+    match metadata {
+        indra_cli::KeyFilePublicMetadata::Hot { name, public } => {
+            println!("Validator Name: {}", name);
+            println!("Validator ID:   {}", hex::encode(public.validator_id));
+            println!(
+                "Classical PK:   {}",
+                hex::encode(public.hybrid_classical_pk)
+            );
+            println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
+            println!("VRF PK:         {}", hex::encode(public.vrf_pk));
+            if let Some(payment_pubkey) = &public.payment_pubkey {
+                println!("Payment PK:     {}", hex::encode(payment_pubkey.encode()));
+            } else {
+                println!("Payment PK:     <absent>");
+            }
+        }
+        indra_cli::KeyFilePublicMetadata::Cold {
+            classical_pk,
+            pq_pk,
+        } => {
+            println!("Key Role:       validator cold authority");
+            println!("Classical PK:   {}", hex::encode(classical_pk));
+            println!("PQ PK bytes:    {}", pq_pk.len());
+        }
     }
 }
 
