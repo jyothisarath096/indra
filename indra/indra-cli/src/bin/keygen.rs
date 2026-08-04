@@ -290,6 +290,14 @@ fn cmd_inspect(args: &[String]) {
 }
 
 fn cmd_cold(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("ceremony") => return cmd_cold_ceremony(&args[1..]),
+        Some("split") => return cmd_cold_split(&args[1..]),
+        Some("verify") => return cmd_cold_verify(&args[1..]),
+        Some("recover") => return cmd_cold_recover(&args[1..]),
+        Some("reshare") => return cmd_cold_reshare(&args[1..]),
+        _ => {}
+    }
     let output = get(args, "--output").unwrap_or_else(|| "validator-cold-keys.json".to_string());
     let plaintext_unsafe = args.iter().any(|arg| arg == "--plaintext-unsafe");
     let force = args.iter().any(|arg| arg == "--force");
@@ -320,6 +328,202 @@ fn cmd_cold(args: &[String]) {
     println!("Classical PK: {}", hex::encode(keys.classical_pk));
     println!("PQ PK:        {}", hex::encode(keys.pq_pk));
     println!("Hot keys.json was not read or modified.");
+}
+
+fn cold_fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("Cold-key ceremony failed: {message}");
+    std::process::exit(1)
+}
+
+fn required(args: &[String], flag: &str) -> String {
+    get(args, flag).unwrap_or_else(|| cold_fail(format!("missing required flag {flag}")))
+}
+
+fn parse_u8_flag(args: &[String], flag: &str) -> u8 {
+    required(args, flag)
+        .parse::<u8>()
+        .unwrap_or_else(|_| cold_fail(format!("{flag} must be an integer in 0..=255")))
+}
+
+fn parse_hex32_flag(args: &[String], flag: &str) -> [u8; 32] {
+    let value = required(args, flag);
+    let bytes = hex::decode(&value).unwrap_or_else(|_| cold_fail(format!("{flag} is invalid hex")));
+    bytes
+        .try_into()
+        .unwrap_or_else(|_| cold_fail(format!("{flag} must contain exactly 32 bytes")))
+}
+
+fn share_paths(args: &[String]) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--share" {
+            let path = args
+                .get(index + 1)
+                .unwrap_or_else(|| cold_fail("--share requires a path"));
+            paths.push(std::path::PathBuf::from(path));
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    if paths.is_empty() {
+        cold_fail("provide repeated --share <path> arguments");
+    }
+    paths
+}
+
+fn load_share_set(args: &[String]) -> Vec<indra_cli::ColdShareFile> {
+    share_paths(args)
+        .iter()
+        .map(|path| indra_cli::read_cold_share(path).unwrap_or_else(|e| cold_fail(e)))
+        .collect()
+}
+
+fn write_ceremony(ceremony: &indra_cli::ColdShareCeremony, out_dir: &std::path::Path, force: bool) {
+    std::fs::create_dir_all(out_dir).unwrap_or_else(|e| cold_fail(e));
+    let manifest_path = out_dir.join("ceremony.json");
+    let share_paths: Vec<_> = ceremony
+        .shares
+        .iter()
+        .map(|share| out_dir.join(format!("share-{:03}.json", share.share_index)))
+        .collect();
+    if !force {
+        for path in std::iter::once(&manifest_path).chain(share_paths.iter()) {
+            if path.exists() {
+                cold_fail(format!("{} already exists", path.display()));
+            }
+        }
+    }
+    let manifest_json =
+        serde_json::to_string_pretty(&ceremony.manifest).unwrap_or_else(|e| cold_fail(e));
+    indra_cli::write_keys_file_secure(
+        manifest_path
+            .to_str()
+            .unwrap_or_else(|| cold_fail("output path is not UTF-8")),
+        &manifest_json,
+    )
+    .unwrap_or_else(|e| cold_fail(e));
+    for (share, path) in ceremony.shares.iter().zip(share_paths) {
+        indra_cli::write_cold_share_secure(&path, share, force).unwrap_or_else(|e| cold_fail(e));
+    }
+    println!(
+        "Cold-key ceremony created: {}-of-{}",
+        ceremony.manifest.threshold, ceremony.manifest.share_count
+    );
+    println!("Ceremony ID: {}", ceremony.manifest.ceremony_id);
+    println!("Cold classical PK: {}", ceremony.manifest.cold_classical_pk);
+    println!("Cold PQ PK: {}", ceremony.manifest.cold_pq_pk);
+    println!("Distribute shares to separate custodians and physical locations.");
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn build_ceremony(keys: &indra_cli::ColdKeysFile, args: &[String]) -> indra_cli::ColdShareCeremony {
+    indra_cli::generate_cold_share_ceremony(
+        keys,
+        parse_hex32_flag(args, "--validator-id"),
+        parse_u8_flag(args, "--threshold"),
+        parse_u8_flag(args, "--shares"),
+        now_unix_seconds(),
+        &mut rand::rngs::OsRng,
+    )
+    .unwrap_or_else(|e| cold_fail(e))
+}
+
+fn cmd_cold_ceremony(args: &[String]) {
+    let mut keys = indra_cli::ColdKeysFile::generate().unwrap_or_else(|e| cold_fail(e));
+    let ceremony = build_ceremony(&keys, args);
+    write_ceremony(
+        &ceremony,
+        std::path::Path::new(&required(args, "--out-dir")),
+        args.iter().any(|arg| arg == "--force"),
+    );
+    keys.zeroize_secret_material();
+    println!("No complete cold secret was written to disk.");
+}
+
+fn cmd_cold_split(args: &[String]) {
+    let mut keys = indra_cli::load_cold_keys(
+        &required(args, "--cold-keys"),
+        keygen_password_source_slice(args),
+    )
+    .unwrap_or_else(|e| cold_fail(e));
+    let ceremony = build_ceremony(&keys, args);
+    write_ceremony(
+        &ceremony,
+        std::path::Path::new(&required(args, "--out-dir")),
+        args.iter().any(|arg| arg == "--force"),
+    );
+    keys.zeroize_secret_material();
+    println!("The source keystore was not modified; retain or destroy it according to your ceremony policy.");
+}
+
+fn cmd_cold_verify(args: &[String]) {
+    let shares = load_share_set(args);
+    let mut keys = indra_cli::reconstruct_cold_shares(&shares).unwrap_or_else(|e| cold_fail(e));
+    keys.reconstruct().unwrap_or_else(|e| cold_fail(e));
+    keys.zeroize_secret_material();
+    println!("Shares reconstruct the expected complete hybrid cold public key.");
+    println!("No reconstructed key file was written.");
+}
+
+fn cmd_cold_recover(args: &[String]) {
+    if !args
+        .iter()
+        .any(|arg| arg == "--acknowledge-destroy-after-use")
+    {
+        cold_fail("recover requires --acknowledge-destroy-after-use");
+    }
+    if args.iter().any(|arg| arg == "--plaintext-unsafe") {
+        cold_fail("plaintext cold-key recovery is never supported");
+    }
+    let mut keys =
+        indra_cli::reconstruct_cold_shares(&load_share_set(args)).unwrap_or_else(|e| cold_fail(e));
+    let output = required(args, "--output");
+    if std::path::Path::new(&output).exists() && !args.iter().any(|arg| arg == "--force") {
+        cold_fail(format!(
+            "{output} already exists; pass --force to overwrite"
+        ));
+    }
+    let password = keygen_password_source_slice(args)
+        .resolve(true)
+        .unwrap_or_else(|e| cold_fail(e));
+    let encrypted =
+        indra_cli::encrypt_cold_keys(&keys, password.as_bytes()).unwrap_or_else(|e| cold_fail(e));
+    indra_cli::write_keys_file_secure(&output, &encrypted).unwrap_or_else(|e| cold_fail(e));
+    let mut verified = indra_keystore::decrypt_cold_keys(&encrypted, password.as_bytes())
+        .unwrap_or_else(|e| cold_fail(e));
+    if verified != keys {
+        cold_fail("encrypted recovery output failed verification");
+    }
+    verified.zeroize_secret_material();
+    keys.zeroize_secret_material();
+    println!("Encrypted temporary cold keystore written to {output}.");
+    println!("DESTROY THIS RECOVERED KEYSTORE IMMEDIATELY AFTER SIGNING OR RE-SHARING.");
+}
+
+fn cmd_cold_reshare(args: &[String]) {
+    let shares = load_share_set(args);
+    let mut keys = indra_cli::reconstruct_cold_shares(&shares).unwrap_or_else(|e| cold_fail(e));
+    let mut ceremony_args = args.to_vec();
+    if get(args, "--validator-id").is_none() {
+        ceremony_args.push("--validator-id".into());
+        ceremony_args.push(shares[0].manifest.validator_id.clone());
+    }
+    let ceremony = build_ceremony(&keys, &ceremony_args);
+    write_ceremony(
+        &ceremony,
+        std::path::Path::new(&required(args, "--out-dir")),
+        args.iter().any(|arg| arg == "--force"),
+    );
+    keys.zeroize_secret_material();
+    println!("No intermediate complete cold keystore was written.");
 }
 
 fn get(args: &[String], flag: &str) -> Option<String> {
@@ -353,7 +557,7 @@ fn keygen_password_source_slice(args: &[String]) -> indra_cli::PasswordSource<'_
 
 fn print_help() {
     println!(
-        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--chain-id id] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path | --plaintext-unsafe] [--force]\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json"
+        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--chain-id id] [--recover|--passphrase] [--keys-password-file path|--plaintext-unsafe]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path | --plaintext-unsafe] [--force]\n  indra-keygen cold ceremony --validator-id <hex> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold split --cold-keys <path> --validator-id <hex> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold verify --share <path> [--share <path> ...]\n  indra-keygen cold recover --share <path> ... --output <encrypted.json> --acknowledge-destroy-after-use [--keys-password-file path]\n  indra-keygen cold reshare --share <path> ... --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen encrypt --keys keys.json (--out encrypted.json | --replace) [--password-file path]\n  indra-keygen decrypt --keys keys.json --out plaintext.json [--password-file path]\n  indra-keygen inspect --keys keys.json"
     );
 }
 

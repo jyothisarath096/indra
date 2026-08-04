@@ -24,6 +24,12 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+mod cold_shamir;
+pub use cold_shamir::{
+    generate_cold_share_ceremony, read_cold_share, reconstruct_cold_shares,
+    write_cold_share_secure, ColdShareCeremony, ColdShareFile, ColdShareManifest,
+};
+
 /// Required filesystem mode for key/password files on Unix: owner read/write only.
 pub const KEY_FILE_MODE: u32 = 0o600;
 /// INDRA encrypted keystore top-level format marker.
@@ -152,6 +158,12 @@ impl ColdKeysFile {
             ));
         }
         Ok(keypair)
+    }
+
+    /// Zeroize the persisted secret seeds held by this in-memory value.
+    pub fn zeroize_secret_material(&mut self) {
+        self.classical_seed.zeroize();
+        self.pq_seed.zeroize();
     }
 }
 
@@ -470,14 +482,21 @@ pub fn encrypt_cold_keys(keys: &ColdKeysFile, password: &[u8]) -> KeystoreResult
     };
     let mut container = ColdEncryptedContainer::new(public, salt, nonce);
     let aad = container.associated_data()?;
-    let private = ColdPrivateJson {
+    let mut private = ColdPrivateJson {
         classical_seed: hex::encode(keys.classical_seed),
         pq_seed: hex::encode(keys.pq_seed),
     };
-    let plaintext =
-        serde_json::to_vec(&private).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-    container.crypto.cipher.ciphertext =
-        hex::encode(encrypt_payload(password, &salt, &nonce, &aad, &plaintext)?);
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&private).map_err(|e| KeystoreError::Parse(e.to_string()))?,
+    );
+    private.zeroize();
+    container.crypto.cipher.ciphertext = hex::encode(encrypt_payload(
+        password,
+        &salt,
+        &nonce,
+        &aad,
+        plaintext.as_slice(),
+    )?);
     serde_json::to_string_pretty(&container).map_err(|e| KeystoreError::Parse(e.to_string()))
 }
 
@@ -491,8 +510,8 @@ pub fn decrypt_cold_keys(json: &str, password: &[u8]) -> KeystoreResult<ColdKeys
     let nonce =
         decode_hex_fixed::<CHACHA_NONCE_BYTES>(&container.crypto.cipher.params.nonce, "nonce")?;
     let ciphertext = decode_hex(&container.crypto.cipher.ciphertext, "ciphertext")?;
-    let plaintext = decrypt_payload(password, &salt, &nonce, &aad, &ciphertext)?;
-    let private: ColdPrivateJson =
+    let plaintext = Zeroizing::new(decrypt_payload(password, &salt, &nonce, &aad, &ciphertext)?);
+    let mut private: ColdPrivateJson =
         serde_json::from_slice(&plaintext).map_err(|e| KeystoreError::Parse(e.to_string()))?;
     let keys = ColdKeysFile {
         classical_seed: decode_hex_fixed::<32>(&private.classical_seed, "classical_seed")?,
@@ -500,6 +519,7 @@ pub fn decrypt_cold_keys(json: &str, password: &[u8]) -> KeystoreResult<ColdKeys
         classical_pk: decode_hex_fixed::<32>(&container.public.classical_pk, "classical_pk")?,
         pq_pk: decode_hex(&container.public.pq_pk, "pq_pk")?,
     };
+    private.zeroize();
     keys.reconstruct()?;
     Ok(keys)
 }
@@ -826,7 +846,7 @@ struct ColdPublicJson {
     pq_pk: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Zeroize)]
 struct ColdPrivateJson {
     classical_seed: String,
     pq_seed: String,

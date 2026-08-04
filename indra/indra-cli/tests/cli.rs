@@ -148,6 +148,123 @@ fn keygen_cold_cli_encrypts_preserves_hot_file_and_requires_force_to_overwrite()
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
+    let dir = temp_dir("cold-share-ceremony");
+    let shares_dir = dir.join("shares");
+    let recovered = dir.join("recovered-cold.json");
+    let password_path = dir.join("cold-password.txt");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&password_path, b"ceremony-password\n").unwrap();
+    let validator_id = hex::encode([0x42; 32]);
+
+    let generated = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "ceremony",
+            "--validator-id",
+            &validator_id,
+            "--threshold",
+            "2",
+            "--shares",
+            "3",
+            "--out-dir",
+            shares_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(!shares_dir.join("validator-cold-keys.json").exists());
+
+    let share_1 = shares_dir.join("share-001.json");
+    let share_2 = shares_dir.join("share-002.json");
+    let insufficient = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args(["cold", "verify", "--share", share_1.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!insufficient.status.success());
+
+    let verified = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "verify",
+            "--share",
+            share_1.to_str().unwrap(),
+            "--share",
+            share_2.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(verified.status.success());
+
+    let no_ack = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "recover",
+            "--share",
+            share_1.to_str().unwrap(),
+            "--share",
+            share_2.to_str().unwrap(),
+            "--output",
+            recovered.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!no_ack.status.success());
+    assert!(!recovered.exists());
+
+    let recovery = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "recover",
+            "--share",
+            share_1.to_str().unwrap(),
+            "--share",
+            share_2.to_str().unwrap(),
+            "--output",
+            recovered.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+            "--acknowledge-destroy-after-use",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    let json = std::fs::read_to_string(&recovered).unwrap();
+    assert!(json.contains("indra-cold-keystore"));
+    assert!(!json.contains("classical_seed"));
+    load_cold_keys(
+        recovered.to_str().unwrap(),
+        PasswordSource::File {
+            path: &password_path,
+            reject_permissive: false,
+        },
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [share_1, share_2, recovered] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // ── Genesis tests ─────────────────────────────────────────────────────────────
 
 #[test]
