@@ -43,7 +43,7 @@ use indra_core::{
             bps_of, Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
             SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
-            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
+            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
         },
         qc::QuorumCertificateV1,
         slash_membership::SlashMembershipRootRecord,
@@ -1318,10 +1318,9 @@ mod tests {
     use crate::chain::ChainState;
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
-        GOVERNANCE_DELIBERATION_EPOCHS,
     };
     use crate::state_root::compute_state_root;
-    use crate::validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};
+    use crate::validator::{ValidatorEntry, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         codec::Encode,
@@ -1334,14 +1333,11 @@ mod tests {
             },
             primitives::{
                 BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS,
-                GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK,
-                MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-                MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_SELF_STAKE_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS,
-                STAKING_TX_IDX, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
-                UNBONDING_PERIOD_EPOCHS,
+                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_INPUTS, MAX_OUTPUTS, MAX_STAKING_OPS_PER_BLOCK,
+                MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
             },
             slash_membership::build_slash_membership_proof,
-            slashing::{SlashEvidenceV1, SlashEvidenceV2},
+            slashing::SlashEvidenceV2,
             staking::{StakingOp, StakingOpBody},
             transaction::{InputV1, OutputV1, TransactionV1},
             vote::{VoteStep, VoteV1},

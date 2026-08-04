@@ -192,28 +192,6 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
     wallet
 }
 
-fn resolve_recipient_pubkey(rpc: &str, address_hex: &str) -> HybridPubKey {
-    let raw = rpc_call(rpc, "indra_getValidator", &[address_hex.to_string()]);
-    let classical = extract_hex_string(&raw, "hybrid_classical_pk").unwrap_or_else(|| {
-        eprintln!(
-            "Error: recipient {} not found in validator set",
-            address_hex
-        );
-        std::process::exit(1);
-    });
-    let pq = extract_hex_string(&raw, "hybrid_pq_pk").unwrap_or_else(|| {
-        eprintln!("Error: recipient {} missing PQ key", address_hex);
-        std::process::exit(1);
-    });
-    HybridPubKey {
-        classical_pk: Bytes32::from(copy32(&classical)),
-        pq_pk: VariableBytes::from_slice(&pq).unwrap_or_else(|_| {
-            eprintln!("Error: recipient PQ key too large");
-            std::process::exit(1);
-        }),
-    }
-}
-
 fn rpc_call(url: &str, method: &str, params: &[String]) -> String {
     let url = url.trim_start_matches("http://");
     let (host, path) = if let Some(pos) = url.find('/') {
@@ -265,25 +243,6 @@ fn required_arg(args: &[String], flag: &str) -> String {
         eprintln!("Error: {} required", flag);
         std::process::exit(1);
     })
-}
-
-fn extract_hex_string(json: &str, field: &str) -> Option<Vec<u8>> {
-    let key = format!("\"{}\":", field);
-    let pos = json.find(&key)?;
-    let after = json[pos + key.len()..].trim_start();
-    let after = after.strip_prefix('"')?;
-    let end = after.find('"')?;
-    hex::decode(&after[..end]).ok()
-}
-
-fn copy32(bytes: &[u8]) -> [u8; 32] {
-    if bytes.len() < 32 {
-        eprintln!("Error: expected 32-byte field");
-        std::process::exit(1);
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes[..32]);
-    arr
 }
 
 #[cfg(test)]

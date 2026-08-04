@@ -418,20 +418,17 @@ pub(crate) fn delegator_identity_value_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smt::CompressedAuthTree;
     use indra_core::{
         codec::{Decode, Encode},
         types::{
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::{CommitmentV1, HybridPubKey},
-            primitives::UNBONDING_PERIOD_EPOCHS,
             reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
             transaction::OutputV1,
         },
         VariableBytes,
     };
-    use std::time::Instant;
-
-    use crate::smt::CompressedAuthTree;
 
     fn id(byte: u8) -> Bytes32 {
         Bytes32::from([byte; 32])

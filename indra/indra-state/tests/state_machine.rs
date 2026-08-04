@@ -12,19 +12,17 @@ use indra_core::{
         primitives::{
             DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES,
-            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
+            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
         },
         qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
-        slashing::SlashEvidenceV1,
         staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
-        vote::{VoteStep, VoteV1},
     },
     Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
 use indra_crypto::{
-    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair,
-    ColdHybridKeypair, HybridKeypair, PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
+    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
+    PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
 };
 use indra_state::{
     apply_block, compute_state_root,
@@ -166,36 +164,6 @@ fn sign_transaction(
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-    }
-}
-
-fn signed_vote(
-    keypair: &HybridKeypair,
-    validator_id: Bytes32,
-    step: VoteStep,
-    block_hash: Bytes32,
-) -> VoteV1 {
-    let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
-        7,
-        0,
-        step,
-        &block_hash,
-        &validator_id,
-        None,
-        indra_core::types::primitives::DEFAULT_CHAIN_ID,
-    );
-    let sig = keypair.sign(&signing_bytes).unwrap();
-    VoteV1 {
-        height: 7,
-        round: 0,
-        step,
-        block_hash,
-        validator_id,
-        election_result_hash: None,
-        signature: HybridSignature {
-            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-        },
     }
 }
 

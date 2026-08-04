@@ -13,7 +13,7 @@ use indra_consensus::{
     error::ConsensusError,
     proposer::{
         compute_fallback_election_result, compute_proposer_vrf, compute_vrf_input,
-        elect_proposer_from_reveals, ProposerCandidate, ProposerElection,
+        elect_proposer_from_reveals, ProposerElection,
     },
     verify_qc,
     vote::{RegisteredVoter, VoteCollector, VoteDecision},
@@ -960,6 +960,7 @@ impl ConsensusDriver {
         })
     }
 
+    #[cfg(test)]
     fn active_vrf_candidates(&self, height: u64, round: u32) -> ProposerElection {
         let epoch_seed = Bytes32::from(indra_crypto::sha256(&self.engine.state.tip_hash.0));
         let candidates = self
@@ -968,12 +969,14 @@ impl ConsensusDriver {
             .validators
             .active_validators()
             .filter_map(|validator| {
-                validator.vrf_pk.map(|vrf_pubkey| ProposerCandidate {
-                    validator_id: validator.validator_id,
-                    vrf_pubkey,
-                    verified_vrf_output: None,
-                    stake: validator.stake_spark,
-                })
+                validator
+                    .vrf_pk
+                    .map(|vrf_pubkey| indra_consensus::proposer::ProposerCandidate {
+                        validator_id: validator.validator_id,
+                        vrf_pubkey,
+                        verified_vrf_output: None,
+                        stake: validator.stake_spark,
+                    })
             })
             .collect();
         ProposerElection {

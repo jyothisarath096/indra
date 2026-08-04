@@ -3,22 +3,16 @@
 //! Tracks each validator's stake, status, and accumulated reward.
 //! The validator set is snapshotted at each epoch boundary.
 
-use std::{cell::RefCell, collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
-use indra_core::types::{
-    primitives::{
-        max_active_validators, muldiv, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
-        MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN,
-        MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
-        SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS, UNBONDING_PERIOD_EPOCHS,
-    },
-    transaction::OutputV1,
+use indra_core::types::primitives::{
+    max_active_validators, Bytes32, MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN,
+    MINIMUM_ACTIVE_SELF_STAKE_SPARK,
 };
 
 use crate::error::{StateError, StateResult};
-use crate::persistent::PersistentOrdMap;
 
 const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 1;
 /// Consensus ceiling for active delegator entries under one validator.
@@ -799,6 +793,7 @@ impl ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
     fn hybrid_components(seed: u8) -> ([u8; 32], [u8; indra_crypto::PQ_PK_BYTES]) {
         let keypair = indra_crypto::HybridKeypair::new(

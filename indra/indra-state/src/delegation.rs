@@ -8,9 +8,8 @@ use indra_core::types::{
     crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
         Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
-        MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-        MINIMUM_VALIDATOR_SELF_STAKE_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN,
-        STAKING_TX_IDX, UNBONDING_PERIOD_EPOCHS,
+        MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+        MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
     },
     staking::{validate_network_addr_string, StakeDepositProof, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -288,7 +287,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             deposit_proof.as_ref(),
             current_height,
             identity_registry_active,
-            true,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
         ),
         StakingOpBody::ExitStakePosition { .. } => {
@@ -322,7 +320,6 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             deposit_proof.as_ref(),
             cold_pubkey.as_ref(),
             current_height,
-            identity_registry_active,
         ),
         StakingOpBody::SetCommission {
             validator_id,
@@ -609,7 +606,6 @@ fn apply_register_validator(
     deposit_proof: Option<&StakeDepositProof>,
     cold_pubkey: Option<&ColdHybridPubKey>,
     current_height: u64,
-    identity_registry_active: bool,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
         || commission_bps > state.governance.params.max_commission_bps
@@ -980,7 +976,6 @@ fn apply_delegate(
     deposit_proof: Option<&StakeDepositProof>,
     current_height: u64,
     identity_registry_active: bool,
-    position_accounting_active: bool,
     bond_count_cap: Option<usize>,
 ) -> StateResult<()> {
     let validator = state
@@ -1554,7 +1549,6 @@ mod tests {
         chain::ChainState,
         validator::{ValidatorEntry, ValidatorStatus},
     };
-    use indra_core::codec::Encode;
     use indra_core::types::{
         crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
         primitives::VariableBytes,

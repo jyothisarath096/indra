@@ -292,11 +292,7 @@ impl Decode for ChainState {
         } else {
             None
         };
-        validate_reward_economic_pairing(
-            &consensus_snapshots,
-            reward_economic_snapshot.as_ref(),
-            height,
-        )?;
+        validate_reward_economic_pairing(&consensus_snapshots, reward_economic_snapshot.as_ref())?;
         let slash_membership_roots = decode_list(
             r,
             MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
@@ -1019,7 +1015,6 @@ fn decode_tombstones(
 fn validate_reward_economic_pairing(
     consensus_snapshots: &[ConsensusSnapshot],
     economic: Option<&RewardEconomicSnapshot>,
-    height: u64,
 ) -> IndraResult<()> {
     let economic = economic.ok_or_else(|| {
         IndraError::InvalidRewardEconomicSnapshot(

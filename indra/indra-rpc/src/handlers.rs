@@ -2611,17 +2611,13 @@ mod tests {
                 ProposalTier,
             },
             primitives::{MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES},
-            slashing::SlashEvidenceV1,
             stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
             staking::{StakingOp, StakingOpBody},
             transaction::OutputV1,
-            vote::{VoteStep, VoteV1},
         },
         Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{
-        sha256, ClassicalKeypair, HybridKeypair, PaymentKeypairV1, PqKeypair, VrfKeypair,
-    };
+    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
     use indra_state::{
         governance::{ProposalPhase, ProposalRecord},
         ChainState,
@@ -2712,26 +2708,6 @@ mod tests {
         };
         engine.blocks.get_mut(&1).unwrap().transactions.push(tx);
         engine
-    }
-
-    fn test_pubkey(byte: u8) -> HybridPubKey {
-        HybridPubKey {
-            classical_pk: Bytes32::from([byte; 32]),
-            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap_or_default(),
-        }
-    }
-
-    fn test_output(byte: u8) -> OutputV1 {
-        OutputV1 {
-            value_spark: 1_000_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
-            },
-            owner_pubkey: test_pubkey(byte),
-            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[byte; 32])
-                .unwrap_or_default(),
-            lock_height: 0,
-        }
     }
 
     fn dummy_signature(byte: u8) -> HybridSignature {

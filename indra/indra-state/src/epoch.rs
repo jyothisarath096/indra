@@ -17,18 +17,14 @@
 use std::collections::HashSet;
 
 use indra_core::{
-    types::{
-        crypto::CommitmentV1,
-        primitives::{
-            bps_of, muldiv, Bytes32, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS,
-            ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
-            ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
-            MINIMUM_ACTIVE_SELF_STAKE_SPARK, SATURATION_MIN_VALIDATORS,
-        },
+    types::primitives::{
+        bps_of, muldiv, Bytes32, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
+        ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
+        ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+        SATURATION_MIN_VALIDATORS,
     },
     EpochRecord,
 };
-use rand::SeedableRng;
 
 use crate::{
     chain::ChainState,

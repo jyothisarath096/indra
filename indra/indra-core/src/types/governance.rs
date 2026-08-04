@@ -633,8 +633,8 @@ impl GovernanceOpV2 {
         ))
     }
 
-    /// Enforce the enrollment-gated structural split between legacy and cold forms.
-    pub fn validate_structure_at_height(&self, height: u64) -> IndraResult<()> {
+    /// Enforce the canonical structural rules for governance authorization.
+    pub fn validate_structure(&self) -> IndraResult<()> {
         if self.payload.action_type() != self.action_type {
             return Err(IndraError::InvariantViolation {
                 message: "governance payload/action type mismatch",

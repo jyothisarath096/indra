@@ -184,31 +184,6 @@ fn parse_cli_indra_amount(raw: &str, flag: &str) -> indra_cli::CliResult<u64> {
     indra_cli::parse_indra_amount_to_spark(raw, flag)
 }
 
-fn resolve_recipient(node_url: &str, to: &str) -> String {
-    if to.contains(':') {
-        return to.to_string();
-    }
-
-    if to.len() == 64 {
-        if let Some(pubkey_hex) = lookup_validator_pubkey(node_url, to) {
-            return pubkey_hex;
-        }
-    }
-
-    to.to_string()
-}
-
-fn lookup_validator_pubkey(node_url: &str, address: &str) -> Option<String> {
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","method":"indra_getValidator","params":["{}"],"id":1}}"#,
-        address
-    );
-    let response = submit_raw_rpc(node_url, &body).ok()?;
-    let classical = extract_json_field(&response, "hybrid_classical_pk")?;
-    let pq = extract_json_field(&response, "hybrid_pq_pk")?;
-    Some(format!("{classical}:{pq}"))
-}
-
 /// Submit a hex-encoded transaction to the node via JSON-RPC.
 fn submit_transaction(node_url: &str, tx_hex: &str) -> Result<String, String> {
     let body = format!(
@@ -253,22 +228,6 @@ fn submit_raw_rpc(node_url: &str, body: &str) -> Result<String, String> {
     } else {
         Ok(response)
     }
-}
-
-fn extract_json_field(json: &str, field: &str) -> Option<String> {
-    let key = format!("\"{field}\":\"");
-    let pos = json.find(&key)?;
-    let after = &json[pos + key.len()..];
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
-}
-
-fn extract_number(json: &str, field: &str) -> Option<u64> {
-    let key = format!("\"{field}\":");
-    let pos = json.find(&key)?;
-    let after = json[pos + key.len()..].trim_start();
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
 }
 
 #[cfg(test)]

@@ -364,16 +364,6 @@ impl<'a> StateTxn<'a> {
         self.after_mutation()
     }
 
-    /// Set the isolated lifecycle nonce for a principal owner.
-    pub(crate) fn set_position_nonce(&mut self, owner_id: Bytes32, nonce: u64) -> StateResult<()> {
-        self.snapshot_staking_nonces();
-        if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
-            commitment.put_staking_nonce(&owner_id, nonce);
-        }
-        self.state.staking_nonces.insert(owner_id, nonce);
-        self.after_mutation()
-    }
-
     /// Mutate base fee.
     pub(crate) fn set_base_fee(&mut self, base_fee: u64) -> StateResult<()> {
         self.record_scalars();
@@ -514,11 +504,6 @@ impl<'a> StateTxn<'a> {
             ));
             self.reward_economic_snapshot_recorded = true;
         }
-    }
-
-    pub(crate) fn snapshot_slash_membership_root_scope(&mut self) {
-        self.snapshot_slash_membership_roots();
-        self.mark_commitment_touched();
     }
 
     fn snapshot_slash_membership_roots(&mut self) {
@@ -722,7 +707,6 @@ pub(crate) fn timing() -> StateTxnTiming {
 mod tests {
     use super::*;
     use indra_core::{
-        codec::Encode,
         types::{
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::HybridPubKey,
@@ -762,7 +746,8 @@ mod tests {
         set_fail_after_mutation(Some(1));
         {
             let mut txn = StateTxn::begin(&mut state, height);
-            txn.snapshot_slash_membership_root_scope();
+            txn.snapshot_slash_membership_roots();
+            txn.mark_commitment_touched();
             txn.state_mut().slash_membership_roots[0].membership_root = Bytes32::from([0xA2; 32]);
             assert!(txn.after_mutation().is_err());
         }

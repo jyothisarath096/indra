@@ -38,18 +38,12 @@ pub fn apply_governance_op(
     current_height: u64,
     chain_id: &str,
 ) -> StateResult<()> {
-    op.validate_structure_at_height(current_height)
+    op.validate_structure()
         .map_err(|error| StateError::InvalidGovernanceOp {
             reason: error.to_string(),
         })?;
     let identity_registry_active = true;
-    let cold_authorized = verify_governance_sig(
-        state,
-        op,
-        chain_id,
-        identity_registry_active,
-        current_height,
-    )?;
+    let cold_authorized = verify_governance_sig(state, op, chain_id, identity_registry_active)?;
     apply_governance_nonce(state, op, current_height, cold_authorized)?;
 
     match &op.payload {
@@ -96,7 +90,6 @@ pub fn apply_governance_op(
             to_validator,
             *amount_spark,
             identity_registry_active,
-            current_height,
         ),
         GovernancePayload::Execute { proposal_id } => {
             apply_execute(state, current_epoch, current_height, proposal_id)
@@ -363,7 +356,6 @@ fn apply_redelegate(
     to_validator: &Bytes32,
     amount_spark: u64,
     identity_registry_active: bool,
-    current_height: u64,
 ) -> StateResult<()> {
     if amount_spark == 0 {
         return invalid("redelegation amount cannot be zero");
@@ -560,7 +552,6 @@ fn verify_governance_sig(
     op: &GovernanceOpV2,
     chain_id: &str,
     identity_registry_active: bool,
-    current_height: u64,
 ) -> StateResult<bool> {
     let cold_designated = matches!(
         op.payload,
@@ -2385,7 +2376,6 @@ mod tests {
             &to_validator,
             60,
             false,
-            2,
         )
         .unwrap();
         assert_eq!(
@@ -2428,7 +2418,6 @@ mod tests {
                 &to_validator,
                 1,
                 false,
-                2,
             ),
             Err(StateError::DelegatorNotFound)
         ));

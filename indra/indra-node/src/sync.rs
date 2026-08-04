@@ -12,12 +12,9 @@
 use std::net::SocketAddr;
 
 use indra_consensus::mempool::Mempool;
-use indra_consensus::{
-    proposer::{
-        compute_fallback_election_result, compute_vrf_input, elect_proposer_from_reveals,
-        ProposerCandidate, ProposerElection,
-    },
-    qc::{verify_qc_strict, QcValidator},
+use indra_consensus::proposer::{
+    compute_fallback_election_result, compute_vrf_input, elect_proposer_from_reveals,
+    ProposerCandidate, ProposerElection,
 };
 use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
@@ -763,6 +760,7 @@ pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_consensus::qc::{verify_qc_strict, QcValidator};
     use indra_consensus::{
         producer::{produce_block, BlockTemplate},
         proposer::{compute_proposer_vrf, elect_proposer, ProposerCandidate, ProposerElection},

@@ -486,13 +486,8 @@ fn validate_snapshot_state(mut state: ChainState, file_height: u64) -> Result<Ch
 mod tests {
     use super::*;
     use indra_core::{
+        types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         types::primitives::{DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES},
-        types::{
-            block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-            consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
-            reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
-            slash_membership::{compute_slash_membership_root, SlashMembershipRootRecord},
-        },
         Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{
@@ -558,23 +553,6 @@ mod tests {
         state.validators.upsert(test_validator()).unwrap();
         state.finalize_genesis().unwrap();
         state
-    }
-
-    fn write_snapshot_meta(dir: &Path, state: &ChainState, snapshot_bytes: &[u8]) {
-        let roots = compute_state_roots(state);
-        let meta = SnapshotMeta {
-            height: state.height,
-            block_hash: state.tip_hash,
-            state_root: roots.state_root,
-            validator_set_root: roots.validator_set_root,
-            chain_id: state.chain_id.clone(),
-            checksum: crc32(snapshot_bytes),
-        };
-        std::fs::write(
-            dir.join(format!("state_{}.snap.meta", state.height)),
-            meta.encode(),
-        )
-        .unwrap();
     }
 
     #[test]

@@ -5,22 +5,19 @@ use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     crypto::{CommitmentV1, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
+        Bytes32, ProtocolVersion, VariableBytes, EPOCH_DURATION_BLOCKS,
         INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES,
-        MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES, UNBONDING_PERIOD_EPOCHS,
+        MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     },
-    slashing::SlashEvidenceV1,
-    staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
     transaction::{InputV1, OutputV1, TransactionV1},
-    vote::{VoteStep, VoteV1},
 };
 use indra_crypto::{
     commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
     PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
 };
 use indra_state::{
-    apply_block, apply_epoch_transition, apply_staking_op, ChainState, EpochTransitionContext,
-    ValidatorEntry, ValidatorStatus,
+    apply_block, apply_epoch_transition, ChainState, EpochTransitionContext, ValidatorEntry,
+    ValidatorStatus,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -49,14 +46,6 @@ fn dummy_sig() -> HybridSignature {
         classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
         pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
     }
-}
-
-fn sign_staking_op(keypair: &HybridKeypair, chain_id: &str, op: &mut StakingOp) {
-    let sig = keypair.sign(&op.signing_bytes(chain_id)).unwrap();
-    op.signature = HybridSignature {
-        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-    };
 }
 
 fn sign_transaction(
@@ -117,49 +106,6 @@ fn make_validator(pubkey: &HybridPubKey, seed: [u8; 32], stake: u64) -> Validato
         cold_key_version: 1,
         cold_nonce: 0,
     }
-}
-
-fn self_stake_op(
-    state: &ChainState,
-    deposit_utxo_id: Bytes32,
-    validator_pubkey: HybridPubKey,
-    validator_keypair: &HybridKeypair,
-    nonce: u64,
-) -> StakingOp {
-    let deposit_proof = state.utxos.get(&deposit_utxo_id).and_then(|entry| {
-        (0u8..=u8::MAX).find_map(|seed| {
-            let candidate = commit(entry.output.value_spark, &[seed; 32]);
-            (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
-                indra_core::types::staking::StakeDepositProof {
-                    committed_value_spark: entry.output.value_spark,
-                    blinding_factor: Bytes32::from([seed; 32]),
-                }
-            })
-        })
-    });
-    let mut op = StakingOp {
-        body: StakingOpBody::SelfStake {
-            deposit_utxo_id,
-            validator_pubkey,
-            deposit_proof,
-            cold_authorization: Some(ColdStakingAuthorization {
-                cold_key_version: 1,
-                cold_nonce: nonce,
-            }),
-        },
-        nonce: 0,
-        signature: dummy_sig(),
-    };
-    let bytes = op
-        .cold_authorization_signing_bytes(&state.chain_id)
-        .unwrap()
-        .unwrap();
-    let sig = validator_keypair.sign(&bytes).unwrap();
-    op.signature = HybridSignature {
-        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-    };
-    op
 }
 
 fn finalize_with_default_validator(state: &mut ChainState) {
@@ -243,39 +189,6 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
         governance_ops: vec![],
         staking_ops: vec![],
         vrf_reveals: vec![],
-    }
-}
-
-fn signed_vote(keypair: &HybridKeypair, validator_id: Bytes32, block_hash: Bytes32) -> VoteV1 {
-    let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
-        7,
-        0,
-        VoteStep::Precommit,
-        &block_hash,
-        &validator_id,
-        None,
-        DEFAULT_CHAIN_ID,
-    );
-    let sig = keypair.sign(&signing_bytes).unwrap();
-    VoteV1 {
-        height: 7,
-        round: 0,
-        step: VoteStep::Precommit,
-        block_hash,
-        validator_id,
-        election_result_hash: None,
-        signature: HybridSignature {
-            classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-        },
-    }
-}
-
-fn slash_evidence(keypair: &HybridKeypair, validator_id: Bytes32) -> SlashEvidenceV1 {
-    SlashEvidenceV1 {
-        validator_id,
-        vote_1: signed_vote(keypair, validator_id, Bytes32::from([0xAA; 32])),
-        vote_2: signed_vote(keypair, validator_id, Bytes32::from([0xBB; 32])),
     }
 }
 
