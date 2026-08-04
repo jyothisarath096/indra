@@ -364,6 +364,8 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         "--output",
         path.to_str().unwrap(),
     ]);
+    let mut validator_inputs = Vec::new();
+    let mut expected_cold_public = Vec::new();
     for i in 0..4u8 {
         let keys = generate_from_master_seed(format!("v{i}"), [i + 1; 32]).unwrap();
         let hot_path = dir.join(format!("hot-{i}.json"));
@@ -373,24 +375,48 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
                 .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
-        let ceremony = indra_cli::ColdShareManifest {
-            format: "indra-cold-key-share".into(),
-            version: 1,
-            ceremony_id: hex::encode([i + 50; 32]),
-            created_unix_seconds: 1,
-            validator_id: hex::encode(keys.public.validator_id),
-            cold_classical_pk: hex::encode(cold_public.classical.0),
-            cold_pq_pk: hex::encode(cold_public.pq.0),
-            threshold: 2,
-            share_count: 3,
-        };
+        let classical_hex = hex::encode(cold_public.classical.0);
+        let pq_hex = hex::encode(cold_public.pq.0);
+        expected_cold_public.push((classical_hex.clone(), pq_hex.clone()));
         let cold_path = dir.join(format!("cold-{i}.json"));
-        std::fs::write(&cold_path, serde_json::to_string(&ceremony).unwrap()).unwrap();
+        if i < 3 {
+            let cold_keys = indra_cli::ColdKeysFile {
+                classical_seed: [i + 20; 32],
+                pq_seed: [i + 84; 32],
+                classical_pk: cold_public.classical.0,
+                pq_pk: cold_public.pq.0.to_vec(),
+            };
+            let encrypted = indra_cli::encrypt_cold_keys(&cold_keys, b"test-password").unwrap();
+            std::fs::write(&cold_path, encrypted).unwrap();
+
+            let inspect = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+                .args(["inspect", "--keys", cold_path.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(inspect.status.success());
+            let inspected = String::from_utf8(inspect.stdout).unwrap();
+            assert!(inspected.contains(&format!("Classical PK:   {classical_hex}")));
+            assert!(inspected.contains(&format!("PQ PK:          {pq_hex}")));
+        } else {
+            let ceremony = indra_cli::ColdShareManifest {
+                format: "indra-cold-key-share".into(),
+                version: 1,
+                ceremony_id: hex::encode([i + 50; 32]),
+                created_unix_seconds: 1,
+                validator_id: hex::encode(keys.public.validator_id),
+                cold_classical_pk: classical_hex,
+                cold_pq_pk: pq_hex,
+                threshold: 2,
+                share_count: 3,
+            };
+            std::fs::write(&cold_path, serde_json::to_string(&ceremony).unwrap()).unwrap();
+        }
         command.arg("--validator").arg(format!(
             "v{i},{stake},{},{}",
             hot_path.display(),
             cold_path.display()
         ));
+        validator_inputs.push((hot_path, cold_path));
     }
     let build = command.output().unwrap();
     assert!(
@@ -398,6 +424,35 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
+    let manifest = indra_node::parse_genesis_manifest(path.to_str().unwrap()).unwrap();
+    for (validator, (classical, pq)) in manifest.validators.iter().zip(&expected_cold_public) {
+        assert_eq!(&validator.cold_hybrid_classical_pk, classical);
+        assert_eq!(&validator.cold_hybrid_pq_pk, pq);
+    }
+
+    let malformed_path = dir.join("cold-malformed.json");
+    std::fs::write(&malformed_path, r#"{"format":"not-a-cold-format"}"#).unwrap();
+    let malformed_genesis = dir.join("malformed-genesis.toml");
+    let mut malformed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+    malformed.args([
+        "build",
+        "--chain-id",
+        "indra-testnet-artifact-test",
+        "--output",
+        malformed_genesis.to_str().unwrap(),
+    ]);
+    for (index, (hot, cold)) in validator_inputs.iter().enumerate() {
+        let cold = if index == 0 { &malformed_path } else { cold };
+        malformed.arg("--validator").arg(format!(
+            "v{index},{stake},{},{}",
+            hot.display(),
+            cold.display()
+        ));
+    }
+    let malformed = malformed.output().unwrap();
+    assert!(!malformed.status.success());
+    assert!(!malformed_genesis.exists());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("unsupported cold-file format"));
 
     let validate = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
         .args(["validate", "--genesis", path.to_str().unwrap()])

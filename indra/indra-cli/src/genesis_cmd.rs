@@ -205,6 +205,7 @@ pub fn with_cold_manifest(
     mut entry: GenesisEntry,
     manifest: &crate::keygen::ColdShareManifest,
 ) -> CliResult<GenesisEntry> {
+    crate::keygen::validate_cold_share_manifest(manifest)?;
     if manifest.validator_id != entry.validator_id {
         return Err(CliError::Genesis(
             "cold ceremony validator_id does not match hot identity".into(),
@@ -213,6 +214,42 @@ pub fn with_cold_manifest(
     entry.cold_hybrid_classical_pk = manifest.cold_classical_pk.clone();
     entry.cold_hybrid_pq_pk = manifest.cold_pq_pk.clone();
     Ok(entry)
+}
+
+/// Attach cold public metadata from either a ceremony manifest or a canonical
+/// plain/encrypted cold keystore. The explicit format discriminator selects
+/// the schema; field-presence guessing is prohibited.
+pub fn with_cold_file(mut entry: GenesisEntry, json: &str) -> CliResult<GenesisEntry> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| CliError::Genesis(format!("invalid cold JSON: {error}")))?;
+    match value.get("format").and_then(|format| format.as_str()) {
+        Some("indra-cold-key-share") => {
+            let manifest: crate::keygen::ColdShareManifest = serde_json::from_value(value)
+                .map_err(|error| CliError::Genesis(format!("invalid cold ceremony: {error}")))?;
+            with_cold_manifest(entry, &manifest)
+        }
+        Some(indra_keystore::COLD_KEYSTORE_FORMAT) => {
+            let metadata = crate::keygen::inspect_key_file_public_metadata(json)?;
+            let crate::keygen::KeyFilePublicMetadata::Cold {
+                classical_pk,
+                pq_pk,
+            } = metadata
+            else {
+                return Err(CliError::Genesis(
+                    "cold-file format resolved to non-cold metadata".into(),
+                ));
+            };
+            entry.cold_hybrid_classical_pk = hex::encode(classical_pk);
+            entry.cold_hybrid_pq_pk = hex::encode(pq_pk);
+            Ok(entry)
+        }
+        Some(format) => Err(CliError::Genesis(format!(
+            "unsupported cold-file format '{format}'; expected indra-cold-key-share or indra-cold-keystore"
+        ))),
+        None => Err(CliError::Genesis(
+            "cold file is missing its required format discriminator".into(),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use indra_cli::{build_genesis_config, entry_from_public_keys, with_cold_manifest};
+use indra_cli::{build_genesis_config, entry_from_public_keys, with_cold_file};
 use indra_state::{compute_state_root, ChainState};
 
 fn main() {
@@ -44,9 +44,7 @@ fn build(args: &[String]) -> Result<(), String> {
     for spec in specs {
         let parts: Vec<&str> = spec.split(',').collect();
         if parts.len() != 4 {
-            return Err(
-                "--validator must be NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_CEREMONY_JSON".into(),
-            );
+            return Err("--validator must be NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON".into());
         }
         let stake = parts[1]
             .parse::<u64>()
@@ -56,12 +54,10 @@ fn build(args: &[String]) -> Result<(), String> {
         let (_, public) = indra_cli::inspect_public_metadata(&hot_json)
             .map_err(|error| format!("invalid hot keystore {}: {error}", parts[2]))?;
         let cold_json = std::fs::read_to_string(parts[3])
-            .map_err(|error| format!("cannot read cold ceremony {}: {error}", parts[3]))?;
-        let cold: indra_cli::ColdShareManifest = serde_json::from_str(&cold_json)
-            .map_err(|error| format!("invalid cold ceremony {}: {error}", parts[3]))?;
+            .map_err(|error| format!("cannot read cold file {}: {error}", parts[3]))?;
         validators.push(
-            with_cold_manifest(entry_from_public_keys(parts[0], &public, stake), &cold)
-                .map_err(|error| error.to_string())?,
+            with_cold_file(entry_from_public_keys(parts[0], &public, stake), &cold_json)
+                .map_err(|error| format!("invalid cold file {}: {error}", parts[3]))?,
         );
     }
     let config = build_genesis_config(&chain_id, validators).map_err(|error| error.to_string())?;
@@ -127,6 +123,6 @@ fn print_artifacts(file_bytes: &[u8], state: &ChainState) -> Result<(), String> 
 
 fn print_help() {
     println!(
-        "Usage:\n  indra-genesis build --chain-id ID --output genesis.toml \\\n    --validator NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_CEREMONY_JSON [--validator ...]\n  indra-genesis validate --genesis genesis.toml\n  indra-genesis inspect --genesis genesis.toml"
+        "Usage:\n  indra-genesis build --chain-id ID --output genesis.toml \\\n    --validator NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON [--validator ...]\n  indra-genesis validate --genesis genesis.toml\n  indra-genesis inspect --genesis genesis.toml"
     );
 }

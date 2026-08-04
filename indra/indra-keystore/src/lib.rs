@@ -27,7 +27,8 @@ use zeroize::{Zeroize, Zeroizing};
 mod cold_shamir;
 pub use cold_shamir::{
     generate_cold_share_ceremony, read_cold_share, reconstruct_cold_shares,
-    write_cold_share_secure, ColdShareCeremony, ColdShareFile, ColdShareManifest,
+    validate_cold_share_manifest, write_cold_share_secure, ColdShareCeremony, ColdShareFile,
+    ColdShareManifest,
 };
 
 /// Required filesystem mode for key/password files on Unix: owner read/write only.

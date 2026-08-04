@@ -182,6 +182,11 @@ fn validate_manifest(manifest: &ColdShareManifest) -> KeystoreResult<()> {
     Ok(())
 }
 
+/// Validate the public, self-identifying portion of a cold-key ceremony.
+pub fn validate_cold_share_manifest(manifest: &ColdShareManifest) -> KeystoreResult<()> {
+    validate_manifest(manifest)
+}
+
 /// Split the two independent cold-key seeds into a new offline ceremony.
 pub fn generate_cold_share_ceremony<R: CryptoRng + RngCore>(
     keys: &ColdKeysFile,

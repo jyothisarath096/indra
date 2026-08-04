@@ -310,6 +310,7 @@ fn cmd_inspect(args: &[String]) {
         } => {
             println!("Key Role:       validator cold authority");
             println!("Classical PK:   {}", hex::encode(classical_pk));
+            println!("PQ PK:          {}", hex::encode(&pq_pk));
             println!("PQ PK bytes:    {}", pq_pk.len());
         }
     }
