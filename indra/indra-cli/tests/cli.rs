@@ -24,6 +24,25 @@ use indra_node::{NodeConfig, NodeEngine};
 use std::path::PathBuf;
 use std::process::Command;
 
+fn genesis_entry(
+    name: &str,
+    keys: &indra_cli::KeysFile,
+    stake: u64,
+    tag: u8,
+) -> indra_cli::GenesisEntry {
+    let cold_public = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+        [tag; 32],
+        [tag.wrapping_add(64); 32],
+    )
+    .unwrap()
+    .public_key();
+    let cold = cold_public.as_complete_hybrid();
+    let mut entry = entry_from_keys(name, keys, stake);
+    entry.cold_hybrid_classical_pk = hex::encode(cold.classical.0);
+    entry.cold_hybrid_pq_pk = hex::encode(cold.pq.0);
+    entry
+}
+
 fn temp_dir(suffix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("indra_cli_test_{}_{}", suffix, std::process::id()));
@@ -274,17 +293,11 @@ fn genesis_with_4_validators() {
         .map(|i| {
             let seed = [i + 1; 32];
             let keys = generate_from_master_seed(format!("v{i}"), seed).unwrap();
-            entry_from_keys(&format!("v{i}"), &keys, stake)
+            genesis_entry(&format!("v{i}"), &keys, stake, i + 20)
         })
         .collect();
 
-    let config = build_genesis_config(
-        "indra-testnet-1",
-        1_700_000_000,
-        1_000_000_000_000_000,
-        validators,
-    )
-    .unwrap();
+    let config = build_genesis_config("indra-testnet-1", validators).unwrap();
 
     assert_eq!(config.validators.len(), 4);
     let toml = config.to_toml();
@@ -299,11 +312,133 @@ fn genesis_rejects_3_validators() {
         .map(|i| {
             let seed = [i + 1; 32];
             let keys = generate_from_master_seed(format!("v{i}"), seed).unwrap();
-            entry_from_keys(&format!("v{i}"), &keys, stake)
+            genesis_entry(&format!("v{i}"), &keys, stake, i + 20)
         })
         .collect();
 
-    assert!(build_genesis_config("test", 0, 0, validators).is_err());
+    assert!(build_genesis_config("test", validators).is_err());
+}
+
+#[test]
+fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
+    let stake = DUST_LIMIT_SPARK * 100;
+    let dir = temp_dir("genesis_artifacts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("genesis.toml");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+    command.args([
+        "build",
+        "--chain-id",
+        "indra-testnet-artifact-test",
+        "--output",
+        path.to_str().unwrap(),
+    ]);
+    for i in 0..4u8 {
+        let keys = generate_from_master_seed(format!("v{i}"), [i + 1; 32]).unwrap();
+        let hot_path = dir.join(format!("hot-{i}.json"));
+        std::fs::write(&hot_path, keys.to_json()).unwrap();
+        let cold =
+            indra_crypto::ColdHybridKeypair::from_independent_seeds([i + 20; 32], [i + 84; 32])
+                .unwrap();
+        let cold_public = cold.public_key();
+        let cold_public = cold_public.as_complete_hybrid();
+        let ceremony = indra_cli::ColdShareManifest {
+            format: "indra-cold-key-share".into(),
+            version: 1,
+            ceremony_id: hex::encode([i + 50; 32]),
+            created_unix_seconds: 1,
+            validator_id: hex::encode(keys.public.validator_id),
+            cold_classical_pk: hex::encode(cold_public.classical.0),
+            cold_pq_pk: hex::encode(cold_public.pq.0),
+            threshold: 2,
+            share_count: 3,
+        };
+        let cold_path = dir.join(format!("cold-{i}.json"));
+        std::fs::write(&cold_path, serde_json::to_string(&ceremony).unwrap()).unwrap();
+        command.arg("--validator").arg(format!(
+            "v{i},{stake},{},{}",
+            hot_path.display(),
+            cold_path.display()
+        ));
+    }
+    let build = command.output().unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let validate = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args(["validate", "--genesis", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args(["inspect", "--genesis", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let stdout = String::from_utf8(inspect.stdout).unwrap();
+    for field in [
+        "genesis_file_sha256=",
+        "genesis_block_hash=",
+        "state_root=",
+        "consensus_snapshot_root=",
+        "reward_economic_snapshot_root=",
+        "slash_membership_root=",
+    ] {
+        assert!(stdout.contains(field), "missing {field} in {stdout}");
+    }
+    let artifact = |name: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in {stdout}"))
+            .to_string()
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let state = indra_node::build_finalized_genesis_state(Some(path.to_str().unwrap())).unwrap();
+    let consensus = state.snapshot_for_consensus_height(1).unwrap();
+    let economic = state.reward_economic_snapshot.as_ref().unwrap();
+    let slash = state
+        .slash_membership_roots
+        .iter()
+        .find(|record| record.activation_height == 1)
+        .unwrap();
+    assert_eq!(
+        artifact("genesis_file_sha256"),
+        hex::encode(indra_crypto::sha256(&bytes))
+    );
+    assert_eq!(
+        artifact("genesis_block_hash"),
+        indra_node::genesis::genesis_block_hash().to_string()
+    );
+    assert_eq!(
+        artifact("state_root"),
+        indra_state::compute_state_root(&state).to_string()
+    );
+    assert_eq!(
+        artifact("consensus_snapshot_root"),
+        consensus.snapshot_root.to_string()
+    );
+    assert_eq!(
+        artifact("reward_economic_snapshot_root"),
+        economic.snapshot_root.to_string()
+    );
+    assert_eq!(
+        artifact("slash_membership_root"),
+        slash.membership_root.to_string()
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ── Query tests ───────────────────────────────────────────────────────────────
@@ -337,19 +472,13 @@ fn full_testnet_setup_pipeline() {
     // Step 2: Coordinator builds genesis
     let stake = DUST_LIMIT_SPARK * 100;
     let validators = vec![
-        entry_from_keys("alice", &alice, stake),
-        entry_from_keys("bob", &bob, stake),
-        entry_from_keys("carol", &carol, stake),
-        entry_from_keys("dave", &dave, stake),
+        genesis_entry("alice", &alice, stake, 21),
+        genesis_entry("bob", &bob, stake, 22),
+        genesis_entry("carol", &carol, stake, 23),
+        genesis_entry("dave", &dave, stake, 24),
     ];
 
-    let config = build_genesis_config(
-        "indra-private-testnet-1",
-        1_700_000_000,
-        1_000_000_000_000_000,
-        validators,
-    )
-    .unwrap();
+    let config = build_genesis_config("indra-private-testnet-1", validators).unwrap();
 
     assert_eq!(config.validators.len(), 4);
 

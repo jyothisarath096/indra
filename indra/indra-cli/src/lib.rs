@@ -49,7 +49,10 @@ pub mod wallet;
 pub use amount::{parse_indra_amount_to_spark, SPARK_PER_INDRA};
 pub use canonical_scan::{scan_canonical_block, scan_canonical_blocks};
 pub use error::{CliError, CliResult};
-pub use genesis_cmd::{build_genesis_config, GenesisConfig, GenesisEntry};
+pub use genesis_cmd::{
+    build_genesis_config, entry_from_keys, entry_from_public_keys, with_cold_manifest,
+    GenesisConfig, GenesisEntry,
+};
 pub use keygen::{
     decrypt_encrypted_keys, encrypt_cold_keys, encrypt_plaintext_keys,
     encrypt_plaintext_keys_replace, generate_cold_keys_file, generate_cold_share_ceremony,

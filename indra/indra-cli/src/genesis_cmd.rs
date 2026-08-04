@@ -9,9 +9,7 @@
 //!
 //! ```toml
 //! [genesis]
-//! timestamp    = 1700000000
 //! chain_id     = "indra-testnet-1"
-//! total_supply = 1000000000000000  # Spark
 //!
 //! [[validators]]
 //! name                = "alice"
@@ -19,6 +17,10 @@
 //! hybrid_classical_pk = "<hex>"
 //! hybrid_pq_pk        = "<hex>"
 //! vrf_pk              = "<hex>"
+//! cold_hybrid_classical_pk = "<hex>"
+//! cold_hybrid_pq_pk        = "<hex>"
+//! cold_key_version         = 1
+//! cold_nonce               = 0
 //! stake               = 10000000000  # Spark
 //! ```
 
@@ -37,6 +39,14 @@ pub struct GenesisEntry {
     pub hybrid_pq_pk: String,
     /// VRF public key (hex).
     pub vrf_pk: String,
+    /// Ed25519 cold public key (hex).
+    pub cold_hybrid_classical_pk: String,
+    /// ML-DSA-87 cold public key (hex).
+    pub cold_hybrid_pq_pk: String,
+    /// Initial cold-key version.
+    pub cold_key_version: u64,
+    /// Initial cold-key replay nonce.
+    pub cold_nonce: u64,
     /// Initial stake in Spark.
     pub stake: u64,
 }
@@ -44,12 +54,8 @@ pub struct GenesisEntry {
 /// A complete genesis configuration.
 #[derive(Debug, Clone)]
 pub struct GenesisConfig {
-    /// Unix timestamp for the genesis block.
-    pub timestamp: u64,
     /// Human-readable chain identifier.
     pub chain_id: String,
-    /// Total initial supply in Spark.
-    pub total_supply: u64,
     /// All initial validators.
     pub validators: Vec<GenesisEntry>,
 }
@@ -60,9 +66,7 @@ impl GenesisConfig {
         let mut out = String::new();
 
         out.push_str("[genesis]\n");
-        out.push_str(&format!("timestamp    = {}\n", self.timestamp));
-        out.push_str(&format!("chain_id     = \"{}\"\n", self.chain_id));
-        out.push_str(&format!("total_supply = {}  # Spark\n", self.total_supply));
+        out.push_str(&format!("chain_id     = {}\n", toml_string(&self.chain_id)));
         out.push_str(&format!(
             "# {} validators, total stake = {} Spark\n\n",
             self.validators.len(),
@@ -71,7 +75,7 @@ impl GenesisConfig {
 
         for v in &self.validators {
             out.push_str("[[validators]]\n");
-            out.push_str(&format!("name                = \"{}\"\n", v.name));
+            out.push_str(&format!("name                = {}\n", toml_string(&v.name)));
             out.push_str(&format!("validator_id        = \"{}\"\n", v.validator_id));
             out.push_str(&format!(
                 "hybrid_classical_pk = \"{}\"\n",
@@ -79,6 +83,19 @@ impl GenesisConfig {
             ));
             out.push_str(&format!("hybrid_pq_pk        = \"{}\"\n", v.hybrid_pq_pk));
             out.push_str(&format!("vrf_pk              = \"{}\"\n", v.vrf_pk));
+            out.push_str(&format!(
+                "cold_hybrid_classical_pk = \"{}\"\n",
+                v.cold_hybrid_classical_pk
+            ));
+            out.push_str(&format!(
+                "cold_hybrid_pq_pk        = \"{}\"\n",
+                v.cold_hybrid_pq_pk
+            ));
+            out.push_str(&format!(
+                "cold_key_version         = {}\n",
+                v.cold_key_version
+            ));
+            out.push_str(&format!("cold_nonce               = {}\n", v.cold_nonce));
             out.push_str(&format!("stake               = {}  # Spark\n\n", v.stake));
         }
 
@@ -117,22 +134,25 @@ impl GenesisConfig {
                 )));
             }
         }
-
-        Ok(())
+        indra_node::genesis::parse_genesis_manifest_str(&self.to_toml())
+            .map(|_| ())
+            .map_err(CliError::Genesis)
     }
+}
+
+// JSON string literals are valid TOML basic strings and give the renderer a
+// single, well-tested escaping rule for operator-supplied text.
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a Rust string cannot fail")
 }
 
 /// Build a genesis config from a list of entries.
 pub fn build_genesis_config(
     chain_id: &str,
-    timestamp: u64,
-    total_supply: u64,
     validators: Vec<GenesisEntry>,
 ) -> CliResult<GenesisConfig> {
     let config = GenesisConfig {
-        timestamp,
         chain_id: chain_id.to_string(),
-        total_supply,
         validators,
     };
     config.validate()?;
@@ -152,8 +172,47 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
         hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
         hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
         vrf_pk: hex::encode(keys.public.vrf_pk),
+        cold_hybrid_classical_pk: String::new(),
+        cold_hybrid_pq_pk: String::new(),
+        cold_key_version: 1,
+        cold_nonce: 0,
         stake,
     }
+}
+
+/// Build a genesis entry from independently inspectable public hot metadata.
+pub fn entry_from_public_keys(
+    name: &str,
+    public: &crate::keygen::ValidatorKeys,
+    stake: u64,
+) -> GenesisEntry {
+    GenesisEntry {
+        name: name.to_string(),
+        validator_id: hex::encode(public.validator_id),
+        hybrid_classical_pk: hex::encode(public.hybrid_classical_pk),
+        hybrid_pq_pk: hex::encode(&public.hybrid_pq_pk),
+        vrf_pk: hex::encode(public.vrf_pk),
+        cold_hybrid_classical_pk: String::new(),
+        cold_hybrid_pq_pk: String::new(),
+        cold_key_version: 1,
+        cold_nonce: 0,
+        stake,
+    }
+}
+
+/// Attach the public output of a cold-key ceremony to a genesis entry.
+pub fn with_cold_manifest(
+    mut entry: GenesisEntry,
+    manifest: &crate::keygen::ColdShareManifest,
+) -> CliResult<GenesisEntry> {
+    if manifest.validator_id != entry.validator_id {
+        return Err(CliError::Genesis(
+            "cold ceremony validator_id does not match hot identity".into(),
+        ));
+    }
+    entry.cold_hybrid_classical_pk = manifest.cold_classical_pk.clone();
+    entry.cold_hybrid_pq_pk = manifest.cold_pq_pk.clone();
+    Ok(entry)
 }
 
 #[cfg(test)]
@@ -167,7 +226,18 @@ mod tests {
             .map(|i| {
                 let seed = [i as u8 + 1; 32];
                 let keys = generate_from_master_seed(format!("validator-{i}"), seed).unwrap();
-                entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10)
+                let cold_public = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+                    [i as u8 + 41; 32],
+                    [i as u8 + 81; 32],
+                )
+                .unwrap()
+                .public_key();
+                let cold = cold_public.as_complete_hybrid();
+                let mut entry =
+                    entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10);
+                entry.cold_hybrid_classical_pk = hex::encode(cold.classical.0);
+                entry.cold_hybrid_pq_pk = hex::encode(cold.pq.0);
+                entry
             })
             .collect()
     }
@@ -175,20 +245,35 @@ mod tests {
     #[test]
     fn build_valid_genesis() {
         let validators = test_validators(4);
-        let config = build_genesis_config(
-            "indra-testnet-1",
-            1_700_000_000,
-            1_000_000_000_000_000,
-            validators,
-        )
-        .unwrap();
+        let config = build_genesis_config("indra-testnet-1", validators).unwrap();
         assert_eq!(config.validators.len(), 4);
+        let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
+        assert_eq!(parsed.genesis.chain_id, config.chain_id);
+        assert_eq!(parsed.validators.len(), config.validators.len());
+        for (parsed, expected) in parsed.validators.iter().zip(&config.validators) {
+            assert_eq!(parsed.validator_id, expected.validator_id);
+            assert_eq!(
+                parsed.cold_hybrid_classical_pk,
+                expected.cold_hybrid_classical_pk
+            );
+            assert_eq!(parsed.cold_hybrid_pq_pk, expected.cold_hybrid_pq_pk);
+            assert_eq!(parsed.cold_key_version, expected.cold_key_version);
+            assert_eq!(parsed.cold_nonce, expected.cold_nonce);
+        }
+    }
+
+    #[test]
+    fn toml_renderer_escapes_operator_text() {
+        let validators = test_validators(4);
+        let config = build_genesis_config("indra-\"test\\chain", validators).unwrap();
+        let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
+        assert_eq!(parsed.genesis.chain_id, "indra-\"test\\chain");
     }
 
     #[test]
     fn too_few_validators_rejected() {
         let validators = test_validators(3);
-        let result = build_genesis_config("test", 0, 1_000_000_000_000_000, validators);
+        let result = build_genesis_config("test", validators);
         assert!(result.is_err());
     }
 
@@ -196,7 +281,7 @@ mod tests {
     fn below_dust_stake_rejected() {
         let mut validators = test_validators(4);
         validators[0].stake = 1; // below DUST_LIMIT_SPARK
-        let result = build_genesis_config("test", 0, 1_000_000_000_000_000, validators);
+        let result = build_genesis_config("test", validators);
         assert!(result.is_err());
     }
 
@@ -204,20 +289,14 @@ mod tests {
     fn duplicate_validator_id_rejected() {
         let mut validators = test_validators(4);
         validators[1].validator_id = validators[0].validator_id.clone();
-        let result = build_genesis_config("test", 0, 1_000_000_000_000_000, validators);
+        let result = build_genesis_config("test", validators);
         assert!(result.is_err());
     }
 
     #[test]
     fn toml_output_has_all_fields() {
         let validators = test_validators(4);
-        let config = build_genesis_config(
-            "indra-testnet-1",
-            1_700_000_000,
-            1_000_000_000_000_000,
-            validators,
-        )
-        .unwrap();
+        let config = build_genesis_config("indra-testnet-1", validators).unwrap();
         let toml = config.to_toml();
         assert!(toml.contains("[genesis]"));
         assert!(toml.contains("[[validators]]"));

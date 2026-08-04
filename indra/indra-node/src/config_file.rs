@@ -348,6 +348,7 @@ impl NodeConfigFile {
         Ok(NodeConfig {
             data_dir: PathBuf::from(data_dir),
             genesis_path: Some(genesis.clone()),
+            genesis_validator_minimum: 4,
             validator_seed,
             vrf_seed,
             pq_sk,

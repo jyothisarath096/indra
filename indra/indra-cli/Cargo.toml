@@ -39,6 +39,10 @@ name = "indra-keygen"
 path = "src/bin/keygen.rs"
 
 [[bin]]
+name = "indra-genesis"
+path = "src/bin/genesis.rs"
+
+[[bin]]
 name = "indra-wallet-scan"
 path = "src/bin/wallet_scan.rs"
 

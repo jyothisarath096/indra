@@ -208,8 +208,11 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
     let hybrid = HybridKeypair::new(classical, pq);
     let public = hybrid.public_key();
     let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
-    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
-        .unwrap();
+    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+        [seed[0] ^ 0xA5; 32],
+        [seed[0] ^ 0x5A; 32],
+    )
+    .unwrap();
     let cold_public = cold.public_key();
     let cold_public = cold_public.as_complete_hybrid();
     let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
@@ -260,14 +263,17 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
     let classical = ClassicalKeypair::from_seed(&seed);
     let pq = PqKeypair::from_seed(&seed).unwrap();
     let vrf = VrfKeypair::from_seed(&seed);
-    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
-        .unwrap();
+    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+        [seed[0] ^ 0xA5; 32],
+        [seed[0] ^ 0x5A; 32],
+    )
+    .unwrap();
     let cold_public = cold.public_key();
     let cold_public = cold_public.as_complete_hybrid();
     let validator_id = indra_crypto::sha256(&classical.public_key().0);
     let genesis_path = dir.join("genesis.toml");
-    let genesis = format!(
-        "[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+    let mut genesis = format!(
+        "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
         name,
         hex::encode(validator_id),
         hex::encode(classical.public_key().0),

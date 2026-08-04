@@ -21,8 +21,189 @@ use indra_core::types::{
 use indra_crypto::{commit, derive_genesis_utxo_blinding, prove_range, sha256};
 use indra_state::ChainState;
 use rand::{rngs::StdRng, SeedableRng};
+use serde::Deserialize;
 
 const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
+
+/// Canonical structured genesis manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenesisManifest {
+    /// Chain-wide settings.
+    pub genesis: GenesisSettings,
+    /// Initial active validators.
+    pub validators: Vec<GenesisValidator>,
+    /// Optional network bootstrap hints (not consensus state).
+    #[serde(default)]
+    pub seeds: Vec<GenesisSeed>,
+}
+
+/// Consensus-relevant genesis settings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenesisSettings {
+    /// Replay-protection domain for the new chain.
+    pub chain_id: String,
+}
+
+/// One initial validator in the canonical genesis manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenesisValidator {
+    /// Human-readable operator label.
+    pub name: String,
+    /// SHA-256 identity derived from the classical hot key.
+    pub validator_id: String,
+    /// Ed25519 hot public key.
+    pub hybrid_classical_pk: String,
+    /// ML-DSA-87 hot public key.
+    pub hybrid_pq_pk: String,
+    /// VRF public key.
+    pub vrf_pk: String,
+    /// Ed25519 cold public key.
+    pub cold_hybrid_classical_pk: String,
+    /// ML-DSA-87 cold public key.
+    pub cold_hybrid_pq_pk: String,
+    /// Initial cold-key generation number.
+    pub cold_key_version: u64,
+    /// Initial cold replay nonce.
+    pub cold_nonce: u64,
+    /// Initial self-stake in Spark.
+    pub stake: u64,
+}
+
+/// Optional non-consensus bootstrap address.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenesisSeed {
+    /// Public host and P2P port.
+    pub addr: String,
+}
+
+/// Parse and fully validate the canonical genesis manifest.
+pub fn parse_genesis_manifest(genesis_path: &str) -> Result<GenesisManifest, String> {
+    let content = std::fs::read_to_string(genesis_path)
+        .map_err(|error| format!("cannot read {genesis_path}: {error}"))?;
+    parse_genesis_manifest_str(&content)
+}
+
+/// Parse and fully validate canonical genesis TOML bytes.
+pub fn parse_genesis_manifest_str(content: &str) -> Result<GenesisManifest, String> {
+    parse_genesis_manifest_str_with_minimum(content, 4)
+}
+
+fn parse_genesis_manifest_str_with_minimum(
+    content: &str,
+    minimum_validators: usize,
+) -> Result<GenesisManifest, String> {
+    let manifest: GenesisManifest =
+        toml::from_str(content).map_err(|error| format!("invalid genesis TOML: {error}"))?;
+    validate_genesis_manifest_with_minimum(&manifest, minimum_validators)?;
+    Ok(manifest)
+}
+
+/// Validate all cross-field and uniqueness invariants for genesis.
+pub fn validate_genesis_manifest(manifest: &GenesisManifest) -> Result<(), String> {
+    validate_genesis_manifest_with_minimum(manifest, 4)
+}
+
+fn validate_genesis_manifest_with_minimum(
+    manifest: &GenesisManifest,
+    minimum_validators: usize,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+    let chain_id = manifest.genesis.chain_id.as_bytes();
+    if chain_id.is_empty() {
+        return Err("genesis chain_id must not be empty".into());
+    }
+    if chain_id.len() > indra_core::types::primitives::MAX_CHAIN_ID_BYTES {
+        return Err(format!(
+            "genesis chain_id exceeds {} bytes",
+            indra_core::types::primitives::MAX_CHAIN_ID_BYTES
+        ));
+    }
+    if manifest.validators.len() < minimum_validators {
+        return Err(format!(
+            "genesis requires at least {minimum_validators} validators for BFT safety"
+        ));
+    }
+    let mut validator_ids = HashSet::new();
+    let mut classical_keys = HashSet::new();
+    let mut pq_keys = HashSet::new();
+    let mut vrf = HashSet::new();
+    for validator in &manifest.validators {
+        let validator_id = decode_hex_exact::<32>(&validator.validator_id, "validator_id")?;
+        let classical =
+            decode_hex_exact::<32>(&validator.hybrid_classical_pk, "hybrid_classical_pk")?;
+        let pq = decode_hex_len(
+            &validator.hybrid_pq_pk,
+            indra_crypto::PQ_PK_BYTES,
+            "hybrid_pq_pk",
+        )?;
+        let vrf_pk = decode_hex_exact::<32>(&validator.vrf_pk, "vrf_pk")?;
+        let cold_classical_pk = decode_hex_exact::<32>(
+            &validator.cold_hybrid_classical_pk,
+            "cold_hybrid_classical_pk",
+        )?;
+        let cold_pq_pk = decode_hex_len(
+            &validator.cold_hybrid_pq_pk,
+            indra_crypto::PQ_PK_BYTES,
+            "cold_hybrid_pq_pk",
+        )?;
+        if validator_id != indra_crypto::sha256(&classical) {
+            return Err(format!(
+                "genesis validator {} validator_id does not match its classical hot key",
+                validator.name
+            ));
+        }
+        for (inserted, label) in [
+            (validator_ids.insert(validator_id.to_vec()), "validator_id"),
+            (
+                classical_keys.insert(classical.to_vec()),
+                "classical hot/cold key",
+            ),
+            (pq_keys.insert(pq), "PQ hot/cold key"),
+            (vrf.insert(vrf_pk.to_vec()), "VRF key"),
+            (
+                classical_keys.insert(cold_classical_pk.to_vec()),
+                "classical hot/cold key",
+            ),
+            (pq_keys.insert(cold_pq_pk), "PQ hot/cold key"),
+        ] {
+            if !inserted {
+                return Err(format!("duplicate genesis {label}"));
+            }
+        }
+        if validator.stake < indra_core::types::primitives::DUST_LIMIT_SPARK {
+            return Err(format!(
+                "genesis validator {} stake is below dust",
+                validator.name
+            ));
+        }
+        if validator.cold_key_version == 0 {
+            return Err(format!(
+                "genesis validator {} cold_key_version must be nonzero",
+                validator.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_hex_exact<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+    let bytes = hex::decode(value).map_err(|_| format!("invalid hex in genesis {field}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("genesis {field} must be exactly {N} bytes"))
+}
+
+fn decode_hex_len(value: &str, expected: usize, field: &str) -> Result<Vec<u8>, String> {
+    let bytes = hex::decode(value).map_err(|_| format!("invalid hex in genesis {field}"))?;
+    if bytes.len() != expected {
+        return Err(format!("genesis {field} must be exactly {expected} bytes"));
+    }
+    Ok(bytes)
+}
 
 /// Build the genesis block.
 ///
@@ -141,78 +322,22 @@ pub fn load_genesis_validators(
     genesis_path: &str,
     state: &mut indra_state::ChainState,
 ) -> Result<(), String> {
+    load_genesis_validators_with_minimum(genesis_path, state, 4)
+}
+
+fn load_genesis_validators_with_minimum(
+    genesis_path: &str,
+    state: &mut indra_state::ChainState,
+    minimum_validators: usize,
+) -> Result<(), String> {
     use indra_core::types::primitives::Bytes32;
     use indra_state::{ValidatorEntry, ValidatorStatus};
 
-    fn parse_fixed_hex<const N: usize>(value: Option<&String>) -> Option<[u8; N]> {
-        let hex = value?;
-        let bytes = hex::decode(hex).ok()?;
-        let array: [u8; N] = bytes.try_into().ok()?;
-        Some(array)
-    }
-
-    fn parse_vec_hex(value: Option<&String>) -> Option<Vec<u8>> {
-        let hex = value?;
-        hex::decode(hex).ok()
-    }
-
     let content = std::fs::read_to_string(genesis_path)
         .map_err(|error| format!("cannot read {genesis_path}: {error}"))?;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "chain_id" {
-                state.chain_id = value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_end_matches(',')
-                    .trim_matches('"')
-                    .to_string();
-                break;
-            }
-        }
-    }
-
-    // Parse each [[validators]] block
-    let mut in_validator = false;
-    let mut current: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut validators = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "[[validators]]" {
-            if !current.is_empty() {
-                validators.push(current.clone());
-                current.clear();
-            }
-            in_validator = true;
-            continue;
-        }
-        if line.starts_with('[') && line != "[[validators]]" {
-            if in_validator && !current.is_empty() {
-                validators.push(current.clone());
-                current.clear();
-            }
-            in_validator = false;
-            continue;
-        }
-        if in_validator {
-            if let Some(eq) = line.find('=') {
-                let key = line[..eq].trim().to_string();
-                let val = line[eq + 1..]
-                    .trim()
-                    .trim_matches('"')
-                    .trim_end_matches(',')
-                    .trim_matches('"')
-                    .to_string();
-                current.insert(key, val);
-            }
-        }
-    }
-    if !current.is_empty() {
-        validators.push(current);
-    }
+    let manifest = parse_genesis_manifest_str_with_minimum(&content, minimum_validators)?;
+    state.chain_id = manifest.genesis.chain_id.clone();
+    let validators = manifest.validators;
 
     // NOTE: startup logging for node bootstrap; replace with structured tracing later.
     println!(
@@ -222,51 +347,25 @@ pub fn load_genesis_validators(
     );
 
     for v in &validators {
-        let id_hex = v
-            .get("validator_id")
-            .cloned()
-            .ok_or_else(|| "genesis validator is missing validator_id".to_string())?;
-        let stake_str = v
-            .get("stake")
-            .ok_or_else(|| format!("genesis validator {id_hex} is missing stake"))?;
-        let stake: u64 = stake_str
-            .trim()
-            .parse()
-            .map_err(|_| format!("genesis validator {id_hex} has invalid stake"))?;
-        let name = v
-            .get("name")
-            .cloned()
-            .ok_or_else(|| format!("genesis validator {id_hex} is missing name"))?;
-
-        let id_bytes = match hex::decode(&id_hex) {
-            Ok(b) if b.len() == 32 => b,
-            _ => return Err(format!("invalid validator_id for {name}: {id_hex}")),
-        };
-
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&id_bytes);
+        let id_hex = &v.validator_id;
+        let stake = v.stake;
+        let name = &v.name;
+        let arr = decode_hex_exact::<32>(id_hex, "validator_id")?;
         let validator_id = Bytes32::from(arr);
 
         let entry = ValidatorEntry {
             validator_id,
             name: name.clone(),
-            hybrid_classical_pk: Some(
-                parse_fixed_hex::<32>(v.get("hybrid_classical_pk")).ok_or_else(|| {
-                    format!("genesis validator {name} has missing/malformed hybrid_classical_pk")
-                })?,
-            ),
-            hybrid_pq_pk: Some(
-                parse_vec_hex(v.get("hybrid_pq_pk"))
-                    .filter(|key| key.len() == indra_crypto::PQ_PK_BYTES)
-                    .ok_or_else(|| {
-                        format!("genesis validator {name} has missing/malformed hybrid_pq_pk")
-                    })?,
-            ),
-            vrf_pk: Some(
-                parse_fixed_hex::<32>(v.get("vrf_pk")).ok_or_else(|| {
-                    format!("genesis validator {name} has missing/malformed vrf_pk")
-                })?,
-            ),
+            hybrid_classical_pk: Some(decode_hex_exact::<32>(
+                &v.hybrid_classical_pk,
+                "hybrid_classical_pk",
+            )?),
+            hybrid_pq_pk: Some(decode_hex_len(
+                &v.hybrid_pq_pk,
+                indra_crypto::PQ_PK_BYTES,
+                "hybrid_pq_pk",
+            )?),
+            vrf_pk: Some(decode_hex_exact::<32>(&v.vrf_pk, "vrf_pk")?),
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -281,31 +380,16 @@ pub fn load_genesis_validators(
             auto_delegate_to: None,
             network_addr: None,
             network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: Some(
-                parse_fixed_hex::<32>(v.get("cold_hybrid_classical_pk")).ok_or_else(|| {
-                    format!(
-                        "genesis validator {name} has missing/malformed cold_hybrid_classical_pk"
-                    )
-                })?,
-            ),
-            cold_hybrid_pq_pk: Some(
-                parse_fixed_hex::<{ indra_crypto::PQ_PK_BYTES }>(v.get("cold_hybrid_pq_pk"))
-                    .ok_or_else(|| {
-                        format!("genesis validator {name} has missing/malformed cold_hybrid_pq_pk")
-                    })?,
-            ),
-            cold_key_version: v
-                .get("cold_key_version")
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| {
-                    format!("genesis validator {name} has missing/malformed cold_key_version")
-                })?,
-            cold_nonce: v
-                .get("cold_nonce")
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| {
-                    format!("genesis validator {name} has missing/malformed cold_nonce")
-                })?,
+            cold_hybrid_classical_pk: Some(decode_hex_exact::<32>(
+                &v.cold_hybrid_classical_pk,
+                "cold_hybrid_classical_pk",
+            )?),
+            cold_hybrid_pq_pk: Some(decode_hex_exact::<{ indra_crypto::PQ_PK_BYTES }>(
+                &v.cold_hybrid_pq_pk,
+                "cold_hybrid_pq_pk",
+            )?),
+            cold_key_version: v.cold_key_version,
+            cold_nonce: v.cold_nonce,
         };
 
         state
@@ -313,8 +397,15 @@ pub fn load_genesis_validators(
             .upsert(entry)
             .map_err(|error| error.to_string())?;
         if let (Some(classical_pk), Some(hybrid_pq_pk)) = (
-            parse_fixed_hex::<32>(v.get("hybrid_classical_pk")),
-            parse_vec_hex(v.get("hybrid_pq_pk")),
+            Some(decode_hex_exact::<32>(
+                &v.hybrid_classical_pk,
+                "hybrid_classical_pk",
+            )?),
+            Some(decode_hex_len(
+                &v.hybrid_pq_pk,
+                indra_crypto::PQ_PK_BYTES,
+                "hybrid_pq_pk",
+            )?),
         ) {
             let blinding = derive_genesis_utxo_blinding(&validator_id.0);
             let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
@@ -356,10 +447,18 @@ pub fn load_genesis_validators(
 /// Every production startup/replay path must use this constructor rather than
 /// treating `ChainState::new_genesis()` as a valid canonical state.
 pub fn build_finalized_genesis_state(genesis_path: Option<&str>) -> Result<ChainState, String> {
+    build_finalized_genesis_state_with_minimum(genesis_path, 4)
+}
+
+pub(crate) fn build_finalized_genesis_state_with_minimum(
+    genesis_path: Option<&str>,
+    minimum_validators: usize,
+) -> Result<ChainState, String> {
     let mut state = ChainState::new_genesis();
-    if let Some(path) = genesis_path {
-        load_genesis_validators(path, &mut state)?;
-    }
+    let path = genesis_path.ok_or_else(|| {
+        "canonical genesis construction requires a validated genesis manifest".to_string()
+    })?;
+    load_genesis_validators_with_minimum(path, &mut state, minimum_validators)?;
     state
         .finalize_genesis()
         .map_err(|error| error.to_string())?;
@@ -368,47 +467,126 @@ pub fn build_finalized_genesis_state(genesis_path: Option<&str>) -> Result<Chain
 
 /// Load optional P2P seed peer hints from a genesis.toml file.
 pub fn load_genesis_seed_peers(genesis_path: &str) -> Vec<String> {
-    let content = match std::fs::read_to_string(genesis_path) {
-        Ok(content) => content,
-        Err(_) => return vec![],
-    };
-
-    let mut in_seed = false;
-    let mut peers = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "[[seeds]]" {
-            in_seed = true;
-            continue;
-        }
-        if line.starts_with('[') && line != "[[seeds]]" {
-            in_seed = false;
-            continue;
-        }
-        if in_seed {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if key.trim() == "addr" {
-                let addr = value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_end_matches(',')
-                    .trim_matches('"')
-                    .to_string();
-                if !addr.is_empty() {
-                    peers.push(addr);
-                }
-            }
-        }
-    }
-    peers
+    parse_genesis_manifest(genesis_path)
+        .map(|manifest| manifest.seeds.into_iter().map(|seed| seed.addr).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use indra_crypto::derive_genesis_utxo_blinding_from_classical_pk;
+
+    fn valid_manifest() -> GenesisManifest {
+        let validators = (0..4u8)
+            .map(|index| {
+                let hot = indra_crypto::HybridKeypair::new(
+                    indra_crypto::ClassicalKeypair::from_seed(&[index + 1; 32]),
+                    indra_crypto::PqKeypair::from_seed(&[index + 11; 32]).unwrap(),
+                );
+                let hot_public = hot.public_key();
+                let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+                    [index + 21; 32],
+                    [index + 31; 32],
+                )
+                .unwrap();
+                let cold_public = cold.public_key();
+                let cold_public = cold_public.as_complete_hybrid();
+                GenesisValidator {
+                    name: format!("validator-{index}"),
+                    validator_id: hex::encode(sha256(&hot_public.classical.0)),
+                    hybrid_classical_pk: hex::encode(hot_public.classical.0),
+                    hybrid_pq_pk: hex::encode(hot_public.pq.0),
+                    vrf_pk: hex::encode(
+                        indra_crypto::VrfKeypair::from_seed(&[index + 41; 32]).public_key(),
+                    ),
+                    cold_hybrid_classical_pk: hex::encode(cold_public.classical.0),
+                    cold_hybrid_pq_pk: hex::encode(cold_public.pq.0),
+                    cold_key_version: 1,
+                    cold_nonce: 0,
+                    stake: 100_000_000_000,
+                }
+            })
+            .collect();
+        GenesisManifest {
+            genesis: GenesisSettings {
+                chain_id: "indra-testnet-new".into(),
+            },
+            validators,
+            seeds: vec![],
+        }
+    }
+
+    fn render_manifest(manifest: &GenesisManifest, omit_cold: bool) -> String {
+        let mut rendered = format!("[genesis]\nchain_id = \"{}\"\n", manifest.genesis.chain_id);
+        for validator in &manifest.validators {
+            rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk));
+            if !omit_cold {
+                rendered.push_str(&format!(
+                    "cold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\n",
+                    validator.cold_hybrid_classical_pk, validator.cold_hybrid_pq_pk
+                ));
+            }
+            rendered.push_str(&format!(
+                "cold_key_version = {}\ncold_nonce = {}\nstake = {}\n",
+                validator.cold_key_version, validator.cold_nonce, validator.stake
+            ));
+        }
+        rendered
+    }
+
+    #[test]
+    fn canonical_genesis_rejects_missing_cold_fields_and_bad_chain_ids() {
+        let manifest = valid_manifest();
+        assert!(parse_genesis_manifest_str(&render_manifest(&manifest, true)).is_err());
+        let mut empty = manifest.clone();
+        empty.genesis.chain_id.clear();
+        assert!(validate_genesis_manifest(&empty).is_err());
+        let mut oversized = manifest;
+        oversized.genesis.chain_id =
+            "x".repeat(indra_core::types::primitives::MAX_CHAIN_ID_BYTES + 1);
+        assert!(validate_genesis_manifest(&oversized).is_err());
+    }
+
+    #[test]
+    fn canonical_genesis_rejects_too_few_mismatched_and_duplicate_identities() {
+        let baseline = valid_manifest();
+        let mut too_few = baseline.clone();
+        too_few.validators.pop();
+        assert!(validate_genesis_manifest(&too_few).is_err());
+
+        let mut mismatch = baseline.clone();
+        mismatch.validators[0].validator_id = hex::encode([0xFF; 32]);
+        assert!(validate_genesis_manifest(&mismatch).is_err());
+
+        for field in 0..6 {
+            let mut duplicate = baseline.clone();
+            match field {
+                0 => {
+                    duplicate.validators[1].validator_id =
+                        duplicate.validators[0].validator_id.clone()
+                }
+                1 => {
+                    duplicate.validators[1].hybrid_classical_pk =
+                        duplicate.validators[0].hybrid_classical_pk.clone()
+                }
+                2 => {
+                    duplicate.validators[1].hybrid_pq_pk =
+                        duplicate.validators[0].hybrid_pq_pk.clone()
+                }
+                3 => duplicate.validators[1].vrf_pk = duplicate.validators[0].vrf_pk.clone(),
+                4 => {
+                    duplicate.validators[1].cold_hybrid_classical_pk =
+                        duplicate.validators[0].cold_hybrid_classical_pk.clone()
+                }
+                _ => {
+                    duplicate.validators[1].cold_hybrid_pq_pk =
+                        duplicate.validators[0].cold_hybrid_pq_pk.clone()
+                }
+            }
+            assert!(validate_genesis_manifest(&duplicate).is_err());
+        }
+    }
 
     #[test]
     fn genesis_block_is_deterministic() {
@@ -449,8 +627,8 @@ mod tests {
             "indra-genesis-blinding-test-{}.toml",
             std::process::id()
         ));
-        let contents = format!(
-            "chain_id = \"test\"\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = \"100000000000\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+        let mut contents = format!(
+            "[genesis]\nchain_id = \"test\"\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
             hex::encode(validator_id.0),
             hex::encode(classical_pk),
             hex::encode(&pq_pk),
@@ -458,6 +636,29 @@ mod tests {
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
+        for i in 1..4u8 {
+            let hot = indra_crypto::HybridKeypair::new(
+                indra_crypto::ClassicalKeypair::from_seed(&[0x60 + i; 32]),
+                indra_crypto::PqKeypair::from_seed(&[0x70 + i; 32]).unwrap(),
+            );
+            let hot_public = hot.public_key();
+            let extra_cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+                [0x80 + i; 32],
+                [0x90 + i; 32],
+            )
+            .unwrap();
+            let extra_cold_public = extra_cold.public_key();
+            let extra_cold_public = extra_cold_public.as_complete_hybrid();
+            contents.push_str(&format!(
+                "\n[[validators]]\nname = \"extra-{i}\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+                hex::encode(sha256(&hot_public.classical.0)),
+                hex::encode(hot_public.classical.0),
+                hex::encode(hot_public.pq.0),
+                hex::encode([0xA0 + i; 32]),
+                hex::encode(extra_cold_public.classical.0),
+                hex::encode(extra_cold_public.pq.0),
+            ));
+        }
         std::fs::write(&path, contents).unwrap();
 
         load_genesis_validators(path.to_str().unwrap(), &mut state).unwrap();

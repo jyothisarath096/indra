@@ -24,6 +24,10 @@ pub struct NodeConfig {
     /// into an already-populated state.
     pub genesis_path: Option<String>,
 
+    /// Minimum genesis validator count. Production configurations must use 4;
+    /// `local_test` uses 1 solely for focused single-validator unit fixtures.
+    pub(crate) genesis_validator_minimum: usize,
+
     /// The node's validator identity (32-byte Ed25519 seed).
     /// If None, this node is a full node (validates but does not propose).
     pub validator_seed: Option<[u8; 32]>,
@@ -125,7 +129,7 @@ impl NodeConfig {
             let vrf_public = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]).public_key();
             let validator_id = indra_crypto::sha256(&hot_public.classical.0);
             let contents = format!(
-                "[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = \"1000000000000\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = \"1\"\ncold_nonce = \"0\"\n",
+                "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
                 hex::encode(validator_id), hex::encode(hot_public.classical.0),
                 hex::encode(hot_public.pq.0), hex::encode(vrf_public),
                 hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
@@ -136,6 +140,7 @@ impl NodeConfig {
         Self {
             data_dir,
             genesis_path: Some(genesis_path.to_string_lossy().to_string()),
+            genesis_validator_minimum: 1,
             validator_seed: Some([0x42u8; 32]),
             vrf_seed: Some([0x42u8; 32]),
             pq_sk: None,
@@ -163,6 +168,7 @@ impl NodeConfig {
         Self {
             data_dir,
             genesis_path: None,
+            genesis_validator_minimum: 4,
             validator_seed: None,
             vrf_seed: None,
             pq_sk: None,
@@ -193,6 +199,7 @@ impl NodeConfig {
         Self {
             data_dir,
             genesis_path: None,
+            genesis_validator_minimum: 4,
             validator_seed: None,
             vrf_seed: None,
             pq_sk: None,

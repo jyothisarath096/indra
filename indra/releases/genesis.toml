@@ -1,7 +1,5 @@
 [genesis]
-timestamp    = 1780283525
 chain_id     = "indra-testnet-1"
-total_supply = 1000000000000000
 
 [[validators]]
 name                = "buddhi"

@@ -4,14 +4,15 @@
 #
 # How to use this file:
 #
-# 1. Each validator runs:
-#      indra-cli keygen --passphrase "my-unique-passphrase" --output keys.json
+# 1. Each validator creates their encrypted hot keystore and completes an
+#    offline cold-key Shamir ceremony. No private material is sent to the
+#    coordinator.
 #
-# 2. Each validator shares ONLY their public section (validator_id, *_pk fields)
-#    with the genesis coordinator.
+# 2. Each validator shares only their inspectable hot public metadata and the
+#    public cold-ceremony manifest with the genesis coordinator.
 #
-# 3. The coordinator fills in this file with all validators' public keys
-#    and distributes it to everyone.
+# 3. The coordinator runs `indra-genesis build`; operators compare the output
+#    of `indra-genesis inspect` on every machine before starting any node.
 #
 # 4. Each validator runs:
 #      indra-node --genesis genesis.toml --keys keys.json --data-dir ./data
@@ -19,9 +20,7 @@
 # =============================================================================
 
 [genesis]
-timestamp    = 1700000000       # 2023-11-14 00:00:00 UTC — fixed genesis time
 chain_id     = "indra-testnet-1"
-total_supply = 1000000000000000 # 1,000,000,000 INDRA in Spark (10^6 Spark per INDRA)
 
 # Minimum 4 validators required (BFT safety: 3f+1, f=1 means tolerate 1 failure)
 # Recommended for testnet: 4–10 validators
@@ -32,6 +31,10 @@ validator_id        = "aabbcc..."   # 64 hex chars (32 bytes)
 hybrid_classical_pk = "aabbcc..."   # 64 hex chars (Ed25519 public key)
 hybrid_pq_pk        = "aabbcc..."   # variable length (Dilithium2 public key)
 vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
+cold_hybrid_classical_pk = "aabbcc..." # 64 hex chars
+cold_hybrid_pq_pk        = "aabbcc..." # exact ML-DSA-87 public-key length
+cold_key_version         = 1
+cold_nonce               = 0
 # Genesis validator stake in Spark (1 INDRA = 100,000,000 Spark)
 # Genesis validators are exempt from minimum stake requirements.
 # stake = 100000000000 -> 1,000 INDRA per genesis validator
@@ -46,6 +49,10 @@ validator_id        = "112233..."
 hybrid_classical_pk = "112233..."
 hybrid_pq_pk        = "112233..."
 vrf_pk              = "112233..."
+cold_hybrid_classical_pk = "112233..."
+cold_hybrid_pq_pk        = "112233..."
+cold_key_version         = 1
+cold_nonce               = 0
 stake               = 100000000000
 
 [[validators]]
@@ -54,6 +61,10 @@ validator_id        = "334455..."
 hybrid_classical_pk = "334455..."
 hybrid_pq_pk        = "334455..."
 vrf_pk              = "334455..."
+cold_hybrid_classical_pk = "334455..."
+cold_hybrid_pq_pk        = "334455..."
+cold_key_version         = 1
+cold_nonce               = 0
 stake               = 100000000000
 
 [[validators]]
@@ -62,4 +73,8 @@ validator_id        = "556677..."
 hybrid_classical_pk = "556677..."
 hybrid_pq_pk        = "556677..."
 vrf_pk              = "556677..."
+cold_hybrid_classical_pk = "556677..."
+cold_hybrid_pq_pk        = "556677..."
+cold_key_version         = 1
+cold_nonce               = 0
 stake               = 100000000000

@@ -1827,40 +1827,40 @@ fn main() {
         );
     }
 
-    let config = NodeConfig {
-        data_dir: std::path::PathBuf::from(&data_dir),
-        genesis_path: Some(genesis_path),
-        validator_seed: Some(keys_data.hybrid_seed),
-        vrf_seed: Some(keys_data.vrf_seed),
-        pq_sk: if keys_data.pq_sk.is_empty() {
-            None
-        } else {
-            Some(keys_data.pq_sk)
-        },
-        pq_pk: if keys_data.pq_pk.is_empty() {
-            None
-        } else {
-            Some(keys_data.pq_pk)
-        },
-        p2p_addr: p2p_addr.clone(),
-        bootstrap_peers: bootstrap_peers.clone(),
-        dns_seed_host: dns_seed_host.clone(),
-        dns_seed_validation,
-        dns_seed_signed_validation,
-        dns_seed_signed_public_key: dns_seed_signed_public_key.clone(),
-        peers_file: peers_file.clone(),
-        snapshot_interval: cfg_file.snapshot_interval.unwrap_or(300),
-        mempool_capacity: cfg_file.mempool_capacity.unwrap_or(5_000),
-        staking_mempool_capacity: cfg_file
-            .staking_mempool_capacity
-            .unwrap_or(DEFAULT_STAKING_MEMPOOL_CAPACITY),
-        governance_mempool_capacity: cfg_file
-            .governance_mempool_capacity
-            .unwrap_or_else(default_governance_mempool_capacity),
-        prune_keep_blocks: if archive { None } else { Some(prune_keep) },
-        observer_addr: observer_addr.clone(),
-        metrics_addr: metrics_addr.clone(),
+    // Start from the production constructor so the four-validator genesis
+    // minimum cannot be weakened by executable configuration.
+    let mut config = NodeConfig::full_node(std::path::PathBuf::from(&data_dir));
+    config.genesis_path = Some(genesis_path);
+    config.validator_seed = Some(keys_data.hybrid_seed);
+    config.vrf_seed = Some(keys_data.vrf_seed);
+    config.pq_sk = if keys_data.pq_sk.is_empty() {
+        None
+    } else {
+        Some(keys_data.pq_sk)
     };
+    config.pq_pk = if keys_data.pq_pk.is_empty() {
+        None
+    } else {
+        Some(keys_data.pq_pk)
+    };
+    config.p2p_addr = p2p_addr.clone();
+    config.bootstrap_peers = bootstrap_peers.clone();
+    config.dns_seed_host = dns_seed_host.clone();
+    config.dns_seed_validation = dns_seed_validation;
+    config.dns_seed_signed_validation = dns_seed_signed_validation;
+    config.dns_seed_signed_public_key = dns_seed_signed_public_key.clone();
+    config.peers_file = peers_file.clone();
+    config.snapshot_interval = cfg_file.snapshot_interval.unwrap_or(300);
+    config.mempool_capacity = cfg_file.mempool_capacity.unwrap_or(5_000);
+    config.staking_mempool_capacity = cfg_file
+        .staking_mempool_capacity
+        .unwrap_or(DEFAULT_STAKING_MEMPOOL_CAPACITY);
+    config.governance_mempool_capacity = cfg_file
+        .governance_mempool_capacity
+        .unwrap_or_else(default_governance_mempool_capacity);
+    config.prune_keep_blocks = if archive { None } else { Some(prune_keep) };
+    config.observer_addr = observer_addr.clone();
+    config.metrics_addr = metrics_addr.clone();
 
     // Init node engine + consensus driver
     let engine = NodeEngine::init(config).unwrap_or_else(|e| panic!("Node init failed: {}", e));
@@ -4215,19 +4215,16 @@ mod tests {
         let cold_pq = indra_crypto::hybrid::PqKeypair::from_seed(&cold_seed).unwrap();
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            &genesis_path,
-            format!(
-                "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+        let mut genesis = format!(
+                "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
                 hex::encode(indra_crypto::sha256(&classical.public_key().0)),
                 hex::encode(classical.public_key().0),
                 hex::encode(pq.public_key().0),
                 hex::encode(vrf.public_key()),
                 hex::encode(cold_classical.public_key().0),
                 hex::encode(cold_pq.public_key().0),
-            ),
-        )
-        .unwrap();
+            );
+        std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);

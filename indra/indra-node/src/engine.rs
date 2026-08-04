@@ -55,7 +55,7 @@ use indra_storage::{
 use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
-    genesis::{build_finalized_genesis_state, build_genesis_block},
+    genesis::build_genesis_block,
     sync::{import_block, project_and_verify_block_state_root},
 };
 
@@ -134,8 +134,11 @@ impl NodeEngine {
                 });
             }
         }
-        let mut genesis_base = build_finalized_genesis_state(config.genesis_path.as_deref())
-            .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
+        let mut genesis_base = crate::genesis::build_finalized_genesis_state_with_minimum(
+            config.genesis_path.as_deref(),
+            config.genesis_validator_minimum,
+        )
+        .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
             verify_snapshot_tip_against_retained_block(&snapshot, &mut block_store)?;
@@ -245,8 +248,11 @@ impl NodeEngine {
     /// Rebuild the current chain state by replaying the block log on top of a
     /// fresh genesis-equivalent state seeded from the configured genesis file.
     pub fn rebuild_state_from_block_log(&mut self) -> NodeResult<()> {
-        let mut rebuilt = build_finalized_genesis_state(self.config.genesis_path.as_deref())
-            .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
+        let mut rebuilt = crate::genesis::build_finalized_genesis_state_with_minimum(
+            self.config.genesis_path.as_deref(),
+            self.config.genesis_validator_minimum,
+        )
+        .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
         rebuild_state_from_height(&mut rebuilt, &mut self.block_store, 1)?;
         self.state = rebuilt;
         Ok(())
@@ -1174,9 +1180,11 @@ mod tests {
         let hybrid = HybridKeypair::new(classical, pq);
         let public = hybrid.public_key();
         let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
-        let cold =
-            indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
-                .unwrap();
+        let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+            [seed[0] ^ 0xA5; 32],
+            [seed[0] ^ 0x5A; 32],
+        )
+        .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
         let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
@@ -1231,15 +1239,17 @@ mod tests {
         let classical = ClassicalKeypair::from_seed(&seed);
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let vrf = VrfKeypair::from_seed(&seed);
-        let cold =
-            indra_crypto::ColdHybridKeypair::from_independent_seeds(seed, [seed[0] ^ 0xFF; 32])
-                .unwrap();
+        let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+            [seed[0] ^ 0xA5; 32],
+            [seed[0] ^ 0x5A; 32],
+        )
+        .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
-        let genesis = format!(
-            "[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+        let mut genesis = format!(
+            "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
@@ -1284,8 +1294,8 @@ mod tests {
 
     fn cold_keypair_for_seed(seed: [u8; 32]) -> HybridKeypair {
         HybridKeypair::new(
-            ClassicalKeypair::from_seed(&seed),
-            PqKeypair::from_seed(&[seed[0] ^ 0xFF; 32]).unwrap(),
+            ClassicalKeypair::from_seed(&[seed[0] ^ 0xA5; 32]),
+            PqKeypair::from_seed(&[seed[0] ^ 0x5A; 32]).unwrap(),
         )
     }
 
@@ -2322,8 +2332,8 @@ mod tests {
         let cold_public = cold.public_key();
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
-        let genesis = format!(
-            "[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
+        let mut genesis = format!(
+            "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
