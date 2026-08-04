@@ -819,6 +819,7 @@ fn start_network_runtime(
     bootstrap_peers: Vec<String>,
     initial_discovered_peers: Vec<String>,
     peers_file_path: String,
+    dns_discovery_enabled: bool,
     dns_seed_host: String,
     dns_seed_validation: DnsSeedValidationMode,
     dns_seed_signed_validation: SignedDnsSeedValidationMode,
@@ -1089,30 +1090,35 @@ fn start_network_runtime(
                             }
                         }
                         eprintln!("[discovery] loaded {} persisted peers", persisted.len());
-                        eprintln!(
-                            "[discovery] invoking DNS seed resolver with dnssec={} signed={} signed_key_bytes={}",
-                            dns_seed_validation,
-                            dns_seed_signed_validation,
-                            dns_seed_signed_public_key
-                                .as_ref()
-                                .map(|bytes| bytes.len())
-                                .unwrap_or(0)
-                        );
-                        let signed_public_key =
-                            dns_seed_signed_public_key.as_ref().and_then(|bytes| {
-                                let array: [u8; indra_crypto::PQ_PK_BYTES] =
-                                    bytes.as_slice().try_into().ok()?;
-                                Some(PqPublicKey(array))
-                            });
-                        let dns_peers = resolve_dns_seeds_with_policies_and_replay_store(
-                            &dns_seed_host,
-                            p2p_port,
-                            dns_seed_validation,
-                            dns_seed_signed_validation,
-                            signed_public_key.as_ref(),
-                            Some(&signed_dns_replay_state),
-                        )
-                        .await;
+                        let dns_peers = if dns_discovery_enabled {
+                            eprintln!(
+                                "[discovery] invoking DNS seed resolver with dnssec={} signed={} signed_key_bytes={}",
+                                dns_seed_validation,
+                                dns_seed_signed_validation,
+                                dns_seed_signed_public_key
+                                    .as_ref()
+                                    .map(|bytes| bytes.len())
+                                    .unwrap_or(0)
+                            );
+                            let signed_public_key =
+                                dns_seed_signed_public_key.as_ref().and_then(|bytes| {
+                                    let array: [u8; indra_crypto::PQ_PK_BYTES] =
+                                        bytes.as_slice().try_into().ok()?;
+                                    Some(PqPublicKey(array))
+                                });
+                            resolve_dns_seeds_with_policies_and_replay_store(
+                                &dns_seed_host,
+                                p2p_port,
+                                dns_seed_validation,
+                                dns_seed_signed_validation,
+                                signed_public_key.as_ref(),
+                                Some(&signed_dns_replay_state),
+                            )
+                            .await
+                        } else {
+                            eprintln!("[discovery] DNS seed discovery disabled");
+                            Vec::new()
+                        };
                         {
                             let mut dp = discovered_peers.lock().unwrap();
                             let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
@@ -1657,6 +1663,9 @@ fn main() {
     if let Some(v) = get_arg("--seeds") {
         cfg_file.dns_seed_host = Some(v);
     }
+    if args.iter().any(|a| a == "--no-dns-discovery") {
+        cfg_file.dns_discovery_enabled = Some(false);
+    }
     if let Some(v) = get_arg("--peers-file") {
         cfg_file.peers_file = Some(v);
     }
@@ -1711,6 +1720,7 @@ fn main() {
         .dns_seed_host
         .clone()
         .unwrap_or_else(default_dns_seed_hosts_config);
+    let dns_discovery_enabled = cfg_file.dns_discovery_enabled.unwrap_or(true);
     let dns_seed_validation = cfg_file
         .dns_seed_validation
         .as_deref()
@@ -1776,7 +1786,8 @@ fn main() {
     eprintln!("Data:      {}", data_dir);
     eprintln!("P2P:       {}", p2p_addr);
     eprintln!(
-        "DNS seed:  dnssec={} signed={} signed_key_bytes={}",
+        "DNS seed:  enabled={} dnssec={} signed={} signed_key_bytes={}",
+        dns_discovery_enabled,
         dns_seed_validation,
         dns_seed_signed_validation,
         dns_seed_signed_public_key
@@ -1846,6 +1857,7 @@ fn main() {
     config.p2p_addr = p2p_addr.clone();
     config.bootstrap_peers = bootstrap_peers.clone();
     config.dns_seed_host = dns_seed_host.clone();
+    config.dns_discovery_enabled = dns_discovery_enabled;
     config.dns_seed_validation = dns_seed_validation;
     config.dns_seed_signed_validation = dns_seed_signed_validation;
     config.dns_seed_signed_public_key = dns_seed_signed_public_key.clone();
@@ -1904,6 +1916,7 @@ fn main() {
             bootstrap_peers.clone(),
             genesis_seed_peers.clone(),
             peers_file.clone(),
+            dns_discovery_enabled,
             dns_seed_host.clone(),
             dns_seed_validation,
             dns_seed_signed_validation,
@@ -3158,6 +3171,7 @@ fn print_help() {
     println!("  --no-metrics");
     println!("  --bootstrap-peers <addr,addr,...>");
     println!("  --seeds <hostname>");
+    println!("  --no-dns-discovery");
     println!("  --prune-keep <blocks>");
     println!("  --archive");
     println!("  --peers-file <path>");
@@ -3210,6 +3224,8 @@ p2p_addr        = "0.0.0.0:30303"
 observer_addr   = "0.0.0.0:{}"
 bootstrap_peers = {}
 dns_seed_host   = "{}"
+# Set false for rehearsals or other environments that must not query DNS seeds.
+dns_discovery_enabled = true
 # off = ordinary DNS, warn = log DNSSEC problems but use answers, require = secure answers only.
 dns_seed_validation = "warn"
 # Signed DNS discovery is INDRA's EIP-1459-style overlay. It requires an

@@ -53,6 +53,8 @@ pub struct NodeConfigFile {
     pub bootstrap_peers: Vec<String>,
     /// `[network].dns_seed_host`.
     pub dns_seed_host: Option<String>,
+    /// `[network].dns_discovery_enabled`.
+    pub dns_discovery_enabled: Option<bool>,
     /// `[network].dns_seed_validation`.
     pub dns_seed_validation: Option<String>,
     /// `[network].dns_seed_signed_validation`.
@@ -122,6 +124,7 @@ impl NodeConfigFile {
             observer_addr: get_str(&table, "network", "observer_addr"),
             bootstrap_peers: get_str_array(&table, "network", "bootstrap_peers"),
             dns_seed_host: get_str(&table, "network", "dns_seed_host"),
+            dns_discovery_enabled: get_bool(&table, "network", "dns_discovery_enabled"),
             dns_seed_validation: get_str(&table, "network", "dns_seed_validation"),
             dns_seed_signed_validation: get_str(&table, "network", "dns_seed_signed_validation"),
             dns_seed_signed_public_key: get_str(&table, "network", "dns_seed_signed_public_key"),
@@ -362,6 +365,7 @@ impl NodeConfigFile {
                 .dns_seed_host
                 .clone()
                 .unwrap_or_else(|| DNS_SEED_HOSTS.join(",")),
+            dns_discovery_enabled: self.dns_discovery_enabled.unwrap_or(true),
             dns_seed_validation: self
                 .dns_seed_validation
                 .as_deref()
@@ -444,6 +448,7 @@ fn allowed_config_keys(section: &str) -> Option<&'static [&'static str]> {
             "observer_addr",
             "bootstrap_peers",
             "dns_seed_host",
+            "dns_discovery_enabled",
             "dns_seed_validation",
             "dns_seed_signed_validation",
             "dns_seed_signed_public_key",
@@ -604,6 +609,7 @@ p2p_addr = "0.0.0.0:30303"
 observer_addr = "0.0.0.0:30304"
 bootstrap_peers = ["1.1.1.1:30303", "2.2.2.2:30303"]
 dns_seed_host = "seeds.indraprotocol.com"
+dns_discovery_enabled = false
 dns_seed_validation = "require"
 dns_seed_signed_validation = "warn"
 peers_file = "/root/.indra/data/peers.json"
@@ -640,6 +646,7 @@ governance_mempool_capacity = 2400
         let cfg = NodeConfigFile::load(&path).unwrap_or_else(|e| panic!("{}", e));
         assert_eq!(cfg.p2p_addr.as_deref(), Some("0.0.0.0:30303"));
         assert_eq!(cfg.bootstrap_peers.len(), 2);
+        assert_eq!(cfg.dns_discovery_enabled, Some(false));
         assert_eq!(cfg.dns_seed_validation.as_deref(), Some("require"));
         assert_eq!(cfg.dns_seed_signed_validation.as_deref(), Some("warn"));
         assert_eq!(cfg.rpc_enabled, Some(true));
@@ -872,6 +879,7 @@ extra_security_mode = "warn"
             .unwrap_or_else(|e| panic!("{}", e));
         assert_eq!(node.p2p_addr, "0.0.0.0:30303");
         assert_eq!(node.dns_seed_host, DNS_SEED_HOSTS.join(","));
+        assert!(node.dns_discovery_enabled);
         assert_eq!(node.peers_file, "/tmp/indra/peers.json");
         assert_eq!(node.prune_keep_blocks, Some(DEFAULT_PRUNE_KEEP_BLOCKS));
         assert_eq!(

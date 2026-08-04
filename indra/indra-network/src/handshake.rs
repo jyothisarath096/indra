@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use blake3::Hash as Blake3Hash;
-use indra_core::types::primitives::Bytes32;
+use indra_core::types::primitives::{Bytes32, MAX_CHAIN_ID_BYTES};
 use indra_crypto::{verify_pq, PqKeypair, PqPublicKey, PqSignature, PQ_SIG_BYTES};
 use ml_kem::{Decapsulate, Encapsulate, EncapsulationKey1024, Kem, KeyExport, MlKem1024};
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -26,6 +26,7 @@ const X25519_PK_LEN: usize = 32;
 const ML_KEM_1024_EK_LEN: usize = 1_568;
 const ML_KEM_1024_CT_LEN: usize = 1_568;
 const VALIDATOR_ID_LEN: usize = 32;
+const CHAIN_PREFACE_HEADER_LEN: usize = 4 + 2 + 2;
 const STEP1_LEN: usize = 4 + 2 + X25519_PK_LEN + ML_KEM_1024_EK_LEN + VALIDATOR_ID_LEN;
 const STEP2_LEN: usize = 4 + 2 + X25519_PK_LEN + ML_KEM_1024_CT_LEN + VALIDATOR_ID_LEN;
 const AUTH_CONTEXT: &[u8] = b"INDRA-auth-v1";
@@ -73,6 +74,54 @@ fn lookup_validator_pk(
         .find(|(id, _)| *id == validator_id)
         .map(|(_, pk)| pk.clone())
         .ok_or(NetworkError::UnknownValidator { validator_id })
+}
+
+fn build_chain_preface(chain_id: &str) -> NetworkResult<Vec<u8>> {
+    let chain_id = chain_id.as_bytes();
+    if chain_id.is_empty() || chain_id.len() > MAX_CHAIN_ID_BYTES {
+        return Err(NetworkError::DecodeFailed {
+            reason: format!("local chain id length must be 1..={MAX_CHAIN_ID_BYTES} bytes"),
+        });
+    }
+    let mut out = Vec::with_capacity(CHAIN_PREFACE_HEADER_LEN + chain_id.len());
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&(chain_id.len() as u16).to_le_bytes());
+    out.extend_from_slice(chain_id);
+    Ok(out)
+}
+
+async fn write_chain_preface(stream: &mut TcpStream, chain_id: &str) -> NetworkResult<()> {
+    stream.write_all(&build_chain_preface(chain_id)?).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_and_verify_chain_preface(
+    stream: &mut TcpStream,
+    expected_chain_id: &str,
+) -> NetworkResult<()> {
+    let mut header = [0u8; CHAIN_PREFACE_HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    parse_common_prefix(&header)?;
+    let chain_len = u16::from_le_bytes([header[6], header[7]]) as usize;
+    if chain_len == 0 || chain_len > MAX_CHAIN_ID_BYTES {
+        return Err(NetworkError::DecodeFailed {
+            reason: format!("peer chain id length must be 1..={MAX_CHAIN_ID_BYTES} bytes"),
+        });
+    }
+    let mut chain_bytes = vec![0u8; chain_len];
+    stream.read_exact(&mut chain_bytes).await?;
+    let peer_chain_id = String::from_utf8(chain_bytes).map_err(|_| NetworkError::DecodeFailed {
+        reason: "peer chain id is not valid UTF-8".to_string(),
+    })?;
+    if peer_chain_id != expected_chain_id {
+        return Err(NetworkError::ChainIdMismatch {
+            expected: expected_chain_id.to_string(),
+            got: peer_chain_id,
+        });
+    }
+    Ok(())
 }
 
 fn build_step1(
@@ -254,6 +303,11 @@ async fn perform_handshake_inner(
     initiator: bool,
 ) -> NetworkResult<HandshakeResult> {
     if initiator {
+        // Establish chain identity before generating or exchanging any key
+        // material and before looking up either validator identity.
+        write_chain_preface(&mut stream, &config.chain_id).await?;
+        read_and_verify_chain_preface(&mut stream, &config.chain_id).await?;
+
         let x_secret = EphemeralSecret::random();
         let x_public = PublicKey::from(&x_secret).to_bytes();
         let (kem_dk, kem_ek) = MlKem1024::generate_keypair();
@@ -301,6 +355,11 @@ async fn perform_handshake_inner(
             is_initiator: true,
         })
     } else {
+        // Fail closed on cross-chain connections before key exchange or
+        // validator authorization. Only acknowledge a matching chain.
+        read_and_verify_chain_preface(&mut stream, &config.chain_id).await?;
+        write_chain_preface(&mut stream, &config.chain_id).await?;
+
         let mut step1 = vec![0u8; STEP1_LEN];
         stream.read_exact(&mut step1).await?;
         let (peer_x_pk_bytes, peer_kem_ek_bytes, peer_validator_id) = parse_step1(&step1)?;
@@ -446,6 +505,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_rejects_chain_mismatch_before_validator_or_key_exchange() {
+        let (initiator_id, initiator_sk, _) = make_validator(0x21, 0xA2);
+        let (responder_id, responder_sk, _) = make_validator(0x22, 0xB2);
+        let mut initiator_cfg = make_config(
+            initiator_id,
+            initiator_sk,
+            Vec::new(),
+            Duration::from_secs(2),
+        );
+        initiator_cfg.chain_id = "indra-other-chain".to_string();
+        let responder_cfg = make_config(
+            responder_id,
+            responder_sk,
+            Vec::new(),
+            Duration::from_secs(2),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            perform_handshake_responder(stream, &responder_cfg).await
+        });
+        let initiator = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            perform_handshake_initiator(stream, &initiator_cfg).await
+        });
+
+        let responder_result = responder.await.expect("join");
+        let _ = initiator.await.expect("join");
+        assert!(matches!(
+            responder_result,
+            Err(NetworkError::ChainIdMismatch { expected, got })
+                if expected == "indra-testnet-1" && got == "indra-other-chain"
+        ));
+    }
+
+    #[tokio::test]
     async fn handshake_rejects_unknown_validator() {
         let (initiator_id, initiator_sk, initiator_pk) = make_validator(0x31, 0xC1);
         let (responder_id, responder_sk, responder_pk) = make_validator(0x32, 0xD2);
@@ -509,7 +609,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
-        let mut bogus = vec![0u8; STEP1_LEN];
+        let mut bogus = vec![0u8; CHAIN_PREFACE_HEADER_LEN];
         bogus[..4].copy_from_slice(b"NOPE");
         client.write_all(&bogus).await.expect("write");
 
@@ -565,6 +665,12 @@ mod tests {
 
         let responder = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
+            read_and_verify_chain_preface(&mut stream, "indra-testnet-1")
+                .await
+                .expect("read chain preface");
+            write_chain_preface(&mut stream, "indra-testnet-1")
+                .await
+                .expect("write chain preface");
             let mut step1 = vec![0u8; STEP1_LEN];
             stream.read_exact(&mut step1).await.expect("read step1");
             let (peer_x_pk_bytes, peer_kem_ek_bytes, peer_validator_id) =

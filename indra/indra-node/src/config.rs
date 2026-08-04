@@ -52,6 +52,9 @@ pub struct NodeConfig {
     /// DNS seed hostname for peer discovery.
     pub dns_seed_host: String,
 
+    /// Whether DNS-based peer discovery is enabled.
+    pub dns_discovery_enabled: bool,
+
     /// DNSSEC validation policy for DNS seed hostname responses.
     pub dns_seed_validation: DnsSeedValidationMode,
 
@@ -148,6 +151,7 @@ impl NodeConfig {
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
+            dns_discovery_enabled: true,
             dns_seed_validation: DnsSeedValidationMode::DEFAULT,
             dns_seed_signed_validation: SignedDnsSeedValidationMode::DEFAULT,
             dns_seed_signed_public_key: None,
@@ -176,6 +180,7 @@ impl NodeConfig {
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
+            dns_discovery_enabled: true,
             dns_seed_validation: DnsSeedValidationMode::DEFAULT,
             dns_seed_signed_validation: SignedDnsSeedValidationMode::DEFAULT,
             dns_seed_signed_public_key: None,
@@ -207,6 +212,7 @@ impl NodeConfig {
             p2p_addr,
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),
+            dns_discovery_enabled: true,
             dns_seed_validation: DnsSeedValidationMode::DEFAULT,
             dns_seed_signed_validation: SignedDnsSeedValidationMode::DEFAULT,
             dns_seed_signed_public_key: None,

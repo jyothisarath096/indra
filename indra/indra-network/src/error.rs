@@ -86,6 +86,15 @@ pub enum NetworkError {
         got: u16,
     },
 
+    /// The peer belongs to a different chain.
+    #[error("chain id mismatch: expected {expected:?}, got {got:?}")]
+    ChainIdMismatch {
+        /// Locally configured chain identifier.
+        expected: String,
+        /// Chain identifier announced by the peer.
+        got: String,
+    },
+
     /// The peer claimed a validator identity we do not trust.
     #[error("unknown validator {validator_id}")]
     UnknownValidator {
