@@ -85,7 +85,6 @@ pub struct ProjectedBlockRoots {
     pub epoch_record: Option<EpochRecord>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlashAccounting {
     slash_amount: u64,
@@ -360,6 +359,7 @@ fn apply_slash_common(
                 if let Some(commitment) = state.state_commitment_v2.as_mut() {
                     commitment.put_stake_position(&position);
                 }
+                crate::txn::complex_mutation_checkpoint()?;
             }
         }
     }
@@ -424,6 +424,7 @@ fn apply_slash_common(
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
             commitment.delete_unbonding_tranche(old_id);
         }
+        crate::txn::complex_mutation_checkpoint()?;
         if let Some(successor) = successor {
             state
                 .unbonding_tranches
@@ -431,6 +432,7 @@ fn apply_slash_common(
             if let Some(commitment) = state.state_commitment_v2.as_mut() {
                 commitment.put_unbonding_tranche(successor);
             }
+            crate::txn::complex_mutation_checkpoint()?;
         }
     }
     if let Some(mut tombstone) = state
@@ -462,6 +464,7 @@ fn apply_slash_common(
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
             commitment.put_evicted_validator_tombstone(&tombstone);
         }
+        crate::txn::complex_mutation_checkpoint()?;
     }
     state
         .rebuild_position_tranche_index()
@@ -483,6 +486,7 @@ fn apply_slash_common(
         // exclusion from future reward eligibility through `Slashed` status.
         v.status = ValidatorStatus::Slashed;
         updated_validator = Some(v.clone());
+        crate::txn::complex_mutation_checkpoint()?;
     }
     if let (Some(commitment), Some(validator)) =
         (state.state_commitment_v2.as_mut(), updated_validator)
@@ -508,10 +512,12 @@ fn apply_slash_common(
     };
     let burned = slash_amount.saturating_sub(reporter_reward);
     state.total_supply = state.total_supply.saturating_sub(burned);
+    crate::txn::complex_mutation_checkpoint()?;
     state.applied_slash_hashes.insert(evidence_hash);
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_slash_hash(&evidence_hash);
     }
+    crate::txn::complex_mutation_checkpoint()?;
 
     eprintln!(
         "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
@@ -1314,6 +1320,7 @@ mod tests {
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
         GOVERNANCE_DELIBERATION_EPOCHS,
     };
+    use crate::state_root::compute_state_root;
     use crate::validator::{ValidatorEntry, ValidatorSet, ValidatorStatus};
     use curve25519_dalek::scalar::Scalar;
     use indra_core::{
@@ -1329,7 +1336,7 @@ mod tests {
                 BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS,
                 GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_GOV_OPS_PER_BLOCK,
                 MAX_INPUTS, MAX_OUTPUTS, MAX_SLASHES_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK,
-                MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_BOND_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS,
+                MAX_TX_PER_BLOCK, MINIMUM_VALIDATOR_SELF_STAKE_SPARK, SLASH_EVIDENCE_WINDOW_EPOCHS,
                 STAKING_TX_IDX, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
                 UNBONDING_PERIOD_EPOCHS,
             },
@@ -1539,7 +1546,7 @@ mod tests {
 
     fn canonical_test_genesis() -> ChainState {
         let mut state = ChainState::new_genesis();
-        install_governance_validator(&mut state, [0xF0; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        install_governance_validator(&mut state, [0xF0; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
         state.finalize_genesis().unwrap();
         state
     }
@@ -1698,10 +1705,14 @@ mod tests {
         cold_seed[0] = cold_seed[0].wrapping_add(1);
         let (cold_pubkey, cold_keypair) = make_test_keypair(cold_seed);
         let validator_id = staking_delegator_id_for_test(&validator_pubkey);
-        let bond_utxo_id = state
+        let deposit_utxo_id = state
             .utxos
             .insert(
-                output_with_value(MINIMUM_VALIDATOR_BOND_SPARK, cold_pubkey.clone(), seed[0]),
+                output_with_value(
+                    MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                    cold_pubkey.clone(),
+                    seed[0],
+                ),
                 0,
                 0,
                 seed[0] as u32,
@@ -1710,11 +1721,11 @@ mod tests {
         let mut op = StakingOp {
             body: StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
-                bond_utxo_id,
+                deposit_utxo_id,
                 validator_pubkey,
                 vrf_pk: indra_crypto::VrfKeypair::from_seed(&seed).public_key(),
-                bond_proof: Some(indra_core::types::staking::StakingBondProof {
-                    committed_value_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+                deposit_proof: Some(indra_core::types::staking::StakeDepositProof {
+                    committed_value_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
                     blinding_factor: Bytes32::from([seed[0]; 32]),
                 }),
                 cold_pubkey: Some(indra_core::types::crypto::ColdHybridPubKey {
@@ -1749,16 +1760,16 @@ mod tests {
     fn signed_delegate_op(
         state: &ChainState,
         validator_id: Bytes32,
-        bond_utxo_id: Bytes32,
+        deposit_utxo_id: Bytes32,
         delegator_pubkey: HybridPubKey,
         keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let bond_proof = state.utxos.get(&bond_utxo_id).and_then(|entry| {
+        let deposit_proof = state.utxos.get(&deposit_utxo_id).and_then(|entry| {
             (0u8..=u8::MAX).find_map(|seed| {
                 let candidate = commit(entry.output.value_spark, &[seed; 32]);
                 (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
-                    indra_core::types::staking::StakingBondProof {
+                    indra_core::types::staking::StakeDepositProof {
                         committed_value_spark: entry.output.value_spark,
                         blinding_factor: Bytes32::from([seed; 32]),
                     }
@@ -1768,9 +1779,9 @@ mod tests {
         let mut op = StakingOp {
             body: StakingOpBody::Delegate {
                 validator_id,
-                bond_utxo_id,
+                deposit_utxo_id,
                 delegator_pubkey,
-                bond_proof,
+                deposit_proof,
             },
             nonce,
             signature: dummy_sig(),
@@ -1782,7 +1793,7 @@ mod tests {
     fn signed_undelegate_op(
         state: &ChainState,
         validator_id: Bytes32,
-        _bond_utxo_id: Bytes32,
+        _deposit_utxo_id: Bytes32,
         delegator_pubkey: HybridPubKey,
         keypair: &HybridKeypair,
         nonce: u64,
@@ -1792,8 +1803,7 @@ mod tests {
             .stake_positions
             .values()
             .find(|position| {
-                position.validator_id == validator_id
-                    && position.principal_owner_id == delegator_id
+                position.validator_id == validator_id && position.principal_owner_id == delegator_id
             })
             .expect("delegation must have created a position");
         let mut op = StakingOp {
@@ -1832,16 +1842,16 @@ mod tests {
 
     fn signed_self_stake_op(
         state: &ChainState,
-        bond_utxo_id: Bytes32,
+        deposit_utxo_id: Bytes32,
         validator_pubkey: HybridPubKey,
         keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let bond_proof = state.utxos.get(&bond_utxo_id).and_then(|entry| {
+        let deposit_proof = state.utxos.get(&deposit_utxo_id).and_then(|entry| {
             (0u8..=u8::MAX).find_map(|seed| {
                 let candidate = commit(entry.output.value_spark, &[seed; 32]);
                 (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
-                    indra_core::types::staking::StakingBondProof {
+                    indra_core::types::staking::StakeDepositProof {
                         committed_value_spark: entry.output.value_spark,
                         blinding_factor: Bytes32::from([seed; 32]),
                     }
@@ -1850,9 +1860,9 @@ mod tests {
         });
         let mut op = StakingOp {
             body: StakingOpBody::SelfStake {
-                bond_utxo_id,
+                deposit_utxo_id,
                 validator_pubkey,
-                bond_proof,
+                deposit_proof,
                 cold_authorization: None,
             },
             nonce,
@@ -1929,6 +1939,34 @@ mod tests {
         (state, validator_id, keypair)
     }
 
+    fn capstone_accounted_value(state: &ChainState) -> u64 {
+        let utxos = state
+            .utxos
+            .all_entries()
+            .map(|entry| entry.output.value_spark)
+            .sum::<u64>();
+        let positions = state.stake_positions.values().fold(0u64, |sum, position| {
+            sum.saturating_add(
+                position
+                    .active
+                    .map(|active| active.principal_spark)
+                    .unwrap_or(0),
+            )
+            .saturating_add(position.pending_rewards_spark)
+        });
+        let tranches = state
+            .unbonding_tranches
+            .values()
+            .map(|tranche| tranche.principal_spark)
+            .sum::<u64>();
+        utxos
+            .saturating_add(positions)
+            .saturating_add(tranches)
+            .saturating_add(state.treasury_balance)
+            .saturating_add(state.fee_reward_pool)
+            .saturating_add(state.burn_buffer)
+    }
+
     fn signed_vote(
         keypair: &HybridKeypair,
         validator_id: Bytes32,
@@ -1999,7 +2037,7 @@ mod tests {
     /// Build a state that has one pre-existing UTXO ready to be spent.
     fn state_with_utxo() -> (ChainState, Bytes32, HybridKeypair, [u8; 32], u64) {
         let mut state = ChainState::new_genesis();
-        install_governance_validator(&mut state, [0xF1; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+        install_governance_validator(&mut state, [0xF1; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
         let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
         let output = dummy_output(0x01, owner_pubkey);
         let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
@@ -2171,7 +2209,7 @@ mod tests {
 
     fn install_inert_gate_snapshot_fixture(state: &mut ChainState) {
         let (_, _, validator_id) =
-            install_governance_validator(state, [0xD9; 32], MINIMUM_VALIDATOR_BOND_SPARK);
+            install_governance_validator(state, [0xD9; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
         state.validators.get_mut(&validator_id).unwrap().vrf_pk =
             Some(indra_crypto::VrfKeypair::from_seed(&[0xD9; 32]).public_key());
         let snapshot = state
@@ -2326,7 +2364,6 @@ mod tests {
         state.governance.proposals.insert(proposal_id, proposal);
     }
 
-
     fn governance_proposal_state(
         phase: ProposalPhase,
     ) -> (ChainState, HybridPubKey, HybridKeypair, Bytes32, Bytes32) {
@@ -2345,6 +2382,8 @@ mod tests {
                         .unwrap(),
             },
         ];
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
         state.consensus_snapshots = vec![snapshot];
         state.rebuild_state_commitment_v2(0);
         let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
@@ -2582,9 +2621,6 @@ mod tests {
         );
     }
 
-
-
-
     #[test]
     fn state_txn_rolls_back_governance_proposal_failpoints() {
         let mut state = canonical_test_genesis();
@@ -2763,7 +2799,6 @@ mod tests {
         crate::txn::set_fail_after_mutation(None);
     }
 
-
     #[test]
     fn state_txn_replay_determinism_rejected_block_then_valid_block() {
         let mut reference = canonical_test_genesis();
@@ -2783,7 +2818,6 @@ mod tests {
         apply_block(&mut candidate, &valid_block, 0).unwrap();
         assert_same_consensus_state(&candidate, &reference);
     }
-
 
     #[test]
     fn block_protocol_version_validation_is_strict_allow_list() {
@@ -2811,7 +2845,7 @@ mod tests {
                 hybrid_classical_pk: None,
                 hybrid_pq_pk: None,
                 vrf_pk: None,
-                stake_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+                stake_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 99,
@@ -2917,7 +2951,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn apply_empty_block_advances_height() {
         let mut state = canonical_test_genesis();
@@ -2925,8 +2958,6 @@ mod tests {
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
     }
-
-
 
     #[test]
     fn apply_block_nonempty_governance_shadow_still_rejects_invalid_op_before_real_apply() {
@@ -2955,8 +2986,6 @@ mod tests {
         );
         assert_eq!(state, original);
     }
-
-
 
     #[test]
     fn apply_block_updates_tip_hash() {
@@ -3011,7 +3040,6 @@ mod tests {
             })
         );
     }
-
 
     #[test]
     fn double_spend_rejected() {
@@ -3377,7 +3405,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_proven_slash_uses_bootstrap_snapshot_and_historical_keys() {
+    fn reward_then_slash_then_eviction_composes_without_principal_or_reward_loss() {
         let (mut state, validator_id, keypair) = slash_validator_state([0xD1; 32], 1_000_000);
         state.height = u64::MAX - 1;
         let snapshot = state
@@ -3392,6 +3420,8 @@ mod tests {
                         .unwrap(),
             },
         ];
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
         state.consensus_snapshots = vec![snapshot];
         let evidence = SlashEvidenceV2 {
             validator_id,
@@ -3414,16 +3444,302 @@ mod tests {
             membership_proof: proof,
         };
         let chain_id = state.chain_id.clone();
+        let self_position_id = indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            validator_id,
+            indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id,
+            },
+        );
+        state.fee_reward_pool = 25_000;
+        state.total_supply = capstone_accounted_value(&state);
+        let conserved = state.total_supply;
+        let pre_reward = state.clone();
+        crate::txn::set_fail_after_mutation(None);
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, u64::MAX);
+            txn.snapshot_epoch_scope();
+            crate::epoch::distribute_fee_rewards(txn.state_mut(), 1, u64::MAX).unwrap();
+            txn.after_mutation().unwrap();
+            txn.commit();
+        }
+        let reward_mutations = crate::txn::mutation_count();
+        assert!(reward_mutations >= 3);
+        for failpoint in 1..=reward_mutations {
+            crate::txn::set_fail_after_mutation(Some(failpoint));
+            let mut candidate = pre_reward.clone();
+            {
+                let mut txn = crate::txn::StateTxn::begin(&mut candidate, u64::MAX);
+                txn.snapshot_epoch_scope();
+                let result = crate::epoch::distribute_fee_rewards(txn.state_mut(), 1, u64::MAX)
+                    .and_then(|_| txn.after_mutation());
+                assert!(result.is_err());
+            }
+            assert_eq!(candidate.encode_to_vec(), pre_reward.encode_to_vec());
+            assert_eq!(
+                compute_state_root(&candidate),
+                compute_state_root(&pre_reward)
+            );
+        }
+        crate::txn::set_fail_after_mutation(None);
+        assert_eq!(capstone_accounted_value(&state), conserved);
         let current = state.validators.get_mut(&validator_id).unwrap();
         current.hybrid_classical_pk = None;
         current.hybrid_pq_pk = None;
 
-        apply_slash_v2_at_height_with_accounting(&mut state, &evidence, &chain_id, u64::MAX, None)
+        let pre_slash = state.clone();
+        crate::txn::set_fail_after_mutation(None);
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, u64::MAX);
+            txn.snapshot_slashing_scope();
+            apply_slash_v2_at_height_with_accounting(
+                txn.state_mut(),
+                &evidence,
+                &chain_id,
+                u64::MAX,
+                None,
+            )
             .unwrap();
+            txn.after_mutation().unwrap();
+            txn.commit();
+        }
+        let slash_mutations = crate::txn::mutation_count();
+        assert!(slash_mutations >= 5);
+        for failpoint in 1..=slash_mutations {
+            crate::txn::set_fail_after_mutation(Some(failpoint));
+            let mut candidate = pre_slash.clone();
+            {
+                let mut txn = crate::txn::StateTxn::begin(&mut candidate, u64::MAX);
+                txn.snapshot_slashing_scope();
+                let result = apply_slash_v2_at_height_with_accounting(
+                    txn.state_mut(),
+                    &evidence,
+                    &chain_id,
+                    u64::MAX,
+                    None,
+                )
+                .and_then(|_| txn.after_mutation());
+                assert!(result.is_err());
+            }
+            assert_eq!(candidate.encode_to_vec(), pre_slash.encode_to_vec());
+            assert_eq!(
+                compute_state_root(&candidate),
+                compute_state_root(&pre_slash)
+            );
+        }
+        crate::txn::set_fail_after_mutation(None);
 
         assert_eq!(
             state.validators.get(&validator_id).unwrap().stake_spark,
             950_000
+        );
+        assert_eq!(
+            state
+                .stake_positions
+                .get(&self_position_id)
+                .unwrap()
+                .pending_rewards_spark,
+            25_000,
+            "prospective slashing must preserve rewards already credited in the epoch"
+        );
+
+        let validator = state.validators.get(&validator_id).unwrap().clone();
+        let positions = state
+            .stake_positions
+            .iter()
+            .map(|(id, position)| (*id, position.clone()))
+            .collect();
+        let tranches = state
+            .unbonding_tranches
+            .iter()
+            .map(|(id, tranche)| (*id, tranche.clone()))
+            .collect();
+        let public = keypair.public_key();
+        let plan = crate::tranche_tombstone::plan_tranche_native_eviction_v2(
+            &chain_id,
+            validator_id,
+            u64::MAX,
+            crate::tranche_tombstone::TombstoneAuthorityV2 {
+                classical_vote_pk: public.classical.0,
+                pq_vote_pk: public.pq.0,
+                vrf_pk: validator.vrf_pk.unwrap(),
+                cold_custody: Some(crate::validator::EvictedColdCustodyV1 {
+                    classical_pk: public.classical.0,
+                    pq_pk: public.pq.0,
+                    key_version: 1,
+                }),
+            },
+            &positions,
+            &tranches,
+        )
+        .unwrap();
+        let converted = plan
+            .tranches
+            .values()
+            .find(|tranche| tranche.position_id == self_position_id)
+            .unwrap();
+        assert_eq!(converted.principal_spark, 950_000);
+        assert_eq!(
+            plan.positions
+                .get(&self_position_id)
+                .unwrap()
+                .pending_rewards_spark,
+            25_000
+        );
+        let pre_eviction = state.clone();
+        crate::txn::set_fail_after_mutation(None);
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, u64::MAX);
+            txn.snapshot_staking_scope();
+            crate::delegation::commit_tranche_eviction_plan(
+                txn.state_mut(),
+                validator_id,
+                plan.clone(),
+                u64::MAX,
+            )
+            .unwrap();
+            txn.after_mutation().unwrap();
+            txn.commit();
+        }
+        let eviction_mutations = crate::txn::mutation_count();
+        assert!(eviction_mutations >= 6);
+        for failpoint in 1..=eviction_mutations {
+            crate::txn::set_fail_after_mutation(Some(failpoint));
+            let mut candidate = pre_eviction.clone();
+            {
+                let mut txn = crate::txn::StateTxn::begin(&mut candidate, u64::MAX);
+                txn.snapshot_staking_scope();
+                let result = crate::delegation::commit_tranche_eviction_plan(
+                    txn.state_mut(),
+                    validator_id,
+                    plan.clone(),
+                    u64::MAX,
+                )
+                .and_then(|_| txn.after_mutation());
+                assert!(result.is_err());
+            }
+            assert_eq!(candidate.encode_to_vec(), pre_eviction.encode_to_vec());
+            assert_eq!(
+                compute_state_root(&candidate),
+                compute_state_root(&pre_eviction)
+            );
+        }
+        crate::txn::set_fail_after_mutation(None);
+        assert_eq!(capstone_accounted_value(&state), state.total_supply);
+    }
+
+    #[test]
+    fn full_stack_atomic_eviction_cap_measurement() {
+        let (mut state, validator_id, keypair) = slash_validator_state([0xE8; 32], 1_000_000);
+        for ordinal in 1..crate::validator::MAX_ATOMIC_EVICTION_POSITION_CONVERSIONS {
+            let owner_id = Bytes32::from(indra_crypto::sha256(&(ordinal as u64).to_le_bytes()));
+            let custody = indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                delegator_id: owner_id,
+            };
+            let position = indra_core::types::stake_position::StakePositionV1::new(
+                validator_id,
+                owner_id,
+                custody,
+                Some(
+                    indra_core::types::stake_position::ActiveStakeAggregateV1::new(
+                        indra_core::types::primitives::DUST_LIMIT_SPARK,
+                        1,
+                        1,
+                    )
+                    .unwrap(),
+                ),
+                0,
+                0,
+            )
+            .unwrap();
+            state.stake_positions.insert(position.position_id, position);
+        }
+        state.rebuild_position_tranche_index().unwrap();
+        state.rebuild_state_commitment_v2(1);
+        let public = keypair.public_key();
+        let started = std::time::Instant::now();
+        let consensus = state.build_consensus_snapshot(1, 0).unwrap();
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&consensus).unwrap());
+        let economic_elapsed = started.elapsed();
+        let positions = state
+            .stake_positions
+            .iter()
+            .map(|(id, position)| (*id, position.clone()))
+            .collect();
+        let tranches = state
+            .unbonding_tranches
+            .iter()
+            .map(|(id, tranche)| (*id, tranche.clone()))
+            .collect();
+        let plan = crate::tranche_tombstone::plan_tranche_native_eviction_v2(
+            &state.chain_id,
+            validator_id,
+            2,
+            crate::tranche_tombstone::TombstoneAuthorityV2 {
+                classical_vote_pk: public.classical.0,
+                pq_vote_pk: public.pq.0,
+                vrf_pk: state.validators.get(&validator_id).unwrap().vrf_pk.unwrap(),
+                cold_custody: Some(crate::validator::EvictedColdCustodyV1 {
+                    classical_pk: public.classical.0,
+                    pq_pk: public.pq.0,
+                    key_version: 1,
+                }),
+            },
+            &positions,
+            &tranches,
+        )
+        .unwrap();
+        let plan_elapsed = started.elapsed();
+        crate::txn::set_fail_after_mutation(None);
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, 2);
+            txn.snapshot_staking_scope();
+            crate::delegation::commit_tranche_eviction_plan(txn.state_mut(), validator_id, plan, 2)
+                .unwrap();
+            txn.after_mutation().unwrap();
+            txn.commit();
+        }
+        let commit_elapsed = started.elapsed();
+        // Exercise the complete checkpoint and external-view projection costs
+        // after the consensus mutation rather than timing the planner alone.
+        let checkpoint = state.encode_to_vec();
+        assert!(!checkpoint.is_empty());
+        let checkpoint_elapsed = started.elapsed();
+        let projected_positions = state
+            .stake_positions
+            .values()
+            .map(|position| {
+                (
+                    position.position_id,
+                    position.validator_id,
+                    position.pending_rewards_spark,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected_positions.len(),
+            crate::validator::MAX_ATOMIC_EVICTION_POSITION_CONVERSIONS
+        );
+        let elapsed = started.elapsed();
+        println!(
+            "full_stack_atomic_eviction_4096 economic_ms={} plan_ms={} commit_ms={} checkpoint_ms={} total_ms={}",
+            economic_elapsed.as_millis(),
+            plan_elapsed.saturating_sub(economic_elapsed).as_millis(),
+            commit_elapsed.saturating_sub(plan_elapsed).as_millis(),
+            checkpoint_elapsed.saturating_sub(commit_elapsed).as_millis(),
+            elapsed.as_millis()
+        );
+        let limit = if cfg!(debug_assertions) {
+            // Debug arithmetic/tree code is intentionally unoptimized; the
+            // release-profile assertion below is the block-budget gate.
+            std::time::Duration::from_secs(12)
+        } else {
+            std::time::Duration::from_secs(6)
+        };
+        assert!(
+            elapsed < limit,
+            "full-stack eviction exceeded budget: {elapsed:?}"
         );
     }
 
@@ -3442,10 +3758,8 @@ mod tests {
             0,
         )
         .unwrap();
-        let timing = indra_core::types::stake_position::UnbondingTimingV1::height_precise(
-            u64::MAX,
-        )
-        .unwrap();
+        let timing =
+            indra_core::types::stake_position::UnbondingTimingV1::height_precise(u64::MAX).unwrap();
         let creation_op_id = Bytes32::from([0xD4; 32]);
         let provisional_id = indra_core::types::stake_position::derive_tranche_id(
             position.position_id,
@@ -3518,7 +3832,10 @@ mod tests {
         };
         let mut validator = state.validators.get(&validator_id).unwrap().clone();
         validator.cold_hybrid_classical_pk = validator.hybrid_classical_pk;
-        validator.cold_hybrid_pq_pk = validator.hybrid_pq_pk.clone().map(|pq| pq.try_into().unwrap());
+        validator.cold_hybrid_pq_pk = validator
+            .hybrid_pq_pk
+            .clone()
+            .map(|pq| pq.try_into().unwrap());
         validator.cold_key_version = 1;
         state.validators.remove(&validator_id);
         state.evicted_validator_tombstones.insert(
@@ -3541,8 +3858,49 @@ mod tests {
         );
         let tranche_count_before = state.unbonding_tranches.len();
         let chain_id = state.chain_id.clone();
-        apply_slash_v2_at_height_with_accounting(&mut state, &evidence, &chain_id, u64::MAX, None)
+        let pre_successor_slash = state.clone();
+        crate::txn::set_fail_after_mutation(None);
+        {
+            let mut txn = crate::txn::StateTxn::begin(&mut state, u64::MAX);
+            txn.snapshot_slashing_scope();
+            apply_slash_v2_at_height_with_accounting(
+                txn.state_mut(),
+                &evidence,
+                &chain_id,
+                u64::MAX,
+                None,
+            )
             .unwrap();
+            txn.after_mutation().unwrap();
+            txn.commit();
+        }
+        let successor_mutations = crate::txn::mutation_count();
+        for failpoint in 1..=successor_mutations {
+            crate::txn::set_fail_after_mutation(Some(failpoint));
+            let mut candidate = pre_successor_slash.clone();
+            {
+                let mut txn = crate::txn::StateTxn::begin(&mut candidate, u64::MAX);
+                txn.snapshot_slashing_scope();
+                let result = apply_slash_v2_at_height_with_accounting(
+                    txn.state_mut(),
+                    &evidence,
+                    &chain_id,
+                    u64::MAX,
+                    None,
+                )
+                .and_then(|_| txn.after_mutation());
+                assert!(result.is_err());
+            }
+            assert_eq!(
+                candidate.encode_to_vec(),
+                pre_successor_slash.encode_to_vec()
+            );
+            assert_eq!(
+                compute_state_root(&candidate),
+                compute_state_root(&pre_successor_slash)
+            );
+        }
+        crate::txn::set_fail_after_mutation(None);
         assert_eq!(state.unbonding_tranches.len(), tranche_count_before);
         assert!(!state.unbonding_tranches.contains_key(&tranche.tranche_id));
         let successor = state.unbonding_tranches.values().next().unwrap();

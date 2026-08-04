@@ -62,7 +62,7 @@ pub struct OutputV1 {
     /// commitment. The aggregate commitment balance equation (`verify_balance`)
     /// prevents inflation across the full transaction, but individual output
     /// public values are unverified metadata. Code that consumes this field for
-    /// economic decisions (for example, staking bond amounts) must not trust it
+    /// economic decisions (for example, stake-deposit amounts) must not trust it
     /// as a commitment opening without additional verification, or must only use
     /// it where the aggregate balance guarantee is sufficient.
     pub value_spark: u64,

@@ -1,19 +1,21 @@
 //! Integration tests for the CLI tools.
 
 use indra_cli::{
-    build_claim_rewards_op, build_delegate_op, build_register_validator_op_with_cold,
-    build_exit_stake_position_op, build_set_commission_op, generate_from_master_seed,
+    build_claim_rewards_op, build_delegate_op, build_exit_stake_position_op,
+    build_register_validator_op_with_cold, build_set_commission_op, generate_from_master_seed,
     generate_from_passphrase,
     genesis_cmd::{build_genesis_config, entry_from_keys},
     load_cold_keys,
     query::rpc_call,
-    tx_builder::build_self_stake_op, PasswordSource, StakePositionExitSigner,
+    tx_builder::build_self_stake_op,
+    PasswordSource, StakePositionExitSigner,
 };
 use indra_core::{
     codec::Decode,
     types::{
-        primitives::DUST_LIMIT_SPARK, stake_position::PositionCustodyV1,
-        staking::{StakingBondProof, StakingOp},
+        primitives::DUST_LIMIT_SPARK,
+        stake_position::PositionCustodyV1,
+        staking::{StakeDepositProof, StakingOp},
     },
     Bytes32,
 };
@@ -262,8 +264,8 @@ fn test_build_and_decode_all_staking_ops() {
         PqKeypair::from_seed(&[0x90; 32]).unwrap(),
     );
     let validator_id = Bytes32::from([0xA1; 32]);
-    let bond_utxo_id = Bytes32::from([0xB2; 32]);
-    let bond_proof = StakingBondProof {
+    let deposit_utxo_id = Bytes32::from([0xB2; 32]);
+    let deposit_proof = StakeDepositProof {
         committed_value_spark: 1_000_000,
         blinding_factor: Bytes32::from([0xB2; 32]),
     };
@@ -271,8 +273,8 @@ fn test_build_and_decode_all_staking_ops() {
     let built = vec![
         build_register_validator_op_with_cold(
             1_000,
-            bond_utxo_id,
-            bond_proof.clone(),
+            deposit_utxo_id,
+            deposit_proof.clone(),
             &keypair,
             &indra_crypto::ColdHybridKeypair::from_independent_seeds([0x91; 32], [0x92; 32])
                 .unwrap(),
@@ -281,22 +283,36 @@ fn test_build_and_decode_all_staking_ops() {
             chain_id,
         )
         .unwrap(),
-        build_self_stake_op(bond_utxo_id, bond_proof.clone(), &keypair, 2, chain_id).unwrap(),
+        build_self_stake_op(
+            deposit_utxo_id,
+            deposit_proof.clone(),
+            &keypair,
+            2,
+            chain_id,
+        )
+        .unwrap(),
         build_delegate_op(
             validator_id,
-            bond_utxo_id,
-            bond_proof,
+            deposit_utxo_id,
+            deposit_proof,
             &keypair,
             4,
             chain_id,
         )
         .unwrap(),
         build_exit_stake_position_op(
-            Bytes32::from([0xD4; 32]), 500_000,
-            PositionCustodyV1::DelegatorIdentity { delegator_id: validator_id },
-            StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 5 },
+            Bytes32::from([0xD4; 32]),
+            500_000,
+            PositionCustodyV1::DelegatorIdentity {
+                delegator_id: validator_id,
+            },
+            StakePositionExitSigner::Delegator {
+                keypair: &keypair,
+                nonce: 5,
+            },
             chain_id,
-        ).unwrap(),
+        )
+        .unwrap(),
         build_claim_rewards_op(validator_id, &keypair, 6, chain_id).unwrap(),
         build_set_commission_op(validator_id, 1_250, &keypair, 7, chain_id).unwrap(),
     ];

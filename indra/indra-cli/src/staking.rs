@@ -8,10 +8,9 @@ use std::{
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
 pub use crate::tx_builder::{
-    build_claim_rewards_op, build_delegate_op, build_register_validator_op,
-    build_exit_stake_position_op,
-    build_register_validator_op_with_cold, build_set_auto_delegate_op, build_set_commission_op,
-    build_update_network_address_op, StakePositionExitSigner,
+    build_claim_rewards_op, build_delegate_op, build_exit_stake_position_op,
+    build_register_validator_op, build_register_validator_op_with_cold, build_set_auto_delegate_op,
+    build_set_commission_op, build_update_network_address_op, StakePositionExitSigner,
 };
 use crate::{
     error::{CliError, CliResult},
@@ -87,10 +86,7 @@ pub fn fetch_chain_id(node_url: &str) -> CliResult<String> {
 }
 
 /// Fetch the registered cold-key version and next cold-role nonce.
-pub fn fetch_validator_cold_replay(
-    node_url: &str,
-    validator_id: &str,
-) -> CliResult<(u64, u64)> {
+pub fn fetch_validator_cold_replay(node_url: &str, validator_id: &str) -> CliResult<(u64, u64)> {
     let body = format!(
         r#"{{"jsonrpc":"2.0","method":"indra_getValidator","params":["{}"],"id":1}}"#,
         validator_id

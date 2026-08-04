@@ -1527,7 +1527,7 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
     ))
 }
 
-/// `indra_getValidatorSelfStake` — returns active self-stake bonds for a validator.
+/// `indra_getValidatorSelfStake` — returns active self-stake positions for a validator.
 ///
 /// Params: `["<validator_id_hex>"]`
 /// Result: `{"validator_id", "total_spark", "bonds"}`

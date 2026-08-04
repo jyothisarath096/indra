@@ -202,11 +202,16 @@ fn test_get_latest_epoch_null_when_no_epochs() {
 }
 
 #[test]
-fn get_delegations_returns_empty_for_unknown_validator() {
-    let e = engine("rpc_delegations");
+fn get_validator_stake_positions_returns_empty_for_unknown_validator() {
+    let e = engine("rpc_positions");
     let validator = "22".repeat(32);
-    let resp = call_rpc("indra_getDelegations", &[format!(r#""{}""#, validator)], &e);
-    assert!(resp.contains("\"delegators\":[]"));
+    let resp = call_rpc(
+        "indra_getValidatorStakePositions",
+        &[format!(r#""{}""#, validator)],
+        &e,
+    );
+    assert!(resp.contains("\"positions\":[]"));
+    assert!(resp.contains("\"total_count\":0"));
 }
 
 #[test]
@@ -352,20 +357,17 @@ fn rpc_governance_queries_reflect_retained_state_after_pruning() {
 }
 
 #[test]
-fn test_get_delegator_positions_unknown_returns_empty() {
+fn test_get_owner_stake_positions_unknown_returns_empty() {
     let e = engine("rpc_positions_unknown");
     let delegator = "33".repeat(32);
     let resp = call_rpc(
-        "indra_getDelegatorPositions",
+        "indra_getOwnerStakePositions",
         &[format!(r#""{}""#, delegator)],
         &e,
     );
 
     assert!(resp.contains("\"positions\":[]"));
-    assert!(resp.contains("\"total_staked_spark\":0"));
-    assert!(resp.contains("\"total_pending_rewards\":0"));
-    assert!(resp.contains("\"active_positions\":0"));
-    assert!(resp.contains("\"unbonding_positions\":0"));
+    assert!(resp.contains("\"total_count\":0"));
 }
 
 #[test]
@@ -383,20 +385,17 @@ fn test_get_delegator_rewards_unknown_returns_zero() {
 }
 
 #[test]
-fn test_get_validator_delegators_unknown_returns_empty() {
+fn test_get_unbonding_tranches_unknown_returns_empty() {
     let e = engine("rpc_validator_delegators_unknown");
     let validator = "55".repeat(32);
     let resp = call_rpc(
-        "indra_getValidatorDelegators",
-        &[format!(r#""{}""#, validator)],
+        "indra_getUnbondingTranches",
+        &["null".into(), "null".into(), format!(r#""{}""#, validator)],
         &e,
     );
 
-    assert!(resp.contains("\"validator_name\":\"unknown\""));
-    assert!(resp.contains("\"total_delegated_spark\":0"));
-    assert!(resp.contains("\"total_pending_rewards\":0"));
-    assert!(resp.contains("\"delegator_count\":0"));
-    assert!(resp.contains("\"delegators\":[]"));
+    assert!(resp.contains("\"tranches\":[]"));
+    assert!(resp.contains("\"total_count\":0"));
 }
 
 #[test]
@@ -414,11 +413,13 @@ fn test_all_methods_reachable_via_dispatch() {
         ("indra_getUtxoProof", vec![hex32.clone()]),
         ("indra_getPeers", vec![]),
         ("indra_getStakingNonce", vec![hex32.clone()]),
-        ("indra_getDelegations", vec![hex32.clone()]),
-        ("indra_getDelegatorPositions", vec![hex32.clone()]),
+        ("indra_getStakePositions", vec![]),
+        ("indra_getStakePosition", vec![hex32.clone()]),
+        ("indra_getUnbondingTranches", vec![]),
+        ("indra_getUnbondingTranche", vec![hex32.clone()]),
+        ("indra_getValidatorStakePositions", vec![hex32.clone()]),
+        ("indra_getOwnerStakePositions", vec![hex32.clone()]),
         ("indra_getDelegatorRewards", vec![hex32.clone()]),
-        ("indra_getValidatorDelegators", vec![hex32.clone()]),
-        ("indra_getStakeBonds", vec![hex32.clone()]),
         ("indra_getDelegatorIdentityDebug", vec![hex32.clone()]),
         ("indra_getEpochInfo", vec![]),
         ("indra_getEpochRecord", vec!["0".to_string()]),
@@ -616,11 +617,11 @@ fn read_only_listener_allows_every_classified_read_method() {
             "indra_getLegacyScanChallenge"
             | "indra_getUtxoProof"
             | "indra_getStakingNonce"
-            | "indra_getDelegations"
-            | "indra_getDelegatorPositions"
             | "indra_getDelegatorRewards"
-            | "indra_getValidatorDelegators"
-            | "indra_getStakeBonds"
+            | "indra_getStakePosition"
+            | "indra_getUnbondingTranche"
+            | "indra_getValidatorStakePositions"
+            | "indra_getOwnerStakePositions"
             | "indra_getProposal"
             | "indra_getProposalVotes"
             | "indra_getGovernanceNonce"

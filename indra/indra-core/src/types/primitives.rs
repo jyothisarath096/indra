@@ -28,9 +28,6 @@ pub const EPOCH_DURATION_BLOCKS: u64 = 300;
 /// registration cost cannot create unbounded state every node must sync.
 pub const MAX_VALIDATORS: usize = 1_500;
 
-/// Maximum live stake-bond records associated with one validator.
-pub const MAX_LIVE_BONDS_PER_VALIDATOR: usize = 104_096;
-
 /// Maximum canonical staking positions associated with one validator.
 pub const MAX_STAKE_POSITIONS_PER_VALIDATOR: usize = 100_001;
 /// Binding network-wide maximum canonical staking positions.
@@ -112,21 +109,6 @@ pub const MAX_VRF_EMPTY_REVEAL_ROUNDS: u32 = 3;
 /// Memory cap for commit/reveal entries retained for one election round.
 pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
 
-/// Block height at which staking bond operations must include a per-output
-/// commitment binding proof (`StakingBondProof`).
-///
-/// `0` means required from genesis on fresh testnet. For mainnet, set this to
-/// a future announced hard-fork height.
-///
-/// MAINNET GENESIS REQUIREMENT: this constant is a single, global value with
-/// no per-chain-ID differentiation. It currently holds a testnet-specific
-/// activation height. Before building mainnet genesis, this MUST be
-/// deliberately reset to the correct mainnet value (often 0 when the rule
-/// should be active from mainnet's first block). It will NOT automatically
-/// differ between testnet and mainnet, and silently reusing a testnet value
-/// would activate this rule at an arbitrary, meaningless point in mainnet's own
-/// history.
-
 /// Epochs delay before a governance-approved timeout change takes effect.
 pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
 
@@ -196,16 +178,6 @@ pub const STAKING_TX_IDX: u32 = u32::MAX;
 /// Domain for deterministic staking reward blinding factor derivation.
 pub const STAKING_REWARD_BLINDING_DOMAIN: &[u8] = b"indra-staking-reward-v1";
 
-/// Domain for deterministic slashed self-stake bond release blinding derivation.
-pub const SLASH_BOND_RELEASE_BLINDING_DOMAIN: &[u8] = b"INDRA-slash-bond-release-v1";
-
-/// Domain for deterministic compact stake-bond release blinding derivation.
-pub const COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] =
-    b"INDRA-compact-stake-bond-release-v1";
-
-/// Domain for deterministic normal stake-bond release blinding derivation.
-pub const NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN: &[u8] = b"INDRA-normal-stake-bond-release-v1";
-
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 
 /// Maximum Ed25519 signature size (bytes).
@@ -257,7 +229,7 @@ pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
 pub const DUST_LIMIT_SPARK: u64 = 100_000;
 
 /// Minimum validator self-bond required for registration.
-pub const MINIMUM_VALIDATOR_BOND_SPARK: u64 = 1_000_000_000;
+pub const MINIMUM_VALIDATOR_SELF_STAKE_SPARK: u64 = 1_000_000_000;
 
 /// Maximum governance-set global delegation floor.
 ///
@@ -265,14 +237,14 @@ pub const MINIMUM_VALIDATOR_BOND_SPARK: u64 = 1_000_000_000;
 /// raised above the minimum cost to register a validator. Otherwise governance
 /// could effectively disable ordinary delegation while validator registration
 /// remains cheaper than delegating.
-pub const MAX_DELEGATION_SPARK: u64 = MINIMUM_VALIDATOR_BOND_SPARK;
+pub const MAX_DELEGATION_SPARK: u64 = MINIMUM_VALIDATOR_SELF_STAKE_SPARK;
 
 /// Minimum active validator self-stake required to remain in the active set.
 ///
 /// Falling below this floor after self-unstaking demotes the validator back to
 /// `Registered` immediately; it can re-enter the active set after adding enough
 /// self-stake and the next active-set selection.
-pub const MINIMUM_ACTIVE_SELF_STAKE_SPARK: u64 = MINIMUM_VALIDATOR_BOND_SPARK;
+pub const MINIMUM_ACTIVE_SELF_STAKE_SPARK: u64 = MINIMUM_VALIDATOR_SELF_STAKE_SPARK;
 
 /// Blocks per year assuming a 6 second target block time.
 ///

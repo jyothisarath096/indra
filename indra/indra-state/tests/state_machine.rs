@@ -77,9 +77,15 @@ fn signed_staking_op(
             cold_nonce: nonce,
         });
         match &mut body {
-            StakingOpBody::SelfStake { cold_authorization, .. }
-            | StakingOpBody::ClaimRewards { cold_authorization, .. }
-            | StakingOpBody::SetAutoDelegate { cold_authorization, .. } => {
+            StakingOpBody::SelfStake {
+                cold_authorization, ..
+            }
+            | StakingOpBody::ClaimRewards {
+                cold_authorization, ..
+            }
+            | StakingOpBody::SetAutoDelegate {
+                cold_authorization, ..
+            } => {
                 *cold_authorization = authorization;
             }
             _ => unreachable!(),
@@ -101,7 +107,6 @@ fn signed_staking_op(
     };
     op
 }
-
 
 fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
@@ -746,7 +751,6 @@ fn chain_is_deterministic() {
         assert_eq!(state_a.base_fee, state_b.base_fee);
     }
 }
-
 
 #[test]
 fn test_auto_delegate_full_lifecycle() {

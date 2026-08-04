@@ -98,7 +98,7 @@ pub(crate) fn resolve_active_validator_cold_pubkey(
 /// Resolve and check a submitted delegator public key against existing state.
 ///
 /// Registry entries are authoritative. If no registry entry exists, only legacy
-/// stake bonds that retained a range proof are considered as fallback evidence.
+/// stake deposits with a retained range proof are considered fallback evidence.
 pub fn resolve_and_check_identity(
     delegator_id: &Bytes32,
     submitted_pubkey: &HybridPubKey,

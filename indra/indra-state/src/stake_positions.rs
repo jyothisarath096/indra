@@ -657,6 +657,33 @@ mod tests {
         }
     }
 
+    fn accounted_value(state: &ChainState) -> u64 {
+        state
+            .utxos
+            .all_entries()
+            .map(|entry| entry.output.value_spark)
+            .sum::<u64>()
+            .saturating_add(state.stake_positions.values().fold(0u64, |sum, position| {
+                sum.saturating_add(
+                    position
+                        .active
+                        .map(|active| active.principal_spark)
+                        .unwrap_or(0),
+                )
+                .saturating_add(position.pending_rewards_spark)
+            }))
+            .saturating_add(
+                state
+                    .unbonding_tranches
+                    .values()
+                    .map(|tranche| tranche.principal_spark)
+                    .sum::<u64>(),
+            )
+            .saturating_add(state.treasury_balance)
+            .saturating_add(state.fee_reward_pool)
+            .saturating_add(state.burn_buffer)
+    }
+
     fn validator(validator_id: Bytes32, vote_keys: &HybridKeypair) -> ValidatorEntry {
         let vote_public = vote_keys.public_key();
         let vrf = indra_crypto::VrfKeypair::from_seed(&[0x77; 32]);
@@ -837,12 +864,145 @@ mod tests {
     }
 
     #[test]
+    fn repeated_deposits_consolidate_without_principal_drift_at_position_cap_boundaries() {
+        let (mut state, keys, validator_id, owner_id) = setup();
+        let custody = PositionCustodyV1::DelegatorIdentity {
+            delegator_id: owner_id,
+        };
+        let deposits = 128u32;
+        for ordinal in 0..deposits {
+            let amount = DUST_LIMIT_SPARK + u64::from(ordinal);
+            let blinding = [ordinal as u8; 32];
+            let input = add_deposit_utxo(
+                &mut state,
+                &keys,
+                amount,
+                blinding,
+                100 + u64::from(ordinal),
+                ordinal,
+            );
+            deposit_stake_position(
+                &mut state,
+                validator_id,
+                owner_id,
+                custody,
+                input,
+                PositionDepositOpeningV1 {
+                    principal_spark: amount,
+                    blinding,
+                },
+                100 + u64::from(ordinal),
+            )
+            .unwrap();
+        }
+        let owner_position_id = derive_position_id(validator_id, owner_id, custody);
+        let expected = u64::from(deposits) * DUST_LIMIT_SPARK
+            + u64::from(deposits) * (u64::from(deposits) - 1) / 2;
+        assert_eq!(
+            state
+                .stake_positions
+                .get(&owner_position_id)
+                .unwrap()
+                .active
+                .unwrap()
+                .principal_spark,
+            expected
+        );
+
+        let mut usage = CapacityUsage {
+            positions_total: MAX_STAKE_POSITIONS_TOTAL - 1,
+            positions_validator: MAX_STAKE_POSITIONS_PER_VALIDATOR - 1,
+            active_positions_total: MAX_STAKE_POSITIONS_TOTAL - 1,
+            active_positions_validator: MAX_STAKE_POSITIONS_PER_VALIDATOR - 1,
+            tranches_total: 0,
+            tranches_validator: 0,
+            tranches_position: 0,
+        };
+        assert!(preflight_deposit_usage(usage).is_ok());
+        usage.positions_validator = MAX_STAKE_POSITIONS_PER_VALIDATOR;
+        assert!(preflight_deposit_usage(usage).is_err());
+        usage.positions_validator = MAX_STAKE_POSITIONS_PER_VALIDATOR - 1;
+        usage.positions_total = MAX_STAKE_POSITIONS_TOTAL;
+        assert!(preflight_deposit_usage(usage).is_err());
+    }
+
+    #[test]
+    fn partial_exit_fragmentation_reserves_final_exit_and_never_truncates() {
+        let (mut state, keys, validator_id, owner_id) = setup();
+        let custody = PositionCustodyV1::DelegatorIdentity {
+            delegator_id: owner_id,
+        };
+        let input = add_deposit_utxo(&mut state, &keys, 6_400_000, [0xA1; 32], 10, 0);
+        let position_id = deposit_stake_position(
+            &mut state,
+            validator_id,
+            owner_id,
+            custody,
+            input,
+            PositionDepositOpeningV1 {
+                principal_spark: 6_400_000,
+                blinding: [0xA1; 32],
+            },
+            11,
+        )
+        .unwrap();
+        for nonce in 1..MAX_TRANCHES_PER_POSITION as u64 {
+            let intent = signed_exit(&keys, &state, position_id, owner_id, 100_000, nonce);
+            exit_stake_position(&mut state, &intent, 100 + nonce).unwrap();
+        }
+        assert_eq!(
+            state.tranche_ids_for_position(&position_id).len(),
+            MAX_TRANCHES_PER_POSITION - 1
+        );
+        let before_rejected = state.clone();
+        let partial = signed_exit(
+            &keys,
+            &state,
+            position_id,
+            owner_id,
+            50_000,
+            MAX_TRANCHES_PER_POSITION as u64,
+        );
+        assert!(exit_stake_position(&mut state, &partial, 200).is_err());
+        assert_eq!(state, before_rejected);
+
+        let remaining = state
+            .stake_positions
+            .get(&position_id)
+            .unwrap()
+            .active
+            .unwrap()
+            .principal_spark;
+        let full = signed_exit(
+            &keys,
+            &state,
+            position_id,
+            owner_id,
+            remaining,
+            MAX_TRANCHES_PER_POSITION as u64,
+        );
+        exit_stake_position(&mut state, &full, 201).unwrap();
+        assert_eq!(
+            state.tranche_ids_for_position(&position_id).len(),
+            MAX_TRANCHES_PER_POSITION
+        );
+        assert!(state
+            .stake_positions
+            .get(&position_id)
+            .unwrap()
+            .active
+            .is_none());
+    }
+
+    #[test]
     fn partial_and_full_exits_create_immutable_precise_tranches_then_refund() {
         let (mut state, keys, validator_id, owner_id) = setup();
         let custody = PositionCustodyV1::DelegatorIdentity {
             delegator_id: owner_id,
         };
         let input = add_deposit_utxo(&mut state, &keys, 1_000_000, [3; 32], 20, 0);
+        state.total_supply = accounted_value(&state);
+        let conserved = state.total_supply;
         let position_id = deposit_stake_position(
             &mut state,
             validator_id,
@@ -856,8 +1016,10 @@ mod tests {
             21,
         )
         .unwrap();
+        assert_eq!(accounted_value(&state), conserved);
         let first_intent = signed_exit(&keys, &state, position_id, owner_id, 400_000, 1);
         let first = exit_stake_position(&mut state, &first_intent, 100).unwrap();
+        assert_eq!(accounted_value(&state), conserved);
         let frozen = state.unbonding_tranches.get(&first).unwrap().clone();
         assert_eq!(
             state
@@ -871,6 +1033,7 @@ mod tests {
         );
         let second_intent = signed_exit(&keys, &state, position_id, owner_id, 600_000, 2);
         let second = exit_stake_position(&mut state, &second_intent, 101).unwrap();
+        assert_eq!(accounted_value(&state), conserved);
         assert_eq!(state.unbonding_tranches.get(&first).unwrap(), &frozen);
         assert!(state
             .stake_positions
@@ -887,11 +1050,28 @@ mod tests {
         };
         let release_height = end_epoch * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
         let before_failed_release = state.clone();
-        set_fail_after_mutation(Some(1));
-        assert!(release_matured_position_tranches(&mut state, release_height).is_err());
         set_fail_after_mutation(None);
-        assert_eq!(state, before_failed_release);
+        let mut successful_release = state.clone();
+        release_matured_position_tranches(&mut successful_release, release_height).unwrap();
+        let release_mutations = crate::txn::mutation_count();
+        assert!(release_mutations >= 4);
+        for failpoint in 1..=release_mutations {
+            set_fail_after_mutation(Some(failpoint));
+            let mut candidate = before_failed_release.clone();
+            assert!(release_matured_position_tranches(&mut candidate, release_height).is_err());
+            assert_eq!(
+                candidate.encode_to_vec(),
+                before_failed_release.encode_to_vec()
+            );
+            assert_eq!(
+                compute_state_root(&candidate),
+                compute_state_root(&before_failed_release)
+            );
+        }
+        set_fail_after_mutation(None);
+        assert_eq!(state.encode_to_vec(), before_failed_release.encode_to_vec());
         let outputs = release_matured_position_tranches(&mut state, release_height).unwrap();
+        assert_eq!(accounted_value(&state), conserved);
         assert_eq!(outputs.len(), 2);
         assert!(state.stake_positions.get(&position_id).is_none());
         assert!(state.unbonding_tranches.is_empty());

@@ -359,7 +359,7 @@ pub fn derive_tranche_source_blinding_v1(
 /// end_epoch_le`, hashed with SHA-256 and reduced modulo the scalar order.
 ///
 /// Knowledge of this opening is public. Spend authorization remains protected
-/// by the refund output's hybrid owner key, matching normal bond releases.
+/// by the refund output's hybrid owner key, matching existing deterministic refunds.
 pub fn derive_tranche_refund_blinding_v1(
     inputs: &TrancheRefundBlindingInputsV1<'_>,
 ) -> CryptoResult<[u8; 32]> {
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(derive_tranche_refund_blinding_v1(&inputs).unwrap(), oracle);
         assert_eq!(derive_tranche_refund_blinding_v1(&inputs).unwrap(), oracle);
 
-        // Normal bond release uses this same reviewed public construction:
+        // The prior deterministic refund construction used this same reviewed pattern:
         // domain-separated SHA-256 over canonical public fields, followed by
         // scalar reduction. The domains ensure the two openings cannot alias.
         let mut bond_material = Vec::new();

@@ -212,9 +212,9 @@ pub enum StateError {
     #[error("validator registry replacement cannot retain any victim within tombstone capacity")]
     TombstoneCapacityExceeded,
 
-    /// A bond-producing operation would exceed one validator's live-bond cap.
-    #[error("validator {validator_id} already has the maximum {max} live stake bonds")]
-    ValidatorBondCountAtMaximum {
+    /// A deposit would exceed one validator's canonical position cap.
+    #[error("validator {validator_id} already has the maximum {max} stake positions")]
+    ValidatorPositionCountAtMaximum {
         /// Validator whose bond population is full.
         validator_id: indra_core::Bytes32,
         /// Consensus cap in force.
@@ -229,18 +229,18 @@ pub enum StateError {
     #[error("invalid reward economic snapshot: {0}")]
     InvalidRewardEconomicSnapshot(String),
 
-    /// A bond-producing staking op omitted the required commitment proof.
-    #[error("staking bond proof required")]
-    BondProofRequired,
+    /// A stake deposit omitted the required commitment-opening proof.
+    #[error("stake-deposit proof required")]
+    DepositProofRequired,
 
-    /// A staking bond proof does not open to the bonded UTXO commitment.
-    #[error("staking bond commitment mismatch")]
-    StakingBondCommitmentMismatch,
+    /// A stake-deposit proof does not open the source UTXO commitment.
+    #[error("stake-deposit commitment mismatch")]
+    StakeDepositCommitmentMismatch,
 
-    /// A staking bond proof opens to a value different from the UTXO public value.
-    #[error("staking bond value mismatch: public {public_value}, committed {committed_value}")]
-    StakingBondValueMismatch {
-        /// Public `OutputV1.value_spark` on the bonded UTXO.
+    /// A stake-deposit proof opens to a value different from the UTXO public value.
+    #[error("stake-deposit value mismatch: public {public_value}, committed {committed_value}")]
+    StakeDepositValueMismatch {
+        /// Public `OutputV1.value_spark` on the source UTXO.
         public_value: u64,
         /// Value proven by the commitment opening.
         committed_value: u64,

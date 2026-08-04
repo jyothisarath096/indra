@@ -19,7 +19,7 @@ use indra_core::{
             TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
         },
         stake_position::PositionCustodyV1,
-        staking::{ColdStakingAuthorization, StakingBondProof, StakingOp, StakingOpBody},
+        staking::{ColdStakingAuthorization, StakeDepositProof, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
@@ -306,17 +306,17 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
 
 /// Build and sign a validator self-stake operation.
 pub fn build_self_stake_op(
-    bond_utxo_id: Bytes32,
-    bond_proof: StakingBondProof,
+    deposit_utxo_id: Bytes32,
+    deposit_proof: StakeDepositProof,
     validator_keypair: &HybridKeypair,
     nonce: u64,
     chain_id: &str,
 ) -> CliResult<BuiltStakingOp> {
     build_signed_staking_op(
         StakingOpBody::SelfStake {
-            bond_utxo_id,
+            deposit_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
-            bond_proof: Some(bond_proof),
+            deposit_proof: Some(deposit_proof),
             cold_authorization: None,
         },
         validator_keypair,
@@ -328,8 +328,8 @@ pub fn build_self_stake_op(
 /// Build and sign a validator registration staking operation.
 pub fn build_register_validator_op_with_cold(
     commission_bps: u32,
-    bond_utxo_id: Bytes32,
-    bond_proof: StakingBondProof,
+    deposit_utxo_id: Bytes32,
+    deposit_proof: StakeDepositProof,
     keypair: &HybridKeypair,
     cold_keypair: &ColdHybridKeypair,
     vrf_pk: [u8; 32],
@@ -346,10 +346,10 @@ pub fn build_register_validator_op_with_cold(
     let mut op = StakingOp {
         body: StakingOpBody::RegisterValidator {
             commission_bps,
-            bond_utxo_id,
+            deposit_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
-            bond_proof: Some(bond_proof),
+            deposit_proof: Some(deposit_proof),
             cold_pubkey: Some(cold_pubkey),
             cold_signature: Some(dummy_signature()?),
         },
@@ -388,8 +388,8 @@ pub fn build_register_validator_op_with_cold(
 /// Registration without an independently persisted cold key is unsupported.
 pub fn build_register_validator_op(
     _commission_bps: u32,
-    _bond_utxo_id: Bytes32,
-    _bond_proof: StakingBondProof,
+    _deposit_utxo_id: Bytes32,
+    _deposit_proof: StakeDepositProof,
     _keypair: &HybridKeypair,
     _vrf_pk: [u8; 32],
     _nonce: u64,
@@ -403,8 +403,8 @@ pub fn build_register_validator_op(
 /// Build and sign a delegate staking operation.
 pub fn build_delegate_op(
     validator_id: Bytes32,
-    bond_utxo_id: Bytes32,
-    bond_proof: StakingBondProof,
+    deposit_utxo_id: Bytes32,
+    deposit_proof: StakeDepositProof,
     delegator_keypair: &HybridKeypair,
     nonce: u64,
     chain_id: &str,
@@ -412,9 +412,9 @@ pub fn build_delegate_op(
     build_signed_staking_op(
         StakingOpBody::Delegate {
             validator_id,
-            bond_utxo_id,
+            deposit_utxo_id,
             delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
-            bond_proof: Some(bond_proof),
+            deposit_proof: Some(deposit_proof),
         },
         delegator_keypair,
         nonce,
@@ -471,7 +471,9 @@ pub fn build_exit_stake_position_op(
             let message = op
                 .cold_authorization_signing_bytes(chain_id)
                 .map_err(|e| CliError::Transaction(e.to_string()))?
-                .ok_or_else(|| CliError::Transaction("missing cold authorization message".into()))?;
+                .ok_or_else(|| {
+                    CliError::Transaction("missing cold authorization message".into())
+                })?;
             let signature = keypair
                 .sign(&message)
                 .map_err(|e| CliError::Crypto(e.to_string()))?;
@@ -584,7 +586,9 @@ fn build_signed_staking_op(
     encode_built_staking_op(op)
 }
 
-fn wire_hybrid_signature(sig: &indra_crypto::hybrid::HybridSignature) -> CliResult<HybridSignature> {
+fn wire_hybrid_signature(
+    sig: &indra_crypto::hybrid::HybridSignature,
+) -> CliResult<HybridSignature> {
     Ok(HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0)
             .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
@@ -719,8 +723,8 @@ mod tests {
         blake3::derive_key(PAYMENT_BLINDING_CONTEXT_V1, &ikm)
     }
 
-    fn bond_proof(byte: u8, value: u64) -> StakingBondProof {
-        StakingBondProof {
+    fn deposit_proof(byte: u8, value: u64) -> StakeDepositProof {
+        StakeDepositProof {
             committed_value_spark: value,
             blinding_factor: Bytes32::from([byte; 32]),
         }
@@ -856,11 +860,17 @@ mod tests {
         let (_, seed, _, spk) = make_wallet_with_funds();
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
-        let bond_utxo_id = Bytes32::from([0xA5; 32]);
+        let deposit_utxo_id = Bytes32::from([0xA5; 32]);
 
-        let proof = bond_proof(0xA5, 1_000_000);
-        let built = build_self_stake_op(bond_utxo_id, proof.clone(), &keypair, 7, DEFAULT_CHAIN_ID)
-            .unwrap();
+        let proof = deposit_proof(0xA5, 1_000_000);
+        let built = build_self_stake_op(
+            deposit_utxo_id,
+            proof.clone(),
+            &keypair,
+            7,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
         let bytes = hex::decode(&built.op_hex).unwrap();
         let op = StakingOp::decode_exact(&bytes).unwrap();
 
@@ -869,13 +879,13 @@ mod tests {
         assert!(matches!(
             op.body,
             StakingOpBody::SelfStake {
-                bond_utxo_id: id,
+                deposit_utxo_id: id,
                 validator_pubkey,
-                bond_proof,
+                deposit_proof,
                 ..
-            } if id == bond_utxo_id
+            } if id == deposit_utxo_id
                 && validator_pubkey.classical_pk == spk.classical_pk
-                && bond_proof == Some(proof)
+                && deposit_proof == Some(proof)
         ));
     }
 
@@ -915,11 +925,11 @@ mod tests {
     #[test]
     fn build_register_validator_op_serialises_and_decodes() {
         let keypair = test_keypair(0x71);
-        let bond_utxo_id = Bytes32::from([0xAB; 32]);
+        let deposit_utxo_id = Bytes32::from([0xAB; 32]);
         let built = build_register_validator_op_with_cold(
             1_000,
-            bond_utxo_id,
-            bond_proof(0xAB, 2_000_000),
+            deposit_utxo_id,
+            deposit_proof(0xAB, 2_000_000),
             &keypair,
             &test_cold_keypair(0x91),
             [0xAA; 32],
@@ -933,10 +943,10 @@ mod tests {
             op.body,
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
-                bond_utxo_id: id,
+                deposit_utxo_id: id,
                 vrf_pk,
                 ..
-            } if id == bond_utxo_id && vrf_pk == [0xAA; 32]
+            } if id == deposit_utxo_id && vrf_pk == [0xAA; 32]
         ));
     }
 
@@ -944,11 +954,11 @@ mod tests {
     fn build_delegate_op_serialises_and_decodes() {
         let keypair = test_keypair(0x72);
         let validator_id = Bytes32::from([0x01; 32]);
-        let bond_utxo_id = Bytes32::from([0x02; 32]);
+        let deposit_utxo_id = Bytes32::from([0x02; 32]);
         let built = build_delegate_op(
             validator_id,
-            bond_utxo_id,
-            bond_proof(0x02, 500_000),
+            deposit_utxo_id,
+            deposit_proof(0x02, 500_000),
             &keypair,
             10,
             DEFAULT_CHAIN_ID,
@@ -959,9 +969,9 @@ mod tests {
             op.body,
             StakingOpBody::Delegate {
                 validator_id: v,
-                bond_utxo_id: b,
+                deposit_utxo_id: b,
                 ..
-            } if v == validator_id && b == bond_utxo_id
+            } if v == validator_id && b == deposit_utxo_id
         ));
     }
 
@@ -974,9 +984,13 @@ mod tests {
             position_id,
             400_000,
             PositionCustodyV1::DelegatorIdentity { delegator_id },
-            StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 11 },
+            StakePositionExitSigner::Delegator {
+                keypair: &keypair,
+                nonce: 11,
+            },
             DEFAULT_CHAIN_ID,
-        ).unwrap();
+        )
+        .unwrap();
         let op = decode_built(&built);
         assert!(matches!(
             op.body,
@@ -1122,12 +1136,12 @@ mod tests {
     fn all_ops_have_correct_nonce() {
         let keypair = test_keypair(0x76);
         let validator_id = Bytes32::from([0x07; 32]);
-        let bond_utxo_id = Bytes32::from([0x08; 32]);
+        let deposit_utxo_id = Bytes32::from([0x08; 32]);
         let ops = vec![
             build_register_validator_op_with_cold(
                 1_000,
-                bond_utxo_id,
-                bond_proof(0x11, 1_000),
+                deposit_utxo_id,
+                deposit_proof(0x11, 1_000),
                 &keypair,
                 &test_cold_keypair(0x92),
                 [0x11; 32],
@@ -1136,8 +1150,8 @@ mod tests {
             )
             .unwrap(),
             build_self_stake_op(
-                bond_utxo_id,
-                bond_proof(0x12, 1_000),
+                deposit_utxo_id,
+                deposit_proof(0x12, 1_000),
                 &keypair,
                 42,
                 DEFAULT_CHAIN_ID,
@@ -1145,19 +1159,26 @@ mod tests {
             .unwrap(),
             build_delegate_op(
                 validator_id,
-                bond_utxo_id,
-                bond_proof(0x13, 1_000),
+                deposit_utxo_id,
+                deposit_proof(0x13, 1_000),
                 &keypair,
                 42,
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
             build_exit_stake_position_op(
-                Bytes32::from([0x31; 32]), 1_000,
-                PositionCustodyV1::DelegatorIdentity { delegator_id: validator_id },
-                StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 42 },
+                Bytes32::from([0x31; 32]),
+                1_000,
+                PositionCustodyV1::DelegatorIdentity {
+                    delegator_id: validator_id,
+                },
+                StakePositionExitSigner::Delegator {
+                    keypair: &keypair,
+                    nonce: 42,
+                },
                 DEFAULT_CHAIN_ID,
-            ).unwrap(),
+            )
+            .unwrap(),
             build_claim_rewards_op(validator_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_set_commission_op(validator_id, 1_100, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_set_auto_delegate_op(
@@ -1186,12 +1207,12 @@ mod tests {
     fn all_ops_have_non_zero_signatures() {
         let keypair = test_keypair(0x77);
         let validator_id = Bytes32::from([0x09; 32]);
-        let bond_utxo_id = Bytes32::from([0x0A; 32]);
+        let deposit_utxo_id = Bytes32::from([0x0A; 32]);
         let ops = vec![
             build_register_validator_op_with_cold(
                 1_000,
-                bond_utxo_id,
-                bond_proof(0x21, 1_000),
+                deposit_utxo_id,
+                deposit_proof(0x21, 1_000),
                 &keypair,
                 &test_cold_keypair(0x93),
                 [0x12; 32],
@@ -1200,8 +1221,8 @@ mod tests {
             )
             .unwrap(),
             build_self_stake_op(
-                bond_utxo_id,
-                bond_proof(0x22, 1_000),
+                deposit_utxo_id,
+                deposit_proof(0x22, 1_000),
                 &keypair,
                 2,
                 DEFAULT_CHAIN_ID,
@@ -1209,19 +1230,26 @@ mod tests {
             .unwrap(),
             build_delegate_op(
                 validator_id,
-                bond_utxo_id,
-                bond_proof(0x23, 1_000),
+                deposit_utxo_id,
+                deposit_proof(0x23, 1_000),
                 &keypair,
                 4,
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
             build_exit_stake_position_op(
-                Bytes32::from([0x32; 32]), 1_000,
-                PositionCustodyV1::DelegatorIdentity { delegator_id: validator_id },
-                StakePositionExitSigner::Delegator { keypair: &keypair, nonce: 5 },
+                Bytes32::from([0x32; 32]),
+                1_000,
+                PositionCustodyV1::DelegatorIdentity {
+                    delegator_id: validator_id,
+                },
+                StakePositionExitSigner::Delegator {
+                    keypair: &keypair,
+                    nonce: 5,
+                },
                 DEFAULT_CHAIN_ID,
-            ).unwrap(),
+            )
+            .unwrap(),
             build_claim_rewards_op(validator_id, &keypair, 6, DEFAULT_CHAIN_ID).unwrap(),
             build_set_commission_op(validator_id, 1_200, &keypair, 7, DEFAULT_CHAIN_ID).unwrap(),
             build_set_auto_delegate_op(

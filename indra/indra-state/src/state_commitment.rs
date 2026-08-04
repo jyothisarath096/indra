@@ -28,20 +28,15 @@ use indra_crypto::sha256;
 
 use crate::{
     persistent::PersistentAuthTree,
-    validator::{
-        DelegationReturnEvent, EvictedValidatorTombstoneV2, ValidatorEntry,
-    },
+    validator::{EvictedValidatorTombstoneV2, ValidatorEntry},
     ChainState,
 };
 
 const KEY_DOMAIN: &[u8] = b"INDRA-state-v2-key:";
 
 const DOMAIN_VALIDATOR: u8 = 0x01;
-const DOMAIN_DELEGATOR: u8 = 0x02;
 const DOMAIN_STAKING_NONCE: u8 = 0x03;
-const DOMAIN_STAKED_BOND: u8 = 0x04;
 const DOMAIN_SLASH_HASH: u8 = 0x05;
-const DOMAIN_DELEGATION_RETURN_EVENT: u8 = 0x06;
 const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
 const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
 const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
@@ -107,14 +102,6 @@ impl StateCommitmentV2 {
                 retired_cold_component_value_hash(1, component),
             ));
         }
-        {
-            for event in &state.delegation_return_events {
-                leaves.push((
-                    delegation_return_event_key(event),
-                    delegation_return_event_value_hash(event),
-                ));
-            }
-        }
         for snapshot in &state.consensus_snapshots {
             leaves.push((
                 consensus_snapshot_key(snapshot.activation_height),
@@ -163,7 +150,6 @@ impl StateCommitmentV2 {
         self.tree.delete(validator_key(validator_id));
     }
 
-
     /// Insert or replace a staking nonce leaf.
     pub fn put_staking_nonce(&mut self, signer_id: &Bytes32, nonce: u64) {
         self.tree.insert(
@@ -176,7 +162,6 @@ impl StateCommitmentV2 {
     pub fn delete_staking_nonce(&mut self, signer_id: &Bytes32) {
         self.tree.delete(staking_nonce_key(signer_id));
     }
-
 
     /// Insert or replace a canonical stake-position leaf.
     pub fn put_stake_position(&mut self, position: &StakePositionV1) {
@@ -206,19 +191,6 @@ impl StateCommitmentV2 {
     pub fn put_slash_hash(&mut self, hash: &Bytes32) {
         self.tree
             .insert(slash_hash_key(hash), slash_hash_value_hash(hash));
-    }
-
-    /// Insert a delegation-return event leaf.
-    pub fn put_delegation_return_event(&mut self, event: &DelegationReturnEvent) {
-        self.tree.insert(
-            delegation_return_event_key(event),
-            delegation_return_event_value_hash(event),
-        );
-    }
-
-    /// Delete a delegation-return event leaf.
-    pub fn delete_delegation_return_event(&mut self, event: &DelegationReturnEvent) {
-        self.tree.delete(delegation_return_event_key(event));
     }
 
     /// Insert or replace a delegator identity-registry leaf.
@@ -256,31 +228,12 @@ pub(crate) fn validator_key(validator_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_VALIDATOR, &validator_id.0)
 }
 
-pub(crate) fn delegator_key(validator_id: &Bytes32, delegator_id: &Bytes32) -> [u8; 32] {
-    let mut raw = Vec::with_capacity(64);
-    raw.extend_from_slice(&validator_id.0);
-    raw.extend_from_slice(&delegator_id.0);
-    derive_key(DOMAIN_DELEGATOR, &raw)
-}
-
 fn staking_nonce_key(signer_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_STAKING_NONCE, &signer_id.0)
 }
 
-fn staked_bond_key(utxo_id: &Bytes32) -> [u8; 32] {
-    derive_key(DOMAIN_STAKED_BOND, &utxo_id.0)
-}
-
 fn slash_hash_key(hash: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_SLASH_HASH, &hash.0)
-}
-
-fn delegation_return_event_key(event: &DelegationReturnEvent) -> [u8; 32] {
-    let mut raw = Vec::with_capacity(72);
-    raw.extend_from_slice(&event.delegator_id.0);
-    raw.extend_from_slice(&event.bond_utxo_id.0);
-    raw.extend_from_slice(&event.returned_height.to_le_bytes());
-    derive_key(DOMAIN_DELEGATION_RETURN_EVENT, &raw)
 }
 
 pub(crate) fn delegator_identity_key(delegator_id: &Bytes32) -> [u8; 32] {
@@ -441,7 +394,6 @@ pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> 
     sha256(&value)
 }
 
-
 fn staking_nonce_value_hash(signer_id: &Bytes32, nonce: u64) -> [u8; 32] {
     let mut value = Vec::with_capacity(40);
     value.extend_from_slice(&signer_id.0);
@@ -449,15 +401,8 @@ fn staking_nonce_value_hash(signer_id: &Bytes32, nonce: u64) -> [u8; 32] {
     sha256(&value)
 }
 
-
 fn slash_hash_value_hash(hash: &Bytes32) -> [u8; 32] {
     sha256(&hash.0)
-}
-
-fn delegation_return_event_value_hash(event: &DelegationReturnEvent) -> [u8; 32] {
-    let mut value = Vec::new();
-    event.encode(&mut value);
-    sha256(&value)
 }
 
 pub(crate) fn delegator_identity_value_hash(
@@ -681,7 +626,6 @@ mod tests {
         }
     }
 
-
     fn pubkey(byte: u8) -> HybridPubKey {
         HybridPubKey {
             classical_pk: id(byte),
@@ -711,14 +655,6 @@ mod tests {
                 delegator_identity_key(delegator_id),
                 delegator_identity_value_hash(delegator_id, pubkey),
             ));
-        }
-        {
-            for event in &state.delegation_return_events {
-                leaves.push((
-                    delegation_return_event_key(event),
-                    delegation_return_event_value_hash(event),
-                ));
-            }
         }
         for snapshot in &state.consensus_snapshots {
             leaves.push((
@@ -768,14 +704,6 @@ mod tests {
         for hash in &state.applied_slash_hashes {
             leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
         }
-        {
-            for event in &state.delegation_return_events {
-                leaves.push((
-                    delegation_return_event_key(event),
-                    delegation_return_event_value_hash(event),
-                ));
-            }
-        }
         Bytes32::from(
             CompressedAuthTree::from_pairs(leaves)
                 .expect("pre-identity oracle keys are domain-separated and unique")
@@ -802,7 +730,6 @@ mod tests {
         value.extend_from_slice(&encoded_pubkey);
         sha256(&value)
     }
-
 
     #[test]
     fn validator_leaf_commits_cold_state_but_not_uncommitted_display_name() {
@@ -902,7 +829,6 @@ mod tests {
         let identity_key = delegator_identity_key(&delegator_id);
         assert_ne!(identity_key, validator_key(&delegator_id));
         assert_ne!(identity_key, staking_nonce_key(&delegator_id));
-        assert_ne!(identity_key, staked_bond_key(&delegator_id));
         assert_ne!(identity_key, slash_hash_key(&delegator_id));
     }
 
@@ -945,16 +871,12 @@ mod tests {
         assert_eq!(state.state_commitment_v2_root(height), baseline_root);
     }
 
-
     #[test]
     fn state_commitment_v2_domain_bytes_do_not_collide() {
         let domains = [
             ("validator", DOMAIN_VALIDATOR),
-            ("delegator", DOMAIN_DELEGATOR),
             ("staking_nonce", DOMAIN_STAKING_NONCE),
-            ("staked_bond", DOMAIN_STAKED_BOND),
             ("slash_hash", DOMAIN_SLASH_HASH),
-            ("delegation_return_event", DOMAIN_DELEGATION_RETURN_EVENT),
             ("delegator_identity", DOMAIN_DELEGATOR_IDENTITY),
             ("retired_cold_component", DOMAIN_RETIRED_COLD_COMPONENT),
             ("consensus_snapshot", DOMAIN_CONSENSUS_SNAPSHOT),
@@ -1083,7 +1005,6 @@ mod tests {
         assert_eq!(incremental.root(), baseline);
     }
 
-
     #[test]
     fn state_commitment_v2_rebuild_after_decode_is_deterministic() {
         let height = u64::MAX;
@@ -1100,5 +1021,4 @@ mod tests {
         assert!(decoded.state_commitment_v2.is_none());
         assert_eq!(decoded.state_commitment_v2_root(height), root_before);
     }
-
 }

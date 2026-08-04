@@ -69,7 +69,7 @@ const ROTATE_VALIDATOR_COLD_KEY_PAYLOAD_DOMAIN: &[u8] =
 ///   checked against the UTXO read from state;
 /// - is replay-safe because bonding spends the referenced UTXO.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StakingBondProof {
+pub struct StakeDepositProof {
     /// The committed value. Must equal the bonded UTXO's `value_spark`.
     pub committed_value_spark: u64,
     /// Pedersen blinding factor `r` stored as raw bytes, matching the existing
@@ -106,7 +106,7 @@ impl Decode for ColdStakingAuthorization {
     }
 }
 
-impl Encode for StakingBondProof {
+impl Encode for StakeDepositProof {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.committed_value_spark.encode(buf);
         self.blinding_factor.encode(buf);
@@ -117,7 +117,7 @@ impl Encode for StakingBondProof {
     }
 }
 
-impl Decode for StakingBondProof {
+impl Decode for StakeDepositProof {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
             committed_value_spark: u64::decode(r)?,
@@ -147,11 +147,11 @@ pub enum StakingOpBody {
         /// Target validator.
         validator_id: Bytes32,
         /// The UTXO being bonded as stake.
-        bond_utxo_id: Bytes32,
+        deposit_utxo_id: Bytes32,
         /// Delegator's public key.
         delegator_pubkey: HybridPubKey,
         /// Proof binding the bonded UTXO commitment to its public value.
-        bond_proof: Option<StakingBondProof>,
+        deposit_proof: Option<StakeDepositProof>,
     },
 
     /// Move exact active position principal into a new unbonding tranche.
@@ -181,13 +181,13 @@ pub enum StakingOpBody {
         /// Commission rate in basis points (e.g. 1000 = 10%).
         commission_bps: u32,
         /// Validator-owned UTXO atomically bonded at registration.
-        bond_utxo_id: Bytes32,
+        deposit_utxo_id: Bytes32,
         /// Validator's public key.
         validator_pubkey: HybridPubKey,
         /// Validator's VRF public key for proposer election.
         vrf_pk: [u8; 32],
         /// Proof binding the bonded UTXO commitment to its public value.
-        bond_proof: Option<StakingBondProof>,
+        deposit_proof: Option<StakeDepositProof>,
         /// Proposed independent cold hybrid public key.
         cold_pubkey: Option<ColdHybridPubKey>,
         /// Complete cold hybrid signature over the dual authorization message.
@@ -224,11 +224,11 @@ pub enum StakingOpBody {
     /// Bond a validator-owned UTXO as validator self-stake.
     SelfStake {
         /// The UTXO being bonded as validator self-stake.
-        bond_utxo_id: Bytes32,
+        deposit_utxo_id: Bytes32,
         /// Validator's public key.
         validator_pubkey: HybridPubKey,
         /// Proof binding the bonded UTXO commitment to its public value.
-        bond_proof: Option<StakingBondProof>,
+        deposit_proof: Option<StakeDepositProof>,
         /// Present only for an enrolled validator.
         cold_authorization: Option<ColdStakingAuthorization>,
     },
@@ -368,10 +368,10 @@ impl StakingOp {
     ) -> IndraResult<Option<Vec<u8>>> {
         let StakingOpBody::RegisterValidator {
             commission_bps,
-            bond_utxo_id,
+            deposit_utxo_id,
             validator_pubkey,
             vrf_pk,
-            bond_proof,
+            deposit_proof,
             cold_pubkey: Some(cold_pubkey),
             ..
         } = &self.body
@@ -382,10 +382,10 @@ impl StakingOp {
         let mut payload = Vec::new();
         payload.extend_from_slice(REGISTER_VALIDATOR_PAYLOAD_DOMAIN);
         commission_bps.encode(&mut payload);
-        bond_utxo_id.encode(&mut payload);
+        deposit_utxo_id.encode(&mut payload);
         validator_pubkey.encode(&mut payload);
         payload.extend_from_slice(vrf_pk);
-        encode_optional_bond_proof(bond_proof, &mut payload);
+        encode_optional_deposit_proof(deposit_proof, &mut payload);
         cold_pubkey.encode(&mut payload);
         1u64.encode(&mut payload);
 
@@ -627,15 +627,15 @@ impl Encode for StakingOpBody {
         match self {
             StakingOpBody::Delegate {
                 validator_id,
-                bond_utxo_id,
+                deposit_utxo_id,
                 delegator_pubkey,
-                bond_proof,
+                deposit_proof,
             } => {
                 buf.push(TAG_DELEGATE);
                 validator_id.encode(buf);
-                bond_utxo_id.encode(buf);
+                deposit_utxo_id.encode(buf);
                 delegator_pubkey.encode(buf);
-                encode_optional_bond_proof(bond_proof, buf);
+                encode_optional_deposit_proof(deposit_proof, buf);
             }
             StakingOpBody::ExitStakePosition {
                 position_id,
@@ -673,19 +673,19 @@ impl Encode for StakingOpBody {
             }
             StakingOpBody::RegisterValidator {
                 commission_bps,
-                bond_utxo_id,
+                deposit_utxo_id,
                 validator_pubkey,
                 vrf_pk,
-                bond_proof,
+                deposit_proof,
                 cold_pubkey,
                 cold_signature,
             } => {
                 buf.push(TAG_REGISTER_VALIDATOR_WITH_COLD_KEY);
                 commission_bps.encode(buf);
-                bond_utxo_id.encode(buf);
+                deposit_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
                 buf.extend_from_slice(vrf_pk);
-                encode_optional_bond_proof(bond_proof, buf);
+                encode_optional_deposit_proof(deposit_proof, buf);
                 cold_pubkey.is_some().encode(buf);
                 if let Some(pubkey) = cold_pubkey {
                     pubkey.encode(buf);
@@ -731,9 +731,9 @@ impl Encode for StakingOpBody {
                 }
             }
             StakingOpBody::SelfStake {
-                bond_utxo_id,
+                deposit_utxo_id,
                 validator_pubkey,
-                bond_proof,
+                deposit_proof,
                 cold_authorization,
             } => {
                 buf.push(if cold_authorization.is_some() {
@@ -741,9 +741,9 @@ impl Encode for StakingOpBody {
                 } else {
                     TAG_SELF_STAKE
                 });
-                bond_utxo_id.encode(buf);
+                deposit_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
-                encode_optional_bond_proof(bond_proof, buf);
+                encode_optional_deposit_proof(deposit_proof, buf);
                 if let Some(authorization) = cold_authorization {
                     authorization.encode(buf);
                 }
@@ -782,8 +782,8 @@ impl Encode for StakingOpBody {
             } => {
                 32 + 32
                     + delegator_pubkey.encoded_len()
-                    + optional_bond_proof_encoded_len(match self {
-                        StakingOpBody::Delegate { bond_proof, .. } => bond_proof,
+                    + optional_deposit_proof_encoded_len(match self {
+                        StakingOpBody::Delegate { deposit_proof, .. } => deposit_proof,
                         _ => unreachable!(),
                     })
             }
@@ -812,7 +812,7 @@ impl Encode for StakingOpBody {
             }
             StakingOpBody::RegisterValidator {
                 validator_pubkey,
-                bond_proof,
+                deposit_proof,
                 cold_pubkey,
                 cold_signature,
                 ..
@@ -820,7 +820,7 @@ impl Encode for StakingOpBody {
                 4 + 32
                     + validator_pubkey.encoded_len()
                     + 32
-                    + optional_bond_proof_encoded_len(bond_proof)
+                    + optional_deposit_proof_encoded_len(deposit_proof)
                     + 1
                     + cold_pubkey.as_ref().map(Encode::encoded_len).unwrap_or(0)
                     + 1
@@ -855,12 +855,12 @@ impl Encode for StakingOpBody {
             }
             StakingOpBody::SelfStake {
                 validator_pubkey,
-                bond_proof,
+                deposit_proof,
                 cold_authorization,
                 ..
             } => {
                 32 + validator_pubkey.encoded_len()
-                    + optional_bond_proof_encoded_len(bond_proof)
+                    + optional_deposit_proof_encoded_len(deposit_proof)
                     + cold_authorization
                         .as_ref()
                         .map(Encode::encoded_len)
@@ -893,9 +893,9 @@ impl Decode for StakingOpBody {
         match tag {
             TAG_DELEGATE => Ok(StakingOpBody::Delegate {
                 validator_id: Bytes32::decode(r)?,
-                bond_utxo_id: Bytes32::decode(r)?,
+                deposit_utxo_id: Bytes32::decode(r)?,
                 delegator_pubkey: HybridPubKey::decode(r)?,
-                bond_proof: decode_optional_bond_proof(r)?,
+                deposit_proof: decode_optional_deposit_proof(r)?,
             }),
             TAG_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
                 position_id: Bytes32::decode(r)?,
@@ -910,10 +910,10 @@ impl Decode for StakingOpBody {
             }),
             TAG_REGISTER_VALIDATOR_WITH_COLD_KEY => {
                 let commission_bps = u32::decode(r)?;
-                let bond_utxo_id = Bytes32::decode(r)?;
+                let deposit_utxo_id = Bytes32::decode(r)?;
                 let validator_pubkey = HybridPubKey::decode(r)?;
                 let vrf_pk = r.read_bytes32()?;
-                let bond_proof = decode_optional_bond_proof(r)?;
+                let deposit_proof = decode_optional_deposit_proof(r)?;
                 let cold_pubkey = if bool::decode(r)? {
                     Some(ColdHybridPubKey::decode(r)?)
                 } else {
@@ -931,10 +931,10 @@ impl Decode for StakingOpBody {
                 }
                 Ok(StakingOpBody::RegisterValidator {
                     commission_bps,
-                    bond_utxo_id,
+                    deposit_utxo_id,
                     validator_pubkey,
                     vrf_pk,
-                    bond_proof,
+                    deposit_proof,
                     cold_pubkey,
                     cold_signature,
                 })
@@ -965,9 +965,9 @@ impl Decode for StakingOpBody {
                 cold_authorization: None,
             }),
             TAG_SELF_STAKE => Ok(StakingOpBody::SelfStake {
-                bond_utxo_id: Bytes32::decode(r)?,
+                deposit_utxo_id: Bytes32::decode(r)?,
                 validator_pubkey: HybridPubKey::decode(r)?,
-                bond_proof: decode_optional_bond_proof(r)?,
+                deposit_proof: decode_optional_deposit_proof(r)?,
                 cold_authorization: None,
             }),
             TAG_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
@@ -990,9 +990,9 @@ impl Decode for StakingOpBody {
                 cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
             }),
             TAG_COLD_SELF_STAKE => Ok(StakingOpBody::SelfStake {
-                bond_utxo_id: Bytes32::decode(r)?,
+                deposit_utxo_id: Bytes32::decode(r)?,
                 validator_pubkey: HybridPubKey::decode(r)?,
-                bond_proof: decode_optional_bond_proof(r)?,
+                deposit_proof: decode_optional_deposit_proof(r)?,
                 cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
             }),
             TAG_COLD_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
@@ -1036,7 +1036,7 @@ impl Decode for StakingOp {
     }
 }
 
-fn encode_optional_bond_proof(proof: &Option<StakingBondProof>, buf: &mut Vec<u8>) {
+fn encode_optional_deposit_proof(proof: &Option<StakeDepositProof>, buf: &mut Vec<u8>) {
     if let Some(proof) = proof {
         1u8.encode(buf);
         proof.encode(buf);
@@ -1045,15 +1045,15 @@ fn encode_optional_bond_proof(proof: &Option<StakingBondProof>, buf: &mut Vec<u8
     }
 }
 
-fn decode_optional_bond_proof(r: &mut ByteReader<'_>) -> IndraResult<Option<StakingBondProof>> {
+fn decode_optional_deposit_proof(r: &mut ByteReader<'_>) -> IndraResult<Option<StakeDepositProof>> {
     match u8::decode(r)? {
         0 => Ok(None),
-        1 => Ok(Some(StakingBondProof::decode(r)?)),
+        1 => Ok(Some(StakeDepositProof::decode(r)?)),
         byte => Err(crate::error::IndraError::InvalidBool { byte }),
     }
 }
 
-fn optional_bond_proof_encoded_len(proof: &Option<StakingBondProof>) -> usize {
+fn optional_deposit_proof_encoded_len(proof: &Option<StakeDepositProof>) -> usize {
     1 + proof.as_ref().map(Encode::encoded_len).unwrap_or(0)
 }
 
@@ -1150,8 +1150,8 @@ mod tests {
         }
     }
 
-    fn dummy_bond_proof(byte: u8, value: u64) -> StakingBondProof {
-        StakingBondProof {
+    fn dummy_deposit_proof(byte: u8, value: u64) -> StakeDepositProof {
+        StakeDepositProof {
             committed_value_spark: value,
             blinding_factor: Bytes32::from([byte; 32]),
         }
@@ -1170,9 +1170,9 @@ mod tests {
         let cases = vec![
             op(StakingOpBody::Delegate {
                 validator_id: Bytes32::from([1u8; 32]),
-                bond_utxo_id: Bytes32::from([0x11u8; 32]),
+                deposit_utxo_id: Bytes32::from([0x11u8; 32]),
                 delegator_pubkey: dummy_pubkey(),
-                bond_proof: Some(dummy_bond_proof(0xA1, 10_000)),
+                deposit_proof: Some(dummy_deposit_proof(0xA1, 10_000)),
             }),
             op(StakingOpBody::ExitStakePosition {
                 position_id: Bytes32::from([2u8; 32]),
@@ -1189,10 +1189,10 @@ mod tests {
             }),
             op(StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
-                bond_utxo_id: Bytes32::from([0x44; 32]),
+                deposit_utxo_id: Bytes32::from([0x44; 32]),
                 validator_pubkey: dummy_pubkey(),
                 vrf_pk: [4u8; 32],
-                bond_proof: Some(dummy_bond_proof(0xA2, 20_000)),
+                deposit_proof: Some(dummy_deposit_proof(0xA2, 20_000)),
                 cold_pubkey: Some(dummy_cold_pubkey()),
                 cold_signature: Some(dummy_signature()),
             }),
@@ -1202,9 +1202,9 @@ mod tests {
                 cold_authorization: None,
             }),
             op(StakingOpBody::SelfStake {
-                bond_utxo_id: Bytes32::from([0x66u8; 32]),
+                deposit_utxo_id: Bytes32::from([0x66u8; 32]),
                 validator_pubkey: dummy_pubkey(),
-                bond_proof: Some(dummy_bond_proof(0xA3, 30_000)),
+                deposit_proof: Some(dummy_deposit_proof(0xA3, 30_000)),
                 cold_authorization: None,
             }),
             op(StakingOpBody::SetAutoDelegate {
@@ -1267,15 +1267,15 @@ mod tests {
             ),
             (
                 StakingOpBody::SelfStake {
-                    bond_utxo_id: Bytes32::from([0xD3; 32]),
+                    deposit_utxo_id: Bytes32::from([0xD3; 32]),
                     validator_pubkey: validator_pubkey.clone(),
-                    bond_proof: Some(dummy_bond_proof(0xD4, 100)),
+                    deposit_proof: Some(dummy_deposit_proof(0xD4, 100)),
                     cold_authorization: None,
                 },
                 StakingOpBody::SelfStake {
-                    bond_utxo_id: Bytes32::from([0xD3; 32]),
+                    deposit_utxo_id: Bytes32::from([0xD3; 32]),
                     validator_pubkey: validator_pubkey.clone(),
-                    bond_proof: Some(dummy_bond_proof(0xD4, 100)),
+                    deposit_proof: Some(dummy_deposit_proof(0xD4, 100)),
                     cold_authorization: Some(authorization),
                 },
                 TAG_SELF_STAKE,
@@ -1331,16 +1331,16 @@ mod tests {
     fn staking_op_signing_bytes_domain_separation() {
         let delegate = op(StakingOpBody::Delegate {
             validator_id: Bytes32::from([1u8; 32]),
-            bond_utxo_id: Bytes32::from([0x11u8; 32]),
+            deposit_utxo_id: Bytes32::from([0x11u8; 32]),
             delegator_pubkey: dummy_pubkey(),
-            bond_proof: None,
+            deposit_proof: None,
         });
         let register = op(StakingOpBody::RegisterValidator {
             commission_bps: 1_000,
-            bond_utxo_id: Bytes32::from([0x99; 32]),
+            deposit_utxo_id: Bytes32::from([0x99; 32]),
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [9u8; 32],
-            bond_proof: None,
+            deposit_proof: None,
             cold_pubkey: None,
             cold_signature: None,
         });
@@ -1406,9 +1406,9 @@ mod tests {
     fn staking_op_validate_structure_accepts_bond_id_delegate() {
         let op = op(StakingOpBody::Delegate {
             validator_id: Bytes32::ZERO,
-            bond_utxo_id: Bytes32::ZERO,
+            deposit_utxo_id: Bytes32::ZERO,
             delegator_pubkey: dummy_pubkey(),
-            bond_proof: None,
+            deposit_proof: None,
         });
         assert!(op.validate_structure().is_ok());
     }
@@ -1417,10 +1417,10 @@ mod tests {
     fn staking_op_validate_structure_rejects_bad_commission() {
         let bad_register = op(StakingOpBody::RegisterValidator {
             commission_bps: 10_001,
-            bond_utxo_id: Bytes32::ZERO,
+            deposit_utxo_id: Bytes32::ZERO,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
-            bond_proof: None,
+            deposit_proof: None,
             cold_pubkey: None,
             cold_signature: None,
         });
@@ -1438,10 +1438,10 @@ mod tests {
     fn commission_in_range_accepted() {
         let op = op(StakingOpBody::RegisterValidator {
             commission_bps: 1_000,
-            bond_utxo_id: Bytes32::ZERO,
+            deposit_utxo_id: Bytes32::ZERO,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
-            bond_proof: None,
+            deposit_proof: None,
             cold_pubkey: Some(dummy_cold_pubkey()),
             cold_signature: Some(dummy_signature()),
         });
@@ -1453,9 +1453,9 @@ mod tests {
         let pubkey = dummy_pubkey();
         let a = op(StakingOpBody::Delegate {
             validator_id: Bytes32::from([1u8; 32]),
-            bond_utxo_id: Bytes32::from([0x11u8; 32]),
+            deposit_utxo_id: Bytes32::from([0x11u8; 32]),
             delegator_pubkey: pubkey.clone(),
-            bond_proof: None,
+            deposit_proof: None,
         });
         let b = op(StakingOpBody::ClaimRewards {
             validator_id: Bytes32::from([2u8; 32]),
@@ -1468,9 +1468,9 @@ mod tests {
     #[test]
     fn staking_op_self_stake_encode_decode_round_trip() {
         let op = op(StakingOpBody::SelfStake {
-            bond_utxo_id: Bytes32::from([0xA1; 32]),
+            deposit_utxo_id: Bytes32::from([0xA1; 32]),
             validator_pubkey: dummy_pubkey(),
-            bond_proof: Some(dummy_bond_proof(0xA4, 42)),
+            deposit_proof: Some(dummy_deposit_proof(0xA4, 42)),
             cold_authorization: None,
         });
         let encoded = op.encode_to_vec();
@@ -1554,9 +1554,9 @@ mod tests {
         let pubkey = dummy_pubkey();
         let expected = pubkey_to_id(&pubkey);
         let op = op(StakingOpBody::SelfStake {
-            bond_utxo_id: Bytes32::from([0xA3; 32]),
+            deposit_utxo_id: Bytes32::from([0xA3; 32]),
             validator_pubkey: pubkey,
-            bond_proof: None,
+            deposit_proof: None,
             cold_authorization: None,
         });
         assert_eq!(op.signer_id(), expected);
@@ -1565,18 +1565,18 @@ mod tests {
     #[test]
     fn staking_op_self_stake_signing_bytes_domain_separated_from_delegate() {
         let pubkey = dummy_pubkey();
-        let bond_utxo_id = Bytes32::from([0xA4; 32]);
+        let deposit_utxo_id = Bytes32::from([0xA4; 32]);
         let self_stake = op(StakingOpBody::SelfStake {
-            bond_utxo_id,
+            deposit_utxo_id,
             validator_pubkey: pubkey.clone(),
-            bond_proof: None,
+            deposit_proof: None,
             cold_authorization: None,
         });
         let delegate = op(StakingOpBody::Delegate {
             validator_id: pubkey_to_id(&pubkey),
-            bond_utxo_id,
+            deposit_utxo_id,
             delegator_pubkey: pubkey,
-            bond_proof: None,
+            deposit_proof: None,
         });
         assert_ne!(
             self_stake.signing_bytes("indra-testnet-1"),
@@ -1585,25 +1585,25 @@ mod tests {
     }
 
     #[test]
-    fn staking_bond_proof_encoding_round_trips() {
-        let proof = dummy_bond_proof(0x42, 123_456);
+    fn staking_deposit_proof_encoding_round_trips() {
+        let proof = dummy_deposit_proof(0x42, 123_456);
         let encoded = proof.encode_to_vec();
         assert_eq!(encoded.len(), 40);
-        assert_eq!(StakingBondProof::decode_exact(&encoded).unwrap(), proof);
+        assert_eq!(StakeDepositProof::decode_exact(&encoded).unwrap(), proof);
     }
 
     #[test]
-    fn staking_op_signing_bytes_include_bond_proof() {
+    fn staking_op_signing_bytes_include_deposit_proof() {
         let base = op(StakingOpBody::SelfStake {
-            bond_utxo_id: Bytes32::from([0xB1; 32]),
+            deposit_utxo_id: Bytes32::from([0xB1; 32]),
             validator_pubkey: dummy_pubkey(),
-            bond_proof: Some(dummy_bond_proof(0x01, 100)),
+            deposit_proof: Some(dummy_deposit_proof(0x01, 100)),
             cold_authorization: None,
         });
         let changed = op(StakingOpBody::SelfStake {
-            bond_utxo_id: Bytes32::from([0xB1; 32]),
+            deposit_utxo_id: Bytes32::from([0xB1; 32]),
             validator_pubkey: dummy_pubkey(),
-            bond_proof: Some(dummy_bond_proof(0x02, 100)),
+            deposit_proof: Some(dummy_deposit_proof(0x02, 100)),
             cold_authorization: None,
         });
         assert_ne!(

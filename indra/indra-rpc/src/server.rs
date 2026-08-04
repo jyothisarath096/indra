@@ -274,10 +274,11 @@ pub enum RpcMethodCost {
 /// Classify public read-only methods by expected resource cost.
 pub fn rpc_method_cost(method: &str) -> RpcMethodCost {
     match method {
-        "indra_getDelegatorPositions"
+        "indra_getStakePositions"
+        | "indra_getUnbondingTranches"
+        | "indra_getValidatorStakePositions"
+        | "indra_getOwnerStakePositions"
         | "indra_getDelegatorRewards"
-        | "indra_getValidatorDelegators"
-        | "indra_getStakeBonds"
         | "indra_getEpochHistory"
         | "indra_getUtxoProof" => RpcMethodCost::Expensive,
         _ => RpcMethodCost::Cheap,
@@ -811,7 +812,7 @@ mod tests {
     #[test]
     fn rpc_public_expensive_method_classification_is_explicit() {
         assert_eq!(
-            rpc_method_cost("indra_getDelegatorPositions"),
+            rpc_method_cost("indra_getStakePositions"),
             RpcMethodCost::Expensive
         );
         assert_eq!(

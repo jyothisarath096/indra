@@ -16,9 +16,9 @@ use indra_core::types::slash_membership::{
 
 use indra_core::types::primitives::{
     Bytes32, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-    INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_DELEGATION_RETURN_EVENTS,
-    MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
-    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
+    INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_STAKE_POSITIONS_PER_VALIDATOR,
+    MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR,
+    MAX_TRANCHES_TOTAL,
 };
 use indra_core::types::stake_position::{
     ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTrancheV1,
@@ -31,11 +31,7 @@ use crate::{
     persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::UtxoSet,
-    validator::{
-        decode_delegation_return_events, delegation_return_events_encoded_len,
-        encode_delegation_return_events, DelegationReturnEvent, EvictedValidatorTombstoneV2,
-        ValidatorSet,
-    },
+    validator::{EvictedValidatorTombstoneV2, ValidatorSet},
 };
 
 /// Defensive snapshot decode ceiling for staked-bond entries.
@@ -123,7 +119,6 @@ pub struct ChainState {
     /// Bounded historical/custody records for post-v8 registry evictions.
     pub evicted_validator_tombstones: PersistentOrdMap<Bytes32, EvictedValidatorTombstoneV2>,
 
-
     /// Canonical active/reward staking positions.
     pub stake_positions: PersistentOrdMap<Bytes32, StakePositionV1>,
 
@@ -151,12 +146,6 @@ pub struct ChainState {
 
     /// On-chain governance state.
     pub governance: GovernanceState,
-
-    /// Bounded rolling log of automatic delegation principal returns.
-    ///
-    /// This is consensus-visible after the registered-validator-cap activation
-    /// so delegators can discover forced returns caused by validator eviction.
-    pub delegation_return_events: Vec<DelegationReturnEvent>,
 
     /// Derived, non-authoritative StateCommitmentV2 cache.
     ///
@@ -210,7 +199,6 @@ impl Encode for ChainState {
         encode_nonce_map(&self.staking_nonces, buf);
         encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
-        encode_delegation_return_events(&self.delegation_return_events, buf);
         encode_delegator_identity_registry(&self.delegator_identities, buf);
         encode_retired_cold_components(
             &self.retired_cold_classical_components,
@@ -247,7 +235,6 @@ impl Encode for ChainState {
             + nonce_map_encoded_len(&self.staking_nonces)
             + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
-            + delegation_return_events_encoded_len(&self.delegation_return_events)
             + delegator_identity_registry_encoded_len(&self.delegator_identities)
             + retired_cold_components_encoded_len(
                 &self.retired_cold_classical_components,
@@ -285,11 +272,6 @@ impl Decode for ChainState {
         let staking_nonces = decode_nonce_map(r)?;
         let applied_slash_hashes = decode_hash_set(r, "snapshot.applied_slash_hashes")?;
         let governance = GovernanceState::decode(r)?;
-        let delegation_return_events = if r.remaining() > 0 {
-            decode_delegation_return_events(r)?
-        } else {
-            Vec::new()
-        };
         let delegator_identities = if r.remaining() > 0 {
             decode_delegator_identity_registry(r)?
         } else {
@@ -375,7 +357,6 @@ impl Decode for ChainState {
             retired_cold_pq_components,
             applied_slash_hashes,
             governance,
-            delegation_return_events,
             state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
@@ -386,12 +367,14 @@ impl Decode for ChainState {
 
 impl ChainState {
     /// Sum active delegated principal from authoritative staking positions.
-    pub fn total_active_delegated_bond_stake(&self) -> u64 {
+    pub fn total_active_delegated_stake(&self) -> u64 {
         self.stake_positions
             .values()
             .filter(|position| position.validator_id != position.principal_owner_id)
             .filter_map(|position| position.active)
-            .fold(0u64, |sum, active| sum.saturating_add(active.principal_spark))
+            .fold(0u64, |sum, active| {
+                sum.saturating_add(active.principal_spark)
+            })
     }
 
     /// Create the genesis state (before any block has been applied).
@@ -423,7 +406,6 @@ impl ChainState {
             retired_cold_pq_components: PersistentOrdSet::new(),
             applied_slash_hashes: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
-            delegation_return_events: Vec::new(),
             state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
@@ -557,43 +539,80 @@ impl ChainState {
             principals.insert(member.validator_id, BTreeMap::new());
         }
         for position in self.stake_positions.values() {
-            let Some(active) = position.active else { continue };
-            if position.principal_owner_id == position.validator_id { continue; }
+            let Some(active) = position.active else {
+                continue;
+            };
+            if position.principal_owner_id == position.validator_id {
+                continue;
+            }
             if let Some(owners) = principals.get_mut(&position.validator_id) {
                 let (bonded, _) = owners.entry(position.principal_owner_id).or_default();
-                *bonded = bonded.checked_add(active.principal_spark).ok_or_else(||
-                    crate::error::StateError::InvalidRewardEconomicSnapshot("delegated principal overflow".into()))?;
+                *bonded = bonded.checked_add(active.principal_spark).ok_or_else(|| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(
+                        "delegated principal overflow".into(),
+                    )
+                })?;
             }
         }
-        for source in self.validators.all_validators().filter(|v|
-            matches!(v.status, crate::validator::ValidatorStatus::Registered) && v.auto_delegate_to.is_some()) {
-            let Some(position) = self.stake_positions.values().find(|p|
-                p.validator_id == source.validator_id && p.principal_owner_id == source.validator_id) else { continue };
-            let Some(active) = position.active else { continue };
+        for source in self.validators.all_validators().filter(|v| {
+            matches!(v.status, crate::validator::ValidatorStatus::Registered)
+                && v.auto_delegate_to.is_some()
+        }) {
+            let Some(position) = self.stake_positions.values().find(|p| {
+                p.validator_id == source.validator_id && p.principal_owner_id == source.validator_id
+            }) else {
+                continue;
+            };
+            let Some(active) = position.active else {
+                continue;
+            };
             if let Some(owners) = principals.get_mut(&source.auto_delegate_to.expect("filtered")) {
                 let (_, auto) = owners.entry(source.validator_id).or_default();
-                *auto = auto.checked_add(active.principal_spark).ok_or_else(||
-                    crate::error::StateError::InvalidRewardEconomicSnapshot("auto-delegated principal overflow".into()))?;
+                *auto = auto.checked_add(active.principal_spark).ok_or_else(|| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(
+                        "auto-delegated principal overflow".into(),
+                    )
+                })?;
             }
         }
         let bound = self.governance.params.max_commission_bps;
         let mut validators = Vec::with_capacity(consensus_snapshot.entries().len());
         for member in consensus_snapshot.entries() {
-            let validator = self.validators.get(&member.validator_id).ok_or_else(||
-                crate::error::StateError::InvalidRewardEconomicSnapshot("snapshot validator missing".into()))?;
-            let owners = principals.remove(&member.validator_id).unwrap_or_default().into_iter()
-                .map(|(id, (bonded, auto))| RewardEconomicDelegatorEntry::new(id, bonded, auto)
-                    .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string())))
+            let validator = self.validators.get(&member.validator_id).ok_or_else(|| {
+                crate::error::StateError::InvalidRewardEconomicSnapshot(
+                    "snapshot validator missing".into(),
+                )
+            })?;
+            let owners = principals
+                .remove(&member.validator_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, (bonded, auto))| {
+                    RewardEconomicDelegatorEntry::new(id, bonded, auto).map_err(|e| {
+                        crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string())
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            validators.push(RewardEconomicValidatorEntry::new(member.validator_id, validator.commission_bps, owners, bound)
-                .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string()))?);
+            validators.push(
+                RewardEconomicValidatorEntry::new(
+                    member.validator_id,
+                    validator.commission_bps,
+                    owners,
+                    bound,
+                )
+                .map_err(|e| {
+                    crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string())
+                })?,
+            );
         }
-        RewardEconomicSnapshot::new(consensus_snapshot.activation_height,
-            consensus_snapshot.source_boundary_height, bound, validators)
-            .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string()))
+        RewardEconomicSnapshot::new(
+            consensus_snapshot.activation_height,
+            consensus_snapshot.source_boundary_height,
+            bound,
+            validators,
+        )
+        .map_err(|e| crate::error::StateError::InvalidRewardEconomicSnapshot(e.to_string()))
     }
-
-
 
     /// Resolve exactly paired consensus and reward authority for `height`.
     pub fn reward_economic_snapshot_for_height(
@@ -640,13 +659,17 @@ impl ChainState {
                 validator_id,
                 validator_id,
                 PositionCustodyV1::ValidatorColdIdentity { validator_id },
-                Some(ActiveStakeAggregateV1::new(principal_spark, 0, 0).map_err(|error| {
-                    crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
-                })?),
+                Some(
+                    ActiveStakeAggregateV1::new(principal_spark, 0, 0).map_err(|error| {
+                        crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+                    })?,
+                ),
                 0,
                 0,
             )
-            .map_err(|error| crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string()))?;
+            .map_err(|error| {
+                crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
+            })?;
             // Genesis finalization is the authority for the self-position. Test
             // builders may deliberately amend the height-zero validator set and
             // finalize again; replace the same deterministic position atomically.
@@ -815,27 +838,6 @@ impl ChainState {
     /// True if the chain has had at least one block applied.
     pub fn has_blocks(&self) -> bool {
         self.height > 0
-    }
-
-    /// Append a delegation-return event and prune the oldest entries if the
-    /// fixed global retention bound is exceeded.
-    pub fn push_delegation_return_event(&mut self, event: DelegationReturnEvent) {
-        if let Some(commitment) = self.state_commitment_v2.as_mut() {
-            commitment.put_delegation_return_event(&event);
-        }
-        self.delegation_return_events.push(event);
-        let excess = self
-            .delegation_return_events
-            .len()
-            .saturating_sub(MAX_DELEGATION_RETURN_EVENTS);
-        if excess > 0 {
-            let removed: Vec<_> = self.delegation_return_events.drain(0..excess).collect();
-            if let Some(commitment) = self.state_commitment_v2.as_mut() {
-                for event in &removed {
-                    commitment.delete_delegation_return_event(event);
-                }
-            }
-        }
     }
 }
 
@@ -2051,8 +2053,6 @@ mod tests {
         }
     }
 
-
-
     fn encode_nonce_map_btree(nonces: &BTreeMap<Bytes32, u64>, buf: &mut Vec<u8>) {
         (nonces.len() as u32).encode(buf);
         for (signer_id, nonce) in nonces {
@@ -2060,7 +2060,6 @@ mod tests {
             nonce.encode(buf);
         }
     }
-
 
     fn encode_hash_set_hashset(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
         let mut entries: Vec<_> = hashes.iter().copied().collect();
@@ -2070,11 +2069,6 @@ mod tests {
             hash.encode(buf);
         }
     }
-
-
-
-
-
 
     #[test]
     fn staking_nonce_decode_cap_is_derived_from_staking_signer_capacity() {
@@ -2302,7 +2296,4 @@ mod tests {
         encode_hash_set(&reverse, &mut reverse_bytes);
         assert_eq!(forward_bytes, reverse_bytes);
     }
-
-
-
 }

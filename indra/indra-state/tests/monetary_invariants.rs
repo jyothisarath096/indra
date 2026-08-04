@@ -121,16 +121,16 @@ fn make_validator(pubkey: &HybridPubKey, seed: [u8; 32], stake: u64) -> Validato
 
 fn self_stake_op(
     state: &ChainState,
-    bond_utxo_id: Bytes32,
+    deposit_utxo_id: Bytes32,
     validator_pubkey: HybridPubKey,
     validator_keypair: &HybridKeypair,
     nonce: u64,
 ) -> StakingOp {
-    let bond_proof = state.utxos.get(&bond_utxo_id).and_then(|entry| {
+    let deposit_proof = state.utxos.get(&deposit_utxo_id).and_then(|entry| {
         (0u8..=u8::MAX).find_map(|seed| {
             let candidate = commit(entry.output.value_spark, &[seed; 32]);
             (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
-                indra_core::types::staking::StakingBondProof {
+                indra_core::types::staking::StakeDepositProof {
                     committed_value_spark: entry.output.value_spark,
                     blinding_factor: Bytes32::from([seed; 32]),
                 }
@@ -139,9 +139,9 @@ fn self_stake_op(
     });
     let mut op = StakingOp {
         body: StakingOpBody::SelfStake {
-            bond_utxo_id,
+            deposit_utxo_id,
             validator_pubkey,
-            bond_proof,
+            deposit_proof,
             cold_authorization: Some(ColdStakingAuthorization {
                 cold_key_version: 1,
                 cold_nonce: nonce,
@@ -161,7 +161,6 @@ fn self_stake_op(
     };
     op
 }
-
 
 fn finalize_with_default_validator(state: &mut ChainState) {
     if state.validators.is_empty() {
@@ -279,7 +278,6 @@ fn slash_evidence(keypair: &HybridKeypair, validator_id: Bytes32) -> SlashEviden
         vote_2: signed_vote(keypair, validator_id, Bytes32::from([0xBB; 32])),
     }
 }
-
 
 #[test]
 fn epoch_reward_does_not_increase_total_supply() {

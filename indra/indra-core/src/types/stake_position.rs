@@ -691,7 +691,7 @@ mod tests {
         codec::{Decode, Encode},
         types::{
             crypto::{HybridPubKey, HybridSignature},
-            staking::{StakingBondProof, StakingOpBody},
+            staking::{StakeDepositProof, StakingOpBody},
         },
         VariableBytes,
     };
@@ -945,9 +945,9 @@ mod tests {
         let delegate = operation(
             StakingOpBody::Delegate {
                 validator_id: id(11),
-                bond_utxo_id: id(12),
+                deposit_utxo_id: id(12),
                 delegator_pubkey: dummy_pubkey(13),
-                bond_proof: Some(StakingBondProof {
+                deposit_proof: Some(StakeDepositProof {
                     committed_value_spark: 14,
                     blinding_factor: id(15),
                 }),
@@ -960,9 +960,9 @@ mod tests {
             operation(
                 StakingOpBody::Delegate {
                     validator_id: id(21),
-                    bond_utxo_id: id(12),
+                    deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(13),
-                    bond_proof: Some(StakingBondProof {
+                    deposit_proof: Some(StakeDepositProof {
                         committed_value_spark: 14,
                         blinding_factor: id(15),
                     }),
@@ -973,9 +973,9 @@ mod tests {
             operation(
                 StakingOpBody::Delegate {
                     validator_id: id(11),
-                    bond_utxo_id: id(22),
+                    deposit_utxo_id: id(22),
                     delegator_pubkey: dummy_pubkey(13),
-                    bond_proof: Some(StakingBondProof {
+                    deposit_proof: Some(StakeDepositProof {
                         committed_value_spark: 14,
                         blinding_factor: id(15),
                     }),
@@ -986,9 +986,9 @@ mod tests {
             operation(
                 StakingOpBody::Delegate {
                     validator_id: id(11),
-                    bond_utxo_id: id(12),
+                    deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(23),
-                    bond_proof: Some(StakingBondProof {
+                    deposit_proof: Some(StakeDepositProof {
                         committed_value_spark: 14,
                         blinding_factor: id(15),
                     }),
@@ -999,9 +999,9 @@ mod tests {
             operation(
                 StakingOpBody::Delegate {
                     validator_id: id(11),
-                    bond_utxo_id: id(12),
+                    deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(13),
-                    bond_proof: Some(StakingBondProof {
+                    deposit_proof: Some(StakeDepositProof {
                         committed_value_spark: 24,
                         blinding_factor: id(15),
                     }),
@@ -1012,9 +1012,9 @@ mod tests {
             operation(
                 StakingOpBody::Delegate {
                     validator_id: id(11),
-                    bond_utxo_id: id(12),
+                    deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(13),
-                    bond_proof: Some(StakingBondProof {
+                    deposit_proof: Some(StakeDepositProof {
                         committed_value_spark: 14,
                         blinding_factor: id(25),
                     }),
@@ -1025,9 +1025,9 @@ mod tests {
             operation(
                 StakingOpBody::Delegate {
                     validator_id: id(11),
-                    bond_utxo_id: id(12),
+                    deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(13),
-                    bond_proof: None,
+                    deposit_proof: None,
                 },
                 8,
                 1,

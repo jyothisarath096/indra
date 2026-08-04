@@ -1262,12 +1262,12 @@ mod tests {
         StakingOp {
             body: StakingOpBody::Delegate {
                 validator_id: Bytes32::from([0xAA; 32]),
-                bond_utxo_id: Bytes32::from([0xBB; 32]),
+                deposit_utxo_id: Bytes32::from([0xBB; 32]),
                 delegator_pubkey: HybridPubKey {
                     classical_pk: Bytes32::from([seed; 32]),
                     pq_pk: VariableBytes::from_slice(&[seed; 2592]).unwrap(),
                 },
-                bond_proof: None,
+                deposit_proof: None,
             },
             nonce,
             signature: dummy_signature(),

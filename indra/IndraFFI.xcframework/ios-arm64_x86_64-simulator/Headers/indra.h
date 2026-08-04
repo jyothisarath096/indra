@@ -186,9 +186,9 @@ int32_t indra_verify_range_proof(
 
 int32_t indra_build_register_validator_with_handle(
     uint32_t commission_bps,
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     uint64_t bond_value_spark,
-    const uint8_t* bond_blinding_factor,
+    const uint8_t* deposit_blinding_factor,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -197,9 +197,9 @@ int32_t indra_build_register_validator_with_handle(
 );
 
 int32_t indra_build_self_stake_with_handle(
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     uint64_t bond_value_spark,
-    const uint8_t* bond_blinding_factor,
+    const uint8_t* deposit_blinding_factor,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -208,7 +208,7 @@ int32_t indra_build_self_stake_with_handle(
 );
 
 int32_t indra_build_self_unstake_with_handle(
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -218,9 +218,9 @@ int32_t indra_build_self_unstake_with_handle(
 
 int32_t indra_build_delegate_with_handle(
     const uint8_t* validator_id,
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     uint64_t bond_value_spark,
-    const uint8_t* bond_blinding_factor,
+    const uint8_t* deposit_blinding_factor,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -230,7 +230,7 @@ int32_t indra_build_delegate_with_handle(
 
 int32_t indra_build_undelegate_with_handle(
     const uint8_t* validator_id,
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -369,9 +369,9 @@ int32_t indra_build_tx(const IndraTxParams* params, IndraTxResult* out);
 
 int32_t indra_build_register_validator(
     uint32_t commission_bps,
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     uint64_t bond_value_spark,
-    const uint8_t* bond_blinding_factor,
+    const uint8_t* deposit_blinding_factor,
     const uint8_t* classical_seed,
     const uint8_t* pq_pk,
     const uint8_t* pq_sk,
@@ -383,9 +383,9 @@ int32_t indra_build_register_validator(
 );
 
 int32_t indra_build_self_stake(
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     uint64_t bond_value_spark,
-    const uint8_t* bond_blinding_factor,
+    const uint8_t* deposit_blinding_factor,
     const uint8_t* classical_seed,
     const uint8_t* pq_pk,
     const uint8_t* pq_sk,
@@ -396,7 +396,7 @@ int32_t indra_build_self_stake(
 );
 
 int32_t indra_build_self_unstake(
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     const uint8_t* classical_seed,
     const uint8_t* pq_pk,
     const uint8_t* pq_sk,
@@ -408,9 +408,9 @@ int32_t indra_build_self_unstake(
 
 int32_t indra_build_delegate(
     const uint8_t* validator_id,
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     uint64_t bond_value_spark,
-    const uint8_t* bond_blinding_factor,
+    const uint8_t* deposit_blinding_factor,
     const uint8_t* classical_seed,
     const uint8_t* pq_pk,
     const uint8_t* pq_sk,
@@ -422,7 +422,7 @@ int32_t indra_build_delegate(
 
 int32_t indra_build_undelegate(
     const uint8_t* validator_id,
-    const uint8_t* bond_utxo_id,
+    const uint8_t* deposit_utxo_id,
     const uint8_t* classical_seed,
     const uint8_t* pq_pk,
     const uint8_t* pq_sk,

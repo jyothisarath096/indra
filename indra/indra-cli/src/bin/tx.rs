@@ -173,10 +173,18 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
             .map(|keypair| keypair.public_key().hash())
             .collect(),
     );
-    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &payment_keys).unwrap_or_else(|error| {
-        eprintln!("Error scanning canonical blocks: {}", error);
-        std::process::exit(1);
-    });
+    let owner_pubkey = HybridPubKey {
+        classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
+        pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
+            eprintln!("Error: invalid canonical hybrid public key");
+            std::process::exit(1);
+        }),
+    };
+    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &payment_keys, &[owner_pubkey])
+        .unwrap_or_else(|error| {
+            eprintln!("Error scanning canonical blocks: {}", error);
+            std::process::exit(1);
+        });
     wallet.save(wallet_path).unwrap_or_else(|error| {
         eprintln!("Error saving wallet {}: {}", wallet_path, error);
         std::process::exit(1);

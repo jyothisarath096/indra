@@ -10,10 +10,9 @@ use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::{
     primitives::{
         max_active_validators, muldiv, Bytes32, VariableBytes, DUST_LIMIT_SPARK,
-        MAX_DELEGATION_RETURN_EVENTS, MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS,
-        MAX_VALIDATOR_NETWORK_ADDR_LEN, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION,
-        SCHEMA_VERSION_GENESIS, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
-        UNBONDING_PERIOD_EPOCHS,
+        MAX_RANGE_PROOF_BYTES, MAX_VALIDATORS, MAX_VALIDATOR_NETWORK_ADDR_LEN,
+        MINIMUM_ACTIVE_SELF_STAKE_SPARK, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
+        SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS, UNBONDING_PERIOD_EPOCHS,
     },
     transaction::OutputV1,
 };
@@ -22,31 +21,6 @@ use crate::error::{StateError, StateResult};
 use crate::persistent::PersistentOrdMap;
 
 const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 1;
-const STAKE_BOND_FORMAT_VERSION: u8 = 1;
-
-fn unsupported_schema(struct_name: &'static str, version: u8) -> IndraError {
-    IndraError::UnsupportedSchemaVersion {
-        struct_name,
-        version,
-        max_supported: SCHEMA_VERSION,
-    }
-}
-
-fn decode_bytes32_with_first(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<Bytes32> {
-    match first_byte {
-        Some(first) => {
-            let mut bytes = [0u8; 32];
-            bytes[0] = first;
-            bytes[1..].copy_from_slice(r.read_bytes(31)?);
-            Ok(Bytes32::from(bytes))
-        }
-        None => Bytes32::decode(r),
-    }
-}
-
 /// Consensus ceiling for active delegator entries under one validator.
 ///
 /// This is intentionally far above expected 200-validator mainnet operating
@@ -62,126 +36,6 @@ pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDA
 
 /// Maximum unresolved validator self-bonds migrated by one enrollment.
 pub const MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS: usize = 4_096;
-
-/// Why a stake bond principal was returned to a spendable UTXO.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegationReturnReason {
-    /// Validator was evicted from the bounded registry by a higher-stake
-    /// registration; all associated bonds were returned immediately.
-    ValidatorEvicted,
-    /// A normally unbonding stake bond reached its release epoch.
-    UnbondingMatured,
-}
-
-impl Encode for DelegationReturnReason {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        match self {
-            Self::ValidatorEvicted => 1u8.encode(buf),
-            Self::UnbondingMatured => 2u8.encode(buf),
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        1
-    }
-}
-
-impl Decode for DelegationReturnReason {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        match u8::decode(r)? {
-            1 => Ok(Self::ValidatorEvicted),
-            2 => Ok(Self::UnbondingMatured),
-            _ => Err(IndraError::InvariantViolation {
-                message: "invalid delegation return reason",
-            }),
-        }
-    }
-}
-
-/// Consensus-visible event recording an automatic delegation principal return.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DelegationReturnEvent {
-    /// Delegator whose stake bond was returned.
-    pub delegator_id: Bytes32,
-    /// Validator from which the stake bond was returned.
-    pub validator_id: Bytes32,
-    /// Original bonded UTXO ID.
-    pub bond_utxo_id: Bytes32,
-    /// Principal amount returned in Spark.
-    pub amount_spark: u64,
-    /// Why this return happened.
-    pub reason: DelegationReturnReason,
-    /// Epoch in which the return was applied.
-    pub returned_epoch: u64,
-    /// Height at which the return was applied.
-    pub returned_height: u64,
-    /// Newly created refund UTXO ID.
-    pub refund_utxo_id: Bytes32,
-}
-
-impl Encode for DelegationReturnEvent {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        SCHEMA_VERSION.encode(buf);
-        self.delegator_id.encode(buf);
-        self.validator_id.encode(buf);
-        self.bond_utxo_id.encode(buf);
-        self.amount_spark.encode(buf);
-        self.reason.encode(buf);
-        self.returned_epoch.encode(buf);
-        self.returned_height.encode(buf);
-        self.refund_utxo_id.encode(buf);
-    }
-
-    fn encoded_len(&self) -> usize {
-        1 + 32 + 32 + 32 + 8 + self.reason.encoded_len() + 8 + 8 + 32
-    }
-}
-
-impl Decode for DelegationReturnEvent {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let marker = u8::decode(r)?;
-        match marker {
-            SCHEMA_VERSION_GENESIS
-            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
-            | SCHEMA_VERSION => Ok(Self {
-                delegator_id: Bytes32::decode(r)?,
-                validator_id: Bytes32::decode(r)?,
-                bond_utxo_id: Bytes32::decode(r)?,
-                amount_spark: u64::decode(r)?,
-                reason: DelegationReturnReason::decode(r)?,
-                returned_epoch: u64::decode(r)?,
-                returned_height: u64::decode(r)?,
-                refund_utxo_id: Bytes32::decode(r)?,
-            }),
-            _ => Err(IndraError::UnsupportedSchemaVersion {
-                struct_name: "DelegationReturnEvent",
-                version: marker,
-                max_supported: SCHEMA_VERSION,
-            }),
-        }
-    }
-}
-
-/// Encode the bounded global delegation-return event log.
-pub fn encode_delegation_return_events(events: &[DelegationReturnEvent], buf: &mut Vec<u8>) {
-    encode_list(events, buf);
-}
-
-/// Decode the bounded global delegation-return event log.
-pub fn decode_delegation_return_events(
-    r: &mut ByteReader<'_>,
-) -> IndraResult<Vec<DelegationReturnEvent>> {
-    decode_list(
-        r,
-        MAX_DELEGATION_RETURN_EVENTS,
-        "snapshot.delegation_return_events",
-    )
-}
-
-/// Encoded length of the bounded global delegation-return event log.
-pub fn delegation_return_events_encoded_len(events: &[DelegationReturnEvent]) -> usize {
-    list_encoded_len(events)
-}
 
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1178,9 +1032,6 @@ mod tests {
         assert_eq!(decoded.network_addr_last_updated_epoch, Some(7));
     }
 
-
-
-
     #[test]
     fn insert_and_retrieve() {
         let mut vs = ValidatorSet::new();
@@ -1242,11 +1093,6 @@ mod tests {
         let id = Bytes32::from([0x01u8; 32]);
         assert_eq!(vs.get(&id).unwrap().pending_rewards, 500);
     }
-
-
-
-
-
 }
 
 /// Cold-key custody retained after a validator is evicted from the bounded live registry.

@@ -13,7 +13,7 @@ use indra_core::types::{
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
         MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES,
-        MINIMUM_VALIDATOR_BOND_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+        MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
@@ -51,7 +51,7 @@ fn finalized_genesis() -> ChainState {
             hybrid_classical_pk: Some(public.classical_pk.0),
             hybrid_pq_pk: Some(public.pq_pk.as_slice().to_vec()),
             vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
-            stake_spark: MINIMUM_VALIDATOR_BOND_SPARK,
+            stake_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,

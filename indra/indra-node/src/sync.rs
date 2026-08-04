@@ -1310,7 +1310,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn live_import_projection_commit_preserves_epoch_record_timestamp() {
         let mut state = ChainState::new_genesis();
@@ -1459,8 +1458,6 @@ mod tests {
             .to_string()
             .contains("block failed during pre-apply root verification"));
     }
-
-
 
     #[test]
     fn import_chain_of_blocks() {

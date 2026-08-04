@@ -17,10 +17,8 @@ use indra_core::{
     codec::Decode,
     types::{
         block::BlockV1,
-        primitives::{
-            Bytes32, COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN, STAKING_REWARD_BLINDING_DOMAIN,
-        },
+        crypto::HybridPubKey,
+        primitives::{Bytes32, VariableBytes, STAKING_REWARD_BLINDING_DOMAIN},
         transaction::{OutputV1, TransactionV1},
     },
 };
@@ -135,7 +133,14 @@ fn main() {
             .map(|keypair| keypair.public_key().hash())
             .collect(),
     );
-    match scan_canonical_blocks(&node_url, &mut wallet, &payment_keys) {
+    let owner_pubkey = HybridPubKey {
+        classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
+        pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
+            eprintln!("Error: invalid canonical hybrid public key");
+            std::process::exit(1);
+        }),
+    };
+    match scan_canonical_blocks(&node_url, &mut wallet, &payment_keys, &[owner_pubkey]) {
         Ok(discovered) => {
             wallet.save(&wallet_path).unwrap_or_else(|error| {
                 eprintln!("Error saving wallet: {error}");
@@ -160,8 +165,9 @@ fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut indra_cli::Wallet,
     payment_keys: &[PaymentKeypairV1],
+    owner_pubkeys: &[HybridPubKey],
 ) -> Result<usize, String> {
-    indra_cli::scan_canonical_blocks(node_url, wallet, payment_keys)
+    indra_cli::scan_canonical_blocks(node_url, wallet, payment_keys, owner_pubkeys)
 }
 
 fn scan_canonical_block(
@@ -410,37 +416,40 @@ fn derive_protocol_blinding(
     context: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<[u8; 32], String> {
     match category {
+        "tranche_refund" => {
+            let chain_id = context
+                .get("chain_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "tranche refund context missing chain_id".to_string())?;
+            let position_id = context_hex32(context, "position_id")?;
+            let tranche_id = context_hex32(context, "tranche_id")?;
+            let principal_owner_id = context_hex32(context, "principal_owner_id")?;
+            let custody_hex = context
+                .get("custody_hex")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "tranche refund context missing custody_hex".to_string())?;
+            let custody = hex::decode(custody_hex)
+                .map_err(|_| "tranche refund custody_hex is invalid".to_string())?;
+            let principal_spark = context_u64(context, "principal_spark")?;
+            let release_height = context_u64(context, "release_height")?;
+            let end_epoch = context_u64(context, "end_epoch")?;
+            indra_crypto::derive_tranche_refund_blinding_v1(
+                &indra_crypto::TrancheRefundBlindingInputsV1 {
+                    chain_id: chain_id.as_bytes(),
+                    position_id,
+                    tranche_id,
+                    principal_owner_id,
+                    custody_encoding: &custody,
+                    principal_spark,
+                    release_height,
+                    end_epoch,
+                },
+            )
+            .map_err(|error| format!("tranche refund derivation failed: {error}"))
+        }
         "staking_reward_claim" => derive_staking_reward_from_context(context, "claim_height"),
         "validator_eviction_pending_reward" => {
             derive_staking_reward_from_context(context, "returned_height")
-        }
-        "validator_eviction_bond_refund" => {
-            let validator_id = context_hex32(context, "validator_id")?;
-            let delegator_id = context_hex32(context, "delegator_id")?;
-            let bond_utxo_id = context_hex32(context, "bond_utxo_id")?;
-            let release_height = context_u64(context, "returned_height")?;
-            let amount_spark = context_u64(context, "amount_spark")?;
-            Ok(derive_compact_bond_release_blinding(
-                &validator_id,
-                &delegator_id,
-                &bond_utxo_id,
-                release_height,
-                amount_spark,
-            ))
-        }
-        "normal_bond_release" => {
-            let validator_id = context_hex32(context, "validator_id")?;
-            let delegator_id = context_hex32(context, "delegator_id")?;
-            let bond_utxo_id = context_hex32(context, "bond_utxo_id")?;
-            let release_height = context_u64(context, "returned_height")?;
-            let amount_spark = context_u64(context, "amount_spark")?;
-            Ok(derive_normal_bond_release_blinding(
-                &validator_id,
-                &delegator_id,
-                &bond_utxo_id,
-                release_height,
-                amount_spark,
-            ))
         }
         "slash_reporter_reward" => {
             let evidence_hash = context_hex32(context, "evidence_hash")?;
@@ -485,42 +494,6 @@ fn derive_staking_reward_blinding(
     data.extend_from_slice(validator_id);
     data.extend_from_slice(delegator_id);
     data.extend_from_slice(&height.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
-fn derive_compact_bond_release_blinding(
-    validator_id: &[u8; 32],
-    delegator_id: &[u8; 32],
-    bond_utxo_id: &[u8; 32],
-    release_height: u64,
-    amount_spark: u64,
-) -> [u8; 32] {
-    let mut data =
-        Vec::with_capacity(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
-    data.extend_from_slice(COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-    data.extend_from_slice(validator_id);
-    data.extend_from_slice(delegator_id);
-    data.extend_from_slice(bond_utxo_id);
-    data.extend_from_slice(&release_height.to_le_bytes());
-    data.extend_from_slice(&amount_spark.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
-fn derive_normal_bond_release_blinding(
-    validator_id: &[u8; 32],
-    delegator_id: &[u8; 32],
-    bond_utxo_id: &[u8; 32],
-    release_height: u64,
-    amount_spark: u64,
-) -> [u8; 32] {
-    let mut data =
-        Vec::with_capacity(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN.len() + 32 + 32 + 32 + 8 + 8);
-    data.extend_from_slice(NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN);
-    data.extend_from_slice(validator_id);
-    data.extend_from_slice(delegator_id);
-    data.extend_from_slice(bond_utxo_id);
-    data.extend_from_slice(&release_height.to_le_bytes());
-    data.extend_from_slice(&amount_spark.to_le_bytes());
     indra_crypto::sha256(&data)
 }
 
@@ -1136,7 +1109,7 @@ mod tests {
         let height = 12;
         let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
         let context = format!(
-            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":4000000,"derivation":"pending_reward_payout"}}"#,
+            r#"{{"validator_id":"{}","delegator_id":"{}","deposit_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":4000000,"derivation":"pending_reward_payout"}}"#,
             hex::encode(validator_id),
             hex::encode(delegator_id),
             hex32(0x23),
@@ -1144,58 +1117,6 @@ mod tests {
         );
 
         assert_recovered_wallet_entry("validator_eviction_pending_reward", context, blinding);
-    }
-
-    #[test]
-    fn scanner_recovers_validator_eviction_compact_bond_refund_via_protocol_provenance() {
-        let validator_id = [0x31; 32];
-        let delegator_id = [0x32; 32];
-        let bond_utxo_id = [0x33; 32];
-        let height = 12;
-        let amount = 4_000_000;
-        let blinding = derive_compact_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let context = format!(
-            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"compact_bond_release"}}"#,
-            hex::encode(validator_id),
-            hex::encode(delegator_id),
-            hex::encode(bond_utxo_id),
-            height,
-            amount
-        );
-
-        assert_recovered_wallet_entry("validator_eviction_bond_refund", context, blinding);
-    }
-
-    #[test]
-    fn scanner_recovers_normal_bond_release_via_protocol_provenance() {
-        let validator_id = [0x34; 32];
-        let delegator_id = [0x35; 32];
-        let bond_utxo_id = [0x36; 32];
-        let height = 12;
-        let amount = 4_000_000;
-        let blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let context = format!(
-            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"normal_bond_release"}}"#,
-            hex::encode(validator_id),
-            hex::encode(delegator_id),
-            hex::encode(bond_utxo_id),
-            height,
-            amount
-        );
-
-        assert_recovered_wallet_entry("normal_bond_release", context, blinding);
     }
 
     #[test]
@@ -1255,43 +1176,6 @@ mod tests {
             "staking_reward_claim",
             &context,
             4_000_000,
-            height,
-            indra_core::types::primitives::STAKING_TX_IDX,
-            0,
-            real_blinding,
-        );
-
-        let err = recover_protocol_provenance_from_response(&utxo, &response).unwrap_err();
-        assert!(err.contains("does not open"), "{err}");
-    }
-
-    #[test]
-    fn scanner_rejects_malformed_normal_bond_release_provenance_response() {
-        let validator_id = [0x74; 32];
-        let delegator_id = [0x75; 32];
-        let bond_utxo_id = [0x76; 32];
-        let wrong_bond_utxo_id = [0x77; 32];
-        let height = 12;
-        let amount = 4_000_000;
-        let real_blinding = derive_normal_bond_release_blinding(
-            &validator_id,
-            &delegator_id,
-            &bond_utxo_id,
-            height,
-            amount,
-        );
-        let context = format!(
-            r#"{{"validator_id":"{}","delegator_id":"{}","bond_utxo_id":"{}","returned_height":{},"returned_epoch":0,"amount_spark":{},"derivation":"normal_bond_release"}}"#,
-            hex::encode(validator_id),
-            hex::encode(delegator_id),
-            hex::encode(wrong_bond_utxo_id),
-            height,
-            amount
-        );
-        let (utxo, response) = protocol_response(
-            "normal_bond_release",
-            &context,
-            amount,
             height,
             indra_core::types::primitives::STAKING_TX_IDX,
             0,
@@ -1477,30 +1361,6 @@ mod tests {
         assert_eq!(parsed[0].created_height, 0);
         assert_eq!(parsed[0].tx_index, 0);
         assert_eq!(parsed[0].out_index, 0);
-    }
-
-    #[test]
-    fn scanner_reports_legacy_and_slashed_self_stake_as_unrecoverable() {
-        for (category, reason) in [
-            (
-                "legacy_bond_release",
-                "legacy bond release requires local wallet history",
-            ),
-            (
-                "slashed_self_stake_release",
-                "slashed self-stake release requires archive provenance",
-            ),
-        ] {
-            let (utxo, response) = unrecoverable_response(category, reason);
-            let result = recover_protocol_provenance_from_response(&utxo, &response).unwrap();
-            assert_eq!(
-                result,
-                ProtocolRecovery::Unrecoverable {
-                    category: category.to_string(),
-                    reason: reason.to_string()
-                }
-            );
-        }
     }
 
     #[test]

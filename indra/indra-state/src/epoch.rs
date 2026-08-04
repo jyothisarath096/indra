@@ -20,13 +20,10 @@ use indra_core::{
     types::{
         crypto::CommitmentV1,
         primitives::{
-            bps_of, muldiv, Bytes32, VariableBytes, BLOCKS_PER_YEAR,
-            COMPACT_STAKE_BOND_RELEASE_BLINDING_DOMAIN, EPOCH_DURATION_BLOCKS,
+            bps_of, muldiv, Bytes32, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS,
             ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK,
             ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK,
-            MINIMUM_ACTIVE_SELF_STAKE_SPARK, NORMAL_STAKE_BOND_RELEASE_BLINDING_DOMAIN,
-            SATURATION_MIN_VALIDATORS, SLASH_BOND_RELEASE_BLINDING_DOMAIN,
-            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
+            MINIMUM_ACTIVE_SELF_STAKE_SPARK, SATURATION_MIN_VALIDATORS,
         },
     },
     EpochRecord,
@@ -41,7 +38,7 @@ use crate::{
         GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS, MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS,
     },
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
-    validator::{DelegationReturnEvent, DelegationReturnReason, ValidatorStatus},
+    validator::ValidatorStatus,
 };
 
 /// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
@@ -665,7 +662,7 @@ fn distribute_block_rewards(
     )
 }
 
-fn distribute_fee_rewards(
+pub(crate) fn distribute_fee_rewards(
     state: &mut ChainState,
     current_epoch: u64,
     height: u64,
@@ -677,6 +674,7 @@ fn distribute_fee_rewards(
         return Ok(());
     }
     state.fee_reward_pool = 0;
+    crate::txn::complex_mutation_checkpoint()?;
     let result = distribute_snapshot_rewards(
         state,
         fee_pool,
@@ -747,9 +745,10 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
             .map(|validator| (validator.validator_id, validator.stake_spark))
             .collect::<Vec<_>>();
         for (validator_id, principal) in validator_positions {
-            let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
-                validator_id,
-            };
+            let custody =
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                    validator_id,
+                };
             let position_id = indra_core::types::stake_position::derive_position_id(
                 validator_id,
                 validator_id,
@@ -760,20 +759,24 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
                     validator_id,
                     validator_id,
                     custody,
-                    Some(indra_core::types::stake_position::ActiveStakeAggregateV1::new(
-                        principal,
-                        0,
-                        0,
-                    ).map_err(|error| crate::error::StateError::InvalidStakingOp(error.to_string()))?),
+                    Some(
+                        indra_core::types::stake_position::ActiveStakeAggregateV1::new(
+                            principal, 0, 0,
+                        )
+                        .map_err(|error| {
+                            crate::error::StateError::InvalidStakingOp(error.to_string())
+                        })?,
+                    ),
                     0,
                     0,
-                ).map_err(|error| crate::error::StateError::InvalidStakingOp(error.to_string()))?;
+                )
+                .map_err(|error| crate::error::StateError::InvalidStakingOp(error.to_string()))?;
                 state.stake_positions.insert(position.position_id, position);
             }
         }
-        state.rebuild_position_tranche_index().map_err(|error| {
-            crate::error::StateError::InvalidStakingOp(error.to_string())
-        })?;
+        state
+            .rebuild_position_tranche_index()
+            .map_err(|error| crate::error::StateError::InvalidStakingOp(error.to_string()))?;
         let consensus = state.build_consensus_snapshot(1, 0)?;
         let economic = state.build_reward_economic_snapshot(&consensus)?;
         state.consensus_snapshots = vec![consensus];
@@ -916,6 +919,7 @@ fn distribute_snapshot_rewards(
             state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder)
         }
     }
+    crate::txn::complex_mutation_checkpoint()?;
     Ok(())
 }
 
@@ -950,6 +954,7 @@ fn credit_position_reward(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_stake_position(&position);
     }
+    crate::txn::complex_mutation_checkpoint()?;
     Ok(())
 }
 
@@ -975,9 +980,6 @@ fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
         }
     }
 }
-
-
-
 
 fn apply_liveness_penalties(
     state: &mut ChainState,
@@ -1068,7 +1070,7 @@ mod tests {
                 Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
                 DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
                 ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-                MAX_DELEGATION_RETURN_EVENTS, MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
                 SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
             transaction::OutputV1,
@@ -1210,9 +1212,6 @@ mod tests {
         );
     }
 
-
-
-
     #[test]
     fn epoch_transition_context_validates_and_derives_boundary_facts() {
         let context = EpochTransitionContext::new(300, 299).unwrap();
@@ -1231,8 +1230,6 @@ mod tests {
         assert!(EpochTransitionContext::new(299, 298).is_err());
         assert!(EpochTransitionContext::new(300, 298).is_err());
     }
-
-
 
     #[test]
     fn reward_snapshot_pairing_missing_or_mismatched_fails_closed() {
@@ -1325,8 +1322,6 @@ mod tests {
         assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
         assert_eq!(compute_state_root(&replay), compute_state_root(&state));
     }
-
-
 
     #[test]
     fn epoch_boundary_detection() {
@@ -1721,7 +1716,6 @@ mod tests {
         assert_eq!(snapshot2.total_stake, 150);
     }
 
-
     #[test]
     fn commission_change_takes_effect_after_delay() {
         let mut state = crate::chain::ChainState::new_genesis();
@@ -1765,8 +1759,6 @@ mod tests {
         assert_eq!(after_effective.pending_commission_bps, None);
         assert_eq!(after_effective.pending_commission_effective_epoch, None);
     }
-
-
 
     #[test]
     fn proposer_cannot_earn_extra_reward_by_including_more_transactions() {
@@ -2149,7 +2141,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn auto_delegation_skipped_if_target_not_active() {
         let mut state = crate::chain::ChainState::new_genesis();
@@ -2230,8 +2221,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn auto_delegate_to_changes_state_root() {
         let mut with_auto = crate::chain::ChainState::new_genesis();
@@ -2275,5 +2264,60 @@ mod tests {
         assert_eq!(state.total_supply, supply_before);
     }
 
-
+    #[test]
+    fn frozen_auto_delegation_edge_survives_target_eviction_for_payout() {
+        let mut state = crate::chain::ChainState::new_genesis();
+        let source_id = Bytes32::from([0xE1; 32]);
+        let target_id = Bytes32::from([0xE2; 32]);
+        let mut source = make_snapshot_validator(0xE1, 1_000_000);
+        source.validator_id = source_id;
+        source.auto_delegate_to = Some(target_id);
+        let mut target = make_snapshot_validator(0xE2, 1_000_000);
+        target.validator_id = target_id;
+        state.validators.upsert(source).unwrap();
+        state.validators.upsert(target).unwrap();
+        for validator_id in [source_id, target_id] {
+            let custody =
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                    validator_id,
+                };
+            let position = indra_core::types::stake_position::StakePositionV1::new(
+                validator_id,
+                validator_id,
+                custody,
+                Some(
+                    indra_core::types::stake_position::ActiveStakeAggregateV1::new(1_000_000, 1, 1)
+                        .unwrap(),
+                ),
+                0,
+                0,
+            )
+            .unwrap();
+            state.stake_positions.insert(position.position_id, position);
+        }
+        state.finalize_genesis().unwrap();
+        let source_position_id = indra_core::types::stake_position::derive_position_id(
+            source_id,
+            source_id,
+            indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id: source_id,
+            },
+        );
+        state.validators.remove(&target_id);
+        let before = state
+            .stake_positions
+            .get(&source_position_id)
+            .unwrap()
+            .pending_rewards_spark;
+        distribute_block_rewards(&mut state, 1_000, 1, 1).unwrap();
+        assert!(
+            state
+                .stake_positions
+                .get(&source_position_id)
+                .unwrap()
+                .pending_rewards_spark
+                > before,
+            "the frozen derived edge must pay its source even after the target leaves the live registry"
+        );
+    }
 }

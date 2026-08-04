@@ -6,7 +6,7 @@ use indra_cli::{
     CliResult, KeysFile, PasswordSource, StakePositionExitSigner, Wallet, WalletEntry,
 };
 use indra_core::types::{
-    primitives::Bytes32, stake_position::PositionCustodyV1, staking::StakingBondProof,
+    primitives::Bytes32, stake_position::PositionCustodyV1, staking::StakeDepositProof,
 };
 #[cfg(test)]
 use indra_core::{
@@ -64,17 +64,17 @@ fn run_register(args: &[String]) -> CliResult<()> {
         .reconstruct()
         .map_err(|e| CliError::Keystore(e.to_string()))?;
     let commission_bps = parse_commission(args)?;
-    let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
+    let deposit_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
-    let bond_proof = staking_bond_proof_from_wallet(&wallet_path, &bond_utxo_id)?;
+    let deposit_proof = stake_deposit_proof_from_wallet(&wallet_path, &deposit_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
     let built = indra_cli::tx_builder::build_register_validator_op_with_cold(
         commission_bps,
-        bond_utxo_id,
-        bond_proof,
+        deposit_utxo_id,
+        deposit_proof,
         &keypair,
         &cold_keypair,
         keys.public.vrf_pk,
@@ -90,9 +90,9 @@ fn run_register(args: &[String]) -> CliResult<()> {
         &node_url,
         &[
             ("Commission", format!("{} bps", commission_bps)),
-            ("Bond UTXO", hex::encode(bond_utxo_id.0)),
+            ("Bond UTXO", hex::encode(deposit_utxo_id.0)),
         ],
-        Some((&wallet_path, bond_utxo_id)),
+        Some((&wallet_path, deposit_utxo_id)),
     )
 }
 
@@ -103,16 +103,16 @@ fn run_self_stake(args: &[String]) -> CliResult<()> {
     }
     let keys = load_keys(args)?;
     let keypair = reconstruct_keypair(&keys)?;
-    let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
+    let deposit_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
-    let bond_proof = staking_bond_proof_from_wallet(&wallet_path, &bond_utxo_id)?;
+    let deposit_proof = stake_deposit_proof_from_wallet(&wallet_path, &deposit_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
     let built = indra_cli::tx_builder::build_self_stake_op(
-        bond_utxo_id,
-        bond_proof,
+        deposit_utxo_id,
+        deposit_proof,
         &keypair,
         nonce,
         &chain_id,
@@ -124,8 +124,8 @@ fn run_self_stake(args: &[String]) -> CliResult<()> {
         &signer_id,
         nonce,
         &node_url,
-        &[("Bond UTXO", hex::encode(bond_utxo_id.0))],
-        Some((&wallet_path, bond_utxo_id)),
+        &[("Bond UTXO", hex::encode(deposit_utxo_id.0))],
+        Some((&wallet_path, deposit_utxo_id)),
     )
 }
 
@@ -149,8 +149,8 @@ fn run_self_unstake(args: &[String]) -> CliResult<()> {
     } else {
         PasswordSource::Prompt
     };
-    let cold_keys = load_cold_keys(&cold_path, cold_password)
-        .map_err(|e| CliError::Keystore(e.to_string()))?;
+    let cold_keys =
+        load_cold_keys(&cold_path, cold_password).map_err(|e| CliError::Keystore(e.to_string()))?;
     let cold_keypair = cold_keys
         .reconstruct()
         .map_err(|e| CliError::Keystore(e.to_string()))?;
@@ -193,18 +193,18 @@ fn run_delegate(args: &[String]) -> CliResult<()> {
     }
     let keys = load_keys(args)?;
     let keypair = reconstruct_keypair(&keys)?;
-    let bond_utxo_id = parse_required_bytes32(args, "--utxo")?;
+    let deposit_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let validator_id = parse_required_bytes32(args, "--validator")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
-    let bond_proof = staking_bond_proof_from_wallet(&wallet_path, &bond_utxo_id)?;
+    let deposit_proof = stake_deposit_proof_from_wallet(&wallet_path, &deposit_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
     let built = indra_cli::tx_builder::build_delegate_op(
         validator_id,
-        bond_utxo_id,
-        bond_proof,
+        deposit_utxo_id,
+        deposit_proof,
         &keypair,
         nonce,
         &chain_id,
@@ -218,9 +218,9 @@ fn run_delegate(args: &[String]) -> CliResult<()> {
         &node_url,
         &[
             ("Validator", hex::encode(validator_id.0)),
-            ("Bond UTXO", hex::encode(bond_utxo_id.0)),
+            ("Bond UTXO", hex::encode(deposit_utxo_id.0)),
         ],
-        Some((&wallet_path, bond_utxo_id)),
+        Some((&wallet_path, deposit_utxo_id)),
     )
 }
 
@@ -544,25 +544,25 @@ fn load_keys(args: &[String]) -> CliResult<KeysFile> {
     indra_cli::load_keys_for_cli(&path, args)
 }
 
-fn staking_bond_proof_from_wallet(
+fn stake_deposit_proof_from_wallet(
     wallet_path: &str,
     utxo_id: &Bytes32,
-) -> CliResult<StakingBondProof> {
+) -> CliResult<StakeDepositProof> {
     let wallet = Wallet::load(wallet_path)?;
     match wallet.get(utxo_id) {
-        Some(entry) => staking_bond_proof_from_wallet_entry(entry),
+        Some(entry) => stake_deposit_proof_from_wallet_entry(entry),
         None => Err(CliError::Transaction(format!(
-            "UTXO {} not found in wallet {}; cannot construct staking bond proof without value and blinding factor",
+            "UTXO {} not found in wallet {}; cannot construct stake-deposit proof without value and blinding factor",
             hex::encode(utxo_id.0),
             wallet_path
         ))),
     }
 }
 
-fn staking_bond_proof_from_wallet_entry(entry: &WalletEntry) -> CliResult<StakingBondProof> {
+fn stake_deposit_proof_from_wallet_entry(entry: &WalletEntry) -> CliResult<StakeDepositProof> {
     if entry.spent {
         return Err(CliError::Transaction(
-            "UTXO is already marked spent in wallet; refusing to build staking bond proof".into(),
+            "UTXO is already marked spent in wallet; refusing to build stake-deposit proof".into(),
         ));
     }
     if entry.blinding == [0u8; 32] {
@@ -571,7 +571,7 @@ fn staking_bond_proof_from_wallet_entry(entry: &WalletEntry) -> CliResult<Stakin
                 .into(),
         ));
     }
-    Ok(StakingBondProof {
+    Ok(StakeDepositProof {
         committed_value_spark: entry.value_spark,
         blinding_factor: Bytes32::from(entry.blinding),
     })
@@ -649,7 +649,7 @@ fn hybrid_pubkey_from_keys(keys: &KeysFile) -> CliResult<HybridPubKey> {
 
 fn print_help() {
     println!(
-        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator\n  self-stake              Bond one of your UTXOs as self-stake\n  self-unstake            Begin unbonding a self-stake bond\n  delegate                Delegate a UTXO to a validator\n  undelegate              Begin undelegating from a validator\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
+        "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator with self-stake\n  self-stake              Add a UTXO to the validator's active position\n  self-unstake            Exit principal from a validator position\n  delegate                Add a UTXO to a delegated position\n  undelegate              Exit principal from a delegated position\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
     );
 }
 

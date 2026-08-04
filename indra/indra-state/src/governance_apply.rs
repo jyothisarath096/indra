@@ -13,7 +13,7 @@ use indra_crypto::{commit, prove_range, sha256, verify_hybrid};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
-    delegation::active_delegated_bond_stake,
+    delegation::active_delegated_position_stake,
     error::{StateError, StateResult},
     governance::{
         GovernableParams, GovernanceRedelegation, GovernanceState, ProposalPhase, ProposalRecord,
@@ -406,7 +406,7 @@ fn apply_redelegate(
                 && position.active.is_some()
         })
         .ok_or(StateError::DelegatorNotFound)?;
-    let active_stake = active_delegated_bond_stake(state, from_validator, &op.signer_id);
+    let active_stake = active_delegated_position_stake(state, from_validator, &op.signer_id);
     if amount_spark > active_stake {
         return invalid("redelegation exceeds active delegated stake");
     }
@@ -2340,5 +2340,97 @@ mod tests {
             .get(&validator_id)
             .map(|reveal| reveal.vote)
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn governance_redelegation_uses_only_active_remainder_mid_unbonding() {
+        let mut state = ChainState::new_genesis();
+        let (_, delegator_keys) = keypair(0xD8);
+        let delegator_id = Bytes32::from(indra_crypto::sha256(
+            &delegator_keys.public_key().classical.0,
+        ));
+        let from_validator = Bytes32::from([0xD9; 32]);
+        let to_validator = Bytes32::from([0xDA; 32]);
+        let proposal_id = Bytes32::from([0xDB; 32]);
+        install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
+        let custody = indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+            delegator_id,
+        };
+        let position = indra_core::types::stake_position::StakePositionV1::new(
+            from_validator,
+            delegator_id,
+            custody,
+            Some(indra_core::types::stake_position::ActiveStakeAggregateV1::new(60, 1, 2).unwrap()),
+            0,
+            0,
+        )
+        .unwrap();
+        state
+            .stake_positions
+            .insert(position.position_id, position.clone());
+        let op = redelegate_op(
+            delegator_id,
+            &delegator_keys,
+            proposal_id,
+            from_validator,
+            to_validator,
+            60,
+            1,
+        );
+        apply_redelegate(
+            &mut state,
+            &op,
+            &proposal_id,
+            &from_validator,
+            &to_validator,
+            60,
+            false,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            state.governance.proposals[&proposal_id].redelegations[0].amount_spark,
+            60
+        );
+
+        let mut fully_unbonding = state.clone();
+        let mut no_active = fully_unbonding
+            .stake_positions
+            .get(&position.position_id)
+            .unwrap()
+            .clone();
+        no_active.active = None;
+        fully_unbonding
+            .stake_positions
+            .insert(position.position_id, no_active);
+        let second_proposal = Bytes32::from([0xDC; 32]);
+        install_reveal_phase_proposal(
+            &mut fully_unbonding,
+            second_proposal,
+            from_validator,
+            to_validator,
+        );
+        let second = redelegate_op(
+            delegator_id,
+            &delegator_keys,
+            second_proposal,
+            from_validator,
+            to_validator,
+            1,
+            2,
+        );
+        assert!(matches!(
+            apply_redelegate(
+                &mut fully_unbonding,
+                &second,
+                &second_proposal,
+                &from_validator,
+                &to_validator,
+                1,
+                false,
+                2,
+            ),
+            Err(StateError::DelegatorNotFound)
+        ));
     }
 }

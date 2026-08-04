@@ -13,7 +13,7 @@ use indra_core::{
         consensus_snapshot::ConsensusSnapshot,
         reward_economic_snapshot::RewardEconomicSnapshot,
         slash_membership::SlashMembershipRootRecord,
-        stake_position::{StakePositionV1, UnbondingTrancheV1},
+        stake_position::{StakePositionV1, TrancheRefundEventV1, UnbondingTrancheV1},
         transaction::OutputV1,
     },
     Bytes32,
@@ -26,7 +26,7 @@ use crate::{
     persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::{UtxoEntry, UtxoSet},
-    validator::{DelegationReturnEvent, EvictedValidatorTombstoneV2, ValidatorSet},
+    validator::{EvictedValidatorTombstoneV2, ValidatorSet},
 };
 use indra_core::types::crypto::HybridPubKey;
 
@@ -63,7 +63,6 @@ enum UndoEntry {
     RetiredColdPq(PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>),
     Governance(GovernanceState),
     Utxos(UtxoSet),
-    DelegationReturnEvents(Vec<DelegationReturnEvent>),
     ConsensusSnapshots(Vec<ConsensusSnapshot>),
     RewardEconomicSnapshot(Option<RewardEconomicSnapshot>),
     SlashMembershipRoots(Vec<SlashMembershipRootRecord>),
@@ -94,7 +93,6 @@ pub(crate) struct StateTxn<'a> {
     retired_cold_components_recorded: bool,
     governance_recorded: bool,
     utxos_recorded: bool,
-    delegation_return_events_recorded: bool,
     consensus_snapshots_recorded: bool,
     reward_economic_snapshot_recorded: bool,
     slash_membership_roots_recorded: bool,
@@ -121,7 +119,6 @@ impl<'a> StateTxn<'a> {
             retired_cold_components_recorded: false,
             governance_recorded: false,
             utxos_recorded: false,
-            delegation_return_events_recorded: false,
             consensus_snapshots_recorded: false,
             reward_economic_snapshot_recorded: false,
             slash_membership_roots_recorded: false,
@@ -182,7 +179,6 @@ impl<'a> StateTxn<'a> {
         self.snapshot_position_state();
         self.snapshot_staking_nonces();
         self.snapshot_utxos();
-        self.snapshot_delegation_return_events();
         self.snapshot_retired_cold_components();
         self.snapshot_evicted_validator_tombstones();
         self.record_scalars();
@@ -226,7 +222,6 @@ impl<'a> StateTxn<'a> {
         self.snapshot_position_state();
         self.snapshot_governance();
         self.snapshot_utxos();
-        self.snapshot_delegation_return_events();
         self.snapshot_consensus_snapshots();
         self.snapshot_reward_economic_snapshot();
         self.snapshot_slash_membership_roots();
@@ -264,6 +259,28 @@ impl<'a> StateTxn<'a> {
             .state
             .utxos
             .insert(output, height, tx_index, output_index)?;
+        measure_undo_recording(|| self.undo.push(UndoEntry::UtxoInserted(id)));
+        self.after_mutation()?;
+        Ok(id)
+    }
+
+    /// Insert a tranche-refund UTXO with provenance bound to the same
+    /// canonical lifetime and rollback entry.
+    pub(crate) fn insert_tranche_refund_utxo(
+        &mut self,
+        output: OutputV1,
+        height: u64,
+        tx_index: u32,
+        output_index: u32,
+        event: TrancheRefundEventV1,
+    ) -> StateResult<Bytes32> {
+        let id = self.state.utxos.insert_with_tranche_refund(
+            output,
+            height,
+            tx_index,
+            output_index,
+            Some(event),
+        )?;
         measure_undo_recording(|| self.undo.push(UndoEntry::UtxoInserted(id)));
         self.after_mutation()?;
         Ok(id)
@@ -482,14 +499,6 @@ impl<'a> StateTxn<'a> {
         }
     }
 
-    fn snapshot_delegation_return_events(&mut self) {
-        if !self.delegation_return_events_recorded {
-            let snapshot = measure_undo_recording(|| self.state.delegation_return_events.clone());
-            self.undo.push(UndoEntry::DelegationReturnEvents(snapshot));
-            self.delegation_return_events_recorded = true;
-        }
-    }
-
     fn snapshot_consensus_snapshots(&mut self) {
         if !self.consensus_snapshots_recorded {
             let snapshot = self.state.consensus_snapshots.clone();
@@ -586,9 +595,6 @@ impl<'a> StateTxn<'a> {
                 }
                 UndoEntry::Governance(governance) => self.state.governance = governance,
                 UndoEntry::Utxos(utxos) => self.state.utxos = utxos,
-                UndoEntry::DelegationReturnEvents(events) => {
-                    self.state.delegation_return_events = events;
-                }
                 UndoEntry::ConsensusSnapshots(snapshots) => {
                     self.state.consensus_snapshots = snapshots;
                 }
@@ -685,6 +691,12 @@ fn failpoint_after_mutation() -> StateResult<()> {
     Ok(())
 }
 
+/// Test-only checkpoint for complex helpers that mutate through a snapshotted
+/// `StateTxn` scope rather than through individual transaction methods.
+pub(crate) fn complex_mutation_checkpoint() -> StateResult<()> {
+    failpoint_after_mutation()
+}
+
 #[cfg(test)]
 pub(crate) fn set_fail_after_mutation(target: Option<usize>) {
     FAIL_AFTER_MUTATION.with(|cell| cell.set(target));
@@ -734,9 +746,6 @@ mod tests {
             lock_height: 0,
         }
     }
-
-
-
 
     #[test]
     fn rollback_restores_slash_membership_root_history_and_commitment() {
@@ -825,5 +834,4 @@ mod tests {
         assert_eq!(state.state_commitment_v2, original.state_commitment_v2);
         assert_eq!(state, original);
     }
-
 }

@@ -10,7 +10,7 @@ use indra_cli::tx_builder::{
     build_set_auto_delegate_op, build_set_commission_op,
 };
 use indra_core::types::primitives::Bytes32;
-use indra_core::types::staking::StakingBondProof;
+use indra_core::types::staking::StakeDepositProof;
 use indra_crypto::hybrid::HybridKeypair;
 #[cfg(feature = "legacy_raw_keys")]
 use indra_crypto::hybrid::{ClassicalKeypair, PqKeypair};
@@ -36,12 +36,12 @@ pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
     out
 }
 
-pub(crate) unsafe fn read_staking_bond_proof(
+pub(crate) unsafe fn read_staking_deposit_proof(
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
-) -> StakingBondProof {
-    let mut blinding = read_bytes32(bond_blinding_factor);
-    let proof = StakingBondProof {
+    deposit_blinding_factor: *const u8,
+) -> StakeDepositProof {
+    let mut blinding = read_bytes32(deposit_blinding_factor);
+    let proof = StakeDepositProof {
         committed_value_spark: bond_value_spark,
         blinding_factor: Bytes32::from(blinding),
     };
@@ -188,9 +188,9 @@ struct StakingHandleArgs {
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_register_validator(
     commission_bps: u32,
-    bond_utxo_id: *const u8,
+    deposit_utxo_id: *const u8,
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
+    deposit_blinding_factor: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -200,7 +200,7 @@ pub unsafe extern "C" fn indra_build_register_validator(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() || vrf_pk.is_null() {
+    if deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() || vrf_pk.is_null() {
         return IndraError::NullPointer.code();
     }
     if commission_bps > 10_000 {
@@ -217,9 +217,9 @@ pub unsafe extern "C" fn indra_build_register_validator(
             out_len,
         },
         |keypair, nonce, chain| {
-            let bond = Bytes32::from(read_bytes32(bond_utxo_id));
+            let bond = Bytes32::from(read_bytes32(deposit_utxo_id));
             let vrf = read_bytes32(vrf_pk);
-            let proof = read_staking_bond_proof(bond_value_spark, bond_blinding_factor);
+            let proof = read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor);
             build_register_validator_op(commission_bps, bond, proof, keypair, vrf, nonce, chain)
                 .map(|built| built.op_hex)
                 .map_err(IndraError::from)
@@ -232,16 +232,16 @@ pub unsafe extern "C" fn indra_build_register_validator(
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_register_validator_with_handle(
     commission_bps: u32,
-    bond_utxo_id: *const u8,
+    deposit_utxo_id: *const u8,
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
+    deposit_blinding_factor: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+    if deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     if commission_bps > 10_000 {
@@ -256,8 +256,8 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
             out_len,
         },
         |keypair, _validator_id, nonce, chain| {
-            let bond = Bytes32::from(read_bytes32(bond_utxo_id));
-            let proof = read_staking_bond_proof(bond_value_spark, bond_blinding_factor);
+            let bond = Bytes32::from(read_bytes32(deposit_utxo_id));
+            let proof = read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor);
             let vrf = handles::public_info(handle)?.vrf_pk;
             build_register_validator_op(commission_bps, bond, proof, keypair, vrf, nonce, chain)
                 .map(|built| built.op_hex)
@@ -270,15 +270,15 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
 ///
 /// # Safety
 ///
-/// All pointer arguments must be valid and non-null. `bond_utxo_id` must
+/// All pointer arguments must be valid and non-null. `deposit_utxo_id` must
 /// reference 32 readable bytes. Key and output pointers follow
 /// `indra_build_register_validator`.
 #[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_stake(
-    bond_utxo_id: *const u8,
+    deposit_utxo_id: *const u8,
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
+    deposit_blinding_factor: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn indra_build_self_stake(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+    if deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_keypair(
@@ -302,8 +302,8 @@ pub unsafe extern "C" fn indra_build_self_stake(
         },
         |keypair, nonce, chain| {
             build_self_stake_op(
-                Bytes32::from(read_bytes32(bond_utxo_id)),
-                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
+                Bytes32::from(read_bytes32(deposit_utxo_id)),
+                read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor),
                 keypair,
                 nonce,
                 chain,
@@ -316,16 +316,16 @@ pub unsafe extern "C" fn indra_build_self_stake(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_stake_with_handle(
-    bond_utxo_id: *const u8,
+    deposit_utxo_id: *const u8,
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
+    deposit_blinding_factor: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+    if deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_handle(
@@ -338,8 +338,8 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
         },
         |keypair, _validator_id, nonce, chain| {
             build_self_stake_op(
-                Bytes32::from(read_bytes32(bond_utxo_id)),
-                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
+                Bytes32::from(read_bytes32(deposit_utxo_id)),
+                read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor),
                 keypair,
                 nonce,
                 chain,
@@ -355,15 +355,15 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
 /// # Safety
 ///
 /// All pointer arguments must be valid and non-null. `validator_id` and
-/// `bond_utxo_id` must each reference 32 readable bytes. Key and output
+/// `deposit_utxo_id` must each reference 32 readable bytes. Key and output
 /// pointers follow `indra_build_register_validator`.
 #[cfg(feature = "legacy_raw_keys")]
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_delegate(
     validator_id: *const u8,
-    bond_utxo_id: *const u8,
+    deposit_utxo_id: *const u8,
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
+    deposit_blinding_factor: *const u8,
     classical_seed: *const u8,
     pq_pk: *const u8,
     pq_sk: *const u8,
@@ -372,7 +372,7 @@ pub unsafe extern "C" fn indra_build_delegate(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if validator_id.is_null() || bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+    if validator_id.is_null() || deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_keypair(
@@ -388,8 +388,8 @@ pub unsafe extern "C" fn indra_build_delegate(
         |keypair, nonce, chain| {
             build_delegate_op(
                 Bytes32::from(read_bytes32(validator_id)),
-                Bytes32::from(read_bytes32(bond_utxo_id)),
-                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
+                Bytes32::from(read_bytes32(deposit_utxo_id)),
+                read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor),
                 keypair,
                 nonce,
                 chain,
@@ -403,16 +403,16 @@ pub unsafe extern "C" fn indra_build_delegate(
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_delegate_with_handle(
     validator_id: *const u8,
-    bond_utxo_id: *const u8,
+    deposit_utxo_id: *const u8,
     bond_value_spark: u64,
-    bond_blinding_factor: *const u8,
+    deposit_blinding_factor: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if validator_id.is_null() || bond_utxo_id.is_null() || bond_blinding_factor.is_null() {
+    if validator_id.is_null() || deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_handle(
@@ -426,8 +426,8 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
         |keypair, _signer_id, nonce, chain| {
             build_delegate_op(
                 Bytes32::from(read_bytes32(validator_id)),
-                Bytes32::from(read_bytes32(bond_utxo_id)),
-                read_staking_bond_proof(bond_value_spark, bond_blinding_factor),
+                Bytes32::from(read_bytes32(deposit_utxo_id)),
+                read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor),
                 keypair,
                 nonce,
                 chain,
@@ -777,16 +777,16 @@ mod tests {
     fn commission_out_of_range_rejected() {
         let keys = keys();
         let chain = CString::new("indra-testnet-1").unwrap();
-        let bond_utxo_id = [0x08u8; 32];
-        let bond_blinding_factor = [0x0au8; 32];
+        let deposit_utxo_id = [0x08u8; 32];
+        let deposit_blinding_factor = [0x0au8; 32];
         let vrf_pk = [0x09u8; 32];
         let mut out = out();
         let result = unsafe {
             indra_build_register_validator(
                 10_001,
-                bond_utxo_id.as_ptr(),
+                deposit_utxo_id.as_ptr(),
                 1_000_000,
-                bond_blinding_factor.as_ptr(),
+                deposit_blinding_factor.as_ptr(),
                 keys.classical_seed.as_ptr(),
                 keys.pq_pk.as_ptr(),
                 keys.pq_sk.as_ptr(),
