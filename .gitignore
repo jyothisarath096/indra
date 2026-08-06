@@ -1,2 +1,5 @@
 target/
 keys.json
+.DS_Store
+incident_*/
+buggy-node-binary

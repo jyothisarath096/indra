@@ -5,6 +5,13 @@ use thiserror::Error;
 /// All errors that can occur at the node level.
 #[derive(Debug, Error)]
 pub enum NodeError {
+    /// Runtime configuration violates a node resource-safety invariant.
+    #[error("invalid node configuration: {detail}")]
+    InvalidConfiguration {
+        /// Actionable description of the invalid setting.
+        detail: String,
+    },
+
     /// A storage operation failed.
     #[error("storage error: {0}")]
     Storage(#[from] indra_storage::StorageError),

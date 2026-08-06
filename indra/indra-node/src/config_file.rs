@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 
 use crate::config::{
-    default_governance_mempool_capacity, NodeConfig, DEFAULT_STAKING_MEMPOOL_CAPACITY,
+    default_governance_mempool_capacity, validate_pool_capacities, NodeConfig,
+    DEFAULT_STAKING_MEMPOOL_CAPACITY,
 };
 use crate::discovery::{DnsSeedValidationMode, SignedDnsSeedValidationMode};
 use indra_core::types::primitives::{
@@ -280,6 +281,15 @@ impl NodeConfigFile {
         }
         if self.snapshot_interval == Some(0) {
             errors.push("storage.snapshot_interval must be greater than 0".to_string());
+        }
+        if let Err(capacity_errors) = validate_pool_capacities(
+            self.mempool_capacity.unwrap_or(5_000),
+            self.staking_mempool_capacity
+                .unwrap_or(DEFAULT_STAKING_MEMPOOL_CAPACITY),
+            self.governance_mempool_capacity
+                .unwrap_or_else(default_governance_mempool_capacity),
+        ) {
+            errors.extend(capacity_errors);
         }
         if errors.is_empty() {
             Ok(())
@@ -854,6 +864,66 @@ extra_security_mode = "warn"
         cfg.prune_keep_blocks = Some(MIN_PRUNE_KEEP_BLOCKS.saturating_sub(1));
         let err = cfg.validate().err().unwrap_or_else(|| vec![]);
         assert!(err.iter().any(|e| e.contains("prune_keep_blocks")));
+    }
+
+    #[test]
+    fn test_validate_rejects_pool_capacities_outside_hard_ranges() {
+        let governance_max = crate::config::max_governance_mempool_capacity();
+        for (key, mutate) in [
+            (
+                "storage.mempool_capacity",
+                (|cfg: &mut NodeConfigFile| cfg.mempool_capacity = Some(0))
+                    as fn(&mut NodeConfigFile),
+            ),
+            (
+                "storage.staking_mempool_capacity",
+                (|cfg: &mut NodeConfigFile| cfg.staking_mempool_capacity = Some(0))
+                    as fn(&mut NodeConfigFile),
+            ),
+            (
+                "storage.governance_mempool_capacity",
+                (|cfg: &mut NodeConfigFile| cfg.governance_mempool_capacity = Some(0))
+                    as fn(&mut NodeConfigFile),
+            ),
+        ] {
+            let mut cfg = minimal();
+            mutate(&mut cfg);
+            let errors = cfg.validate().unwrap_err();
+            assert!(errors.iter().any(|error| error.contains(key)));
+        }
+
+        let mut cfg = minimal();
+        cfg.mempool_capacity = Some(crate::config::MAX_MEMPOOL_CAPACITY + 1);
+        cfg.staking_mempool_capacity = Some(crate::config::MAX_STAKING_MEMPOOL_CAPACITY + 1);
+        cfg.governance_mempool_capacity = Some(governance_max + 1);
+        let errors = cfg.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("storage.mempool_capacity")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("storage.staking_mempool_capacity")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("storage.governance_mempool_capacity")));
+    }
+
+    #[test]
+    fn test_validate_accepts_pool_capacity_range_endpoints() {
+        for (transaction, staking, governance) in [
+            (1, 1, 1),
+            (
+                crate::config::MAX_MEMPOOL_CAPACITY,
+                crate::config::MAX_STAKING_MEMPOOL_CAPACITY,
+                crate::config::max_governance_mempool_capacity(),
+            ),
+        ] {
+            let mut cfg = minimal();
+            cfg.mempool_capacity = Some(transaction);
+            cfg.staking_mempool_capacity = Some(staking);
+            cfg.governance_mempool_capacity = Some(governance);
+            assert!(cfg.validate().is_ok());
+        }
     }
 
     #[test]

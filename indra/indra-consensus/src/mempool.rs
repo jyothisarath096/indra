@@ -24,7 +24,10 @@ use std::collections::{HashMap, HashSet};
 
 use indra_core::{
     codec::Encode,
-    types::{primitives::Bytes32, transaction::TransactionV1},
+    types::{
+        primitives::{Bytes32, MAX_BLOCK_SIZE_BYTES},
+        transaction::TransactionV1,
+    },
 };
 use indra_crypto::sha256;
 
@@ -36,6 +39,9 @@ pub const AGE_INCLUSION_BLOCKS: u64 = 50;
 
 /// Maximum number of transactions the mempool holds at once.
 pub const DEFAULT_MEMPOOL_CAPACITY: usize = 5_000;
+
+/// Maximum aggregate canonical transaction payload retained in memory.
+pub const MAX_MEMPOOL_ENCODED_BYTES: usize = 10 * MAX_BLOCK_SIZE_BYTES;
 
 /// Configuration for the mempool.
 #[derive(Debug, Clone)]
@@ -67,6 +73,8 @@ pub struct MempoolEntry {
     pub arrived_height: u64,
     /// Fee per KB of transaction weight (Spark/KB).
     pub fee_rate: u64,
+    /// Canonical encoded transaction size accounted against the byte cap.
+    encoded_size: usize,
 }
 
 impl MempoolEntry {
@@ -82,6 +90,8 @@ impl MempoolEntry {
 pub struct Mempool {
     entries: HashMap<Bytes32, MempoolEntry>,
     config: MempoolConfig,
+    total_encoded_bytes: usize,
+    max_encoded_bytes: usize,
 }
 
 impl Mempool {
@@ -90,6 +100,18 @@ impl Mempool {
         Self {
             entries: HashMap::new(),
             config,
+            total_encoded_bytes: 0,
+            max_encoded_bytes: MAX_MEMPOOL_ENCODED_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_byte_limit(config: MempoolConfig, max_encoded_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            config,
+            total_encoded_bytes: 0,
+            max_encoded_bytes,
         }
     }
 
@@ -106,6 +128,11 @@ impl Mempool {
     /// True if the mempool is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Aggregate canonical encoded size of all retained transactions.
+    pub fn total_encoded_bytes(&self) -> usize {
+        self.total_encoded_bytes
     }
 
     /// Compute the transaction ID: SHA-256(encode(tx)).
@@ -141,7 +168,13 @@ impl Mempool {
         }
 
         // Fee check
-        let weight_kb = (tx.encode_to_vec().len() as u64).div_ceil(1024);
+        let encoded_size = tx.encoded_len();
+        if encoded_size > self.max_encoded_bytes {
+            return Err(ConsensusError::MempoolByteLimit {
+                limit: self.max_encoded_bytes,
+            });
+        }
+        let weight_kb = (encoded_size as u64).div_ceil(1024);
         let fee_rate = if weight_kb > 0 {
             tx.fee_amount / weight_kb
         } else {
@@ -177,34 +210,67 @@ impl Mempool {
                 reason: "transaction conflicts with equal-or-higher-fee mempool entry",
             });
         }
-        for (conflict_id, _) in conflicts {
-            self.entries.remove(&conflict_id);
+        let mut evict_ids: HashSet<Bytes32> = conflicts.iter().map(|(id, _)| *id).collect();
+        let conflict_bytes = evict_ids
+            .iter()
+            .filter_map(|id| self.entries.get(id))
+            .map(|entry| entry.encoded_size)
+            .sum::<usize>();
+        let mut prospective_count = self
+            .entries
+            .len()
+            .saturating_sub(evict_ids.len())
+            .saturating_add(1);
+        let mut prospective_bytes = self
+            .total_encoded_bytes
+            .saturating_sub(conflict_bytes)
+            .saturating_add(encoded_size);
+
+        // Select every additional eviction before mutating the pool. Lowest
+        // fee rate loses first; equal rates evict the highest tx_id, matching
+        // the established deterministic count-cap ordering.
+        let mut eviction_candidates: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(id, _)| !evict_ids.contains(id))
+            .map(|(id, entry)| (*id, entry.fee_rate, entry.encoded_size))
+            .collect();
+        eviction_candidates.sort_by(|(id_a, rate_a, _), (id_b, rate_b, _)| {
+            rate_a.cmp(rate_b).then_with(|| id_b.cmp(id_a))
+        });
+        let mut candidates = eviction_candidates.into_iter();
+        while prospective_count > self.config.capacity || prospective_bytes > self.max_encoded_bytes
+        {
+            let count_exceeded = prospective_count > self.config.capacity;
+            let Some((candidate_id, candidate_rate, candidate_size)) = candidates.next() else {
+                return Err(if count_exceeded {
+                    ConsensusError::MempoolFull {
+                        capacity: self.config.capacity,
+                    }
+                } else {
+                    ConsensusError::MempoolByteLimit {
+                        limit: self.max_encoded_bytes,
+                    }
+                });
+            };
+            if fee_rate <= candidate_rate {
+                return Err(if count_exceeded {
+                    ConsensusError::MempoolFull {
+                        capacity: self.config.capacity,
+                    }
+                } else {
+                    ConsensusError::MempoolByteLimit {
+                        limit: self.max_encoded_bytes,
+                    }
+                });
+            }
+            evict_ids.insert(candidate_id);
+            prospective_count = prospective_count.saturating_sub(1);
+            prospective_bytes = prospective_bytes.saturating_sub(candidate_size);
         }
 
-        // Capacity check — evict lowest-fee tx if full
-        if self.entries.len() >= self.config.capacity {
-            // Find the tx with the lowest fee rate. Break equal-fee ties by
-            // highest tx_id so every node evicts the same transaction.
-            let min_id = self
-                .entries
-                .iter()
-                .min_by(|(_, a), (_, b)| {
-                    a.fee_rate
-                        .cmp(&b.fee_rate)
-                        .then_with(|| b.tx_id.cmp(&a.tx_id))
-                })
-                .map(|(id, _)| *id);
-
-            if let Some(min_id) = min_id {
-                let min_rate = self.entries.get(&min_id).map(|e| e.fee_rate).unwrap_or(0);
-                if fee_rate > min_rate {
-                    self.entries.remove(&min_id);
-                } else {
-                    return Err(ConsensusError::MempoolFull {
-                        capacity: self.config.capacity,
-                    });
-                }
-            }
+        for evict_id in evict_ids {
+            self.remove_entry(&evict_id);
         }
 
         self.entries.insert(
@@ -214,8 +280,14 @@ impl Mempool {
                 tx_id,
                 arrived_height: current_height,
                 fee_rate,
+                encoded_size,
             },
         );
+        self.total_encoded_bytes = self
+            .total_encoded_bytes
+            .checked_add(encoded_size)
+            .expect("mempool byte accounting overflow");
+        self.debug_assert_byte_accounting();
 
         Ok(tx_id)
     }
@@ -256,13 +328,15 @@ impl Mempool {
 
     /// Remove a transaction by ID (called after block inclusion).
     pub fn evict(&mut self, tx_id: &Bytes32) -> Option<MempoolEntry> {
-        self.entries.remove(tx_id)
+        let removed = self.remove_entry(tx_id);
+        self.debug_assert_byte_accounting();
+        removed
     }
 
     /// Remove all transactions whose nullifiers appear in the given set.
     /// Called after a block is applied to evict spent transactions.
     pub fn evict_spent(&mut self, nullifiers: &indra_state::NullifierSet) {
-        self.entries.retain(|_, entry| {
+        self.retain_entries(|_, entry| {
             !entry
                 .tx
                 .inputs
@@ -273,7 +347,7 @@ impl Mempool {
 
     /// Remove transactions that are no longer valid against the current state.
     pub fn evict_invalid(&mut self, state: &indra_state::ChainState) {
-        self.entries.retain(|tx_id, entry| {
+        self.retain_entries(|tx_id, entry| {
             let mut block_nullifiers = HashSet::new();
             let mut block_input_utxos = HashSet::new();
             let keep = indra_state::apply::validate_transaction(
@@ -290,6 +364,54 @@ impl Mempool {
             }
             keep
         });
+    }
+
+    /// Remove every pending transaction and reset byte accounting.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.total_encoded_bytes = 0;
+        self.debug_assert_byte_accounting();
+    }
+
+    fn remove_entry(&mut self, tx_id: &Bytes32) -> Option<MempoolEntry> {
+        let removed = self.entries.remove(tx_id);
+        if let Some(entry) = &removed {
+            self.total_encoded_bytes = self
+                .total_encoded_bytes
+                .checked_sub(entry.encoded_size)
+                .expect("mempool byte accounting underflow");
+        }
+        removed
+    }
+
+    fn retain_entries(&mut self, mut keep: impl FnMut(&Bytes32, &MempoolEntry) -> bool) {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|tx_id, entry| {
+            let retained = keep(tx_id, entry);
+            if !retained {
+                removed_bytes = removed_bytes
+                    .checked_add(entry.encoded_size)
+                    .expect("mempool removed-byte accounting overflow");
+            }
+            retained
+        });
+        self.total_encoded_bytes = self
+            .total_encoded_bytes
+            .checked_sub(removed_bytes)
+            .expect("mempool byte accounting underflow");
+        self.debug_assert_byte_accounting();
+    }
+
+    fn debug_assert_byte_accounting(&self) {
+        debug_assert_eq!(
+            self.total_encoded_bytes,
+            self.entries
+                .values()
+                .map(|entry| entry.encoded_size)
+                .sum::<usize>()
+        );
+        debug_assert!(self.total_encoded_bytes <= self.max_encoded_bytes);
+        debug_assert!(self.entries.len() <= self.config.capacity);
     }
 
     /// Return transactions for block production.
@@ -355,8 +477,10 @@ impl Mempool {
     #[cfg(feature = "test-utils")]
     pub fn insert_unchecked_for_test(&mut self, tx: TransactionV1, submitted_height: u64) {
         let tx_id = tx.tx_hash();
-        let weight_kb = (tx.encode_to_vec().len() as u64).div_ceil(1024);
+        let encoded_size = tx.encoded_len();
+        let weight_kb = (encoded_size as u64).div_ceil(1024);
         let fee_rate = tx.fee_amount / weight_kb.max(1);
+        self.remove_entry(&tx_id);
         self.entries.insert(
             tx_id,
             MempoolEntry {
@@ -364,8 +488,14 @@ impl Mempool {
                 tx_id,
                 fee_rate,
                 arrived_height: submitted_height,
+                encoded_size,
             },
         );
+        self.total_encoded_bytes = self
+            .total_encoded_bytes
+            .checked_add(encoded_size)
+            .expect("mempool byte accounting overflow");
+        self.debug_assert_byte_accounting();
     }
 }
 
@@ -525,6 +655,22 @@ mod tests {
         (state, tx)
     }
 
+    fn assert_byte_accounting(mempool: &Mempool) {
+        let canonical_sum = mempool
+            .entries
+            .values()
+            .map(|entry| entry.tx.encoded_len())
+            .sum::<usize>();
+        let recorded_sum = mempool
+            .entries
+            .values()
+            .map(|entry| entry.encoded_size)
+            .sum::<usize>();
+        assert_eq!(mempool.total_encoded_bytes(), canonical_sum);
+        assert_eq!(mempool.total_encoded_bytes(), recorded_sum);
+        assert!(mempool.total_encoded_bytes() <= mempool.max_encoded_bytes);
+    }
+
     #[test]
     fn submit_and_retrieve() {
         let mut mp = Mempool::default_config();
@@ -532,6 +678,27 @@ mod tests {
         let id = mp.submit(tx.clone(), 100, 1).unwrap();
         assert!(mp.contains(&id));
         assert_eq!(mp.len(), 1);
+        assert_byte_accounting(&mp);
+    }
+
+    #[test]
+    fn production_byte_cap_is_ten_maximum_blocks() {
+        assert_eq!(MAX_MEMPOOL_ENCODED_BYTES, 125_829_120);
+        assert_eq!(MAX_MEMPOOL_ENCODED_BYTES, 10 * MAX_BLOCK_SIZE_BYTES);
+    }
+
+    #[test]
+    fn zero_capacity_mempool_reliably_rejects_insertion() {
+        let mut mempool = Mempool::new(MempoolConfig {
+            capacity: 0,
+            min_fee_ratio_bps: 10_000,
+        });
+        assert!(matches!(
+            mempool.submit(dummy_tx(10_000, 0x01), 100, 1),
+            Err(ConsensusError::MempoolFull { capacity: 0 })
+        ));
+        assert!(mempool.is_empty());
+        assert_eq!(mempool.total_encoded_bytes(), 0);
     }
 
     #[test]
@@ -557,6 +724,7 @@ mod tests {
         assert!(!mempool.contains(&lower_id));
         assert!(mempool.contains(&higher_id));
         assert_eq!(mempool.len(), 1);
+        assert_byte_accounting(&mempool);
     }
 
     #[test]
@@ -632,6 +800,124 @@ mod tests {
         // The 1_000 fee tx should have been evicted
         let fees: Vec<u64> = mp.iter().map(|e| e.tx.fee_amount).collect();
         assert!(!fees.contains(&1_000));
+        assert_byte_accounting(&mp);
+    }
+
+    #[test]
+    fn byte_cap_evicts_by_fee_rate_while_count_cap_has_room() {
+        let sample_size = dummy_tx(10_000, 0x01).encoded_len();
+        let config = MempoolConfig {
+            capacity: 10,
+            min_fee_ratio_bps: 10_000,
+        };
+        let mut mempool = Mempool::new_with_byte_limit(config, sample_size * 2);
+        let lowest_id = mempool.submit(dummy_tx(10_000, 0x01), 100, 1).unwrap();
+        mempool.submit(dummy_tx(20_000, 0x02), 100, 1).unwrap();
+
+        mempool.submit(dummy_tx(30_000, 0x03), 100, 1).unwrap();
+        assert_eq!(mempool.len(), 2);
+        assert!(!mempool.contains(&lowest_id));
+        assert_byte_accounting(&mempool);
+
+        let before_ids: HashSet<_> = mempool.entries.keys().copied().collect();
+        let before_bytes = mempool.total_encoded_bytes();
+        assert!(matches!(
+            mempool.submit(dummy_tx(15_000, 0x04), 100, 1),
+            Err(ConsensusError::MempoolByteLimit { .. })
+        ));
+        assert_eq!(
+            mempool.entries.keys().copied().collect::<HashSet<_>>(),
+            before_ids
+        );
+        assert_eq!(mempool.total_encoded_bytes(), before_bytes);
+        assert_byte_accounting(&mempool);
+    }
+
+    #[test]
+    fn transaction_larger_than_byte_cap_is_rejected_without_mutation() {
+        let tx = dummy_tx(10_000, 0x05);
+        let mut mempool = Mempool::new_with_byte_limit(
+            MempoolConfig {
+                capacity: 10,
+                min_fee_ratio_bps: 10_000,
+            },
+            tx.encoded_len() - 1,
+        );
+        assert!(matches!(
+            mempool.submit(tx, 100, 1),
+            Err(ConsensusError::MempoolByteLimit { .. })
+        ));
+        assert!(mempool.is_empty());
+        assert_byte_accounting(&mempool);
+    }
+
+    #[test]
+    fn byte_accounting_tracks_commit_and_spent_evictions() {
+        let mut mempool = Mempool::default_config();
+        let committed = dummy_tx(10_000, 0x11);
+        let spent = dummy_tx(20_000, 0x12);
+        let retained = dummy_tx(30_000, 0x13);
+        let committed_id = mempool.submit(committed, 100, 1).unwrap();
+        mempool.submit(spent.clone(), 100, 1).unwrap();
+        mempool.submit(retained, 100, 1).unwrap();
+        assert_byte_accounting(&mempool);
+
+        mempool.evict(&committed_id);
+        assert_byte_accounting(&mempool);
+
+        let mut nullifiers = indra_state::NullifierSet::new();
+        assert!(nullifiers.insert(spent.inputs[0].nullifier));
+        mempool.evict_spent(&nullifiers);
+        assert_eq!(mempool.len(), 1);
+        assert_byte_accounting(&mempool);
+    }
+
+    #[test]
+    fn byte_accounting_tracks_invalid_pruning_and_clear() {
+        let mut mempool = Mempool::default_config();
+        mempool.submit(dummy_tx(10_000, 0x21), 100, 1).unwrap();
+        mempool.submit(dummy_tx(20_000, 0x22), 100, 1).unwrap();
+        assert_byte_accounting(&mempool);
+
+        mempool.evict_invalid(&ChainState::new_genesis());
+        assert!(mempool.is_empty());
+        assert_byte_accounting(&mempool);
+
+        mempool.submit(dummy_tx(30_000, 0x23), 100, 1).unwrap();
+        assert_byte_accounting(&mempool);
+        mempool.clear();
+        assert!(mempool.is_empty());
+        assert_eq!(mempool.total_encoded_bytes(), 0);
+        assert_byte_accounting(&mempool);
+    }
+
+    #[test]
+    fn byte_accounting_remains_exact_across_combined_mutations() {
+        let sample_size = dummy_tx(10_000, 0x31).encoded_len();
+        let config = MempoolConfig {
+            capacity: 3,
+            min_fee_ratio_bps: 10_000,
+        };
+        let mut mempool = Mempool::new_with_byte_limit(config, sample_size * 2);
+        let conflict_low = dummy_tx(10_000, 0x31);
+        let mut conflict_high = conflict_low.clone();
+        conflict_high.fee_amount = 40_000;
+        mempool.submit(conflict_low, 100, 1).unwrap();
+        mempool.submit(dummy_tx(20_000, 0x32), 100, 1).unwrap();
+        assert_byte_accounting(&mempool);
+
+        let replacement_id = mempool.submit(conflict_high, 100, 1).unwrap();
+        assert_byte_accounting(&mempool);
+        mempool.submit(dummy_tx(50_000, 0x33), 100, 1).unwrap();
+        assert_eq!(mempool.len(), 2);
+        assert_byte_accounting(&mempool);
+
+        mempool.evict(&replacement_id);
+        assert_byte_accounting(&mempool);
+        mempool.submit(dummy_tx(60_000, 0x34), 100, 1).unwrap();
+        assert_byte_accounting(&mempool);
+        mempool.clear();
+        assert_byte_accounting(&mempool);
     }
 
     #[test]

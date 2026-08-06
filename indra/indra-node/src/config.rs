@@ -101,16 +101,60 @@ pub struct NodeConfig {
 /// Default staking-op mempool capacity.
 pub const DEFAULT_STAKING_MEMPOOL_CAPACITY: usize = 5_000;
 
+/// Hard upper bound for the operator-configurable transaction mempool.
+pub const MAX_MEMPOOL_CAPACITY: usize = 5_000;
+
+/// Hard upper bound for the operator-configurable staking-operation pool.
+pub const MAX_STAKING_MEMPOOL_CAPACITY: usize = 5_000;
+
 /// Default governance-op mempool capacity.
 ///
 /// The expected governance burst is bounded by active validators and active
 /// proposals: commits, reveals, and redelegations for each active validator,
 /// plus headroom for propose/execute/cancel operations.
 pub fn default_governance_mempool_capacity() -> usize {
+    max_governance_mempool_capacity()
+}
+
+/// Hard upper bound for the operator-configurable governance-operation pool.
+///
+/// This follows the same active-validator × active-proposal × four-operation
+/// headroom formula as the default, rather than duplicating a numeric value.
+pub fn max_governance_mempool_capacity() -> usize {
     MAX_ACTIVE_VALIDATORS
         .saturating_mul(MAX_ACTIVE_GOVERNANCE_PROPOSALS)
         .saturating_mul(4)
         .max(256)
+}
+
+/// Validate every operator-configurable pending-pool capacity.
+pub fn validate_pool_capacities(
+    mempool_capacity: usize,
+    staking_mempool_capacity: usize,
+    governance_mempool_capacity: usize,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if !(1..=MAX_MEMPOOL_CAPACITY).contains(&mempool_capacity) {
+        errors.push(format!(
+            "storage.mempool_capacity must be between 1 and {MAX_MEMPOOL_CAPACITY}"
+        ));
+    }
+    if !(1..=MAX_STAKING_MEMPOOL_CAPACITY).contains(&staking_mempool_capacity) {
+        errors.push(format!(
+            "storage.staking_mempool_capacity must be between 1 and {MAX_STAKING_MEMPOOL_CAPACITY}"
+        ));
+    }
+    let governance_max = max_governance_mempool_capacity();
+    if !(1..=governance_max).contains(&governance_mempool_capacity) {
+        errors.push(format!(
+            "storage.governance_mempool_capacity must be between 1 and {governance_max}"
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 impl NodeConfig {

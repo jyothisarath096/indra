@@ -24,6 +24,13 @@ pub enum ConsensusError {
         capacity: usize,
     },
 
+    /// The mempool cannot accommodate another transaction within its byte cap.
+    #[error("mempool encoded-byte limit reached: {limit} bytes")]
+    MempoolByteLimit {
+        /// Maximum aggregate canonical transaction bytes.
+        limit: usize,
+    },
+
     /// Transaction fee is below the current base fee.
     #[error("transaction fee too low")]
     FeeTooLow,

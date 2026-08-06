@@ -125,6 +125,15 @@ pub struct NetworkAuthorityMember {
 impl NodeEngine {
     /// Initialise a node from its configuration.
     pub fn init(config: NodeConfig) -> NodeResult<Self> {
+        if let Err(errors) = crate::config::validate_pool_capacities(
+            config.mempool_capacity,
+            config.staking_mempool_capacity,
+            config.governance_mempool_capacity,
+        ) {
+            return Err(NodeError::InvalidConfiguration {
+                detail: errors.join("; "),
+            });
+        }
         std::fs::create_dir_all(&config.data_dir).map_err(indra_storage::StorageError::Io)?;
 
         if let Some(keep) = config.prune_keep_blocks {
@@ -3109,20 +3118,66 @@ mod tests {
     }
 
     #[test]
-    fn staking_mempool_capacity_is_enforced_at_admission() {
+    fn programmatic_config_rejects_zero_staking_mempool_capacity() {
         let dir = temp_dir("staking_mempool_capacity");
         let mut config = NodeConfig::local_test(dir.clone());
         config.staking_mempool_capacity = 0;
-        let mut engine = NodeEngine::init(config).unwrap();
-        let keypair = install_active_validator(&mut engine, [0x74; 32], "stake-cap");
-        let cold = cold_keypair_for_seed([0x74; 32]);
-        let op = valid_set_commission_staking_op(&engine, &keypair, &cold, 1, 1_100);
-
-        let err = engine.add_staking_op(op).unwrap_err().to_string();
-        assert!(err.contains("staking mempool full"));
-        assert!(engine.staking_mempool.is_empty());
+        let err = match NodeEngine::init(config) {
+            Ok(_) => panic!("zero staking capacity unexpectedly initialized"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("storage.staking_mempool_capacity"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn programmatic_config_enforces_all_pool_capacity_ceilings_and_accepts_bounds() {
+        let cases = [
+            ("transaction-zero", 0, 1, 1, "storage.mempool_capacity"),
+            (
+                "transaction-high",
+                crate::config::MAX_MEMPOOL_CAPACITY + 1,
+                1,
+                1,
+                "storage.mempool_capacity",
+            ),
+            (
+                "staking-high",
+                1,
+                crate::config::MAX_STAKING_MEMPOOL_CAPACITY + 1,
+                1,
+                "storage.staking_mempool_capacity",
+            ),
+            (
+                "governance-high",
+                1,
+                1,
+                crate::config::max_governance_mempool_capacity() + 1,
+                "storage.governance_mempool_capacity",
+            ),
+        ];
+        for (name, transaction, staking, governance, expected_key) in cases {
+            let dir = temp_dir(name);
+            let mut config = NodeConfig::local_test(dir.clone());
+            config.mempool_capacity = transaction;
+            config.staking_mempool_capacity = staking;
+            config.governance_mempool_capacity = governance;
+            let err = match NodeEngine::init(config) {
+                Ok(_) => panic!("out-of-range capacity unexpectedly initialized"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains(expected_key), "unexpected error: {err}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        let dir = temp_dir("pool-capacity-valid-maxima");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.mempool_capacity = crate::config::MAX_MEMPOOL_CAPACITY;
+        config.staking_mempool_capacity = crate::config::MAX_STAKING_MEMPOOL_CAPACITY;
+        config.governance_mempool_capacity = crate::config::max_governance_mempool_capacity();
+        assert!(NodeEngine::init(config).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3557,18 +3612,15 @@ mod tests {
     }
 
     #[test]
-    fn governance_mempool_capacity_is_enforced_at_admission() {
+    fn programmatic_config_rejects_zero_governance_mempool_capacity() {
         let dir = temp_dir("governance_mempool_capacity");
         let mut config = NodeConfig::local_test(dir.clone());
         config.governance_mempool_capacity = 0;
-        let mut engine = NodeEngine::init(config).unwrap();
-        let keypair = install_active_validator(&mut engine, [0x54; 32], "gov-cap");
-        let cold = cold_keypair_for_seed([0x54; 32]);
-        let op = valid_cold_governance_propose_op(&mut engine, &keypair, &cold, 1);
-
-        let err = engine.add_governance_op(op).unwrap_err().to_string();
-        assert!(err.contains("governance mempool full"));
-        assert!(engine.governance_mempool.is_empty());
+        let err = match NodeEngine::init(config) {
+            Ok(_) => panic!("zero governance capacity unexpectedly initialized"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("storage.governance_mempool_capacity"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
