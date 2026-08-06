@@ -129,7 +129,7 @@ impl PeerInfo {
 }
 
 /// Score adjustment reasons.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreEvent {
     /// Received a valid block.
     ValidBlock,
@@ -284,14 +284,33 @@ impl PeerTable {
     }
 
     /// Remove peers that have been banned longer than BAN_DURATION.
-    pub fn cleanup_expired_bans(&mut self) {
+    pub fn cleanup_expired_bans(&mut self) -> usize {
+        let before = self.peers.len();
         self.peers.retain(|_, peer| {
             if peer.status == PeerStatus::Banned {
-                !peer.is_banned() // keep if still banned, remove if ban expired
+                peer.is_banned()
             } else {
                 true
             }
         });
+        before - self.peers.len()
+    }
+
+    /// Evict the least-recently-seen disconnected, non-banned peer.
+    pub fn evict_oldest_disconnected(&mut self) -> Option<SocketAddr> {
+        let candidate = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.status == PeerStatus::Disconnected && !peer.is_banned())
+            .min_by(|(addr_a, peer_a), (addr_b, peer_b)| {
+                peer_a
+                    .last_seen
+                    .cmp(&peer_b.last_seen)
+                    .then_with(|| addr_a.cmp(addr_b))
+            })
+            .map(|(addr, _)| *addr)?;
+        self.peers.remove(&candidate);
+        Some(candidate)
     }
 }
 
@@ -374,5 +393,23 @@ mod tests {
         table.update_height(&a, 100);
         table.update_height(&b, 200);
         assert_eq!(table.best_peer().unwrap().addr, b);
+    }
+
+    #[test]
+    fn cleanup_retains_active_bans_and_removes_expired_bans() {
+        let mut table = PeerTable::new();
+        let active = addr(1010);
+        let expired = addr(1011);
+        table.add(active).unwrap();
+        table.add(expired).unwrap();
+        for target in [active, expired] {
+            let peer = table.get_mut(&target).unwrap();
+            peer.status = PeerStatus::Banned;
+        }
+        table.get_mut(&active).unwrap().ban_until = Some(Instant::now() + Duration::from_secs(60));
+        table.get_mut(&expired).unwrap().ban_until = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(table.cleanup_expired_bans(), 1);
+        assert!(table.get(&active).is_some());
+        assert!(table.get(&expired).is_none());
     }
 }

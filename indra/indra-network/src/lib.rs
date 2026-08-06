@@ -6,7 +6,7 @@
 //!
 //! ```text
 //!  ┌─────────────────────────────────────────────┐
-//!  │                GossipEngine                  │
+//!  │      Authenticated async peer manager       │
 //!  │                                              │
 //!  │  ┌───────────┐  ┌──────────┐  ┌──────────┐  │
 //!  │  │ PeerTable │  │Transport │  │ Message  │  │
@@ -37,10 +37,7 @@
 //! timeouts, sending duplicate votes) decreases it. Score drops to
 //! zero → peer is banned for BAN_DURATION_BLOCKS blocks.
 //!
-//! The workspace is currently transitioning from a blocking plaintext
-//! transport to an authenticated encrypted Tokio transport. The new framing,
-//! handshake, and peer-manager modules coexist with the legacy transport while
-//! `indra-node` is migrated.
+//! Validator networking uses the authenticated encrypted Tokio transport.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -50,19 +47,18 @@
 
 pub mod error;
 pub mod frame;
-pub mod gossip;
 pub mod handshake;
 pub mod message;
 pub mod net_types;
 pub mod observer;
 pub mod peer;
 pub mod peer_manager;
+pub mod policy;
 pub mod rate_limit;
 pub mod transport;
 
 pub use error::{NetworkError, NetworkResult};
 pub use frame::{FrameReader, FrameWriter};
-pub use gossip::{GossipEngine, GossipEvent};
 pub use handshake::{
     perform_handshake_initiator, perform_handshake_responder, HandshakeConfig, HandshakeResult,
 };
@@ -74,6 +70,7 @@ pub use observer::{
 };
 pub use peer::{PeerInfo, PeerStatus, PeerTable};
 pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
+pub use policy::{BanStore, BoundedTtlSet, CooldownTracker, NetworkGroup};
 pub use rate_limit::{
     GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket,
 };

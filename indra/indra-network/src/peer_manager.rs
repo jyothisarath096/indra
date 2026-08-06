@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -31,7 +32,11 @@ use crate::{
     handshake::HandshakeResult,
     message::Message,
     net_types::{NetworkCommand, NetworkEvent, RelayValidatorKey},
-    peer::{PeerTable, ScoreEvent, BAN_DURATION_RATE_LIMIT},
+    peer::{
+        PeerTable, ScoreEvent, BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE,
+        MAX_SCORE,
+    },
+    policy::{BanStore, BoundedTtlSet},
     rate_limit::{
         GlobalRateLimiter, MessageClass, PeerRateLimiter, RateLimitReason,
         RateLimitViolation as RateLimitViolationInfo,
@@ -43,7 +48,9 @@ const LARGE_QUEUE_CAPACITY: usize = 4;
 const TIE_BREAK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CONSENSUS_DUPLICATE_FILTER_CAPACITY: usize = 512;
 const CONSENSUS_RELAY_SEEN_CAPACITY: usize = 16_384;
+const CONSENSUS_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const STATUS_COALESCE_WINDOW: Duration = Duration::from_millis(500);
+const BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const RELAY_FANOUT_SCALE_FACTOR: f64 = 2.0;
 const RELAY_FANOUT_MARGIN: usize = 2;
 const MIN_CONSENSUS_RELAY_FANOUT: usize = 4;
@@ -81,6 +88,7 @@ enum PeerManagerMessage {
 
 struct ManagedPeer {
     addr: SocketAddr,
+    is_outbound: bool,
     small_tx: mpsc::Sender<OutboundMessage>,
     large_tx: mpsc::Sender<OutboundMessage>,
     read_task: JoinHandle<()>,
@@ -97,6 +105,9 @@ struct PeerManagerActor {
     peers_by_validator: HashMap<Bytes32, ManagedPeer>,
     validator_by_addr: HashMap<SocketAddr, Bytes32>,
     connected_peers: Arc<AtomicUsize>,
+    connected_outbound_peers: Arc<AtomicUsize>,
+    ban_store: BanStore,
+    scores_by_validator: HashMap<Bytes32, i32>,
     global_limiter: GlobalRateLimiter,
     transport_slash_detector: Arc<Mutex<SlashDetector>>,
     last_tie_break_log: HashMap<Bytes32, Instant>,
@@ -167,15 +178,11 @@ struct BlockRelaySlotKey {
     validator_id: Bytes32,
 }
 
-#[derive(Debug, Clone)]
-struct RelaySeenEntry {
-    key: RelayMessageKey,
-    forwarded_to: HashSet<Bytes32>,
-}
-
 struct RelaySeenCache {
-    seen: VecDeque<RelaySeenEntry>,
+    order: VecDeque<(RelayMessageKey, Instant)>,
+    forwarded: HashMap<RelayMessageKey, HashSet<Bytes32>>,
     capacity: usize,
+    ttl: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -188,29 +195,22 @@ struct RelayMetrics {
 }
 
 struct ConsensusDuplicateFilter {
-    seen: VecDeque<ConsensusMessageKey>,
-    capacity: usize,
+    seen: BoundedTtlSet<ConsensusMessageKey>,
 }
 
 impl ConsensusDuplicateFilter {
     fn new(capacity: usize) -> Self {
         Self {
-            seen: VecDeque::with_capacity(capacity),
-            capacity,
+            seen: BoundedTtlSet::new(capacity, CONSENSUS_SEEN_TTL),
         }
     }
 
     fn is_duplicate(&mut self, key: ConsensusMessageKey) -> bool {
-        if self.seen.contains(&key) {
+        let now = Instant::now();
+        if self.seen.contains_at(&key, now) {
             return true;
         }
-        if self.capacity == 0 {
-            return false;
-        }
-        if self.seen.len() >= self.capacity {
-            self.seen.pop_front();
-        }
-        self.seen.push_back(key);
+        let _ = self.seen.insert_at(key, now);
         false
     }
 
@@ -223,20 +223,21 @@ impl ConsensusDuplicateFilter {
 impl RelaySeenCache {
     fn new(capacity: usize) -> Self {
         Self {
-            seen: VecDeque::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            forwarded: HashMap::with_capacity(capacity),
             capacity,
+            ttl: CONSENSUS_SEEN_TTL,
         }
     }
 
     fn is_seen(&self, key: &RelayMessageKey) -> bool {
-        self.seen.iter().any(|entry| &entry.key == key)
+        self.forwarded.contains_key(key)
     }
 
     fn forwarded_to(&self, key: &RelayMessageKey, validator_id: &Bytes32) -> bool {
-        self.seen
-            .iter()
-            .find(|entry| &entry.key == key)
-            .is_some_and(|entry| entry.forwarded_to.contains(validator_id))
+        self.forwarded
+            .get(key)
+            .is_some_and(|forwarded| forwarded.contains(validator_id))
     }
 
     fn record_forwarded(&mut self, key: RelayMessageKey, forwarded_to: &[Bytes32]) {
@@ -248,25 +249,34 @@ impl RelaySeenCache {
     }
 
     fn upsert_forwarded(&mut self, key: RelayMessageKey, forwarded: &HashSet<Bytes32>) {
-        if let Some(entry) = self.seen.iter_mut().find(|entry| entry.key == key) {
-            entry.forwarded_to.extend(forwarded.iter().copied());
+        self.expire(Instant::now());
+        if let Some(existing) = self.forwarded.get_mut(&key) {
+            existing.extend(forwarded.iter().copied());
             return;
         }
         if self.capacity == 0 {
             return;
         }
-        if self.seen.len() >= self.capacity {
-            self.seen.pop_front();
+        while self.order.len() >= self.capacity {
+            if let Some((old, _)) = self.order.pop_front() {
+                self.forwarded.remove(&old);
+            }
         }
-        self.seen.push_back(RelaySeenEntry {
-            key,
-            forwarded_to: forwarded.clone(),
-        });
+        self.order.push_back((key, Instant::now() + self.ttl));
+        self.forwarded.insert(key, forwarded.clone());
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self.order.front().is_some_and(|(_, expiry)| *expiry <= now) {
+            if let Some((key, _)) = self.order.pop_front() {
+                self.forwarded.remove(&key);
+            }
+        }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.seen.len()
+        self.forwarded.len()
     }
 }
 
@@ -838,6 +848,8 @@ impl PeerManagerActor {
     }
 
     async fn run(mut self) {
+        let mut cleanup = tokio::time::interval(BAN_CLEANUP_INTERVAL);
+        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 maybe_command = self.command_rx.recv() => {
@@ -851,6 +863,12 @@ impl PeerManagerActor {
                         break;
                     };
                     self.handle_control(control).await;
+                }
+                _ = cleanup.tick() => {
+                    self.peer_table.cleanup_expired_bans();
+                    if let Err(error) = self.ban_store.cleanup_expired_at(BanStore::unix_now()) {
+                        eprintln!("[p2p] failed to persist expired-ban cleanup: {error}");
+                    }
                 }
             }
         }
@@ -878,16 +896,25 @@ impl PeerManagerActor {
             } => {
                 if let Some(peer) = self.peers_by_validator.get(&validator_id) {
                     let addr = peer.addr;
-                    self.peer_table
-                        .score_event(&addr, ScoreEvent::InvalidMessage);
+                    self.score_validator(validator_id, ScoreEvent::InvalidMessage, BAN_DURATION)
+                        .await;
                     eprintln!(
                         "[p2p] disconnecting validator {} ({}) for invalid consensus message: {}",
                         short_validator_id(&validator_id),
                         addr,
                         reason
                     );
-                    self.drop_peer(validator_id, addr).await;
+                    if self.peers_by_validator.contains_key(&validator_id) {
+                        self.drop_peer(validator_id, addr).await;
+                    }
                 }
+            }
+            NetworkCommand::ScorePeer {
+                validator_id,
+                event,
+            } => {
+                self.score_validator(validator_id, event, BAN_DURATION)
+                    .await;
             }
             NetworkCommand::UpdateRelayValidatorKeys {
                 chain_id,
@@ -924,17 +951,24 @@ impl PeerManagerActor {
                     );
                     return;
                 }
-                self.peer_table.adjust_score_with_duration(
-                    &addr,
+                self.adjust_validator_score(
+                    validator_id,
                     -violation.penalty,
                     BAN_DURATION_RATE_LIMIT,
-                );
+                )
+                .await;
                 if self
                     .peer_table
                     .get(&addr)
                     .map(|peer| peer.is_banned())
                     .unwrap_or(false)
                 {
+                    if let Err(error) = self.ban_store.ban_until(
+                        validator_id,
+                        BanStore::unix_now().saturating_add(BAN_DURATION_RATE_LIMIT.as_secs()),
+                    ) {
+                        eprintln!("[p2p] failed to persist rate-limit ban: {error}");
+                    }
                     eprintln!(
                         "[p2p] peer {} ({}) banned 10min for sustained rate limit violations",
                         short_validator_id(&validator_id),
@@ -986,6 +1020,18 @@ impl PeerManagerActor {
             drop(handshake.stream);
             return;
         }
+        if self
+            .ban_store
+            .is_banned_at(&peer_validator_id, BanStore::unix_now())
+        {
+            eprintln!(
+                "[p2p] rejected actively banned validator {} from {}",
+                short_validator_id(&peer_validator_id),
+                addr
+            );
+            drop(handshake.stream);
+            return;
+        }
 
         if let Some(existing) = self.peers_by_validator.get(&peer_validator_id) {
             let keep_new = tie_break_keep_new(
@@ -1025,6 +1071,17 @@ impl PeerManagerActor {
             }
         }
 
+        self.peer_table.cleanup_expired_bans();
+        if self.peer_table.add(addr).is_err() {
+            let _ = self.peer_table.evict_oldest_disconnected();
+            if let Err(error) = self.peer_table.add(addr) {
+                eprintln!("[p2p] rejecting {}: peer table remains full: {error}", addr);
+                drop(handshake.stream);
+                return;
+            }
+        }
+
+        let is_outbound = handshake.is_initiator;
         let stream = handshake.stream;
         let send_key = handshake.send_key;
         let recv_key = handshake.recv_key;
@@ -1126,14 +1183,21 @@ impl PeerManagerActor {
             .await;
         });
 
-        let _ = self.peer_table.add(addr);
         self.peer_table.set_validator_id(&addr, peer_validator_id);
         self.peer_table.mark_connected(&addr);
+        if let Some(peer) = self.peer_table.get_mut(&addr) {
+            peer.score = self
+                .scores_by_validator
+                .get(&peer_validator_id)
+                .copied()
+                .unwrap_or(INITIAL_SCORE);
+        }
         self.validator_by_addr.insert(addr, peer_validator_id);
         self.peers_by_validator.insert(
             peer_validator_id,
             ManagedPeer {
                 addr,
+                is_outbound,
                 small_tx,
                 large_tx,
                 read_task,
@@ -1147,15 +1211,18 @@ impl PeerManagerActor {
             .send(NetworkEvent::PeerConnected {
                 validator_id: peer_validator_id,
                 addr,
-                is_outbound: handshake.is_initiator,
+                is_outbound,
             })
             .await;
+        self.refresh_connection_counts();
     }
 
     async fn drop_peer(&mut self, validator_id: Bytes32, addr: SocketAddr) {
+        let mut is_outbound = false;
         if let Some(peer) = self.peers_by_validator.get(&validator_id) {
             if peer.addr == addr {
                 let peer = self.peers_by_validator.remove(&validator_id).unwrap();
+                is_outbound = peer.is_outbound;
                 peer.read_task.abort();
                 peer.write_task.abort();
             } else {
@@ -1172,10 +1239,73 @@ impl PeerManagerActor {
         self.peer_table.mark_disconnected(&addr);
         self.connected_peers
             .store(self.peers_by_validator.len(), Ordering::Relaxed);
+        self.refresh_connection_counts();
         let _ = self
             .event_tx
-            .send(NetworkEvent::PeerDisconnected { validator_id, addr })
+            .send(NetworkEvent::PeerDisconnected {
+                validator_id,
+                addr,
+                is_outbound,
+            })
             .await;
+    }
+
+    fn refresh_connection_counts(&self) {
+        self.connected_peers
+            .store(self.peers_by_validator.len(), Ordering::Relaxed);
+        self.connected_outbound_peers.store(
+            self.peers_by_validator
+                .values()
+                .filter(|peer| peer.is_outbound)
+                .count(),
+            Ordering::Relaxed,
+        );
+    }
+
+    async fn score_validator(
+        &mut self,
+        validator_id: Bytes32,
+        event: ScoreEvent,
+        ban_duration: Duration,
+    ) {
+        if !self.peers_by_validator.contains_key(&validator_id) {
+            return;
+        }
+        self.adjust_validator_score(validator_id, event.delta(), ban_duration)
+            .await;
+    }
+
+    async fn adjust_validator_score(
+        &mut self,
+        validator_id: Bytes32,
+        delta: i32,
+        ban_duration: Duration,
+    ) {
+        let score = self
+            .scores_by_validator
+            .entry(validator_id)
+            .or_insert(INITIAL_SCORE);
+        *score = (*score + delta).clamp(BAN_SCORE, MAX_SCORE);
+        let addr = self
+            .peers_by_validator
+            .get(&validator_id)
+            .map(|peer| peer.addr);
+        if let Some(addr) = addr {
+            if let Some(peer) = self.peer_table.get_mut(&addr) {
+                peer.score = *score;
+            }
+        }
+        if *score <= BAN_SCORE {
+            if let Err(error) = self.ban_store.ban_until(
+                validator_id,
+                BanStore::unix_now().saturating_add(ban_duration.as_secs()),
+            ) {
+                eprintln!("[p2p] failed to persist identity ban: {error}");
+            }
+            if let Some(addr) = addr {
+                self.drop_peer(validator_id, addr).await;
+            }
+        }
     }
 }
 
@@ -1231,6 +1361,8 @@ pub struct PeerManagerConfig {
     pub event_tx: mpsc::Sender<NetworkEvent>,
     /// Maximum buffered commands from the node into the actor.
     pub command_buffer: usize,
+    /// Node-local path for restart-persistent validator identity bans.
+    pub ban_store_path: PathBuf,
 }
 
 /// Handle returned to callers that need to enqueue network commands or attach peers.
@@ -1239,6 +1371,7 @@ pub struct PeerManagerHandle {
     command_tx: mpsc::Sender<NetworkCommand>,
     control_tx: mpsc::Sender<PeerManagerMessage>,
     connected_peers: Arc<AtomicUsize>,
+    connected_outbound_peers: Arc<AtomicUsize>,
 }
 
 impl PeerManagerHandle {
@@ -1274,6 +1407,11 @@ impl PeerManagerHandle {
     pub fn connected_peer_count(&self) -> usize {
         self.connected_peers.load(Ordering::Relaxed)
     }
+
+    /// Number of established connections initiated by this node.
+    pub fn connected_outbound_peer_count(&self) -> usize {
+        self.connected_outbound_peers.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawn the peer-manager actor and return its handle.
@@ -1281,6 +1419,21 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
     let (command_tx, command_rx) = mpsc::channel(config.command_buffer);
     let (control_tx, control_rx) = mpsc::channel(config.command_buffer);
     let connected_peers = Arc::new(AtomicUsize::new(0));
+    let connected_outbound_peers = Arc::new(AtomicUsize::new(0));
+    let ban_store = match BanStore::load(&config.ban_store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("[p2p] failed to load ban store; authenticated networking disabled: {error}");
+            drop(command_rx);
+            drop(control_rx);
+            return PeerManagerHandle {
+                command_tx,
+                control_tx,
+                connected_peers,
+                connected_outbound_peers,
+            };
+        }
+    };
     let actor = PeerManagerActor {
         local_validator_id: config.local_validator_id,
         event_tx: config.event_tx,
@@ -1291,6 +1444,9 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         peers_by_validator: HashMap::new(),
         validator_by_addr: HashMap::new(),
         connected_peers: Arc::clone(&connected_peers),
+        connected_outbound_peers: Arc::clone(&connected_outbound_peers),
+        ban_store,
+        scores_by_validator: HashMap::new(),
         global_limiter: GlobalRateLimiter::new(),
         transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
         last_tie_break_log: HashMap::new(),
@@ -1306,6 +1462,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         command_tx,
         control_tx,
         connected_peers,
+        connected_outbound_peers,
     }
 }
 
@@ -1334,6 +1491,7 @@ mod tests {
         event_tx: mpsc::Sender<NetworkEvent>,
         local_validator_id: Bytes32,
     ) -> PeerManagerActor {
+        static NEXT_TEST_STORE: AtomicUsize = AtomicUsize::new(0);
         let (_command_tx, command_rx) = mpsc::channel(16);
         let (control_tx, control_rx) = mpsc::channel(16);
         PeerManagerActor {
@@ -1346,6 +1504,13 @@ mod tests {
             peers_by_validator: HashMap::new(),
             validator_by_addr: HashMap::new(),
             connected_peers: Arc::new(AtomicUsize::new(0)),
+            connected_outbound_peers: Arc::new(AtomicUsize::new(0)),
+            ban_store: BanStore::empty(std::env::temp_dir().join(format!(
+                "indra-peer-manager-test-bans-{}-{}",
+                std::process::id(),
+                NEXT_TEST_STORE.fetch_add(1, Ordering::Relaxed),
+            ))),
+            scores_by_validator: HashMap::new(),
             global_limiter: GlobalRateLimiter::new(),
             transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
             last_tie_break_log: HashMap::new(),
@@ -1373,6 +1538,79 @@ mod tests {
             },
             keepalive,
         )
+    }
+
+    #[tokio::test]
+    async fn eight_inbound_connections_do_not_satisfy_outbound_target() {
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut actor = test_actor(event_tx, Bytes32::from([0xF0; 32]));
+        let mut keepalive = Vec::new();
+        for index in 0..8u8 {
+            let (handshake, peer_stream) =
+                handshake_result(Bytes32::from([index; 32]), false).await;
+            actor
+                .register_peer(
+                    format!("127.0.0.{}:{}", index + 1, 20_000 + index as u16)
+                        .parse()
+                        .unwrap(),
+                    handshake,
+                )
+                .await;
+            keepalive.push(peer_stream);
+            let _ = event_rx.recv().await;
+        }
+        assert_eq!(actor.peers_by_validator.len(), 8);
+        assert_eq!(actor.connected_outbound_peers.load(Ordering::Relaxed), 0);
+
+        let (handshake, peer_stream) = handshake_result(Bytes32::from([0xA0; 32]), true).await;
+        actor
+            .register_peer("127.0.1.1:21000".parse().unwrap(), handshake)
+            .await;
+        keepalive.push(peer_stream);
+        assert_eq!(actor.connected_outbound_peers.load(Ordering::Relaxed), 1);
+        assert_eq!(actor.peers_by_validator.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn active_identity_ban_rejects_reconnect_from_new_port() {
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let mut actor = test_actor(event_tx, Bytes32::from([0xF1; 32]));
+        let validator = Bytes32::from([0x42; 32]);
+        actor
+            .ban_store
+            .ban_until(validator, BanStore::unix_now() + 60)
+            .unwrap();
+        let (handshake, _keepalive) = handshake_result(validator, false).await;
+        actor
+            .register_peer("127.0.0.1:29999".parse().unwrap(), handshake)
+            .await;
+        assert!(!actor.peers_by_validator.contains_key(&validator));
+    }
+
+    #[tokio::test]
+    async fn registration_at_peer_table_capacity_evicts_stale_and_remains_scored() {
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let mut actor = test_actor(event_tx, Bytes32::from([0xF2; 32]));
+        for index in 0..crate::peer::MAX_PEERS {
+            let addr: SocketAddr = format!("127.1.{}.{index}:30000", index / 250)
+                .parse()
+                .unwrap();
+            actor.peer_table.add(addr).unwrap();
+            actor.peer_table.mark_disconnected(&addr);
+        }
+        let validator = Bytes32::from([0x55; 32]);
+        let (handshake, _keepalive) = handshake_result(validator, true).await;
+        let addr = "127.2.0.1:30001".parse().unwrap();
+        actor.register_peer(addr, handshake).await;
+        assert_eq!(actor.peer_table.len(), crate::peer::MAX_PEERS);
+        assert!(actor.peer_table.get(&addr).is_some());
+        actor
+            .score_validator(validator, ScoreEvent::ValidTx, BAN_DURATION)
+            .await;
+        assert_eq!(
+            actor.peer_table.get(&addr).unwrap().score,
+            crate::peer::INITIAL_SCORE + 1
+        );
     }
 
     #[tokio::test]
@@ -1613,6 +1851,7 @@ mod tests {
             validator_id,
             ManagedPeer {
                 addr,
+                is_outbound: false,
                 small_tx,
                 large_tx,
                 read_task: tokio::spawn(async {}),
@@ -1643,6 +1882,7 @@ mod tests {
             validator_id,
             ManagedPeer {
                 addr,
+                is_outbound: false,
                 small_tx,
                 large_tx,
                 read_task: tokio::spawn(async {}),
@@ -2062,6 +2302,40 @@ mod tests {
             receiver_rx.try_recv().unwrap().msg,
             Message::Vote(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn relay_verification_does_not_score_but_authoritative_outcomes_do() {
+        let sender = Bytes32::from([0x12; 32]);
+        let receiver = Bytes32::from([0x13; 32]);
+        let keypair = hybrid_key(0x12);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let _sender_rx = add_test_peer(&mut actor, sender, 34012);
+        let _receiver_rx = add_test_peer(&mut actor, receiver, 34013);
+        let addr = actor.peers_by_validator.get(&sender).unwrap().addr;
+        let initial = actor.peer_table.get(&addr).unwrap().score;
+
+        actor
+            .relay_if_eligible(sender, &Message::Vote(signed_vote(sender, &keypair)))
+            .await;
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, initial);
+
+        actor
+            .score_validator(sender, ScoreEvent::ValidTx, BAN_DURATION)
+            .await;
+        actor
+            .score_validator(sender, ScoreEvent::ValidVote, BAN_DURATION)
+            .await;
+        actor
+            .score_validator(sender, ScoreEvent::ValidBlock, BAN_DURATION)
+            .await;
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, initial + 7);
+        actor
+            .score_validator(sender, ScoreEvent::InvalidMessage, BAN_DURATION)
+            .await;
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, initial - 3);
     }
 
     #[tokio::test]
@@ -3633,12 +3907,10 @@ mod tests {
     #[tokio::test]
     async fn authenticated_validator_status_burst_does_not_trigger_penalty() {
         let validator = Bytes32::from([0xAA; 32]);
-        let addr: SocketAddr = "127.0.0.1:32001".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:32003".parse().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(16);
         let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
-        actor.peer_table.add(addr).unwrap();
-        actor.peer_table.set_validator_id(&addr, validator);
-        actor.peer_table.mark_connected(&addr);
+        let _receivers = add_test_peer_receivers(&mut actor, validator, 32003);
         let before = actor.peer_table.get(&addr).unwrap().score;
 
         actor
@@ -3692,9 +3964,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:32003".parse().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(16);
         let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
-        actor.peer_table.add(addr).unwrap();
-        actor.peer_table.set_validator_id(&addr, validator);
-        actor.peer_table.mark_connected(&addr);
+        let _receivers = add_test_peer_receivers(&mut actor, validator, 32003);
         let before = actor.peer_table.get(&addr).unwrap().score;
 
         actor

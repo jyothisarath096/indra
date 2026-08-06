@@ -28,7 +28,6 @@ use indra_core::types::{
         VRF_REVEAL_WINDOW_MS,
     },
     qc::QuorumCertificateV1,
-    transaction::TransactionV1,
     vote::{VoteStep, VoteV1},
     vrf_election::{
         chain_id_hash, compute_reveal_set_commitment, compute_vrf_commit_hash,
@@ -182,13 +181,6 @@ pub enum DriverEvent {
         /// The vote payload.
         vote: VoteV1,
     },
-    /// A new transaction arrived from a peer.
-    InboundTx {
-        /// The sender.
-        from: SocketAddr,
-        /// The encoded transaction bytes.
-        tx_bytes: Vec<u8>,
-    },
     /// A peer announced its chain status.
     PeerStatus {
         /// The peer.
@@ -261,8 +253,6 @@ pub enum DriverAction {
     BroadcastBlock(BlockV1),
     /// Broadcast this vote to peers.
     BroadcastVote(VoteV1),
-    /// Broadcast this transaction to peers.
-    BroadcastTx(TransactionV1),
     /// Request a block range from a peer.
     RequestBlocks {
         /// The peer to ask.
@@ -334,6 +324,13 @@ pub enum DriverAction {
         validator_id: Bytes32,
         /// Human-readable reason for logs/scoring.
         reason: String,
+    },
+    /// An inbound message passed authoritative consensus validation.
+    ScorePeer {
+        /// Authenticated transport endpoint that supplied the message.
+        from: SocketAddr,
+        /// Reputation event to apply after authoritative acceptance.
+        event: indra_network::peer::ScoreEvent,
     },
     /// No action needed.
     None,
@@ -889,7 +886,6 @@ impl ConsensusDriver {
         match event {
             DriverEvent::InboundBlock { from, block } => self.process_block(from, block),
             DriverEvent::InboundVote { from, vote } => self.process_vote(from, vote),
-            DriverEvent::InboundTx { from, tx_bytes } => self.process_tx(from, tx_bytes),
             DriverEvent::PeerStatus {
                 from,
                 height,
@@ -2164,7 +2160,7 @@ impl ConsensusDriver {
 
     fn process_block_internal(
         &mut self,
-        _from: Option<SocketAddr>,
+        from: Option<SocketAddr>,
         block: BlockV1,
     ) -> Vec<DriverAction> {
         let height = block.header.height;
@@ -2244,6 +2240,12 @@ impl ConsensusDriver {
         }
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
+        if let Some(from) = from {
+            actions.push(DriverAction::ScorePeer {
+                from,
+                event: indra_network::peer::ScoreEvent::ValidBlock,
+            });
+        }
 
         if let Some(buffered_votes) = self.buffered_votes.remove(&(
             block.header.height,
@@ -2511,7 +2513,10 @@ impl ConsensusDriver {
         self.prune_vote_collectors();
 
         match decision {
-            Ok(_decision) => {}
+            Ok(_decision) => actions.push(DriverAction::ScorePeer {
+                from,
+                event: indra_network::peer::ScoreEvent::ValidVote,
+            }),
             Err(err) => {
                 eprintln!(
                     "[vote] rejected vote from {} for {} at height={} round={}: {}",
@@ -2566,6 +2571,10 @@ impl ConsensusDriver {
 
         match decision {
             Ok(decision) => {
+                actions.push(DriverAction::ScorePeer {
+                    from,
+                    event: indra_network::peer::ScoreEvent::ValidVote,
+                });
                 actions.push(DriverAction::BroadcastVote(vote.clone()));
 
                 match decision {
@@ -2883,23 +2892,6 @@ impl ConsensusDriver {
                 );
                 vec![DriverAction::None]
             }
-        }
-    }
-
-    fn process_tx(&mut self, _from: SocketAddr, tx_bytes: Vec<u8>) -> Vec<DriverAction> {
-        let mut reader = ByteReader::new(&tx_bytes);
-        let tx = match TransactionV1::decode(&mut reader) {
-            Ok(tx) => tx,
-            Err(_) => return vec![DriverAction::None],
-        };
-
-        match self
-            .engine
-            .mempool
-            .submit_validated(tx.clone(), &self.engine.state)
-        {
-            Ok(_) => vec![DriverAction::BroadcastTx(tx)],
-            Err(_) => vec![DriverAction::None],
         }
     }
 
@@ -5445,10 +5437,10 @@ mod tests {
                         }
                     }
                     DriverAction::None
-                    | DriverAction::BroadcastTx(_)
                     | DriverAction::RequestBlocks { .. }
                     | DriverAction::RequestProposal { .. }
                     | DriverAction::SlashDetected(_)
+                    | DriverAction::ScorePeer { .. }
                     | DriverAction::DisconnectInvalidConsensusPeer { .. } => {}
                 }
             }

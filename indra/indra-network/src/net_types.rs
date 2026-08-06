@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use indra_core::types::{primitives::Bytes32, slashing::SlashEvidenceV1};
 
-use crate::message::Message;
+use crate::{message::Message, peer::ScoreEvent};
 
 /// Read-only validator public keys used by the peer manager for relay
 /// eligibility checks.
@@ -51,6 +51,8 @@ pub enum NetworkEvent {
         validator_id: Bytes32,
         /// Last known remote socket address.
         addr: SocketAddr,
+        /// True when this node initiated the disconnected connection.
+        is_outbound: bool,
     },
     /// Slash evidence detected by the transport before rate limiting.
     SlashDetected(SlashEvidenceV1),
@@ -91,6 +93,13 @@ pub enum NetworkCommand {
         validator_id: Bytes32,
         /// Human-readable reason for logs.
         reason: String,
+    },
+    /// Apply a validation outcome to an authenticated peer's reputation.
+    ScorePeer {
+        /// Remote validator identity whose message was authoritatively judged.
+        validator_id: Bytes32,
+        /// Positive or negative authoritative outcome.
+        event: ScoreEvent,
     },
     /// Replace the read-only validator key snapshot used for relay checks.
     UpdateRelayValidatorKeys {

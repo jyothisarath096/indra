@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use indra_core::types::primitives::Bytes32;
 use indra_network::{
-    gossip::GossipEngine,
     message::{Message, PeerListEntry},
     peer::{PeerStatus, PeerTable, ScoreEvent, INITIAL_SCORE},
     transport::{RecvStatus, Transport},
@@ -153,30 +152,4 @@ fn two_nodes_exchange_status() {
         Message::Status { height, .. } => assert_eq!(height, 100),
         _ => panic!("wrong response type"),
     }
-}
-
-#[test]
-fn gossip_engine_seen_dedup() {
-    let mut engine = GossipEngine::new();
-    let hash = indra_crypto::sha256(b"test message");
-    assert!(!engine.is_seen(&hash));
-    engine.mark_seen(hash);
-    assert!(engine.is_seen(&hash));
-    // Marking again should be idempotent
-    engine.mark_seen(hash);
-    assert!(engine.is_seen(&hash));
-}
-
-#[test]
-fn equivocating_peer_gets_banned() {
-    let mut engine = GossipEngine::new();
-    let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
-    engine.peers_mut().add(addr).unwrap();
-
-    // EquivocatingBlock = -50 per event, start at 100
-    // After 2 events: score = 0 → banned
-    engine.score_event(&addr, ScoreEvent::EquivocatingBlock);
-    engine.score_event(&addr, ScoreEvent::EquivocatingBlock);
-
-    assert!(engine.peers().get(&addr).unwrap().is_banned());
 }

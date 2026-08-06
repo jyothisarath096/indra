@@ -18,13 +18,9 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
             block,
         }),
         Message::Vote(vote) => Some(DriverEvent::InboundVote { from, vote }),
-        Message::Tx(tx) => {
-            let tx_bytes = {
-                use indra_core::codec::Encode;
-                tx.encode_to_vec()
-            };
-            Some(DriverEvent::InboundTx { from, tx_bytes })
-        }
+        // Transactions use the node's single authoritative path, which wraps
+        // mempool validation with deduplication and identity scoring.
+        Message::Tx(_) => None,
         Message::Status {
             height,
             tip_hash,
@@ -72,7 +68,6 @@ pub fn action_to_message(action: &DriverAction) -> Option<Message> {
     match action {
         DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
         DriverAction::BroadcastVote(vote) => Some(Message::Vote(vote.clone())),
-        DriverAction::BroadcastTx(tx) => Some(Message::Tx(tx.clone())),
         DriverAction::BroadcastVrfCommit(commit) => Some(Message::VrfCommit(commit.clone())),
         DriverAction::BroadcastVrfReveal(reveal) => Some(Message::VrfReveal(reveal.clone())),
         DriverAction::RequestQC { .. } => None,
