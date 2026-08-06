@@ -152,6 +152,35 @@ impl Mempool {
             return Err(ConsensusError::FeeTooLow);
         }
 
+        // Admission conflict check. A higher-fee transaction atomically replaces
+        // every lower-fee entry that claims one of the same UTXOs or nullifiers.
+        // Equal/lower-fee conflicts are rejected so pool contents are independent
+        // of hash-map iteration order.
+        let input_utxos: HashSet<_> = tx.inputs.iter().map(|input| input.utxo_id).collect();
+        let nullifiers: HashSet<_> = tx.inputs.iter().map(|input| input.nullifier).collect();
+        let mut conflicts: Vec<(Bytes32, u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.tx.inputs.iter().any(|input| {
+                    input_utxos.contains(&input.utxo_id) || nullifiers.contains(&input.nullifier)
+                })
+            })
+            .map(|(id, entry)| (*id, entry.fee_rate))
+            .collect();
+        conflicts.sort_by_key(|(id, _)| *id);
+        if conflicts
+            .iter()
+            .any(|(_, existing_rate)| fee_rate <= *existing_rate)
+        {
+            return Err(ConsensusError::InvalidTransaction {
+                reason: "transaction conflicts with equal-or-higher-fee mempool entry",
+            });
+        }
+        for (conflict_id, _) in conflicts {
+            self.entries.remove(&conflict_id);
+        }
+
         // Capacity check — evict lowest-fee tx if full
         if self.entries.len() >= self.config.capacity {
             // Find the tx with the lowest fee rate. Break equal-fee ties by
@@ -319,6 +348,24 @@ impl Mempool {
     /// Iterate over all entries.
     pub fn iter(&self) -> impl Iterator<Item = &MempoolEntry> {
         self.entries.values()
+    }
+
+    /// Inject an entry for cross-crate adversarial tests that reproduce pools
+    /// created by older software before conflict-aware admission existed.
+    #[cfg(feature = "test-utils")]
+    pub fn insert_unchecked_for_test(&mut self, tx: TransactionV1, submitted_height: u64) {
+        let tx_id = tx.tx_hash();
+        let weight_kb = (tx.encode_to_vec().len() as u64).div_ceil(1024);
+        let fee_rate = tx.fee_amount / weight_kb.max(1);
+        self.entries.insert(
+            tx_id,
+            MempoolEntry {
+                tx,
+                tx_id,
+                fee_rate,
+                arrived_height: submitted_height,
+            },
+        );
     }
 }
 
@@ -496,6 +543,37 @@ mod tests {
             mp.submit(tx, 100, 1),
             Err(ConsensusError::DuplicateTransaction)
         );
+    }
+
+    #[test]
+    fn higher_fee_conflict_replaces_lower_fee_entry() {
+        let mut mempool = Mempool::default_config();
+        let lower = dummy_tx(10_000, 0x31);
+        let mut higher = lower.clone();
+        higher.fee_amount = 20_000;
+        let lower_id = mempool.submit(lower, 100, 1).unwrap();
+        let higher_id = mempool.submit(higher, 100, 1).unwrap();
+
+        assert!(!mempool.contains(&lower_id));
+        assert!(mempool.contains(&higher_id));
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn equal_or_lower_fee_conflict_is_rejected() {
+        let mut mempool = Mempool::default_config();
+        let incumbent = dummy_tx(20_000, 0x32);
+        let mut lower = incumbent.clone();
+        lower.fee_amount = 10_000;
+        let incumbent_id = mempool.submit(incumbent, 100, 1).unwrap();
+
+        assert!(matches!(
+            mempool.submit(lower, 100, 1),
+            Err(ConsensusError::InvalidTransaction { reason })
+                if reason.contains("equal-or-higher-fee")
+        ));
+        assert!(mempool.contains(&incumbent_id));
+        assert_eq!(mempool.len(), 1);
     }
 
     #[test]

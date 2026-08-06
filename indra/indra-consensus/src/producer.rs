@@ -15,24 +15,26 @@
 //! - Broadcast the block (Phase 5 networking)
 //! - Sign the block header (proposers don't sign headers — the QC does)
 
-use indra_core::types::{
-    block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-    governance::GovernanceOpV2,
-    primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, MAX_QC_SIZE_BYTES,
-        MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+use indra_core::{
+    codec::Encode,
+    types::{
+        block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+        governance::GovernanceOpV2,
+        primitives::{
+            Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, MAX_BLOCK_SIZE_BYTES,
+            MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
+        },
+        slashing::SlashEvidenceV2,
+        staking::StakingOp,
+        transaction::TransactionV1,
+        vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
     },
-    slashing::SlashEvidenceV2,
-    staking::StakingOp,
-    transaction::TransactionV1,
-    vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
 };
 use indra_crypto::VrfKeypair;
 use indra_state::{project_block_for_roots, ChainState};
 
 use crate::{
     error::{ConsensusError, ConsensusResult},
-    mempool::Mempool,
     proposer::{compute_proposer_vrf, ProposerElection},
 };
 
@@ -49,6 +51,8 @@ pub struct BlockTemplate {
     pub timestamp: u64,
     /// Round whose prevote quorum justified re-proposal of this value.
     pub polc_round: Option<u32>,
+    /// Transactions already selected against the shared scratch state.
+    pub transactions: Vec<TransactionV1>,
     /// Staking operations selected for inclusion.
     pub staking_ops: Vec<StakingOp>,
     /// Governance operations selected for inclusion.
@@ -69,11 +73,11 @@ pub struct BlockTemplate {
     pub vrf_reveals: Vec<VrfRevealEvidence>,
 }
 
-/// Produce a block from the current state and mempool.
+/// Produce a block from contents already selected against a shared scratch state.
 ///
 /// This is the complete block production pipeline:
 ///   1. Verify the proposer won the slot election
-///   2. Select transactions from the mempool
+///   2. Assemble the pre-selected contents
 ///   3. Assemble and return the block
 ///
 /// The returned block is ready for broadcast and voting.
@@ -81,7 +85,6 @@ pub struct BlockTemplate {
 pub fn produce_block(
     template: &BlockTemplate,
     state: &mut ChainState,
-    mempool: &Mempool,
     election: &ProposerElection,
 ) -> ConsensusResult<BlockV1> {
     // Verify this keypair is the elected proposer
@@ -133,31 +136,7 @@ pub fn produce_block(
         }
     };
 
-    // Transaction selection policy:
-    // - Transactions are selected from the mempool by age eligibility first,
-    //   then fee rate, up to MAX_TX_PER_BLOCK.
-    // - The proposer has discretion over whether to include any particular
-    //   non-consensus-mandatory transaction; empty blocks remain valid.
-    // - Proposers can censor or delay individual transactions by omitting
-    //   them, but cannot earn extra base block reward by doing so because
-    //   block rewards are epoch-based, not per-transaction.
-    // - Front-running within a block is possible within the deterministic
-    //   selected set/order constraints.
-    // - Future mainnet consideration: inclusion rules, ordering commitments,
-    //   or PBS may be needed if MEV risk grows.
-    let selected: Vec<TransactionV1> = mempool
-        .select_for_block(MAX_TX_PER_BLOCK, state.height)
-        .into_iter()
-        .map(|e| e.tx.clone())
-        .collect();
-    let mut selected = selected;
-    selected.sort_by_key(|tx| tx.tx_hash().0);
-    if selected.is_empty() && mempool.has_fee_eligible_transactions(state.base_fee) {
-        eprintln!(
-            "[proposer] WARNING: producing empty block at height={} but mempool has fee-eligible transactions — possible censorship",
-            state.height.saturating_add(1),
-        );
-    }
+    let selected = template.transactions.clone();
 
     // Build VRF proof bytes for header
     let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
@@ -199,6 +178,22 @@ pub fn produce_block(
         staking_ops: template.staking_ops.clone(),
         vrf_reveals: template.vrf_reveals.clone(),
     };
+
+    // Keep the largest deterministic prefix of the coordinator's selection.
+    // Removing in reverse mutation order cannot invalidate an earlier item,
+    // and omitted pool entries remain pending for a later block.
+    while block.encode_to_vec().len() > MAX_BLOCK_SIZE_BYTES {
+        if block.slashing_evidence.pop().is_none()
+            && block.governance_ops.pop().is_none()
+            && block.staking_ops.pop().is_none()
+            && block.transactions.pop().is_none()
+        {
+            return Err(ConsensusError::CryptoError {
+                detail: "fixed block fields exceed maximum encoded block size".to_string(),
+            });
+        }
+    }
+    block.header.mempool_set_root = compute_selected_tx_root(&block.transactions);
 
     let projected =
         project_block_for_roots(state, &block, 0).map_err(|err| ConsensusError::CryptoError {
@@ -377,6 +372,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -385,7 +388,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &election).unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.header.prev_hash, state.tip_hash);
         assert_eq!(block.transactions.len(), 0);
@@ -404,6 +407,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -412,7 +423,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &election).unwrap();
         let original_hash = block.header.block_hash();
         let mut tampered = block.header.clone();
         tampered.election_result_hash = Some(Bytes32::from([0x44; 32]));
@@ -436,6 +447,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -445,7 +464,7 @@ mod tests {
         };
 
         assert!(matches!(
-            produce_block(&template, &mut state, &mempool, &election),
+            produce_block(&template, &mut state, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "local VRF key is not in election candidates"
         ));
@@ -483,6 +502,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -491,7 +518,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &election).unwrap();
 
         assert_eq!(
             block.header.election_result_hash,
@@ -557,6 +584,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -566,7 +601,7 @@ mod tests {
         };
 
         assert!(matches!(
-            produce_block(&template, &mut state, &mempool, &election),
+            produce_block(&template, &mut state, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "authoritative election result does not match proposer slot"
         ));
@@ -596,6 +631,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -611,7 +654,7 @@ mod tests {
             vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0xCD; 80]).unwrap(),
         }];
         assert!(matches!(
-            produce_block(&mismatched_evidence, &mut state, &mempool, &election),
+            produce_block(&mismatched_evidence, &mut state, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "authoritative reveal-set commitment does not match proposal evidence"
         ));
@@ -620,7 +663,7 @@ mod tests {
         mismatched_hash.vrf_reveals = vec![];
         mismatched_hash.election_result_hash = Some(Bytes32::from([0xEF; 32]));
         assert!(matches!(
-            produce_block(&mismatched_hash, &mut state, &mempool, &election),
+            produce_block(&mismatched_hash, &mut state, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "provided election_result_hash disagrees with authoritative result"
         ));
@@ -629,7 +672,7 @@ mod tests {
         missing_result.election_result_hash = None;
         missing_result.election_result = None;
         assert!(matches!(
-            produce_block(&missing_result, &mut state, &mempool, &election),
+            produce_block(&missing_result, &mut state, &election),
             Err(ConsensusError::WrongProposer { reason })
                 if reason == "missing authoritative election result"
         ));
@@ -647,6 +690,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -654,7 +705,7 @@ mod tests {
             election_result: Some(election_result_for(&election, seed)),
             vrf_reveals: vec![],
         };
-        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &election).unwrap();
         assert_eq!(block.header.height, state.height + 1);
     }
 
@@ -671,6 +722,14 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: mempool
+                .select_for_block(
+                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                    state.height,
+                )
+                .into_iter()
+                .map(|entry| entry.tx.clone())
+                .collect(),
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -679,7 +738,7 @@ mod tests {
             vrf_reveals: vec![],
         };
 
-        let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+        let block = produce_block(&template, &mut state, &election).unwrap();
         assert_produced_block_matches_clone_projection(&block, &original);
         assert_eq!(
             block,
@@ -708,6 +767,14 @@ mod tests {
                 prev_qc_bytes: vec![],
                 timestamp: 1_700_000_001 + index as u64,
                 polc_round: None,
+                transactions: mempool
+                    .select_for_block(
+                        indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                        new_state.height,
+                    )
+                    .into_iter()
+                    .map(|entry| entry.tx.clone())
+                    .collect(),
                 slash_evidence: vec![],
                 governance_ops: vec![],
                 staking_ops: vec![],
@@ -716,7 +783,7 @@ mod tests {
                 vrf_reveals: vec![],
             };
 
-            let produced = produce_block(&template, &mut new_state, &mempool, &election).unwrap();
+            let produced = produce_block(&template, &mut new_state, &election).unwrap();
             let reference = clone_reference_block_from_produced(&produced, &reference_state);
             assert_eq!(
                 produced, reference,

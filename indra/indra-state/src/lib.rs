@@ -55,7 +55,11 @@ pub(crate) mod txn;
 pub mod utxo;
 pub mod validator;
 
-pub use apply::{apply_block, project_block_for_roots, ProjectedBlockRoots};
+pub use apply::{
+    apply_block, project_block_for_roots, try_apply_governance_candidate,
+    try_apply_slash_candidate, try_apply_staking_candidate, try_apply_transaction_candidate,
+    ProjectedBlockRoots,
+};
 pub use chain::ChainState;
 pub use delegation::apply_staking_op;
 pub use epoch::{apply_epoch_transition, EpochTransitionContext};

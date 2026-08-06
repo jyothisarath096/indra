@@ -39,6 +39,7 @@ use indra_core::{
     types::{
         block::BlockV1,
         crypto::{CommitmentV1, HybridPubKey},
+        governance::GovernanceOpV2,
         primitives::{
             bps_of, Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
@@ -48,6 +49,7 @@ use indra_core::{
         qc::QuorumCertificateV1,
         slash_membership::SlashMembershipRootRecord,
         slashing::{SlashEvidenceV1, SlashEvidenceV2},
+        staking::StakingOp,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
         vrf_election::VrfElectionResult,
@@ -703,6 +705,90 @@ pub fn apply_block(
     let epoch_record = apply_block_inner(&mut txn, block, timestamp_secs)?;
     txn.commit();
     Ok(epoch_record)
+}
+
+/// Atomically validate and apply one transaction to an evolving candidate state.
+///
+/// On failure the scoped state transaction restores `state` exactly. This is
+/// intentionally narrower than exposing [`StateTxn`] outside the state crate.
+pub fn try_apply_transaction_candidate(
+    state: &mut ChainState,
+    tx: &TransactionV1,
+    height: u64,
+    tx_index: u32,
+) -> StateResult<()> {
+    let mut block_nullifiers = HashSet::new();
+    let mut block_input_utxos = HashSet::new();
+    validate_transaction(
+        state,
+        tx,
+        &state.chain_id,
+        &mut block_nullifiers,
+        &mut block_input_utxos,
+        height,
+    )?;
+    let mut txn = StateTxn::begin(state, height);
+    apply_transaction(&mut txn, tx, height, tx_index)?;
+    txn.commit();
+    Ok(())
+}
+
+/// Atomically apply one staking operation to an evolving candidate state.
+pub fn try_apply_staking_candidate(
+    state: &mut ChainState,
+    op: &StakingOp,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_staking_scope();
+    txn.snapshot_delegator_identity_scope();
+    apply_staking_op(txn.state_mut(), op, &chain_id, height)?;
+    txn.after_mutation()?;
+    txn.commit();
+    Ok(())
+}
+
+/// Atomically apply one governance operation to an evolving candidate state.
+pub fn try_apply_governance_candidate(
+    state: &mut ChainState,
+    op: &GovernanceOpV2,
+    current_epoch: u64,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_governance_scope();
+    txn.snapshot_delegator_identity_scope();
+    apply_governance_op(txn.state_mut(), op, current_epoch, height, &chain_id)?;
+    txn.after_mutation()?;
+    txn.commit();
+    Ok(())
+}
+
+/// Atomically validate and apply one proof-carrying slash-evidence candidate.
+///
+/// `reporter_pubkey` is the elected proposer's reward destination when this is
+/// used during block construction. Admission validation passes `None`.
+pub fn try_apply_slash_candidate(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_slashing_scope();
+    let accounting = apply_slash_v2_at_height_with_accounting(
+        txn.state_mut(),
+        evidence,
+        &chain_id,
+        height,
+        reporter_pubkey,
+    )?;
+    txn.add_slash_accounting(accounting.slash_amount)?;
+    txn.commit();
+    Ok(())
 }
 
 /// Temporarily apply a block, compute its post-state roots, then roll back.
@@ -2615,6 +2701,124 @@ mod tests {
             mutation_count >= 6,
             "transaction block should exercise several undo-recorded mutations, got {mutation_count}"
         );
+    }
+
+    #[test]
+    fn transaction_candidate_adapter_rolls_back_partial_application() {
+        let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            value,
+            blinding,
+            Bytes32::from([0xC1; 32]),
+        );
+        let before = state.clone();
+        let mut scratch = state;
+        crate::txn::set_fail_after_mutation(Some(1));
+        assert!(try_apply_transaction_candidate(&mut scratch, &tx, 1, 0).is_err());
+        crate::txn::set_fail_after_mutation(None);
+        assert_eq!(scratch.encode_to_vec(), before.encode_to_vec());
+        assert_eq!(scratch, before);
+    }
+
+    #[test]
+    fn staking_candidate_adapter_rolls_back_partial_application() {
+        let mut state = canonical_test_genesis();
+        let validator_id = state
+            .validators
+            .active_validators()
+            .next()
+            .unwrap()
+            .validator_id;
+        let (delegator_pubkey, delegator_keypair) = make_test_keypair([0xC2; 32]);
+        let deposit = state
+            .utxos
+            .insert(
+                output_with_value(100_000, delegator_pubkey.clone(), 0x22),
+                0,
+                1,
+                0,
+            )
+            .unwrap();
+        let op = signed_delegate_op(
+            &state,
+            validator_id,
+            deposit,
+            delegator_pubkey,
+            &delegator_keypair,
+            1,
+        );
+        let before = state.clone();
+        let mut scratch = state;
+        crate::txn::set_fail_after_mutation(Some(1));
+        assert!(try_apply_staking_candidate(&mut scratch, &op, 1).is_err());
+        crate::txn::set_fail_after_mutation(None);
+        assert_eq!(scratch.encode_to_vec(), before.encode_to_vec());
+        assert_eq!(scratch, before);
+    }
+
+    #[test]
+    fn governance_candidate_adapter_rolls_back_partial_application() {
+        let mut state = canonical_test_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (pubkey, keypair, signer_id) =
+            install_governance_validator(&mut state, [0xC3; 32], 100_000);
+        let deposit = state
+            .utxos
+            .insert(governance_deposit_output(pubkey.clone(), 1_500), 0, 2, 0)
+            .unwrap();
+        let op = governance_propose_op(
+            signer_id,
+            &keypair,
+            pubkey,
+            deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark { value: 100_000 },
+        );
+        let before = state.clone();
+        let mut scratch = state;
+        crate::txn::set_fail_after_mutation(Some(1));
+        assert!(try_apply_governance_candidate(&mut scratch, &op, 0, 1).is_err());
+        crate::txn::set_fail_after_mutation(None);
+        assert_eq!(scratch.encode_to_vec(), before.encode_to_vec());
+        assert_eq!(scratch, before);
+    }
+
+    #[test]
+    fn slash_candidate_adapter_rolls_back_partial_application() {
+        let (state, validator_id, keypair) = slash_validator_state([0xC4; 32], 1_000_000);
+        let snapshot = state.build_genesis_consensus_snapshot().unwrap();
+        let (position, _) = snapshot.entry_with_position(&validator_id).unwrap();
+        let proof = build_slash_membership_proof(&snapshot, position).unwrap();
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xC5; 32]),
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xC6; 32]),
+            ),
+            membership_proof: proof,
+        };
+        let before = state.clone();
+        let mut scratch = state;
+        crate::txn::set_fail_after_mutation(Some(1));
+        assert!(try_apply_slash_candidate(&mut scratch, &evidence, 1, None).is_err());
+        crate::txn::set_fail_after_mutation(None);
+        assert_eq!(scratch.encode_to_vec(), before.encode_to_vec());
+        assert_eq!(scratch, before);
     }
 
     #[test]

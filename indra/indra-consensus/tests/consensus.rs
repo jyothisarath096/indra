@@ -274,6 +274,14 @@ fn mempool_to_block_pipeline() {
         prev_qc_bytes: vec![],
         timestamp: 1_700_000_001,
         polc_round: None,
+        transactions: mempool
+            .select_for_block(
+                indra_core::types::primitives::MAX_TX_PER_BLOCK,
+                state.height,
+            )
+            .into_iter()
+            .map(|entry| entry.tx.clone())
+            .collect(),
         slash_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
@@ -282,7 +290,7 @@ fn mempool_to_block_pipeline() {
         vrf_reveals,
     };
 
-    let block = produce_block(&template, &mut state, &mempool, &election).unwrap();
+    let block = produce_block(&template, &mut state, &election).unwrap();
     assert_eq!(block.transactions.len(), 5);
     assert_eq!(block.header.height, 1);
 }

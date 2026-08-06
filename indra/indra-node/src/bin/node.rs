@@ -1999,7 +1999,9 @@ fn main() {
                             .slash_events_total
                             .fetch_add(1, Ordering::Relaxed);
                         let mut d = driver.lock().unwrap();
-                        d.engine.add_slash_evidence(evidence);
+                        if let Err(error) = d.engine.add_slash_evidence(evidence) {
+                            eprintln!("[slash] rejected network evidence: {error}");
+                        }
                     }
                     NetworkEvent::Message {
                         from: addr,
@@ -2955,11 +2957,13 @@ fn process_driver_actions(
                 vote_2: slash_evidence.vote_b.clone(),
             };
             let mut d = driver.lock().unwrap();
-            d.engine.add_slash_evidence(wire_evidence);
-            eprintln!(
-                "[slash] equivocation detected from validator {} — evidence queued",
-                hex::encode(&slash_evidence.validator_id.0[..4])
-            );
+            match d.engine.add_slash_evidence(wire_evidence) {
+                Ok(()) => eprintln!(
+                    "[slash] equivocation detected from validator {} — evidence queued",
+                    hex::encode(&slash_evidence.validator_id.0[..4])
+                ),
+                Err(error) => eprintln!("[slash] rejected locally detected evidence: {error}"),
+            }
             continue;
         }
 

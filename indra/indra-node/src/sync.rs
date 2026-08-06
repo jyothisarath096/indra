@@ -946,6 +946,7 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000u64.saturating_add(state.height.saturating_add(1)),
             polc_round: None,
+            transactions: vec![],
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -954,13 +955,7 @@ mod tests {
             vrf_reveals,
         };
         let mut projection_state = state.clone();
-        produce_block(
-            &template,
-            &mut projection_state,
-            &Mempool::default_config(),
-            &election,
-        )
-        .unwrap()
+        produce_block(&template, &mut projection_state, &election).unwrap()
     }
 
     fn make_reveal_set_block(

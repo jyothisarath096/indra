@@ -30,7 +30,7 @@ toml.workspace = true
 indra-core      = { path = "../indra-core" }
 indra-crypto    = { path = "../indra-crypto" }
 indra-state     = { path = "../indra-state" }
-indra-consensus = { path = "../indra-consensus" }
+indra-consensus = { path = "../indra-consensus", features = ["test-utils"] }
 indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
 

@@ -6,6 +6,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+test-utils = []
+
 [dependencies]
 indra-core   = { path = "../indra-core" }
 indra-crypto = { path = "../indra-crypto" }

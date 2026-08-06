@@ -24,6 +24,7 @@ use indra_consensus::{
 use indra_core::codec::{ByteReader, Decode};
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    crypto::HybridPubKey,
     governance::GovernanceOpV2,
     primitives::{
         Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
@@ -42,10 +43,10 @@ use indra_crypto::{
 };
 use indra_state::{
     apply::{compute_pending_slash_evidence_hash, compute_slash_evidence_v2_hash},
-    apply_staking_op,
     epoch::epoch_for_height,
-    governance_apply::{apply_governance_op, validate_governance_op},
-    ChainState,
+    governance_apply::validate_governance_op,
+    try_apply_governance_candidate, try_apply_slash_candidate, try_apply_staking_candidate,
+    try_apply_transaction_candidate, ChainState,
 };
 use indra_storage::{
     load_chain_manifest, load_last_qc, save_chain_manifest, BlockStore, ChainManifest, EpochStore,
@@ -86,6 +87,19 @@ pub struct NodeEngine {
     vrf_keypair: Option<VrfKeypair>,
     /// This validator's identity (SHA-256 of hybrid public key classical component).
     validator_id: Option<Bytes32>,
+}
+
+/// Slash evidence is large and only one pending record per validator is useful.
+/// 1,024 entries provide more than five full active sets of reconfiguration
+/// headroom while imposing a finite memory/verification bound.
+pub const MAX_PENDING_SLASH_EVIDENCE: usize = 1_024;
+
+#[derive(Debug)]
+struct SelectedBlockContents {
+    transactions: Vec<indra_core::types::transaction::TransactionV1>,
+    staking_ops: Vec<StakingOp>,
+    governance_ops: Vec<GovernanceOpV2>,
+    slash_evidence: Vec<SlashEvidenceV2>,
 }
 
 /// Validator authority used by authenticated transport, relay checks, and
@@ -265,9 +279,18 @@ impl NodeEngine {
         let signer_id = op.signer_id();
         let cold_authorization = op.cold_authorization();
         let mut scratch = self.state.clone();
-        let chain_id = self.state.chain_id.clone();
         let validation_height = self.state.height.saturating_add(1);
-        apply_staking_op(&mut scratch, &op, &chain_id, validation_height)
+        let mut valid_pending = Vec::with_capacity(self.staking_mempool.len());
+        for pending in std::mem::take(&mut self.staking_mempool) {
+            match try_apply_staking_candidate(&mut scratch, &pending, validation_height) {
+                Ok(()) => valid_pending.push(pending),
+                Err(error) => {
+                    eprintln!("[staking] pruning invalid pending op during admission: {error}")
+                }
+            }
+        }
+        self.staking_mempool = valid_pending;
+        try_apply_staking_candidate(&mut scratch, &op, validation_height)
             .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
         if self.staking_mempool.iter().any(|existing| {
             existing.signer_id() == signer_id
@@ -342,100 +365,256 @@ impl NodeEngine {
         });
     }
 
-    /// Add slash evidence to the pending pool if it has not already been seen.
-    pub fn add_slash_evidence(&mut self, evidence: SlashEvidenceV1) {
+    /// Validate and add slash evidence to the bounded pending pool.
+    pub fn add_slash_evidence(&mut self, evidence: SlashEvidenceV1) -> NodeResult<()> {
         let hash = compute_pending_slash_evidence_hash(&evidence);
         let already_pending = self
             .pending_slashes
             .iter()
             .any(|existing| compute_pending_slash_evidence_hash(existing) == hash);
-        if !already_pending && !self.state.applied_slash_hashes.contains(&hash) {
-            self.pending_slashes.push(evidence);
+        if already_pending {
+            return Ok(());
         }
-    }
-
-    /// Select and prove membership-authorized slash evidence.
-    pub fn select_slash_evidence(&self) -> Vec<SlashEvidenceV2> {
-        self.pending_slashes
+        if self
+            .pending_slashes
             .iter()
-            .filter_map(|evidence| {
-                let snapshot = self
-                    .state
-                    .snapshot_for_consensus_height(evidence.vote_1.height)
-                    .ok()?;
-                let (position, _) = snapshot.entry_with_position(&evidence.validator_id)?;
-                let membership_proof = build_slash_membership_proof(snapshot, position).ok()?;
-                Some(SlashEvidenceV2 {
-                    validator_id: evidence.validator_id,
-                    vote_1: evidence.vote_1.clone(),
-                    vote_2: evidence.vote_2.clone(),
-                    membership_proof,
+            .any(|pending| pending.validator_id == evidence.validator_id)
+        {
+            return Err(NodeError::State(
+                indra_state::StateError::InvalidSlashEvidence {
+                    reason: "slash evidence for validator is already pending".into(),
+                },
+            ));
+        }
+        if self.pending_slashes.len() >= MAX_PENDING_SLASH_EVIDENCE {
+            return Err(NodeError::State(
+                indra_state::StateError::InvalidSlashEvidence {
+                    reason: format!(
+                        "slash evidence pool full: {MAX_PENDING_SLASH_EVIDENCE} entries"
+                    ),
+                },
+            ));
+        }
+        let snapshot = self
+            .state
+            .snapshot_for_consensus_height(evidence.vote_1.height)?;
+        let (position, _) = snapshot
+            .entry_with_position(&evidence.validator_id)
+            .ok_or_else(|| indra_state::StateError::InvalidSlashEvidence {
+                reason: "claimed validator is absent from the infraction snapshot".into(),
+            })?;
+        let membership_proof =
+            build_slash_membership_proof(snapshot, position).map_err(|error| {
+                NodeError::State(indra_state::StateError::InvalidSlashEvidence {
+                    reason: format!("failed to build membership proof: {error}"),
                 })
-            })
-            .take(MAX_SLASHES_PER_BLOCK)
-            .collect()
+            })?;
+        let proof_evidence = SlashEvidenceV2 {
+            validator_id: evidence.validator_id,
+            vote_1: evidence.vote_1.clone(),
+            vote_2: evidence.vote_2.clone(),
+            membership_proof,
+        };
+        let v2_hash = compute_slash_evidence_v2_hash(&proof_evidence);
+        if self.state.applied_slash_hashes.contains(&v2_hash) {
+            return Err(NodeError::State(
+                indra_state::StateError::SlashAlreadyApplied,
+            ));
+        }
+        let mut scratch = self.state.clone();
+        try_apply_slash_candidate(
+            &mut scratch,
+            &proof_evidence,
+            self.state.height.saturating_add(1),
+            None,
+        )?;
+        self.pending_slashes.push(evidence);
+        Ok(())
     }
 
     /// Remove slash evidence that has already been committed.
     pub fn evict_committed_slashes(&mut self, committed: &[SlashEvidenceV2]) {
-        for evidence in committed {
-            let hash = compute_slash_evidence_v2_hash(evidence);
-            if !self.state.applied_slash_hashes.contains(&hash) {
+        let slashed: std::collections::HashSet<_> = committed
+            .iter()
+            .map(|evidence| evidence.validator_id)
+            .collect();
+        self.pending_slashes
+            .retain(|pending| !slashed.contains(&pending.validator_id));
+    }
+
+    /// Select all candidate block contents against one evolving detached state.
+    /// Pool order is preserved for staking, governance, and slashing; transaction
+    /// ordering remains the mempool's age/fee/tx-id policy.
+    fn select_block_contents(&mut self) -> SelectedBlockContents {
+        let height = self.state.height.saturating_add(1);
+        let current_epoch = epoch_for_height(height);
+        let mut scratch = self.state.clone();
+        let reporter_pubkey = self.hybrid_keypair.as_ref().map(|keypair| {
+            let public = keypair.public_key();
+            HybridPubKey {
+                classical_pk: Bytes32::from(public.classical.0),
+                pq_pk: VariableBytes::from_slice(&public.pq.0)
+                    .expect("ML-DSA-87 public key fits protocol bound"),
+            }
+        });
+
+        let transaction_candidates: Vec<_> = self
+            .mempool
+            .select_for_block(usize::MAX, self.state.height)
+            .into_iter()
+            .map(|entry| (entry.tx_id, entry.tx.clone()))
+            .collect();
+        let mut transactions = Vec::new();
+        for (tx_id, tx) in transaction_candidates {
+            if transactions.len() >= indra_core::types::primitives::MAX_TX_PER_BLOCK {
+                break;
+            }
+            match try_apply_transaction_candidate(
+                &mut scratch,
+                &tx,
+                height,
+                transactions.len() as u32,
+            ) {
+                Ok(()) => transactions.push(tx),
+                Err(error) => {
+                    eprintln!("[mempool] evicting conflicting candidate {tx_id}: {error}");
+                    self.mempool.evict(&tx_id);
+                }
+            }
+        }
+
+        let mut staking_ops = Vec::new();
+        let mut retained_staking = Vec::new();
+        for op in std::mem::take(&mut self.staking_mempool) {
+            if staking_ops.len() >= MAX_STAKING_OPS_PER_BLOCK {
+                retained_staking.push(op);
                 continue;
             }
-            let legacy = SlashEvidenceV1 {
+            match try_apply_staking_candidate(&mut scratch, &op, height) {
+                Ok(()) => {
+                    staking_ops.push(op.clone());
+                    retained_staking.push(op);
+                }
+                Err(error) => eprintln!(
+                    "[staking] evicting conflicting candidate signer={}: {error}",
+                    hex::encode(&op.signer_id().0[..4]),
+                ),
+            }
+        }
+        self.staking_mempool = retained_staking;
+
+        let mut governance_ops = Vec::new();
+        let mut retained_governance = Vec::new();
+        for op in std::mem::take(&mut self.governance_mempool) {
+            if governance_ops.len() >= MAX_GOV_OPS_PER_BLOCK {
+                retained_governance.push(op);
+                continue;
+            }
+            match try_apply_governance_candidate(&mut scratch, &op, current_epoch, height) {
+                Ok(()) => {
+                    governance_ops.push(op.clone());
+                    retained_governance.push(op);
+                }
+                Err(error) => eprintln!(
+                    "[governance] evicting conflicting candidate signer={} nonce={}: {error}",
+                    hex::encode(&op.signer_id.0[..4]),
+                    op.nonce,
+                ),
+            }
+        }
+        self.governance_mempool = retained_governance;
+
+        let mut slash_evidence = Vec::new();
+        let mut retained_slashes = Vec::new();
+        for evidence in std::mem::take(&mut self.pending_slashes) {
+            if slash_evidence.len() >= MAX_SLASHES_PER_BLOCK {
+                retained_slashes.push(evidence);
+                continue;
+            }
+            let proof_evidence = self
+                .state
+                .snapshot_for_consensus_height(evidence.vote_1.height)
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .entry_with_position(&evidence.validator_id)
+                        .and_then(|(position, _)| {
+                            build_slash_membership_proof(snapshot, position).ok()
+                        })
+                })
+                .map(|membership_proof| SlashEvidenceV2 {
+                    validator_id: evidence.validator_id,
+                    vote_1: evidence.vote_1.clone(),
+                    vote_2: evidence.vote_2.clone(),
+                    membership_proof,
+                });
+            let Some(proof_evidence) = proof_evidence else {
+                eprintln!("[slash] evicting candidate with unavailable membership proof");
+                continue;
+            };
+            match try_apply_slash_candidate(
+                &mut scratch,
+                &proof_evidence,
+                height,
+                reporter_pubkey.as_ref(),
+            ) {
+                Ok(()) => {
+                    slash_evidence.push(proof_evidence);
+                    retained_slashes.push(evidence);
+                }
+                Err(error) => eprintln!(
+                    "[slash] evicting conflicting candidate validator={}: {error}",
+                    hex::encode(&evidence.validator_id.0[..4]),
+                ),
+            }
+        }
+        self.pending_slashes = retained_slashes;
+
+        SelectedBlockContents {
+            transactions,
+            staking_ops,
+            governance_ops,
+            slash_evidence,
+        }
+    }
+
+    /// Revalidate staking operations after canonical state advances.
+    fn prune_invalid_staking_ops(&mut self) {
+        let height = self.state.height.saturating_add(1);
+        let state = self.state.clone();
+        self.staking_mempool.retain(|op| {
+            let mut scratch = state.clone();
+            try_apply_staking_candidate(&mut scratch, op, height).is_ok()
+        });
+    }
+
+    /// Revalidate pending slash evidence after canonical state advances.
+    fn prune_invalid_slash_evidence(&mut self) {
+        let height = self.state.height.saturating_add(1);
+        let state = self.state.clone();
+        self.pending_slashes.retain(|evidence| {
+            let proof = state
+                .snapshot_for_consensus_height(evidence.vote_1.height)
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .entry_with_position(&evidence.validator_id)
+                        .and_then(|(position, _)| {
+                            build_slash_membership_proof(snapshot, position).ok()
+                        })
+                });
+            let Some(membership_proof) = proof else {
+                return false;
+            };
+            let evidence = SlashEvidenceV2 {
                 validator_id: evidence.validator_id,
                 vote_1: evidence.vote_1.clone(),
                 vote_2: evidence.vote_2.clone(),
+                membership_proof,
             };
-            let legacy_hash = compute_pending_slash_evidence_hash(&legacy);
-            self.pending_slashes
-                .retain(|pending| compute_pending_slash_evidence_hash(pending) != legacy_hash);
-        }
-    }
-
-    /// Select staking operations for block inclusion.
-    pub fn select_staking_ops(&self) -> Vec<StakingOp> {
-        self.staking_mempool
-            .iter()
-            .take(MAX_STAKING_OPS_PER_BLOCK)
-            .cloned()
-            .collect()
-    }
-
-    /// Select governance operations for block inclusion.
-    pub fn select_governance_ops(&mut self) -> Vec<GovernanceOpV2> {
-        if self.governance_mempool.is_empty() {
-            return Vec::new();
-        }
-        let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
-        let chain_id = self.state.chain_id.clone();
-        let mut scratch = self.state.clone();
-        let mut selected = Vec::new();
-        let mut retained = Vec::new();
-        for op in std::mem::take(&mut self.governance_mempool) {
-            if selected.len() >= MAX_GOV_OPS_PER_BLOCK {
-                retained.push(op);
-                continue;
-            }
-            let current_height = scratch.height;
-            match apply_governance_op(&mut scratch, &op, current_epoch, current_height, &chain_id) {
-                Ok(()) => {
-                    selected.push(op.clone());
-                    retained.push(op);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[governance] evicting invalid pending op signer={} nonce={}: {}",
-                        hex::encode(&op.signer_id.0[..4]),
-                        op.nonce,
-                        error
-                    );
-                }
-            }
-        }
-        self.governance_mempool = retained;
-        selected
+            let mut scratch = state.clone();
+            try_apply_slash_candidate(&mut scratch, &evidence, height, None).is_ok()
+        });
     }
 
     /// Remove staking operations included in a committed block.
@@ -555,7 +734,9 @@ impl NodeEngine {
             })?
             .clone();
 
+        self.prune_invalid_staking_ops();
         self.prune_invalid_governance_ops();
+        self.prune_invalid_slash_evidence();
 
         let election_result = election_result.ok_or_else(|| {
             NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer {
@@ -563,15 +744,17 @@ impl NodeEngine {
             })
         })?;
         let election_result_hash = election_result.hash();
+        let contents = self.select_block_contents();
         let template = BlockTemplate {
             proposer_vrf_keypair: vrf_kp,
             epoch_seed: election.epoch_seed,
             prev_qc_bytes,
             timestamp,
             polc_round,
-            slash_evidence: self.select_slash_evidence(),
-            governance_ops: self.select_governance_ops(),
-            staking_ops: self.select_staking_ops(),
+            transactions: contents.transactions,
+            slash_evidence: contents.slash_evidence,
+            governance_ops: contents.governance_ops,
+            staking_ops: contents.staking_ops,
             election_result_hash: Some(election_result_hash),
             election_result: Some(election_result),
             vrf_reveals,
@@ -581,8 +764,15 @@ impl NodeEngine {
             "[proposer] producing block at height={} round={}",
             proposal_height, election.round
         );
-        produce_block(&template, &mut self.state, &self.mempool, election)
-            .map_err(NodeError::Consensus)
+        let result =
+            produce_block(&template, &mut self.state, election).map_err(NodeError::Consensus);
+        if result.is_err() {
+            self.mempool.evict_invalid(&self.state);
+            self.prune_invalid_staking_ops();
+            self.prune_invalid_governance_ops();
+            self.prune_invalid_slash_evidence();
+        }
+        result
     }
 
     /// Re-propose an already validated value in a later round while keeping
@@ -918,6 +1108,9 @@ impl NodeEngine {
         self.evict_committed_staking_ops(&block.staking_ops);
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
+        self.prune_invalid_staking_ops();
+        self.prune_invalid_governance_ops();
+        self.prune_invalid_slash_evidence();
         Ok(())
     }
 
@@ -1138,15 +1331,19 @@ mod tests {
         GovernanceActionType, GovernanceOpV2, GovernancePayload,
     };
     use indra_core::types::primitives::{
-        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_RANGE_PROOF_BYTES,
+        TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     };
     use indra_core::types::slashing::SlashEvidenceV1;
-    use indra_core::types::staking::StakingOpBody;
-    use indra_core::types::transaction::OutputV1;
+    use indra_core::types::stake_position::{PositionCustodyV1, StakePositionV1};
+    use indra_core::types::staking::{StakeDepositProof, StakingOpBody};
+    use indra_core::types::transaction::{InputV1, OutputV1, TransactionV1};
     use indra_core::types::vote::{VoteStep, VoteV1};
     use indra_core::CommitmentV1;
     use indra_core::VariableBytes;
+    use indra_crypto::{constants::ML_KEM_1024_CT_BYTES, PaymentBlindingNoteV1};
     use indra_state::{ValidatorEntry, ValidatorStatus};
+    use rand::{rngs::StdRng, SeedableRng};
 
     fn temp_dir(suffix: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -1292,6 +1489,118 @@ mod tests {
         };
     }
 
+    fn valid_delegate_op(
+        engine: &mut NodeEngine,
+        validator_id: Bytes32,
+        delegator: &HybridKeypair,
+        seed: u8,
+    ) -> StakingOp {
+        let delegator_pubkey = governance_pubkey_from_keypair(delegator);
+        let value = engine
+            .state
+            .governance
+            .params
+            .proposal_deposit_spark
+            .max(engine.state.governance.params.min_delegation_spark)
+            .max(DUST_LIMIT_SPARK);
+        let blinding = [0; 32];
+        let commitment = indra_crypto::commit(value, &blinding);
+        let deposit_utxo_id = engine
+            .state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: value,
+                    commitment: CommitmentV1 {
+                        compressed_point: Bytes32::from(commitment.0),
+                    },
+                    owner_pubkey: delegator_pubkey.clone(),
+                    range_proof: VariableBytes::from_slice(&[]).unwrap(),
+                    lock_height: 0,
+                },
+                0,
+                seed as u32,
+                0,
+            )
+            .unwrap();
+        let mut op = StakingOp {
+            body: StakingOpBody::Delegate {
+                validator_id,
+                deposit_utxo_id,
+                delegator_pubkey,
+                deposit_proof: Some(StakeDepositProof {
+                    committed_value_spark: value,
+                    blinding_factor: Bytes32::from(blinding),
+                }),
+            },
+            nonce: 1,
+            signature: dummy_signature(),
+        };
+        sign_staking_op(&mut op, delegator, &engine.state.chain_id);
+        op
+    }
+
+    fn valid_tx_spending(
+        engine: &NodeEngine,
+        utxo_id: Bytes32,
+        owner: &HybridKeypair,
+        input_blinding: [u8; 32],
+        seed: u8,
+    ) -> TransactionV1 {
+        let input = engine.state.utxos.get(&utxo_id).unwrap().output.clone();
+        let owner_pubkey = governance_pubkey_from_keypair(owner);
+        let fee = engine.state.base_fee.saturating_mul(10);
+        let output_value = input.value_spark.checked_sub(fee).unwrap();
+        assert_eq!(input_blinding, [0; 32]);
+        let output_blinding = [0; 32];
+        let fee_blinding = [0; 32];
+        let output_commitment = indra_crypto::commit(output_value, &output_blinding);
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let range_proof =
+            indra_crypto::prove_range(output_value, &output_blinding, &mut rng).unwrap();
+        let fee_commitment = indra_crypto::commit(fee, &fee_blinding);
+        let mut tx = TransactionV1 {
+            version: indra_core::ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+            signature_module_id: 1,
+            inputs: vec![InputV1 {
+                utxo_id,
+                nullifier: Bytes32::from([seed ^ 0xA5; 32]),
+            }],
+            outputs: vec![OutputV1 {
+                value_spark: output_value,
+                commitment: CommitmentV1 {
+                    compressed_point: Bytes32::from(output_commitment.0),
+                },
+                owner_pubkey: owner_pubkey.clone(),
+                range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&range_proof)
+                    .unwrap(),
+                lock_height: 0,
+            }],
+            payment_notes: vec![PaymentBlindingNoteV1 {
+                version: 1,
+                owner_id: indra_crypto::sha256(&owner_pubkey.classical_pk.0),
+                payment_pubkey_hash: [0; 32],
+                sender_x25519_ephemeral_pk: [0; 32],
+                ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
+                note_nonce: [0; 32],
+            }],
+            fee_amount: fee,
+            fee_blinding: Bytes32::ZERO,
+            fee_commitment: CommitmentV1 {
+                compressed_point: Bytes32::from(fee_commitment.0),
+            },
+            signature: dummy_signature(),
+        };
+        let signature = owner
+            .sign(&tx.signing_bytes(&engine.state.chain_id))
+            .unwrap();
+        tx.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+        };
+        tx
+    }
+
     fn cold_keypair_for_seed(seed: [u8; 32]) -> HybridKeypair {
         HybridKeypair::new(
             ClassicalKeypair::from_seed(&[seed[0] ^ 0xA5; 32]),
@@ -1372,10 +1681,11 @@ mod tests {
     }
 
     fn governance_deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
+        let commitment = indra_crypto::commit(value_spark, &[0; 32]);
         OutputV1 {
             value_spark,
             commitment: CommitmentV1 {
-                compressed_point: Bytes32::ZERO,
+                compressed_point: Bytes32::from(commitment.0),
             },
             owner_pubkey,
             range_proof: VariableBytes::from_slice(&[]).unwrap(),
@@ -1494,6 +1804,45 @@ mod tests {
         }
     }
 
+    fn signed_slash_evidence(
+        engine: &NodeEngine,
+        keypair: &HybridKeypair,
+        height: u64,
+        round_1: u32,
+        round_2: u32,
+        step_1: VoteStep,
+        step_2: VoteStep,
+        hash_1: Bytes32,
+        hash_2: Bytes32,
+    ) -> SlashEvidenceV1 {
+        let validator_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        SlashEvidenceV1 {
+            validator_id,
+            vote_1: produce_vote_with_election_result(
+                height,
+                round_1,
+                step_1,
+                hash_1,
+                validator_id,
+                None,
+                &engine.state.chain_id,
+                keypair,
+            )
+            .unwrap(),
+            vote_2: produce_vote_with_election_result(
+                height,
+                round_2,
+                step_2,
+                hash_2,
+                validator_id,
+                None,
+                &engine.state.chain_id,
+                keypair,
+            )
+            .unwrap(),
+        }
+    }
+
     fn make_strict_block(
         state: &indra_state::ChainState,
         proposer_seed: [u8; 32],
@@ -1561,6 +1910,7 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000 + state.height + 1,
             polc_round: None,
+            transactions: vec![],
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -1569,13 +1919,7 @@ mod tests {
             vrf_reveals,
         };
         let mut projection_state = state.clone();
-        produce_block(
-            &template,
-            &mut projection_state,
-            &indra_consensus::mempool::Mempool::default_config(),
-            &election,
-        )
-        .unwrap()
+        produce_block(&template, &mut projection_state, &election).unwrap()
     }
 
     fn build_single_validator_qc_bytes(
@@ -1941,10 +2285,171 @@ mod tests {
         let dir = temp_dir("slash_dedupe");
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
-        let evidence = dummy_slash_evidence(0xA1);
-        engine.add_slash_evidence(evidence.clone());
-        engine.add_slash_evidence(evidence);
+        let keypair = install_active_validator(&mut engine, [0xA1; 32], "slash-dedupe");
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0xA1; 32]),
+            Bytes32::from([0xA2; 32]),
+        );
+        engine.add_slash_evidence(evidence.clone()).unwrap();
+        engine.add_slash_evidence(evidence).unwrap();
         assert_eq!(engine.pending_slashes.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slash_admission_rejects_each_signed_shape_violation() {
+        let dir = temp_dir("slash_shape_admission");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let keypair = install_active_validator(&mut engine, [0xA2; 32], "slash-shape");
+        let cases = [
+            (
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    1,
+                    0,
+                    1,
+                    VoteStep::Precommit,
+                    VoteStep::Precommit,
+                    Bytes32::from([1; 32]),
+                    Bytes32::from([2; 32]),
+                ),
+                "same height and round",
+            ),
+            (
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    1,
+                    0,
+                    0,
+                    VoteStep::Prevote,
+                    VoteStep::Precommit,
+                    Bytes32::from([3; 32]),
+                    Bytes32::from([4; 32]),
+                ),
+                "must both be precommits or both be prevotes",
+            ),
+            (
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    1,
+                    0,
+                    0,
+                    VoteStep::Precommit,
+                    VoteStep::Precommit,
+                    Bytes32::from([5; 32]),
+                    Bytes32::from([5; 32]),
+                ),
+                "same block hash",
+            ),
+            (
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    1,
+                    0,
+                    0,
+                    VoteStep::Precommit,
+                    VoteStep::Precommit,
+                    Bytes32::ZERO,
+                    Bytes32::from([6; 32]),
+                ),
+                "nil vote",
+            ),
+        ];
+        for (evidence, expected) in cases {
+            let error = engine.add_slash_evidence(evidence).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let mut bad_signature = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([7; 32]),
+            Bytes32::from([8; 32]),
+        );
+        bad_signature.vote_1.signature = dummy_signature();
+        let error = engine
+            .add_slash_evidence(bad_signature)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vote_1 signature invalid"));
+        assert!(engine.pending_slashes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slash_pool_capacity_is_enforced() {
+        let dir = temp_dir("slash_pool_capacity");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let keypair = install_active_validator(&mut engine, [0xA3; 32], "slash-cap");
+        engine.pending_slashes = (0..MAX_PENDING_SLASH_EVIDENCE)
+            .map(|index| dummy_slash_evidence((index % 255) as u8))
+            .collect();
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([9; 32]),
+            Bytes32::from([10; 32]),
+        );
+        let error = engine.add_slash_evidence(evidence).unwrap_err().to_string();
+        assert!(error.contains("slash evidence pool full"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_validator_double_slash_selects_one_and_prunes_the_rest() {
+        let dir = temp_dir("slash_same_validator_conflict");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let keypair = install_active_validator(&mut engine, [0xA4; 32], "slash-conflict");
+        let first = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x11; 32]),
+            Bytes32::from([0x12; 32]),
+        );
+        let second = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            1,
+            1,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x13; 32]),
+            Bytes32::from([0x14; 32]),
+        );
+        engine.pending_slashes = vec![first, second];
+
+        let selected = engine.select_block_contents().slash_evidence;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(engine.pending_slashes.len(), 1);
+        engine.evict_committed_slashes(&selected);
+        assert!(engine.pending_slashes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1964,16 +2469,43 @@ mod tests {
     }
 
     #[test]
-    fn add_slash_already_applied_ignored() {
+    fn add_slash_rejects_v2_hash_already_applied() {
         let dir = temp_dir("slash_applied");
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
-        let evidence = dummy_slash_evidence(0xA4);
+        let keypair = install_active_validator(&mut engine, [0xA5; 32], "slash-applied");
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0xA4; 32]),
+            Bytes32::from([0xA5; 32]),
+        );
+        let snapshot = engine.state.snapshot_for_consensus_height(1).unwrap();
+        let (position, _) = snapshot
+            .entry_with_position(&evidence.validator_id)
+            .unwrap();
+        let proof = build_slash_membership_proof(snapshot, position).unwrap();
+        let v2 = SlashEvidenceV2 {
+            validator_id: evidence.validator_id,
+            vote_1: evidence.vote_1.clone(),
+            vote_2: evidence.vote_2.clone(),
+            membership_proof: proof,
+        };
         engine
             .state
             .applied_slash_hashes
-            .insert(compute_pending_slash_evidence_hash(&evidence));
-        engine.add_slash_evidence(evidence);
+            .insert(compute_slash_evidence_v2_hash(&v2));
+        assert!(matches!(
+            engine.add_slash_evidence(evidence),
+            Err(NodeError::State(
+                indra_state::StateError::SlashAlreadyApplied
+            ))
+        ));
         assert!(engine.pending_slashes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2594,6 +3126,58 @@ mod tests {
     }
 
     #[test]
+    fn cross_signer_last_stake_position_slot_selects_exactly_one() {
+        let dir = temp_dir("staking_last_position_slot");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let validator = install_active_validator(&mut engine, [0x81; 32], "position-target");
+        let validator_id = Bytes32::from(indra_crypto::sha256(&validator.public_key().classical.0));
+        // Genesis already contains the validator's self position.
+        for ordinal in 0..(indra_core::types::primitives::MAX_STAKE_POSITIONS_PER_VALIDATOR - 2) {
+            let owner = Bytes32::from(indra_crypto::sha256(&(ordinal as u64).to_le_bytes()));
+            let position = StakePositionV1::new(
+                validator_id,
+                owner,
+                PositionCustodyV1::DelegatorIdentity {
+                    delegator_id: owner,
+                },
+                None,
+                1,
+                0,
+            )
+            .unwrap();
+            engine
+                .state
+                .stake_positions
+                .insert(position.position_id, position);
+        }
+        engine.state.rebuild_position_tranche_index().unwrap();
+        let first_signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x82; 32]),
+            PqKeypair::from_seed(&[0x82; 32]).unwrap(),
+        );
+        let second_signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x83; 32]),
+            PqKeypair::from_seed(&[0x83; 32]).unwrap(),
+        );
+        let first = valid_delegate_op(&mut engine, validator_id, &first_signer, 0x82);
+        let second = valid_delegate_op(&mut engine, validator_id, &second_signer, 0x83);
+        engine.add_staking_op(first.clone()).unwrap();
+        assert!(matches!(
+            engine.add_staking_op(second.clone()),
+            Err(NodeError::InvalidStakingOp(_))
+        ));
+        assert_eq!(engine.staking_mempool, vec![first.clone()]);
+        // Bypass admission deliberately: this reproduces the historical race
+        // where both were independently valid against the same pre-state.
+        engine.staking_mempool = vec![first.clone(), second];
+
+        let selected = engine.select_block_contents().staking_ops;
+        assert_eq!(selected, vec![first]);
+        assert_eq!(engine.staking_mempool.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn governance_mempool_rejects_invalid_signature() {
         let dir = temp_dir("governance_bad_sig");
         let config = NodeConfig::local_test(dir.clone());
@@ -2699,7 +3283,7 @@ mod tests {
         let original_state = engine.state.clone();
 
         engine.prune_invalid_governance_ops();
-        let selected = engine.select_governance_ops();
+        let selected = engine.select_block_contents().governance_ops;
 
         assert!(selected.is_empty());
         assert!(engine.governance_mempool.is_empty());
@@ -2718,11 +3302,257 @@ mod tests {
         let op = valid_cold_governance_propose_op(&mut engine, &keypair, &cold, 1);
         engine.governance_mempool.push(op.clone());
 
-        let selected = engine.select_governance_ops();
+        let selected = engine.select_block_contents().governance_ops;
 
         assert_eq!(selected, vec![op.clone()]);
         assert_eq!(engine.governance_mempool, vec![op]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_candidate_failure_rolls_back_nonce_and_all_state() {
+        let dir = temp_dir("governance_atomic_candidate");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x56; 32], "gov-rollback");
+        let mut op = valid_governance_propose_op(&mut engine, &keypair, 1);
+        if let GovernancePayload::Propose {
+            deposit_utxo_id, ..
+        } = &mut op.payload
+        {
+            *deposit_utxo_id = Bytes32::from([0xFE; 32]);
+        }
+        sign_governance_op(&mut op, &keypair);
+        let before = engine.state.clone();
+        let mut scratch = before.clone();
+
+        assert!(try_apply_governance_candidate(&mut scratch, &op, 0, 1).is_err());
+        assert_eq!(scratch, before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governance_deposit_conflicting_with_staking_is_evicted() {
+        let dir = temp_dir("governance_staking_deposit_conflict");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let validator = install_active_validator(&mut engine, [0x57; 32], "gov-stake-target");
+        let validator_id = Bytes32::from(indra_crypto::sha256(&validator.public_key().classical.0));
+        let hot = install_active_validator(&mut engine, [0x58; 32], "gov-stake-signer");
+        let cold = cold_keypair_for_seed([0x58; 32]);
+        let governance = valid_cold_governance_propose_op(&mut engine, &hot, &cold, 1);
+        let (deposit_utxo_id, delegator_pubkey) = match &governance.payload {
+            GovernancePayload::Propose {
+                deposit_utxo_id,
+                proposer_pubkey,
+                ..
+            } => (*deposit_utxo_id, proposer_pubkey.clone()),
+            _ => unreachable!(),
+        };
+        let value = engine.state.governance.params.proposal_deposit_spark;
+        let mut staking = StakingOp {
+            body: StakingOpBody::Delegate {
+                validator_id,
+                deposit_utxo_id,
+                delegator_pubkey,
+                deposit_proof: Some(StakeDepositProof {
+                    committed_value_spark: value,
+                    blinding_factor: Bytes32::ZERO,
+                }),
+            },
+            nonce: 1,
+            signature: dummy_signature(),
+        };
+        sign_staking_op(&mut staking, &cold, &engine.state.chain_id);
+        engine.staking_mempool = vec![staking.clone()];
+        engine.governance_mempool = vec![governance];
+
+        let selected = engine.select_block_contents();
+        assert_eq!(selected.staking_ops, vec![staking]);
+        assert!(selected.governance_ops.is_empty());
+        assert!(engine.governance_mempool.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_conflicts_evict_later_staking_and_governance_candidates() {
+        let dir = temp_dir("transaction_cross_pool_conflicts");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let target = install_active_validator(&mut engine, [0x59; 32], "tx-conflict-target");
+        let target_id = Bytes32::from(indra_crypto::sha256(&target.public_key().classical.0));
+
+        let delegator = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x5A; 32]),
+            PqKeypair::from_seed(&[0x5A; 32]).unwrap(),
+        );
+        let staking = valid_delegate_op(&mut engine, target_id, &delegator, 0x5A);
+        let staking_utxo = match &staking.body {
+            StakingOpBody::Delegate {
+                deposit_utxo_id, ..
+            } => *deposit_utxo_id,
+            _ => unreachable!(),
+        };
+        let staking_tx = valid_tx_spending(&engine, staking_utxo, &delegator, [0; 32], 0x6A);
+        engine
+            .mempool
+            .submit_validated(staking_tx.clone(), &engine.state)
+            .unwrap();
+        engine.staking_mempool = vec![staking];
+        let selected = engine.select_block_contents();
+        assert_eq!(selected.transactions, vec![staking_tx]);
+        assert!(selected.staking_ops.is_empty());
+        assert!(engine.staking_mempool.is_empty());
+
+        engine.mempool = Mempool::default_config();
+        let hot = install_active_validator(&mut engine, [0x5B; 32], "tx-gov-signer");
+        let cold = cold_keypair_for_seed([0x5B; 32]);
+        let governance = valid_cold_governance_propose_op(&mut engine, &hot, &cold, 1);
+        let governance_utxo = match &governance.payload {
+            GovernancePayload::Propose {
+                deposit_utxo_id, ..
+            } => *deposit_utxo_id,
+            _ => unreachable!(),
+        };
+        let governance_tx = valid_tx_spending(&engine, governance_utxo, &cold, [0; 32], 0x6B);
+        engine
+            .mempool
+            .submit_validated(governance_tx.clone(), &engine.state)
+            .unwrap();
+        engine.governance_mempool = vec![governance];
+        let selected = engine.select_block_contents();
+        assert_eq!(selected.transactions, vec![governance_tx]);
+        assert!(selected.governance_ops.is_empty());
+        assert!(engine.governance_mempool.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn combined_four_pool_conflicts_produce_deterministic_maximal_subset() {
+        let dir = temp_dir("combined_four_pool_conflicts");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let proposer = install_active_validator(&mut engine, [0x42; 32], "combined-proposer");
+        let proposer_id = Bytes32::from(indra_crypto::sha256(&proposer.public_key().classical.0));
+
+        // Two transactions spend the same UTXO; deterministic mempool order wins.
+        let tx_owner = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x61; 32]),
+            PqKeypair::from_seed(&[0x61; 32]).unwrap(),
+        );
+        let tx_source = valid_delegate_op(&mut engine, proposer_id, &tx_owner, 0x61);
+        let tx_utxo = match &tx_source.body {
+            StakingOpBody::Delegate {
+                deposit_utxo_id, ..
+            } => *deposit_utxo_id,
+            _ => unreachable!(),
+        };
+        let tx_a = valid_tx_spending(&engine, tx_utxo, &tx_owner, [0; 32], 0x71);
+        let tx_b = valid_tx_spending(&engine, tx_utxo, &tx_owner, [0; 32], 0x72);
+        engine.mempool.insert_unchecked_for_test(tx_a.clone(), 0);
+        engine.mempool.insert_unchecked_for_test(tx_b.clone(), 0);
+        let expected_tx = engine.mempool.select_for_block(1, 0)[0].tx.clone();
+
+        // Duplicate staking candidates are individually valid against pre-state.
+        let delegator = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x62; 32]),
+            PqKeypair::from_seed(&[0x62; 32]).unwrap(),
+        );
+        let staking = valid_delegate_op(&mut engine, proposer_id, &delegator, 0x62);
+        engine.staking_mempool = vec![staking.clone(), staking.clone()];
+
+        // Duplicate governance candidates contend for one nonce/deposit UTXO.
+        let cold = cold_keypair_for_seed([0x42; 32]);
+        let governance = valid_cold_governance_propose_op(&mut engine, &proposer, &cold, 1);
+        engine.governance_mempool = vec![governance.clone(), governance.clone()];
+
+        // Two valid equivocations target the same validator.
+        let slash_a = signed_slash_evidence(
+            &engine,
+            &proposer,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x81; 32]),
+            Bytes32::from([0x82; 32]),
+        );
+        let slash_b = signed_slash_evidence(
+            &engine,
+            &proposer,
+            1,
+            1,
+            1,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x83; 32]),
+            Bytes32::from([0x84; 32]),
+        );
+        engine.pending_slashes = vec![slash_a, slash_b];
+
+        let contents = engine.select_block_contents();
+        assert_eq!(contents.transactions, vec![expected_tx.clone()]);
+        assert_eq!(contents.staking_ops, vec![staking.clone()]);
+        assert_eq!(contents.governance_ops, vec![governance.clone()]);
+        assert_eq!(contents.slash_evidence.len(), 1);
+        assert_eq!(engine.mempool.len(), 1);
+        assert_eq!(engine.staking_mempool, vec![staking]);
+        assert_eq!(engine.governance_mempool, vec![governance]);
+        assert_eq!(engine.pending_slashes.len(), 1);
+
+        let election = ProposerElection {
+            epoch_seed: Bytes32::from(indra_crypto::sha256(&engine.state.tip_hash.0)),
+            height: 1,
+            round: 0,
+            candidates: vec![ProposerCandidate {
+                validator_id: proposer_id,
+                vrf_pubkey: VrfKeypair::from_seed(&[0x42; 32]).public_key(),
+                verified_vrf_output: None,
+                stake: engine
+                    .state
+                    .validators
+                    .get(&proposer_id)
+                    .unwrap()
+                    .stake_spark,
+            }],
+        };
+        let slot = compute_proposer_vrf(
+            proposer_id,
+            &VrfKeypair::from_seed(&[0x42; 32]),
+            &election.epoch_seed,
+            1,
+            0,
+        );
+        let reveals = vec![VrfRevealEvidence {
+            validator_id: proposer_id,
+            vrf_output: Bytes32::from(slot.vrf_output.0),
+            vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
+        }];
+        let election_result = VrfElectionResult {
+            height: 1,
+            round: 0,
+            elected_validator_id: proposer_id,
+            elected_vrf_output: reveals[0].vrf_output,
+            fallback_used: false,
+            reveal_set_commitment: compute_reveal_set_commitment(&reveals),
+        };
+        let template = BlockTemplate {
+            proposer_vrf_keypair: VrfKeypair::from_seed(&[0x42; 32]),
+            epoch_seed: election.epoch_seed,
+            prev_qc_bytes: vec![],
+            timestamp: 1_700_000_001,
+            polc_round: None,
+            transactions: contents.transactions,
+            staking_ops: contents.staking_ops,
+            governance_ops: contents.governance_ops,
+            slash_evidence: contents.slash_evidence,
+            election_result_hash: Some(election_result.hash()),
+            election_result: Some(election_result),
+            vrf_reveals: reveals,
+        };
+        let block = produce_block(&template, &mut engine.state, &election).unwrap();
+        assert_eq!(block.transactions, vec![expected_tx]);
+        assert_eq!(block.staking_ops.len(), 1);
+        assert_eq!(block.governance_ops.len(), 1);
+        assert_eq!(block.slashing_evidence.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -117,6 +117,7 @@ fn make_strict_block(
         prev_qc_bytes,
         timestamp: 1_700_000_000 + state.height + 1,
         polc_round: None,
+        transactions: vec![],
         slash_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
@@ -125,13 +126,7 @@ fn make_strict_block(
         vrf_reveals,
     };
     let mut projection_state = state.clone();
-    produce_block(
-        &template,
-        &mut projection_state,
-        &Mempool::default_config(),
-        &election,
-    )
-    .unwrap()
+    produce_block(&template, &mut projection_state, &election).unwrap()
 }
 
 async fn write_plain_msg<W>(writer: &mut W, msg: &Message)

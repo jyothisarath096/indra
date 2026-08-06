@@ -4283,6 +4283,7 @@ mod tests {
             prev_qc_bytes,
             timestamp: 1_700_000_000 + driver.engine.state.height + 1,
             polc_round: None,
+            transactions: vec![],
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -4291,13 +4292,7 @@ mod tests {
             vrf_reveals,
         };
         let mut projection_state = driver.engine.state.clone();
-        produce_block(
-            &template,
-            &mut projection_state,
-            &driver.engine.mempool,
-            &election,
-        )
-        .unwrap()
+        produce_block(&template, &mut projection_state, &election).unwrap()
     }
 
     fn authoritative_result_for_seed(
@@ -6751,6 +6746,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: vec![],
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -6758,13 +6754,8 @@ mod tests {
             election_result: Some(result),
             vrf_reveals: frozen.clone(),
         };
-        let block = produce_block(
-            &template,
-            &mut driver.engine.state,
-            &driver.engine.mempool,
-            &election,
-        )
-        .expect("frozen evidence should satisfy the authoritative result commitment");
+        let block = produce_block(&template, &mut driver.engine.state, &election)
+            .expect("frozen evidence should satisfy the authoritative result commitment");
 
         assert_eq!(block.vrf_reveals, frozen);
         assert_eq!(block.header.election_result_hash, Some(result.hash()));
@@ -6836,6 +6827,7 @@ mod tests {
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
+            transactions: vec![],
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
@@ -6844,13 +6836,8 @@ mod tests {
             vrf_reveals: driver.vrf_reveal_evidence(height, round),
         };
 
-        produce_block(
-            &template,
-            &mut driver.engine.state,
-            &driver.engine.mempool,
-            &election,
-        )
-        .expect("proposal must use frozen evidence and avoid proposer identity mismatch");
+        produce_block(&template, &mut driver.engine.state, &election)
+            .expect("proposal must use frozen evidence and avoid proposer identity mismatch");
         let _ = std::fs::remove_dir_all(dir);
     }
 
