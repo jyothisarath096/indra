@@ -30,6 +30,7 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
     error::{StateError, StateResult},
+    identity::resolve_active_validator_cold_pubkey,
     txn::StateTxn,
     ChainState,
 };
@@ -71,12 +72,30 @@ pub fn deposit_stake_position(
             current_height,
         });
     }
-    let owner_id = Bytes32::from(indra_crypto::sha256(
-        &utxo.output.owner_pubkey.classical_pk.0,
-    ));
-    if owner_id != principal_owner_id || utxo.output.value_spark != opening.principal_spark {
+    let owner_matches_custody = match custody {
+        PositionCustodyV1::DelegatorIdentity { delegator_id } => {
+            Bytes32::from(indra_crypto::sha256(
+                &utxo.output.owner_pubkey.classical_pk.0,
+            )) == delegator_id
+        }
+        PositionCustodyV1::ValidatorColdIdentity { validator_id } => {
+            let cold_pubkey =
+                resolve_active_validator_cold_pubkey(state, &validator_id).map_err(|_| {
+                    StateError::InvalidStakingOp(
+                        "validator cold custody key cannot be resolved".to_string(),
+                    )
+                })?;
+            utxo.output.owner_pubkey == cold_pubkey
+        }
+    };
+    if !owner_matches_custody {
         return Err(StateError::InvalidStakingOp(
-            "position deposit UTXO owner or public principal does not match intent".to_string(),
+            "position deposit UTXO owner does not match custody authority".to_string(),
+        ));
+    }
+    if utxo.output.value_spark != opening.principal_spark {
+        return Err(StateError::InvalidStakingOp(
+            "position deposit public principal does not match intent".to_string(),
         ));
     }
     let commitment = indra_crypto::PedersenCommitment(utxo.output.commitment.compressed_point.0);

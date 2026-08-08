@@ -38,12 +38,38 @@ pub fn apply_governance_op(
     current_height: u64,
     chain_id: &str,
 ) -> StateResult<()> {
+    apply_governance_op_inner(state, op, current_epoch, current_height, chain_id, true)
+}
+
+/// Apply an admission-verified governance operation without repeating crypto.
+///
+/// Callers must first confirm that its admission authority fingerprint still
+/// matches canonical state.
+pub fn apply_verified_governance_op(
+    state: &mut ChainState,
+    op: &GovernanceOpV2,
+    current_epoch: u64,
+    current_height: u64,
+    chain_id: &str,
+) -> StateResult<()> {
+    apply_governance_op_inner(state, op, current_epoch, current_height, chain_id, false)
+}
+
+fn apply_governance_op_inner(
+    state: &mut ChainState,
+    op: &GovernanceOpV2,
+    current_epoch: u64,
+    current_height: u64,
+    chain_id: &str,
+    verify_crypto: bool,
+) -> StateResult<()> {
     op.validate_structure()
         .map_err(|error| StateError::InvalidGovernanceOp {
             reason: error.to_string(),
         })?;
     let identity_registry_active = true;
-    let cold_authorized = verify_governance_sig(state, op, chain_id, identity_registry_active)?;
+    let cold_authorized =
+        verify_governance_sig(state, op, chain_id, identity_registry_active, verify_crypto)?;
     apply_governance_nonce(state, op, current_height, cold_authorized)?;
 
     match &op.payload {
@@ -109,7 +135,13 @@ pub fn validate_governance_op(
     chain_id: &str,
 ) -> StateResult<()> {
     let mut scratch = state.clone();
-    apply_governance_op(&mut scratch, op, current_epoch, state.height, chain_id)
+    apply_governance_op(
+        &mut scratch,
+        op,
+        current_epoch,
+        state.height.saturating_add(1),
+        chain_id,
+    )
 }
 
 fn apply_propose(
@@ -552,6 +584,7 @@ fn verify_governance_sig(
     op: &GovernanceOpV2,
     chain_id: &str,
     identity_registry_active: bool,
+    verify_crypto: bool,
 ) -> StateResult<bool> {
     let cold_designated = matches!(
         op.payload,
@@ -608,7 +641,9 @@ fn verify_governance_sig(
             .ok_or_else(|| StateError::InvalidGovernanceOp {
                 reason: "active validator operation is missing canonical cold authorization".into(),
             })?;
-        verify_governance_sig_with_pubkey(&signing_bytes, &op.signature, &pubkey)?;
+        if verify_crypto {
+            verify_governance_sig_with_pubkey(&signing_bytes, &op.signature, &pubkey)?;
+        }
         return Ok(true);
     }
 
@@ -624,7 +659,9 @@ fn verify_governance_sig(
         chain_id,
     );
     let msg_hash = sha256(&domain);
-    verify_governance_sig_with_pubkey(&msg_hash, &op.signature, &pubkey)?;
+    if verify_crypto {
+        verify_governance_sig_with_pubkey(&msg_hash, &op.signature, &pubkey)?;
+    }
     Ok(false)
 }
 
@@ -1871,6 +1908,56 @@ mod tests {
             proposal.deposit_spark, 1_000,
             "only required deposit should be locked/at risk"
         );
+    }
+
+    #[test]
+    fn governance_admission_uses_next_block_height_exactly_like_selection() {
+        let mut state = ChainState::new_genesis();
+        state.height = 10;
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair) = keypair(0x36);
+        let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
+        let deposit = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 1_500), 0, 0, 0)
+            .unwrap();
+        let dummy = state
+            .utxos
+            .insert(deposit_output(proposer_pubkey.clone(), 77), 0, 0, 1)
+            .unwrap();
+        let op = propose_op(proposer_id, &proposer_keypair, proposer_pubkey, deposit, 1);
+
+        let mut next_projection = state.clone();
+        apply_governance_op(&mut next_projection, &op, 0, 11, DEFAULT_CHAIN_ID).unwrap();
+        let change = next_projection
+            .utxos
+            .all_entries()
+            .find(|entry| entry.output.value_spark == 500)
+            .unwrap()
+            .output
+            .clone();
+        state.utxos.insert(change, 11, u32::MAX - 3, 1).unwrap();
+        state.utxos.spend_at_height(&dummy, 10).unwrap();
+
+        let mut old_height_projection = state.clone();
+        assert!(apply_governance_op(
+            &mut old_height_projection,
+            &op,
+            0,
+            state.height,
+            DEFAULT_CHAIN_ID,
+        )
+        .is_ok());
+        assert!(validate_governance_op(&state, &op, 0, DEFAULT_CHAIN_ID).is_err());
+        let mut selection_projection = state.clone();
+        assert!(apply_governance_op(
+            &mut selection_projection,
+            &op,
+            0,
+            state.height.saturating_add(1),
+            DEFAULT_CHAIN_ID,
+        )
+        .is_err());
     }
 
     #[test]

@@ -28,7 +28,9 @@ use indra_core::types::{
     governance::GovernanceOpV2,
     primitives::{
         Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
-        MAX_STAKING_OPS_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+        MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_STAKING_OPS_PER_BLOCK,
+        MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
+        MAX_VRF_PROOF_BYTES,
     },
     slash_membership::build_slash_membership_proof,
     slashing::{SlashEvidenceV1, SlashEvidenceV2},
@@ -42,11 +44,9 @@ use indra_crypto::{
     VrfKeypair,
 };
 use indra_state::{
-    apply::{compute_pending_slash_evidence_hash, compute_slash_evidence_v2_hash},
-    epoch::epoch_for_height,
-    governance_apply::validate_governance_op,
-    try_apply_governance_candidate, try_apply_slash_candidate, try_apply_staking_candidate,
-    try_apply_transaction_candidate, ChainState,
+    apply::compute_slash_evidence_v2_hash, epoch::epoch_for_height, try_apply_governance_candidate,
+    try_apply_slash_candidate, try_apply_staking_candidate, try_apply_transaction_candidate,
+    ChainState,
 };
 use indra_storage::{
     load_chain_manifest, load_last_qc, save_chain_manifest, BlockStore, ChainManifest, EpochStore,
@@ -57,7 +57,10 @@ use crate::{
     config::NodeConfig,
     error::{NodeError, NodeResult},
     genesis::build_genesis_block,
-    sync::{import_block, project_and_verify_block_state_root},
+    pending_dependencies::{
+        governance_footprint, slash_footprint, staking_footprint, DependencyIndex, DependencyKey,
+    },
+    sync::{import_block_with_effects, project_and_verify_block_state_root},
 };
 
 /// The node engine: owns all state and drives consensus.
@@ -69,11 +72,19 @@ pub struct NodeEngine {
     /// Pending transaction pool.
     pub mempool: Mempool,
     /// Pending staking operations waiting to be included in a block.
-    pub staking_mempool: Vec<StakingOp>,
+    pub(crate) staking_mempool: Vec<StakingOp>,
     /// Pending governance operations waiting to be included in a block.
-    pub governance_mempool: Vec<GovernanceOpV2>,
+    pub(crate) governance_mempool: Vec<GovernanceOpV2>,
     /// Pending slash evidence waiting to be included in a block.
-    pub pending_slashes: Vec<SlashEvidenceV1>,
+    pub(crate) pending_slashes: Vec<SlashEvidenceV2>,
+    staking_dependency_index: DependencyIndex,
+    governance_dependency_index: DependencyIndex,
+    slash_dependency_index: DependencyIndex,
+    pending_dependency_epoch: u64,
+    verified_staking:
+        std::collections::BTreeMap<Bytes32, indra_state::pending::VerifiedPendingStaking>,
+    verified_governance:
+        std::collections::BTreeMap<Bytes32, indra_state::pending::VerifiedPendingGovernance>,
     /// Persistent block log.
     pub block_store: BlockStore,
     /// Persistent epoch history log.
@@ -123,6 +134,307 @@ pub struct NetworkAuthorityMember {
 }
 
 impl NodeEngine {
+    fn ensure_pending_indexes(&mut self) {
+        let epoch = epoch_for_height(self.state.height.saturating_add(1));
+        let epoch_changed = self.pending_dependency_epoch != epoch;
+        if epoch_changed || self.staking_dependency_index.len() != self.staking_mempool.len() {
+            self.staking_dependency_index = DependencyIndex::default();
+            for op in &self.staking_mempool {
+                self.staking_dependency_index.insert(
+                    indra_state::pending::staking_op_id(op),
+                    staking_footprint(&self.state, op, epoch),
+                );
+            }
+        }
+        if epoch_changed || self.governance_dependency_index.len() != self.governance_mempool.len()
+        {
+            self.governance_dependency_index = DependencyIndex::default();
+            for op in &self.governance_mempool {
+                self.governance_dependency_index.insert(
+                    indra_state::pending::governance_op_id(op),
+                    governance_footprint(op, epoch),
+                );
+            }
+        }
+        if epoch_changed || self.slash_dependency_index.len() != self.pending_slashes.len() {
+            self.slash_dependency_index = DependencyIndex::default();
+            for evidence in &self.pending_slashes {
+                let id = compute_slash_evidence_v2_hash(evidence);
+                self.slash_dependency_index
+                    .insert(id, slash_footprint(&self.state, evidence, id, epoch));
+            }
+        }
+        self.pending_dependency_epoch = epoch;
+        self.debug_assert_pending_indexes();
+    }
+
+    fn debug_assert_pending_indexes(&self) {
+        let epoch = epoch_for_height(self.state.height.saturating_add(1));
+        self.staking_dependency_index
+            .assert_reconstructed(self.staking_mempool.iter().map(|op| {
+                (
+                    indra_state::pending::staking_op_id(op),
+                    staking_footprint(&self.state, op, epoch),
+                )
+            }));
+        self.governance_dependency_index
+            .assert_reconstructed(self.governance_mempool.iter().map(|op| {
+                (
+                    indra_state::pending::governance_op_id(op),
+                    governance_footprint(op, epoch),
+                )
+            }));
+        self.slash_dependency_index
+            .assert_reconstructed(self.pending_slashes.iter().map(|evidence| {
+                let id = compute_slash_evidence_v2_hash(evidence);
+                (id, slash_footprint(&self.state, evidence, id, epoch))
+            }));
+    }
+
+    fn apply_pending_canonical_effects(&mut self, effects: &indra_state::CanonicalStateEffects) {
+        self.ensure_pending_indexes();
+
+        let mut common = vec![DependencyKey::NextHeight];
+        common.extend(effects.spent_utxos.iter().copied().map(DependencyKey::Utxo));
+        common.extend(
+            effects
+                .inserted_nullifiers
+                .iter()
+                .copied()
+                .map(DependencyKey::Nullifier),
+        );
+        if effects.base_fee_changed {
+            common.push(DependencyKey::BaseFee);
+        }
+        for id in &effects.validators_changed {
+            common.extend([
+                DependencyKey::Validator(*id),
+                DependencyKey::ValidatorPositionCapacity(*id),
+                DependencyKey::ValidatorTrancheCapacity(*id),
+            ]);
+        }
+        common.extend(
+            effects
+                .staking_nonces_changed
+                .iter()
+                .copied()
+                .map(DependencyKey::StakingNonce),
+        );
+        common.extend(
+            effects
+                .governance_nonces_changed
+                .iter()
+                .copied()
+                .map(DependencyKey::GovernanceNonce),
+        );
+        common.extend(
+            effects
+                .delegator_identities_changed
+                .iter()
+                .copied()
+                .map(DependencyKey::DelegatorIdentity),
+        );
+        common.extend(
+            effects
+                .stake_positions_changed
+                .iter()
+                .copied()
+                .map(DependencyKey::StakePosition),
+        );
+        common.extend(
+            effects
+                .position_tranche_capacity_changed_for
+                .iter()
+                .copied()
+                .map(DependencyKey::PositionTrancheCapacity),
+        );
+        common.extend(
+            effects
+                .tombstones_changed
+                .iter()
+                .copied()
+                .map(DependencyKey::Tombstone),
+        );
+        if !effects.tombstones_changed.is_empty() {
+            common.push(DependencyKey::TombstoneRegistry);
+        }
+        common.extend(
+            effects
+                .proposals_changed
+                .iter()
+                .copied()
+                .map(DependencyKey::Proposal),
+        );
+        common.extend(
+            effects
+                .applied_slash_hashes
+                .iter()
+                .copied()
+                .map(DependencyKey::AppliedSlash),
+        );
+        if effects.validator_registry_changed || !effects.validator_keys_changed.is_empty() {
+            common.push(DependencyKey::ValidatorRegistry);
+        }
+        if effects.retired_cold_components_changed {
+            // Retired-component footprints are proposed-component-specific;
+            // registry changes conservatively select registrations/rotations.
+            common.push(DependencyKey::ValidatorRegistry);
+        }
+        if effects.global_position_tranche_capacity_changed {
+            common.extend([
+                DependencyKey::GlobalPositionCapacity,
+                DependencyKey::GlobalTrancheCapacity,
+            ]);
+        }
+        for id in &effects.validator_position_capacity_changed {
+            common.push(DependencyKey::ValidatorPositionCapacity(*id));
+        }
+        for id in &effects.validator_tranche_capacity_changed {
+            common.push(DependencyKey::ValidatorTrancheCapacity(*id));
+        }
+        if effects.governance_params_changed {
+            common.extend((0..10).map(DependencyKey::GovernanceParam));
+        }
+        if !effects.proposals_changed.is_empty() {
+            common.push(DependencyKey::ActiveProposalCount);
+        }
+
+        let mut affected_staking = self
+            .staking_dependency_index
+            .affected(common.iter().copied());
+        let mut affected_governance = self
+            .governance_dependency_index
+            .affected(common.iter().copied());
+        let mut affected_slashes = self.slash_dependency_index.affected(common.iter().copied());
+        if effects.epoch_changed {
+            affected_staking.extend(
+                self.staking_mempool
+                    .iter()
+                    .map(indra_state::pending::staking_op_id),
+            );
+            affected_governance.extend(
+                self.governance_mempool
+                    .iter()
+                    .map(indra_state::pending::governance_op_id),
+            );
+            affected_slashes.extend(
+                self.pending_slashes
+                    .iter()
+                    .map(compute_slash_evidence_v2_hash),
+            );
+        }
+        if effects.slash_membership_history_changed {
+            affected_slashes.extend(
+                self.pending_slashes
+                    .iter()
+                    .map(compute_slash_evidence_v2_hash),
+            );
+        }
+
+        self.revalidate_affected_staking(&affected_staking);
+        self.revalidate_affected_governance(&affected_governance);
+        self.revalidate_affected_slashes(&affected_slashes);
+        self.debug_assert_pending_indexes();
+    }
+
+    fn revalidate_affected_staking(&mut self, affected: &std::collections::BTreeSet<Bytes32>) {
+        let height = self.state.height.saturating_add(1);
+        let epoch = epoch_for_height(height);
+        let state = &self.state;
+        self.staking_mempool.retain(|op| {
+            let id = indra_state::pending::staking_op_id(op);
+            if !affected.contains(&id) {
+                return true;
+            }
+            let mut scratch = state.clone();
+            let refreshed = match self.verified_staking.get(&id) {
+                Some(verified)
+                    if indra_state::pending::staking_authority_unchanged(state, op, verified) =>
+                {
+                    indra_state::try_apply_verified_staking_candidate(&mut scratch, op, height)
+                        .is_ok()
+                        .then(|| verified.clone())
+                }
+                _ => indra_state::pending::verify_pending_staking(state, op, height).ok(),
+            };
+            if let Some(verified) = &refreshed {
+                self.staking_dependency_index
+                    .insert(id, staking_footprint(state, op, epoch));
+                self.verified_staking.insert(id, verified.clone());
+            } else {
+                self.staking_dependency_index.remove(&id);
+                self.verified_staking.remove(&id);
+            }
+            refreshed.is_some()
+        });
+    }
+
+    fn revalidate_affected_governance(&mut self, affected: &std::collections::BTreeSet<Bytes32>) {
+        let height = self.state.height.saturating_add(1);
+        let epoch = epoch_for_height(height);
+        let state = &self.state;
+        self.governance_mempool.retain(|op| {
+            let id = indra_state::pending::governance_op_id(op);
+            if !affected.contains(&id) {
+                return true;
+            }
+            let mut scratch = state.clone();
+            let refreshed = match self.verified_governance.get(&id) {
+                Some(verified)
+                    if indra_state::pending::governance_authority_unchanged(
+                        state, op, verified,
+                    ) =>
+                {
+                    indra_state::try_apply_verified_governance_candidate(
+                        &mut scratch,
+                        op,
+                        epoch,
+                        height,
+                    )
+                    .is_ok()
+                    .then(|| verified.clone())
+                }
+                _ => indra_state::pending::verify_pending_governance(state, op, epoch, height).ok(),
+            };
+            if let Some(verified) = &refreshed {
+                self.governance_dependency_index
+                    .insert(id, governance_footprint(op, epoch));
+                self.verified_governance.insert(id, verified.clone());
+            } else {
+                self.governance_dependency_index.remove(&id);
+                self.verified_governance.remove(&id);
+            }
+            refreshed.is_some()
+        });
+    }
+
+    fn revalidate_affected_slashes(&mut self, affected: &std::collections::BTreeSet<Bytes32>) {
+        let height = self.state.height.saturating_add(1);
+        let epoch = epoch_for_height(height);
+        let state = &self.state;
+        self.pending_slashes.retain(|evidence| {
+            let id = compute_slash_evidence_v2_hash(evidence);
+            if !affected.contains(&id) {
+                return true;
+            }
+            let mut scratch = state.clone();
+            let valid = indra_state::try_apply_verified_slash_candidate(
+                &mut scratch,
+                evidence,
+                height,
+                None,
+            )
+            .is_ok();
+            if valid {
+                self.slash_dependency_index
+                    .insert(id, slash_footprint(state, evidence, id, epoch));
+            } else {
+                self.slash_dependency_index.remove(&id);
+            }
+            valid
+        });
+    }
+
     /// Initialise a node from its configuration.
     pub fn init(config: NodeConfig) -> NodeResult<Self> {
         if let Err(errors) = crate::config::validate_pool_capacities(
@@ -232,6 +544,7 @@ impl NodeEngine {
                 (None, None) => (None, None, None),
             };
 
+        let pending_dependency_epoch = epoch_for_height(state.height.saturating_add(1));
         Ok(Self {
             config,
             state,
@@ -239,6 +552,12 @@ impl NodeEngine {
             staking_mempool: Vec::new(),
             governance_mempool: Vec::new(),
             pending_slashes: Vec::new(),
+            staking_dependency_index: DependencyIndex::default(),
+            governance_dependency_index: DependencyIndex::default(),
+            slash_dependency_index: DependencyIndex::default(),
+            pending_dependency_epoch,
+            verified_staking: std::collections::BTreeMap::new(),
+            verified_governance: std::collections::BTreeMap::new(),
             block_store,
             epoch_store,
             state_store,
@@ -283,35 +602,161 @@ impl NodeEngine {
 
     /// Add a staking operation to the pending pool.
     pub fn add_staking_op(&mut self, op: StakingOp) -> NodeResult<()> {
+        self.ensure_pending_indexes();
         op.validate_structure()
             .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
-        let signer_id = op.signer_id();
-        let cold_authorization = op.cold_authorization();
-        let mut scratch = self.state.clone();
         let validation_height = self.state.height.saturating_add(1);
-        let mut valid_pending = Vec::with_capacity(self.staking_mempool.len());
-        for pending in std::mem::take(&mut self.staking_mempool) {
-            match try_apply_staking_candidate(&mut scratch, &pending, validation_height) {
-                Ok(()) => valid_pending.push(pending),
-                Err(error) => {
-                    eprintln!("[staking] pruning invalid pending op during admission: {error}")
-                }
+        let verified =
+            indra_state::pending::verify_pending_staking(&self.state, &op, validation_height)
+                .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
+        let epoch = epoch_for_height(validation_height);
+        let footprint = staking_footprint(&self.state, &op, epoch);
+        let exclusive_conflict = footprint.iter().any(|key| {
+            matches!(
+                key,
+                DependencyKey::StakingNonce(_)
+                    | DependencyKey::Utxo(_)
+                    | DependencyKey::StakePosition(_)
+                    | DependencyKey::ValidatorKey(_)
+            ) && self.staking_dependency_index.contains_key(*key)
+        });
+        if exclusive_conflict {
+            return Err(NodeError::InvalidStakingOp(
+                "pending staking operation conflicts with an existing reservation".into(),
+            ));
+        }
+        let new_position_validator = footprint.iter().find_map(|key| match key {
+            DependencyKey::PendingPositionSlot(id) => Some(*id),
+            _ => None,
+        });
+        if let Some(validator_id) = new_position_validator {
+            let global_reserved = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingGlobalPositionSlot])
+                .len();
+            let validator_reserved = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingPositionSlot(validator_id)])
+                .len();
+            let global_used = self.state.stake_positions.len();
+            let validator_used = self
+                .state
+                .stake_positions
+                .values()
+                .filter(|position| position.validator_id == validator_id)
+                .count();
+            if global_used.saturating_add(global_reserved) >= MAX_STAKE_POSITIONS_TOTAL
+                || validator_used.saturating_add(validator_reserved)
+                    >= MAX_STAKE_POSITIONS_PER_VALIDATOR
+            {
+                return Err(NodeError::InvalidStakingOp(
+                    "pending staking reservations exhaust stake-position capacity".into(),
+                ));
             }
         }
-        self.staking_mempool = valid_pending;
-        try_apply_staking_candidate(&mut scratch, &op, validation_height)
-            .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
-        if self.staking_mempool.iter().any(|existing| {
-            existing.signer_id() == signer_id
-                && match (existing.cold_authorization(), cold_authorization) {
-                    (Some(existing), Some(submitted)) => existing == submitted,
-                    (None, None) => existing.nonce == op.nonce,
-                    _ => false,
-                }
+        let exit_position = footprint.iter().find_map(|key| match key {
+            DependencyKey::PendingTrancheSlot(id) => Some(*id),
+            _ => None,
+        });
+        if let Some(position_id) = exit_position {
+            let validator_id = self
+                .state
+                .stake_positions
+                .get(&position_id)
+                .expect("verified exit footprint has a canonical position")
+                .validator_id;
+            let reserved_position = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingTrancheSlot(position_id)])
+                .len();
+            let reserved_validator = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingValidatorTrancheSlot(validator_id)])
+                .len();
+            let reserved_global = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingGlobalTrancheSlot])
+                .len();
+            let used_position = self.state.tranche_ids_for_position(&position_id).len();
+            let used_validator = self
+                .state
+                .unbonding_tranches
+                .values()
+                .filter(|tranche| {
+                    self.state
+                        .stake_positions
+                        .get(&tranche.position_id)
+                        .is_some_and(|position| position.validator_id == validator_id)
+                })
+                .count();
+            let used_global = self.state.unbonding_tranches.len();
+            if used_position.saturating_add(reserved_position) >= MAX_TRANCHES_PER_POSITION
+                || used_validator.saturating_add(reserved_validator) >= MAX_TRANCHES_PER_VALIDATOR
+                || used_global.saturating_add(reserved_global) >= MAX_TRANCHES_TOTAL
+            {
+                return Err(NodeError::InvalidStakingOp(
+                    "pending staking reservations exhaust tranche capacity".into(),
+                ));
+            }
+        }
+        if footprint.contains(&DependencyKey::PendingGlobalFinalExitSlot) {
+            let reserved_global = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingGlobalFinalExitSlot])
+                .len();
+            let active_global = self
+                .state
+                .stake_positions
+                .values()
+                .filter(|position| position.active.is_some())
+                .count();
+            if self
+                .state
+                .unbonding_tranches
+                .len()
+                .saturating_add(active_global)
+                .saturating_add(reserved_global)
+                >= MAX_TRANCHES_TOTAL
+            {
+                return Err(NodeError::InvalidStakingOp(
+                    "pending staking reservations exhaust global final-exit capacity".into(),
+                ));
+            }
+        }
+        if let Some(validator_id) = footprint.iter().find_map(|key| match key {
+            DependencyKey::PendingValidatorFinalExitSlot(id) => Some(*id),
+            _ => None,
         }) {
-            return Err(NodeError::InvalidStakingOp(
-                "duplicate staking op nonce".into(),
-            ));
+            let reserved = self
+                .staking_dependency_index
+                .affected([DependencyKey::PendingValidatorFinalExitSlot(validator_id)])
+                .len();
+            let active = self
+                .state
+                .stake_positions
+                .values()
+                .filter(|position| {
+                    position.validator_id == validator_id && position.active.is_some()
+                })
+                .count();
+            let tranches = self
+                .state
+                .unbonding_tranches
+                .values()
+                .filter(|tranche| {
+                    self.state
+                        .stake_positions
+                        .get(&tranche.position_id)
+                        .is_some_and(|position| position.validator_id == validator_id)
+                })
+                .count();
+            if tranches.saturating_add(active).saturating_add(reserved)
+                >= MAX_TRANCHES_PER_VALIDATOR
+            {
+                return Err(NodeError::InvalidStakingOp(
+                    "pending staking reservations exhaust validator final-exit capacity".into(),
+                ));
+            }
         }
         if self.staking_mempool.len() >= self.config.staking_mempool_capacity {
             return Err(NodeError::InvalidStakingOp(format!(
@@ -319,25 +764,29 @@ impl NodeEngine {
                 self.config.staking_mempool_capacity
             )));
         }
+        let id = indra_state::pending::staking_op_id(&op);
         self.staking_mempool.push(op);
+        self.staking_dependency_index.insert(id, footprint);
+        self.verified_staking.insert(id, verified);
+        self.debug_assert_pending_indexes();
         Ok(())
     }
 
     /// Add a governance operation to the pending pool.
     pub fn add_governance_op(&mut self, op: GovernanceOpV2) -> NodeResult<()> {
-        let signer_id = op.signer_id;
-        let cold_authorization = op.cold_authorization();
+        self.ensure_pending_indexes();
         let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
-        validate_governance_op(&self.state, &op, current_epoch, &self.state.chain_id)
-            .map_err(|error| NodeError::InvalidGovernanceOp(error.to_string()))?;
-        if self.governance_mempool.iter().any(|existing| {
-            existing.signer_id == signer_id
-                && match (existing.cold_authorization(), cold_authorization) {
-                    (Some(existing), Some(submitted)) => existing == submitted,
-                    (None, None) => existing.nonce == op.nonce,
-                    _ => false,
-                }
-        }) {
+        let verified = indra_state::pending::verify_pending_governance(
+            &self.state,
+            &op,
+            current_epoch,
+            self.state.height.saturating_add(1),
+        )
+        .map_err(|error| NodeError::InvalidGovernanceOp(error.to_string()))?;
+        if self
+            .governance_dependency_index
+            .contains_key(DependencyKey::GovernanceNonce(op.signer_id))
+        {
             return Err(NodeError::InvalidGovernanceOp(
                 "duplicate governance op nonce".into(),
             ));
@@ -348,39 +797,23 @@ impl NodeEngine {
                 self.config.governance_mempool_capacity
             )));
         }
+        let id = indra_state::pending::governance_op_id(&op);
+        let footprint = governance_footprint(&op, current_epoch);
         self.governance_mempool.push(op);
+        self.governance_dependency_index.insert(id, footprint);
+        self.verified_governance.insert(id, verified);
+        self.debug_assert_pending_indexes();
         Ok(())
-    }
-
-    /// Remove governance operations that are no longer valid against the
-    /// current tip before selecting them for a new block.
-    pub fn prune_invalid_governance_ops(&mut self) {
-        if self.governance_mempool.is_empty() {
-            return;
-        }
-        let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
-        let chain_id = self.state.chain_id.clone();
-        let state = self.state.clone();
-        self.governance_mempool.retain(|op| {
-            let valid = validate_governance_op(&state, op, current_epoch, &chain_id).is_ok();
-            if !valid {
-                eprintln!(
-                    "[governance] evicting invalid pending op signer={} nonce={}",
-                    hex::encode(&op.signer_id.0[..4]),
-                    op.nonce
-                );
-            }
-            valid
-        });
     }
 
     /// Validate and add slash evidence to the bounded pending pool.
     pub fn add_slash_evidence(&mut self, evidence: SlashEvidenceV1) -> NodeResult<()> {
-        let hash = compute_pending_slash_evidence_hash(&evidence);
-        let already_pending = self
-            .pending_slashes
-            .iter()
-            .any(|existing| compute_pending_slash_evidence_hash(existing) == hash);
+        self.ensure_pending_indexes();
+        let already_pending = self.pending_slashes.iter().any(|existing| {
+            existing.validator_id == evidence.validator_id
+                && existing.vote_1 == evidence.vote_1
+                && existing.vote_2 == evidence.vote_2
+        });
         if already_pending {
             return Ok(());
         }
@@ -437,7 +870,15 @@ impl NodeEngine {
             self.state.height.saturating_add(1),
             None,
         )?;
-        self.pending_slashes.push(evidence);
+        let footprint = slash_footprint(
+            &self.state,
+            &proof_evidence,
+            v2_hash,
+            epoch_for_height(self.state.height.saturating_add(1)),
+        );
+        self.pending_slashes.push(proof_evidence);
+        self.slash_dependency_index.insert(v2_hash, footprint);
+        self.debug_assert_pending_indexes();
         Ok(())
     }
 
@@ -447,14 +888,24 @@ impl NodeEngine {
             .iter()
             .map(|evidence| evidence.validator_id)
             .collect();
+        let removed: Vec<_> = self
+            .pending_slashes
+            .iter()
+            .filter(|pending| slashed.contains(&pending.validator_id))
+            .map(compute_slash_evidence_v2_hash)
+            .collect();
         self.pending_slashes
             .retain(|pending| !slashed.contains(&pending.validator_id));
+        for id in removed {
+            self.slash_dependency_index.remove(&id);
+        }
     }
 
     /// Select all candidate block contents against one evolving detached state.
     /// Pool order is preserved for staking, governance, and slashing; transaction
     /// ordering remains the mempool's age/fee/tx-id policy.
     fn select_block_contents(&mut self) -> SelectedBlockContents {
+        self.ensure_pending_indexes();
         let height = self.state.height.saturating_add(1);
         let current_epoch = epoch_for_height(height);
         let mut scratch = self.state.clone();
@@ -504,10 +955,20 @@ impl NodeEngine {
                     staking_ops.push(op.clone());
                     retained_staking.push(op);
                 }
-                Err(error) => eprintln!(
-                    "[staking] evicting conflicting candidate signer={}: {error}",
-                    hex::encode(&op.signer_id().0[..4]),
-                ),
+                Err(error) => {
+                    let id = indra_state::pending::staking_op_id(&op);
+                    if !retained_staking
+                        .iter()
+                        .any(|retained| indra_state::pending::staking_op_id(retained) == id)
+                    {
+                        self.staking_dependency_index.remove(&id);
+                        self.verified_staking.remove(&id);
+                    }
+                    eprintln!(
+                        "[staking] evicting conflicting candidate signer={}: {error}",
+                        hex::encode(&op.signer_id().0[..4]),
+                    );
+                }
             }
         }
         self.staking_mempool = retained_staking;
@@ -524,11 +985,21 @@ impl NodeEngine {
                     governance_ops.push(op.clone());
                     retained_governance.push(op);
                 }
-                Err(error) => eprintln!(
-                    "[governance] evicting conflicting candidate signer={} nonce={}: {error}",
-                    hex::encode(&op.signer_id.0[..4]),
-                    op.nonce,
-                ),
+                Err(error) => {
+                    let id = indra_state::pending::governance_op_id(&op);
+                    if !retained_governance
+                        .iter()
+                        .any(|retained| indra_state::pending::governance_op_id(retained) == id)
+                    {
+                        self.governance_dependency_index.remove(&id);
+                        self.verified_governance.remove(&id);
+                    }
+                    eprintln!(
+                        "[governance] evicting conflicting candidate signer={} nonce={}: {error}",
+                        hex::encode(&op.signer_id.0[..4]),
+                        op.nonce,
+                    );
+                }
             }
         }
         self.governance_mempool = retained_governance;
@@ -540,44 +1011,28 @@ impl NodeEngine {
                 retained_slashes.push(evidence);
                 continue;
             }
-            let proof_evidence = self
-                .state
-                .snapshot_for_consensus_height(evidence.vote_1.height)
-                .ok()
-                .and_then(|snapshot| {
-                    snapshot
-                        .entry_with_position(&evidence.validator_id)
-                        .and_then(|(position, _)| {
-                            build_slash_membership_proof(snapshot, position).ok()
-                        })
-                })
-                .map(|membership_proof| SlashEvidenceV2 {
-                    validator_id: evidence.validator_id,
-                    vote_1: evidence.vote_1.clone(),
-                    vote_2: evidence.vote_2.clone(),
-                    membership_proof,
-                });
-            let Some(proof_evidence) = proof_evidence else {
-                eprintln!("[slash] evicting candidate with unavailable membership proof");
-                continue;
-            };
             match try_apply_slash_candidate(
                 &mut scratch,
-                &proof_evidence,
+                &evidence,
                 height,
                 reporter_pubkey.as_ref(),
             ) {
                 Ok(()) => {
-                    slash_evidence.push(proof_evidence);
+                    slash_evidence.push(evidence.clone());
                     retained_slashes.push(evidence);
                 }
-                Err(error) => eprintln!(
-                    "[slash] evicting conflicting candidate validator={}: {error}",
-                    hex::encode(&evidence.validator_id.0[..4]),
-                ),
+                Err(error) => {
+                    self.slash_dependency_index
+                        .remove(&compute_slash_evidence_v2_hash(&evidence));
+                    eprintln!(
+                        "[slash] evicting conflicting candidate validator={}: {error}",
+                        hex::encode(&evidence.validator_id.0[..4]),
+                    );
+                }
             }
         }
         self.pending_slashes = retained_slashes;
+        self.debug_assert_pending_indexes();
 
         SelectedBlockContents {
             transactions,
@@ -587,60 +1042,34 @@ impl NodeEngine {
         }
     }
 
-    /// Revalidate staking operations after canonical state advances.
-    fn prune_invalid_staking_ops(&mut self) {
-        let height = self.state.height.saturating_add(1);
-        let state = self.state.clone();
-        self.staking_mempool.retain(|op| {
-            let mut scratch = state.clone();
-            try_apply_staking_candidate(&mut scratch, op, height).is_ok()
-        });
-    }
-
-    /// Revalidate pending slash evidence after canonical state advances.
-    fn prune_invalid_slash_evidence(&mut self) {
-        let height = self.state.height.saturating_add(1);
-        let state = self.state.clone();
-        self.pending_slashes.retain(|evidence| {
-            let proof = state
-                .snapshot_for_consensus_height(evidence.vote_1.height)
-                .ok()
-                .and_then(|snapshot| {
-                    snapshot
-                        .entry_with_position(&evidence.validator_id)
-                        .and_then(|(position, _)| {
-                            build_slash_membership_proof(snapshot, position).ok()
-                        })
-                });
-            let Some(membership_proof) = proof else {
-                return false;
-            };
-            let evidence = SlashEvidenceV2 {
-                validator_id: evidence.validator_id,
-                vote_1: evidence.vote_1.clone(),
-                vote_2: evidence.vote_2.clone(),
-                membership_proof,
-            };
-            let mut scratch = state.clone();
-            try_apply_slash_candidate(&mut scratch, &evidence, height, None).is_ok()
-        });
-    }
-
     /// Remove staking operations included in a committed block.
     pub fn evict_committed_staking_ops(&mut self, committed_ops: &[StakingOp]) {
         for op in committed_ops {
             let signer_id = op.signer_id();
             let cold_authorization = op.cold_authorization();
+            let removed: Vec<_> = self
+                .staking_mempool
+                .iter()
+                .filter(|existing| {
+                    if existing.signer_id() != signer_id {
+                        return false;
+                    }
+                    match (existing.cold_authorization(), cold_authorization) {
+                        (Some(existing), Some(committed)) => existing == committed,
+                        (None, None) => existing.nonce == op.nonce,
+                        _ => false,
+                    }
+                })
+                .map(indra_state::pending::staking_op_id)
+                .collect();
+            let removed_set: std::collections::BTreeSet<_> = removed.iter().copied().collect();
             self.staking_mempool.retain(|existing| {
-                if existing.signer_id() != signer_id {
-                    return true;
-                }
-                !match (existing.cold_authorization(), cold_authorization) {
-                    (Some(existing), Some(committed)) => existing == committed,
-                    (None, None) => existing.nonce == op.nonce,
-                    _ => false,
-                }
+                !removed_set.contains(&indra_state::pending::staking_op_id(existing))
             });
+            for id in removed {
+                self.staking_dependency_index.remove(&id);
+                self.verified_staking.remove(&id);
+            }
         }
     }
 
@@ -649,16 +1078,29 @@ impl NodeEngine {
         for op in committed_ops {
             let signer_id = op.signer_id;
             let cold_authorization = op.cold_authorization();
+            let removed: Vec<_> = self
+                .governance_mempool
+                .iter()
+                .filter(|existing| {
+                    if existing.signer_id != signer_id {
+                        return false;
+                    }
+                    match (existing.cold_authorization(), cold_authorization) {
+                        (Some(existing), Some(committed)) => existing == committed,
+                        (None, None) => existing.nonce == op.nonce,
+                        _ => false,
+                    }
+                })
+                .map(indra_state::pending::governance_op_id)
+                .collect();
+            let removed_set: std::collections::BTreeSet<_> = removed.iter().copied().collect();
             self.governance_mempool.retain(|existing| {
-                if existing.signer_id != signer_id {
-                    return true;
-                }
-                !match (existing.cold_authorization(), cold_authorization) {
-                    (Some(existing), Some(committed)) => existing == committed,
-                    (None, None) => existing.nonce == op.nonce,
-                    _ => false,
-                }
+                !removed_set.contains(&indra_state::pending::governance_op_id(existing))
             });
+            for id in removed {
+                self.governance_dependency_index.remove(&id);
+                self.verified_governance.remove(&id);
+            }
         }
     }
 
@@ -743,10 +1185,6 @@ impl NodeEngine {
             })?
             .clone();
 
-        self.prune_invalid_staking_ops();
-        self.prune_invalid_governance_ops();
-        self.prune_invalid_slash_evidence();
-
         let election_result = election_result.ok_or_else(|| {
             NodeError::Consensus(indra_consensus::ConsensusError::WrongProposer {
                 reason: "missing authoritative election result",
@@ -775,12 +1213,6 @@ impl NodeEngine {
         );
         let result =
             produce_block(&template, &mut self.state, election).map_err(NodeError::Consensus);
-        if result.is_err() {
-            self.mempool.evict_invalid(&self.state);
-            self.prune_invalid_staking_ops();
-            self.prune_invalid_governance_ops();
-            self.prune_invalid_slash_evidence();
-        }
         result
     }
 
@@ -1091,7 +1523,7 @@ impl NodeEngine {
 
     /// Import a block that has been committed (QC formed).
     pub fn commit_block(&mut self, block: &indra_core::types::block::BlockV1) -> NodeResult<()> {
-        let epoch_record = import_block(
+        let outcome = import_block_with_effects(
             block,
             &mut self.state,
             &mut self.mempool,
@@ -1099,7 +1531,7 @@ impl NodeEngine {
             &self.state_store,
             current_timestamp_secs(),
         )?;
-        if let Some(record) = epoch_record {
+        if let Some(record) = outcome.epoch_record {
             self.epoch_store.append(&record)?;
         }
         // QC signer liveness is updated inside `apply_block` so live import,
@@ -1117,9 +1549,7 @@ impl NodeEngine {
         self.evict_committed_staking_ops(&block.staking_ops);
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
-        self.prune_invalid_staking_ops();
-        self.prune_invalid_governance_ops();
-        self.prune_invalid_slash_evidence();
+        self.apply_pending_canonical_effects(&outcome.effects);
         Ok(())
     }
 
@@ -1344,7 +1774,9 @@ mod tests {
         TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
     };
     use indra_core::types::slashing::SlashEvidenceV1;
-    use indra_core::types::stake_position::{PositionCustodyV1, StakePositionV1};
+    use indra_core::types::stake_position::{
+        ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1,
+    };
     use indra_core::types::staking::{StakeDepositProof, StakingOpBody};
     use indra_core::types::transaction::{InputV1, OutputV1, TransactionV1};
     use indra_core::types::vote::{VoteStep, VoteV1};
@@ -1795,24 +2227,6 @@ mod tests {
         op
     }
 
-    fn dummy_slash_evidence(seed: u8) -> SlashEvidenceV1 {
-        let validator_id = Bytes32::from([seed; 32]);
-        let vote = |block_byte| VoteV1 {
-            height: 7,
-            round: 0,
-            step: VoteStep::Precommit,
-            block_hash: Bytes32::from([block_byte; 32]),
-            validator_id,
-            election_result_hash: None,
-            signature: dummy_signature(),
-        };
-        SlashEvidenceV1 {
-            validator_id,
-            vote_1: vote(0xAA),
-            vote_2: vote(0xBB),
-        }
-    }
-
     fn signed_slash_evidence(
         engine: &NodeEngine,
         keypair: &HybridKeypair,
@@ -1849,6 +2263,22 @@ mod tests {
                 keypair,
             )
             .unwrap(),
+        }
+    }
+
+    fn proof_carrying_slash(engine: &NodeEngine, evidence: &SlashEvidenceV1) -> SlashEvidenceV2 {
+        let snapshot = engine
+            .state
+            .snapshot_for_consensus_height(evidence.vote_1.height)
+            .unwrap();
+        let (position, _) = snapshot
+            .entry_with_position(&evidence.validator_id)
+            .unwrap();
+        SlashEvidenceV2 {
+            validator_id: evidence.validator_id,
+            vote_1: evidence.vote_1.clone(),
+            vote_2: evidence.vote_2.clone(),
+            membership_proof: build_slash_membership_proof(snapshot, position).unwrap(),
         }
     }
 
@@ -2406,9 +2836,6 @@ mod tests {
         let dir = temp_dir("slash_pool_capacity");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let keypair = install_active_validator(&mut engine, [0xA3; 32], "slash-cap");
-        engine.pending_slashes = (0..MAX_PENDING_SLASH_EVIDENCE)
-            .map(|index| dummy_slash_evidence((index % 255) as u8))
-            .collect();
         let evidence = signed_slash_evidence(
             &engine,
             &keypair,
@@ -2420,6 +2847,18 @@ mod tests {
             Bytes32::from([9; 32]),
             Bytes32::from([10; 32]),
         );
+        let template = proof_carrying_slash(&engine, &evidence);
+        engine.pending_slashes = (0..MAX_PENDING_SLASH_EVIDENCE)
+            .map(|index| {
+                let mut pending = template.clone();
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                pending.validator_id = Bytes32::from(id);
+                pending.vote_1.validator_id = pending.validator_id;
+                pending.vote_2.validator_id = pending.validator_id;
+                pending
+            })
+            .collect();
         let error = engine.add_slash_evidence(evidence).unwrap_err().to_string();
         assert!(error.contains("slash evidence pool full"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2452,7 +2891,10 @@ mod tests {
             Bytes32::from([0x13; 32]),
             Bytes32::from([0x14; 32]),
         );
-        engine.pending_slashes = vec![first, second];
+        engine.pending_slashes = vec![
+            proof_carrying_slash(&engine, &first),
+            proof_carrying_slash(&engine, &second),
+        ];
 
         let selected = engine.select_block_contents().slash_evidence;
         assert_eq!(selected.len(), 1);
@@ -2462,19 +2904,561 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(any())]
     #[test]
-    fn evict_committed_slashes_removes_correct() {
-        let dir = temp_dir("slash_evict");
-        let config = NodeConfig::local_test(dir.clone());
-        let mut engine = NodeEngine::init(config).unwrap();
-        let first = dummy_slash_evidence(0xA2);
-        let second = dummy_slash_evidence(0xA3);
-        engine.add_slash_evidence(first.clone());
-        engine.add_slash_evidence(second.clone());
-        engine.evict_committed_slashes(&[first]);
-        assert_eq!(engine.pending_slashes, vec![second]);
+    fn stored_v2_slash_survives_consensus_snapshot_retention_expiry() {
+        let dir = temp_dir("slash_v2_outlives_snapshot");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let keypair = install_active_validator(&mut engine, [0xA5; 32], "slash-v2");
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x21; 32]),
+            Bytes32::from([0x22; 32]),
+        );
+        engine.add_slash_evidence(evidence).unwrap();
+        assert_eq!(engine.pending_slashes.len(), 1);
+
+        engine.state.consensus_snapshots.clear();
+        let selected = engine.select_block_contents().slash_evidence;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], engine.pending_slashes[0]);
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn targeted_mixed_pool_invalidation_matches_full_authoritative_oracle() {
+        let dir = temp_dir("targeted_mixed_pool_differential");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+
+        let staking_hot = install_active_validator(&mut engine, [0xB1; 32], "diff-staking");
+        let staking_cold = cold_keypair_for_seed([0xB1; 32]);
+        let staking =
+            valid_set_commission_staking_op(&engine, &staking_hot, &staking_cold, 1, 1_100);
+        engine.add_staking_op(staking).unwrap();
+
+        let governance_hot = install_active_validator(&mut engine, [0xB2; 32], "diff-governance");
+        let governance_cold = cold_keypair_for_seed([0xB2; 32]);
+        let governance =
+            valid_cold_governance_propose_op(&mut engine, &governance_hot, &governance_cold, 1);
+        let governance_deposit = match &governance.payload {
+            GovernancePayload::Propose {
+                deposit_utxo_id, ..
+            } => *deposit_utxo_id,
+            _ => unreachable!(),
+        };
+        engine.add_governance_op(governance).unwrap();
+
+        let slash_key = install_active_validator(&mut engine, [0xB3; 32], "diff-slash");
+        let slash_id = Bytes32::from(indra_crypto::sha256(&slash_key.public_key().classical.0));
+        let slash = signed_slash_evidence(
+            &engine,
+            &slash_key,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x31; 32]),
+            Bytes32::from([0x32; 32]),
+        );
+        engine.add_slash_evidence(slash).unwrap();
+
+        let staking_id = Bytes32::from(indra_crypto::sha256(&staking_hot.public_key().classical.0));
+        engine
+            .state
+            .validators
+            .get_mut(&staking_id)
+            .unwrap()
+            .cold_nonce = 1;
+        engine.state.validators.get_mut(&slash_id).unwrap().status =
+            indra_state::ValidatorStatus::Slashed;
+        engine
+            .state
+            .utxos
+            .spend_at_height(&governance_deposit, 1)
+            .unwrap();
+
+        let height = engine.state.height.saturating_add(1);
+        let epoch = epoch_for_height(height);
+        let oracle_staking: Vec<_> = engine
+            .staking_mempool
+            .iter()
+            .filter(|op| {
+                let mut scratch = engine.state.clone();
+                try_apply_staking_candidate(&mut scratch, op, height).is_ok()
+            })
+            .map(indra_state::pending::staking_op_id)
+            .collect();
+        let oracle_governance: Vec<_> = engine
+            .governance_mempool
+            .iter()
+            .filter(|op| {
+                let mut scratch = engine.state.clone();
+                try_apply_governance_candidate(&mut scratch, op, epoch, height).is_ok()
+            })
+            .map(indra_state::pending::governance_op_id)
+            .collect();
+        let oracle_slashes: Vec<_> = engine
+            .pending_slashes
+            .iter()
+            .filter(|evidence| {
+                let mut scratch = engine.state.clone();
+                try_apply_slash_candidate(&mut scratch, evidence, height, None).is_ok()
+            })
+            .map(compute_slash_evidence_v2_hash)
+            .collect();
+
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.validators_changed.extend([staking_id, slash_id]);
+        effects.spent_utxos.insert(governance_deposit);
+        engine.apply_pending_canonical_effects(&effects);
+
+        assert_eq!(
+            engine
+                .staking_mempool
+                .iter()
+                .map(indra_state::pending::staking_op_id)
+                .collect::<Vec<_>>(),
+            oracle_staking
+        );
+        assert_eq!(
+            engine
+                .governance_mempool
+                .iter()
+                .map(indra_state::pending::governance_op_id)
+                .collect::<Vec<_>>(),
+            oracle_governance
+        );
+        assert_eq!(
+            engine
+                .pending_slashes
+                .iter()
+                .map(compute_slash_evidence_v2_hash)
+                .collect::<Vec<_>>(),
+            oracle_slashes
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dependency_indexes_rebuild_cleanly_when_next_height_crosses_epoch() {
+        let dir = temp_dir("dependency_index_epoch_rebuild");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        engine.staking_mempool.push(dummy_staking_op(0xD0, 1));
+        engine.ensure_pending_indexes();
+        let before = engine.pending_dependency_epoch;
+
+        engine.state.height = indra_core::types::primitives::EPOCH_DURATION_BLOCKS - 1;
+        engine.ensure_pending_indexes();
+
+        assert_ne!(engine.pending_dependency_epoch, before);
+        assert_eq!(
+            engine.pending_dependency_epoch,
+            epoch_for_height(engine.state.height.saturating_add(1))
+        );
+        engine.debug_assert_pending_indexes();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "release-mode Task 1b performance measurement; run explicitly with --release --ignored --nocapture"]
+    fn targeted_invalidation_real_hardware_measurement() {
+        use std::time::Instant;
+
+        let dir = temp_dir("targeted_invalidation_benchmark");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+
+        let transaction_owner = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0xC1; 32]),
+            PqKeypair::from_seed(&[0xC1; 32]).unwrap(),
+        );
+        let transaction_owner_pubkey = governance_pubkey_from_keypair(&transaction_owner);
+        let transaction_utxo = engine
+            .state
+            .utxos
+            .insert(
+                governance_deposit_output(transaction_owner_pubkey, 10_000_000_000),
+                0,
+                77,
+                0,
+            )
+            .unwrap();
+        let transaction =
+            valid_tx_spending(&engine, transaction_utxo, &transaction_owner, [0; 32], 0xC1);
+        let verified_transaction = indra_state::pending::verify_pending_transaction(
+            &engine.state,
+            &transaction,
+            Mempool::tx_id(&transaction),
+            engine.state.height.saturating_add(1),
+        )
+        .unwrap();
+        let started = Instant::now();
+        for _ in 0..5_000 {
+            indra_state::pending::validate_verified_pending_transaction(
+                &engine.state,
+                &transaction,
+                &verified_transaction,
+                engine.state.height.saturating_add(1),
+            )
+            .unwrap();
+        }
+        let transaction_5k = started.elapsed();
+
+        engine.mempool.clear();
+        let input_output = engine
+            .state
+            .utxos
+            .get(&transaction_utxo)
+            .unwrap()
+            .output
+            .clone();
+        for index in 0..5_000u32 {
+            let utxo_id = engine
+                .state
+                .utxos
+                .insert(input_output.clone(), 0, 10_000 + index, 0)
+                .unwrap();
+            let mut pending = transaction.clone();
+            pending.inputs[0].utxo_id = utxo_id;
+            let mut nullifier = [0u8; 32];
+            nullifier[..4].copy_from_slice(&index.to_le_bytes());
+            nullifier[31] = 0xC1;
+            pending.inputs[0].nullifier = Bytes32::from(nullifier);
+            let signature = transaction_owner
+                .sign(&pending.signing_bytes(&engine.state.chain_id))
+                .unwrap();
+            pending.signature = HybridSignature {
+                classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+                pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+            };
+            engine
+                .mempool
+                .submit_validated(pending, &engine.state)
+                .unwrap();
+        }
+        let full_cycle_started = Instant::now();
+        engine.mempool.apply_canonical_effects(
+            &engine.state,
+            &indra_state::CanonicalStateEffects {
+                base_fee_changed: true,
+                ..Default::default()
+            },
+        );
+        let transaction_full_pool_cycle = full_cycle_started.elapsed();
+        assert_eq!(engine.mempool.len(), 5_000);
+
+        let staking_hot = install_active_validator(&mut engine, [0xC2; 32], "bench-staking");
+        let staking_cold = cold_keypair_for_seed([0xC2; 32]);
+        let staking =
+            valid_set_commission_staking_op(&engine, &staking_hot, &staking_cold, 1, 1_100);
+        let verified_staking = indra_state::pending::verify_pending_staking(
+            &engine.state,
+            &staking,
+            engine.state.height.saturating_add(1),
+        )
+        .unwrap();
+        assert!(indra_state::pending::staking_authority_unchanged(
+            &engine.state,
+            &staking,
+            &verified_staking
+        ));
+        let started = Instant::now();
+        for _ in 0..5_000 {
+            let mut scratch = engine.state.clone();
+            indra_state::try_apply_verified_staking_candidate(
+                &mut scratch,
+                &staking,
+                engine.state.height.saturating_add(1),
+            )
+            .unwrap();
+        }
+        let staking_5k_revalidation = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..5_000 {
+            std::hint::black_box(engine.state.clone());
+        }
+        let staking_5k_clone_only = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..5_000 {
+            let mut scratch = engine.state.clone();
+            try_apply_staking_candidate(
+                &mut scratch,
+                &staking,
+                engine.state.height.saturating_add(1),
+            )
+            .unwrap();
+        }
+        let staking_5k_old_full_oracle = started.elapsed();
+
+        let footprint_started = Instant::now();
+        for _ in 0..5_000 {
+            std::hint::black_box(staking_footprint(
+                &engine.state,
+                &staking,
+                epoch_for_height(engine.state.height.saturating_add(1)),
+            ));
+        }
+        let staking_5k_footprints = footprint_started.elapsed();
+
+        for nonce in 2..5_001u64 {
+            let pending = dummy_staking_op(0xD1, nonce);
+            let id = indra_state::pending::staking_op_id(&pending);
+            let footprint = staking_footprint(
+                &engine.state,
+                &pending,
+                epoch_for_height(engine.state.height.saturating_add(1)),
+            );
+            engine.staking_mempool.push(pending);
+            engine.staking_dependency_index.insert(id, footprint);
+        }
+        let admission_started = Instant::now();
+        engine.add_staking_op(staking).unwrap();
+        let staking_full_pool_admission = admission_started.elapsed();
+        assert_eq!(engine.staking_mempool.len(), 5_000);
+
+        let governance_hot = install_active_validator(&mut engine, [0xC3; 32], "bench-governance");
+        let governance_cold = cold_keypair_for_seed([0xC3; 32]);
+        let governance =
+            valid_cold_governance_propose_op(&mut engine, &governance_hot, &governance_cold, 1);
+        let height = engine.state.height.saturating_add(1);
+        let epoch = epoch_for_height(height);
+        let verified_governance = indra_state::pending::verify_pending_governance(
+            &engine.state,
+            &governance,
+            epoch,
+            height,
+        )
+        .unwrap();
+        let started = Instant::now();
+        for _ in 0..2_400 {
+            let mut scratch = engine.state.clone();
+            indra_state::try_apply_verified_governance_candidate(
+                &mut scratch,
+                &governance,
+                epoch,
+                height,
+            )
+            .unwrap();
+        }
+        let governance_2400 = started.elapsed();
+        assert!(indra_state::pending::governance_authority_unchanged(
+            &engine.state,
+            &governance,
+            &verified_governance
+        ));
+
+        // End-to-end governance measurement: populate the production pool via
+        // normal admission with 2,400 independently signed, canonically valid
+        // delegator redelegations, then make one real dependency family dirty.
+        let governance_dir = temp_dir("targeted_governance_full_pool_benchmark");
+        let mut governance_config = NodeConfig::local_test(governance_dir.clone());
+        governance_config.governance_mempool_capacity = 2_400;
+        let mut governance_engine = NodeEngine::init(governance_config).unwrap();
+        let proposer = install_active_validator(
+            &mut governance_engine,
+            [0xC5; 32],
+            "bench-governance-proposer",
+        );
+        let proposer_cold = cold_keypair_for_seed([0xC5; 32]);
+        let proposal =
+            valid_cold_governance_propose_op(&mut governance_engine, &proposer, &proposer_cold, 1);
+        let proposal_id = if let GovernancePayload::Propose { action, .. } = &proposal.payload {
+            indra_core::types::governance::compute_proposal_id(
+                proposal.signer_id,
+                action,
+                0,
+                &governance_engine.state.chain_id,
+            )
+        } else {
+            unreachable!()
+        };
+        try_apply_governance_candidate(
+            &mut governance_engine.state,
+            &proposal,
+            epoch_for_height(1),
+            1,
+        )
+        .unwrap();
+        let from =
+            install_active_validator(&mut governance_engine, [0xC6; 32], "bench-governance-from");
+        let to =
+            install_active_validator(&mut governance_engine, [0xC7; 32], "bench-governance-to");
+        let from_id = Bytes32::from(indra_crypto::sha256(&from.public_key().classical.0));
+        let to_id = Bytes32::from(indra_crypto::sha256(&to.public_key().classical.0));
+        let record = governance_engine
+            .state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap();
+        record.phase = indra_state::governance::ProposalPhase::Reveal;
+        record.reveals.insert(
+            from_id,
+            indra_state::governance::VoteReveal {
+                validator_id: from_id,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        record.reveals.insert(
+            to_id,
+            indra_state::governance::VoteReveal {
+                validator_id: to_id,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        for index in 0..2_400u32 {
+            let mut seed = [0xC8; 32];
+            seed[..4].copy_from_slice(&index.to_le_bytes());
+            let keypair = HybridKeypair::new(
+                ClassicalKeypair::from_seed(&seed),
+                PqKeypair::from_seed(&seed).unwrap(),
+            );
+            let pubkey = governance_pubkey_from_keypair(&keypair);
+            let signer_id = Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0));
+            governance_engine
+                .state
+                .delegator_identities
+                .insert(signer_id, pubkey);
+            let position = StakePositionV1::new(
+                from_id,
+                signer_id,
+                PositionCustodyV1::DelegatorIdentity {
+                    delegator_id: signer_id,
+                },
+                Some(ActiveStakeAggregateV1::new(1_000_000, 0, 0).unwrap()),
+                1,
+                0,
+            )
+            .unwrap();
+            governance_engine
+                .state
+                .stake_positions
+                .insert(position.position_id, position);
+            let mut op = GovernanceOpV2 {
+                action_type: GovernanceActionType::GovernanceRedelegate,
+                signer_id,
+                nonce: 1,
+                payload: GovernancePayload::Redelegate {
+                    proposal_id,
+                    from_validator: from_id,
+                    to_validator: to_id,
+                    amount_spark: 1,
+                },
+                signature: dummy_signature(),
+            };
+            sign_governance_op(&mut op, &keypair);
+            governance_engine.add_governance_op(op).unwrap();
+        }
+        assert_eq!(governance_engine.governance_mempool.len(), 2_400);
+        let governance_pool_started = Instant::now();
+        governance_engine.apply_pending_canonical_effects(&indra_state::CanonicalStateEffects {
+            governance_params_changed: true,
+            ..Default::default()
+        });
+        let governance_full_pool_cycle = governance_pool_started.elapsed();
+        assert_eq!(governance_engine.governance_mempool.len(), 2_400);
+
+        let slash_key = install_active_validator(&mut engine, [0xC4; 32], "bench-slash");
+        let slash = signed_slash_evidence(
+            &engine,
+            &slash_key,
+            1,
+            0,
+            0,
+            VoteStep::Precommit,
+            VoteStep::Precommit,
+            Bytes32::from([0x41; 32]),
+            Bytes32::from([0x42; 32]),
+        );
+        let slash = proof_carrying_slash(&engine, &slash);
+        let started = Instant::now();
+        for _ in 0..1_024 {
+            let mut scratch = engine.state.clone();
+            indra_state::try_apply_verified_slash_candidate(&mut scratch, &slash, height, None)
+                .unwrap();
+        }
+        let slash_1024 = started.elapsed();
+
+        // A production-admissible slash pool is bounded by proof-bearing
+        // validator membership, not merely the 1,024 memory cap. Populate one
+        // full mature-network snapshot (200 distinct validators) through the
+        // real V1 admission path and time end-to-end targeted revalidation.
+        let slash_dir = temp_dir("targeted_slash_reachable_pool_benchmark");
+        let mut slash_engine = NodeEngine::init(NodeConfig::local_test(slash_dir.clone())).unwrap();
+        let mut slash_keys = Vec::new();
+        for index in 0..200u32 {
+            let mut seed = [0xD0; 32];
+            seed[..4].copy_from_slice(&index.to_le_bytes());
+            let keypair =
+                install_active_validator(&mut slash_engine, seed, &format!("bench-slash-{index}"));
+            let validator_id =
+                Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+            slash_engine
+                .state
+                .validators
+                .get_mut(&validator_id)
+                .unwrap()
+                .stake_spark = 250_000_000_000;
+            slash_keys.push(keypair);
+        }
+        slash_engine.state.consensus_snapshots.clear();
+        slash_engine.state.reward_economic_snapshot = None;
+        slash_engine.state.slash_membership_roots.clear();
+        crate::genesis::finalize_test_genesis(&mut slash_engine.state);
+        assert_eq!(
+            slash_engine
+                .state
+                .snapshot_for_consensus_height(1)
+                .unwrap()
+                .entries()
+                .len(),
+            200
+        );
+        for (index, keypair) in slash_keys.iter().enumerate() {
+            let mut left = [0u8; 32];
+            left[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            left[31] = 0xE1;
+            let mut right = left;
+            right[31] = 0xE2;
+            let evidence = signed_slash_evidence(
+                &slash_engine,
+                keypair,
+                1,
+                0,
+                0,
+                VoteStep::Precommit,
+                VoteStep::Precommit,
+                Bytes32::from(left),
+                Bytes32::from(right),
+            );
+            slash_engine.add_slash_evidence(evidence).unwrap();
+        }
+        assert_eq!(slash_engine.pending_slashes.len(), 200);
+        let slash_pool_started = Instant::now();
+        slash_engine.apply_pending_canonical_effects(&indra_state::CanonicalStateEffects {
+            epoch_changed: true,
+            ..Default::default()
+        });
+        let slash_reachable_full_pool_cycle = slash_pool_started.elapsed();
+        assert_eq!(slash_engine.pending_slashes.len(), 200);
+
+        println!(
+            "task1b benchmark: tx_state_only_5000={transaction_5k:?} tx_full_pool_cycle_5000={transaction_full_pool_cycle:?} staking_state_only_5000={staking_5k_revalidation:?} staking_clone_only_5000={staking_5k_clone_only:?} staking_old_full_oracle_same_fixture_5000={staking_5k_old_full_oracle:?} staking_footprints_5000={staking_5k_footprints:?} staking_admission_at_4999={staking_full_pool_admission:?} governance_state_only_2400={governance_2400:?} governance_full_pool_cycle_2400={governance_full_pool_cycle:?} slash_state_only_synthetic_1024={slash_1024:?} slash_full_reachable_pool_cycle_200={slash_reachable_full_pool_cycle:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&governance_dir);
+        let _ = std::fs::remove_dir_all(&slash_dir);
     }
 
     #[test]
@@ -3102,6 +4086,30 @@ mod tests {
     }
 
     #[test]
+    fn staking_next_nonce_is_rejected_at_admission_and_targeted_pruning() {
+        let dir = temp_dir("staking_one_pending_next_nonce");
+        let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        let keypair = install_active_validator(&mut engine, [0x72; 32], "stake-next");
+        let cold = cold_keypair_for_seed([0x72; 32]);
+        let first = valid_set_commission_staking_op(&engine, &keypair, &cold, 1, 1_100);
+        let second = valid_set_commission_staking_op(&engine, &keypair, &cold, 2, 1_200);
+
+        engine.add_staking_op(first.clone()).unwrap();
+        assert!(matches!(
+            engine.add_staking_op(second.clone()),
+            Err(NodeError::InvalidStakingOp(_))
+        ));
+
+        engine.staking_mempool.push(second);
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.validators_changed.insert(first.signer_id());
+        engine.apply_pending_canonical_effects(&effects);
+        assert_eq!(engine.staking_mempool, vec![first]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn staking_mempool_rejects_structurally_invalid_staking_op_at_admission() {
         let dir = temp_dir("staking_mempool_invalid");
         let config = NodeConfig::local_test(dir.clone());
@@ -3337,7 +4345,6 @@ mod tests {
         let mut engine = NodeEngine::init(config).unwrap();
         let original_state = engine.state.clone();
 
-        engine.prune_invalid_governance_ops();
         let selected = engine.select_block_contents().governance_ops;
 
         assert!(selected.is_empty());
@@ -3541,7 +4548,10 @@ mod tests {
             Bytes32::from([0x83; 32]),
             Bytes32::from([0x84; 32]),
         );
-        engine.pending_slashes = vec![slash_a, slash_b];
+        engine.pending_slashes = vec![
+            proof_carrying_slash(&engine, &slash_a),
+            proof_carrying_slash(&engine, &slash_b),
+        ];
 
         let contents = engine.select_block_contents();
         assert_eq!(contents.transactions, vec![expected_tx.clone()]);

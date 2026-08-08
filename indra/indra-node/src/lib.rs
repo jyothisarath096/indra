@@ -38,6 +38,7 @@ pub mod error;
 pub mod genesis;
 pub mod metrics;
 pub mod net_driver;
+mod pending_dependencies;
 pub mod slash;
 pub mod state_root;
 pub mod sync;

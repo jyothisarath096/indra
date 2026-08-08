@@ -170,6 +170,90 @@ pub struct ChainState {
     pub epoch_slash_event_count: u32,
 }
 
+#[cfg(test)]
+impl ChainState {
+    /// Return every top-level state field whose value differs.
+    ///
+    /// The exhaustive destructuring is deliberate: adding a field to
+    /// `ChainState` without extending this detector is a compile error.
+    pub(crate) fn changed_fields(
+        before: &Self,
+        after: &Self,
+    ) -> std::collections::BTreeSet<crate::effects::CanonicalStateField> {
+        use crate::effects::CanonicalStateField as F;
+        let ChainState {
+            chain_id: _,
+            height: _,
+            tip_hash: _,
+            base_fee: _,
+            total_supply: _,
+            treasury_balance: _,
+            burn_buffer: _,
+            fee_reward_pool: _,
+            utxos: _,
+            nullifiers: _,
+            validators: _,
+            consensus_snapshots: _,
+            reward_economic_snapshot: _,
+            slash_membership_roots: _,
+            evicted_validator_tombstones: _,
+            stake_positions: _,
+            unbonding_tranches: _,
+            position_tranche_index: _,
+            staking_nonces: _,
+            delegator_identities: _,
+            retired_cold_classical_components: _,
+            retired_cold_pq_components: _,
+            applied_slash_hashes: _,
+            governance: _,
+            state_commitment_v2: _,
+            epoch_fees_burned: _,
+            epoch_slashed_spark: _,
+            epoch_slash_event_count: _,
+        } = before;
+        let mut changed = std::collections::BTreeSet::new();
+        macro_rules! changed {
+            ($field:ident, $variant:expr) => {
+                if before.$field != after.$field {
+                    changed.insert($variant);
+                }
+            };
+        }
+        changed!(chain_id, F::ChainId);
+        changed!(height, F::Height);
+        changed!(tip_hash, F::TipHash);
+        changed!(base_fee, F::BaseFee);
+        changed!(total_supply, F::TotalSupply);
+        changed!(treasury_balance, F::TreasuryBalance);
+        changed!(burn_buffer, F::BurnBuffer);
+        changed!(fee_reward_pool, F::FeeRewardPool);
+        changed!(utxos, F::Utxos);
+        changed!(nullifiers, F::Nullifiers);
+        changed!(validators, F::Validators);
+        changed!(consensus_snapshots, F::ConsensusSnapshots);
+        changed!(reward_economic_snapshot, F::RewardEconomicSnapshot);
+        changed!(slash_membership_roots, F::SlashMembershipRoots);
+        changed!(evicted_validator_tombstones, F::EvictedValidatorTombstones);
+        changed!(stake_positions, F::StakePositions);
+        changed!(unbonding_tranches, F::UnbondingTranches);
+        changed!(position_tranche_index, F::PositionTrancheIndex);
+        changed!(staking_nonces, F::StakingNonces);
+        changed!(delegator_identities, F::DelegatorIdentities);
+        changed!(
+            retired_cold_classical_components,
+            F::RetiredColdClassicalComponents
+        );
+        changed!(retired_cold_pq_components, F::RetiredColdPqComponents);
+        changed!(applied_slash_hashes, F::AppliedSlashHashes);
+        changed!(governance, F::Governance);
+        changed!(state_commitment_v2, F::StateCommitmentV2);
+        changed!(epoch_fees_burned, F::EpochFeesBurned);
+        changed!(epoch_slashed_spark, F::EpochSlashedSpark);
+        changed!(epoch_slash_event_count, F::EpochSlashEventCount);
+        changed
+    }
+}
+
 impl Encode for ChainState {
     fn encode(&self, buf: &mut Vec<u8>) {
         // Included: transaction signing and state-root computation depend on the configured chain.

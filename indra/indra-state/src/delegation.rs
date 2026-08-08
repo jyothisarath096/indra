@@ -42,9 +42,25 @@ pub fn apply_staking_op(
 ) -> StateResult<()> {
     op.validate_structure_at_height(current_height)
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    apply_staking_op_with_identity_activation(state, op, chain_id, current_height, true)
+    apply_staking_op_with_identity_activation_mode(state, op, chain_id, current_height, true, true)
 }
 
+/// Apply an admission-verified staking operation without repeating intrinsic crypto.
+///
+/// Callers must compare the operation's authority fingerprint with the one
+/// captured during full admission verification before using this function.
+pub fn apply_verified_staking_op(
+    state: &mut ChainState,
+    op: &StakingOp,
+    chain_id: &str,
+    current_height: u64,
+) -> StateResult<()> {
+    op.validate_structure_at_height(current_height)
+        .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
+    apply_staking_op_with_identity_activation_mode(state, op, chain_id, current_height, true, false)
+}
+
+#[cfg(test)]
 pub(crate) fn apply_staking_op_with_identity_activation(
     state: &mut ChainState,
     op: &StakingOp,
@@ -52,8 +68,32 @@ pub(crate) fn apply_staking_op_with_identity_activation(
     current_height: u64,
     identity_registry_active: bool,
 ) -> StateResult<()> {
+    apply_staking_op_with_identity_activation_mode(
+        state,
+        op,
+        chain_id,
+        current_height,
+        identity_registry_active,
+        true,
+    )
+}
+
+fn apply_staking_op_with_identity_activation_mode(
+    state: &mut ChainState,
+    op: &StakingOp,
+    chain_id: &str,
+    current_height: u64,
+    identity_registry_active: bool,
+    verify_crypto: bool,
+) -> StateResult<()> {
     if matches!(op.body, StakingOpBody::RotateValidatorColdKey { .. }) {
-        return verify_and_apply_rotate_validator_cold_key(state, op, chain_id, current_height);
+        return verify_and_apply_rotate_validator_cold_key(
+            state,
+            op,
+            chain_id,
+            current_height,
+            verify_crypto,
+        );
     }
 
     let signer_id = op.signer_id();
@@ -120,7 +160,9 @@ pub(crate) fn apply_staking_op_with_identity_activation(
                 reason: "active validator has no PQ cold key registered".into(),
             }
         })?;
-        verify_staking_sig(&cold_signing_bytes, &op.signature, &cold_classical, cold_pq)?;
+        if verify_crypto {
+            verify_staking_sig(&cold_signing_bytes, &op.signature, &cold_classical, cold_pq)?;
+        }
     } else {
         if op.cold_authorization().is_some() {
             return Err(StateError::InvalidStakingOp(
@@ -137,140 +179,141 @@ pub(crate) fn apply_staking_op_with_identity_activation(
     }
 
     let signing_bytes = op.signing_bytes(chain_id);
-    match &op.body {
-        StakingOpBody::SetCommission { validator_id, .. }
-        | StakingOpBody::SetAutoDelegate { validator_id, .. }
-            if !active_cold_validator =>
-        {
-            let validator = state
-                .validators
-                .get(validator_id)
-                .ok_or(StateError::ValidatorNotFound)?;
-            let classical_pk = validator.hybrid_classical_pk.ok_or_else(|| {
-                StateError::StakingOpSignatureInvalid {
-                    reason: "validator has no classical key registered".into(),
-                }
-            })?;
-            let pq_pk = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
-                StateError::StakingOpSignatureInvalid {
-                    reason: "validator has no PQ key registered".into(),
-                }
-            })?;
-            verify_staking_sig(&signing_bytes, &op.signature, &classical_pk, pq_pk)?;
-        }
-        StakingOpBody::UpdateNetworkAddress { validator_id, .. } => {
-            let validator = state
-                .validators
-                .get(validator_id)
-                .ok_or(StateError::ValidatorNotFound)?;
-            let classical_pk = validator.hybrid_classical_pk.ok_or_else(|| {
-                StateError::StakingOpSignatureInvalid {
-                    reason: "validator has no classical key registered".into(),
-                }
-            })?;
-            let pq_pk = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
-                StateError::StakingOpSignatureInvalid {
-                    reason: "validator has no PQ key registered".into(),
-                }
-            })?;
-            verify_staking_sig(&signing_bytes, &op.signature, &classical_pk, pq_pk)?;
-        }
-        StakingOpBody::Delegate {
-            delegator_pubkey, ..
-        } => {
-            verify_staking_sig(
-                &signing_bytes,
-                &op.signature,
-                &delegator_pubkey.classical_pk.0,
-                delegator_pubkey.pq_pk.as_slice(),
-            )?;
-        }
-        StakingOpBody::ExitStakePosition { .. } if !active_cold_validator => {
-            let owner = state
-                .delegator_identities
-                .get(&signer_id)
-                .ok_or_else(|| StateError::InvalidStakingOp("missing delegator identity".into()))?;
-            verify_staking_sig(
-                &signing_bytes,
-                &op.signature,
-                &owner.classical_pk.0,
-                owner.pq_pk.as_slice(),
-            )?;
-        }
-        StakingOpBody::ClaimRewards {
-            delegator_pubkey, ..
-        } if !active_cold_validator => {
-            verify_staking_sig(
-                &signing_bytes,
-                &op.signature,
-                &delegator_pubkey.classical_pk.0,
-                delegator_pubkey.pq_pk.as_slice(),
-            )?;
-        }
-        StakingOpBody::RegisterValidator {
-            validator_pubkey,
-            cold_pubkey,
-            cold_signature,
-            ..
-        } => {
-            let cold_pubkey = cold_pubkey.as_ref().ok_or_else(|| {
-                StateError::InvalidStakingOp(
-                    "validator registration requires a cold hybrid public key".into(),
-                )
-            })?;
-            let cold_signature = cold_signature.as_ref().ok_or_else(|| {
-                StateError::InvalidStakingOp(
-                    "validator registration requires a cold hybrid signature".into(),
-                )
-            })?;
-            let message = op
-                .register_validator_dual_signing_bytes(chain_id)
-                .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
-                .ok_or_else(|| {
+    if verify_crypto {
+        match &op.body {
+            StakingOpBody::SetCommission { validator_id, .. }
+            | StakingOpBody::SetAutoDelegate { validator_id, .. }
+                if !active_cold_validator =>
+            {
+                let validator = state
+                    .validators
+                    .get(validator_id)
+                    .ok_or(StateError::ValidatorNotFound)?;
+                let classical_pk = validator.hybrid_classical_pk.ok_or_else(|| {
+                    StateError::StakingOpSignatureInvalid {
+                        reason: "validator has no classical key registered".into(),
+                    }
+                })?;
+                let pq_pk = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
+                    StateError::StakingOpSignatureInvalid {
+                        reason: "validator has no PQ key registered".into(),
+                    }
+                })?;
+                verify_staking_sig(&signing_bytes, &op.signature, &classical_pk, pq_pk)?;
+            }
+            StakingOpBody::UpdateNetworkAddress { validator_id, .. } => {
+                let validator = state
+                    .validators
+                    .get(validator_id)
+                    .ok_or(StateError::ValidatorNotFound)?;
+                let classical_pk = validator.hybrid_classical_pk.ok_or_else(|| {
+                    StateError::StakingOpSignatureInvalid {
+                        reason: "validator has no classical key registered".into(),
+                    }
+                })?;
+                let pq_pk = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
+                    StateError::StakingOpSignatureInvalid {
+                        reason: "validator has no PQ key registered".into(),
+                    }
+                })?;
+                verify_staking_sig(&signing_bytes, &op.signature, &classical_pk, pq_pk)?;
+            }
+            StakingOpBody::Delegate {
+                delegator_pubkey, ..
+            } => {
+                verify_staking_sig(
+                    &signing_bytes,
+                    &op.signature,
+                    &delegator_pubkey.classical_pk.0,
+                    delegator_pubkey.pq_pk.as_slice(),
+                )?;
+            }
+            StakingOpBody::ExitStakePosition { .. } if !active_cold_validator => {
+                let owner = state.delegator_identities.get(&signer_id).ok_or_else(|| {
+                    StateError::InvalidStakingOp("missing delegator identity".into())
+                })?;
+                verify_staking_sig(
+                    &signing_bytes,
+                    &op.signature,
+                    &owner.classical_pk.0,
+                    owner.pq_pk.as_slice(),
+                )?;
+            }
+            StakingOpBody::ClaimRewards {
+                delegator_pubkey, ..
+            } if !active_cold_validator => {
+                verify_staking_sig(
+                    &signing_bytes,
+                    &op.signature,
+                    &delegator_pubkey.classical_pk.0,
+                    delegator_pubkey.pq_pk.as_slice(),
+                )?;
+            }
+            StakingOpBody::RegisterValidator {
+                validator_pubkey,
+                cold_pubkey,
+                cold_signature,
+                ..
+            } => {
+                let cold_pubkey = cold_pubkey.as_ref().ok_or_else(|| {
                     StateError::InvalidStakingOp(
-                        "validator registration dual authorization message is absent".into(),
+                        "validator registration requires a cold hybrid public key".into(),
                     )
                 })?;
-            let hot_pk = validator_pubkey
-                .to_crypto_pubkey()
-                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-            let cold_pk = cold_pubkey
-                .to_crypto_pubkey()
-                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-            let hot_sig = op
-                .signature
-                .to_crypto_sig()
-                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-            let cold_sig = cold_signature
-                .to_crypto_sig()
-                .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-            indra_crypto::verify_dual_hybrid(
-                &message,
-                Some(&hot_sig),
-                &hot_pk,
-                Some(&cold_sig),
-                &cold_pk,
-            )
-            .map_err(|err| StateError::StakingOpSignatureInvalid {
-                reason: err.to_string(),
-            })?;
+                let cold_signature = cold_signature.as_ref().ok_or_else(|| {
+                    StateError::InvalidStakingOp(
+                        "validator registration requires a cold hybrid signature".into(),
+                    )
+                })?;
+                let message = op
+                    .register_validator_dual_signing_bytes(chain_id)
+                    .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
+                    .ok_or_else(|| {
+                        StateError::InvalidStakingOp(
+                            "validator registration dual authorization message is absent".into(),
+                        )
+                    })?;
+                let hot_pk = validator_pubkey
+                    .to_crypto_pubkey()
+                    .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+                let cold_pk = cold_pubkey
+                    .to_crypto_pubkey()
+                    .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+                let hot_sig = op
+                    .signature
+                    .to_crypto_sig()
+                    .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+                let cold_sig = cold_signature
+                    .to_crypto_sig()
+                    .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+                indra_crypto::verify_dual_hybrid(
+                    &message,
+                    Some(&hot_sig),
+                    &hot_pk,
+                    Some(&cold_sig),
+                    &cold_pk,
+                )
+                .map_err(|err| StateError::StakingOpSignatureInvalid {
+                    reason: err.to_string(),
+                })?;
+            }
+            StakingOpBody::SelfStake {
+                validator_pubkey, ..
+            } if !active_cold_validator => {
+                verify_staking_sig(
+                    &signing_bytes,
+                    &op.signature,
+                    &validator_pubkey.classical_pk.0,
+                    validator_pubkey.pq_pk.as_slice(),
+                )?;
+            }
+            StakingOpBody::ClaimRewards { .. }
+            | StakingOpBody::SetCommission { .. }
+            | StakingOpBody::SelfStake { .. }
+            | StakingOpBody::ExitStakePosition { .. }
+            | StakingOpBody::SetAutoDelegate { .. } => {}
+            StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
         }
-        StakingOpBody::SelfStake {
-            validator_pubkey, ..
-        } if !active_cold_validator => {
-            verify_staking_sig(
-                &signing_bytes,
-                &op.signature,
-                &validator_pubkey.classical_pk.0,
-                validator_pubkey.pq_pk.as_slice(),
-            )?;
-        }
-        StakingOpBody::ClaimRewards { .. }
-        | StakingOpBody::SetCommission { .. }
-        | StakingOpBody::SelfStake { .. }
-        | StakingOpBody::ExitStakePosition { .. }
-        | StakingOpBody::SetAutoDelegate { .. } => {}
-        StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     }
 
     let result = match &op.body {
@@ -288,6 +331,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             current_height,
             identity_registry_active,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
+            verify_crypto,
         ),
         StakingOpBody::ExitStakePosition { .. } => {
             crate::stake_positions::exit_stake_position(state, op, current_height).map(|_| ())
@@ -320,6 +364,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             deposit_proof.as_ref(),
             cold_pubkey.as_ref(),
             current_height,
+            verify_crypto,
         ),
         StakingOpBody::SetCommission {
             validator_id,
@@ -350,6 +395,7 @@ pub(crate) fn apply_staking_op_with_identity_activation(
             current_height,
             identity_registry_active,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
+            verify_crypto,
         ),
         StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     };
@@ -404,6 +450,7 @@ fn verify_and_apply_rotate_validator_cold_key(
     op: &StakingOp,
     chain_id: &str,
     current_height: u64,
+    verify_crypto: bool,
 ) -> StateResult<()> {
     let StakingOpBody::RotateValidatorColdKey {
         validator_id,
@@ -461,38 +508,42 @@ fn verify_and_apply_rotate_validator_cold_key(
             reason: "Active validator has no current ML-DSA-87 cold component".into(),
         }
     })?;
-    let new_signature = new_cold_signature.as_ref().ok_or_else(|| {
-        StateError::InvalidStakingOp(
-            "cold-key rotation requires the proposed new key signature".into(),
-        )
-    })?;
-    let message = op
-        .rotate_validator_cold_key_dual_signing_bytes(chain_id)
-        .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
-        .ok_or_else(|| {
-            StateError::InvalidStakingOp("cold-key rotation authorization message is absent".into())
+    if verify_crypto {
+        let new_signature = new_cold_signature.as_ref().ok_or_else(|| {
+            StateError::InvalidStakingOp(
+                "cold-key rotation requires the proposed new key signature".into(),
+            )
         })?;
-    let current_pk = hybrid_crypto_pubkey(&old_classical, old_pq)?;
-    let proposed_pk = new_cold_pubkey
-        .to_crypto_pubkey()
-        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-    let current_sig = op
-        .signature
-        .to_crypto_sig()
-        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-    let proposed_sig = new_signature
-        .to_crypto_sig()
-        .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
-    indra_crypto::verify_dual_hybrid(
-        &message,
-        Some(&current_sig),
-        &current_pk,
-        Some(&proposed_sig),
-        &proposed_pk,
-    )
-    .map_err(|err| StateError::StakingOpSignatureInvalid {
-        reason: err.to_string(),
-    })?;
+        let message = op
+            .rotate_validator_cold_key_dual_signing_bytes(chain_id)
+            .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
+            .ok_or_else(|| {
+                StateError::InvalidStakingOp(
+                    "cold-key rotation authorization message is absent".into(),
+                )
+            })?;
+        let current_pk = hybrid_crypto_pubkey(&old_classical, old_pq)?;
+        let proposed_pk = new_cold_pubkey
+            .to_crypto_pubkey()
+            .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+        let current_sig = op
+            .signature
+            .to_crypto_sig()
+            .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+        let proposed_sig = new_signature
+            .to_crypto_sig()
+            .map_err(|reason| StateError::StakingOpSignatureInvalid { reason })?;
+        indra_crypto::verify_dual_hybrid(
+            &message,
+            Some(&current_sig),
+            &current_pk,
+            Some(&proposed_sig),
+            &proposed_pk,
+        )
+        .map_err(|err| StateError::StakingOpSignatureInvalid {
+            reason: err.to_string(),
+        })?;
+    }
 
     let mut retired_pq = [0u8; indra_crypto::PQ_PK_BYTES];
     retired_pq.copy_from_slice(old_pq);
@@ -590,9 +641,17 @@ fn require_and_validate_deposit_proof(
     _current_height: u64,
     output: &OutputV1,
     proof: Option<&StakeDepositProof>,
+    verify_crypto: bool,
 ) -> StateResult<()> {
     match proof {
-        Some(proof) => validate_staking_deposit_proof(output, proof),
+        Some(proof) if verify_crypto => validate_staking_deposit_proof(output, proof),
+        Some(proof) if proof.committed_value_spark != output.value_spark => {
+            Err(StateError::StakeDepositValueMismatch {
+                public_value: output.value_spark,
+                committed_value: proof.committed_value_spark,
+            })
+        }
+        Some(_) => Ok(()),
         None => Err(StateError::DepositProofRequired),
     }
 }
@@ -606,6 +665,7 @@ fn apply_register_validator(
     deposit_proof: Option<&StakeDepositProof>,
     cold_pubkey: Option<&ColdHybridPubKey>,
     current_height: u64,
+    verify_crypto: bool,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
         || commission_bps > state.governance.params.max_commission_bps
@@ -697,7 +757,12 @@ fn apply_register_validator(
             "registration bond UTXO is not owned by the proposed cold hybrid key".into(),
         ));
     }
-    require_and_validate_deposit_proof(current_height, &utxo_entry.output, deposit_proof)?;
+    require_and_validate_deposit_proof(
+        current_height,
+        &utxo_entry.output,
+        deposit_proof,
+        verify_crypto,
+    )?;
 
     // Bond amount is taken from output.value_spark (public metadata field).
     // This field is not individually proven to match the Pedersen commitment;
@@ -977,6 +1042,7 @@ fn apply_delegate(
     current_height: u64,
     identity_registry_active: bool,
     bond_count_cap: Option<usize>,
+    verify_crypto: bool,
 ) -> StateResult<()> {
     let validator = state
         .validators
@@ -1014,7 +1080,12 @@ fn apply_delegate(
     } else {
         None
     };
-    require_and_validate_deposit_proof(current_height, &utxo_entry.output, deposit_proof)?;
+    require_and_validate_deposit_proof(
+        current_height,
+        &utxo_entry.output,
+        deposit_proof,
+        verify_crypto,
+    )?;
 
     // Bond amount is taken from output.value_spark (public metadata field).
     // This field is not individually proven to match the Pedersen commitment;
@@ -1102,6 +1173,7 @@ fn apply_self_stake(
     current_height: u64,
     identity_registry_active: bool,
     bond_count_cap: Option<usize>,
+    verify_crypto: bool,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
     let validator = state
@@ -1131,7 +1203,12 @@ fn apply_self_stake(
             "self-stake UTXO is not owned by the validator's cold key".into(),
         ));
     }
-    require_and_validate_deposit_proof(current_height, &utxo_entry.output, deposit_proof)?;
+    require_and_validate_deposit_proof(
+        current_height,
+        &utxo_entry.output,
+        deposit_proof,
+        verify_crypto,
+    )?;
 
     // Bond amount is taken from output.value_spark (public metadata field).
     // This field is not individually proven to match the Pedersen commitment;
@@ -3115,6 +3192,245 @@ mod tests {
             bond_seed,
         );
         (op, deposit_utxo_id, validator_id)
+    }
+
+    fn cold_self_stake_op(
+        state: &ChainState,
+        deposit_utxo_id: Bytes32,
+        hot: &HybridKeypair,
+        cold: &HybridKeypair,
+        cold_nonce: u64,
+    ) -> StakingOp {
+        let validator_id = pubkey_to_id(&pubkey_from_keypair(hot));
+        let cold_key_version = state
+            .validators
+            .get(&validator_id)
+            .expect("self-stake validator")
+            .cold_key_version;
+        cold_signed_op(
+            StakingOpBody::SelfStake {
+                deposit_utxo_id,
+                validator_pubkey: pubkey_from_keypair(hot),
+                deposit_proof: Some(proof_for_bond_utxo(state, deposit_utxo_id)),
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version,
+                    cold_nonce,
+                }),
+            },
+            cold,
+            &state.chain_id,
+        )
+    }
+
+    #[test]
+    fn register_validator_accepts_distinct_hot_and_cold_custody() {
+        let mut state = ChainState::new_genesis();
+        let (op, deposit_id, validator_id) =
+            registration_op_with_cold_deposit(&mut state, 0x81, 0x82, 0x83, 0x84);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert!(!state.utxos.contains(&deposit_id));
+        let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        };
+        let position_id = indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            validator_id,
+            custody,
+        );
+        let position = state.stake_positions.get(&position_id).unwrap();
+        assert_eq!(position.validator_id, validator_id);
+        assert_eq!(position.principal_owner_id, validator_id);
+        assert_eq!(position.custody, custody);
+        assert_eq!(position.position_id, position_id);
+    }
+
+    #[test]
+    fn self_stake_accepts_distinct_hot_and_current_cold_custody() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0x85);
+        let cold = mixed_keypair(0x86, 0x87);
+        activate_cold_for_test(&mut state, validator_id, &cold);
+        let deposit_id =
+            insert_delegator_utxo(&mut state, pubkey_from_keypair(&cold), 2_000_000, 0x88);
+        let op = cold_self_stake_op(&state, deposit_id, &hot, &cold, 1);
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert!(!state.utxos.contains(&deposit_id));
+        let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        };
+        let position_id = indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            validator_id,
+            custody,
+        );
+        let position = state.stake_positions.get(&position_id).unwrap();
+        assert_eq!(position.position_id, position_id);
+        assert_eq!(position.validator_id, validator_id);
+        assert_eq!(position.principal_owner_id, validator_id);
+        assert_eq!(position.custody, custody);
+
+        // All downstream self/delegation classification is deliberately based
+        // on this logical tuple, not on the funding UTXO's custody key.
+        let snapshot = crate::epoch::take_governance_snapshot(&state);
+        assert_eq!(
+            snapshot.weights.get(&validator_id),
+            Some(&state.validators.get(&validator_id).unwrap().stake_spark)
+        );
+        assert_eq!(state.total_active_delegated_stake(), 0);
+
+        let mut rewarded = position.clone();
+        rewarded.pending_rewards_spark = DUST_LIMIT_SPARK;
+        state.stake_positions.insert(position_id, rewarded);
+        let claim = cold_signed_op(
+            StakingOpBody::ClaimRewards {
+                validator_id,
+                delegator_pubkey: pubkey_from_keypair(&hot),
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 2,
+                }),
+            },
+            &cold,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &claim, &chain_id, 2).unwrap();
+        assert_eq!(
+            state
+                .stake_positions
+                .get(&position_id)
+                .unwrap()
+                .pending_rewards_spark,
+            0
+        );
+
+        let exit = cold_signed_op(
+            StakingOpBody::ExitStakePosition {
+                position_id,
+                amount_spark: 2_000_000,
+                custody,
+                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 3,
+                }),
+            },
+            &cold,
+            &chain_id,
+        );
+        apply_staking_op(&mut state, &exit, &chain_id, 3).unwrap();
+        let tranche = state.unbonding_tranches.values().next().unwrap();
+        let indra_core::types::stake_position::UnbondingTimingV1::HeightPrecise {
+            end_epoch, ..
+        } = tranche.timing;
+        let release_height = end_epoch * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+        let refunds =
+            crate::stake_positions::release_matured_position_tranches(&mut state, release_height)
+                .unwrap();
+        assert_eq!(refunds.len(), 1);
+        assert_eq!(
+            state.utxos.get(&refunds[0]).unwrap().output.owner_pubkey,
+            pubkey_from_keypair(&cold)
+        );
+
+        let incremental_root = state.state_commitment_v2_root(release_height);
+        state.rebuild_state_commitment_v2(release_height);
+        assert_eq!(
+            state.state_commitment_v2_root(release_height),
+            incremental_root
+        );
+    }
+
+    #[test]
+    fn validator_position_deposits_reject_hot_or_foreign_cold_custody() {
+        for (label, owner_kind) in [("hot", 0_u8), ("foreign-cold", 1_u8)] {
+            let mut state = ChainState::new_genesis();
+            let hot = keypair(0x89);
+            let cold = mixed_keypair(0x8A, 0x8B);
+            let foreign_cold = mixed_keypair(0x8C, 0x8D);
+            let owner = if owner_kind == 0 {
+                pubkey_from_keypair(&hot)
+            } else {
+                pubkey_from_keypair(&foreign_cold)
+            };
+            let deposit_id = insert_delegator_utxo(
+                &mut state,
+                owner,
+                MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                0x8E + owner_kind,
+            );
+            let op = dual_signed_register_op(
+                deposit_id,
+                &hot,
+                &cold,
+                1,
+                &state.chain_id,
+                [0x8F + owner_kind; 32],
+                0x8E + owner_kind,
+            );
+            let before = state.clone();
+            let chain_id = state.chain_id.clone();
+            let error = apply_staking_op(&mut state, &op, &chain_id, 1).unwrap_err();
+            assert!(
+                matches!(error, StateError::InvalidStakingOp(ref message)
+                    if message.contains("proposed cold hybrid key")
+                        || message.contains("custody authority")),
+                "{label}: {error}"
+            );
+            assert_eq!(state, before, "{label} registration must be atomic");
+        }
+
+        for (label, owner_kind) in [("hot", 0_u8), ("foreign-cold", 1_u8)] {
+            let mut state = ChainState::new_genesis();
+            let (validator_id, hot) = make_active_validator(&mut state, 0x90);
+            let cold = mixed_keypair(0x91, 0x92);
+            let foreign_cold = mixed_keypair(0x93, 0x94);
+            activate_cold_for_test(&mut state, validator_id, &cold);
+            let owner = if owner_kind == 0 {
+                pubkey_from_keypair(&hot)
+            } else {
+                pubkey_from_keypair(&foreign_cold)
+            };
+            let deposit_id = insert_delegator_utxo(&mut state, owner, 2_000_000, 0x95 + owner_kind);
+            let op = cold_self_stake_op(&state, deposit_id, &hot, &cold, 1);
+            let before = state.clone();
+            let chain_id = state.chain_id.clone();
+            let error = apply_staking_op(&mut state, &op, &chain_id, 1).unwrap_err();
+            assert!(
+                matches!(error, StateError::InvalidStakingOp(ref message) if message.contains("cold key")),
+                "{label}: {error}"
+            );
+            assert_eq!(state, before, "{label} self-stake must be atomic");
+        }
+    }
+
+    #[test]
+    fn self_stake_uses_rotated_current_cold_key() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0x96);
+        let old_cold = mixed_keypair(0x97, 0x98);
+        let new_cold = mixed_keypair(0x99, 0x9A);
+        activate_cold_for_test(&mut state, validator_id, &old_cold);
+        let rotate =
+            dual_signed_rotate_op(validator_id, &old_cold, &new_cold, 1, 1, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &rotate, &chain_id, 1).unwrap();
+
+        let old_deposit =
+            insert_delegator_utxo(&mut state, pubkey_from_keypair(&old_cold), 2_000_000, 0x9B);
+        let old_op = cold_self_stake_op(&state, old_deposit, &hot, &new_cold, 1);
+        assert!(apply_staking_op(&mut state, &old_op, &chain_id, 2).is_err());
+        assert!(state.utxos.contains(&old_deposit));
+
+        let new_deposit =
+            insert_delegator_utxo(&mut state, pubkey_from_keypair(&new_cold), 2_000_000, 0x9C);
+        let new_op = cold_self_stake_op(&state, new_deposit, &hot, &new_cold, 1);
+        apply_staking_op(&mut state, &new_op, &chain_id, 2).unwrap();
+        assert!(!state.utxos.contains(&new_deposit));
     }
 
     #[test]

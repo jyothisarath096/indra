@@ -89,17 +89,21 @@ pub struct ProjectedBlockRoots {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlashAccounting {
+    validator_id: Bytes32,
+    slash_bps: u32,
     slash_amount: u64,
     burned: u64,
+    self_principal_slashed: u64,
     reporter_reward: u64,
 }
 
-fn apply_slash_v2_at_height_with_accounting(
+fn apply_slash_v2_at_height_with_accounting_mode(
     state: &mut ChainState,
     evidence: &SlashEvidenceV2,
     chain_id: &str,
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
+    verify_vote_crypto: bool,
 ) -> StateResult<SlashAccounting> {
     if evidence.membership_proof.entry.validator_id != evidence.validator_id
         || evidence.vote_1.validator_id != evidence.validator_id
@@ -131,7 +135,48 @@ fn apply_slash_v2_at_height_with_accounting(
         chain_id,
         height,
         reporter_pubkey,
+        verify_vote_crypto,
     )
+}
+
+fn apply_slash_v2_at_height_with_accounting(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    chain_id: &str,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<SlashAccounting> {
+    apply_slash_v2_at_height_with_accounting_mode(
+        state,
+        evidence,
+        chain_id,
+        height,
+        reporter_pubkey,
+        true,
+    )
+}
+
+/// Atomically apply proof-carrying evidence whose vote signatures were verified at admission.
+pub fn try_apply_verified_slash_candidate(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_slashing_scope();
+    let accounting = apply_slash_v2_at_height_with_accounting_mode(
+        txn.state_mut(),
+        evidence,
+        &chain_id,
+        height,
+        reporter_pubkey,
+        false,
+    )?;
+    txn.add_slash_accounting(accounting.slash_amount)?;
+    txn.commit_scratch();
+    Ok(())
 }
 
 fn slash_membership_record_for_validation(
@@ -154,6 +199,7 @@ fn apply_slash_common(
     chain_id: &str,
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
+    verify_vote_crypto: bool,
 ) -> StateResult<SlashAccounting> {
     use crate::ValidatorStatus;
     use indra_core::types::{
@@ -197,16 +243,16 @@ fn apply_slash_common(
         }
     }
 
-    verify_vote_sig_with_keys(&evidence.vote_1, &classical_pk, &pq_pk_bytes, chain_id).map_err(
-        |e| StateError::InvalidSlashEvidence {
-            reason: format!("vote_1 signature invalid: {e}"),
-        },
-    )?;
-    verify_vote_sig_with_keys(&evidence.vote_2, &classical_pk, &pq_pk_bytes, chain_id).map_err(
-        |e| StateError::InvalidSlashEvidence {
-            reason: format!("vote_2 signature invalid: {e}"),
-        },
-    )?;
+    if verify_vote_crypto {
+        verify_vote_sig_with_keys(&evidence.vote_1, &classical_pk, &pq_pk_bytes, chain_id)
+            .map_err(|e| StateError::InvalidSlashEvidence {
+                reason: format!("vote_1 signature invalid: {e}"),
+            })?;
+        verify_vote_sig_with_keys(&evidence.vote_2, &classical_pk, &pq_pk_bytes, chain_id)
+            .map_err(|e| StateError::InvalidSlashEvidence {
+                reason: format!("vote_2 signature invalid: {e}"),
+            })?;
+    }
 
     if evidence.vote_1.validator_id != validator_id || evidence.vote_2.validator_id != validator_id
     {
@@ -521,18 +567,12 @@ fn apply_slash_common(
     }
     crate::txn::complex_mutation_checkpoint()?;
 
-    eprintln!(
-        "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
-        hex::encode(&validator_id.0[..4]),
-        slash_bps,
-        burned,
-        total_principal_slashed,
-        reporter_reward,
-    );
-
     Ok(SlashAccounting {
+        validator_id,
+        slash_bps,
         slash_amount,
         burned,
+        self_principal_slashed: total_principal_slashed,
         reporter_reward,
     })
 }
@@ -698,13 +738,28 @@ pub fn apply_block(
     block: &BlockV1,
     timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
 ) -> StateResult<Option<EpochRecord>> {
+    apply_block_with_effects(state, block, timestamp_secs).map(|outcome| outcome.epoch_record)
+}
+
+/// Apply a block and return the effects of the committed canonical transition.
+///
+/// Effects are produced by the same transaction that performs mutation and
+/// are returned only after that transaction commits successfully.
+pub fn apply_block_with_effects(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<crate::AppliedBlockOutcome> {
     // Consensus atomicity: validation is read-only, then mutations happen
     // through a scoped undo log. If any mutation step fails, the transaction
     // drops without commit and rolls back every recorded change.
     let mut txn = StateTxn::begin(state, block.header.height);
     let epoch_record = apply_block_inner(&mut txn, block, timestamp_secs)?;
-    txn.commit();
-    Ok(epoch_record)
+    let effects = txn.commit();
+    Ok(crate::AppliedBlockOutcome {
+        epoch_record,
+        effects,
+    })
 }
 
 /// Atomically validate and apply one transaction to an evolving candidate state.
@@ -729,7 +784,7 @@ pub fn try_apply_transaction_candidate(
     )?;
     let mut txn = StateTxn::begin(state, height);
     apply_transaction(&mut txn, tx, height, tx_index)?;
-    txn.commit();
+    txn.commit_scratch();
     Ok(())
 }
 
@@ -745,7 +800,23 @@ pub fn try_apply_staking_candidate(
     txn.snapshot_delegator_identity_scope();
     apply_staking_op(txn.state_mut(), op, &chain_id, height)?;
     txn.after_mutation()?;
-    txn.commit();
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically apply an admission-certified staking candidate using state-only checks.
+pub fn try_apply_verified_staking_candidate(
+    state: &mut ChainState,
+    op: &StakingOp,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_staking_scope();
+    txn.snapshot_delegator_identity_scope();
+    crate::apply_verified_staking_op(txn.state_mut(), op, &chain_id, height)?;
+    txn.after_mutation()?;
+    txn.commit_scratch();
     Ok(())
 }
 
@@ -762,7 +833,24 @@ pub fn try_apply_governance_candidate(
     txn.snapshot_delegator_identity_scope();
     apply_governance_op(txn.state_mut(), op, current_epoch, height, &chain_id)?;
     txn.after_mutation()?;
-    txn.commit();
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically apply an admission-certified governance candidate using state-only checks.
+pub fn try_apply_verified_governance_candidate(
+    state: &mut ChainState,
+    op: &GovernanceOpV2,
+    current_epoch: u64,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_governance_scope();
+    txn.snapshot_delegator_identity_scope();
+    crate::apply_verified_governance_op(txn.state_mut(), op, current_epoch, height, &chain_id)?;
+    txn.after_mutation()?;
+    txn.commit_scratch();
     Ok(())
 }
 
@@ -787,7 +875,7 @@ pub fn try_apply_slash_candidate(
         reporter_pubkey,
     )?;
     txn.add_slash_accounting(accounting.slash_amount)?;
-    txn.commit();
+    txn.commit_scratch();
     Ok(())
 }
 
@@ -1025,6 +1113,13 @@ fn apply_block_inner(
             message: "slash failed on real state after shadow validation",
         })?;
         txn.add_slash_accounting(accounting.slash_amount)?;
+        txn.record_slash_event(crate::CommittedSlashEvent {
+            validator_id: accounting.validator_id,
+            slash_bps: accounting.slash_bps,
+            burned: accounting.burned,
+            self_principal_slashed: accounting.self_principal_slashed,
+            reporter_reward: accounting.reporter_reward,
+        });
     }
     // Update base fee for next block
     let next_fee = compute_next_base_fee(txn.state().base_fee, block.transactions.len());
@@ -1880,7 +1975,7 @@ mod tests {
         keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let delegator_id = pubkey_to_id_for_test(&delegator_pubkey);
+        let delegator_id = staking_delegator_id_for_test(&delegator_pubkey);
         let position = state
             .stake_positions
             .values()
@@ -2019,6 +2114,399 @@ mod tests {
             .unwrap();
         state.finalize_genesis().unwrap();
         (state, validator_id, keypair)
+    }
+
+    fn assert_verified_staking_matches_full(
+        label: &str,
+        state: &ChainState,
+        op: &StakingOp,
+        height: u64,
+    ) {
+        let verified = crate::pending::verify_pending_staking(state, op, height)
+            .unwrap_or_else(|error| panic!("{label} fixture must be independently valid: {error}"));
+        assert!(crate::pending::staking_authority_unchanged(
+            state, op, &verified
+        ));
+        let mut full = state.clone();
+        let mut targeted = state.clone();
+        let full_result = try_apply_staking_candidate(&mut full, op, height);
+        let targeted_result = try_apply_verified_staking_candidate(&mut targeted, op, height);
+        assert_eq!(full_result.is_ok(), targeted_result.is_ok());
+        assert_eq!(full.encode_to_vec(), targeted.encode_to_vec());
+
+        // A canonical nonce advance is sufficient to make every operation
+        // variant stale. This compares the retained/evicted decision, which
+        // is the pool-level observable targeted invalidation must preserve.
+        let mut changed = state.clone();
+        let signer = op.signer_id();
+        if let Some(validator) = changed.validators.get_mut(&signer) {
+            validator.cold_nonce = validator.cold_nonce.saturating_add(1);
+        } else {
+            changed.staking_nonces.insert(signer, op.nonce.max(1));
+        }
+        let mut full_changed = changed.clone();
+        let mut targeted_changed = changed;
+        assert_eq!(
+            try_apply_staking_candidate(&mut full_changed, op, height).is_ok(),
+            try_apply_verified_staking_candidate(&mut targeted_changed, op, height).is_ok(),
+        );
+    }
+
+    fn assert_verified_governance_matches_full(
+        label: &str,
+        state: &ChainState,
+        op: &GovernanceOpV2,
+        epoch: u64,
+        height: u64,
+    ) {
+        let verified = crate::pending::verify_pending_governance(state, op, epoch, height)
+            .unwrap_or_else(|error| panic!("{label} fixture must be independently valid: {error}"));
+        assert!(crate::pending::governance_authority_unchanged(
+            state, op, &verified
+        ));
+        let mut full = state.clone();
+        let mut targeted = state.clone();
+        assert_eq!(
+            try_apply_governance_candidate(&mut full, op, epoch, height).is_ok(),
+            try_apply_verified_governance_candidate(&mut targeted, op, epoch, height).is_ok(),
+        );
+        assert_eq!(full.encode_to_vec(), targeted.encode_to_vec());
+
+        let mut changed = state.clone();
+        if let Some(validator) = changed.validators.get_mut(&op.signer_id) {
+            validator.cold_nonce = validator.cold_nonce.saturating_add(1);
+        } else {
+            changed
+                .governance
+                .gov_nonces
+                .insert(op.signer_id, op.nonce.max(1));
+        }
+        let mut full_changed = changed.clone();
+        let mut targeted_changed = changed;
+        assert_eq!(
+            try_apply_governance_candidate(&mut full_changed, op, epoch, height,).is_ok(),
+            try_apply_verified_governance_candidate(&mut targeted_changed, op, epoch, height,)
+                .is_ok(),
+        );
+    }
+
+    #[test]
+    fn all_nine_staking_variants_match_full_revalidation_oracle() {
+        let height = 1;
+
+        // RegisterValidator (dual hot/new-cold authority).
+        let mut register_state = canonical_test_genesis();
+        let (register, _) = signed_register_validator_op(&mut register_state, [0x61; 32], 1);
+        assert_verified_staking_matches_full("register", &register_state, &register, height);
+
+        let mut state = canonical_test_genesis();
+        let (validator_pubkey, validator_hot, validator_id) =
+            install_governance_validator(&mut state, [0x62; 32], 2_000_000);
+        let (target_pubkey, _target_hot, target_id) =
+            install_governance_validator(&mut state, [0x63; 32], 2_000_000);
+
+        // Delegate (hot delegator authority).
+        let (delegator_pubkey, delegator) = make_test_keypair([0x64; 32]);
+        let deposit = state
+            .utxos
+            .insert(
+                output_with_value(1_000_000, delegator_pubkey.clone(), 0x64),
+                0,
+                64,
+                0,
+            )
+            .unwrap();
+        let delegate = signed_delegate_op(
+            &state,
+            validator_id,
+            deposit,
+            delegator_pubkey.clone(),
+            &delegator,
+            1,
+        );
+        assert_verified_staking_matches_full("delegate", &state, &delegate, height);
+
+        // Build the canonical position used by ExitStakePosition and ClaimRewards.
+        let mut positioned = state.clone();
+        try_apply_staking_candidate(&mut positioned, &delegate, height).unwrap();
+        let position_id = positioned
+            .stake_positions
+            .values()
+            .find(|position| position.validator_id == validator_id)
+            .unwrap()
+            .position_id;
+        let exit = signed_undelegate_op(
+            &positioned,
+            validator_id,
+            deposit,
+            delegator_pubkey.clone(),
+            &delegator,
+            2,
+        );
+        assert_verified_staking_matches_full("exit", &positioned, &exit, height + 1);
+
+        let mut rewards = positioned.clone();
+        let mut rewarded_position = rewards.stake_positions.get(&position_id).unwrap().clone();
+        rewarded_position.pending_rewards_spark = DUST_LIMIT_SPARK;
+        rewards
+            .stake_positions
+            .insert(position_id, rewarded_position);
+        let claim =
+            signed_claim_rewards_op(&rewards, validator_id, delegator_pubkey, &delegator, 2);
+        assert_verified_staking_matches_full("claim", &rewards, &claim, height + 1);
+
+        // SelfStake (validator cold authority).
+        let self_deposit = state
+            .utxos
+            .insert(
+                output_with_value(1_000_000, validator_pubkey.clone(), 0x65),
+                0,
+                65,
+                0,
+            )
+            .unwrap();
+        let mut self_stake =
+            signed_self_stake_op(&state, self_deposit, validator_pubkey, &validator_hot, 1);
+        if let StakingOpBody::SelfStake {
+            cold_authorization, ..
+        } = &mut self_stake.body
+        {
+            *cold_authorization = Some(indra_core::types::staking::ColdStakingAuthorization {
+                cold_key_version: 1,
+                cold_nonce: 1,
+            });
+        }
+        self_stake.nonce = 0;
+        sign_staking_op(&validator_hot, &state.chain_id, &mut self_stake);
+        assert_verified_staking_matches_full("self-stake", &state, &self_stake, height);
+
+        let cold_auth = Some(indra_core::types::staking::ColdStakingAuthorization {
+            cold_key_version: 1,
+            cold_nonce: 1,
+        });
+        let mut commission = StakingOp {
+            body: StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_100,
+                cold_authorization: cold_auth,
+            },
+            nonce: 0,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(&validator_hot, &state.chain_id, &mut commission);
+        assert_verified_staking_matches_full("commission", &state, &commission, height);
+
+        let mut auto_delegate = StakingOp {
+            body: StakingOpBody::SetAutoDelegate {
+                validator_id,
+                target_validator_id: target_id,
+                cold_authorization: cold_auth,
+            },
+            nonce: 0,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(&validator_hot, &state.chain_id, &mut auto_delegate);
+        assert_verified_staking_matches_full("auto-delegate", &state, &auto_delegate, height);
+
+        let proposed_cold = make_test_keypair([0x66; 32]).1;
+        let current_cold = make_test_keypair([0x62; 32]).1;
+        let mut rotate = StakingOp {
+            body: StakingOpBody::RotateValidatorColdKey {
+                validator_id,
+                current_cold_key_version: 1,
+                new_cold_key_version: 2,
+                current_cold_nonce: 1,
+                new_cold_pubkey: indra_core::types::crypto::ColdHybridPubKey {
+                    classical_pk: Bytes32::from(proposed_cold.public_key().classical.0),
+                    pq_pk: VariableBytes::from_slice(&proposed_cold.public_key().pq.0).unwrap(),
+                },
+                new_cold_signature: Some(dummy_sig()),
+            },
+            nonce: 0,
+            signature: dummy_sig(),
+        };
+        let rotate_bytes = rotate
+            .rotate_validator_cold_key_dual_signing_bytes(&state.chain_id)
+            .unwrap()
+            .unwrap();
+        rotate.signature = {
+            let sig = current_cold.sign(&rotate_bytes).unwrap();
+            HybridSignature {
+                classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+                pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+            }
+        };
+        if let StakingOpBody::RotateValidatorColdKey {
+            new_cold_signature, ..
+        } = &mut rotate.body
+        {
+            let sig = proposed_cold.sign(&rotate_bytes).unwrap();
+            *new_cold_signature = Some(HybridSignature {
+                classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+                pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+            });
+        }
+        assert_verified_staking_matches_full("rotate", &state, &rotate, height);
+
+        let mut network = StakingOp {
+            body: StakingOpBody::UpdateNetworkAddress {
+                validator_id,
+                network_addr: Some("203.0.113.10:30303".into()),
+            },
+            nonce: 1,
+            signature: dummy_sig(),
+        };
+        sign_staking_op(&validator_hot, &state.chain_id, &mut network);
+        assert_verified_staking_matches_full("network", &state, &network, u64::MAX);
+        let _ = target_pubkey;
+    }
+
+    #[test]
+    fn all_six_governance_variants_hot_and_cold_match_full_revalidation_oracle() {
+        let epoch = 0;
+        let height = 1;
+
+        let mut propose_state = canonical_test_genesis();
+        propose_state.governance.params.proposal_deposit_spark = 1_000;
+        let (proposer_pubkey, proposer_keypair, proposer_id) =
+            install_governance_validator(&mut propose_state, [0x71; 32], 100_000);
+        let deposit = propose_state
+            .utxos
+            .insert(
+                governance_deposit_output(proposer_pubkey.clone(), 1_500),
+                0,
+                71,
+                0,
+            )
+            .unwrap();
+        let propose = governance_propose_op(
+            proposer_id,
+            &proposer_keypair,
+            proposer_pubkey,
+            deposit,
+            1,
+            GovernableAction::SetMinDelegationSpark { value: 100_000 },
+        );
+        assert_verified_governance_matches_full("propose", &propose_state, &propose, epoch, height);
+
+        let vote_nonce = Bytes32::from([0x72; 32]);
+        let (commit_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Commit);
+        let commit_hash = governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
+        let commit =
+            governance_commit_op(proposer_id, &proposer_keypair, proposal_id, commit_hash, 1);
+        assert_verified_governance_matches_full("commit", &commit_state, &commit, epoch, height);
+
+        let (mut reveal_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Reveal);
+        let commit_hash = governance_vote_commit_hash(proposal_id, proposer_id, 1, vote_nonce);
+        reveal_state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap()
+            .commits
+            .insert(
+                proposer_id,
+                VoteCommit {
+                    validator_id: proposer_id,
+                    commit_hash,
+                    committed_epoch: 0,
+                },
+            );
+        reveal_state
+            .validators
+            .get_mut(&proposer_id)
+            .unwrap()
+            .cold_nonce = 1;
+        let reveal = governance_reveal_op(
+            proposer_id,
+            &proposer_keypair,
+            proposal_id,
+            1,
+            vote_nonce,
+            2,
+        );
+        assert_verified_governance_matches_full("reveal", &reveal_state, &reveal, epoch, height);
+
+        let (mut redelegate_state, _, _, _, proposal_id) =
+            governance_proposal_state(ProposalPhase::Reveal);
+        let (_, _, from_validator) =
+            install_governance_validator(&mut redelegate_state, [0x73; 32], 100_000);
+        let (_, _, to_validator) =
+            install_governance_validator(&mut redelegate_state, [0x74; 32], 100_000);
+        let proposal = redelegate_state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap();
+        for validator_id in [from_validator, to_validator] {
+            proposal.reveals.insert(
+                validator_id,
+                VoteReveal {
+                    validator_id,
+                    vote: true,
+                    revealed_epoch: 0,
+                },
+            );
+        }
+        let (delegator_pubkey, delegator_keypair) = make_test_keypair([0x75; 32]);
+        let delegator_id = governance_validator_id(&delegator_pubkey);
+        redelegate_state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey);
+        let position = indra_core::types::stake_position::StakePositionV1::new(
+            from_validator,
+            delegator_id,
+            indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                delegator_id,
+            },
+            Some(
+                indra_core::types::stake_position::ActiveStakeAggregateV1::new(100_000, 0, 0)
+                    .unwrap(),
+            ),
+            1,
+            0,
+        )
+        .unwrap();
+        redelegate_state
+            .stake_positions
+            .insert(position.position_id, position);
+        let redelegate = governance_redelegate_op(
+            delegator_id,
+            &delegator_keypair,
+            proposal_id,
+            from_validator,
+            to_validator,
+            1,
+            1,
+        );
+        assert_verified_governance_matches_full(
+            "redelegate",
+            &redelegate_state,
+            &redelegate,
+            epoch,
+            height,
+        );
+
+        let (mut execute_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::ExecDelay);
+        execute_state
+            .governance
+            .queued_executions
+            .push(QueuedExecution {
+                proposal_id,
+                action: GovernableAction::SetMinDelegationSpark { value: 100_001 },
+                executable_epoch: 0,
+                executed: false,
+            });
+        let execute = governance_execute_op(proposer_id, &proposer_keypair, proposal_id, 1);
+        assert_verified_governance_matches_full("execute", &execute_state, &execute, epoch, height);
+
+        let (cancel_state, _, proposer_keypair, proposer_id, proposal_id) =
+            governance_proposal_state(ProposalPhase::Deliberation);
+        let cancel = governance_cancel_op(proposer_id, &proposer_keypair, proposal_id, 1);
+        assert_verified_governance_matches_full("cancel", &cancel_state, &cancel, epoch, height);
     }
 
     fn capstone_accounted_value(state: &ChainState) -> u64 {
@@ -2681,6 +3169,49 @@ mod tests {
             );
         }
         crate::txn::set_fail_after_mutation(None);
+    }
+
+    #[test]
+    fn committed_effect_journal_covers_transaction_validity_state_diff() {
+        let (mut state, utxo_id, keypair, blinding, value) = state_with_utxo();
+        let tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            value,
+            blinding,
+            Bytes32::from([0xC2; 32]),
+        );
+        let nullifier = tx.inputs[0].nullifier;
+        let block = make_block(&state, vec![tx]);
+        let before = state.clone();
+        let outcome = apply_block_with_effects(&mut state, &block, 0).unwrap();
+
+        assert_ne!(before.utxos, state.utxos);
+        assert!(outcome.effects.utxo_set_changed);
+        assert!(outcome.effects.spent_utxos.contains(&utxo_id));
+        assert_ne!(before.nullifiers, state.nullifiers);
+        assert!(outcome.effects.inserted_nullifiers.contains(&nullifier));
+        assert_eq!(
+            before.base_fee != state.base_fee,
+            outcome.effects.base_fee_changed
+        );
+        assert_eq!(
+            before.staking_nonces != state.staking_nonces,
+            !outcome.effects.staking_nonces_changed.is_empty()
+        );
+        assert_eq!(
+            before.governance.params != state.governance.params,
+            outcome.effects.governance_params_changed
+        );
+        let uncovered: Vec<_> = ChainState::changed_fields(&before, &state)
+            .into_iter()
+            .filter(|field| !outcome.effects.covers_field(*field))
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "uncovered changed fields: {uncovered:?}"
+        );
     }
 
     #[test]

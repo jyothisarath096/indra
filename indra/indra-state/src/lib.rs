@@ -38,6 +38,7 @@
 pub mod apply;
 pub mod chain;
 pub mod delegation;
+pub mod effects;
 pub mod epoch;
 pub mod error;
 pub mod fee;
@@ -45,6 +46,7 @@ pub mod governance;
 pub mod governance_apply;
 pub mod identity;
 pub mod nullifier;
+pub mod pending;
 pub mod persistent;
 pub mod smt;
 pub mod stake_positions;
@@ -56,17 +58,19 @@ pub mod utxo;
 pub mod validator;
 
 pub use apply::{
-    apply_block, project_block_for_roots, try_apply_governance_candidate,
+    apply_block, apply_block_with_effects, project_block_for_roots, try_apply_governance_candidate,
     try_apply_slash_candidate, try_apply_staking_candidate, try_apply_transaction_candidate,
-    ProjectedBlockRoots,
+    try_apply_verified_governance_candidate, try_apply_verified_slash_candidate,
+    try_apply_verified_staking_candidate, ProjectedBlockRoots,
 };
 pub use chain::ChainState;
-pub use delegation::apply_staking_op;
+pub use delegation::{apply_staking_op, apply_verified_staking_op};
+pub use effects::{AppliedBlockOutcome, CanonicalStateEffects, CommittedSlashEvent};
 pub use epoch::{apply_epoch_transition, EpochTransitionContext};
 pub use error::{ConsensusSnapshotLookupError, StateError, StateResult};
 pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};
-pub use governance_apply::apply_governance_op;
+pub use governance_apply::{apply_governance_op, apply_verified_governance_op};
 pub use identity::{
     resolve_and_check_identity, resolve_delegator_identity_for_redelegation, IdentityCheckOutcome,
     IdentityError,

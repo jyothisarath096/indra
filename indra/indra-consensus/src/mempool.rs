@@ -20,7 +20,7 @@
 //! In-memory HashMap keyed by tx_id = SHA-256(encode(tx)).
 //! Phase 5 adds WAL-backed persistence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use indra_core::{
     codec::Encode,
@@ -75,6 +75,7 @@ pub struct MempoolEntry {
     pub fee_rate: u64,
     /// Canonical encoded transaction size accounted against the byte cap.
     encoded_size: usize,
+    verified: Option<indra_state::pending::VerifiedPendingTransaction>,
 }
 
 impl MempoolEntry {
@@ -92,6 +93,8 @@ pub struct Mempool {
     config: MempoolConfig,
     total_encoded_bytes: usize,
     max_encoded_bytes: usize,
+    by_utxo: BTreeMap<Bytes32, BTreeSet<Bytes32>>,
+    by_nullifier: BTreeMap<Bytes32, BTreeSet<Bytes32>>,
 }
 
 impl Mempool {
@@ -102,6 +105,8 @@ impl Mempool {
             config,
             total_encoded_bytes: 0,
             max_encoded_bytes: MAX_MEMPOOL_ENCODED_BYTES,
+            by_utxo: BTreeMap::new(),
+            by_nullifier: BTreeMap::new(),
         }
     }
 
@@ -112,6 +117,8 @@ impl Mempool {
             config,
             total_encoded_bytes: 0,
             max_encoded_bytes,
+            by_utxo: BTreeMap::new(),
+            by_nullifier: BTreeMap::new(),
         }
     }
 
@@ -281,8 +288,10 @@ impl Mempool {
                 arrived_height: current_height,
                 fee_rate,
                 encoded_size,
+                verified: None,
             },
         );
+        self.index_entry(tx_id);
         self.total_encoded_bytes = self
             .total_encoded_bytes
             .checked_add(encoded_size)
@@ -304,26 +313,30 @@ impl Mempool {
         tx: TransactionV1,
         state: &indra_state::ChainState,
     ) -> ConsensusResult<Bytes32> {
-        let mut block_nullifiers = HashSet::new();
-        let mut block_input_utxos = HashSet::new();
-        if let Err(error) = indra_state::apply::validate_transaction(
+        let tx_id = Self::tx_id(&tx);
+        let verified = match indra_state::pending::verify_pending_transaction(
             state,
             &tx,
-            &state.chain_id,
-            &mut block_nullifiers,
-            &mut block_input_utxos,
+            tx_id,
             state.height.saturating_add(1),
         ) {
-            eprintln!(
-                "[mempool] rejected invalid tx {:?}: {}",
-                Self::tx_id(&tx),
-                error
-            );
-            return Err(ConsensusError::InvalidTransaction {
-                reason: "state validation failed",
-            });
-        }
-        self.submit(tx, state.base_fee, state.height)
+            Ok(verified) => verified,
+            Err(error) => {
+                eprintln!("[mempool] rejected invalid tx {tx_id:?}: {error}");
+                return Err(ConsensusError::InvalidTransaction {
+                    reason: "state validation failed",
+                });
+            }
+        };
+        let inserted_id = self.submit(tx, state.base_fee, state.height)?;
+        let entry =
+            self.entries
+                .get_mut(&inserted_id)
+                .ok_or(ConsensusError::InvalidTransaction {
+                    reason: "inserted transaction missing from mempool",
+                })?;
+        entry.verified = Some(verified);
+        Ok(inserted_id)
     }
 
     /// Remove a transaction by ID (called after block inclusion).
@@ -333,49 +346,65 @@ impl Mempool {
         removed
     }
 
-    /// Remove all transactions whose nullifiers appear in the given set.
-    /// Called after a block is applied to evict spent transactions.
-    pub fn evict_spent(&mut self, nullifiers: &indra_state::NullifierSet) {
-        self.retain_entries(|_, entry| {
-            !entry
-                .tx
-                .inputs
-                .iter()
-                .any(|i| nullifiers.contains(&i.nullifier))
-        });
-    }
+    /// Eagerly invalidate only entries selected by committed state effects.
+    pub fn apply_canonical_effects(
+        &mut self,
+        state: &indra_state::ChainState,
+        effects: &indra_state::CanonicalStateEffects,
+    ) {
+        let mut affected = BTreeSet::new();
+        for id in &effects.spent_utxos {
+            affected.extend(self.by_utxo.get(id).into_iter().flatten().copied());
+        }
+        for id in &effects.inserted_nullifiers {
+            affected.extend(self.by_nullifier.get(id).into_iter().flatten().copied());
+        }
+        if effects.base_fee_changed {
+            affected.extend(self.entries.keys().copied());
+        }
 
-    /// Remove transactions that are no longer valid against the current state.
-    pub fn evict_invalid(&mut self, state: &indra_state::ChainState) {
-        self.retain_entries(|tx_id, entry| {
-            let mut block_nullifiers = HashSet::new();
-            let mut block_input_utxos = HashSet::new();
-            let keep = indra_state::apply::validate_transaction(
-                state,
-                &entry.tx,
-                &state.chain_id,
-                &mut block_nullifiers,
-                &mut block_input_utxos,
-                state.height.saturating_add(1),
-            )
-            .is_ok();
+        for tx_id in affected {
+            let keep = self.entries.get(&tx_id).is_some_and(|entry| {
+                entry.verified.as_ref().is_some_and(|verified| {
+                    indra_state::pending::validate_verified_pending_transaction(
+                        state,
+                        &entry.tx,
+                        verified,
+                        state.height.saturating_add(1),
+                    )
+                    .is_ok()
+                })
+            });
             if !keep {
-                eprintln!("[mempool] evicting invalid tx {:?}", tx_id);
+                eprintln!("[mempool] evicting invalid tx {tx_id:?}");
+                self.remove_entry(&tx_id);
             }
-            keep
-        });
+        }
+        self.debug_assert_indexes();
     }
 
     /// Remove every pending transaction and reset byte accounting.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.total_encoded_bytes = 0;
+        self.by_utxo.clear();
+        self.by_nullifier.clear();
         self.debug_assert_byte_accounting();
     }
 
     fn remove_entry(&mut self, tx_id: &Bytes32) -> Option<MempoolEntry> {
         let removed = self.entries.remove(tx_id);
         if let Some(entry) = &removed {
+            Self::remove_index_memberships(
+                &mut self.by_utxo,
+                *tx_id,
+                entry.tx.inputs.iter().map(|i| i.utxo_id),
+            );
+            Self::remove_index_memberships(
+                &mut self.by_nullifier,
+                *tx_id,
+                entry.tx.inputs.iter().map(|i| i.nullifier),
+            );
             self.total_encoded_bytes = self
                 .total_encoded_bytes
                 .checked_sub(entry.encoded_size)
@@ -384,22 +413,49 @@ impl Mempool {
         removed
     }
 
-    fn retain_entries(&mut self, mut keep: impl FnMut(&Bytes32, &MempoolEntry) -> bool) {
-        let mut removed_bytes = 0usize;
-        self.entries.retain(|tx_id, entry| {
-            let retained = keep(tx_id, entry);
-            if !retained {
-                removed_bytes = removed_bytes
-                    .checked_add(entry.encoded_size)
-                    .expect("mempool removed-byte accounting overflow");
+    fn index_entry(&mut self, tx_id: Bytes32) {
+        let Some(entry) = self.entries.get(&tx_id) else {
+            return;
+        };
+        for input in &entry.tx.inputs {
+            self.by_utxo.entry(input.utxo_id).or_default().insert(tx_id);
+            self.by_nullifier
+                .entry(input.nullifier)
+                .or_default()
+                .insert(tx_id);
+        }
+        self.debug_assert_indexes();
+    }
+
+    fn remove_index_memberships(
+        index: &mut BTreeMap<Bytes32, BTreeSet<Bytes32>>,
+        entry_id: Bytes32,
+        keys: impl Iterator<Item = Bytes32>,
+    ) {
+        for key in keys {
+            if let Some(ids) = index.get_mut(&key) {
+                ids.remove(&entry_id);
+                if ids.is_empty() {
+                    index.remove(&key);
+                }
             }
-            retained
-        });
-        self.total_encoded_bytes = self
-            .total_encoded_bytes
-            .checked_sub(removed_bytes)
-            .expect("mempool byte accounting underflow");
-        self.debug_assert_byte_accounting();
+        }
+    }
+
+    fn debug_assert_indexes(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let mut utxos = BTreeMap::<Bytes32, BTreeSet<Bytes32>>::new();
+            let mut nullifiers = BTreeMap::<Bytes32, BTreeSet<Bytes32>>::new();
+            for (id, entry) in &self.entries {
+                for input in &entry.tx.inputs {
+                    utxos.entry(input.utxo_id).or_default().insert(*id);
+                    nullifiers.entry(input.nullifier).or_default().insert(*id);
+                }
+            }
+            debug_assert_eq!(self.by_utxo, utxos);
+            debug_assert_eq!(self.by_nullifier, nullifiers);
+        }
     }
 
     fn debug_assert_byte_accounting(&self) {
@@ -489,8 +545,10 @@ impl Mempool {
                 fee_rate,
                 arrived_height: submitted_height,
                 encoded_size,
+                verified: None,
             },
         );
+        self.index_entry(tx_id);
         self.total_encoded_bytes = self
             .total_encoded_bytes
             .checked_add(encoded_size)
@@ -865,21 +923,28 @@ mod tests {
         mempool.evict(&committed_id);
         assert_byte_accounting(&mempool);
 
-        let mut nullifiers = indra_state::NullifierSet::new();
-        assert!(nullifiers.insert(spent.inputs[0].nullifier));
-        mempool.evict_spent(&nullifiers);
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects
+            .inserted_nullifiers
+            .insert(spent.inputs[0].nullifier);
+        mempool.apply_canonical_effects(&ChainState::new_genesis(), &effects);
         assert_eq!(mempool.len(), 1);
         assert_byte_accounting(&mempool);
     }
 
     #[test]
-    fn byte_accounting_tracks_invalid_pruning_and_clear() {
+    fn byte_accounting_tracks_targeted_invalidation_and_clear() {
         let mut mempool = Mempool::default_config();
-        mempool.submit(dummy_tx(10_000, 0x21), 100, 1).unwrap();
-        mempool.submit(dummy_tx(20_000, 0x22), 100, 1).unwrap();
+        let first = dummy_tx(10_000, 0x21);
+        let second = dummy_tx(20_000, 0x22);
+        mempool.submit(first.clone(), 100, 1).unwrap();
+        mempool.submit(second.clone(), 100, 1).unwrap();
         assert_byte_accounting(&mempool);
 
-        mempool.evict_invalid(&ChainState::new_genesis());
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.spent_utxos.insert(first.inputs[0].utxo_id);
+        effects.spent_utxos.insert(second.inputs[0].utxo_id);
+        mempool.apply_canonical_effects(&ChainState::new_genesis(), &effects);
         assert!(mempool.is_empty());
         assert_byte_accounting(&mempool);
 
@@ -991,14 +1056,18 @@ mod tests {
     }
 
     #[test]
-    fn evict_invalid_drops_transactions_that_fail_state_validation() {
+    fn targeted_invalidation_drops_affected_unverified_test_entry() {
         let mut mp = Mempool::default_config();
         let tx = dummy_tx(100_000, 0x01);
         let tx_id = mp.submit(tx, 100, 1).unwrap();
         assert!(mp.contains(&tx_id));
 
         let state = indra_state::ChainState::new_genesis();
-        mp.evict_invalid(&state);
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects
+            .spent_utxos
+            .insert(mp.entries.get(&tx_id).unwrap().tx.inputs[0].utxo_id);
+        mp.apply_canonical_effects(&state, &effects);
 
         assert!(!mp.contains(&tx_id));
     }
@@ -1037,5 +1106,52 @@ mod tests {
 
         assert!(mp.contains(&tx_id));
         assert_eq!(mp.len(), 1);
+    }
+
+    #[test]
+    fn targeted_transaction_invalidation_matches_full_oracle_and_leaves_untouched_valid() {
+        let (mut state, tx) = valid_state_and_tx();
+        let tx_id = Mempool::tx_id(&tx);
+        let mut targeted = Mempool::default_config();
+        targeted.submit_validated(tx.clone(), &state).unwrap();
+
+        let unrelated = indra_state::CanonicalStateEffects {
+            validators_changed: BTreeSet::from([Bytes32::from([0xEE; 32])]),
+            ..Default::default()
+        };
+        targeted.apply_canonical_effects(&state, &unrelated);
+        assert!(targeted.contains(&tx_id));
+        let mut nullifiers = HashSet::new();
+        let mut inputs = HashSet::new();
+        assert!(indra_state::apply::validate_transaction(
+            &state,
+            &tx,
+            &state.chain_id,
+            &mut nullifiers,
+            &mut inputs,
+            state.height.saturating_add(1),
+        )
+        .is_ok());
+
+        let input = &tx.inputs[0];
+        state.utxos.spend_at_height(&input.utxo_id, 1).unwrap();
+        assert!(state.nullifiers.insert(input.nullifier));
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.spent_utxos.insert(input.utxo_id);
+        effects.inserted_nullifiers.insert(input.nullifier);
+        targeted.apply_canonical_effects(&state, &effects);
+
+        let mut nullifiers = HashSet::new();
+        let mut inputs = HashSet::new();
+        assert!(indra_state::apply::validate_transaction(
+            &state,
+            &tx,
+            &state.chain_id,
+            &mut nullifiers,
+            &mut inputs,
+            state.height.saturating_add(1),
+        )
+        .is_err());
+        assert!(!targeted.contains(&tx_id));
     }
 }

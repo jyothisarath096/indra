@@ -24,7 +24,7 @@ use indra_core::types::primitives::{
 use indra_core::types::vrf_election::{compute_reveal_set_commitment, VrfElectionResult};
 use indra_core::EpochRecord;
 use indra_crypto::{vrf_verify, VrfOutput, VrfProof};
-use indra_state::{apply_block, ChainState};
+use indra_state::{apply_block_with_effects, CanonicalStateEffects, ChainState};
 use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_storage::{BlockStore, StateStore};
 
@@ -220,9 +220,29 @@ pub fn import_block(
     state_store: &StateStore,
     timestamp_secs: u64,
 ) -> NodeResult<Option<EpochRecord>> {
+    import_block_with_effects(
+        block,
+        state,
+        mempool,
+        block_store,
+        state_store,
+        timestamp_secs,
+    )
+    .map(|outcome| outcome.epoch_record)
+}
+
+/// Import a block and return the canonical effects published after projection commit.
+pub fn import_block_with_effects(
+    block: &BlockV1,
+    state: &mut ChainState,
+    mempool: &mut Mempool,
+    block_store: &mut BlockStore,
+    state_store: &StateStore,
+    timestamp_secs: u64,
+) -> NodeResult<indra_state::AppliedBlockOutcome> {
     let height = block.header.height;
 
-    let epoch_record = validate_and_apply_imported_block(block, state, mempool, timestamp_secs)?;
+    let outcome = validate_and_apply_imported_block(block, state, mempool, timestamp_secs)?;
 
     // Store genesis placeholder if block_store is empty and this is height 1
     if block_store.is_empty() && height == 1 {
@@ -236,7 +256,7 @@ pub fn import_block(
         state_store.save(state)?;
     }
 
-    Ok(epoch_record)
+    Ok(outcome)
 }
 
 /// Validate and apply the canonical sync/import block pipeline up to, but not
@@ -251,7 +271,7 @@ fn validate_and_apply_imported_block(
     state: &mut ChainState,
     mempool: &mut Mempool,
     timestamp_secs: u64,
-) -> NodeResult<Option<EpochRecord>> {
+) -> NodeResult<indra_state::AppliedBlockOutcome> {
     let height = block.header.height;
 
     verify_imported_block_proposer(block, state)?;
@@ -268,7 +288,18 @@ fn validate_and_apply_imported_block(
     #[cfg(debug_assertions)]
     let verified_value_hash = projection.value_hash;
     let epoch_record = projection.epoch_record;
+    let effects = projection.effects;
     *state = projection.state;
+    for event in &effects.slash_events {
+        eprintln!(
+            "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
+            hex::encode(&event.validator_id.0[..4]),
+            event.slash_bps,
+            event.burned,
+            event.self_principal_slashed,
+            event.reporter_reward,
+        );
+    }
     #[cfg(debug_assertions)]
     {
         let committed_roots = compute_state_roots(state);
@@ -285,10 +316,12 @@ fn validate_and_apply_imported_block(
 
     // Evict spent transactions from mempool after the verified projection has
     // become the real state.
-    mempool.evict_spent(&state.nullifiers);
-    mempool.evict_invalid(state);
+    mempool.apply_canonical_effects(state, &effects);
 
-    Ok(epoch_record)
+    Ok(indra_state::AppliedBlockOutcome {
+        epoch_record,
+        effects,
+    })
 }
 
 /// Whether proposer verification is required for one consensus height.
@@ -673,6 +706,7 @@ fn verify_sync_qc(
 pub(crate) struct VerifiedBlockProjection {
     pub(crate) state: ChainState,
     pub(crate) epoch_record: Option<EpochRecord>,
+    pub(crate) effects: CanonicalStateEffects,
     // Retained for debug/test defense-in-depth assertions after committing the
     // verified projection. Release builds skip those assertions, so these fields
     // are intentionally release-dead even though the values are consumed when
@@ -697,12 +731,13 @@ pub(crate) fn project_and_verify_block_state_root(
     // same projection only after all header commitments match, so import/replay
     // never applies the same block a second time.
     let mut projected = pre_state.clone();
-    let epoch_record = apply_block(&mut projected, block, timestamp_secs).map_err(|e| {
+    let outcome = apply_block_with_effects(&mut projected, block, timestamp_secs).map_err(|e| {
         NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!("block failed during pre-apply root verification: {e}"),
         }
     })?;
+    let epoch_record = outcome.epoch_record;
 
     let actual_roots = compute_state_roots(&projected);
     if actual_roots.state_root != expected_state_root {
@@ -746,6 +781,7 @@ pub(crate) fn project_and_verify_block_state_root(
     Ok(VerifiedBlockProjection {
         state: projected,
         epoch_record,
+        effects: outcome.effects,
         state_root: actual_roots.state_root,
         validator_set_root: actual_roots.validator_set_root,
         value_hash: actual_value_hash,
@@ -1157,15 +1193,15 @@ mod tests {
         timestamp_secs: u64,
     ) -> NodeResult<Option<EpochRecord>> {
         verify_block_state_root(block, state)?;
-        let epoch_record =
-            apply_block(state, block, timestamp_secs).map_err(|e| NodeError::BlockInvalid {
+        let outcome = apply_block_with_effects(state, block, timestamp_secs).map_err(|e| {
+            NodeError::BlockInvalid {
                 height: block.header.height,
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
         let _state_root = compute_state_root(state);
-        mempool.evict_spent(&state.nullifiers);
-        mempool.evict_invalid(state);
-        Ok(epoch_record)
+        mempool.apply_canonical_effects(state, &outcome.effects);
+        Ok(outcome.epoch_record)
     }
 
     fn assert_import_state_equivalent(
@@ -1251,7 +1287,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(reference_record, actual_record);
+            assert_eq!(reference_record, actual_record.epoch_record);
             assert_import_state_equivalent(&reference_state, &actual_state, &block);
             assert_eq!(reference_mempool.len(), actual_mempool.len());
             assert_eq!(reference_mempool.is_empty(), actual_mempool.is_empty());
@@ -1326,6 +1362,7 @@ mod tests {
         let record =
             validate_and_apply_imported_block(&block, &mut state, &mut mempool, timestamp_secs)
                 .unwrap()
+                .epoch_record
                 .expect("height 300 must produce an epoch record");
 
         assert_eq!(block.header.height, EPOCH_DURATION_BLOCKS);

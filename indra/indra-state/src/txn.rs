@@ -21,6 +21,7 @@ use indra_core::{
 
 use crate::{
     chain::ChainState,
+    effects::CanonicalStateEffects,
     error::StateResult,
     governance::GovernanceState,
     persistent::{PersistentOrdMap, PersistentOrdSet},
@@ -99,6 +100,7 @@ pub(crate) struct StateTxn<'a> {
     evicted_validator_tombstones_recorded: bool,
     commitment_touched: bool,
     commitment_before: Option<StateCommitmentV2>,
+    effects: CanonicalStateEffects,
 }
 
 impl<'a> StateTxn<'a> {
@@ -125,6 +127,7 @@ impl<'a> StateTxn<'a> {
             evicted_validator_tombstones_recorded: false,
             commitment_touched: false,
             commitment_before,
+            effects: CanonicalStateEffects::default(),
         }
     }
 
@@ -140,8 +143,252 @@ impl<'a> StateTxn<'a> {
     }
 
     /// Commit the transaction. The state has already been mutated in place.
-    pub(crate) fn commit(mut self) {
+    pub(crate) fn commit(mut self) -> CanonicalStateEffects {
+        self.populate_effects_from_undo();
         self.committed = true;
+        std::mem::take(&mut self.effects)
+    }
+
+    /// Commit a detached scratch-state transaction without constructing a
+    /// canonical effects journal. Candidate validation never publishes its
+    /// projected state, so diffing large snapshotted collections here is both
+    /// semantically meaningless and potentially dominant work.
+    pub(crate) fn commit_scratch(mut self) {
+        self.committed = true;
+    }
+
+    fn populate_effects_from_undo(&mut self) {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let state: &ChainState = self.state;
+        let effects = &mut self.effects;
+        for undo in &self.undo {
+            match undo {
+                UndoEntry::Scalars(before) => {
+                    effects.height_changed |= before.height != state.height;
+                    effects.tip_hash_changed |= before.tip_hash != state.tip_hash;
+                    effects.base_fee_changed |= before.base_fee != state.base_fee;
+                    effects.economic_accounting_changed |= before.total_supply
+                        != state.total_supply
+                        || before.treasury_balance != state.treasury_balance
+                        || before.burn_buffer != state.burn_buffer
+                        || before.fee_reward_pool != state.fee_reward_pool;
+                    effects.epoch_summary_changed |= before.epoch_fees_burned
+                        != state.epoch_fees_burned
+                        || before.epoch_slashed_spark != state.epoch_slashed_spark
+                        || before.epoch_slash_event_count != state.epoch_slash_event_count;
+                    effects.epoch_changed |= before.height
+                        / indra_core::types::primitives::EPOCH_DURATION_BLOCKS
+                        != state.height / indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+                }
+                UndoEntry::UtxoSpent(entry) => {
+                    effects.spent_utxos.insert(entry.utxo_id);
+                    effects.utxo_set_changed = true;
+                }
+                UndoEntry::UtxoInserted(_) => effects.utxo_set_changed = true,
+                UndoEntry::NullifierInserted(nullifier) => {
+                    effects.inserted_nullifiers.insert(*nullifier);
+                }
+                UndoEntry::Validators(before) => {
+                    let old: BTreeMap<_, _> = before
+                        .all_validators()
+                        .map(|validator| (validator.validator_id, validator))
+                        .collect();
+                    let new: BTreeMap<_, _> = state
+                        .validators
+                        .all_validators()
+                        .map(|validator| (validator.validator_id, validator))
+                        .collect();
+                    let ids: BTreeSet<_> = old.keys().chain(new.keys()).copied().collect();
+                    effects.validator_registry_changed |= old.keys().ne(new.keys());
+                    for id in ids {
+                        if old.get(&id) != new.get(&id) {
+                            effects.validators_changed.insert(id);
+                            effects.validator_registry_changed = true;
+                        }
+                        let old_keys = old.get(&id).map(|validator| {
+                            (
+                                &validator.hybrid_classical_pk,
+                                &validator.hybrid_pq_pk,
+                                &validator.vrf_pk,
+                                &validator.cold_hybrid_classical_pk,
+                                &validator.cold_hybrid_pq_pk,
+                                validator.cold_key_version,
+                            )
+                        });
+                        let new_keys = new.get(&id).map(|validator| {
+                            (
+                                &validator.hybrid_classical_pk,
+                                &validator.hybrid_pq_pk,
+                                &validator.vrf_pk,
+                                &validator.cold_hybrid_classical_pk,
+                                &validator.cold_hybrid_pq_pk,
+                                validator.cold_key_version,
+                            )
+                        });
+                        if old_keys != new_keys {
+                            effects.validator_keys_changed.insert(id);
+                        }
+                    }
+                }
+                UndoEntry::PositionState {
+                    positions,
+                    tranches,
+                    index,
+                } => {
+                    effects.position_tranche_index_changed |=
+                        index != &state.position_tranche_index;
+                    let position_ids: BTreeSet<_> = positions
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(state.stake_positions.iter().map(|(id, _)| *id))
+                        .collect();
+                    for id in position_ids {
+                        let old = positions.get(&id);
+                        let new = state.stake_positions.get(&id);
+                        if old != new {
+                            effects.stake_positions_changed.insert(id);
+                            effects.global_position_tranche_capacity_changed = true;
+                            if let Some(validator_id) = old
+                                .map(|position| position.validator_id)
+                                .or_else(|| new.map(|position| position.validator_id))
+                            {
+                                effects
+                                    .validator_position_capacity_changed
+                                    .insert(validator_id);
+                                effects
+                                    .validator_tranche_capacity_changed
+                                    .insert(validator_id);
+                            }
+                        }
+                    }
+                    let tranche_ids: BTreeSet<_> = tranches
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(state.unbonding_tranches.iter().map(|(id, _)| *id))
+                        .collect();
+                    for id in tranche_ids {
+                        let old = tranches.get(&id);
+                        let new = state.unbonding_tranches.get(&id);
+                        if old != new {
+                            effects.global_position_tranche_capacity_changed = true;
+                            if let Some(position_id) = old
+                                .map(|tranche| tranche.position_id)
+                                .or_else(|| new.map(|tranche| tranche.position_id))
+                            {
+                                effects
+                                    .position_tranche_capacity_changed_for
+                                    .insert(position_id);
+                                let validator_id = positions
+                                    .get(&position_id)
+                                    .or_else(|| state.stake_positions.get(&position_id))
+                                    .map(|position| position.validator_id);
+                                if let Some(validator_id) = validator_id {
+                                    effects
+                                        .validator_tranche_capacity_changed
+                                        .insert(validator_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                UndoEntry::StakingNonces(before) => {
+                    for id in before
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(state.staking_nonces.iter().map(|(id, _)| *id))
+                    {
+                        if before.get(&id) != state.staking_nonces.get(&id) {
+                            effects.staking_nonces_changed.insert(id);
+                        }
+                    }
+                }
+                UndoEntry::SlashHashes(before) => {
+                    effects.applied_slash_hashes.extend(
+                        state
+                            .applied_slash_hashes
+                            .iter()
+                            .filter(|hash| !before.contains(hash))
+                            .copied(),
+                    );
+                }
+                UndoEntry::DelegatorIdentities(before) => {
+                    for id in before
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(state.delegator_identities.iter().map(|(id, _)| *id))
+                    {
+                        if before.get(&id) != state.delegator_identities.get(&id) {
+                            effects.delegator_identities_changed.insert(id);
+                        }
+                    }
+                }
+                UndoEntry::RetiredColdClassical(before) => {
+                    effects.retired_cold_components_changed |=
+                        before != &state.retired_cold_classical_components;
+                }
+                UndoEntry::RetiredColdPq(before) => {
+                    effects.retired_cold_components_changed |=
+                        before != &state.retired_cold_pq_components;
+                }
+                UndoEntry::Governance(before) => {
+                    effects.governance_state_changed |= before != &state.governance;
+                    effects.governance_params_changed |= before.params != state.governance.params;
+                    for id in before
+                        .gov_nonces
+                        .keys()
+                        .chain(state.governance.gov_nonces.keys())
+                        .copied()
+                    {
+                        if before.gov_nonces.get(&id) != state.governance.gov_nonces.get(&id) {
+                            effects.governance_nonces_changed.insert(id);
+                        }
+                    }
+                    for id in before
+                        .proposals
+                        .keys()
+                        .chain(state.governance.proposals.keys())
+                        .copied()
+                    {
+                        if before.proposals.get(&id) != state.governance.proposals.get(&id) {
+                            effects.proposals_changed.insert(id);
+                        }
+                    }
+                }
+                UndoEntry::Utxos(before) => {
+                    effects.utxo_set_changed |= before != &state.utxos;
+                    for entry in before.all_entries() {
+                        if !state.utxos.contains(&entry.utxo_id) {
+                            effects.spent_utxos.insert(entry.utxo_id);
+                        }
+                    }
+                }
+                UndoEntry::SlashMembershipRoots(before) => {
+                    effects.slash_membership_history_changed |=
+                        before != &state.slash_membership_roots;
+                }
+                UndoEntry::EvictedValidatorTombstones(before) => {
+                    for id in before
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(state.evicted_validator_tombstones.iter().map(|(id, _)| *id))
+                    {
+                        if before.get(&id) != state.evicted_validator_tombstones.get(&id) {
+                            effects.tombstones_changed.insert(id);
+                        }
+                    }
+                }
+                UndoEntry::ConsensusSnapshots(before) => {
+                    effects.consensus_snapshots_changed |= before != &state.consensus_snapshots;
+                }
+                UndoEntry::RewardEconomicSnapshot(before) => {
+                    effects.reward_economic_snapshot_changed |=
+                        before != &state.reward_economic_snapshot;
+                }
+            }
+        }
+        effects.state_commitment_cache_changed |=
+            self.commitment_before != state.state_commitment_v2;
     }
 
     /// Ensure StateCommitmentV2 exists when active.
@@ -240,6 +487,7 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn spend_utxo(&mut self, id: &Bytes32) -> StateResult<Option<UtxoEntry>> {
         let removed = self.state.utxos.spend_at_height(id, self.height);
         if let Some(entry) = &removed {
+            self.effects.spent_utxos.insert(entry.utxo_id);
             let entry = measure_undo_recording(|| entry.clone());
             self.undo.push(UndoEntry::UtxoSpent(entry));
         }
@@ -292,6 +540,7 @@ impl<'a> StateTxn<'a> {
             .nullifiers
             .insert_or_double_spend_at_height(nullifier, self.height)?;
         measure_undo_recording(|| self.undo.push(UndoEntry::NullifierInserted(nullifier)));
+        self.effects.inserted_nullifiers.insert(nullifier);
         self.after_mutation()
     }
 
@@ -367,6 +616,7 @@ impl<'a> StateTxn<'a> {
     /// Mutate base fee.
     pub(crate) fn set_base_fee(&mut self, base_fee: u64) -> StateResult<()> {
         self.record_scalars();
+        self.effects.base_fee_changed |= self.state.base_fee != base_fee;
         self.state.base_fee = base_fee;
         self.after_mutation()
     }
@@ -398,6 +648,11 @@ impl<'a> StateTxn<'a> {
         self.state.epoch_slashed_spark = self.state.epoch_slashed_spark.saturating_add(amount);
         self.state.epoch_slash_event_count = self.state.epoch_slash_event_count.saturating_add(1);
         self.after_mutation()
+    }
+
+    /// Record a structured slash event for publication only if this transaction commits.
+    pub(crate) fn record_slash_event(&mut self, event: crate::CommittedSlashEvent) {
+        self.effects.slash_events.push(event);
     }
 
     /// Mark StateCommitmentV2 as touched by this transaction.
@@ -712,6 +967,7 @@ mod tests {
             crypto::HybridPubKey,
             primitives::VariableBytes,
             reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
+            stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
         },
         CommitmentV1,
     };
@@ -818,5 +1074,88 @@ mod tests {
         assert_eq!(state.consensus_snapshots, original.consensus_snapshots);
         assert_eq!(state.state_commitment_v2, original.state_commitment_v2);
         assert_eq!(state, original);
+    }
+
+    #[test]
+    fn committed_effect_journal_covers_each_mutated_dependency_scope() {
+        let mut state = ChainState::new_genesis();
+        let signer = Bytes32::from([0x31; 32]);
+        let validator = Bytes32::from([0x32; 32]);
+        let governance_signer = Bytes32::from([0x33; 32]);
+        let nullifier = Bytes32::from([0x34; 32]);
+        let position = StakePositionV1::new(
+            validator,
+            signer,
+            PositionCustodyV1::DelegatorIdentity {
+                delegator_id: signer,
+            },
+            Some(ActiveStakeAggregateV1::new(1_000_000, 0, 0).unwrap()),
+            0,
+            0,
+        )
+        .unwrap();
+        let position_id = position.position_id;
+        let old_base_fee = state.base_fee;
+        let before = state.clone();
+        let mut txn = StateTxn::begin(
+            &mut state,
+            indra_core::types::primitives::EPOCH_DURATION_BLOCKS,
+        );
+        let utxo = txn.insert_utxo(test_output(0x35), 0, 0, 0).unwrap();
+        txn.spend_utxo(&utxo).unwrap();
+        txn.insert_nullifier(nullifier).unwrap();
+        txn.set_base_fee(old_base_fee.saturating_add(1)).unwrap();
+        txn.snapshot_staking_scope();
+        txn.state_mut().staking_nonces.insert(signer, 1);
+        txn.put_stake_position(position).unwrap();
+        txn.snapshot_governance_scope();
+        txn.state_mut()
+            .governance
+            .gov_nonces
+            .insert(governance_signer, 1);
+        txn.state_mut().governance.params.max_commission_bps = txn
+            .state()
+            .governance
+            .params
+            .max_commission_bps
+            .saturating_sub(1);
+        txn.snapshot_epoch_scope();
+        txn.state_mut()
+            .slash_membership_roots
+            .push(SlashMembershipRootRecord {
+                activation_height: 1,
+                membership_root: Bytes32::from([0x36; 32]),
+            });
+        txn.set_tip(
+            indra_core::types::primitives::EPOCH_DURATION_BLOCKS,
+            Bytes32::from([0x37; 32]),
+        )
+        .unwrap();
+        let effects = txn.commit();
+
+        assert!(effects.spent_utxos.contains(&utxo));
+        assert!(effects.utxo_set_changed);
+        assert!(effects.inserted_nullifiers.contains(&nullifier));
+        assert!(effects.base_fee_changed);
+        assert!(effects.staking_nonces_changed.contains(&signer));
+        assert!(effects
+            .governance_nonces_changed
+            .contains(&governance_signer));
+        assert!(effects.stake_positions_changed.contains(&position_id));
+        assert!(effects
+            .validator_position_capacity_changed
+            .contains(&validator));
+        assert!(effects.global_position_tranche_capacity_changed);
+        assert!(effects.governance_params_changed);
+        assert!(effects.slash_membership_history_changed);
+        assert!(effects.epoch_changed);
+        let uncovered: Vec<_> = ChainState::changed_fields(&before, &state)
+            .into_iter()
+            .filter(|field| !effects.covers_field(*field))
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "uncovered changed fields: {uncovered:?}"
+        );
     }
 }
