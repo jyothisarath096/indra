@@ -156,6 +156,10 @@ impl MessageClass {
             Message::Block(_)
                 | Message::BlockResponse { .. }
                 | Message::VrfRevealsResponse { .. }
+                | Message::QCResponse { .. }
+                | Message::Vote(_)
+                | Message::VrfCommit(_)
+                | Message::VrfReveal(_)
                 | Message::Tx(_)
                 | Message::StakingOp(_)
                 | Message::GovernanceOp(_)
@@ -212,7 +216,6 @@ pub struct PeerRateLimiter {
     count_buckets: HashMap<MessageClass, TokenBucket>,
     per_peer_byte_bucket: TokenBucket,
     strikes: StrikeCounter,
-    authenticated_validator: bool,
 }
 
 /// Why a message exceeded the rate limiter.
@@ -244,16 +247,16 @@ impl PeerRateLimiter {
     /// Construct a rate limiter for a cryptographically authenticated validator
     /// transport connection.
     pub fn new_for_authenticated_validator() -> Self {
-        Self::with_authentication(true)
+        Self::with_default_buckets()
     }
 
     /// Construct a rate limiter for unauthenticated/observer-like callers.
     #[cfg(test)]
     pub fn new_for_unauthenticated() -> Self {
-        Self::with_authentication(false)
+        Self::with_default_buckets()
     }
 
-    fn with_authentication(authenticated_validator: bool) -> Self {
+    fn with_default_buckets() -> Self {
         let mut count_buckets = HashMap::new();
         count_buckets.insert(MessageClass::Vote, TokenBucket::new(20, 80));
         count_buckets.insert(MessageClass::BlockOrProposal, TokenBucket::new(5, 10));
@@ -277,7 +280,6 @@ impl PeerRateLimiter {
             count_buckets,
             per_peer_byte_bucket: TokenBucket::new_bytes(33_554_432, 67_108_864),
             strikes: StrikeCounter::new(),
-            authenticated_validator,
         }
     }
 
@@ -286,16 +288,11 @@ impl PeerRateLimiter {
     /// Returns `Some(violation)` when rate limited, `None` when allowed.
     pub fn check(&mut self, msg: &Message, msg_size: usize) -> Option<RateLimitViolation> {
         let class = MessageClass::from_message(msg);
-        let bypass_count_bucket =
-            self.authenticated_validator && class.is_protocol_necessary_for_validators();
-        let count_ok = if bypass_count_bucket {
-            true
-        } else {
-            self.count_buckets
-                .get_mut(&class)
-                .map(|bucket| bucket.try_consume(1))
-                .unwrap_or(true)
-        };
+        let count_ok = self
+            .count_buckets
+            .get_mut(&class)
+            .map(|bucket| bucket.try_consume(1))
+            .unwrap_or(true);
 
         let byte_ok = if MessageClass::needs_per_peer_byte_limit(msg) {
             self.per_peer_byte_bucket.try_consume_bytes(msg_size as u64)
@@ -520,30 +517,56 @@ mod tests {
     }
 
     #[test]
-    fn vote_duplicate_does_not_penalize_authenticated_validator() {
+    fn authenticated_vote_flood_is_finitely_limited() {
         let mut limiter = PeerRateLimiter::new();
         let msg = dummy_vote();
-        for _ in 0..100 {
+        for _ in 0..80 {
             assert_eq!(limiter.check(&msg, 512), None);
         }
+        assert!(limiter.check(&msg, 512).is_some());
     }
 
     #[test]
-    fn vrf_commit_duplicate_does_not_penalize_authenticated_validator() {
+    fn authenticated_vrf_commit_flood_is_finitely_limited() {
         let mut limiter = PeerRateLimiter::new();
         let msg = dummy_vrf_commit();
-        for _ in 0..100 {
+        for _ in 0..16 {
             assert_eq!(limiter.check(&msg, 512), None);
         }
+        assert!(limiter.check(&msg, 512).is_some());
     }
 
     #[test]
-    fn vrf_reveal_duplicate_does_not_penalize_authenticated_validator() {
+    fn authenticated_vrf_reveal_flood_is_finitely_limited() {
         let mut limiter = PeerRateLimiter::new();
         let msg = dummy_vrf_reveal();
-        for _ in 0..100 {
+        for _ in 0..16 {
             assert_eq!(limiter.check(&msg, 512), None);
         }
+        assert!(limiter.check(&msg, 512).is_some());
+    }
+
+    #[test]
+    fn authenticated_vrf_commit_and_reveal_share_one_finite_bucket() {
+        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
+        for _ in 0..8 {
+            assert_eq!(limiter.check(&dummy_vrf_commit(), 512), None);
+            assert_eq!(limiter.check(&dummy_vrf_reveal(), 512), None);
+        }
+        assert!(limiter.check(&dummy_vrf_commit(), 512).is_some());
+    }
+
+    #[test]
+    fn authenticated_qc_response_flood_is_finitely_limited() {
+        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
+        let msg = Message::QCResponse {
+            height: 1,
+            qc_bytes: vec![0u8; 1_000_000],
+        };
+        for _ in 0..10 {
+            assert_eq!(limiter.check(&msg, 1_000_000), None);
+        }
+        assert!(limiter.check(&msg, 1_000_000).is_some());
     }
 
     #[test]
@@ -561,28 +584,30 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_validator_status_burst_does_not_trigger_penalty() {
+    fn authenticated_validator_status_burst_is_finitely_limited() {
         let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
         let msg = Message::Status {
             height: 42,
             tip_hash: Bytes32::from([0x42; 32]),
             round: 7,
         };
-        for _ in 0..100 {
+        for _ in 0..4 {
             assert_eq!(limiter.check(&msg, 256), None);
         }
+        assert!(limiter.check(&msg, 256).is_some());
     }
 
     #[test]
-    fn authenticated_validator_block_request_burst_does_not_ban() {
+    fn authenticated_validator_block_request_burst_is_finitely_limited() {
         let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
         let msg = Message::RequestBlocks {
             from_height: 1,
             to_height: 50,
         };
-        for _ in 0..100 {
+        for _ in 0..10 {
             assert_eq!(limiter.check(&msg, 256), None);
         }
+        assert!(limiter.check(&msg, 256).is_some());
     }
 
     #[test]
@@ -646,6 +671,25 @@ mod tests {
         ];
         for msg in messages {
             assert_eq!(limiter.check(&msg, 256), None);
+        }
+    }
+
+    #[test]
+    fn normal_full_consensus_round_is_well_below_authenticated_limits() {
+        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
+        let messages = [
+            dummy_vote(),
+            dummy_vote(),
+            dummy_vrf_commit(),
+            dummy_vrf_reveal(),
+            Message::QCResponse {
+                height: 1,
+                qc_bytes: vec![0u8; 1_000_000],
+            },
+        ];
+        for msg in messages {
+            let size = msg.encode_wire().unwrap().len();
+            assert_eq!(limiter.check(&msg, size), None);
         }
     }
 

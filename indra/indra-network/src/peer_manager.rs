@@ -38,7 +38,7 @@ use crate::{
     },
     policy::{BanStore, BoundedTtlSet},
     rate_limit::{
-        GlobalRateLimiter, MessageClass, PeerRateLimiter, RateLimitReason,
+        GlobalRateLimiter, MessageClass, PeerRateLimiter,
         RateLimitViolation as RateLimitViolationInfo,
     },
 };
@@ -47,6 +47,7 @@ const SMALL_QUEUE_CAPACITY: usize = 256;
 const LARGE_QUEUE_CAPACITY: usize = 4;
 const TIE_BREAK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CONSENSUS_DUPLICATE_FILTER_CAPACITY: usize = 512;
+const QC_RESPONSE_DEDUP_CAPACITY: usize = 2_048;
 const CONSENSUS_RELAY_SEEN_CAPACITY: usize = 16_384;
 const CONSENSUS_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const STATUS_COALESCE_WINDOW: Duration = Duration::from_millis(500);
@@ -72,11 +73,6 @@ enum PeerManagerMessage {
     Disconnected {
         validator_id: Bytes32,
         addr: SocketAddr,
-    },
-    RateLimitViolation {
-        validator_id: Bytes32,
-        addr: SocketAddr,
-        violation: RateLimitViolationInfo,
     },
     InboundMessage {
         validator_id: Bytes32,
@@ -109,6 +105,8 @@ struct PeerManagerActor {
     ban_store: BanStore,
     scores_by_validator: HashMap<Bytes32, i32>,
     global_limiter: GlobalRateLimiter,
+    limiters_by_validator: HashMap<Bytes32, PeerRateLimiter>,
+    qc_response_seen: BoundedTtlSet<Bytes32>,
     transport_slash_detector: Arc<Mutex<SlashDetector>>,
     last_tie_break_log: HashMap<Bytes32, Instant>,
     relay_keys: HashMap<Bytes32, RelayValidatorKey>,
@@ -602,6 +600,46 @@ async fn write_message(
 }
 
 impl PeerManagerActor {
+    async fn handle_rate_limit_violation(
+        &mut self,
+        validator_id: Bytes32,
+        addr: SocketAddr,
+        violation: RateLimitViolationInfo,
+    ) {
+        if violation.class.is_protocol_necessary_for_validators() {
+            eprintln!(
+                "[p2p] dropping excess {:?} from authenticated validator {} ({}) — no score penalty",
+                violation.class,
+                short_validator_id(&validator_id),
+                addr,
+            );
+            return;
+        }
+        self.adjust_validator_score(validator_id, -violation.penalty, BAN_DURATION_RATE_LIMIT)
+            .await;
+        if self
+            .peer_table
+            .get(&addr)
+            .map(|peer| peer.is_banned())
+            .unwrap_or(false)
+        {
+            if let Err(error) = self.ban_store.ban_until(
+                validator_id,
+                BanStore::unix_now().saturating_add(BAN_DURATION_RATE_LIMIT.as_secs()),
+            ) {
+                eprintln!("[p2p] failed to persist rate-limit ban: {error}");
+            }
+            eprintln!(
+                "[p2p] peer {} ({}) banned 10min for sustained rate limit violations",
+                short_validator_id(&validator_id),
+                addr,
+            );
+            self.drop_peer(validator_id, addr).await;
+        } else {
+            eprintln!("{}", format_rate_limit_log(addr, validator_id, violation));
+        }
+    }
+
     fn increment_relay_metric(
         &mut self,
         class: RelayMessageClass,
@@ -718,6 +756,24 @@ impl PeerManagerActor {
             if !self.relay_verification_passes(msg) {
                 self.increment_relay_metric(class, |metrics| metrics.verification_failed += 1);
                 return;
+            }
+            if let Message::Vote(vote) = msg {
+                if let Some(evidence) = self
+                    .transport_slash_detector
+                    .lock()
+                    .await
+                    .observe_vote(vote.clone())
+                {
+                    let wire_evidence = SlashEvidenceV1 {
+                        validator_id: evidence.validator_id,
+                        vote_1: evidence.vote_a,
+                        vote_2: evidence.vote_b,
+                    };
+                    let _ = self
+                        .event_tx
+                        .send(NetworkEvent::SlashDetected(wire_evidence))
+                        .await;
+                }
             }
             if let Message::Block(block) = msg {
                 if self.block_relay_conflicts(block, &key) {
@@ -935,56 +991,38 @@ impl PeerManagerActor {
             PeerManagerMessage::Disconnected { validator_id, addr } => {
                 self.drop_peer(validator_id, addr).await;
             }
-            PeerManagerMessage::RateLimitViolation {
-                validator_id,
-                addr,
-                violation,
-            } => {
-                if violation.reason == RateLimitReason::Count
-                    && violation.class.is_protocol_necessary_for_validators()
-                {
-                    eprintln!(
-                        "[p2p] dropping excess {:?} from authenticated validator {} ({}) — no score penalty",
-                        violation.class,
-                        short_validator_id(&validator_id),
-                        addr,
-                    );
-                    return;
-                }
-                self.adjust_validator_score(
-                    validator_id,
-                    -violation.penalty,
-                    BAN_DURATION_RATE_LIMIT,
-                )
-                .await;
-                if self
-                    .peer_table
-                    .get(&addr)
-                    .map(|peer| peer.is_banned())
-                    .unwrap_or(false)
-                {
-                    if let Err(error) = self.ban_store.ban_until(
-                        validator_id,
-                        BanStore::unix_now().saturating_add(BAN_DURATION_RATE_LIMIT.as_secs()),
-                    ) {
-                        eprintln!("[p2p] failed to persist rate-limit ban: {error}");
-                    }
-                    eprintln!(
-                        "[p2p] peer {} ({}) banned 10min for sustained rate limit violations",
-                        short_validator_id(&validator_id),
-                        addr,
-                    );
-                    self.drop_peer(validator_id, addr).await;
-                } else {
-                    eprintln!("{}", format_rate_limit_log(addr, validator_id, violation));
-                }
-            }
             PeerManagerMessage::InboundMessage {
                 validator_id,
                 addr,
                 msg,
                 msg_size,
             } => {
+                // Exact QC repeats are harmlessly coalesced before consuming
+                // the sender's finite identity budget. Distinct variants have
+                // distinct hashes and remain governed by the rate limiter.
+                let qc_response_key = if matches!(msg, Message::QCResponse { .. }) {
+                    let Ok(wire) = msg.encode_wire() else {
+                        return;
+                    };
+                    let key = Bytes32::from(sha256(&wire));
+                    let now = Instant::now();
+                    if self.qc_response_seen.contains_at(&key, now) {
+                        return;
+                    }
+                    Some(key)
+                } else {
+                    None
+                };
+                let violation = self
+                    .limiters_by_validator
+                    .entry(validator_id)
+                    .or_insert_with(PeerRateLimiter::new_for_authenticated_validator)
+                    .check(&msg, msg_size);
+                if let Some(violation) = violation {
+                    self.handle_rate_limit_violation(validator_id, addr, violation)
+                        .await;
+                    return;
+                }
                 if MessageClass::needs_global_byte_limit(&msg)
                     && !self.global_limiter.check_large_payload(msg_size)
                 {
@@ -995,6 +1033,9 @@ impl PeerManagerActor {
                     self.peer_table
                         .adjust_score_with_duration(&addr, -1, BAN_DURATION_RATE_LIMIT);
                     return;
+                }
+                if let Some(key) = qc_response_key {
+                    let _ = self.qc_response_seen.insert_at(key, Instant::now());
                 }
                 self.relay_if_eligible(validator_id, &msg).await;
                 let _ = self
@@ -1089,12 +1130,8 @@ impl PeerManagerActor {
         let (small_tx, small_rx) = mpsc::channel(SMALL_QUEUE_CAPACITY);
         let (large_tx, large_rx) = mpsc::channel(LARGE_QUEUE_CAPACITY);
         let control_tx = self.control_tx.clone();
-        let event_tx = self.event_tx.clone();
-        let transport_slash_detector = Arc::clone(&self.transport_slash_detector);
-
         let read_task = tokio::spawn(async move {
             let mut reader = FrameReader::new(reader_half, recv_key);
-            let mut rate_limiter = PeerRateLimiter::new_for_authenticated_validator();
             let mut duplicate_filter =
                 ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
             let mut status_coalescer = StatusCoalescer::new(STATUS_COALESCE_WINDOW);
@@ -1114,38 +1151,12 @@ impl PeerManagerActor {
                     Err(NetworkError::UnknownMessageType { .. }) => continue,
                     Err(_) => break,
                 };
-                if let Message::Vote(vote) = &msg {
-                    if let Some(evidence) = transport_slash_detector
-                        .lock()
-                        .await
-                        .observe_vote(vote.clone())
-                    {
-                        let wire_evidence = SlashEvidenceV1 {
-                            validator_id: evidence.validator_id,
-                            vote_1: evidence.vote_a,
-                            vote_2: evidence.vote_b,
-                        };
-                        let _ = event_tx
-                            .send(NetworkEvent::SlashDetected(wire_evidence))
-                            .await;
-                    }
-                }
                 if let Some(key) = consensus_message_key(&msg) {
                     if duplicate_filter.is_duplicate(key) {
                         continue;
                     }
                 }
                 if status_coalescer.should_drop(&msg, Instant::now()) {
-                    continue;
-                }
-                if let Some(violation) = rate_limiter.check(&msg, msg_size) {
-                    let _ = control_tx
-                        .send(PeerManagerMessage::RateLimitViolation {
-                            validator_id: peer_validator_id,
-                            addr,
-                            violation,
-                        })
-                        .await;
                     continue;
                 }
                 if control_tx
@@ -1448,6 +1459,8 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         ban_store,
         scores_by_validator: HashMap::new(),
         global_limiter: GlobalRateLimiter::new(),
+        limiters_by_validator: HashMap::new(),
+        qc_response_seen: BoundedTtlSet::new(QC_RESPONSE_DEDUP_CAPACITY, CONSENSUS_SEEN_TTL),
         transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
         last_tie_break_log: HashMap::new(),
         relay_chain_id: config.chain_id,
@@ -1469,6 +1482,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rate_limit::RateLimitReason;
     use indra_core::types::{
         block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         crypto::HybridSignature,
@@ -1512,6 +1526,8 @@ mod tests {
             ))),
             scores_by_validator: HashMap::new(),
             global_limiter: GlobalRateLimiter::new(),
+            limiters_by_validator: HashMap::new(),
+            qc_response_seen: BoundedTtlSet::new(QC_RESPONSE_DEDUP_CAPACITY, CONSENSUS_SEEN_TTL),
             transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
             last_tie_break_log: HashMap::new(),
             relay_keys: HashMap::new(),
@@ -1722,11 +1738,24 @@ mod tests {
     }
 
     fn signed_vote(validator_id: Bytes32, keypair: &HybridKeypair) -> VoteV1 {
-        let block_hash = Bytes32::from([0x44; 32]);
+        signed_vote_for_hash(
+            validator_id,
+            keypair,
+            VoteStep::Prevote,
+            Bytes32::from([0x44; 32]),
+        )
+    }
+
+    fn signed_vote_for_hash(
+        validator_id: Bytes32,
+        keypair: &HybridKeypair,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) -> VoteV1 {
         let bytes = vote_signing_bytes(
             7,
             2,
-            VoteStep::Prevote,
+            step,
             &block_hash,
             &validator_id,
             None,
@@ -1735,12 +1764,51 @@ mod tests {
         VoteV1 {
             height: 7,
             round: 2,
-            step: VoteStep::Prevote,
+            step,
             block_hash,
             validator_id,
             election_result_hash: None,
             signature: core_signature(keypair.sign(&bytes).unwrap()),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_slash_detector_observes_only_verified_votes() {
+        let victim = Bytes32::from([0xB3; 32]);
+        let victim_key = hybrid_key(0xB3);
+        let attacker_key = hybrid_key(0xB4);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(victim, &victim_key)]);
+
+        for hash in [Bytes32::from([0xA1; 32]), Bytes32::from([0xA2; 32])] {
+            let forged = Message::Vote(signed_vote_for_hash(
+                victim,
+                &attacker_key,
+                VoteStep::Precommit,
+                hash,
+            ));
+            actor
+                .relay_if_eligible(Bytes32::from([0xB4; 32]), &forged)
+                .await;
+        }
+        assert!(event_rx.try_recv().is_err());
+
+        for hash in [Bytes32::from([0xC1; 32]), Bytes32::from([0xC2; 32])] {
+            let valid = Message::Vote(signed_vote_for_hash(
+                victim,
+                &victim_key,
+                VoteStep::Precommit,
+                hash,
+            ));
+            actor
+                .relay_if_eligible(Bytes32::from([0xB4; 32]), &valid)
+                .await;
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(NetworkEvent::SlashDetected(_))
+        ));
     }
 
     fn signed_commit(validator_id: Bytes32, keypair: &HybridKeypair) -> VrfCommit {
@@ -1949,6 +2017,70 @@ mod tests {
         let mut filter = ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
         assert!(!filter.is_duplicate(key));
         assert!(filter.is_duplicate(key));
+    }
+
+    #[tokio::test]
+    async fn qc_response_dedup_is_node_wide_and_forwards_once() {
+        let validator = Bytes32::from([0xB1; 32]);
+        let addr: SocketAddr = "127.0.0.1:32101".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let msg = Message::QCResponse {
+            height: 9,
+            qc_bytes: vec![0xAB; 128],
+        };
+        for _ in 0..2 {
+            actor
+                .handle_control(PeerManagerMessage::InboundMessage {
+                    validator_id: validator,
+                    addr,
+                    msg: msg.clone(),
+                    msg_size: 128,
+                })
+                .await;
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(NetworkEvent::Message {
+                msg: Message::QCResponse { .. },
+                ..
+            })
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(actor.qc_response_seen.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_vote_limit_is_keyed_by_validator_identity() {
+        let validator = Bytes32::from([0xB2; 32]);
+        let addr: SocketAddr = "127.0.0.1:32102".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        for index in 0..81u8 {
+            let msg = Message::Vote(VoteV1 {
+                height: 1,
+                round: index as u32,
+                step: VoteStep::Prevote,
+                block_hash: Bytes32::from([index; 32]),
+                validator_id: validator,
+                election_result_hash: None,
+                signature: dummy_signature(),
+            });
+            actor
+                .handle_control(PeerManagerMessage::InboundMessage {
+                    validator_id: validator,
+                    addr,
+                    msg,
+                    msg_size: 5_000,
+                })
+                .await;
+        }
+        let mut delivered = 0;
+        while event_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 80);
+        assert_eq!(actor.limiters_by_validator.len(), 1);
     }
 
     #[test]
@@ -3914,15 +4046,15 @@ mod tests {
         let before = actor.peer_table.get(&addr).unwrap().score;
 
         actor
-            .handle_control(PeerManagerMessage::RateLimitViolation {
-                validator_id: validator,
+            .handle_rate_limit_violation(
+                validator,
                 addr,
-                violation: RateLimitViolationInfo {
+                RateLimitViolationInfo {
                     class: MessageClass::Status,
                     penalty: 10,
                     reason: RateLimitReason::Count,
                 },
-            })
+            )
             .await;
 
         assert_eq!(actor.peer_table.get(&addr).unwrap().score, before);
@@ -3942,15 +4074,15 @@ mod tests {
 
         for _ in 0..20 {
             actor
-                .handle_control(PeerManagerMessage::RateLimitViolation {
-                    validator_id: validator,
+                .handle_rate_limit_violation(
+                    validator,
                     addr,
-                    violation: RateLimitViolationInfo {
+                    RateLimitViolationInfo {
                         class: MessageClass::BlockRequest,
                         penalty: 10,
                         reason: RateLimitReason::Count,
                     },
-                })
+                )
                 .await;
         }
 
@@ -3959,7 +4091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_validator_byte_budget_violation_still_penalizes() {
+    async fn authenticated_validator_consensus_byte_overage_is_non_punitive() {
         let validator = Bytes32::from([0xAC; 32]);
         let addr: SocketAddr = "127.0.0.1:32003".parse().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(16);
@@ -3968,18 +4100,18 @@ mod tests {
         let before = actor.peer_table.get(&addr).unwrap().score;
 
         actor
-            .handle_control(PeerManagerMessage::RateLimitViolation {
-                validator_id: validator,
+            .handle_rate_limit_violation(
+                validator,
                 addr,
-                violation: RateLimitViolationInfo {
+                RateLimitViolationInfo {
                     class: MessageClass::BlockResponse,
                     penalty: 10,
                     reason: RateLimitReason::Byte,
                 },
-            })
+            )
             .await;
 
-        assert_eq!(actor.peer_table.get(&addr).unwrap().score, before - 10);
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, before);
     }
 
     #[test]

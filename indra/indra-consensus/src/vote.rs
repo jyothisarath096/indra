@@ -103,6 +103,32 @@ impl VoteCollector {
     ///
     /// Returns the current decision after this vote.
     pub fn add_vote(&mut self, vote: VoteV1) -> ConsensusResult<VoteDecision> {
+        self.validate_dimensions_membership_and_duplicate(&vote)?;
+        verify_vote_authority(&vote, &self.chain_id, &self.voters)?;
+        self.add_verified_vote(vote)
+    }
+
+    /// Add a vote whose membership and hybrid signature were already checked
+    /// with [`verify_vote_authority`] against this collector's voter snapshot.
+    ///
+    /// This exists so callers can authenticate a vote before reserving any
+    /// external admission slot without paying for the hybrid verification
+    /// twice. Structural dimensions and duplicate admission remain enforced
+    /// here.
+    pub fn add_verified_vote(&mut self, vote: VoteV1) -> ConsensusResult<VoteDecision> {
+        self.validate_dimensions_membership_and_duplicate(&vote)?;
+        let voter = self
+            .voters
+            .iter()
+            .find(|v| v.validator_id == vote.validator_id)
+            .expect("membership checked above");
+        let stake = voter.stake;
+        self.received.insert(vote.validator_id, (vote, stake));
+
+        Ok(self.current_decision())
+    }
+
+    fn validate_dimensions_membership_and_duplicate(&self, vote: &VoteV1) -> ConsensusResult<()> {
         // Height/round check
         if vote.height != self.height || vote.round != self.round {
             return Err(ConsensusError::VoteHeightMismatch {
@@ -116,72 +142,19 @@ impl VoteCollector {
             });
         }
 
-        // Find the voter
-        let voter = self
-            .voters
+        // Resolve stake from the same voter snapshot used by the authority
+        // verification performed by the caller.
+        self.voters
             .iter()
             .find(|v| v.validator_id == vote.validator_id)
-            .ok_or(ConsensusError::UnknownVoter)?
-            .clone();
+            .ok_or(ConsensusError::UnknownVoter)?;
 
         // Duplicate check
         if self.received.contains_key(&vote.validator_id) {
             return Err(ConsensusError::DuplicateVote);
         }
 
-        // Verify signature
-        let signing_bytes = vote_signing_bytes(
-            vote.height,
-            vote.round,
-            vote.step,
-            &vote.block_hash,
-            &vote.validator_id,
-            vote.election_result_hash.as_ref(),
-            &self.chain_id,
-        );
-
-        let sig_classical: [u8; 64] =
-            vote.signature
-                .classical_sig
-                .as_slice()
-                .try_into()
-                .map_err(|_| ConsensusError::CryptoError {
-                    detail: "malformed classical sig".to_string(),
-                })?;
-
-        let sig_pq: [u8; indra_crypto::PQ_SIG_BYTES] =
-            vote.signature.pq_sig.as_slice().try_into().map_err(|_| {
-                ConsensusError::CryptoError {
-                    detail: "malformed pq sig".to_string(),
-                }
-            })?;
-        let pk_pq: [u8; indra_crypto::PQ_PK_BYTES] =
-            voter
-                .pq_pk
-                .as_slice()
-                .try_into()
-                .map_err(|_| ConsensusError::CryptoError {
-                    detail: "malformed pq pk".to_string(),
-                })?;
-
-        let sig = HybridSignature {
-            classical: ClassicalSignature(sig_classical),
-            pq: PqSignature(sig_pq),
-        };
-
-        let pk = HybridPublicKey {
-            classical: ClassicalPublicKey(voter.classical_pk),
-            pq: PqPublicKey(pk_pq),
-        };
-
-        verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| ConsensusError::CryptoError {
-            detail: e.to_string(),
-        })?;
-
-        let stake = voter.stake;
-        self.received.insert(vote.validator_id, (vote, stake));
-
-        Ok(self.current_decision())
+        Ok(())
     }
 
     /// Return the current decision without adding a vote.
@@ -229,6 +202,65 @@ impl VoteCollector {
     pub fn has_vote_from(&self, validator_id: &Bytes32) -> bool {
         self.received.contains_key(validator_id)
     }
+}
+
+/// Verify that a vote claims a registered voter and carries a valid hybrid
+/// signature for that authority. This function is deliberately state-free so
+/// admission code can run it before mutating deduplication or slash-detection
+/// state.
+pub fn verify_vote_authority(
+    vote: &VoteV1,
+    chain_id: &str,
+    voters: &[RegisteredVoter],
+) -> ConsensusResult<()> {
+    let voter = voters
+        .iter()
+        .find(|v| v.validator_id == vote.validator_id)
+        .ok_or(ConsensusError::UnknownVoter)?;
+    let signing_bytes = vote_signing_bytes(
+        vote.height,
+        vote.round,
+        vote.step,
+        &vote.block_hash,
+        &vote.validator_id,
+        vote.election_result_hash.as_ref(),
+        chain_id,
+    );
+    let sig_classical: [u8; 64] =
+        vote.signature
+            .classical_sig
+            .as_slice()
+            .try_into()
+            .map_err(|_| ConsensusError::CryptoError {
+                detail: "malformed classical sig".to_string(),
+            })?;
+    let sig_pq: [u8; indra_crypto::PQ_SIG_BYTES] = vote
+        .signature
+        .pq_sig
+        .as_slice()
+        .try_into()
+        .map_err(|_| ConsensusError::CryptoError {
+            detail: "malformed pq sig".to_string(),
+        })?;
+    let pk_pq: [u8; indra_crypto::PQ_PK_BYTES] =
+        voter
+            .pq_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| ConsensusError::CryptoError {
+                detail: "malformed pq pk".to_string(),
+            })?;
+    let sig = HybridSignature {
+        classical: ClassicalSignature(sig_classical),
+        pq: PqSignature(sig_pq),
+    };
+    let pk = HybridPublicKey {
+        classical: ClassicalPublicKey(voter.classical_pk),
+        pq: PqPublicKey(pk_pq),
+    };
+    verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| ConsensusError::CryptoError {
+        detail: e.to_string(),
+    })
 }
 
 /// Produce a signed vote.

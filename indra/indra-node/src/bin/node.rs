@@ -53,6 +53,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(8);
 const PREVOTE_TIMEOUT: Duration = Duration::from_secs(3);
 const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
+const NETWORK_DRIVER_EVENT_CAPACITY: usize = 1_024;
 const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
@@ -1022,7 +1023,11 @@ fn start_network_runtime(
             .cloned()
             .collect::<HashSet<String>>(),
     );
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<NetworkEvent>();
+    // Keep the async-to-sync bridge bounded end-to-end. `send` below applies
+    // explicit backpressure when the driver is slower than network ingress;
+    // consensus messages are never silently discarded.
+    let (event_tx, event_rx) =
+        std::sync::mpsc::sync_channel::<NetworkEvent>(NETWORK_DRIVER_EVENT_CAPACITY);
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<PeerManagerHandle>();
     let outbound_cooldowns = Arc::new(Mutex::new(CooldownTracker::new(
         Duration::from_secs(2),
@@ -1166,7 +1171,9 @@ fn start_network_runtime(
                                 }
                                 NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
                             }
-                            let _ = event_tx.send(event);
+                            if event_tx.send(event).is_err() {
+                                break;
+                            }
                         }
                     }
                 });
@@ -6509,5 +6516,25 @@ mod tests {
         assert!(sem.clone().try_acquire_owned().is_err());
         drop(permits);
         assert!(sem.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn bounded_driver_bridge_applies_backpressure_without_dropping() {
+        assert_eq!(NETWORK_DRIVER_EVENT_CAPACITY, 1_024);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        tx.send(1u8).unwrap();
+        let sender = std::thread::spawn(move || {
+            tx.send(2u8).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(rx.recv().unwrap(), 1);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(rx.recv().unwrap(), 2);
+        sender.join().unwrap();
     }
 }
