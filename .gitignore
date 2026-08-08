@@ -1,5 +1,9 @@
 target/
 keys.json
+wallet.json
+blocks.log
+__pycache__/
+*.pyc
 .DS_Store
 incident_*/
 buggy-node-binary
