@@ -185,6 +185,8 @@ pub enum DriverEvent {
     PeerStatus {
         /// The peer.
         from: SocketAddr,
+        /// Authenticated validator identity bound by the transport handshake.
+        validator_id: Bytes32,
         /// The peer's committed height.
         height: u64,
         /// The peer's tip hash.
@@ -763,6 +765,21 @@ impl ConsensusDriver {
         self.set_last_qc_bytes_if_newer_from_source(certified_height, qc_bytes, source)
     }
 
+    /// Persist QC bytes that the sync coordinator has already verified as
+    /// certifying the current canonical tip.
+    pub fn promote_verified_sync_qc(&mut self, height: u64, qc_bytes: Vec<u8>) -> NodeResult<()> {
+        if height != self.engine.state.height {
+            return Err(NodeError::BlockInvalid {
+                height,
+                reason: format!(
+                    "verified sync QC height does not match canonical height {}",
+                    self.engine.state.height
+                ),
+            });
+        }
+        self.set_last_qc_bytes_if_newer_from_source(height, qc_bytes, "sync-qc-response")
+    }
+
     /// True when the cached QC does not certify the current committed tip.
     pub fn last_qc_is_stale(&self) -> bool {
         if self.engine.state.height == 0 {
@@ -888,10 +905,11 @@ impl ConsensusDriver {
             DriverEvent::InboundVote { from, vote } => self.process_vote(from, vote),
             DriverEvent::PeerStatus {
                 from,
+                validator_id,
                 height,
                 tip_hash,
                 round,
-            } => self.process_status(from, height, tip_hash, round),
+            } => self.process_status(from, validator_id, height, tip_hash, round),
             DriverEvent::QcResponse {
                 from,
                 height,
@@ -3014,8 +3032,9 @@ impl ConsensusDriver {
     fn process_status(
         &mut self,
         from: SocketAddr,
+        validator_id: Bytes32,
         height: u64,
-        _tip_hash: Bytes32,
+        tip_hash: Bytes32,
         peer_round: u32,
     ) -> Vec<DriverAction> {
         let our_height = self.engine.height();
@@ -3043,7 +3062,26 @@ impl ConsensusDriver {
                 self.prune_stalled_collections();
             }
         }
-        match self.sync.observe_status(from, height, our_height) {
+        let peer_stake = self
+            .registered_voters
+            .iter()
+            .find(|voter| voter.validator_id == validator_id)
+            .map(|voter| voter.stake)
+            .unwrap_or(0);
+        let total_active_stake = self
+            .registered_voters
+            .iter()
+            .fold(0u64, |sum, voter| sum.saturating_add(voter.stake));
+        match self.sync.observe_status(
+            validator_id,
+            from,
+            height,
+            tip_hash,
+            peer_stake,
+            total_active_stake,
+            our_height,
+            Instant::now(),
+        ) {
             Some((peer, from_height, to_height)) => vec![DriverAction::RequestBlocks {
                 from: peer,
                 from_height,
@@ -6523,7 +6561,15 @@ mod tests {
         let height = FINAL_REVEAL_SET_HEIGHT + 1;
         let round = 0;
         driver.engine.state.height = height - 1;
-        driver.engine.state.tip_hash = Bytes32::from([0x31; 32]);
+        driver
+            .engine
+            .block_store
+            .append(&crate::genesis::build_genesis_block())
+            .unwrap();
+        let mut stored_parent = make_block(&driver.engine.state);
+        stored_parent.header.height = height - 1;
+        driver.engine.block_store.append(&stored_parent).unwrap();
+        driver.engine.state.tip_hash = stored_parent.header.block_hash();
         driver.sync.mark_caught_up(driver.engine.state.height);
         driver.start_round(round);
 
@@ -6654,7 +6700,15 @@ mod tests {
         let height = FINAL_REVEAL_SET_HEIGHT + 1;
         let round = 0;
         driver.engine.state.height = height - 1;
-        driver.engine.state.tip_hash = Bytes32::from([0x35; 32]);
+        driver
+            .engine
+            .block_store
+            .append(&crate::genesis::build_genesis_block())
+            .unwrap();
+        let mut stored_parent = make_block(&driver.engine.state);
+        stored_parent.header.height = height - 1;
+        driver.engine.block_store.append(&stored_parent).unwrap();
+        driver.engine.state.tip_hash = stored_parent.header.block_hash();
         driver.sync.mark_caught_up(driver.engine.state.height);
         driver.start_round(round);
 
@@ -8091,6 +8145,7 @@ mod tests {
 
         driver.process(DriverEvent::PeerStatus {
             from: peer,
+            validator_id: Bytes32::ZERO,
             height: 1,
             tip_hash: driver.engine.state.tip_hash,
             round: 8,
@@ -8109,6 +8164,7 @@ mod tests {
 
         driver.process(DriverEvent::PeerStatus {
             from: peer,
+            validator_id: Bytes32::ZERO,
             height: 1,
             tip_hash: driver.engine.state.tip_hash,
             round: 1_358,
@@ -8127,6 +8183,7 @@ mod tests {
 
         driver.process(DriverEvent::PeerStatus {
             from: peer,
+            validator_id: Bytes32::ZERO,
             height: 1,
             tip_hash: driver.engine.state.tip_hash,
             round: 6,
@@ -8146,6 +8203,7 @@ mod tests {
             driver.sync.mark_caught_up(driver.height());
             driver.process(DriverEvent::PeerStatus {
                 from: peer,
+                validator_id: Bytes32::ZERO,
                 height: 1,
                 tip_hash: driver.engine.state.tip_hash,
                 round: 29,
@@ -8164,6 +8222,7 @@ mod tests {
 
         driver.process(DriverEvent::PeerStatus {
             from: peer,
+            validator_id: Bytes32::ZERO,
             height: 1,
             tip_hash: driver.engine.state.tip_hash,
             round: 3,
@@ -8181,6 +8240,7 @@ mod tests {
 
         driver.process(DriverEvent::PeerStatus {
             from: peer,
+            validator_id: Bytes32::ZERO,
             height: 1,
             tip_hash: driver.engine.state.tip_hash,
             round: 8,
@@ -10206,7 +10266,19 @@ mod tests {
         driver.refresh_registered_voters();
 
         let peer: SocketAddr = "127.0.0.1:9601".parse().unwrap();
-        let _ = driver.sync.observe_status(peer, 10, driver.height());
+        let voter = driver.registered_voters[0].clone();
+        let local_height = driver.height();
+        driver.sync.peer_connected(voter.validator_id);
+        let _ = driver.sync.observe_status(
+            voter.validator_id,
+            peer,
+            10,
+            Bytes32::ZERO,
+            voter.stake,
+            voter.stake,
+            local_height,
+            Instant::now(),
+        );
         assert!(!driver.sync.is_caught_up());
 
         let block = make_block(&driver.engine.state);
@@ -10227,7 +10299,19 @@ mod tests {
         driver.refresh_registered_voters();
 
         let peer: SocketAddr = "127.0.0.1:9602".parse().unwrap();
-        let _ = driver.sync.observe_status(peer, 10, driver.height());
+        let voter = driver.registered_voters[0].clone();
+        let local_height = driver.height();
+        driver.sync.peer_connected(voter.validator_id);
+        let _ = driver.sync.observe_status(
+            voter.validator_id,
+            peer,
+            10,
+            Bytes32::ZERO,
+            voter.stake,
+            voter.stake,
+            local_height,
+            Instant::now(),
+        );
         assert!(!driver.sync.is_caught_up());
 
         let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));

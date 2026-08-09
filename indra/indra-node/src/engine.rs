@@ -60,7 +60,10 @@ use crate::{
     pending_dependencies::{
         governance_footprint, slash_footprint, staking_footprint, DependencyIndex, DependencyKey,
     },
-    sync::{import_block_with_effects, project_and_verify_block_state_root},
+    sync::{
+        commit_prepared_with_durable_hook, project_and_verify_block_state_root,
+        verify_sync_candidate, PreparedSyncBlock,
+    },
 };
 
 /// The node engine: owns all state and drives consensus.
@@ -1523,29 +1526,58 @@ impl NodeEngine {
 
     /// Import a block that has been committed (QC formed).
     pub fn commit_block(&mut self, block: &indra_core::types::block::BlockV1) -> NodeResult<()> {
-        let outcome = import_block_with_effects(
+        let prepared = verify_sync_candidate(block, &self.state, current_timestamp_secs())?;
+        self.commit_prepared_sync_block(block, prepared)
+    }
+
+    /// Durably commit a sync block using its admission-time detached projection.
+    pub fn commit_prepared_sync_block(
+        &mut self,
+        block: &indra_core::types::block::BlockV1,
+        prepared: PreparedSyncBlock,
+    ) -> NodeResult<()> {
+        let data_dir = self.config.data_dir.clone();
+        let state_dir = self.config.state_dir();
+        let state_store = &self.state_store;
+        let epoch_store = &mut self.epoch_store;
+        let last_qc_height = load_last_qc(&state_dir)
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                let mut reader = ByteReader::new(&bytes);
+                indra_core::types::qc::QuorumCertificateV1::decode(&mut reader)
+                    .ok()
+                    .map(|qc| qc.height)
+            })
+            .unwrap_or(0);
+        let outcome = commit_prepared_with_durable_hook(
             block,
+            prepared,
             &mut self.state,
             &mut self.mempool,
             &mut self.block_store,
-            &self.state_store,
-            current_timestamp_secs(),
+            state_store,
+            |projected_state, epoch_record, block_log_next_height| {
+                if let Some(record) = epoch_record {
+                    epoch_store.append(record)?;
+                }
+                let manifest = ChainManifest {
+                    committed_height: projected_state.height,
+                    committed_block_hash: projected_state.tip_hash,
+                    state_root: indra_state::compute_state_root(projected_state),
+                    snapshot_height: state_store.latest_snapshot_height()?.unwrap_or(0),
+                    block_log_next_height,
+                    last_qc_height,
+                    epoch_log_latest_epoch: epoch_store.latest_epoch(),
+                    chain_id: projected_state.chain_id.clone(),
+                };
+                save_chain_manifest(&data_dir, &manifest)?;
+                Ok(())
+            },
         )?;
-        if let Some(record) = outcome.epoch_record {
-            self.epoch_store.append(&record)?;
-        }
         // QC signer liveness is updated inside `apply_block` so live import,
         // sync import, replay, and block-production projection mutate state
         // identically.
-        if self.state.height > 0
-            && self
-                .state
-                .height
-                .is_multiple_of(indra_storage::state_store::SNAPSHOT_INTERVAL)
-        {
-            self.state_store.save(&self.state)?;
-        }
-        self.write_chain_manifest()?;
         self.evict_committed_staking_ops(&block.staking_ops);
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
@@ -1779,7 +1811,7 @@ mod tests {
     };
     use indra_core::types::staking::{StakeDepositProof, StakingOpBody};
     use indra_core::types::transaction::{InputV1, OutputV1, TransactionV1};
-    use indra_core::types::vote::{VoteStep, VoteV1};
+    use indra_core::types::vote::VoteStep;
     use indra_core::CommitmentV1;
     use indra_core::VariableBytes;
     use indra_crypto::{constants::ML_KEM_1024_CT_BYTES, PaymentBlindingNoteV1};

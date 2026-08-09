@@ -11,7 +11,11 @@ use indra_network::message::Message;
 use crate::driver::{DriverAction, DriverEvent};
 
 /// Convert a network Message into a DriverEvent.
-pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
+pub fn message_to_event(
+    msg: Message,
+    from: SocketAddr,
+    validator_id: indra_core::Bytes32,
+) -> Option<DriverEvent> {
     match msg {
         Message::Block(block) => Some(DriverEvent::InboundBlock {
             from: Some(from),
@@ -27,6 +31,7 @@ pub fn message_to_event(msg: Message, from: SocketAddr) -> Option<DriverEvent> {
             round,
         } => Some(DriverEvent::PeerStatus {
             from,
+            validator_id,
             height,
             tip_hash,
             round,

@@ -37,7 +37,27 @@ use indra_node::{
 };
 use indra_state::ChainState;
 use indra_storage::{BlockStore, PruneConfig, StateStore};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Instant};
+
+fn observe_sync_status(
+    sync: &mut SyncState,
+    peer: std::net::SocketAddr,
+    peer_height: u64,
+    local_height: u64,
+) -> Option<(std::net::SocketAddr, u64, u64)> {
+    let validator_id = Bytes32::from([0x13; 32]);
+    sync.peer_connected(validator_id);
+    sync.observe_status(
+        validator_id,
+        peer,
+        peer_height,
+        Bytes32::ZERO,
+        100,
+        100,
+        local_height,
+        Instant::now(),
+    )
+}
 
 fn temp_dir(suffix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -535,8 +555,8 @@ fn sync_state_downloads_full_chain_from_genesis() {
     let follower_state_store = StateStore::open(&follower_state_dir).unwrap();
     let mut sync = SyncState::follower(follower_state.height);
 
-    let request = sync.observe_status(peer, source_state.height, follower_state.height);
-    assert_eq!(request, Some((peer, 1, source_state.height)));
+    let request = observe_sync_status(&mut sync, peer, source_state.height, follower_state.height);
+    assert_eq!(request, Some((peer, 1, source_state.height + 1)));
 
     for height in 1..=source_state.height {
         let block = source_store.get(height).unwrap();
@@ -814,7 +834,18 @@ fn node_syncs_before_joining_consensus() {
 
     let peer: std::net::SocketAddr = "127.0.0.1:30303".parse().unwrap();
     let local_height = driver.height();
-    let _ = driver.sync_mut().observe_status(peer, 10, local_height);
+    let voter = driver.engine.registered_voters()[0].clone();
+    driver.sync_mut().peer_connected(voter.validator_id);
+    let _ = driver.sync_mut().observe_status(
+        voter.validator_id,
+        peer,
+        10,
+        Bytes32::ZERO,
+        voter.stake,
+        voter.stake,
+        local_height,
+        Instant::now(),
+    );
     assert!(!driver.sync().is_caught_up());
 
     let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
@@ -899,8 +930,8 @@ fn full_restart_recovery_end_to_end() {
         let peer: std::net::SocketAddr = "127.0.0.1:30304".parse().unwrap();
         let mut sync = SyncState::follower(follower_state.height);
         assert_eq!(
-            sync.observe_status(peer, source_state.height, follower_state.height),
-            Some((peer, 2, 2))
+            observe_sync_status(&mut sync, peer, source_state.height, follower_state.height),
+            Some((peer, 2, 3))
         );
 
         let block2 = source_store.get(2).unwrap();

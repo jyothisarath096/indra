@@ -2731,6 +2731,42 @@ mod tests {
         make_block_at_height(state, txs, height, 1_700_000_000 + height)
     }
 
+    #[test]
+    #[ignore = "real-hardware release benchmark; run explicitly with --release --ignored --nocapture"]
+    fn max_transaction_block_validation_real_hardware_benchmark() {
+        let mut state = ChainState::new_genesis();
+        install_governance_validator(&mut state, [0xF1; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
+        let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
+        let mut inputs = Vec::with_capacity(MAX_TX_PER_BLOCK);
+        for index in 0..MAX_TX_PER_BLOCK {
+            let byte = (index + 1) as u8;
+            let output = dummy_output(byte, owner_pubkey.clone());
+            let value = TEST_INPUT_VALUE + u64::from(byte);
+            let utxo_id = state.utxos.insert(output, 0, 0, index as u32).unwrap();
+            inputs.push((utxo_id, value, [byte; 32], Bytes32::from([byte; 32])));
+        }
+        state.finalize_genesis().unwrap();
+        let transactions = inputs
+            .into_iter()
+            .map(|(utxo_id, value, blinding, nullifier)| {
+                make_tx(&state, &keypair, utxo_id, value, blinding, nullifier)
+            })
+            .collect();
+        let block = make_block(&state, transactions);
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let mut projected = state.clone();
+            let started = std::time::Instant::now();
+            std::hint::black_box(apply_block_with_effects(&mut projected, &block, 0).unwrap());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "MAX_TX_BLOCK_BENCH samples={samples:?} median_ms={:.3}",
+            samples[samples.len() / 2].as_secs_f64() * 1_000.0
+        );
+    }
+
     fn make_block_at_height(
         state: &ChainState,
         txs: Vec<TransactionV1>,

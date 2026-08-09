@@ -11,7 +11,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::available_space;
 use indra_core::codec::Encode;
@@ -43,7 +43,10 @@ use indra_node::{
     genesis::load_genesis_seed_peers,
     metrics::{record_block_commit, DEFAULT_METRICS_ADDR},
     net_driver::{action_to_message, message_to_event},
-    sync::SYNC_BATCH_SIZE,
+    sync::{
+        verify_direct_provisional_qc, verify_provisional_certificate, verify_sync_candidate,
+        PairVerificationError, SYNC_BATCH_SIZE,
+    },
     KeysData, MetricsState, NodeConfig, NodeConfigFile, NodeEngine,
 };
 use rand::{seq::SliceRandom, Rng};
@@ -68,6 +71,34 @@ const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
 const MAX_INBOUND_PER_IP: u8 = 3;
 const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn write_sync_recovery_diagnostic(data_dir: &Path, height: u64, tip_hash: indra_core::Bytes32) {
+    let final_path = data_dir.join("sync_recovery_required.json");
+    let tmp_path = data_dir.join("sync_recovery_required.json.tmp");
+    let document = serde_json::json!({
+        "version": 1,
+        "detected_unix_secs": unix_timestamp_secs(),
+        "stalled_height": height,
+        "local_tip_hash": hex::encode(tip_hash.0),
+        "reason": "three distinct authenticated sync sources failed expensive validation at one height",
+        "recovery": "stop the node; run indra-sync-recover <source-data-dir> <new-empty-data-dir> <trusted-genesis.toml>; inspect the report; start from the new directory only after operator review",
+        "in_place_rewind_forbidden": true
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&document) {
+        if let Ok(mut file) = std::fs::File::create(&tmp_path) {
+            if file.write_all(&bytes).is_ok() && file.sync_all().is_ok() {
+                let _ = std::fs::rename(&tmp_path, &final_path);
+            }
+        }
+    }
+}
 const DNS_RESERVED_OUTBOUND: usize = 2;
 const MAX_RPC_CONNECTIONS: u64 = indra_rpc::server::MAX_RPC_CONNECTIONS;
 
@@ -2274,14 +2305,38 @@ fn main() {
         let metrics_state = Arc::clone(&metrics_state);
         let last_block_timestamp = Arc::clone(&last_block_timestamp);
         let op_relay_seen = Arc::clone(&op_relay_seen);
+        let sync_diagnostic_dir = PathBuf::from(data_dir.clone());
 
         std::thread::spawn(move || {
+            let mut sync_cooldowns =
+                CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60));
             while let Ok(event) = network_events.recv() {
+                if let Some(expired) = driver
+                    .lock()
+                    .unwrap()
+                    .sync_mut()
+                    .expire_outstanding(Instant::now())
+                {
+                    sync_cooldowns.record_failure_at(expired.validator_id, Instant::now());
+                    gossip.score_peer(
+                        expired.validator_id,
+                        indra_network::peer::ScoreEvent::Timeout,
+                    );
+                    eprintln!(
+                        "[sync] request {}..={} to {} timed out; rotating source",
+                        expired.from_height, expired.to_height, expired.peer
+                    );
+                }
                 connected_validator_peers.store(gossip.connection_count(), Ordering::Relaxed);
                 match event {
                     NetworkEvent::PeerConnected {
                         validator_id, addr, ..
                     } => {
+                        driver
+                            .lock()
+                            .unwrap()
+                            .sync_mut()
+                            .peer_connected(validator_id);
                         connected_validator_peers
                             .store(gossip.connection_count(), Ordering::Relaxed);
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
@@ -2305,7 +2360,14 @@ fn main() {
                             &last_block_timestamp,
                         );
                     }
-                    NetworkEvent::PeerDisconnected { addr, .. } => {
+                    NetworkEvent::PeerDisconnected {
+                        validator_id, addr, ..
+                    } => {
+                        driver
+                            .lock()
+                            .unwrap()
+                            .sync_mut()
+                            .peer_disconnected(validator_id, addr);
                         connected_validator_peers
                             .store(gossip.connection_count(), Ordering::Relaxed);
                         eprintln!("[p2p] peer disconnected: {}", addr);
@@ -2325,6 +2387,102 @@ fn main() {
                         msg,
                     } => {
                         match &msg {
+                            Message::Status { .. } => {
+                                if sync_cooldowns.blocked_at(&validator_id, Instant::now()) {
+                                    continue;
+                                }
+                            }
+                            Message::QCResponse { height, qc_bytes } => {
+                                let pending = driver.lock().unwrap().sync().provisional().cloned();
+                                if let Some(pending) = pending {
+                                    if pending.block.header.height != *height {
+                                        gossip.score_peer(
+                                            validator_id,
+                                            indra_network::peer::ScoreEvent::InvalidMessage,
+                                        );
+                                        continue;
+                                    }
+                                    let verified = {
+                                        let d = driver.lock().unwrap();
+                                        verify_direct_provisional_qc(
+                                            &pending.block,
+                                            qc_bytes,
+                                            &d.engine.state,
+                                        )
+                                    };
+                                    match verified {
+                                        Ok(()) => {
+                                            let mut d = driver.lock().unwrap();
+                                            let finalized = d
+                                                .sync_mut()
+                                                .take_provisional()
+                                                .expect("verified provisional exists");
+                                            match d.engine.commit_prepared_sync_block(
+                                                &finalized.block,
+                                                finalized.prepared,
+                                            ) {
+                                                Ok(()) => {
+                                                    if let Err(error) = d.promote_verified_sync_qc(
+                                                        *height,
+                                                        qc_bytes.clone(),
+                                                    ) {
+                                                        eprintln!(
+                                                            "[sync] finalized block {} but failed to persist its QC: {}",
+                                                            height, error
+                                                        );
+                                                        write_sync_recovery_diagnostic(
+                                                            &sync_diagnostic_dir,
+                                                            *height,
+                                                            d.engine.state.tip_hash,
+                                                        );
+                                                        continue;
+                                                    }
+                                                    d.sync_mut().on_block_imported(*height);
+                                                    d.refresh_registered_voters();
+                                                    d.reset_round();
+                                                    sync_cooldowns.reset(&validator_id);
+                                                    record_block_commit(
+                                                        &metrics_state,
+                                                        &last_block_timestamp,
+                                                    );
+                                                    let _ = height_tx.send(());
+                                                }
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "[sync] QC-finalized block {} failed durable commit: {}",
+                                                        height, error
+                                                    );
+                                                    write_sync_recovery_diagnostic(
+                                                        &sync_diagnostic_dir,
+                                                        finalized.block.header.height,
+                                                        d.engine.state.tip_hash,
+                                                    );
+                                                }
+                                            }
+                                            drop(d);
+                                            broadcast_status(&driver, &gossip);
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "[sync] invalid requested QC for height {} from {}: {}",
+                                                height, addr, error
+                                            );
+                                            gossip.score_peer(
+                                                validator_id,
+                                                indra_network::peer::ScoreEvent::InvalidMessage,
+                                            );
+                                            sync_cooldowns
+                                                .record_failure_at(validator_id, Instant::now());
+                                            driver
+                                                .lock()
+                                                .unwrap()
+                                                .sync_mut()
+                                                .source_failed(validator_id, addr);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                             Message::StakingOp(op) => {
                                 let key = op_relay_key(&msg).expect("staking relay key");
                                 if op_relay_seen
@@ -2542,6 +2700,23 @@ fn main() {
                                 lowest_available,
                                 highest_available,
                             } => {
+                                let binding = {
+                                    driver.lock().unwrap().sync_mut().accept_response(
+                                        validator_id,
+                                        addr,
+                                        blocks,
+                                    )
+                                };
+                                if let Err(reason) = binding {
+                                    eprintln!(
+                                        "[sync] rejected unbound response from {addr}: {reason}"
+                                    );
+                                    gossip.score_peer(
+                                        validator_id,
+                                        indra_network::peer::ScoreEvent::InvalidMessage,
+                                    );
+                                    continue;
+                                }
                                 if blocks.is_empty() {
                                     if let (Some(lowest), Some(highest)) =
                                         (lowest_available, highest_available)
@@ -2551,71 +2726,231 @@ fn main() {
                                             addr, lowest, highest
                                         );
                                     }
+                                    driver.lock().unwrap().sync_mut().on_empty_response();
+                                    sync_cooldowns.record_failure_at(validator_id, Instant::now());
+                                    gossip.score_peer(
+                                        validator_id,
+                                        indra_network::peer::ScoreEvent::Timeout,
+                                    );
+                                    continue;
                                 }
-                                let response_blocks = blocks.clone();
-                                let request_more;
+                                let mut request_more;
                                 let mut caught_up_height = None;
                                 let mut imported_any = false;
                                 let mut qc_recovery_actions = Vec::new();
+                                let mut request_provisional_qc = None;
+                                let mut scored_failures = Vec::new();
                                 {
                                     let mut d = driver.lock().unwrap();
-                                    for block in response_blocks {
-                                        if block.header.height != d.height() + 1 {
-                                            continue;
+                                    for block in blocks {
+                                        let now = Instant::now();
+                                        let expected_height = d
+                                            .sync()
+                                            .provisional()
+                                            .map(|pending| {
+                                                pending.block.header.height.saturating_add(1)
+                                            })
+                                            .unwrap_or_else(|| d.height().saturating_add(1));
+                                        if block.header.height != expected_height {
+                                            scored_failures.push((
+                                                validator_id,
+                                                indra_network::peer::ScoreEvent::InvalidMessage,
+                                            ));
+                                            d.sync_mut().source_failed(validator_id, addr);
+                                            break;
                                         }
 
-                                        match d.engine.commit_block(&block) {
-                                            Ok(()) => {
-                                                imported_any = true;
-                                                record_block_commit(
-                                                    &metrics_state,
-                                                    &last_block_timestamp,
-                                                );
-                                                refresh_handshake_and_relay_config(
-                                                    &d.engine,
-                                                    &handshake_config,
-                                                    &gossip,
-                                                );
-                                                if let Err(err) =
-                                                    d.promote_block_header_qc(&block, "sync")
-                                                {
-                                                    eprintln!(
-                                                        "[sync] WARNING: imported height={} from {} but failed to promote embedded QC: {}",
-                                                        block.header.height, addr, err,
+                                        if let Some(pending) = d.sync().provisional().cloned() {
+                                            match verify_provisional_certificate(
+                                                &pending.block,
+                                                &block,
+                                                &d.engine.state,
+                                            ) {
+                                                Ok(()) => {
+                                                    let finalized = d
+                                                        .sync_mut()
+                                                        .take_provisional()
+                                                        .expect("provisional exists");
+                                                    if let Err(error) =
+                                                        d.engine.commit_prepared_sync_block(
+                                                            &finalized.block,
+                                                            finalized.prepared,
+                                                        )
+                                                    {
+                                                        eprintln!(
+                                                            "[sync] finalized block {} failed durable commit: {}",
+                                                            finalized.block.header.height, error
+                                                        );
+                                                        write_sync_recovery_diagnostic(
+                                                            &sync_diagnostic_dir,
+                                                            finalized.block.header.height,
+                                                            d.engine.state.tip_hash,
+                                                        );
+                                                        break;
+                                                    }
+                                                    imported_any = true;
+                                                    request_provisional_qc = None;
+                                                    if let Err(error) = d.promote_block_header_qc(
+                                                        &block,
+                                                        "sync-buffer",
+                                                    ) {
+                                                        eprintln!(
+                                                            "[sync] finalized block {} but failed to persist its QC: {}",
+                                                            finalized.block.header.height, error
+                                                        );
+                                                        write_sync_recovery_diagnostic(
+                                                            &sync_diagnostic_dir,
+                                                            finalized.block.header.height,
+                                                            d.engine.state.tip_hash,
+                                                        );
+                                                        break;
+                                                    }
+                                                    d.sync_mut().on_block_imported(
+                                                        finalized.block.header.height,
                                                     );
+                                                    d.refresh_registered_voters();
+                                                    d.reset_round();
+                                                    // One canonical promotion per event-loop
+                                                    // iteration bounds mutex hold time. The next
+                                                    // request re-fetches the carrier as the next
+                                                    // provisional candidate after other network
+                                                    // events and consensus timers get a turn.
+                                                    break;
                                                 }
-                                                d.refresh_registered_voters();
-                                                d.sync_mut().on_block_imported(block.header.height);
-                                                d.reset_round();
-                                                if should_log_sync_height(block.header.height) {
+                                                Err(
+                                                    PairVerificationError::ProvisionalBlockWrong {
+                                                        certified_hash,
+                                                    },
+                                                ) => {
                                                     eprintln!(
-                                                        "[sync] imported block at height={} from {}",
-                                                        block.header.height,
-                                                        addr
+                                                        "[sync] valid QC from {} certifies {}, not provisional {}; attributing fault to earlier source {}",
+                                                        addr,
+                                                        hex::encode(&certified_hash.0[..8]),
+                                                        hex::encode(&pending.block.header.block_hash().0[..8]),
+                                                        pending.source,
                                                     );
+                                                    scored_failures.push((
+                                                        pending.source_validator_id,
+                                                        indra_network::peer::ScoreEvent::InvalidMessage,
+                                                    ));
+                                                    sync_cooldowns.record_failure_at(
+                                                        pending.source_validator_id,
+                                                        now,
+                                                    );
+                                                    d.sync_mut().clear_provisional();
+                                                    d.sync_mut().source_failed(
+                                                        pending.source_validator_id,
+                                                        pending.source,
+                                                    );
+                                                    break;
+                                                }
+                                                Err(
+                                                    PairVerificationError::CertificateCarrierWrong(
+                                                        error,
+                                                    ),
+                                                ) => {
+                                                    eprintln!(
+                                                        "[sync] invalid certificate carrier {} from {}: {}",
+                                                        block.header.height, addr, error
+                                                    );
+                                                    scored_failures.push((
+                                                        validator_id,
+                                                        indra_network::peer::ScoreEvent::InvalidMessage,
+                                                    ));
+                                                    sync_cooldowns
+                                                        .record_failure_at(validator_id, now);
+                                                    let breaker_open =
+                                                        d.sync_mut().note_expensive_failure(
+                                                            block.header.height,
+                                                            validator_id,
+                                                            now,
+                                                        );
+                                                    if breaker_open {
+                                                        write_sync_recovery_diagnostic(
+                                                            &sync_diagnostic_dir,
+                                                            block.header.height,
+                                                            d.engine.state.tip_hash,
+                                                        );
+                                                    }
+                                                    d.sync_mut().source_failed(validator_id, addr);
+                                                    break;
                                                 }
                                             }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[sync] failed to import block {} from {}: {}",
-                                                    block.header.height, addr, e
+                                        }
+
+                                        if d.sync_mut().circuit_open(block.header.height, now) {
+                                            eprintln!(
+                                                "[sync] expensive-validation breaker open at height {}",
+                                                block.header.height
+                                            );
+                                            break;
+                                        }
+                                        match verify_sync_candidate(
+                                            &block,
+                                            &d.engine.state,
+                                            unix_timestamp_secs(),
+                                        ) {
+                                            Ok(prepared) => {
+                                                let staged_height = block.header.height;
+                                                d.sync_mut().stage_provisional(
+                                                    block.clone(),
+                                                    prepared,
+                                                    validator_id,
+                                                    addr,
+                                                    now,
                                                 );
+                                                request_provisional_qc =
+                                                    Some((validator_id, staged_height));
+                                            }
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "[sync] failed to validate provisional block {} from {}: {}",
+                                                    block.header.height, addr, error
+                                                );
+                                                scored_failures.push((
+                                                    validator_id,
+                                                    indra_network::peer::ScoreEvent::InvalidMessage,
+                                                ));
+                                                sync_cooldowns.record_failure_at(validator_id, now);
+                                                let breaker_open =
+                                                    d.sync_mut().note_expensive_failure(
+                                                        block.header.height,
+                                                        validator_id,
+                                                        now,
+                                                    );
+                                                if breaker_open {
+                                                    write_sync_recovery_diagnostic(
+                                                        &sync_diagnostic_dir,
+                                                        block.header.height,
+                                                        d.engine.state.tip_hash,
+                                                    );
+                                                }
+                                                d.sync_mut().source_failed(validator_id, addr);
                                                 break;
                                             }
                                         }
                                     }
-                                    if !imported_any {
-                                        let current_height = d.height();
-                                        d.sync_mut().on_empty_response(current_height);
-                                    }
                                     let new_height = d.height();
                                     request_more =
                                         d.sync_mut().next_request_after_response(new_height);
+                                    if request_more.is_none() && !d.sync().is_caught_up() {
+                                        request_more = d
+                                            .sync_mut()
+                                            .rotate_after_failure(new_height, Instant::now());
+                                    }
                                     if d.sync().is_caught_up() {
                                         d.on_sync_caught_up();
                                         qc_recovery_actions = d.request_qc_if_needed();
                                         caught_up_height = Some(new_height);
                                     }
+                                }
+
+                                for (failed_validator, event) in scored_failures {
+                                    gossip.score_peer(failed_validator, event);
+                                }
+                                if let Some((peer_id, height)) = request_provisional_qc {
+                                    gossip
+                                        .send_to_validator(peer_id, &Message::RequestQC { height });
                                 }
 
                                 if let Some((peer, from_height, to_height)) = request_more {
@@ -2630,8 +2965,11 @@ fn main() {
                                     }
                                 }
                                 if imported_any {
-                                    let _ = height_tx.send(());
-                                    broadcast_status(&driver, &gossip);
+                                    if driver.lock().unwrap().height() > 0 {
+                                        record_block_commit(&metrics_state, &last_block_timestamp);
+                                        let _ = height_tx.send(());
+                                        broadcast_status(&driver, &gossip);
+                                    }
                                 }
                                 if !qc_recovery_actions.is_empty() {
                                     process_driver_actions(
@@ -2671,7 +3009,7 @@ fn main() {
                             _ => {}
                         }
 
-                        if let Some(event) = message_to_event(msg, addr) {
+                        if let Some(event) = message_to_event(msg, addr, validator_id) {
                             let previous_height = driver.lock().unwrap().height();
                             let actions = driver.lock().unwrap().process(event);
                             process_driver_actions(

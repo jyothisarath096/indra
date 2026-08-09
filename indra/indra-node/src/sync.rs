@@ -9,7 +9,11 @@
 //!   5. Evicts spent/invalid transactions from the mempool
 //!   6. Optionally takes a state snapshot
 
-use std::net::SocketAddr;
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use indra_consensus::mempool::Mempool;
 use indra_consensus::proposer::{
@@ -37,6 +41,67 @@ use crate::{
 /// Maximum blocks to request in one sync batch.
 pub const SYNC_BATCH_SIZE: u64 = 50;
 
+/// Status claims expire after five ordinary six-second status intervals.
+pub const SYNC_HEIGHT_CLAIM_TTL: Duration = Duration::from_secs(30);
+/// Three distinct failing sources at one height pause expensive validation.
+pub const MAX_EXPENSIVE_SYNC_FAILURE_SOURCES: usize = 3;
+/// Duration of the aggregate expensive-validation circuit breaker.
+pub const SYNC_FAILURE_CIRCUIT_BREAKER: Duration = Duration::from_secs(60);
+/// Bound one outstanding block request without penalizing ordinary slow disks.
+pub const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+struct HeightClaim {
+    addr: SocketAddr,
+    height: u64,
+    tip_hash: Bytes32,
+    stake: u64,
+    expires_at: Instant,
+}
+
+/// One authenticated, locally-issued block-range request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutstandingSyncRequest {
+    /// Authenticated validator expected to answer.
+    pub validator_id: Bytes32,
+    /// Transport endpoint selected for this request.
+    pub peer: SocketAddr,
+    /// Inclusive first requested height.
+    pub from_height: u64,
+    /// Inclusive last requested height, including one certification look-ahead.
+    pub to_height: u64,
+    /// Monotonic issue time used for timeout and source rotation.
+    pub issued_at: Instant,
+}
+
+/// A fully validated block which is not canonical until its own QC arrives.
+#[derive(Debug, Clone)]
+pub struct ProvisionalSyncBlock {
+    /// Fully validated but not yet finalized block.
+    pub block: BlockV1,
+    /// Authenticated identity which supplied the block.
+    pub source_validator_id: Bytes32,
+    /// Transport endpoint which supplied the block.
+    pub source: SocketAddr,
+    /// Time at which validation completed.
+    pub staged_at: Instant,
+    /// Detached authoritative projection computed exactly once at admission.
+    pub prepared: PreparedSyncBlock,
+}
+
+/// Cryptographic attribution for a failed H/H+1 certification pair.
+#[derive(Debug)]
+pub enum PairVerificationError {
+    /// H+1 carries a valid quorum certificate for a different height-H hash,
+    /// proving that the provisional H supplied earlier is not canonical.
+    ProvisionalBlockWrong {
+        /// Hash which the independently valid quorum actually certified.
+        certified_hash: Bytes32,
+    },
+    /// H+1's claimed certificate is malformed, unauthorized, or invalid.
+    CertificateCarrierWrong(NodeError),
+}
+
 /// Current synchronization phase for a node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncPhase {
@@ -62,6 +127,14 @@ pub struct SyncState {
     best_peer_height: u64,
     received_peer_status: bool,
     is_bootstrap_node: bool,
+    connected_peers: HashSet<Bytes32>,
+    height_claims: HashMap<Bytes32, HeightClaim>,
+    total_active_stake: u64,
+    outstanding: Option<OutstandingSyncRequest>,
+    provisional: Option<ProvisionalSyncBlock>,
+    expensive_failure_sources: HashMap<u64, HashMap<Bytes32, Instant>>,
+    circuit_open_until: HashMap<u64, Instant>,
+    session_finalized_blocks: u64,
 }
 
 impl SyncState {
@@ -76,6 +149,14 @@ impl SyncState {
             best_peer_height: local_height,
             received_peer_status: local_height == 0,
             is_bootstrap_node: true,
+            connected_peers: HashSet::new(),
+            height_claims: HashMap::new(),
+            total_active_stake: 0,
+            outstanding: None,
+            provisional: None,
+            expensive_failure_sources: HashMap::new(),
+            circuit_open_until: HashMap::new(),
+            session_finalized_blocks: 0,
         }
     }
 
@@ -86,6 +167,14 @@ impl SyncState {
             best_peer_height: local_height,
             received_peer_status: false,
             is_bootstrap_node: false,
+            connected_peers: HashSet::new(),
+            height_claims: HashMap::new(),
+            total_active_stake: 0,
+            outstanding: None,
+            provisional: None,
+            expensive_failure_sources: HashMap::new(),
+            circuit_open_until: HashMap::new(),
+            session_finalized_blocks: 0,
         }
     }
 
@@ -110,15 +199,87 @@ impl SyncState {
         }
     }
 
-    /// Observe a peer's status and return a download request if we need one.
+    /// Record an authenticated validator connection for corroboration policy.
+    pub fn peer_connected(&mut self, validator_id: Bytes32) {
+        self.connected_peers.insert(validator_id);
+    }
+
+    /// Remove all transient authority associated with a disconnected peer.
+    pub fn peer_disconnected(&mut self, validator_id: Bytes32, addr: SocketAddr) {
+        self.connected_peers.remove(&validator_id);
+        self.height_claims.remove(&validator_id);
+        if self
+            .outstanding
+            .is_some_and(|request| request.validator_id == validator_id || request.peer == addr)
+        {
+            self.outstanding = None;
+        }
+        if matches!(self.phase, SyncPhase::CaughtUp) {
+            self.outstanding = None;
+            self.provisional = None;
+        }
+        if matches!(self.phase, SyncPhase::Downloading { peer, .. } if peer == addr) {
+            self.phase = SyncPhase::AwaitingPeers;
+        }
+    }
+
+    /// Remove a failed source's claim without treating its transport as disconnected.
+    pub fn source_failed(&mut self, validator_id: Bytes32, addr: SocketAddr) {
+        // A cooled source is not currently eligible for graceful-degradation
+        // counting even if its transport socket remains open.
+        self.connected_peers.remove(&validator_id);
+        self.height_claims.remove(&validator_id);
+        if self
+            .outstanding
+            .is_some_and(|request| request.validator_id == validator_id || request.peer == addr)
+        {
+            self.outstanding = None;
+        }
+        if matches!(self.phase, SyncPhase::Downloading { peer, .. } if peer == addr) {
+            self.phase = SyncPhase::AwaitingPeers;
+        }
+    }
+
+    /// Observe an authenticated validator's expiring, stake-weighted status.
     pub fn observe_status(
         &mut self,
+        validator_id: Bytes32,
         peer: SocketAddr,
         peer_height: u64,
+        tip_hash: Bytes32,
+        peer_stake: u64,
+        total_active_stake: u64,
         local_height: u64,
+        now: Instant,
     ) -> Option<(SocketAddr, u64, u64)> {
         self.received_peer_status = true;
-        self.best_peer_height = self.best_peer_height.max(peer_height);
+        self.total_active_stake = total_active_stake;
+        self.connected_peers.insert(validator_id);
+        self.height_claims.retain(|_, claim| claim.expires_at > now);
+        self.height_claims.insert(
+            validator_id,
+            HeightClaim {
+                addr: peer,
+                height: peer_height,
+                tip_hash,
+                stake: peer_stake,
+                expires_at: now + SYNC_HEIGHT_CLAIM_TTL,
+            },
+        );
+
+        let Some((target_height, selected_id, selected_peer)) =
+            self.corroborated_target(local_height, now)
+        else {
+            if local_height >= self.best_peer_height {
+                self.phase = SyncPhase::CaughtUp;
+            }
+            return None;
+        };
+        self.best_peer_height = target_height;
+
+        if self.outstanding.is_some() {
+            return None;
+        }
 
         if local_height >= self.best_peer_height {
             if matches!(self.phase, SyncPhase::AwaitingPeers) {
@@ -130,21 +291,207 @@ impl SyncState {
             return None;
         }
 
-        let from_height = local_height.saturating_add(1);
+        let from_height = self
+            .provisional
+            .as_ref()
+            .map(|pending| pending.block.header.height.saturating_add(1))
+            .unwrap_or_else(|| local_height.saturating_add(1));
         let target_height = self.best_peer_height;
-        let to_height = target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+        // Fetch one look-ahead block because H+1 carries the QC finalising H.
+        let to_height = target_height
+            .saturating_add(1)
+            .min(from_height.saturating_add(SYNC_BATCH_SIZE));
 
+        self.phase = SyncPhase::Downloading {
+            peer: selected_peer,
+            target_height,
+            next_expected: from_height,
+        };
+        self.outstanding = Some(OutstandingSyncRequest {
+            validator_id: selected_id,
+            peer: selected_peer,
+            from_height,
+            to_height,
+            issued_at: now,
+        });
+
+        Some((selected_peer, from_height, to_height))
+    }
+
+    fn corroborated_target(
+        &self,
+        local_height: u64,
+        now: Instant,
+    ) -> Option<(u64, Bytes32, SocketAddr)> {
+        let mut heights: Vec<u64> = self
+            .height_claims
+            .values()
+            .filter(|claim| claim.expires_at > now && claim.height > local_height)
+            .map(|claim| claim.height)
+            .collect();
+        heights.sort_unstable();
+        heights.dedup();
+
+        for height in heights.into_iter().rev() {
+            let mut supporters: Vec<_> = self
+                .height_claims
+                .iter()
+                .filter(|(_, claim)| claim.expires_at > now && claim.height >= height)
+                .collect();
+            supporters.sort_by_key(|(id, _)| id.0);
+            let supporting_stake = supporters
+                .iter()
+                .fold(0u64, |sum, (_, claim)| sum.saturating_add(claim.stake));
+            let stake_corroborated = self.total_active_stake > 0
+                && u128::from(supporting_stake) * 3 > u128::from(self.total_active_stake);
+            let identity_corroborated = supporters.len() >= 2 || self.connected_peers.len() < 2;
+            if stake_corroborated && identity_corroborated {
+                let (id, claim) = supporters[0];
+                // Retain the selected tip commitment for same-height
+                // contradiction diagnostics and source rotation.
+                let _selected_tip_hash = claim.tip_hash;
+                return Some((height, *id, claim.addr));
+            }
+        }
+        None
+    }
+
+    /// Rotate immediately to another still-corroborated source after failure.
+    pub fn rotate_after_failure(
+        &mut self,
+        local_height: u64,
+        now: Instant,
+    ) -> Option<(SocketAddr, u64, u64)> {
+        let (target_height, validator_id, peer) = self.corroborated_target(local_height, now)?;
+        let from_height = self
+            .provisional
+            .as_ref()
+            .map(|pending| pending.block.header.height.saturating_add(1))
+            .unwrap_or_else(|| local_height.saturating_add(1));
+        let to_height = target_height
+            .saturating_add(1)
+            .min(from_height.saturating_add(SYNC_BATCH_SIZE));
+        self.best_peer_height = target_height;
         self.phase = SyncPhase::Downloading {
             peer,
             target_height,
             next_expected: from_height,
         };
-
+        self.outstanding = Some(OutstandingSyncRequest {
+            validator_id,
+            peer,
+            from_height,
+            to_height,
+            issued_at: now,
+        });
         Some((peer, from_height, to_height))
+    }
+
+    /// Validate and consume the binding for one inbound response.
+    pub fn accept_response(
+        &mut self,
+        validator_id: Bytes32,
+        peer: SocketAddr,
+        blocks: &[BlockV1],
+    ) -> Result<OutstandingSyncRequest, &'static str> {
+        let request = self.outstanding.ok_or("no sync request is outstanding")?;
+        if !matches!(self.phase, SyncPhase::Downloading { .. }) {
+            return Err("sync is not downloading");
+        }
+        if request.validator_id != validator_id || request.peer != peer {
+            return Err("response source does not match selected sync peer");
+        }
+        if blocks.iter().any(|block| {
+            block.header.height < request.from_height || block.header.height > request.to_height
+        }) {
+            return Err("response contains a block outside the requested range");
+        }
+        if blocks
+            .windows(2)
+            .any(|pair| pair[1].header.height != pair[0].header.height.saturating_add(1))
+        {
+            return Err("response block heights are not contiguous");
+        }
+        self.outstanding = None;
+        Ok(request)
+    }
+
+    /// Expire one stalled request so another corroborated source can be tried.
+    pub fn expire_outstanding(&mut self, now: Instant) -> Option<OutstandingSyncRequest> {
+        let request = self.outstanding?;
+        if now.duration_since(request.issued_at) < SYNC_REQUEST_TIMEOUT {
+            return None;
+        }
+        self.source_failed(request.validator_id, request.peer);
+        Some(request)
+    }
+
+    /// Replace the single bounded provisional slot after full validation.
+    pub fn stage_provisional(
+        &mut self,
+        block: BlockV1,
+        prepared: PreparedSyncBlock,
+        source_validator_id: Bytes32,
+        source: SocketAddr,
+        now: Instant,
+    ) {
+        let staged_height = block.header.height;
+        self.provisional = Some(ProvisionalSyncBlock {
+            block,
+            source_validator_id,
+            source,
+            staged_at: now,
+            prepared,
+        });
+        if let SyncPhase::Downloading { next_expected, .. } = &mut self.phase {
+            *next_expected = staged_height.saturating_add(1);
+        }
+    }
+
+    /// Return the currently staged, not-yet-final block.
+    pub fn provisional(&self) -> Option<&ProvisionalSyncBlock> {
+        self.provisional.as_ref()
+    }
+
+    /// Consume the staged block once its own QC has been verified.
+    pub fn take_provisional(&mut self) -> Option<ProvisionalSyncBlock> {
+        self.provisional.take()
+    }
+
+    /// Discard an uncertified candidate before rotating sources.
+    pub fn clear_provisional(&mut self) {
+        self.provisional = None;
+    }
+
+    /// Record one distinct expensive-failure source and open the breaker at three.
+    pub fn note_expensive_failure(
+        &mut self,
+        height: u64,
+        validator_id: Bytes32,
+        now: Instant,
+    ) -> bool {
+        let sources = self.expensive_failure_sources.entry(height).or_default();
+        sources.retain(|_, observed| now.duration_since(*observed) < SYNC_FAILURE_CIRCUIT_BREAKER);
+        sources.insert(validator_id, now);
+        if sources.len() >= MAX_EXPENSIVE_SYNC_FAILURE_SOURCES {
+            self.circuit_open_until
+                .insert(height, now + SYNC_FAILURE_CIRCUIT_BREAKER);
+            return true;
+        }
+        false
+    }
+
+    /// Return whether expensive validation is paused for this height.
+    pub fn circuit_open(&mut self, height: u64, now: Instant) -> bool {
+        self.circuit_open_until.retain(|_, until| *until > now);
+        self.circuit_open_until
+            .get(&height)
+            .is_some_and(|until| *until > now)
     }
 
     /// Record one imported block while downloading.
     pub fn on_block_imported(&mut self, imported_height: u64) {
+        self.session_finalized_blocks = self.session_finalized_blocks.saturating_add(1);
         if let SyncPhase::Downloading {
             target_height,
             next_expected,
@@ -158,6 +505,16 @@ impl SyncState {
             if imported_height >= self.best_peer_height {
                 self.phase = SyncPhase::CaughtUp;
             }
+        }
+        if self
+            .session_finalized_blocks
+            .is_multiple_of(SYNC_BATCH_SIZE)
+            && !matches!(self.phase, SyncPhase::CaughtUp)
+        {
+            // Bound one uninterrupted catch-up session. Fresh, unexpired
+            // status claims must schedule the next 50-block segment.
+            self.phase = SyncPhase::AwaitingPeers;
+            self.outstanding = None;
         }
     }
 
@@ -178,8 +535,20 @@ impl SyncState {
                     None
                 } else {
                     let from_height = next_expected.max(local_height.saturating_add(1));
-                    let to_height =
-                        target_height.min(from_height.saturating_add(SYNC_BATCH_SIZE - 1));
+                    let to_height = target_height
+                        .saturating_add(1)
+                        .min(from_height.saturating_add(SYNC_BATCH_SIZE));
+                    let validator_id = self
+                        .height_claims
+                        .iter()
+                        .find_map(|(id, claim)| (claim.addr == peer).then_some(*id))?;
+                    self.outstanding = Some(OutstandingSyncRequest {
+                        validator_id,
+                        peer,
+                        from_height,
+                        to_height,
+                        issued_at: Instant::now(),
+                    });
                     Some((peer, from_height, to_height))
                 }
             }
@@ -187,13 +556,11 @@ impl SyncState {
         }
     }
 
-    /// Handle a block response that imported nothing.
-    pub fn on_empty_response(&mut self, local_height: u64) {
-        if let SyncPhase::Downloading { .. } = self.phase {
-            if local_height >= self.best_peer_height.saturating_sub(1) {
-                self.best_peer_height = local_height;
-                self.phase = SyncPhase::CaughtUp;
-            }
+    /// Empty responses never prove that the target has been reached.
+    pub fn on_empty_response(&mut self) {
+        self.outstanding = None;
+        if matches!(self.phase, SyncPhase::Downloading { .. }) {
+            self.phase = SyncPhase::AwaitingPeers;
         }
     }
 
@@ -211,7 +578,7 @@ impl SyncState {
 /// Import a block into the chain.
 ///
 /// This is the canonical block processing pipeline:
-/// validate → project/verify → commit projection → evict mempool → store → snapshot.
+/// validate → project/verify → durable writes → publish state and pool effects.
 pub fn import_block(
     block: &BlockV1,
     state: &mut ChainState,
@@ -240,9 +607,71 @@ pub fn import_block_with_effects(
     state_store: &StateStore,
     timestamp_secs: u64,
 ) -> NodeResult<indra_state::AppliedBlockOutcome> {
-    let height = block.header.height;
+    import_block_with_durable_hook(
+        block,
+        state,
+        mempool,
+        block_store,
+        state_store,
+        timestamp_secs,
+        |_, _, _| Ok(()),
+    )
+}
 
-    let outcome = validate_and_apply_imported_block(block, state, mempool, timestamp_secs)?;
+/// Import with a caller-supplied durable commit hook.
+///
+/// The hook runs after the block and interval snapshot are durable but before
+/// canonical memory or pending pools change. `block_log_next_height` reflects
+/// the newly appended block. Callers use this to persist epoch/manifest data
+/// as part of the same fail-closed publication boundary.
+pub(crate) fn import_block_with_durable_hook<F>(
+    block: &BlockV1,
+    state: &mut ChainState,
+    mempool: &mut Mempool,
+    block_store: &mut BlockStore,
+    state_store: &StateStore,
+    timestamp_secs: u64,
+    durable_hook: F,
+) -> NodeResult<indra_state::AppliedBlockOutcome>
+where
+    F: FnOnce(&ChainState, &Option<EpochRecord>, u64) -> NodeResult<()>,
+{
+    let projection = validate_imported_block(block, state, timestamp_secs)?;
+    commit_prepared_with_durable_hook(
+        block,
+        projection,
+        state,
+        mempool,
+        block_store,
+        state_store,
+        durable_hook,
+    )
+}
+
+/// Durably publish an already-verified provisional projection without
+/// repeating cryptographic or state validation.
+pub(crate) fn commit_prepared_with_durable_hook<F>(
+    block: &BlockV1,
+    projection: PreparedSyncBlock,
+    state: &mut ChainState,
+    mempool: &mut Mempool,
+    block_store: &mut BlockStore,
+    state_store: &StateStore,
+    durable_hook: F,
+) -> NodeResult<indra_state::AppliedBlockOutcome>
+where
+    F: FnOnce(&ChainState, &Option<EpochRecord>, u64) -> NodeResult<()>,
+{
+    let height = block.header.height;
+    if projection.block_hash != block.header.block_hash()
+        || projection.pre_height != state.height
+        || projection.pre_tip_hash != state.tip_hash
+    {
+        return Err(NodeError::BlockInvalid {
+            height,
+            reason: "prepared sync projection is stale or belongs to a different block".to_string(),
+        });
+    }
 
     // Store genesis placeholder if block_store is empty and this is height 1
     if block_store.is_empty() && height == 1 {
@@ -251,12 +680,29 @@ pub fn import_block_with_effects(
     }
     block_store.append(block)?;
 
-    // Take snapshot if on interval
+    // Snapshot the verified detached state before it becomes canonical. An I/O
+    // failure therefore cannot leave memory ahead of the durable snapshot.
     if height > 0 && height.is_multiple_of(SNAPSHOT_INTERVAL) {
-        state_store.save(state)?;
+        state_store.save(&projection.state)?;
     }
+    durable_hook(
+        &projection.state,
+        &projection.epoch_record,
+        block_store.next_height(),
+    )?;
 
-    Ok(outcome)
+    // No fallible operation may occur between publishing the verified state
+    // and publishing its pool effects. A failed append/fsync above therefore
+    // leaves both canonical memory and all pending pools unchanged.
+    let epoch_record = projection.epoch_record;
+    let effects = projection.effects;
+    *state = projection.state;
+    publish_committed_effects(state, mempool, &effects);
+
+    Ok(indra_state::AppliedBlockOutcome {
+        epoch_record,
+        effects,
+    })
 }
 
 /// Validate and apply the canonical sync/import block pipeline up to, but not
@@ -266,12 +712,11 @@ pub fn import_block_with_effects(
 /// exercise hard-fork boundary behavior at synthetic heights use this same
 /// path because `BlockStore` itself intentionally requires contiguous heights
 /// from genesis and cannot be jumped to `u64::MAX - 1`.
-fn validate_and_apply_imported_block(
+fn validate_imported_block(
     block: &BlockV1,
-    state: &mut ChainState,
-    mempool: &mut Mempool,
+    state: &ChainState,
     timestamp_secs: u64,
-) -> NodeResult<indra_state::AppliedBlockOutcome> {
+) -> NodeResult<PreparedSyncBlock> {
     let height = block.header.height;
 
     verify_imported_block_proposer(block, state)?;
@@ -280,16 +725,14 @@ fn validate_and_apply_imported_block(
         verify_block_qc(block, state)?;
     }
 
-    let projection = project_and_verify_block_state_root(block, state, timestamp_secs)?;
-    #[cfg(debug_assertions)]
-    let verified_state_root = projection.state_root;
-    #[cfg(debug_assertions)]
-    let verified_validator_set_root = projection.validator_set_root;
-    #[cfg(debug_assertions)]
-    let verified_value_hash = projection.value_hash;
-    let epoch_record = projection.epoch_record;
-    let effects = projection.effects;
-    *state = projection.state;
+    project_and_verify_block_state_root(block, state, timestamp_secs)
+}
+
+fn publish_committed_effects(
+    state: &ChainState,
+    mempool: &mut Mempool,
+    effects: &CanonicalStateEffects,
+) {
     for event in &effects.slash_events {
         eprintln!(
             "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
@@ -300,28 +743,9 @@ fn validate_and_apply_imported_block(
             event.reporter_reward,
         );
     }
-    #[cfg(debug_assertions)]
-    {
-        let committed_roots = compute_state_roots(state);
-        debug_assert_eq!(committed_roots.state_root, verified_state_root);
-        debug_assert_eq!(
-            committed_roots.validator_set_root,
-            verified_validator_set_root
-        );
-        debug_assert_eq!(
-            block.compute_value_hash(state.total_supply),
-            verified_value_hash
-        );
-    }
-
     // Evict spent transactions from mempool after the verified projection has
     // become the real state.
-    mempool.apply_canonical_effects(state, &effects);
-
-    Ok(indra_state::AppliedBlockOutcome {
-        epoch_record,
-        effects,
-    })
+    mempool.apply_canonical_effects(state, effects);
 }
 
 /// Whether proposer verification is required for one consensus height.
@@ -694,6 +1118,93 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
     verify_sync_qc(&qc, state, block.header.height)
 }
 
+/// Fully validate a next-height candidate without publishing any state.
+pub fn verify_sync_candidate(
+    block: &BlockV1,
+    state: &ChainState,
+    timestamp_secs: u64,
+) -> NodeResult<PreparedSyncBlock> {
+    verify_imported_block_proposer(block, state)?;
+    if block.header.height > 1 {
+        verify_block_qc(block, state)?;
+    }
+    project_and_verify_block_state_root(block, state, timestamp_secs)
+}
+
+/// Verify the certificate carried by H+1 against a provisional H and
+/// attribute a mismatch cryptographically rather than blaming H blindly.
+pub fn verify_provisional_certificate(
+    provisional: &BlockV1,
+    carrier: &BlockV1,
+    canonical_state: &ChainState,
+) -> Result<(), PairVerificationError> {
+    let mut reader =
+        indra_core::codec::ByteReader::new(carrier.header.quorum_certificate.as_slice());
+    let qc = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader).map_err(|error| {
+        PairVerificationError::CertificateCarrierWrong(NodeError::BlockInvalid {
+            height: carrier.header.height,
+            reason: format!("invalid QC encoding: {error}"),
+        })
+    })?;
+    if qc.height != provisional.header.height {
+        return Err(PairVerificationError::CertificateCarrierWrong(
+            NodeError::BlockInvalid {
+                height: carrier.header.height,
+                reason: format!(
+                    "certificate carrier claims height {}, expected {}",
+                    qc.height, provisional.header.height
+                ),
+            },
+        ));
+    }
+    // Verify the certificate before comparing its hash. A valid quorum for a
+    // different hash proves H was the wrong provisional branch; an invalid
+    // quorum proves only that the later carrier is bad.
+    verify_sync_qc(&qc, canonical_state, carrier.header.height)
+        .map_err(PairVerificationError::CertificateCarrierWrong)?;
+    let provisional_hash = provisional.header.block_hash();
+    if qc.block_hash != provisional_hash {
+        return Err(PairVerificationError::ProvisionalBlockWrong {
+            certified_hash: qc.block_hash,
+        });
+    }
+    if carrier.header.prev_hash != provisional_hash {
+        return Err(PairVerificationError::CertificateCarrierWrong(
+            NodeError::BlockInvalid {
+                height: carrier.header.height,
+                reason: "carrier parent hash does not match its valid QC".to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Verify a directly requested QC for the bounded provisional block.
+pub fn verify_direct_provisional_qc(
+    provisional: &BlockV1,
+    qc_bytes: &[u8],
+    canonical_state: &ChainState,
+) -> NodeResult<()> {
+    let mut reader = indra_core::codec::ByteReader::new(qc_bytes);
+    let qc = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader).map_err(|error| {
+        NodeError::BlockInvalid {
+            height: provisional.header.height,
+            reason: format!("invalid requested QC encoding: {error}"),
+        }
+    })?;
+    if qc.height != provisional.header.height || qc.block_hash != provisional.header.block_hash() {
+        return Err(NodeError::BlockInvalid {
+            height: provisional.header.height,
+            reason: "requested QC does not certify the provisional block".to_string(),
+        });
+    }
+    verify_sync_qc(
+        &qc,
+        canonical_state,
+        provisional.header.height.saturating_add(1),
+    )
+}
+
 fn verify_sync_qc(
     qc: &indra_core::types::qc::QuorumCertificateV1,
     state: &ChainState,
@@ -703,7 +1214,12 @@ fn verify_sync_qc(
     crate::engine::NodeEngine::verify_qc_with_snapshot(qc, snapshot, &state.chain_id)
 }
 
-pub(crate) struct VerifiedBlockProjection {
+/// Opaque detached result of authoritative sync-candidate validation.
+#[derive(Debug, Clone)]
+pub struct PreparedSyncBlock {
+    pub(crate) block_hash: Bytes32,
+    pub(crate) pre_height: u64,
+    pub(crate) pre_tip_hash: Bytes32,
     pub(crate) state: ChainState,
     pub(crate) epoch_record: Option<EpochRecord>,
     pub(crate) effects: CanonicalStateEffects,
@@ -711,11 +1227,11 @@ pub(crate) struct VerifiedBlockProjection {
     // verified projection. Release builds skip those assertions, so these fields
     // are intentionally release-dead even though the values are consumed when
     // debug assertions are enabled.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) state_root: Bytes32,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) validator_set_root: Bytes32,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) value_hash: Bytes32,
 }
 
@@ -723,7 +1239,7 @@ pub(crate) fn project_and_verify_block_state_root(
     block: &BlockV1,
     pre_state: &ChainState,
     timestamp_secs: u64,
-) -> NodeResult<VerifiedBlockProjection> {
+) -> NodeResult<PreparedSyncBlock> {
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
 
@@ -778,7 +1294,10 @@ pub(crate) fn project_and_verify_block_state_root(
         });
     }
 
-    Ok(VerifiedBlockProjection {
+    Ok(PreparedSyncBlock {
+        block_hash: block.header.block_hash(),
+        pre_height: pre_state.height,
+        pre_tip_hash: pre_state.tip_hash,
         state: projected,
         epoch_record,
         effects: outcome.effects,
@@ -807,12 +1326,11 @@ mod tests {
         codec::Encode,
         types::{
             block::{BlockHeaderV1, BlockV1},
-            primitives::{DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, MAX_VRF_PROOF_BYTES},
-            transaction::OutputV1,
+            primitives::{DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS},
             vote::VoteStep,
             vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
         },
-        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, QuorumCertificateV1, VariableBytes,
+        Bytes32, ProtocolVersion, QuorumCertificateV1, VariableBytes,
     };
     use indra_crypto::{
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
@@ -829,6 +1347,27 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("indra_sync_test_{}_{}", suffix, std::process::id()));
         p
+    }
+
+    fn observe_for_test(
+        sync: &mut SyncState,
+        identity_byte: u8,
+        peer: SocketAddr,
+        peer_height: u64,
+        local_height: u64,
+    ) -> Option<(SocketAddr, u64, u64)> {
+        let identity = Bytes32::from([identity_byte; 32]);
+        sync.peer_connected(identity);
+        sync.observe_status(
+            identity,
+            peer,
+            peer_height,
+            Bytes32::from([identity_byte; 32]),
+            100,
+            100,
+            local_height,
+            Instant::now(),
+        )
     }
 
     fn install_active_validator(
@@ -1279,15 +1818,12 @@ mod tests {
                 1_900_000_000,
             )
             .unwrap();
-            let actual_record = validate_and_apply_imported_block(
-                &block,
-                &mut actual_state,
-                &mut actual_mempool,
-                1_900_000_000,
-            )
-            .unwrap();
+            let actual = validate_imported_block(&block, &actual_state, 1_900_000_000).unwrap();
+            let actual_record = actual.epoch_record.clone();
+            actual_state = actual.state;
+            publish_committed_effects(&actual_state, &mut actual_mempool, &actual.effects);
 
-            assert_eq!(reference_record, actual_record.epoch_record);
+            assert_eq!(reference_record, actual_record);
             assert_import_state_equivalent(&reference_state, &actual_state, &block);
             assert_eq!(reference_mempool.len(), actual_mempool.len());
             assert_eq!(reference_mempool.is_empty(), actual_mempool.is_empty());
@@ -1359,11 +1895,13 @@ mod tests {
         let timestamp_secs = 1_999_999_999;
         let block = make_strict_block(&state, 0x62, 0, parent_qc);
 
-        let record =
-            validate_and_apply_imported_block(&block, &mut state, &mut mempool, timestamp_secs)
-                .unwrap()
-                .epoch_record
-                .expect("height 300 must produce an epoch record");
+        let projection = validate_imported_block(&block, &state, timestamp_secs).unwrap();
+        let record = projection
+            .epoch_record
+            .clone()
+            .expect("height 300 must produce an epoch record");
+        state = projection.state;
+        publish_committed_effects(&state, &mut mempool, &projection.effects);
 
         assert_eq!(block.header.height, EPOCH_DURATION_BLOCKS);
         assert_eq!(record.epoch, 0);
@@ -1460,6 +1998,41 @@ mod tests {
         assert_eq!(state_store.latest_snapshot_height().unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_append_rejection_cannot_publish_projected_state_or_pool_effects() {
+        let dir = temp_dir("durable_append_before_publish");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = crate::genesis::canonical_test_genesis();
+        let original_state = state.clone();
+        let mut mempool = Mempool::default_config();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        )
+        .unwrap();
+        let state_store = StateStore::open(dir.join("state")).unwrap();
+        let block = make_block(&state);
+
+        block_store
+            .append(&crate::genesis::build_genesis_block())
+            .unwrap();
+        block_store.append(&block).unwrap();
+        let error = import_block(
+            &block,
+            &mut state,
+            &mut mempool,
+            &mut block_store,
+            &state_store,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-sequential write"));
+        assert_eq!(state, original_state);
+        assert!(mempool.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1570,23 +2143,328 @@ mod tests {
     }
 
     #[test]
-    fn sync_tracks_highest_known_peer_height() {
+    fn single_peer_cannot_raise_target_past_corroborated_height() {
         let peer_a: SocketAddr = "127.0.0.1:30001".parse().unwrap();
         let peer_b: SocketAddr = "127.0.0.1:30002".parse().unwrap();
         let mut sync = SyncState::follower(0);
 
-        assert_eq!(sync.observe_status(peer_a, 550, 0), Some((peer_a, 1, 50)));
-        assert_eq!(sync.observe_status(peer_b, 8_314, 0), Some((peer_b, 1, 50)));
+        assert_eq!(
+            observe_for_test(&mut sync, 1, peer_a, 550, 0),
+            Some((peer_a, 1, 51))
+        );
+        assert_eq!(
+            observe_for_test(&mut sync, 2, peer_b, 8_314, 0),
+            None,
+            "an outstanding bound request is not replaced by a later height claim"
+        );
 
         for height in 1..=550 {
             sync.on_block_imported(height);
         }
 
-        assert_eq!(
-            sync.next_request_after_response(550),
-            Some((peer_b, 551, 600))
+        assert_eq!(sync.next_request_after_response(550), None);
+        assert!(matches!(sync.phase(), SyncPhase::AwaitingPeers));
+        assert!(
+            !sync.is_caught_up(),
+            "50-block checkpoints require a fresh status"
         );
-        assert!(!sync.is_caught_up());
+    }
+
+    #[test]
+    fn false_height_requires_two_identities_and_one_third_stake() {
+        let now = Instant::now();
+        let peer_a: SocketAddr = "127.0.0.1:30101".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:30102".parse().unwrap();
+        let id_a = Bytes32::from([0xA1; 32]);
+        let id_b = Bytes32::from([0xA2; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id_a);
+        sync.peer_connected(id_b);
+
+        assert_eq!(
+            sync.observe_status(id_a, peer_a, 10_000, Bytes32::ZERO, 33, 100, 0, now),
+            None,
+            "one sub-one-third identity must not set a target"
+        );
+        assert_eq!(
+            sync.observe_status(id_b, peer_b, 10_000, Bytes32::ZERO, 1, 100, 0, now),
+            Some((peer_a, 1, 51)),
+            "two identities with combined stake strictly above one third corroborate"
+        );
+    }
+
+    #[test]
+    fn single_peer_graceful_degradation_never_relaxes_stake_threshold() {
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:30103".parse().unwrap();
+        let id = Bytes32::from([0xA3; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        assert_eq!(
+            sync.observe_status(id, peer, 9_000, Bytes32::ZERO, 33, 100, 0, now),
+            None
+        );
+        assert_eq!(
+            sync.observe_status(id, peer, 9_000, Bytes32::ZERO, 34, 100, 0, now),
+            Some((peer, 1, 51))
+        );
+    }
+
+    #[test]
+    fn height_claims_expire_after_thirty_seconds() {
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:30104".parse().unwrap();
+        let id = Bytes32::from([0xA4; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        assert!(sync
+            .observe_status(id, peer, 42, Bytes32::ZERO, 100, 100, 0, now)
+            .is_some());
+        assert!(sync
+            .corroborated_target(0, now + SYNC_HEIGHT_CLAIM_TTL + Duration::from_millis(1))
+            .is_none());
+    }
+
+    #[test]
+    fn response_binding_rejects_unsolicited_wrong_peer_and_out_of_range() {
+        let peer: SocketAddr = "127.0.0.1:30105".parse().unwrap();
+        let wrong_peer: SocketAddr = "127.0.0.1:30106".parse().unwrap();
+        let id = Bytes32::from([0xA5; 32]);
+        let wrong_id = Bytes32::from([0xA6; 32]);
+        let mut sync = SyncState::follower(0);
+        assert!(sync.accept_response(id, peer, &[]).is_err());
+        sync.peer_connected(id);
+        sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, Instant::now());
+        assert!(sync.accept_response(wrong_id, wrong_peer, &[]).is_err());
+        let mut out_of_range = make_block(&crate::genesis::canonical_test_genesis());
+        out_of_range.header.height = 99;
+        assert!(sync.accept_response(id, peer, &[out_of_range]).is_err());
+    }
+
+    #[test]
+    fn disconnect_clears_selected_peer_and_outstanding_request() {
+        let peer: SocketAddr = "127.0.0.1:30107".parse().unwrap();
+        let id = Bytes32::from([0xA7; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, Instant::now());
+        sync.peer_disconnected(id, peer);
+        assert!(matches!(sync.phase(), SyncPhase::AwaitingPeers));
+        assert!(sync.accept_response(id, peer, &[]).is_err());
+    }
+
+    #[test]
+    fn stalled_request_expires_and_releases_selected_source() {
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:30108".parse().unwrap();
+        let id = Bytes32::from([0xA8; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, now);
+        assert!(sync.expire_outstanding(now).is_none());
+        let expired = sync
+            .expire_outstanding(now + SYNC_REQUEST_TIMEOUT + Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(expired.validator_id, id);
+        assert!(matches!(sync.phase(), SyncPhase::AwaitingPeers));
+    }
+
+    #[test]
+    fn three_distinct_expensive_failures_open_circuit_for_sixty_seconds() {
+        let now = Instant::now();
+        let mut sync = SyncState::follower(0);
+        assert!(!sync.note_expensive_failure(7, Bytes32::from([1; 32]), now));
+        assert!(!sync.note_expensive_failure(7, Bytes32::from([2; 32]), now));
+        assert!(sync.note_expensive_failure(7, Bytes32::from([3; 32]), now));
+        assert!(sync.circuit_open(7, now));
+        assert!(!sync.circuit_open(
+            7,
+            now + SYNC_FAILURE_CIRCUIT_BREAKER + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn valid_qc_for_other_hash_proves_provisional_block_is_wrong() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0xB1, 10_000, true, true);
+        let real = make_strict_block(&state, 0xB1, 0, vec![]);
+        let mut unfinalized_fork = real.clone();
+        unfinalized_fork.header.timestamp = unfinalized_fork.header.timestamp.saturating_add(1);
+        unfinalized_fork.header.value_hash =
+            unfinalized_fork.compute_value_hash(state.total_supply);
+        verify_sync_candidate(&unfinalized_fork, &state, 0).unwrap();
+
+        let qc = build_qc_bytes(
+            real.header.height,
+            real.header.proposer_round,
+            real.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let mut after_real = state.clone();
+        apply_block(&mut after_real, &real, 0).unwrap();
+        let carrier = make_strict_block(&after_real, 0xB1, 0, qc);
+
+        match verify_provisional_certificate(&unfinalized_fork, &carrier, &state) {
+            Err(PairVerificationError::ProvisionalBlockWrong { certified_hash }) => {
+                assert_eq!(certified_hash, real.header.block_hash());
+            }
+            other => panic!("wrong fault attribution: {other:?}"),
+        }
+        assert_eq!(
+            state.height, 0,
+            "provisional fork must remain non-canonical"
+        );
+    }
+
+    #[test]
+    fn invalid_later_certificate_is_attributed_to_carrier() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0xB2, 10_000, true, true);
+        let block = make_strict_block(&state, 0xB2, 0, vec![]);
+        let mut qc = build_qc_bytes(
+            block.header.height,
+            block.header.proposer_round,
+            block.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        *qc.last_mut().unwrap() ^= 0x01;
+        let mut after_block = state.clone();
+        apply_block(&mut after_block, &block, 0).unwrap();
+        let carrier = make_strict_block(&after_block, 0xB2, 0, qc);
+
+        assert!(matches!(
+            verify_provisional_certificate(&block, &carrier, &state),
+            Err(PairVerificationError::CertificateCarrierWrong(_))
+        ));
+        assert_eq!(state.height, 0);
+    }
+
+    #[test]
+    fn offline_recovery_writes_new_directory_and_copies_only_certified_prefix() {
+        let source_dir = temp_dir("offline_recovery_source");
+        let destination_dir = temp_dir("offline_recovery_destination");
+        let mut source =
+            crate::NodeEngine::init(crate::NodeConfig::local_test(source_dir.clone())).unwrap();
+        let classical = ClassicalKeypair::from_seed(&[0x42; 32]);
+        let pq = PqKeypair::from_seed(&[0x43; 32]).unwrap();
+        let hybrid = HybridKeypair::new(classical, pq);
+        let validator_id = Bytes32::from(indra_crypto::sha256(&hybrid.public_key().classical.0));
+        let stake = source.state.validators.total_active_stake();
+
+        let block1 = make_strict_block(&source.state, 0x42, 0, vec![]);
+        source.commit_block(&block1).unwrap();
+        let qc1 = build_qc_bytes(
+            1,
+            0,
+            block1.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            stake,
+        );
+        let block2 = make_strict_block(&source.state, 0x42, 0, qc1);
+        source.commit_block(&block2).unwrap();
+        let qc2 = build_qc_bytes(
+            2,
+            0,
+            block2.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            stake,
+        );
+        indra_storage::save_last_qc(&source.config.state_dir(), &qc2).unwrap();
+        let genesis_path = source_dir.join("genesis.toml");
+        drop(source);
+
+        let mut destination_config = crate::NodeConfig::full_node(destination_dir.clone());
+        destination_config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
+        destination_config.genesis_validator_minimum = 1;
+        let report =
+            crate::recovery::recover_finalized_prefix(&source_dir, destination_config).unwrap();
+        assert_eq!(report.recovered_height, 2);
+        assert_eq!(report.first_unfinalized_height, None);
+
+        let recovered = crate::NodeEngine::init({
+            let mut config = crate::NodeConfig::full_node(destination_dir.clone());
+            config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
+            config.genesis_validator_minimum = 1;
+            config
+        })
+        .unwrap();
+        assert_eq!(recovered.height(), 2);
+        assert_eq!(recovered.state.tip_hash, block2.header.block_hash());
+
+        let _ = std::fs::remove_dir_all(source_dir);
+        let _ = std::fs::remove_dir_all(destination_dir);
+    }
+
+    #[test]
+    #[ignore = "real-hardware release benchmark; run explicitly with --release --ignored --nocapture"]
+    fn buffered_sync_real_hardware_benchmark() {
+        const FINALIZED_BLOCKS: usize = 50;
+        let mut builder = ChainState::new_genesis();
+        let (validator_id, hybrid) =
+            install_active_validator(&mut builder, 0xC1, 10_000, true, true);
+        let initial = builder.clone();
+        let mut blocks = Vec::with_capacity(FINALIZED_BLOCKS + 1);
+        let mut previous_qc = Vec::new();
+        for _ in 0..=FINALIZED_BLOCKS {
+            let block = make_strict_block(&builder, 0xC1, 0, previous_qc);
+            previous_qc = build_qc_bytes(
+                block.header.height,
+                block.header.proposer_round,
+                block.header.block_hash(),
+                validator_id,
+                &hybrid,
+                hybrid.public_key().pq.0.to_vec(),
+                10_000,
+            );
+            apply_block(&mut builder, &block, 0).unwrap();
+            blocks.push(block);
+        }
+
+        let dir = temp_dir("buffered_sync_benchmark");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = initial;
+        let mut mempool = Mempool::default_config();
+        let mut block_store = BlockStore::open(
+            dir.join("blocks.log"),
+            indra_storage::PruneConfig::archive(),
+        )
+        .unwrap();
+        let state_store = StateStore::open(dir.join("state")).unwrap();
+        let started = Instant::now();
+        for pair in blocks.windows(2) {
+            let prepared = verify_sync_candidate(&pair[0], &state, 0).unwrap();
+            verify_provisional_certificate(&pair[0], &pair[1], &state).unwrap();
+            commit_prepared_with_durable_hook(
+                &pair[0],
+                prepared,
+                &mut state,
+                &mut mempool,
+                &mut block_store,
+                &state_store,
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "BUFFERED_SYNC_BENCH blocks={} total_ms={:.3} per_block_ms={:.3} blocks_per_sec={:.3}",
+            FINALIZED_BLOCKS,
+            elapsed.as_secs_f64() * 1_000.0,
+            elapsed.as_secs_f64() * 1_000.0 / FINALIZED_BLOCKS as f64,
+            FINALIZED_BLOCKS as f64 / elapsed.as_secs_f64(),
+        );
+        assert_eq!(state.height, FINALIZED_BLOCKS as u64);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1595,7 +2473,7 @@ mod tests {
         let mut sync = SyncState::follower(10);
 
         assert!(!sync.is_caught_up());
-        assert_eq!(sync.observe_status(peer, 10, 10), None);
+        assert_eq!(observe_for_test(&mut sync, 3, peer, 10, 10), None);
         assert!(sync.is_caught_up());
     }
 
@@ -1627,7 +2505,7 @@ mod tests {
         let mut sync = SyncState::follower(0);
         let peer: SocketAddr = "1.2.3.4:30303".parse().unwrap();
 
-        sync.observe_status(peer, 0, 0);
+        observe_for_test(&mut sync, 4, peer, 0, 0);
         assert!(sync.is_caught_up());
 
         sync.mark_caught_up(1);
@@ -1640,7 +2518,7 @@ mod tests {
         let mut sync = SyncState::bootstrap(10);
 
         assert!(!sync.is_caught_up());
-        assert_eq!(sync.observe_status(peer, 10, 10), None);
+        assert_eq!(observe_for_test(&mut sync, 5, peer, 10, 10), None);
         assert!(sync.is_caught_up());
     }
 
@@ -1649,11 +2527,14 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:30006".parse().unwrap();
         let mut sync = SyncState::follower(10);
 
-        assert_eq!(sync.observe_status(peer, 11, 10), Some((peer, 11, 11)));
+        assert_eq!(
+            observe_for_test(&mut sync, 6, peer, 11, 10),
+            Some((peer, 11, 12))
+        );
         assert!(!sync.is_caught_up());
 
-        sync.on_empty_response(10);
-        assert!(sync.is_caught_up());
+        sync.on_empty_response();
+        assert!(!sync.is_caught_up());
         assert!(sync.next_request_after_response(10).is_none());
     }
 
@@ -1662,7 +2543,10 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:30003".parse().unwrap();
         let mut sync = SyncState::follower(530);
 
-        assert_eq!(sync.observe_status(peer, 531, 530), Some((peer, 531, 531)));
+        assert_eq!(
+            observe_for_test(&mut sync, 7, peer, 531, 530),
+            Some((peer, 531, 532))
+        );
         assert!(!sync.is_caught_up());
 
         sync.on_block_imported(531);
