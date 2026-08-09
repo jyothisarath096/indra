@@ -138,7 +138,53 @@ pub struct SyncState {
     session_finalized_blocks: u64,
 }
 
+/// Read-only operational synchronization diagnostics exposed only to admin RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncDiagnostics {
+    /// Stable phase name.
+    pub phase: &'static str,
+    /// Local canonical height.
+    pub local_height: u64,
+    /// Corroborated target height, when downloading.
+    pub target_height: Option<u64>,
+    /// In-memory provisional height awaiting its own QC.
+    pub provisional_height: Option<u64>,
+    /// Number of unexpired authenticated height claims.
+    pub corroboration_claim_count: usize,
+    /// Whether any expensive-validation circuit breaker is currently open.
+    pub circuit_breaker_open: bool,
+    /// Whether operator recovery has been requested after multi-source failure.
+    pub recovery_required: bool,
+}
+
 impl SyncState {
+    /// Return a non-mutating operational diagnostic snapshot.
+    pub fn diagnostics(&self, local_height: u64, now: Instant) -> SyncDiagnostics {
+        let phase = match self.phase {
+            SyncPhase::AwaitingPeers => "awaiting_peers",
+            SyncPhase::Downloading { .. } => "downloading",
+            SyncPhase::CaughtUp => "caught_up",
+        };
+        let circuit_breaker_open = self.circuit_open_until.values().any(|until| *until > now);
+        SyncDiagnostics {
+            phase,
+            local_height,
+            target_height: self.target_height(),
+            provisional_height: self
+                .provisional
+                .as_ref()
+                .map(|pending| pending.block.header.height),
+            corroboration_claim_count: self
+                .height_claims
+                .values()
+                .filter(|claim| claim.expires_at > now)
+                .count(),
+            circuit_breaker_open,
+            // The durable recovery marker lives in the node data directory;
+            // the RPC integration fills this field while it owns the driver.
+            recovery_required: false,
+        }
+    }
     /// Create the bootstrap node sync state.
     pub fn bootstrap(local_height: u64) -> Self {
         Self {
@@ -2232,6 +2278,108 @@ mod tests {
         assert!(sync
             .corroborated_target(0, now + SYNC_HEIGHT_CLAIM_TTL + Duration::from_millis(1))
             .is_none());
+    }
+
+    #[test]
+    fn diagnostics_reports_exact_phase_claim_provisional_and_circuit_state() {
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:30140".parse().unwrap();
+        let mut sync = SyncState::follower(40);
+
+        assert_eq!(
+            sync.diagnostics(40, now),
+            SyncDiagnostics {
+                phase: "awaiting_peers",
+                local_height: 40,
+                target_height: None,
+                provisional_height: None,
+                corroboration_claim_count: 0,
+                circuit_breaker_open: false,
+                recovery_required: false,
+            }
+        );
+        sync.phase = SyncPhase::CaughtUp;
+        assert_eq!(sync.diagnostics(40, now).phase, "caught_up");
+
+        sync.phase = SyncPhase::Downloading {
+            peer,
+            target_height: 52,
+            next_expected: 41,
+        };
+        sync.height_claims.insert(
+            Bytes32::from([1; 32]),
+            HeightClaim {
+                addr: peer,
+                height: 52,
+                tip_hash: Bytes32::from([11; 32]),
+                stake: 10,
+                expires_at: now - Duration::from_millis(1),
+            },
+        );
+        sync.height_claims.insert(
+            Bytes32::from([2; 32]),
+            HeightClaim {
+                addr: peer,
+                height: 52,
+                tip_hash: Bytes32::from([12; 32]),
+                stake: 20,
+                expires_at: now,
+            },
+        );
+        sync.height_claims.insert(
+            Bytes32::from([3; 32]),
+            HeightClaim {
+                addr: peer,
+                height: 52,
+                tip_hash: Bytes32::from([13; 32]),
+                stake: 30,
+                expires_at: now + Duration::from_secs(1),
+            },
+        );
+
+        let state = crate::genesis::canonical_test_genesis();
+        let block = make_block(&state);
+        let provisional_height = block.header.height;
+        let prepared = PreparedSyncBlock {
+            block_hash: block.header.block_hash(),
+            pre_height: state.height,
+            pre_tip_hash: state.tip_hash,
+            state,
+            epoch_record: None,
+            effects: CanonicalStateEffects::default(),
+            state_root: Bytes32::ZERO,
+            validator_set_root: Bytes32::ZERO,
+            value_hash: Bytes32::ZERO,
+        };
+        sync.stage_provisional(block, prepared, Bytes32::from([3; 32]), peer, now);
+
+        sync.circuit_open_until
+            .insert(50, now - Duration::from_millis(1));
+        sync.circuit_open_until.insert(51, now);
+        sync.circuit_open_until
+            .insert(52, now + Duration::from_secs(1));
+
+        assert_eq!(
+            sync.diagnostics(40, now),
+            SyncDiagnostics {
+                phase: "downloading",
+                local_height: 40,
+                target_height: Some(52),
+                provisional_height: Some(provisional_height),
+                // Both an already-expired claim and one expiring exactly at
+                // `now` are excluded; only expires_at > now remains live.
+                corroboration_claim_count: 1,
+                circuit_breaker_open: true,
+                recovery_required: false,
+            }
+        );
+
+        sync.circuit_open_until
+            .insert(52, now - Duration::from_millis(1));
+        assert!(
+            !sync.diagnostics(40, now).circuit_breaker_open,
+            "past and exactly-now breaker deadlines must both be closed"
+        );
     }
 
     #[test]

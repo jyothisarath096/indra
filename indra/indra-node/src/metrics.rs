@@ -42,8 +42,58 @@ pub struct MetricsState {
     pub slash_events_total: Arc<AtomicU64>,
     /// Total blocks committed since node start.
     pub blocks_committed_total: Arc<AtomicU64>,
+    /// Total observed RPC requests, including policy rejections.
+    pub rpc_requests_total: Arc<AtomicU64>,
+    /// Cumulative RPC request latency in microseconds.
+    pub rpc_latency_micros_total: Arc<AtomicU64>,
+    /// Cumulative consensus-driver lock wait in microseconds from RPC writes/storage reads.
+    pub rpc_lock_wait_micros_total: Arc<AtomicU64>,
+    /// Total encoded RPC response bytes.
+    pub rpc_response_bytes_total: Arc<AtomicU64>,
+    /// Current RPC connections across hardened listeners.
+    pub rpc_active_connections: Arc<AtomicU64>,
+    /// Per-listener limiter telemetry sources. Each listener owns its current
+    /// values; rendering sums them without racy read-modify-write deltas.
+    rpc_limiter_telemetry: Mutex<Vec<Arc<RpcLimiterTelemetry>>>,
+    /// Socket response write failures.
+    pub rpc_write_failures_total: Arc<AtomicU64>,
+    /// Structurally malformed transaction submissions.
+    pub rpc_invalid_tx_structural_total: Arc<AtomicU64>,
+    /// Authoritatively rejected transaction submissions.
+    pub rpc_invalid_tx_validation_total: Arc<AtomicU64>,
+    /// Structurally malformed staking submissions.
+    pub rpc_invalid_staking_structural_total: Arc<AtomicU64>,
+    /// Authoritatively rejected staking submissions.
+    pub rpc_invalid_staking_validation_total: Arc<AtomicU64>,
+    /// Structurally malformed governance submissions.
+    pub rpc_invalid_governance_structural_total: Arc<AtomicU64>,
+    /// Authoritatively rejected governance submissions.
+    pub rpc_invalid_governance_validation_total: Arc<AtomicU64>,
     /// Node process start time.
     pub started_at: Instant,
+}
+
+/// Per-listener bridge that contributes bounded-map gauges/counters to the
+/// process-wide RPC telemetry without attacker-controlled labels.
+#[derive(Debug, Default)]
+pub struct RpcLimiterTelemetry {
+    entries: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl RpcLimiterTelemetry {
+    /// Publish this listener's latest combined map state.
+    pub fn update(&self, entries: u64, evictions: u64) {
+        self.entries.store(entries, Ordering::Relaxed);
+        self.evictions.store(evictions, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> (u64, u64) {
+        (
+            self.entries.load(Ordering::Relaxed),
+            self.evictions.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl MetricsState {
@@ -52,8 +102,43 @@ impl MetricsState {
         Self {
             slash_events_total: Arc::new(AtomicU64::new(0)),
             blocks_committed_total: Arc::new(AtomicU64::new(0)),
+            rpc_requests_total: Arc::new(AtomicU64::new(0)),
+            rpc_latency_micros_total: Arc::new(AtomicU64::new(0)),
+            rpc_lock_wait_micros_total: Arc::new(AtomicU64::new(0)),
+            rpc_response_bytes_total: Arc::new(AtomicU64::new(0)),
+            rpc_active_connections: Arc::new(AtomicU64::new(0)),
+            rpc_limiter_telemetry: Mutex::new(Vec::new()),
+            rpc_write_failures_total: Arc::new(AtomicU64::new(0)),
+            rpc_invalid_tx_structural_total: Arc::new(AtomicU64::new(0)),
+            rpc_invalid_tx_validation_total: Arc::new(AtomicU64::new(0)),
+            rpc_invalid_staking_structural_total: Arc::new(AtomicU64::new(0)),
+            rpc_invalid_staking_validation_total: Arc::new(AtomicU64::new(0)),
+            rpc_invalid_governance_structural_total: Arc::new(AtomicU64::new(0)),
+            rpc_invalid_governance_validation_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
+    }
+
+    /// Register one listener-owned limiter gauge source.
+    pub fn register_rpc_limiter_telemetry(&self, telemetry: Arc<RpcLimiterTelemetry>) {
+        self.rpc_limiter_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(telemetry);
+    }
+
+    fn rpc_limiter_totals(&self) -> (u64, u64) {
+        self.rpc_limiter_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|telemetry| telemetry.load())
+            .fold((0u64, 0u64), |(entries, evictions), current| {
+                (
+                    entries.saturating_add(current.0),
+                    evictions.saturating_add(current.1),
+                )
+            })
     }
 }
 
@@ -331,6 +416,7 @@ fn render_snapshot(
     version: &str,
 ) -> String {
     let mut buf = String::new();
+    let (rpc_limiter_entries, rpc_limiter_evictions) = metrics_state.rpc_limiter_totals();
     gauge(
         &mut buf,
         "indra_block_height",
@@ -456,6 +542,110 @@ fn render_snapshot(
         "indra_slash_events",
         "Total slash events detected since node start",
         metrics_state.slash_events_total.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_requests",
+        "Observed RPC requests including policy rejections",
+        metrics_state.rpc_requests_total.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_latency_microseconds",
+        "Cumulative RPC request latency",
+        metrics_state
+            .rpc_latency_micros_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_consensus_lock_wait_microseconds",
+        "Cumulative RPC wait for the consensus-driver lock",
+        metrics_state
+            .rpc_lock_wait_micros_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_response_bytes",
+        "Encoded RPC response bytes",
+        metrics_state
+            .rpc_response_bytes_total
+            .load(Ordering::Relaxed),
+    );
+    gauge(
+        &mut buf,
+        "indra_rpc_active_connections",
+        "Active hardened RPC connections",
+        metrics_state.rpc_active_connections.load(Ordering::Relaxed),
+    );
+    gauge(
+        &mut buf,
+        "indra_rpc_limiter_entries",
+        "Live bounded RPC limiter source entries",
+        rpc_limiter_entries,
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_limiter_evictions",
+        "RPC limiter capacity or idle-TTL evictions",
+        rpc_limiter_evictions,
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_write_failures",
+        "RPC socket response write failures",
+        metrics_state
+            .rpc_write_failures_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_invalid_transaction_structural",
+        "Structurally malformed RPC transaction submissions",
+        metrics_state
+            .rpc_invalid_tx_structural_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_invalid_transaction_validation",
+        "Authoritatively rejected RPC transaction submissions",
+        metrics_state
+            .rpc_invalid_tx_validation_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_invalid_staking_structural",
+        "Structurally malformed RPC staking submissions",
+        metrics_state
+            .rpc_invalid_staking_structural_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_invalid_staking_validation",
+        "Authoritatively rejected RPC staking submissions",
+        metrics_state
+            .rpc_invalid_staking_validation_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_invalid_governance_structural",
+        "Structurally malformed RPC governance submissions",
+        metrics_state
+            .rpc_invalid_governance_structural_total
+            .load(Ordering::Relaxed),
+    );
+    counter(
+        &mut buf,
+        "indra_rpc_invalid_governance_validation",
+        "Authoritatively rejected RPC governance submissions",
+        metrics_state
+            .rpc_invalid_governance_validation_total
+            .load(Ordering::Relaxed),
     );
     gauge(
         &mut buf,
@@ -747,5 +937,91 @@ mod tests {
         }
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("indra_block_height"));
+    }
+
+    #[test]
+    fn rpc_metrics_are_bounded_cardinality_and_render_incremented_values() {
+        let (driver, data_dir) = test_driver();
+        let observer_count = Arc::new(AtomicUsize::new(0));
+        let metrics = MetricsState::new();
+        metrics.rpc_requests_total.store(7, Ordering::Relaxed);
+        metrics.rpc_active_connections.store(3, Ordering::Relaxed);
+        let limiter = Arc::new(RpcLimiterTelemetry::default());
+        limiter.update(11, 0);
+        metrics.register_rpc_limiter_telemetry(limiter);
+        metrics
+            .rpc_invalid_tx_validation_total
+            .store(2, Ordering::Relaxed);
+        let output = render_metrics(
+            &driver,
+            &observer_count,
+            0,
+            &metrics,
+            &AtomicU64::new(0),
+            &data_dir,
+            "0.1.0",
+        );
+        assert!(output.contains("indra_rpc_requests_total 7"));
+        assert!(output.contains("indra_rpc_active_connections 3"));
+        assert!(output.contains("indra_rpc_limiter_entries 11"));
+        assert!(output.contains("indra_rpc_invalid_transaction_validation_total 2"));
+        for line in output.lines().filter(|line| line.starts_with("indra_rpc_")) {
+            assert!(
+                !line.contains("ip="),
+                "attacker-controlled IP label: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn limiter_telemetry_aggregates_independent_listeners_without_labels() {
+        let metrics = MetricsState::new();
+        let full = Arc::new(RpcLimiterTelemetry::default());
+        let public = Arc::new(RpcLimiterTelemetry::default());
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&full));
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&public));
+        full.update(7, 2);
+        public.update(5, 3);
+        assert_eq!(metrics.rpc_limiter_totals(), (12, 5));
+        full.update(4, 4);
+        assert_eq!(metrics.rpc_limiter_totals(), (9, 7));
+    }
+
+    #[test]
+    fn limiter_telemetry_concurrent_updates_cannot_drift_aggregate() {
+        use std::sync::Barrier;
+
+        let metrics = MetricsState::new();
+        let full = Arc::new(RpcLimiterTelemetry::default());
+        let public = Arc::new(RpcLimiterTelemetry::default());
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&full));
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&public));
+
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for worker in 0..8u64 {
+            let telemetry = if worker % 2 == 0 {
+                Arc::clone(&full)
+            } else {
+                Arc::clone(&public)
+            };
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iteration in 0..10_000u64 {
+                    telemetry.update(worker + iteration % 97, worker * 10 + iteration);
+                }
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        // A final independently known publication must make the rendered
+        // aggregate exact regardless of every racing update that preceded it.
+        full.update(41, 101);
+        public.update(59, 202);
+        assert_eq!(metrics.rpc_limiter_totals(), (100, 303));
     }
 }

@@ -1,8 +1,7 @@
 //! INDRA observer/full-node binary.
 
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -147,7 +146,12 @@ async fn run() -> Result<(), String> {
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
     let observer_count = Arc::new(AtomicUsize::new(0));
 
-    start_rpc(&rpc_addr, Arc::clone(&engine));
+    indra_node::hardened_read_rpc::start_hardened_observer_rpc(
+        rpc_addr.clone(),
+        cfg_file.rpc_trusted_tls_proxy == Some(true),
+        Arc::clone(&engine),
+        Arc::clone(&metrics_state),
+    );
     eprintln!("[observer] rpc listening on {}", rpc_addr);
     if let Some(addr) = observer_addr {
         start_observer_reserve(&addr, Arc::clone(&engine), Arc::clone(&observer_count));
@@ -293,113 +297,6 @@ async fn serve_observer_peer(
             _ => {}
         }
     }
-}
-
-fn start_rpc(addr: &str, engine: Arc<Mutex<NodeEngine>>) {
-    let addr = addr.to_string();
-    std::thread::spawn(move || {
-        let listener = match TcpListener::bind(&addr) {
-            Ok(listener) => listener,
-            Err(e) => {
-                eprintln!("[observer] rpc bind failed: {}", e);
-                return;
-            }
-        };
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let engine = Arc::clone(&engine);
-                    std::thread::spawn(move || handle_rpc(stream, engine));
-                }
-                Err(e) => eprintln!("[observer] rpc accept error: {}", e),
-            }
-        }
-    });
-}
-
-fn handle_rpc(stream: TcpStream, engine: Arc<Mutex<NodeEngine>>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let response = read_rpc_response(&stream, &engine).unwrap_or_else(|e| {
-        format!(
-            r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"{}"}},"id":null}}"#,
-            e.replace('"', "\\\"")
-        )
-    });
-    let http = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response.len(),
-        response
-    );
-    if let Ok(mut writer) = stream.try_clone() {
-        let _ = writer.write_all(http.as_bytes());
-    }
-}
-
-fn read_rpc_response(
-    stream: &TcpStream,
-    engine: &Arc<Mutex<NodeEngine>>,
-) -> Result<String, String> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    let mut content_length = 0usize;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if trimmed.to_ascii_lowercase().starts_with("content-length:") {
-            content_length = trimmed["content-length:".len()..]
-                .trim()
-                .parse()
-                .unwrap_or(0);
-        }
-    }
-    let mut body = vec![0u8; content_length.min(1_048_576)];
-    reader.read_exact(&mut body).map_err(|e| e.to_string())?;
-    let body = String::from_utf8_lossy(&body);
-    let method = extract_json_string(&body, "method").unwrap_or_default();
-    let result = {
-        let engine = engine
-            .lock()
-            .map_err(|_| "engine lock poisoned".to_string())?;
-        match method.as_str() {
-            "indra_getHeight" => format!(r#"{{"height":{}}}"#, engine.state.height),
-            "indra_getTip" => format!(
-                r#"{{"height":{},"tip_hash":"{}"}}"#,
-                engine.state.height,
-                hex::encode(engine.state.tip_hash.0)
-            ),
-            "indra_getChainInfo" => format!(
-                r#"{{"height":{},"tip_hash":"{}","base_fee":{},"total_supply":{},"epoch":{},"chain_id":"{}"}}"#,
-                engine.state.height,
-                hex::encode(engine.state.tip_hash.0),
-                engine.state.base_fee,
-                engine.state.total_supply,
-                engine.state.current_epoch(),
-                engine.state.chain_id,
-            ),
-            "indra_getMempoolSize" => format!(r#"{{"size":{}}}"#, engine.mempool.len()),
-            _ => {
-                return Ok(format!(
-                    r#"{{"jsonrpc":"2.0","error":{{"code":-32601,"message":"method not found"}},"id":1}}"#
-                ));
-            }
-        }
-    };
-    Ok(format!(r#"{{"jsonrpc":"2.0","result":{},"id":1}}"#, result))
-}
-
-fn extract_json_string(json: &str, field: &str) -> Option<String> {
-    let key = format!("\"{}\"", field);
-    let pos = json.find(&key)?;
-    let after = &json[pos + key.len()..];
-    let colon = after.find(':')?;
-    let after = after[colon + 1..].trim_start();
-    let after = after.strip_prefix('"')?;
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
 }
 
 async fn connect_and_sync(

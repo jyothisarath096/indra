@@ -70,12 +70,22 @@ pub struct NodeConfigFile {
     pub rpc_enabled: Option<bool>,
     /// `[rpc].admin_token`.
     pub rpc_admin_token: Option<String>,
+    /// `[rpc].access_token`.
+    pub rpc_access_token: Option<String>,
+    /// `[rpc].trusted_tls_proxy`.
+    pub rpc_trusted_tls_proxy: Option<bool>,
+    /// `[rpc].per_ip_connection_cap`.
+    pub rpc_per_ip_connection_cap: Option<u64>,
     /// `[rpc].cors_origins`.
     pub rpc_cors_origins: Vec<String>,
     /// `[rpc_public].addr`.
     pub rpc_public_addr: Option<String>,
     /// `[rpc_public].enabled`.
     pub rpc_public_enabled: Option<bool>,
+    /// `[rpc_public].trusted_tls_proxy`.
+    pub rpc_public_trusted_tls_proxy: Option<bool>,
+    /// `[rpc_public].per_ip_connection_cap`.
+    pub rpc_public_per_ip_connection_cap: Option<u64>,
     /// `[rpc_public].cors_origins`.
     pub rpc_public_cors_origins: Vec<String>,
     /// `[rpc_public].per_ip_rate_per_sec`.
@@ -133,9 +143,18 @@ impl NodeConfigFile {
             rpc_addr: get_str(&table, "rpc", "addr"),
             rpc_enabled: get_bool(&table, "rpc", "enabled"),
             rpc_admin_token: get_str(&table, "rpc", "admin_token"),
+            rpc_access_token: get_str(&table, "rpc", "access_token"),
+            rpc_trusted_tls_proxy: get_bool(&table, "rpc", "trusted_tls_proxy"),
+            rpc_per_ip_connection_cap: get_u64(&table, "rpc", "per_ip_connection_cap"),
             rpc_cors_origins: get_str_array(&table, "rpc", "cors_origins"),
             rpc_public_addr: get_str(&table, "rpc_public", "addr"),
             rpc_public_enabled: get_bool(&table, "rpc_public", "enabled"),
+            rpc_public_trusted_tls_proxy: get_bool(&table, "rpc_public", "trusted_tls_proxy"),
+            rpc_public_per_ip_connection_cap: get_u64(
+                &table,
+                "rpc_public",
+                "per_ip_connection_cap",
+            ),
             rpc_public_cors_origins: get_str_array(&table, "rpc_public", "cors_origins"),
             rpc_public_per_ip_rate_per_sec: get_u64(&table, "rpc_public", "per_ip_rate_per_sec"),
             rpc_public_per_ip_burst: get_u64(&table, "rpc_public", "per_ip_burst"),
@@ -229,7 +248,30 @@ impl NodeConfigFile {
             if !addr.is_empty() && !is_valid_addr(addr) {
                 errors.push("rpc.addr must be valid host:port, empty, or omitted".to_string());
             }
+            if !addr.is_empty()
+                && self.rpc_enabled.unwrap_or(true)
+                && !is_loopback_addr(addr)
+                && self.rpc_trusted_tls_proxy != Some(true)
+            {
+                errors.push(
+                    "rpc.addr must be loopback unless rpc.trusted_tls_proxy=true explicitly acknowledges a trusted TLS-terminating proxy"
+                        .to_string(),
+                );
+            }
         }
+        if mode != "observer"
+            && self.rpc_enabled.unwrap_or(true)
+            && is_blank(self.rpc_access_token.as_deref())
+        {
+            errors.push(
+                "rpc.access_token must be set and non-empty when full RPC is enabled".to_string(),
+            );
+        }
+        validate_connection_cap(
+            "rpc.per_ip_connection_cap",
+            self.rpc_per_ip_connection_cap,
+            &mut errors,
+        );
         for origin in &self.rpc_cors_origins {
             if origin.trim().is_empty() || origin == "*" {
                 errors.push(
@@ -242,7 +284,22 @@ impl NodeConfigFile {
                 errors
                     .push("rpc_public.addr must be valid host:port, empty, or omitted".to_string());
             }
+            if !addr.is_empty()
+                && self.rpc_public_enabled == Some(true)
+                && !is_loopback_addr(addr)
+                && self.rpc_public_trusted_tls_proxy != Some(true)
+            {
+                errors.push(
+                    "rpc_public.addr must be loopback unless rpc_public.trusted_tls_proxy=true explicitly acknowledges a trusted TLS-terminating proxy"
+                        .to_string(),
+                );
+            }
         }
+        validate_connection_cap(
+            "rpc_public.per_ip_connection_cap",
+            self.rpc_public_per_ip_connection_cap,
+            &mut errors,
+        );
         for origin in &self.rpc_public_cors_origins {
             if origin.trim().is_empty() || origin == "*" {
                 errors.push(
@@ -464,10 +521,20 @@ fn allowed_config_keys(section: &str) -> Option<&'static [&'static str]> {
             "dns_seed_signed_public_key",
             "peers_file",
         ]),
-        "rpc" => Some(&["addr", "enabled", "admin_token", "cors_origins"]),
+        "rpc" => Some(&[
+            "addr",
+            "enabled",
+            "admin_token",
+            "access_token",
+            "trusted_tls_proxy",
+            "per_ip_connection_cap",
+            "cors_origins",
+        ]),
         "rpc_public" => Some(&[
             "addr",
             "enabled",
+            "trusted_tls_proxy",
+            "per_ip_connection_cap",
             "cors_origins",
             "per_ip_rate_per_sec",
             "per_ip_burst",
@@ -535,6 +602,19 @@ fn is_valid_addr(s: &str) -> bool {
     parts[0].parse::<u16>().map(|p| p > 0).unwrap_or(false)
 }
 
+fn is_loopback_addr(s: &str) -> bool {
+    s.parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback())
+}
+
+fn validate_connection_cap(name: &str, value: Option<u64>, errors: &mut Vec<String>) {
+    if let Some(value) = value {
+        if !(1..=64).contains(&value) {
+            errors.push(format!("{name} must be in the range 1..=64"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +650,7 @@ mod tests {
             data_dir: Some("/tmp/indra".to_string()),
             genesis: Some("/tmp/indra/genesis.toml".to_string()),
             keys_path: Some("/tmp/indra/keys.json".to_string()),
+            rpc_access_token: Some("test-access".to_string()),
             ..Default::default()
         }
     }
@@ -628,11 +709,16 @@ peers_file = "/root/.indra/data/peers.json"
 addr = "127.0.0.1:8545"
 enabled = true
 admin_token = "local-admin"
+access_token = "local-access"
+trusted_tls_proxy = false
+per_ip_connection_cap = 4
 cors_origins = ["http://localhost:3000"]
 
 [rpc_public]
 addr = "127.0.0.1:8547"
 enabled = true
+trusted_tls_proxy = false
+per_ip_connection_cap = 4
 cors_origins = ["https://explorer.indraprotocol.com"]
 per_ip_rate_per_sec = 5
 per_ip_burst = 20
@@ -661,6 +747,7 @@ governance_mempool_capacity = 2400
         assert_eq!(cfg.dns_seed_signed_validation.as_deref(), Some("warn"));
         assert_eq!(cfg.rpc_enabled, Some(true));
         assert_eq!(cfg.rpc_admin_token.as_deref(), Some("local-admin"));
+        assert_eq!(cfg.rpc_access_token.as_deref(), Some("local-access"));
         assert_eq!(
             cfg.rpc_cors_origins,
             vec!["http://localhost:3000".to_string()]
@@ -833,6 +920,41 @@ extra_security_mode = "warn"
         cfg.rpc_public_addr = Some("bad-public-rpc".to_string());
         let err = cfg.validate().err().unwrap_or_else(|| vec![]);
         assert!(err.iter().any(|e| e.contains("rpc_public.addr")));
+    }
+
+    #[test]
+    fn rpc_security_configuration_fails_closed() {
+        let mut cfg = minimal();
+        cfg.rpc_access_token = None;
+        cfg.rpc_enabled = Some(true);
+        cfg.rpc_addr = Some("0.0.0.0:8545".to_string());
+        cfg.rpc_public_enabled = Some(true);
+        cfg.rpc_public_addr = Some("0.0.0.0:8547".to_string());
+        cfg.rpc_per_ip_connection_cap = Some(0);
+        cfg.rpc_public_per_ip_connection_cap = Some(65);
+        let errors = cfg.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rpc.access_token")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rpc.trusted_tls_proxy")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rpc_public.trusted_tls_proxy")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rpc.per_ip_connection_cap")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rpc_public.per_ip_connection_cap")));
+
+        cfg.rpc_access_token = Some("access".to_string());
+        cfg.rpc_trusted_tls_proxy = Some(true);
+        cfg.rpc_public_trusted_tls_proxy = Some(true);
+        cfg.rpc_per_ip_connection_cap = Some(4);
+        cfg.rpc_public_per_ip_connection_cap = Some(4);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

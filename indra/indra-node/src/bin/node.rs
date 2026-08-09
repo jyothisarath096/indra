@@ -4,12 +4,12 @@
 //! Consensus and state transition logic remain synchronous on dedicated threads.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex, RwLock,
+    Arc, Condvar, Mutex, RwLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,9 +47,11 @@ use indra_node::{
         verify_direct_provisional_qc, verify_provisional_certificate, verify_sync_candidate,
         PairVerificationError, SYNC_BATCH_SIZE,
     },
-    KeysData, MetricsState, NodeConfig, NodeConfigFile, NodeEngine,
+    KeysData, MetricsState, NodeConfig, NodeConfigFile, NodeEngine, RpcLimiterTelemetry,
 };
+use indra_rpc::handlers::RpcEngineView;
 use rand::{seq::SliceRandom, Rng};
+use subtle::ConstantTimeEq;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -101,6 +103,7 @@ fn write_sync_recovery_diagnostic(data_dir: &Path, height: u64, tip_hash: indra_
 }
 const DNS_RESERVED_OUTBOUND: usize = 2;
 const MAX_RPC_CONNECTIONS: u64 = indra_rpc::server::MAX_RPC_CONNECTIONS;
+const MAX_CONCURRENT_EXPENSIVE_RPC: usize = 4;
 
 #[derive(Debug, Clone)]
 struct RpcListenerPolicy {
@@ -110,6 +113,53 @@ struct RpcListenerPolicy {
     global_burst: Option<u64>,
     max_body_bytes: usize,
     request_timeout: Duration,
+    per_ip_connection_cap: u64,
+}
+
+struct RpcSemaphore {
+    available: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl RpcSemaphore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            available: Mutex::new(capacity),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire_until(&self, deadline: Instant) -> Option<RpcPermit<'_>> {
+        let mut available = self.available.lock().ok()?;
+        loop {
+            if *available > 0 {
+                *available -= 1;
+                return Some(RpcPermit { semaphore: self });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, timeout) = self.changed.wait_timeout(available, remaining).ok()?;
+            available = next;
+            if timeout.timed_out() {
+                return None;
+            }
+        }
+    }
+}
+
+struct RpcPermit<'a> {
+    semaphore: &'a RpcSemaphore,
+}
+
+impl Drop for RpcPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut available) = self.semaphore.available.lock() {
+            *available = available.saturating_add(1);
+            self.semaphore.changed.notify_one();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -246,14 +296,15 @@ fn source_rank(source: PeerSource) -> u8 {
 }
 
 impl RpcListenerPolicy {
-    fn full() -> Self {
+    fn full(cfg: &NodeConfigFile) -> Self {
         Self {
             per_ip_rate_per_sec: indra_rpc::server::RPC_RATE_LIMIT_PER_SEC,
             per_ip_burst: indra_rpc::server::RPC_RATE_BURST,
-            global_rate_per_sec: None,
-            global_burst: None,
+            global_rate_per_sec: Some(indra_rpc::server::RPC_PUBLIC_GLOBAL_RATE_LIMIT_PER_SEC),
+            global_burst: Some(indra_rpc::server::RPC_PUBLIC_GLOBAL_RATE_BURST),
             max_body_bytes: indra_rpc::server::MAX_RPC_BODY_BYTES,
             request_timeout: indra_rpc::server::RPC_REQUEST_TIMEOUT,
+            per_ip_connection_cap: cfg.rpc_per_ip_connection_cap.unwrap_or(4),
         }
     }
 
@@ -280,6 +331,7 @@ impl RpcListenerPolicy {
                 cfg.rpc_public_timeout_ms
                     .unwrap_or(indra_rpc::server::RPC_PUBLIC_REQUEST_TIMEOUT.as_millis() as u64),
             ),
+            per_ip_connection_cap: cfg.rpc_public_per_ip_connection_cap.unwrap_or(4),
         }
     }
 }
@@ -2036,6 +2088,44 @@ fn main() {
             .get_or_insert_with(|| "keys.json".to_string());
     }
 
+    if rpc_should_start(cfg_file.rpc_enabled)
+        && cfg_file
+            .rpc_access_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+    {
+        eprintln!("ERROR: rpc.access_token must be set and non-empty when full RPC is enabled");
+        std::process::exit(1);
+    }
+    if rpc_should_start(cfg_file.rpc_enabled)
+        && !rpc_bind_is_loopback(
+            get_arg("--rpc-addr")
+                .or_else(|| cfg_file.rpc_addr.clone())
+                .as_deref()
+                .unwrap_or("127.0.0.1:8545"),
+        )
+        && cfg_file.rpc_trusted_tls_proxy != Some(true)
+    {
+        eprintln!(
+            "ERROR: rpc.trusted_tls_proxy must be true before full RPC may bind non-loopback"
+        );
+        std::process::exit(1);
+    }
+    if cfg_file.rpc_public_enabled == Some(true)
+        && !rpc_bind_is_loopback(
+            get_arg("--rpc-public-addr")
+                .or_else(|| cfg_file.rpc_public_addr.clone())
+                .as_deref()
+                .unwrap_or("127.0.0.1:8546"),
+        )
+        && cfg_file.rpc_public_trusted_tls_proxy != Some(true)
+    {
+        eprintln!(
+            "ERROR: rpc_public.trusted_tls_proxy must be true before public RPC may bind non-loopback"
+        );
+        std::process::exit(1);
+    }
+
     let keys_path = cfg_file
         .keys_path
         .clone()
@@ -2564,8 +2654,7 @@ fn main() {
                                     .and_then(|mut guard| {
                                         let engine = &mut guard.engine;
                                         engine
-                                            .mempool
-                                            .submit_validated(tx.clone(), &engine.state)
+                                            .add_transaction(tx.clone())
                                             .map_err(|error| error.to_string())
                                     });
                                 match result {
@@ -3454,21 +3543,29 @@ fn main() {
     }
 
     // ── Thread 5: RPC server ────────────────────────────────────────────────
-    // Inline HTTP/JSON-RPC handler — avoids circular dependency with indra-rpc.
-    // Reads chain state directly from the driver under a brief lock.
+    // Readers use the immutable state published at canonical commit boundaries.
+    let (rpc_snapshot, rpc_storage) = {
+        let guard = driver.lock().unwrap();
+        (
+            guard.engine.rpc_snapshot.clone(),
+            indra_node::rpc_snapshot::RpcStorageReadHandles {
+                blocks: guard.engine.block_store.read_handle(),
+                epochs: guard.engine.epoch_store.read_handle(),
+            },
+        )
+    };
     if rpc_should_start(cfg_file.rpc_enabled) {
         let rpc_addr = get_arg("--rpc-addr")
             .or_else(|| cfg_file.rpc_addr.clone())
             .unwrap_or_else(|| "127.0.0.1:8545".to_string());
-        if let Some(warning) = rpc_non_loopback_warning(&rpc_addr) {
-            eprintln!("{}", warning);
-        }
         spawn_rpc_listener(
             "rpc",
             rpc_addr,
             indra_rpc::handlers::RpcMode::Full,
-            RpcListenerPolicy::full(),
+            RpcListenerPolicy::full(&cfg_file),
             Arc::clone(&driver),
+            rpc_snapshot.clone(),
+            rpc_storage.clone(),
             Arc::clone(&gossip),
             Arc::clone(&discovered_peers),
             Arc::clone(&op_relay_seen),
@@ -3478,32 +3575,38 @@ fn main() {
                 .rpc_admin_token
                 .clone()
                 .filter(|token| !token.trim().is_empty()),
+            cfg_file
+                .rpc_access_token
+                .clone()
+                .filter(|token| !token.trim().is_empty()),
+            Arc::clone(&metrics_state),
         );
     } else {
         eprintln!("[rpc] RPC server disabled by config");
     }
 
     if rpc_public_should_start(cfg_file.rpc_public_enabled) {
-        let rpc_public_addr = cfg_file
-            .rpc_public_addr
+        let rpc_public_addr = get_arg("--rpc-public-addr")
+            .or_else(|| cfg_file.rpc_public_addr.clone())
             .clone()
             .filter(|addr| !addr.trim().is_empty())
             .unwrap_or_else(|| "127.0.0.1:8547".to_string());
-        if let Some(warning) = rpc_public_non_loopback_warning(&rpc_public_addr) {
-            eprintln!("[rpc-public] {}", warning);
-        }
         spawn_rpc_listener(
             "rpc-public",
             rpc_public_addr,
             indra_rpc::handlers::RpcMode::ReadOnly,
             RpcListenerPolicy::public_from_config(&cfg_file),
             Arc::clone(&driver),
+            rpc_snapshot.clone(),
+            rpc_storage.clone(),
             Arc::clone(&gossip),
             Arc::clone(&discovered_peers),
             Arc::clone(&op_relay_seen),
             Arc::clone(&observer_count),
             cfg_file.rpc_public_cors_origins.clone(),
             None,
+            None,
+            Arc::clone(&metrics_state),
         );
     }
 
@@ -3969,6 +4072,11 @@ fn run_init() {
     );
     let metrics_addr = prompt_default("Metrics address", "0.0.0.0:9615");
     let rpc_addr = prompt_default("RPC address", "127.0.0.1:8545");
+    let mut generated_access_token = [0u8; 32];
+    rand::rngs::OsRng.fill(&mut generated_access_token);
+    let generated_access_token = hex::encode(generated_access_token);
+    let rpc_access_token =
+        prompt_default("Full RPC access token (required)", &generated_access_token);
     let prune_keep = prompt_default("Prune keep blocks [50000, 0=archive]", "50000");
     let config_path = Path::new(&data_dir).join("config.toml");
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -4012,6 +4120,10 @@ addr    = "{}"
 enabled = true
 # Empty admin token disables privileged RPC topology details.
 admin_token = ""
+# Required for every full-listener request, including loopback clients.
+access_token = "{}"
+trusted_tls_proxy = false
+per_ip_connection_cap = 4
 # Empty allowlist means browsers receive no cross-origin access by default.
 cors_origins = []
 
@@ -4020,6 +4132,8 @@ cors_origins = []
 # at the RPC dispatch layer before any submission path is reachable.
 addr    = "127.0.0.1:8547"
 enabled = false
+trusted_tls_proxy = false
+per_ip_connection_cap = 4
 cors_origins = []
 
 [metrics]
@@ -4041,6 +4155,7 @@ mempool_capacity  = 5000
         DNS_SEED_HOSTS.join(","),
         toml_escape(&data_dir),
         toml_escape(&rpc_addr),
+        toml_escape(&rpc_access_token),
         toml_escape(&metrics_addr),
         prune_keep
     );
@@ -4169,30 +4284,6 @@ fn release_rpc_connection(count: &AtomicU64) {
     });
 }
 
-fn rpc_non_loopback_warning(addr: &str) -> Option<String> {
-    let parsed = addr.parse::<SocketAddr>().ok()?;
-    if parsed.ip().is_loopback() {
-        None
-    } else {
-        Some(format!(
-            "WARNING: full RPC listener binding to non-loopback address {}. This listener can accept signed submissions and admin methods; do not expose it directly to the public internet. Bind to 127.0.0.1 or a private interface and protect it with firewall rules.",
-            parsed
-        ))
-    }
-}
-
-fn rpc_public_non_loopback_warning(addr: &str) -> Option<String> {
-    let parsed = addr.parse::<SocketAddr>().ok()?;
-    if parsed.ip().is_loopback() {
-        None
-    } else {
-        Some(format!(
-            "WARNING: rpc_public listener binding to non-loopback address {}. This read-only listener is designed for public consumers only with public-endpoint hardening; mainnet operators should still place it behind a reverse proxy/CDN/WAF with TLS, additional rate limits, logging, and monitoring.",
-            parsed
-        ))
-    }
-}
-
 fn rpc_should_start(enabled: Option<bool>) -> bool {
     enabled.unwrap_or(true)
 }
@@ -4207,17 +4298,23 @@ fn spawn_rpc_listener(
     mode: indra_rpc::handlers::RpcMode,
     policy: RpcListenerPolicy,
     driver: Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    rpc_snapshot: indra_node::rpc_snapshot::RpcSnapshotPublisher,
+    rpc_storage: indra_node::rpc_snapshot::RpcStorageReadHandles,
     gossip: Arc<NetworkBridge>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
     op_relay_seen: Arc<Mutex<InboundDedupCaches>>,
     observer_count: Arc<AtomicUsize>,
     cors_origins: Vec<String>,
     admin_token: Option<String>,
+    access_token: Option<String>,
+    metrics: Arc<MetricsState>,
 ) {
     let rpc_cors_origins = Arc::new(cors_origins);
     let admin_token = Arc::new(admin_token);
+    let access_token = Arc::new(access_token);
     let policy = Arc::new(policy);
     let rpc_conn_count = Arc::new(AtomicU64::new(0));
+    let rpc_ip_connections = Arc::new(Mutex::new(HashMap::<IpAddr, u64>::new()));
     let rpc_rate_limiter = Arc::new(indra_rpc::server::RpcRateLimiter::new());
     let rpc_global_rate_limiter = policy
         .global_rate_per_sec
@@ -4225,7 +4322,10 @@ fn spawn_rpc_listener(
         .map(|(rate, burst)| Arc::new(indra_rpc::server::RpcGlobalRateLimiter::new(rate, burst)));
     let expensive_limiter = Arc::new(indra_rpc::server::RpcWindowRateLimiter::new());
     let expensive_global_limiter = Arc::new(indra_rpc::server::RpcGlobalWindowRateLimiter::new());
+    let expensive_semaphore = Arc::new(RpcSemaphore::new(MAX_CONCURRENT_EXPENSIVE_RPC));
     let rejection_counters = Arc::new(RpcRejectionCounters::default());
+    let limiter_telemetry = Arc::new(RpcLimiterTelemetry::default());
+    metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry));
     eprintln!("[{}] listening on {} ({:?})", label, rpc_addr, mode);
 
     std::thread::spawn(move || {
@@ -4248,7 +4348,22 @@ fn spawn_rpc_listener(
                         continue;
                     }
                     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+                    if let Some(ip) = peer_ip {
+                        let mut counts = rpc_ip_connections.lock().unwrap();
+                        if !reserve_rpc_ip_connection(&mut counts, ip, policy.per_ip_connection_cap)
+                        {
+                            release_rpc_connection(&rpc_conn_count);
+                            eprintln!("[{label}] per-IP connection cap rejected {ip}");
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                    metrics
+                        .rpc_active_connections
+                        .fetch_add(1, Ordering::Relaxed);
                     let driver_rpc = Arc::clone(&driver);
+                    let rpc_snapshot = rpc_snapshot.clone();
+                    let rpc_storage = rpc_storage.clone();
                     let gossip_rpc = Arc::clone(&gossip);
                     let discovered_peers_rpc = Arc::clone(&discovered_peers);
                     let op_relay_seen_rpc = Arc::clone(&op_relay_seen);
@@ -4258,14 +4373,21 @@ fn spawn_rpc_listener(
                     let rpc_global_rate_limiter = rpc_global_rate_limiter.clone();
                     let expensive_limiter = Arc::clone(&expensive_limiter);
                     let expensive_global_limiter = Arc::clone(&expensive_global_limiter);
+                    let expensive_semaphore = Arc::clone(&expensive_semaphore);
                     let rejection_counters = Arc::clone(&rejection_counters);
+                    let limiter_telemetry = Arc::clone(&limiter_telemetry);
                     let rpc_cors_origins = Arc::clone(&rpc_cors_origins);
                     let admin_token = Arc::clone(&admin_token);
+                    let access_token = Arc::clone(&access_token);
+                    let rpc_ip_connections = Arc::clone(&rpc_ip_connections);
+                    let metrics = Arc::clone(&metrics);
                     let policy = Arc::clone(&policy);
                     std::thread::spawn(move || {
                         handle_rpc(
                             stream,
                             &driver_rpc,
+                            &rpc_snapshot,
+                            &rpc_storage,
                             &gossip_rpc,
                             &discovered_peers_rpc,
                             &op_relay_seen_rpc,
@@ -4275,13 +4397,29 @@ fn spawn_rpc_listener(
                             rpc_global_rate_limiter.as_deref(),
                             &expensive_limiter,
                             &expensive_global_limiter,
+                            &expensive_semaphore,
                             &rejection_counters,
                             &rpc_cors_origins,
                             mode,
                             &policy,
                             admin_token.as_ref().as_deref(),
+                            access_token.as_ref().as_deref(),
+                            &metrics,
+                            &limiter_telemetry,
                         );
+                        if let Some(ip) = peer_ip {
+                            let mut counts = rpc_ip_connections.lock().unwrap();
+                            if let Some(count) = counts.get_mut(&ip) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    counts.remove(&ip);
+                                }
+                            }
+                        }
                         release_rpc_connection(&rpc_conn_count);
+                        metrics
+                            .rpc_active_connections
+                            .fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => eprintln!("[{}] accept error: {}", label, e),
@@ -4290,47 +4428,95 @@ fn spawn_rpc_listener(
     });
 }
 
+fn reserve_rpc_ip_connection(counts: &mut HashMap<IpAddr, u64>, ip: IpAddr, cap: u64) -> bool {
+    let count = counts.entry(ip).or_default();
+    if *count >= cap {
+        return false;
+    }
+    *count = count.saturating_add(1);
+    true
+}
+
 struct RpcSnapshot {
-    chain: indra_state::ChainState,
-    mempool_size: usize,
-    pruned_mode: bool,
-    lowest_block: u64,
-    blocks_retained: usize,
-    requested_block: Option<(u64, indra_core::types::block::BlockV1)>,
+    read: Arc<indra_node::rpc_snapshot::RpcReadSnapshot>,
+    requested_blocks: HashMap<u64, indra_core::types::block::BlockV1>,
     latest_epoch: Option<u64>,
     epoch_records: HashMap<u64, indra_core::EpochRecord>,
 }
 
 impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
     fn chain_state(&self) -> &indra_state::ChainState {
-        &self.chain
+        self.read.chain_state()
     }
 
     fn mempool_size(&self) -> usize {
-        self.mempool_size
+        self.read.mempool_size()
     }
 
     fn pruned_mode(&self) -> bool {
-        self.pruned_mode
+        self.read.pruned_mode()
     }
 
     fn lowest_block(&self) -> u64 {
-        self.lowest_block
+        self.read.lowest_block()
     }
 
     fn blocks_retained(&self) -> usize {
-        self.blocks_retained
+        self.read.blocks_retained()
+    }
+
+    fn state_root(&self) -> indra_core::Bytes32 {
+        self.read.state_root()
+    }
+
+    fn position_ids_by_owner(&self, owner: &indra_core::Bytes32) -> Option<&[indra_core::Bytes32]> {
+        self.read.position_ids_by_owner(owner)
+    }
+
+    fn position_ids_by_validator(
+        &self,
+        validator: &indra_core::Bytes32,
+    ) -> Option<&[indra_core::Bytes32]> {
+        self.read.position_ids_by_validator(validator)
+    }
+
+    fn tranche_ids_by_position(
+        &self,
+        position: &indra_core::Bytes32,
+    ) -> Option<&[indra_core::Bytes32]> {
+        self.read.tranche_ids_by_position(position)
+    }
+
+    fn tranche_ids_by_owner(&self, owner: &indra_core::Bytes32) -> Option<&[indra_core::Bytes32]> {
+        self.read.tranche_ids_by_owner(owner)
+    }
+
+    fn tranche_ids_by_validator(
+        &self,
+        validator: &indra_core::Bytes32,
+    ) -> Option<&[indra_core::Bytes32]> {
+        self.read.tranche_ids_by_validator(validator)
+    }
+
+    fn reward_ids_by_delegator(
+        &self,
+        delegator: &indra_core::Bytes32,
+    ) -> Option<&[indra_core::Bytes32]> {
+        self.read.reward_ids_by_delegator(delegator)
+    }
+
+    fn reward_ids_by_validator(
+        &self,
+        validator: &indra_core::Bytes32,
+    ) -> Option<&[indra_core::Bytes32]> {
+        self.read.reward_ids_by_validator(validator)
     }
 
     fn get_block_by_height(
         &self,
         height: u64,
     ) -> Result<Option<indra_core::types::block::BlockV1>, String> {
-        Ok(self
-            .requested_block
-            .as_ref()
-            .filter(|(block_height, _)| *block_height == height)
-            .map(|(_, block)| block.clone()))
+        Ok(self.requested_blocks.get(&height).cloned())
     }
 
     fn get_epoch_record(&self, epoch: u64) -> Result<Option<indra_core::EpochRecord>, String> {
@@ -4362,62 +4548,110 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
 }
 
 fn snapshot_rpc_state(
-    driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    publisher: &indra_node::rpc_snapshot::RpcSnapshotPublisher,
+    storage: &indra_node::rpc_snapshot::RpcStorageReadHandles,
     req: &indra_rpc::types::RpcRequest,
 ) -> Result<RpcSnapshot, String> {
-    let guard = driver
-        .lock()
-        .map_err(|_| "consensus driver lock poisoned".to_string())?;
-    let engine = &guard.engine;
-    let requested_block_height = requested_block_height_for_rpc(req, &engine.state);
-    let requested_block = match requested_block_height {
-        Some(height) => match engine.block_store.get_read_only(height) {
-            Ok(block) => Some((height, block)),
-            Err(indra_storage::StorageError::BlockNotFound { .. })
-            | Err(indra_storage::StorageError::BlockPruned { .. }) => None,
-            Err(error) => return Err(error.to_string()),
-        },
-        None => None,
-    };
-    let latest_epoch = engine.epoch_store.latest_epoch();
-    let epoch_records = match latest_epoch {
-        Some(latest) => {
-            let limit = usize::try_from(latest.saturating_add(1))
-                .unwrap_or(usize::MAX)
-                .min(10_000);
-            engine
-                .epoch_store
-                .get_range(latest, limit)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|record| (record.epoch, record))
-                .collect()
+    let read = publisher.load();
+    let block_heights = requested_block_heights_for_rpc(req, read.chain_state());
+    let needs_epoch_storage = matches!(
+        req.method.as_str(),
+        "indra_getEpochRecord" | "indra_getEpochHistory" | "indra_getLatestEpoch"
+    );
+    let mut requested_blocks = HashMap::new();
+    let mut latest_epoch = None;
+    let mut epoch_records = HashMap::new();
+    if !block_heights.is_empty() || needs_epoch_storage {
+        for height in block_heights {
+            match storage.blocks.get(height) {
+                Ok(block) => {
+                    requested_blocks.insert(height, block);
+                }
+                Err(indra_storage::StorageError::BlockNotFound { .. })
+                | Err(indra_storage::StorageError::BlockPruned { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
-        None => HashMap::new(),
-    };
+        latest_epoch = storage.epochs.latest_epoch();
+        match req.method.as_str() {
+            "indra_getEpochRecord" => {
+                if let Some(epoch) = req
+                    .params
+                    .first()
+                    .and_then(|value| indra_rpc::types::unquote(value).parse::<u64>().ok())
+                {
+                    if let Ok(record) = storage.epochs.get(epoch) {
+                        epoch_records.insert(epoch, record);
+                    }
+                }
+            }
+            "indra_getEpochHistory" => {
+                let to = req
+                    .params
+                    .first()
+                    .and_then(|value| indra_rpc::types::unquote(value).parse::<u64>().ok())
+                    .or(latest_epoch);
+                let limit = req
+                    .params
+                    .get(1)
+                    .and_then(|value| indra_rpc::types::unquote(value).parse::<usize>().ok())
+                    .unwrap_or(100)
+                    .min(100);
+                if let Some(to) = to {
+                    for record in storage
+                        .epochs
+                        .get_range(to, limit)
+                        .map_err(|error| error.to_string())?
+                    {
+                        epoch_records.insert(record.epoch, record);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(RpcSnapshot {
-        chain: engine.state.clone(),
-        mempool_size: engine.mempool.len(),
-        pruned_mode: !engine.block_store.is_archive(),
-        lowest_block: engine.block_store.lowest_height(),
-        blocks_retained: engine.block_store.len(),
-        requested_block,
+        read,
+        requested_blocks,
         latest_epoch,
         epoch_records,
     })
 }
 
-fn requested_block_height_for_rpc(
+fn requested_block_heights_for_rpc(
     req: &indra_rpc::types::RpcRequest,
     chain: &indra_state::ChainState,
-) -> Option<u64> {
+) -> Vec<u64> {
     match req.method.as_str() {
         "indra_getBlock" | "indra_getTransaction" => req
             .params
             .first()
-            .and_then(|param| indra_rpc::types::unquote(param).parse::<u64>().ok()),
-        "indra_explainUtxoProvenanceAuthorized" => provenance_requested_block_height(req, chain),
-        _ => None,
+            .and_then(|param| indra_rpc::types::unquote(param).parse::<u64>().ok())
+            .into_iter()
+            .collect(),
+        "indra_getCanonicalBlocks" => {
+            let Some(from) = req
+                .params
+                .first()
+                .and_then(|value| indra_rpc::types::unquote(value).parse::<u64>().ok())
+            else {
+                return Vec::new();
+            };
+            let limit = req
+                .params
+                .get(1)
+                .and_then(|value| indra_rpc::types::unquote(value).parse::<u64>().ok())
+                .unwrap_or(0)
+                .min(100);
+            (from..=chain
+                .height
+                .min(from.saturating_add(limit).saturating_sub(1)))
+                .collect()
+        }
+        "indra_explainUtxoProvenanceAuthorized" => provenance_requested_block_height(req, chain)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -4440,7 +4674,7 @@ fn provenance_requested_block_height(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_public_light_method(
     method: &str,
-    driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    publisher: &indra_node::rpc_snapshot::RpcSnapshotPublisher,
     connected_validator_peer_count: usize,
     discovered_count: usize,
     observer_count_val: usize,
@@ -4455,30 +4689,22 @@ fn dispatch_public_light_method(
         return None;
     }
     match method {
-        "indra_getHeight" => Some(
-            driver
-                .lock()
-                .map_err(|_| indra_rpc::RpcError::Internal("consensus driver lock poisoned".into()))
-                .map(|guard| format!(r#"{{"height":{}}}"#, guard.engine.state.height)),
-        ),
-        "indra_getTip" => Some(
-            driver
-                .lock()
-                .map_err(|_| indra_rpc::RpcError::Internal("consensus driver lock poisoned".into()))
-                .map(|guard| {
-                    format!(
-                        r#"{{"height":{},"tip_hash":"{}"}}"#,
-                        guard.engine.state.height,
-                        hex::encode(guard.engine.state.tip_hash.0)
-                    )
-                }),
-        ),
-        "indra_getMempoolSize" => Some(
-            driver
-                .lock()
-                .map_err(|_| indra_rpc::RpcError::Internal("consensus driver lock poisoned".into()))
-                .map(|guard| format!(r#"{{"size":{}}}"#, guard.engine.mempool.len())),
-        ),
+        "indra_getHeight" => {
+            let snapshot = publisher.load();
+            Some(Ok(format!(r#"{{"height":{}}}"#, snapshot.height())))
+        }
+        "indra_getTip" => {
+            let snapshot = publisher.load();
+            Some(Ok(format!(
+                r#"{{"height":{},"tip_hash":"{}"}}"#,
+                snapshot.chain_state().height,
+                hex::encode(snapshot.chain_state().tip_hash.0)
+            )))
+        }
+        "indra_getMempoolSize" => {
+            let snapshot = publisher.load();
+            Some(Ok(format!(r#"{{"size":{}}}"#, snapshot.mempool_size())))
+        }
         "indra_getPeers" => Some(Ok(format!(
             r#"{{"peer_count":{},"target_peers":{},"discovered_count":{},"observer_peer_count":{}}}"#,
             connected_validator_peer_count,
@@ -4554,6 +4780,8 @@ fn public_expensive_method_allowed(
 fn handle_rpc(
     stream: std::net::TcpStream,
     driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    rpc_snapshot: &indra_node::rpc_snapshot::RpcSnapshotPublisher,
+    rpc_storage: &indra_node::rpc_snapshot::RpcStorageReadHandles,
     gossip: &Arc<NetworkBridge>,
     discovered_peers: &Arc<Mutex<HashSet<String>>>,
     op_relay_seen: &Arc<Mutex<InboundDedupCaches>>,
@@ -4563,17 +4791,26 @@ fn handle_rpc(
     global_rate_limiter: Option<&indra_rpc::server::RpcGlobalRateLimiter>,
     expensive_limiter: &indra_rpc::server::RpcWindowRateLimiter,
     expensive_global_limiter: &indra_rpc::server::RpcGlobalWindowRateLimiter,
+    expensive_semaphore: &RpcSemaphore,
     rejection_counters: &RpcRejectionCounters,
     cors_origins: &[String],
     rpc_mode: indra_rpc::handlers::RpcMode,
     policy: &RpcListenerPolicy,
     configured_admin_token: Option<&str>,
+    configured_access_token: Option<&str>,
+    metrics: &MetricsState,
+    limiter_telemetry: &RpcLimiterTelemetry,
 ) {
     use indra_rpc::handlers::{
         check_rpc_method_allowed_with_admin, dispatch_with_admin, DispatchResult, NodeState,
     };
     use indra_rpc::types::RpcResponse;
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::BufReader;
+
+    let _request_metrics = RpcRequestMetricsGuard::new(metrics);
+    let read_started = Instant::now();
+    let read_deadline = read_started + policy.request_timeout;
+    let mut request_bytes_read = 0usize;
 
     let _ = stream.set_read_timeout(Some(policy.request_timeout));
     let _ = stream.set_write_timeout(Some(policy.request_timeout));
@@ -4585,12 +4822,16 @@ fn handle_rpc(
                 .fetch_add(1, Ordering::Relaxed);
             eprintln!("[rpc] per-IP rate limit rejected request from {ip}");
             let response = indra_rpc::server::rpc_rate_limited_response();
-            let _ = stream
-                .try_clone()
-                .map(|mut writer| writer.write_all(response.as_bytes()));
+            write_http_response(&stream, &response, metrics);
             return;
         }
     }
+    let (limiter_entries, limiter_evictions) = rate_limiter.map_stats();
+    let (expensive_entries, expensive_evictions) = expensive_limiter.map_stats();
+    limiter_telemetry.update(
+        limiter_entries.saturating_add(expensive_entries) as u64,
+        limiter_evictions.saturating_add(expensive_evictions),
+    );
     if let Some(global_limiter) = global_rate_limiter {
         if !global_limiter.allow() {
             rejection_counters
@@ -4598,9 +4839,7 @@ fn handle_rpc(
                 .fetch_add(1, Ordering::Relaxed);
             eprintln!("[rpc] global rate limit rejected request");
             let response = indra_rpc::server::rpc_rate_limited_response();
-            let _ = stream
-                .try_clone()
-                .map(|mut writer| writer.write_all(response.as_bytes()));
+            write_http_response(&stream, &response, metrics);
             return;
         }
     }
@@ -4614,16 +4853,32 @@ fn handle_rpc(
     let mut method = String::new();
     let mut origin: Option<String> = None;
     let mut presented_admin_token: Option<String> = None;
+    let mut presented_access_token: Option<String> = None;
     let mut line = String::new();
     let mut first_line = true;
 
     loop {
         line.clear();
-        if reader.read_line(&mut line).is_err() {
+        if read_line_with_deadline(
+            &mut reader,
+            &mut line,
+            read_started,
+            read_deadline,
+            &mut request_bytes_read,
+        )
+        .is_err()
+        {
             rejection_counters
                 .timeouts_or_incomplete_reads
                 .fetch_add(1, Ordering::Relaxed);
             eprintln!("[rpc] incomplete or timed-out header read");
+            return;
+        }
+        if request_bytes_read > MAX_RPC_HEADER_BYTES {
+            rejection_counters
+                .oversized_bodies
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("[rpc] oversized request headers rejected");
             return;
         }
         let trimmed = line.trim();
@@ -4650,6 +4905,9 @@ fn handle_rpc(
         if trimmed.to_lowercase().starts_with("x-admin-token:") {
             presented_admin_token = Some(trimmed["x-admin-token:".len()..].trim().to_string());
         }
+        if trimmed.to_ascii_lowercase().starts_with("x-rpc-token:") {
+            presented_access_token = Some(trimmed["x-rpc-token:".len()..].trim().to_string());
+        }
     }
 
     let cors = indra_rpc::server::cors_headers(origin.as_deref(), cors_origins);
@@ -4659,9 +4917,7 @@ fn handle_rpc(
             "HTTP/1.1 204 No Content\r\n{}Connection: close\r\n\r\n",
             cors
         );
-        let _ = stream
-            .try_clone()
-            .map(|mut writer| writer.write_all(resp.as_bytes()));
+        write_http_response(&stream, &resp, metrics);
         return;
     }
 
@@ -4672,15 +4928,13 @@ fn handle_rpc(
             "Method Not Allowed",
             &cors,
         );
-        let _ = stream
-            .try_clone()
-            .map(|mut writer| writer.write_all(response.as_bytes()));
+        write_http_response(&stream, &response, metrics);
         return;
     }
 
     if content_length == 0 {
         let body = r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"empty body"},"id":null}"#;
-        send_http(&stream, &cors, body);
+        send_http(&stream, &cors, body, metrics);
         return;
     }
 
@@ -4698,14 +4952,20 @@ fn handle_rpc(
             "request body too large",
             &cors,
         );
-        let _ = stream
-            .try_clone()
-            .map(|mut writer| writer.write_all(response.as_bytes()));
+        write_http_response(&stream, &response, metrics);
         return;
     }
 
     let mut body_bytes = vec![0u8; content_length];
-    if reader.read_exact(&mut body_bytes).is_err() {
+    if read_exact_with_deadline(
+        &mut reader,
+        &mut body_bytes,
+        read_started,
+        read_deadline,
+        &mut request_bytes_read,
+    )
+    .is_err()
+    {
         rejection_counters
             .timeouts_or_incomplete_reads
             .fetch_add(1, Ordering::Relaxed);
@@ -4717,13 +4977,29 @@ fn handle_rpc(
         Ok(request) => request,
         Err(response) => {
             let body = response.to_json();
-            send_http(&stream, &cors, &body);
+            send_http(&stream, &cors, &body, metrics);
             return;
         }
     };
 
     let (admin_token_configured, admin_token_valid) =
         rpc_admin_token_status(configured_admin_token, presented_admin_token.as_deref());
+
+    if rpc_mode == indra_rpc::handlers::RpcMode::Full
+        && !rpc_access_token_valid(configured_access_token, presented_access_token.as_deref())
+    {
+        rejection_counters
+            .auth_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let body = RpcResponse::err(
+            req.id.clone(),
+            -32003,
+            "full RPC requires a valid X-Rpc-Token header".to_string(),
+        )
+        .to_json();
+        send_http(&stream, &cors, &body, metrics);
+        return;
+    }
 
     if let Err(error) = check_rpc_method_allowed_with_admin(
         &req.method,
@@ -4739,20 +5015,68 @@ fn handle_rpc(
         }
         let body =
             RpcResponse::err(req.id.clone(), error.code(), error.message().to_string()).to_json();
-        send_http(&stream, &cors, &body);
+        send_http(&stream, &cors, &body, metrics);
         return;
     }
 
-    if rpc_mode == indra_rpc::handlers::RpcMode::ReadOnly
-        && indra_rpc::server::rpc_method_cost(&req.method)
-            == indra_rpc::server::RpcMethodCost::Expensive
+    if req.method == "indra_getSyncDiagnostics" {
+        let lock_started = Instant::now();
+        let diagnostic = match driver.lock() {
+            Ok(guard) => {
+                metrics.rpc_lock_wait_micros_total.fetch_add(
+                    lock_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                let mut diagnostic = guard.sync().diagnostics(guard.height(), Instant::now());
+                diagnostic.recovery_required = guard
+                    .engine
+                    .config
+                    .state_dir()
+                    .join("sync_recovery_required.json")
+                    .exists();
+                diagnostic
+            }
+            Err(_) => {
+                let body = RpcResponse::err(
+                    req.id.clone(),
+                    -32000,
+                    "consensus driver lock poisoned".to_string(),
+                )
+                .to_json();
+                send_http(&stream, &cors, &body, metrics);
+                return;
+            }
+        };
+        let result = format!(
+            r#"{{"phase":"{}","local_height":{},"target_height":{},"provisional_height":{},"corroboration_claim_count":{},"circuit_breaker_open":{},"recovery_required":{}}}"#,
+            diagnostic.phase,
+            diagnostic.local_height,
+            diagnostic
+                .target_height
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+            diagnostic
+                .provisional_height
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+            diagnostic.corroboration_claim_count,
+            diagnostic.circuit_breaker_open,
+            diagnostic.recovery_required,
+        );
+        let body = RpcResponse::ok(req.id.clone(), result).to_json();
+        send_http(&stream, &cors, &body, metrics);
+        return;
+    }
+
+    let _expensive_permit = if indra_rpc::server::rpc_method_cost(&req.method)
+        == indra_rpc::server::RpcMethodCost::Expensive
     {
-        if !public_expensive_method_allowed(
-            &req.method,
-            peer_ip,
-            expensive_limiter,
-            expensive_global_limiter,
-        ) {
+        if rpc_mode == indra_rpc::handlers::RpcMode::ReadOnly
+            && !public_expensive_method_allowed(
+                &req.method,
+                peer_ip,
+                expensive_limiter,
+                expensive_global_limiter,
+            )
+        {
             rejection_counters
                 .expensive_method_limited
                 .fetch_add(1, Ordering::Relaxed);
@@ -4761,12 +5085,28 @@ fn handle_rpc(
                 req.method
             );
             let response = indra_rpc::server::rpc_rate_limited_response();
-            let _ = stream
-                .try_clone()
-                .map(|mut writer| writer.write_all(response.as_bytes()));
+            write_http_response(&stream, &response, metrics);
             return;
         }
-    }
+        match expensive_semaphore.acquire_until(read_deadline) {
+            Some(permit) => Some(permit),
+            None => {
+                rejection_counters
+                    .expensive_method_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                let body = RpcResponse::err(
+                    req.id.clone(),
+                    -32029,
+                    "expensive RPC concurrency limit exceeded".to_string(),
+                )
+                .to_json();
+                send_http(&stream, &cors, &body, metrics);
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let validator_peer_addrs: Vec<String> = gossip
         .connected_addrs()
@@ -4780,7 +5120,7 @@ fn handle_rpc(
 
     if let Some(result) = dispatch_public_light_method(
         &req.method,
-        driver,
+        rpc_snapshot,
         connected_validator_peer_count,
         discovered_count,
         observer_count_val,
@@ -4791,24 +5131,24 @@ fn handle_rpc(
         match result {
             Ok(result) => {
                 let body = RpcResponse::ok(req.id.clone(), result).to_json();
-                send_http(&stream, &cors, &body);
+                send_http(&stream, &cors, &body, metrics);
             }
             Err(error) => {
                 let body =
                     RpcResponse::err(req.id.clone(), error.code(), error.message().to_string())
                         .to_json();
-                send_http(&stream, &cors, &body);
+                send_http(&stream, &cors, &body, metrics);
             }
         }
         return;
     }
 
     let response_body = {
-        let snapshot = match snapshot_rpc_state(driver, &req) {
+        let snapshot = match snapshot_rpc_state(rpc_snapshot, rpc_storage, &req) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let body = RpcResponse::err(req.id.clone(), -32000, error).to_json();
-                send_http(&stream, &cors, &body);
+                send_http(&stream, &cors, &body, metrics);
                 return;
             }
         };
@@ -4821,7 +5161,8 @@ fn handle_rpc(
             observer_count_val,
             rpc_mode,
             admin_token_configured,
-        );
+        )
+        .with_execution_deadline(read_deadline);
         match dispatch_with_admin(
             &req.method,
             &req.params,
@@ -4836,17 +5177,33 @@ fn handle_rpc(
                     .to_json()
             }
             DispatchResult::SubmitStakingOp(op_bytes) => {
+                // `dispatch_with_admin` currently rejects read-only writes before
+                // producing this variant. Keep this intentionally unreachable
+                // guard as the last-line invariant if that dispatcher gate changes.
+                if rpc_mode == indra_rpc::handlers::RpcMode::ReadOnly {
+                    return send_http(
+                        &stream,
+                        &cors,
+                        &RpcResponse::err(
+                            req.id.clone(),
+                            -32003,
+                            "write method is unavailable on read-only RPC".to_string(),
+                        )
+                        .to_json(),
+                        metrics,
+                    );
+                }
                 use indra_core::codec::Decode;
                 use indra_core::types::staking::StakingOp;
                 match StakingOp::decode_exact(&op_bytes) {
-                    Ok(op) => match driver
-                        .lock()
+                    Ok(op) => match lock_driver_for_rpc(driver, metrics)
                         .map_err(|_| "consensus driver lock poisoned".to_string())
                         .and_then(|mut guard| {
                             guard
                                 .engine
                                 .add_staking_op(op.clone())
-                                .map_err(|e| e.to_string())
+                                .map_err(|e| e.to_string())?;
+                            Ok(())
                         }) {
                         Ok(()) => {
                             broadcast_locally_accepted_op(
@@ -4861,30 +5218,54 @@ fn handle_rpc(
                             .to_json()
                         }
                         Err(error) => {
+                            metrics
+                                .rpc_invalid_staking_validation_total
+                                .fetch_add(1, Ordering::Relaxed);
                             RpcResponse::err(req.id.clone(), -32000, format!("rejected: {error}"))
                                 .to_json()
                         }
                     },
-                    Err(error) => RpcResponse::err(
-                        req.id.clone(),
-                        -32602,
-                        format!("staking op decode failed: {error}"),
-                    )
-                    .to_json(),
+                    Err(error) => {
+                        metrics
+                            .rpc_invalid_staking_structural_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        RpcResponse::err(
+                            req.id.clone(),
+                            -32602,
+                            format!("staking op decode failed: {error}"),
+                        )
+                        .to_json()
+                    }
                 }
             }
             DispatchResult::SubmitGovernanceOp(op_bytes) => {
+                // `dispatch_with_admin` currently rejects read-only writes before
+                // producing this variant. Keep this intentionally unreachable
+                // guard as the last-line invariant if that dispatcher gate changes.
+                if rpc_mode == indra_rpc::handlers::RpcMode::ReadOnly {
+                    return send_http(
+                        &stream,
+                        &cors,
+                        &RpcResponse::err(
+                            req.id.clone(),
+                            -32003,
+                            "write method is unavailable on read-only RPC".to_string(),
+                        )
+                        .to_json(),
+                        metrics,
+                    );
+                }
                 use indra_core::codec::Decode;
                 use indra_core::types::governance::GovernanceOpV2;
                 match GovernanceOpV2::decode_exact(&op_bytes) {
-                    Ok(op) => match driver
-                        .lock()
+                    Ok(op) => match lock_driver_for_rpc(driver, metrics)
                         .map_err(|_| "consensus driver lock poisoned".to_string())
                         .and_then(|mut guard| {
                             guard
                                 .engine
                                 .add_governance_op(op.clone())
-                                .map_err(|e| e.to_string())
+                                .map_err(|e| e.to_string())?;
+                            Ok(())
                         }) {
                         Ok(()) => {
                             broadcast_locally_accepted_op(
@@ -4899,32 +5280,54 @@ fn handle_rpc(
                             .to_json()
                         }
                         Err(error) => {
+                            metrics
+                                .rpc_invalid_governance_validation_total
+                                .fetch_add(1, Ordering::Relaxed);
                             RpcResponse::err(req.id.clone(), -32000, format!("rejected: {error}"))
                                 .to_json()
                         }
                     },
-                    Err(error) => RpcResponse::err(
-                        req.id.clone(),
-                        -32602,
-                        format!("governance op decode failed: {error}"),
-                    )
-                    .to_json(),
+                    Err(error) => {
+                        metrics
+                            .rpc_invalid_governance_structural_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        RpcResponse::err(
+                            req.id.clone(),
+                            -32602,
+                            format!("governance op decode failed: {error}"),
+                        )
+                        .to_json()
+                    }
                 }
             }
             DispatchResult::SubmitTransaction(tx_bytes) => {
+                // `dispatch_with_admin` currently rejects read-only writes before
+                // producing this variant. Keep this intentionally unreachable
+                // guard as the last-line invariant if that dispatcher gate changes.
+                if rpc_mode == indra_rpc::handlers::RpcMode::ReadOnly {
+                    return send_http(
+                        &stream,
+                        &cors,
+                        &RpcResponse::err(
+                            req.id.clone(),
+                            -32003,
+                            "write method is unavailable on read-only RPC".to_string(),
+                        )
+                        .to_json(),
+                        metrics,
+                    );
+                }
                 use indra_core::codec::{ByteReader, Decode};
                 use indra_core::types::transaction::TransactionV1;
                 let mut reader = ByteReader::new(&tx_bytes);
                 match TransactionV1::decode(&mut reader) {
                     Ok(tx) => {
-                        let submit_result = driver
-                            .lock()
+                        let submit_result = lock_driver_for_rpc(driver, metrics)
                             .map_err(|_| "consensus driver lock poisoned".to_string())
                             .and_then(|mut guard| {
                                 let engine = &mut guard.engine;
                                 engine
-                                    .mempool
-                                    .submit_validated(tx.clone(), &engine.state)
+                                    .add_transaction(tx.clone())
                                     .map_err(|e| e.to_string())
                             });
                         match submit_result {
@@ -4942,26 +5345,36 @@ fn handle_rpc(
                                 )
                                 .to_json()
                             }
-                            Err(error) => RpcResponse::err(
-                                req.id.clone(),
-                                -32000,
-                                format!("mempool rejected: {error}"),
-                            )
-                            .to_json(),
+                            Err(error) => {
+                                metrics
+                                    .rpc_invalid_tx_validation_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                RpcResponse::err(
+                                    req.id.clone(),
+                                    -32000,
+                                    format!("mempool rejected: {error}"),
+                                )
+                                .to_json()
+                            }
                         }
                     }
-                    Err(error) => RpcResponse::err(
-                        req.id.clone(),
-                        -32602,
-                        format!("tx decode failed: {error}"),
-                    )
-                    .to_json(),
+                    Err(error) => {
+                        metrics
+                            .rpc_invalid_tx_structural_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        RpcResponse::err(
+                            req.id.clone(),
+                            -32602,
+                            format!("tx decode failed: {error}"),
+                        )
+                        .to_json()
+                    }
                 }
             }
         }
     };
 
-    send_http(&stream, &cors, &response_body);
+    send_http(&stream, &cors, &response_body, metrics);
 }
 
 fn rpc_admin_token_status(
@@ -4971,20 +5384,188 @@ fn rpc_admin_token_status(
     let configured = configured_admin_token.is_some();
     let valid = configured_admin_token
         .zip(presented_admin_token)
-        .is_some_and(|(expected, presented)| expected == presented);
+        .is_some_and(|(expected, presented)| constant_time_token_eq(expected, presented));
     (configured, valid)
 }
 
-fn send_http(stream: &std::net::TcpStream, cors: &str, body: &str) {
+fn lock_driver_for_rpc<'a>(
+    driver: &'a Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    metrics: &MetricsState,
+) -> Result<std::sync::MutexGuard<'a, indra_node::driver::ConsensusDriver>, String> {
+    let started = Instant::now();
+    let result = driver
+        .lock()
+        .map_err(|_| "consensus driver lock poisoned".to_string());
+    metrics.rpc_lock_wait_micros_total.fetch_add(
+        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    result
+}
+
+fn rpc_access_token_valid(configured: Option<&str>, presented: Option<&str>) -> bool {
+    configured
+        .zip(presented)
+        .is_some_and(|(expected, actual)| constant_time_token_eq(expected, actual))
+}
+
+fn constant_time_token_eq(expected: &str, actual: &str) -> bool {
+    let expected_hash = indra_crypto::sha256(expected.as_bytes());
+    let actual_hash = indra_crypto::sha256(actual.as_bytes());
+    bool::from(expected_hash.ct_eq(&actual_hash))
+}
+
+fn rpc_bind_is_loopback(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+const MAX_RPC_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RPC_HEADER_BYTES: usize = 16 * 1024;
+
+fn write_http_response(stream: &std::net::TcpStream, response: &str, metrics: &MetricsState) {
+    metrics
+        .rpc_response_bytes_total
+        .fetch_add(response.len() as u64, Ordering::Relaxed);
+    if let Err(error) = stream
+        .try_clone()
+        .and_then(|mut writer| writer.write_all(response.as_bytes()))
+    {
+        metrics
+            .rpc_write_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!("[rpc] response write failed: {error}");
+    }
+}
+
+fn send_http(stream: &std::net::TcpStream, cors: &str, body: &str, metrics: &MetricsState) {
+    let bounded_body = bounded_rpc_response_body(body);
+    let body = bounded_body.as_ref();
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         cors,
         body.len(),
         body
     );
-    let _ = stream
-        .try_clone()
-        .map(|mut writer| writer.write_all(response.as_bytes()));
+    write_http_response(stream, &response, metrics);
+}
+
+fn bounded_rpc_response_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.len() > MAX_RPC_RESPONSE_BYTES {
+        std::borrow::Cow::Owned(
+            indra_rpc::types::RpcResponse::err(
+                indra_rpc::types::JsonId::Null,
+                -32030,
+                "encoded RPC response exceeds 32 MiB limit".to_string(),
+            )
+            .to_json(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
+struct RpcRequestMetricsGuard<'a> {
+    metrics: &'a MetricsState,
+    started: Instant,
+}
+
+const RPC_READ_PROGRESS_GRACE: Duration = Duration::from_secs(2);
+const RPC_MIN_READ_BYTES_PER_SEC: usize = 1024;
+
+fn read_progress_is_sufficient(started: Instant, bytes: usize) -> bool {
+    let elapsed = started.elapsed();
+    elapsed <= RPC_READ_PROGRESS_GRACE
+        || bytes >= RPC_MIN_READ_BYTES_PER_SEC.saturating_mul(elapsed.as_secs() as usize)
+}
+
+fn read_line_with_deadline(
+    reader: &mut std::io::BufReader<std::net::TcpStream>,
+    line: &mut String,
+    started: Instant,
+    deadline: Instant,
+    bytes: &mut usize,
+) -> std::io::Result<usize> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !read_progress_is_sufficient(started, *bytes) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "absolute RPC request deadline or minimum read progress exceeded",
+            ));
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining.min(Duration::from_secs(1))))?;
+        match reader.read_line(line) {
+            Ok(count) => {
+                *bytes = bytes.saturating_add(count);
+                return Ok(count);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_exact_with_deadline(
+    reader: &mut std::io::BufReader<std::net::TcpStream>,
+    output: &mut [u8],
+    started: Instant,
+    deadline: Instant,
+    bytes: &mut usize,
+) -> std::io::Result<()> {
+    let mut offset = 0usize;
+    while offset < output.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !read_progress_is_sufficient(started, *bytes) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "absolute RPC request deadline or minimum read progress exceeded",
+            ));
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining.min(Duration::from_secs(1))))?;
+        match reader.read(&mut output[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) => {
+                offset = offset.saturating_add(count);
+                *bytes = bytes.saturating_add(count);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+impl<'a> RpcRequestMetricsGuard<'a> {
+    fn new(metrics: &'a MetricsState) -> Self {
+        metrics.rpc_requests_total.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RpcRequestMetricsGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.rpc_latency_micros_total.fetch_add(
+            self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -6029,24 +6610,10 @@ mod tests {
     }
 
     #[test]
-    fn rpc_warns_on_non_loopback_binding() {
-        let warning = rpc_non_loopback_warning("0.0.0.0:8545").unwrap();
-        assert!(warning.contains("full RPC listener"));
-        assert!(warning.contains("do not expose"));
-        assert!(rpc_non_loopback_warning("127.0.0.1:8545").is_none());
-
-        let public_warning = rpc_public_non_loopback_warning("0.0.0.0:8547").unwrap();
-        assert!(public_warning.contains("rpc_public listener"));
-        assert!(public_warning.contains("reverse proxy"));
-        assert!(public_warning.contains("CDN"));
-        assert!(rpc_public_non_loopback_warning("127.0.0.1:8547").is_none());
-    }
-
-    #[test]
     fn rpc_public_policy_uses_stricter_limits_than_full_rpc() {
         let cfg = NodeConfigFile::default();
         let public = RpcListenerPolicy::public_from_config(&cfg);
-        let full = RpcListenerPolicy::full();
+        let full = RpcListenerPolicy::full(&cfg);
         assert_eq!(
             public.per_ip_rate_per_sec,
             indra_rpc::server::RPC_PUBLIC_RATE_LIMIT_PER_SEC
@@ -6061,6 +6628,10 @@ mod tests {
         );
         assert!(public.max_body_bytes < full.max_body_bytes);
         assert!(public.request_timeout < full.request_timeout);
+        assert_eq!(full.global_rate_per_sec, Some(100));
+        assert_eq!(full.global_burst, Some(200));
+        assert_eq!(full.per_ip_connection_cap, 4);
+        assert_eq!(public.per_ip_connection_cap, 4);
     }
 
     #[test]
@@ -6149,16 +6720,201 @@ mod tests {
     }
 
     #[test]
+    fn full_rpc_access_token_is_fail_closed_even_on_loopback() {
+        assert!(!rpc_access_token_valid(None, None));
+        assert!(!rpc_access_token_valid(Some("access"), None));
+        assert!(!rpc_access_token_valid(Some("access"), Some("wrong")));
+        assert!(rpc_access_token_valid(Some("access"), Some("access")));
+    }
+
+    #[test]
+    fn rpc_per_ip_connection_cap_rejects_fifth_connection() {
+        let ip: IpAddr = "192.0.2.5".parse().unwrap();
+        let mut counts = HashMap::new();
+        for _ in 0..4 {
+            assert!(reserve_rpc_ip_connection(&mut counts, ip, 4));
+        }
+        assert!(!reserve_rpc_ip_connection(&mut counts, ip, 4));
+    }
+
+    #[test]
+    fn rpc_bind_policy_requires_loopback_or_explicit_proxy_acknowledgement() {
+        assert!(rpc_bind_is_loopback("127.0.0.1:8545"));
+        assert!(rpc_bind_is_loopback("[::1]:8545"));
+        assert!(!rpc_bind_is_loopback("0.0.0.0:8545"));
+        assert!(!rpc_bind_is_loopback("not-an-address"));
+    }
+
+    #[test]
+    fn rpc_write_paths_have_one_authoritative_driver_lock_each() {
+        let source = include_str!("node.rs");
+        // Exactly one call in each of the three write arms (staking,
+        // governance, transaction), plus one helper definition.
+        let lock_helper = ["lock_driver", "_for_rpc("].concat();
+        assert_eq!(source.matches(&lock_helper).count(), 3);
+        let lock_definition = ["fn lock_driver", "_for_rpc"].concat();
+        assert_eq!(source.matches(&lock_definition).count(), 1);
+        let snapshot_signature = source
+            .split("fn snapshot_rpc_state(")
+            .nth(1)
+            .and_then(|tail| tail.split(") -> Result<RpcSnapshot").next())
+            .expect("snapshot function signature");
+        assert!(!snapshot_signature.contains("driver"));
+    }
+
+    #[test]
+    fn rpc_method_policy_precedes_snapshot_and_storage_access() {
+        let source = include_str!("node.rs");
+        let handler = source
+            .split("fn handle_rpc(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn read_line_with_deadline").next())
+            .expect("RPC handler body");
+        let policy = handler
+            .find("check_rpc_method_allowed_with_admin(")
+            .expect("method policy check");
+        let snapshot = handler
+            .find("snapshot_rpc_state(rpc_snapshot")
+            .expect("snapshot access");
+        assert!(policy < snapshot);
+    }
+
+    #[test]
+    fn read_only_handle_rejects_transaction_before_authoritative_submission() {
+        let (driver, dir) = proposer_test_driver([0xD7; 32], "rpc_read_only_write_gate");
+        let snapshot = driver.engine.rpc_snapshot.clone();
+        let storage = indra_node::rpc_snapshot::RpcStorageReadHandles {
+            blocks: driver.engine.block_store.read_handle(),
+            epochs: driver.engine.epoch_store.read_handle(),
+        };
+        let initial_mempool_len = driver.engine.mempool.len();
+        let driver = Arc::new(Mutex::new(driver));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime_guard = runtime.enter();
+        let (event_tx, _event_rx) = tokio_mpsc::channel(1);
+        let handle = spawn_peer_manager(PeerManagerConfig {
+            local_validator_id: indra_core::Bytes32::ZERO,
+            chain_id: "indra-testnet-1".to_string(),
+            relay_validator_keys: Vec::new(),
+            event_tx,
+            command_buffer: 1,
+            ban_store_path: dir.join("rpc-read-only-ban-store.bin"),
+        });
+        let gossip = Arc::new(NetworkBridge::new(
+            handle,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        ));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"indra_sendTransaction","params":["00"]}"#;
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let metrics = MetricsState::new();
+        let telemetry = RpcLimiterTelemetry::default();
+        handle_rpc(
+            server,
+            &driver,
+            &snapshot,
+            &storage,
+            &gossip,
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(InboundDedupCaches::new())),
+            &Arc::new(AtomicUsize::new(0)),
+            None,
+            &indra_rpc::server::RpcRateLimiter::new(),
+            None,
+            &indra_rpc::server::RpcWindowRateLimiter::new(),
+            &indra_rpc::server::RpcGlobalWindowRateLimiter::new(),
+            &RpcSemaphore::new(1),
+            &RpcRejectionCounters::default(),
+            &[],
+            indra_rpc::handlers::RpcMode::ReadOnly,
+            &RpcListenerPolicy::public_from_config(&NodeConfigFile::default()),
+            None,
+            None,
+            &metrics,
+            &telemetry,
+        );
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(
+            response.contains("not available on read-only listener"),
+            "{response}"
+        );
+        assert_eq!(
+            driver.lock().unwrap().engine.mempool.len(),
+            initial_mempool_len
+        );
+        assert_eq!(
+            metrics
+                .rpc_invalid_tx_structural_total
+                .load(Ordering::Relaxed),
+            0,
+            "the malformed sentinel payload must not reach transaction decoding"
+        );
+        assert_eq!(
+            metrics.rpc_lock_wait_micros_total.load(Ordering::Relaxed),
+            0,
+            "the read-only rejection must occur before authoritative driver locking"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_encoded_response_is_replaced_by_bounded_error() {
+        let oversized = "x".repeat(MAX_RPC_RESPONSE_BYTES + 1);
+        let bounded = bounded_rpc_response_body(&oversized);
+        assert!(bounded.len() < 1024);
+        assert!(bounded.contains("-32030"));
+        let ordinary = r#"{"ok":true}"#;
+        assert_eq!(bounded_rpc_response_body(ordinary), ordinary);
+    }
+
+    #[test]
+    fn slow_drip_progress_policy_expires_after_grace() {
+        let started = Instant::now() - Duration::from_secs(3);
+        assert!(!read_progress_is_sufficient(started, 2));
+        assert!(read_progress_is_sufficient(started, 4096));
+    }
+
+    #[test]
+    fn expensive_semaphore_is_bounded_per_listener() {
+        let semaphore = RpcSemaphore::new(4);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let permits: Vec<_> = (0..4)
+            .map(|_| semaphore.acquire_until(deadline).unwrap())
+            .collect();
+        assert!(semaphore.acquire_until(Instant::now()).is_none());
+        drop(permits);
+        assert!(semaphore
+            .acquire_until(Instant::now() + Duration::from_millis(10))
+            .is_some());
+    }
+
+    #[test]
     fn rpc_read_state_is_consistent_snapshot() {
         let mut chain = indra_state::ChainState::new_genesis();
         chain.height = 42;
         let snapshot = RpcSnapshot {
-            chain,
-            mempool_size: 3,
-            pruned_mode: false,
-            lowest_block: 0,
-            blocks_retained: 43,
-            requested_block: None,
+            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 3, false, 0, 43)
+                .load(),
+            requested_blocks: HashMap::new(),
             latest_epoch: None,
             epoch_records: HashMap::new(),
         };
@@ -6211,8 +6967,8 @@ mod tests {
         };
 
         assert_eq!(
-            requested_block_height_for_rpc(&req, &chain),
-            Some(created_height)
+            requested_block_heights_for_rpc(&req, &chain),
+            vec![created_height]
         );
 
         let mut unknown = [0xCCu8; 32];
@@ -6225,7 +6981,7 @@ mod tests {
             ],
             ..req
         };
-        assert_eq!(requested_block_height_for_rpc(&unknown_req, &chain), None);
+        assert!(requested_block_heights_for_rpc(&unknown_req, &chain).is_empty());
     }
 
     #[test]
@@ -6238,7 +6994,7 @@ mod tests {
             id: indra_rpc::types::JsonId::Number(1),
         };
 
-        assert_eq!(requested_block_height_for_rpc(&req, &chain), Some(176_677));
+        assert_eq!(requested_block_heights_for_rpc(&req, &chain), vec![176_677]);
     }
 
     fn snapshot_test_transaction(byte: u8) -> indra_core::types::transaction::TransactionV1 {
@@ -6288,12 +7044,11 @@ mod tests {
         let mut block = block_response_test_block(height);
         block.transactions.push(tx);
         let snapshot = RpcSnapshot {
-            chain,
-            mempool_size: 0,
-            pruned_mode: true,
-            lowest_block: 126_677,
-            blocks_retained: 50_000,
-            requested_block: Some((height, block)),
+            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(
+                &chain, 0, true, 126_677, 50_000,
+            )
+            .load(),
+            requested_blocks: HashMap::from([(height, block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
         };
@@ -6346,12 +7101,8 @@ mod tests {
         };
         let expected_hash = hex::encode(block.header.block_hash().0);
         let snapshot = RpcSnapshot {
-            chain,
-            mempool_size: 0,
-            pruned_mode: true,
-            lowest_block: 1,
-            blocks_retained: 2,
-            requested_block: Some((1, block)),
+            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).load(),
+            requested_blocks: HashMap::from([(1, block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
         };

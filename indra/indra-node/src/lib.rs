@@ -36,10 +36,12 @@ pub mod driver;
 pub mod engine;
 pub mod error;
 pub mod genesis;
+pub mod hardened_read_rpc;
 pub mod metrics;
 pub mod net_driver;
 mod pending_dependencies;
 pub mod recovery;
+pub mod rpc_snapshot;
 pub mod slash;
 pub mod state_root;
 pub mod sync;
@@ -54,7 +56,9 @@ pub use genesis::{
     load_genesis_validators, parse_genesis_manifest, parse_genesis_manifest_str,
     validate_genesis_manifest, GenesisManifest, GenesisSeed, GenesisSettings, GenesisValidator,
 };
-pub use metrics::{start_metrics_server, start_observer_metrics_server, MetricsState};
+pub use metrics::{
+    start_metrics_server, start_observer_metrics_server, MetricsState, RpcLimiterTelemetry,
+};
 pub use net_driver::{action_to_message, message_to_event};
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};
 
@@ -134,8 +138,6 @@ impl indra_rpc::handlers::RpcEngineMut for NodeEngine {
         &mut self,
         tx: indra_core::types::transaction::TransactionV1,
     ) -> Result<indra_core::Bytes32, String> {
-        self.mempool
-            .submit_validated(tx, &self.state)
-            .map_err(|error| error.to_string())
+        self.add_transaction(tx).map_err(|error| error.to_string())
     }
 }

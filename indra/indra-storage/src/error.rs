@@ -101,6 +101,15 @@ pub enum StorageError {
         /// What did not match.
         detail: String,
     },
+
+    /// A synchronization primitive protecting a multi-step storage invariant
+    /// was poisoned by a panic. Continuing could pair stale metadata with a
+    /// different durable file generation, so callers must fail loudly.
+    #[error("storage synchronization poisoned: {component}")]
+    LockPoisoned {
+        /// Protected storage component.
+        component: &'static str,
+    },
 }
 
 /// Convenience alias.

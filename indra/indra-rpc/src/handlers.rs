@@ -25,6 +25,7 @@ use crate::{
     error::{RpcError, RpcResult},
     types::unquote,
 };
+use std::time::Instant;
 
 /// Shared node state passed to all handlers.
 pub struct NodeState<'a> {
@@ -40,12 +41,15 @@ pub struct NodeState<'a> {
     pub lowest_block: u64,
     /// Number of locally retained blocks.
     pub blocks_retained: usize,
+    /// Canonical state root cached by the published read snapshot.
+    pub state_root: Bytes32,
     /// Optional network context for validator-node-only peer methods.
     pub network: Option<NetworkContext<'a>>,
     /// RPC listener mode serving this request.
     pub rpc_mode: RpcMode,
     /// Whether this listener has a configured non-empty admin token.
     pub admin_token_configured: bool,
+    execution_deadline: Option<Instant>,
 }
 
 /// Network-layer context needed by peer-aware RPC methods.
@@ -124,6 +128,7 @@ impl<'a> NodeState<'a> {
             pruned_mode: engine.pruned_mode(),
             lowest_block: engine.lowest_block(),
             blocks_retained: engine.blocks_retained(),
+            state_root: engine.state_root(),
             network: Some(NetworkContext {
                 validator_peer_addrs,
                 validator_peer_topology: topology,
@@ -134,6 +139,7 @@ impl<'a> NodeState<'a> {
             }),
             rpc_mode,
             admin_token_configured,
+            execution_deadline: None,
         }
     }
 
@@ -146,9 +152,11 @@ impl<'a> NodeState<'a> {
             pruned_mode: engine.pruned_mode(),
             lowest_block: engine.lowest_block(),
             blocks_retained: engine.blocks_retained(),
+            state_root: engine.state_root(),
             network: None,
             rpc_mode: RpcMode::ReadOnly,
             admin_token_configured: false,
+            execution_deadline: None,
         }
     }
 
@@ -167,10 +175,30 @@ impl<'a> NodeState<'a> {
             pruned_mode,
             lowest_block,
             blocks_retained,
+            state_root: indra_state::compute_state_root(chain),
             network: None,
             rpc_mode: RpcMode::Full,
             admin_token_configured: false,
+            execution_deadline: None,
         }
+    }
+
+    /// Attach a cooperative execution deadline for long-running handlers.
+    pub fn with_execution_deadline(mut self, deadline: Instant) -> Self {
+        self.execution_deadline = Some(deadline);
+        self
+    }
+
+    fn check_deadline(&self) -> RpcResult<()> {
+        if self
+            .execution_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(RpcError::Internal(
+                "RPC computation deadline exceeded".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -186,6 +214,38 @@ pub trait RpcEngineView {
     fn lowest_block(&self) -> u64;
     /// Return the number of locally retained blocks.
     fn blocks_retained(&self) -> usize;
+    /// Return the canonical state root for this immutable view.
+    fn state_root(&self) -> Bytes32 {
+        indra_state::compute_state_root(self.chain_state())
+    }
+    /// Precomputed position identifiers for one principal owner, when available.
+    fn position_ids_by_owner(&self, _owner: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
+    /// Precomputed position identifiers for one validator, when available.
+    fn position_ids_by_validator(&self, _validator: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
+    /// Precomputed tranche identifiers for one parent position, when available.
+    fn tranche_ids_by_position(&self, _position: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
+    /// Precomputed tranche identifiers for one owner, when available.
+    fn tranche_ids_by_owner(&self, _owner: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
+    /// Precomputed tranche identifiers for one validator, when available.
+    fn tranche_ids_by_validator(&self, _validator: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
+    /// Precomputed reward-bearing position identifiers for one delegator.
+    fn reward_ids_by_delegator(&self, _delegator: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
+    /// Precomputed reward-bearing position identifiers for one validator.
+    fn reward_ids_by_validator(&self, _validator: &Bytes32) -> Option<&[Bytes32]> {
+        None
+    }
     /// Return a retained block by height, if this RPC context has block-store access.
     fn get_block_by_height(&self, _height: u64) -> Result<Option<BlockV1>, String> {
         Ok(None)
@@ -331,6 +391,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getValidatorAutoDelegate", RpcMethodAccess::ReadOnly),
     ("indra_getValidatorSet", RpcMethodAccess::ReadOnly),
     ("indra_getPeerTopology", RpcMethodAccess::Admin),
+    ("indra_getSyncDiagnostics", RpcMethodAccess::Admin),
     ("indra_getRpcPolicy", RpcMethodAccess::ReadOnly),
     ("indra_submitStakingOp", RpcMethodAccess::Write),
     ("indra_submitGovernanceOp", RpcMethodAccess::Write),
@@ -386,12 +447,7 @@ pub fn check_rpc_method_allowed_with_admin(
             )));
         }
         Some(RpcMethodAccess::ReadOnly | RpcMethodAccess::Write) => {}
-        None if mode == RpcMode::ReadOnly => {
-            return Err(RpcError::Forbidden(format!(
-                "RPC method {method} is not available on read-only listener"
-            )));
-        }
-        None => {}
+        None => return Err(RpcError::MethodNotFound(method.to_string())),
     }
     Ok(())
 }
@@ -466,7 +522,7 @@ pub fn dispatch_with_admin(
         "indra_getValidator" => Ready(get_validator(params, state)),
         "indra_getValidatorSelfStake" => Ready(get_validator_self_stake(params, state)),
         "indra_getValidatorAutoDelegate" => Ready(get_validator_auto_delegate(params, state)),
-        "indra_getValidatorSet" => Ready(get_validator_set(state)),
+        "indra_getValidatorSet" => Ready(get_validator_set(params, state)),
         "indra_getPeerTopology" => Ready(get_peer_topology(state)),
         "indra_getRpcPolicy" => Ready(get_rpc_policy(state)),
         "indra_sendTransaction" => send_transaction(params),
@@ -695,6 +751,7 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
         .min(from_height.saturating_add(limit).saturating_sub(1));
     let mut entries = Vec::new();
     for height in from_height..=last_height {
+        state.check_deadline()?;
         let block = state
             .engine
             .get_block_by_height(height)
@@ -1773,32 +1830,51 @@ fn tranche_json(
 }
 
 fn position_page(
-    state: &ChainState,
+    rpc: &NodeState<'_>,
     owner: Option<Bytes32>,
     validator: Option<Bytes32>,
     offset: usize,
     limit: usize,
 ) -> String {
-    let matching = state
-        .stake_positions
-        .values()
-        .filter(|position| {
-            owner.is_none_or(|id| position.principal_owner_id == id)
-                && validator.is_none_or(|id| position.validator_id == id)
-        })
-        .collect::<Vec<_>>();
-    let page = matching
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|position| position_json(position, state))
-        .collect::<Vec<_>>();
+    let state = rpc.chain;
+    let indexed_ids = owner
+        .and_then(|id| rpc.engine.position_ids_by_owner(&id))
+        .or_else(|| validator.and_then(|id| rpc.engine.position_ids_by_validator(&id)));
+    let matches = |position: &&indra_core::types::stake_position::StakePositionV1| {
+        owner.is_none_or(|id| position.principal_owner_id == id)
+            && validator.is_none_or(|id| position.validator_id == id)
+    };
+    let (total_count, page) = if let Some(ids) = indexed_ids {
+        let matching = || {
+            ids.iter()
+                .filter_map(|id| state.stake_positions.get(id))
+                .filter(matches)
+        };
+        (
+            matching().count(),
+            matching()
+                .skip(offset)
+                .take(limit)
+                .map(|position| position_json(position, state))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let matching = || state.stake_positions.values().filter(matches);
+        (
+            matching().count(),
+            matching()
+                .skip(offset)
+                .take(limit)
+                .map(|position| position_json(position, state))
+                .collect::<Vec<_>>(),
+        )
+    };
     format!(
         r#"{{"positions":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
         page.join(","),
         offset,
         limit,
-        matching.len()
+        total_count
     )
 }
 
@@ -1806,7 +1882,7 @@ fn get_stake_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<St
     let owner = optional_id(params, 0, "owner_id")?;
     let validator = optional_id(params, 1, "validator_id")?;
     let (offset, limit) = pagination(params, 2)?;
-    Ok(position_page(state.chain, owner, validator, offset, limit))
+    Ok(position_page(state, owner, validator, offset, limit))
 }
 
 fn get_stake_position(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
@@ -1820,53 +1896,67 @@ fn get_stake_position(params: &[String], state: &NodeState<'_>) -> RpcResult<Str
 fn get_validator_stake_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let validator = parse_hex32_param(params, "validator_id")?;
     let (offset, limit) = pagination(params, 1)?;
-    Ok(position_page(
-        state.chain,
-        None,
-        Some(validator),
-        offset,
-        limit,
-    ))
+    Ok(position_page(state, None, Some(validator), offset, limit))
 }
 
 fn get_owner_stake_positions(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let owner = parse_hex32_param(params, "owner_id")?;
     let (offset, limit) = pagination(params, 1)?;
-    Ok(position_page(state.chain, Some(owner), None, offset, limit))
+    Ok(position_page(state, Some(owner), None, offset, limit))
 }
 
 fn tranche_page(
-    state: &ChainState,
+    rpc: &NodeState<'_>,
     position: Option<Bytes32>,
     owner: Option<Bytes32>,
     validator: Option<Bytes32>,
     offset: usize,
     limit: usize,
 ) -> String {
-    let matching = state
-        .unbonding_tranches
-        .values()
-        .filter(|tranche| {
-            let Some(parent) = state.stake_positions.get(&tranche.position_id) else {
-                return false;
-            };
-            position.is_none_or(|id| tranche.position_id == id)
-                && owner.is_none_or(|id| parent.principal_owner_id == id)
-                && validator.is_none_or(|id| parent.validator_id == id)
-        })
-        .collect::<Vec<_>>();
-    let page = matching
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|tranche| tranche_json(tranche, state))
-        .collect::<Vec<_>>();
+    let state = rpc.chain;
+    let indexed_ids = position
+        .and_then(|id| rpc.engine.tranche_ids_by_position(&id))
+        .or_else(|| owner.and_then(|id| rpc.engine.tranche_ids_by_owner(&id)))
+        .or_else(|| validator.and_then(|id| rpc.engine.tranche_ids_by_validator(&id)));
+    let matches = |tranche: &&indra_core::types::stake_position::UnbondingTrancheV1| {
+        let Some(parent) = state.stake_positions.get(&tranche.position_id) else {
+            return false;
+        };
+        position.is_none_or(|id| tranche.position_id == id)
+            && owner.is_none_or(|id| parent.principal_owner_id == id)
+            && validator.is_none_or(|id| parent.validator_id == id)
+    };
+    let (total_count, page) = if let Some(ids) = indexed_ids {
+        let matching = || {
+            ids.iter()
+                .filter_map(|id| state.unbonding_tranches.get(id))
+                .filter(matches)
+        };
+        (
+            matching().count(),
+            matching()
+                .skip(offset)
+                .take(limit)
+                .map(|tranche| tranche_json(tranche, state))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let matching = || state.unbonding_tranches.values().filter(matches);
+        (
+            matching().count(),
+            matching()
+                .skip(offset)
+                .take(limit)
+                .map(|tranche| tranche_json(tranche, state))
+                .collect::<Vec<_>>(),
+        )
+    };
     format!(
         r#"{{"tranches":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
         page.join(","),
         offset,
         limit,
-        matching.len()
+        total_count
     )
 }
 
@@ -1876,12 +1966,7 @@ fn get_unbonding_tranches(params: &[String], state: &NodeState<'_>) -> RpcResult
     let validator = optional_id(params, 2, "validator_id")?;
     let (offset, limit) = pagination(params, 3)?;
     Ok(tranche_page(
-        state.chain,
-        position,
-        owner,
-        validator,
-        offset,
-        limit,
+        state, position, owner, validator, offset, limit,
     ))
 }
 
@@ -1898,38 +1983,62 @@ fn get_delegator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
     let delegator_hex = first_param(params, "delegator_id")?;
     let delegator_id = parse_hex32_value(&delegator_hex, "delegator_id")?;
 
+    let (offset, limit) = pagination(params, 1)?;
     let mut claimable = Vec::new();
     let mut total_rewards = 0u64;
+    let mut total_count = 0usize;
+    let indexed = state.engine.reward_ids_by_delegator(&delegator_id);
+    let mut visit =
+        |position: &indra_core::types::stake_position::StakePositionV1| -> RpcResult<()> {
+            state.check_deadline()?;
+            if position.principal_owner_id != delegator_id
+                || position.validator_id == position.principal_owner_id
+                || position.pending_rewards_spark == 0
+            {
+                return Ok(());
+            }
+            let page_member = total_count >= offset && claimable.len() < limit;
+            total_count = total_count.saturating_add(1);
+            let validator_id = &position.validator_id;
 
-    for position in state.chain.stake_positions.values() {
-        if position.principal_owner_id != delegator_id
-            || position.validator_id == position.principal_owner_id
-            || position.pending_rewards_spark == 0
+            let validator_name = state
+                .chain
+                .validators
+                .get(validator_id)
+                .map(|validator| validator.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
+            if page_member {
+                claimable.push(format!(
+                    r#"{{"validator_id":"{}","validator_name":"{}","pending_rewards":{}}}"#,
+                    hex::encode(validator_id.0),
+                    validator_name,
+                    position.pending_rewards_spark,
+                ));
+            }
+            Ok(())
+        };
+    if let Some(ids) = indexed {
+        for position in ids
+            .iter()
+            .filter_map(|id| state.chain.stake_positions.get(id))
         {
-            continue;
+            visit(position)?;
         }
-        let validator_id = &position.validator_id;
-
-        let validator_name = state
-            .chain
-            .validators
-            .get(validator_id)
-            .map(|validator| validator.name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        total_rewards = total_rewards.saturating_add(position.pending_rewards_spark);
-        claimable.push(format!(
-            r#"{{"validator_id":"{}","validator_name":"{}","pending_rewards":{}}}"#,
-            hex::encode(validator_id.0),
-            validator_name,
-            position.pending_rewards_spark,
-        ));
+    } else {
+        for position in state.chain.stake_positions.values() {
+            visit(position)?;
+        }
     }
 
     Ok(format!(
-        r#"{{"delegator_id":"{}","total_pending_rewards":{},"claimable_from":[{}]}}"#,
+        r#"{{"delegator_id":"{}","total_pending_rewards":{},"claimable_from":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
         delegator_hex,
         total_rewards,
         claimable.join(","),
+        offset,
+        limit,
+        total_count,
     ))
 }
 
@@ -2219,16 +2328,17 @@ fn get_governance_params(state: &NodeState<'_>) -> RpcResult<String> {
 /// `total_count` is the number retained in current node state, not a lifetime
 /// proposal count. Older terminal proposals require an archive/indexer.
 fn get_proposals(_params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    state.check_deadline()?;
     let mut proposals: Vec<_> = state.chain.governance.proposals.values().collect();
     proposals.sort_by_key(|proposal| proposal.proposed_epoch);
-    let summaries = proposals
-        .iter()
-        .map(|proposal| proposal_summary_json(proposal))
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut summaries = Vec::with_capacity(proposals.len());
+    for proposal in &proposals {
+        state.check_deadline()?;
+        summaries.push(proposal_summary_json(proposal));
+    }
     Ok(format!(
         "{{\"proposals\":[{}],\"active_count\":{},\"total_count\":{}}}",
-        summaries,
+        summaries.join(","),
         state.chain.governance.active_proposal_count(),
         proposals.len()
     ))
@@ -2248,6 +2358,7 @@ fn get_proposal(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 }
 
 fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    state.check_deadline()?;
     let proposal_id = parse_hex32_value(&first_param(params, "proposal_id")?, "proposal_id")?;
     // Same retained-state semantics: NotFound cannot distinguish never-existed
     // from pruned historical proposals.
@@ -2264,28 +2375,28 @@ fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<Str
         .map(|snapshot| snapshot.weights.keys().copied().collect())
         .unwrap_or_else(Vec::new);
     validator_ids.sort_by_key(|id: &indra_core::Bytes32| id.0);
-    let votes = validator_ids
-        .iter()
-        .map(|validator_id| {
-            let weight = proposal
-                .snapshot2
-                .as_ref()
-                .and_then(|snapshot| snapshot.weights.get(validator_id))
-                .copied()
-                .unwrap_or(0);
-            let vote = match proposal.reveals.get(validator_id) {
-                Some(reveal) if reveal.vote => "YES",
-                Some(_) => "NO",
-                None => "ABSTAIN",
-            };
-            let committed = proposal.commits.contains_key(validator_id);
-            let name = state
-                .chain
-                .validators
-                .get(validator_id)
-                .map(|validator| validator.name.as_str())
-                .unwrap_or("unknown");
-            format!(
+    let mut votes = Vec::with_capacity(validator_ids.len());
+    for validator_id in &validator_ids {
+        state.check_deadline()?;
+        let weight = proposal
+            .snapshot2
+            .as_ref()
+            .and_then(|snapshot| snapshot.weights.get(validator_id))
+            .copied()
+            .unwrap_or(0);
+        let vote = match proposal.reveals.get(validator_id) {
+            Some(reveal) if reveal.vote => "YES",
+            Some(_) => "NO",
+            None => "ABSTAIN",
+        };
+        let committed = proposal.commits.contains_key(validator_id);
+        let name = state
+            .chain
+            .validators
+            .get(validator_id)
+            .map(|validator| validator.name.as_str())
+            .unwrap_or("unknown");
+        votes.push(format!(
                 "{{\"validator_id\":\"{}\",\"name\":\"{}\",\"vote\":\"{}\",\"snapshot2_weight\":{},\"committed\":{},\"revealed\":{}}}",
                 hex::encode(validator_id.0),
                 json_escape(name),
@@ -2293,14 +2404,12 @@ fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<Str
                 weight,
                 committed,
                 proposal.reveals.contains_key(validator_id)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+            ));
+    }
     Ok(format!(
         "{{\"proposal_id\":\"{}\",\"votes\":[{}]}}",
         hex::encode(proposal_id.0),
-        votes
+        votes.join(",")
     ))
 }
 
@@ -2413,26 +2522,56 @@ fn get_validator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
         .get(&validator_id)
         .map(|v| v.pending_rewards)
         .unwrap_or(0);
-    let delegator_rewards: Vec<String> = state
-        .chain
-        .stake_positions
-        .values()
-        .filter(|position| {
-            position.validator_id == validator_id && position.principal_owner_id != validator_id
-        })
-        .map(|position| {
-            format!(
-                r#"{{"delegator_id":"{}","pending_rewards":{}}}"#,
-                hex::encode(position.principal_owner_id.0),
-                position.pending_rewards_spark,
+    let (offset, limit) = pagination(params, 1)?;
+    let matches = |position: &&indra_core::types::stake_position::StakePositionV1| {
+        position.validator_id == validator_id && position.principal_owner_id != validator_id
+    };
+    let (total_count, delegator_rewards) =
+        if let Some(ids) = state.engine.reward_ids_by_validator(&validator_id) {
+            let matching = || {
+                ids.iter()
+                    .filter_map(|id| state.chain.stake_positions.get(id))
+                    .filter(matches)
+            };
+            (
+                matching().count(),
+                matching()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|position| {
+                        format!(
+                            r#"{{"delegator_id":"{}","pending_rewards":{}}}"#,
+                            hex::encode(position.principal_owner_id.0),
+                            position.pending_rewards_spark,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
             )
-        })
-        .collect();
+        } else {
+            let matching = || state.chain.stake_positions.values().filter(matches);
+            (
+                matching().count(),
+                matching()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|position| {
+                        format!(
+                            r#"{{"delegator_id":"{}","pending_rewards":{}}}"#,
+                            hex::encode(position.principal_owner_id.0),
+                            position.pending_rewards_spark,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
     Ok(format!(
-        r#"{{"validator_id":"{}","validator_pending_rewards":{},"delegator_rewards":[{}]}}"#,
+        r#"{{"validator_id":"{}","validator_pending_rewards":{},"delegator_rewards":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
         validator_hex,
         validator_rewards,
-        delegator_rewards.join(",")
+        delegator_rewards.join(","),
+        offset,
+        limit,
+        total_count
     ))
 }
 
@@ -2440,9 +2579,18 @@ fn get_validator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<
 ///
 /// Result: `{"validators": [{"validator_id", "stake"}, ...]}`
 // v2 — includes name field
-fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
+fn get_validator_set(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let (offset, limit) = validator_set_pagination(params)?;
+    let total_count = state.chain.validators.active_validators().count();
     let mut entries = Vec::new();
-    for v in state.chain.validators.active_validators() {
+    for v in state
+        .chain
+        .validators
+        .active_validators()
+        .skip(offset)
+        .take(limit)
+    {
+        state.check_deadline()?;
         let id_hex = hex::encode(v.validator_id.0);
         let network_addr = v
             .network_addr
@@ -2470,7 +2618,32 @@ fn get_validator_set(state: &NodeState<'_>) -> RpcResult<String> {
             v.cold_nonce,
         ));
     }
-    Ok(format!(r#"{{"validators":[{}]}}"#, entries.join(",")))
+    Ok(format!(
+        r#"{{"validators":[{}],"offset":{},"limit":{},"total_count":{}}}"#,
+        entries.join(","),
+        offset,
+        limit,
+        total_count
+    ))
+}
+
+fn validator_set_pagination(params: &[String]) -> RpcResult<(usize, usize)> {
+    const VALIDATOR_PAGE_DEFAULT: usize = 50;
+    const VALIDATOR_PAGE_MAX: usize = 200;
+    let offset = params
+        .first()
+        .map(|value| unquote(value).parse::<usize>())
+        .transpose()
+        .map_err(|_| RpcError::InvalidParams("offset must be an unsigned integer".into()))?
+        .unwrap_or(0);
+    let limit = params
+        .get(1)
+        .map(|value| unquote(value).parse::<usize>())
+        .transpose()
+        .map_err(|_| RpcError::InvalidParams("limit must be an unsigned integer".into()))?
+        .unwrap_or(VALIDATOR_PAGE_DEFAULT)
+        .min(VALIDATOR_PAGE_MAX);
+    Ok((offset, limit))
 }
 
 /// `indra_getUtxoProof` — returns sparse Merkle proof data for a UTXO.
@@ -2487,7 +2660,7 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
         .chain
         .utxos
         .prove_at_height(&utxo_id, state.chain.height);
-    let state_root = indra_state::compute_state_root(&state.chain);
+    let state_root = state.state_root;
     match proof {
         AuthTreeProof::V2Compressed(proof) => {
             let value_hash = proof.value.map(hex::encode).unwrap_or_default();
@@ -3005,6 +3178,44 @@ mod tests {
             result,
             DispatchResult::Ready(Err(RpcError::MethodNotFound(_)))
         ));
+    }
+
+    #[test]
+    fn sync_diagnostics_is_full_listener_admin_only() {
+        assert!(matches!(
+            check_rpc_method_allowed_with_admin(
+                "indra_getSyncDiagnostics",
+                RpcMode::Full,
+                true,
+                false,
+            ),
+            Err(RpcError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_rpc_method_allowed_with_admin(
+                "indra_getSyncDiagnostics",
+                RpcMode::ReadOnly,
+                true,
+                true,
+            ),
+            Err(RpcError::Forbidden(_))
+        ));
+        assert!(check_rpc_method_allowed_with_admin(
+            "indra_getSyncDiagnostics",
+            RpcMode::Full,
+            true,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validator_set_pagination_defaults_to_50_and_caps_at_200() {
+        assert_eq!(validator_set_pagination(&[]).unwrap(), (0, 50));
+        assert_eq!(
+            validator_set_pagination(&["7".into(), "9999".into()]).unwrap(),
+            (7, 200)
+        );
     }
 
     #[test]

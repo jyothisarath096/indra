@@ -24,11 +24,12 @@
 //! // server.run(); // blocks forever
 //! ```
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use indra_network::policy::BoundedTtlMap;
 
 use crate::{
     error::{ERR_INTERNAL_ERROR, ERR_INVALID_REQUEST, ERR_PARSE_ERROR},
@@ -63,6 +64,12 @@ pub const RPC_PUBLIC_GLOBAL_RATE_LIMIT_PER_SEC: u64 = 100;
 /// Public read-only RPC listener-wide burst.
 pub const RPC_PUBLIC_GLOBAL_RATE_BURST: u64 = 200;
 
+/// Maximum number of attacker-controlled source identities retained by a limiter.
+pub const RPC_LIMITER_MAP_CAPACITY: usize = 16_384;
+
+/// Idle time after which limiter state for a source identity is discarded.
+pub const RPC_LIMITER_MAP_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+
 /// Maximum RPC request body size.
 pub const MAX_RPC_BODY_BYTES: usize = 1_048_576;
 
@@ -88,16 +95,19 @@ fn body_exceeds_rpc_limit(content_length: usize) -> bool {
 }
 
 /// Shared per-IP fixed-window limiter for expensive UTXO scan endpoints.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RpcWindowRateLimiter {
-    windows: Mutex<HashMap<IpAddr, (Instant, u64)>>,
+    windows: Mutex<BoundedTtlMap<IpAddr, (Instant, u64)>>,
 }
 
 impl RpcWindowRateLimiter {
     /// Create an empty window limiter.
     pub fn new() -> Self {
         Self {
-            windows: Mutex::new(HashMap::new()),
+            windows: Mutex::new(BoundedTtlMap::new(
+                RPC_LIMITER_MAP_CAPACITY,
+                RPC_LIMITER_MAP_IDLE_TTL,
+            )),
         }
     }
 
@@ -107,7 +117,10 @@ impl RpcWindowRateLimiter {
             Ok(windows) => windows,
             Err(_) => return false,
         };
-        let entry = windows.entry(ip).or_insert((Instant::now(), 0));
+        let now = Instant::now();
+        let Some(entry) = windows.get_or_insert_with_at(ip, now, || (now, 0)) else {
+            return false;
+        };
         if entry.0.elapsed() >= Duration::from_secs(60) {
             *entry = (Instant::now(), 0);
         }
@@ -116,6 +129,20 @@ impl RpcWindowRateLimiter {
         }
         entry.1 = entry.1.saturating_add(1);
         true
+    }
+
+    /// Current live source count and cumulative capacity/TTL evictions.
+    pub fn map_stats(&self) -> (usize, u64) {
+        self.windows
+            .lock()
+            .map(|windows| (windows.len(), windows.evictions()))
+            .unwrap_or_default()
+    }
+}
+
+impl Default for RpcWindowRateLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -198,16 +225,19 @@ impl RpcTokenBucket {
 }
 
 /// Shared per-IP RPC limiter.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RpcRateLimiter {
-    buckets: Mutex<HashMap<IpAddr, RpcTokenBucket>>,
+    buckets: Mutex<BoundedTtlMap<IpAddr, RpcTokenBucket>>,
 }
 
 impl RpcRateLimiter {
     /// Create an empty RPC rate limiter.
     pub fn new() -> Self {
         Self {
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(BoundedTtlMap::new(
+                RPC_LIMITER_MAP_CAPACITY,
+                RPC_LIMITER_MAP_IDLE_TTL,
+            )),
         }
     }
 
@@ -223,9 +253,24 @@ impl RpcRateLimiter {
             Err(_) => return false,
         };
         buckets
-            .entry(ip)
-            .or_insert_with(|| RpcTokenBucket::new(refill_per_sec, burst))
-            .allow()
+            .get_or_insert_with_at(ip, Instant::now(), || {
+                RpcTokenBucket::new(refill_per_sec, burst)
+            })
+            .is_some_and(RpcTokenBucket::allow)
+    }
+
+    /// Current live source count and cumulative capacity evictions.
+    pub fn map_stats(&self) -> (usize, u64) {
+        self.buckets
+            .lock()
+            .map(|buckets| (buckets.len(), buckets.evictions()))
+            .unwrap_or_default()
+    }
+}
+
+impl Default for RpcRateLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -280,7 +325,11 @@ pub fn rpc_method_cost(method: &str) -> RpcMethodCost {
         | "indra_getOwnerStakePositions"
         | "indra_getDelegatorRewards"
         | "indra_getEpochHistory"
-        | "indra_getUtxoProof" => RpcMethodCost::Expensive,
+        | "indra_getUtxoProof"
+        | "indra_getValidatorRewards"
+        | "indra_getValidatorSet"
+        | "indra_explainUtxoProvenanceAuthorized"
+        | "indra_getCanonicalBlocks" => RpcMethodCost::Expensive,
         _ => RpcMethodCost::Cheap,
     }
 }
@@ -731,8 +780,7 @@ mod tests {
         let engine = ChainState::new_genesis();
         let resp = call_rpc("indra_fake", &[], &engine);
         assert!(resp.contains("\"error\""));
-        assert!(resp.contains("-32003"));
-        assert!(resp.contains("read-only listener"));
+        assert!(resp.contains("-32601"));
 
         let full_resp = call_rpc_with_mode("indra_fake", &[], &engine, RpcMode::Full);
         assert!(full_resp.contains("\"error\""));
@@ -819,6 +867,18 @@ mod tests {
             rpc_method_cost("indra_getEpochHistory"),
             RpcMethodCost::Expensive
         );
+        for method in [
+            "indra_getValidatorRewards",
+            "indra_getValidatorSet",
+            "indra_explainUtxoProvenanceAuthorized",
+            "indra_getCanonicalBlocks",
+        ] {
+            assert_eq!(
+                rpc_method_cost(method),
+                RpcMethodCost::Expensive,
+                "{method}"
+            );
+        }
         assert_eq!(rpc_method_cost("indra_getHeight"), RpcMethodCost::Cheap);
     }
 

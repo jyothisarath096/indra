@@ -53,8 +53,8 @@ pub mod state_store;
 pub mod vote_safety;
 pub mod wal;
 
-pub use block_store::{BlockStore, PruneConfig};
-pub use epoch_store::EpochStore;
+pub use block_store::{BlockStore, BlockStoreReadHandle, PruneConfig};
+pub use epoch_store::{EpochStore, EpochStoreReadHandle};
 pub use error::{StorageError, StorageResult};
 pub use manifest::{load_chain_manifest, save_chain_manifest, ChainManifest};
 pub use qc_store::{

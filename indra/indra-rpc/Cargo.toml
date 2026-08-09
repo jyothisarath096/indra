@@ -11,6 +11,7 @@ indra-core      = { path = "../indra-core" }
 indra-crypto    = { path = "../indra-crypto" }
 indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
+indra-network   = { path = "../indra-network" }
 thiserror.workspace = true
 hex.workspace = true
 serde_json.workspace = true

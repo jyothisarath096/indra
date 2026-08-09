@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
 
 use indra_core::{
     codec::{Decode, Encode},
@@ -70,11 +74,50 @@ impl PruneConfig {
 pub struct BlockStore {
     path: PathBuf,
     file: File,
-    index: HashMap<u64, u64>, // height → file offset of the entry header
+    index: Arc<RwLock<HashMap<u64, u64>>>, // height → file offset of the entry header
     next_height: u64,
     prune_cfg: PruneConfig,
-    lowest_height: u64,
+    lowest_height: Arc<AtomicU64>,
+    io_guard: Arc<RwLock<()>>,
     data_start: u64,
+}
+
+/// Cloneable block-log read capability independent of the canonical writer.
+#[derive(Clone)]
+pub struct BlockStoreReadHandle {
+    path: PathBuf,
+    index: Arc<RwLock<HashMap<u64, u64>>>,
+    lowest_height: Arc<AtomicU64>,
+    io_guard: Arc<RwLock<()>>,
+}
+
+impl BlockStoreReadHandle {
+    /// Read one currently-retained block without acquiring the writer owner.
+    pub fn get(&self, height: u64) -> StorageResult<BlockV1> {
+        let _io = self
+            .io_guard
+            .read()
+            .map_err(|_| StorageError::LockPoisoned {
+                component: "block-log rewrite generation",
+            })?;
+        let index = self.index.read().map_err(|_| StorageError::LockPoisoned {
+            component: "block-log height index",
+        })?;
+        let lowest = self.lowest_height.load(Ordering::Relaxed);
+        if !index.is_empty() && height < lowest {
+            return Err(StorageError::BlockPruned {
+                height,
+                lowest_available: lowest,
+            });
+        }
+        let offset = index
+            .get(&height)
+            .copied()
+            .ok_or(StorageError::BlockNotFound { height })?;
+        drop(index);
+        let mut file = File::open(&self.path)?;
+        read_block_at(&mut file, height, offset)
+    }
 }
 
 impl BlockStore {
@@ -96,10 +139,11 @@ impl BlockStore {
         let mut store = Self {
             path,
             file,
-            index: HashMap::new(),
+            index: Arc::new(RwLock::new(HashMap::new())),
             next_height: 0,
             prune_cfg,
-            lowest_height: 0,
+            lowest_height: Arc::new(AtomicU64::new(0)),
+            io_guard: Arc::new(RwLock::new(())),
             data_start,
         };
         store.rebuild_index()?;
@@ -109,12 +153,18 @@ impl BlockStore {
 
     /// Total number of blocks stored.
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// True if no blocks are stored.
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     /// The height of the next block to be appended.
@@ -124,7 +174,7 @@ impl BlockStore {
 
     /// Lowest block height currently stored.
     pub fn lowest_height(&self) -> u64 {
-        self.lowest_height
+        self.lowest_height.load(Ordering::Relaxed)
     }
 
     /// True if this store keeps all blocks forever.
@@ -150,7 +200,10 @@ impl BlockStore {
         self.file.flush()?;
         self.file.sync_all()?;
 
-        self.index.insert(height, offset);
+        self.index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(height, offset);
         self.next_height += 1;
 
         if let Some(keep) = self.prune_cfg.keep_blocks {
@@ -181,15 +234,31 @@ impl BlockStore {
         read_block_at(&mut file, height, offset)
     }
 
+    /// Create an independently usable RPC/storage read handle sharing only the
+    /// appender's immutable height index, never the consensus-driver mutex.
+    pub fn read_handle(&self) -> BlockStoreReadHandle {
+        BlockStoreReadHandle {
+            path: self.path.clone(),
+            index: Arc::clone(&self.index),
+            lowest_height: Arc::clone(&self.lowest_height),
+            io_guard: Arc::clone(&self.io_guard),
+        }
+    }
+
     fn block_offset(&self, height: u64) -> StorageResult<u64> {
-        if !self.index.is_empty() && height < self.lowest_height {
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lowest_height = self.lowest_height();
+        if !index.is_empty() && height < lowest_height {
             return Err(StorageError::BlockPruned {
                 height,
-                lowest_available: self.lowest_height,
+                lowest_available: lowest_height,
             });
         }
 
-        self.index
+        index
             .get(&height)
             .copied()
             .ok_or(StorageError::BlockNotFound { height })
@@ -197,26 +266,30 @@ impl BlockStore {
 
     /// Remove all blocks with heights below `prune_below`.
     fn prune_below(&mut self, prune_below: u64) -> StorageResult<()> {
-        if prune_below <= self.lowest_height {
+        if prune_below <= self.lowest_height() {
             return Ok(());
         }
 
         let keep_from_height = prune_below;
-        let keep_offset = match self.index.get(&keep_from_height).copied() {
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keep_offset = match index.get(&keep_from_height).copied() {
             Some(offset) => offset,
             None => {
-                let next_available = self
-                    .index
+                let next_available = index
                     .keys()
                     .filter(|&&height| height >= keep_from_height)
                     .min()
                     .copied();
                 match next_available {
-                    Some(height) => self.index[&height],
+                    Some(height) => index[&height],
                     None => return Ok(()),
                 }
             }
         };
+        drop(index);
 
         if keep_offset == self.data_start {
             return Ok(());
@@ -234,6 +307,7 @@ impl BlockStore {
         let mut offset: u64 = self.data_start;
         let mut last_good_offset: u64 = self.data_start;
         let mut max_height: Option<u64> = None;
+        let mut rebuilt_index = HashMap::new();
 
         loop {
             if offset + ENTRY_HEADER_BYTES as u64 > file_len {
@@ -298,7 +372,7 @@ impl BlockStore {
                 });
             }
 
-            self.index.insert(height, offset);
+            rebuilt_index.insert(height, offset);
             if max_height.is_none_or(|m| height > m) {
                 max_height = Some(height);
             }
@@ -308,41 +382,54 @@ impl BlockStore {
             self.file.seek(SeekFrom::Start(offset))?;
         }
 
-        self.next_height = max_height.map_or(0, |h| h + 1);
-        self.lowest_height = self.index.keys().min().copied().unwrap_or(0);
-        self.verify_contiguous_index()?;
+        let next_height = max_height.map_or(0, |h| h + 1);
+        let lowest = rebuilt_index.keys().min().copied().unwrap_or(0);
+        if !rebuilt_index.is_empty() {
+            for height in lowest..next_height {
+                if !rebuilt_index.contains_key(&height) {
+                    return Err(StorageError::BlockLogGap {
+                        missing_height: height,
+                    });
+                }
+            }
+        }
+
+        // Publish only after the complete replacement index has decoded,
+        // checksum-verified, and passed its contiguity invariant.
+        let mut shared = self.index.write().map_err(|_| StorageError::LockPoisoned {
+            component: "block-log height index rebuild",
+        })?;
+        *shared = rebuilt_index;
+        drop(shared);
+        self.next_height = next_height;
+        self.lowest_height.store(lowest, Ordering::Relaxed);
         Ok(())
     }
 
     fn log_verified_range(&self) {
-        if self.index.is_empty() {
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if index.is_empty() {
             return;
         }
         eprintln!(
             "[storage] block log verified: heights {}..={}, {} entries, checksums valid",
-            self.lowest_height,
+            self.lowest_height(),
             self.next_height.saturating_sub(1),
-            self.index.len(),
+            index.len(),
         );
     }
 
-    fn verify_contiguous_index(&self) -> StorageResult<()> {
-        if self.index.is_empty() {
-            return Ok(());
-        }
-        let min_h = self.lowest_height;
-        let max_h = self.next_height.saturating_sub(1);
-        for height in min_h..=max_h {
-            if !self.index.contains_key(&height) {
-                return Err(StorageError::BlockLogGap {
-                    missing_height: height,
-                });
-            }
-        }
-        Ok(())
-    }
-
     fn rewrite_suffix(&mut self, keep_offset: u64) -> StorageResult<()> {
+        // Keep RPC readers from pairing a pre-rewrite offset with the
+        // post-rename file. The published index and file generation change as
+        // one read-handle-visible unit.
+        let io_guard = Arc::clone(&self.io_guard);
+        let _io = io_guard.write().map_err(|_| StorageError::LockPoisoned {
+            component: "block-log rewrite generation",
+        })?;
         let tmp_path = self.path.with_extension("tmp");
         let mut tmp = File::create(&tmp_path)?;
         write_block_log_header(&mut tmp)?;
@@ -364,7 +451,6 @@ impl BlockStore {
             .truncate(false)
             .open(&self.path)?;
         self.data_start = initialise_block_log_header(&mut self.file)?;
-        self.index.clear();
         self.rebuild_index()?;
         Ok(())
     }
@@ -543,6 +629,32 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_rewrite_generation_fails_loudly() {
+        let path = temp_path("poisoned_rewrite_generation");
+        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+        store.append(&dummy_block(0, [0u8; 32])).unwrap();
+        let reader = store.read_handle();
+
+        let rewrite_generation = Arc::clone(&reader.io_guard);
+        let _ = std::thread::spawn(move || {
+            let _guard = rewrite_generation.write().unwrap();
+            panic!("deliberately poison the block-log rewrite generation guard");
+        })
+        .join();
+
+        assert!(matches!(
+            reader.get(0),
+            Err(StorageError::LockPoisoned {
+                component: "block-log rewrite generation"
+            })
+        ));
+
+        drop(reader);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn read_only_get_returns_height_indexed_block() {
         let path = temp_path("read_only_get");
         let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
@@ -554,15 +666,20 @@ mod tests {
         store.append(&b1).unwrap();
         store.append(&b2).unwrap();
 
-        let first = store.get_read_only(1).unwrap();
-        let second = store.get_read_only(1).unwrap();
+        let read = store.read_handle();
+        let first = read.get(1).unwrap();
+        let second = read.get(1).unwrap();
         assert_eq!(first.header.height, 1);
         assert_eq!(first.header.prev_hash, Bytes32::from([1u8; 32]));
         assert_eq!(first.header.block_hash(), second.header.block_hash());
         assert_ne!(
             first.header.block_hash(),
-            store.get_read_only(2).unwrap().header.block_hash()
+            read.get(2).unwrap().header.block_hash()
         );
+
+        let b3 = dummy_block(3, [3u8; 32]);
+        store.append(&b3).unwrap();
+        assert_eq!(read.get(3).unwrap().header.height, 3);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -700,6 +817,7 @@ mod tests {
             },
         )
         .unwrap();
+        let read = store.read_handle();
 
         for height in 0..10u64 {
             store.append(&dummy_block(height, [0u8; 32])).unwrap();
@@ -711,6 +829,8 @@ mod tests {
         assert!(store.get(9).is_ok());
         assert_eq!(store.lowest_height(), 5);
         assert_eq!(store.len(), 5);
+        assert!(matches!(read.get(4), Err(StorageError::BlockPruned { .. })));
+        assert_eq!(read.get(9).unwrap().header.height, 9);
 
         let _ = std::fs::remove_file(&path);
     }

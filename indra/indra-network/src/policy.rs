@@ -55,6 +55,159 @@ pub struct BoundedTtlSet<K> {
     ttl: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct TimedMapEntry<K> {
+    key: K,
+    generation: u64,
+    expires_at: Instant,
+}
+
+/// Capacity- and idle-TTL-bounded map for attacker-controlled identity state.
+///
+/// Access refreshes the idle deadline. Capacity eviction is deterministic:
+/// the least-recently-touched live entry is removed first.
+#[derive(Debug)]
+pub struct BoundedTtlMap<K, V> {
+    order: VecDeque<TimedMapEntry<K>>,
+    values: HashMap<K, (V, u64, Instant)>,
+    capacity: usize,
+    ttl: Duration,
+    next_generation: u64,
+    evictions: u64,
+}
+
+impl<K: Clone + Eq + Hash, V> BoundedTtlMap<K, V> {
+    /// Create an empty bounded map.
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity),
+            values: HashMap::with_capacity(capacity),
+            capacity,
+            ttl,
+            next_generation: 0,
+            evictions: 0,
+        }
+    }
+
+    /// Get an entry, inserting it when absent, and refresh its idle TTL.
+    pub fn get_or_insert_with_at(
+        &mut self,
+        key: K,
+        now: Instant,
+        make: impl FnOnce() -> V,
+    ) -> Option<&mut V> {
+        self.expire_at(now);
+        if self.capacity == 0 {
+            return None;
+        }
+        if !self.values.contains_key(&key) {
+            while self.values.len() >= self.capacity {
+                if !self.evict_oldest_live() {
+                    return None;
+                }
+                self.evictions = self.evictions.saturating_add(1);
+            }
+            self.next_generation = self.next_generation.wrapping_add(1);
+            let generation = self.next_generation;
+            let expires_at = now + self.ttl;
+            self.values
+                .insert(key.clone(), (make(), generation, expires_at));
+            self.order.push_back(TimedMapEntry {
+                key: key.clone(),
+                generation,
+                expires_at,
+            });
+        } else {
+            self.next_generation = self.next_generation.wrapping_add(1);
+            let generation = self.next_generation;
+            let expires_at = now + self.ttl;
+            if let Some((_, stored_generation, stored_expiry)) = self.values.get_mut(&key) {
+                *stored_generation = generation;
+                *stored_expiry = expires_at;
+            }
+            self.order.push_back(TimedMapEntry {
+                key: key.clone(),
+                generation,
+                expires_at,
+            });
+        }
+        self.compact_order_if_needed();
+        self.values.get_mut(&key).map(|(value, _, _)| value)
+    }
+
+    /// Remove expired entries.
+    pub fn expire_at(&mut self, now: Instant) {
+        while self
+            .order
+            .front()
+            .is_some_and(|entry| entry.expires_at <= now)
+        {
+            let entry = self.order.pop_front().expect("front exists");
+            if self
+                .values
+                .get(&entry.key)
+                .is_some_and(|(_, generation, expiry)| {
+                    *generation == entry.generation && *expiry <= now
+                })
+            {
+                self.values.remove(&entry.key);
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        if self.order.len() <= self.capacity.saturating_mul(2).max(1) {
+            return;
+        }
+        let mut live = self
+            .values
+            .iter()
+            .map(|(key, (_, generation, expires_at))| TimedMapEntry {
+                key: key.clone(),
+                generation: *generation,
+                expires_at: *expires_at,
+            })
+            .collect::<Vec<_>>();
+        live.sort_by_key(|entry| entry.generation);
+        self.order = live.into();
+    }
+
+    fn evict_oldest_live(&mut self) -> bool {
+        while let Some(entry) = self.order.pop_front() {
+            if self
+                .values
+                .get(&entry.key)
+                .is_some_and(|(_, generation, _)| *generation == entry.generation)
+            {
+                self.values.remove(&entry.key);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of live entries.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Return true when there are no live entries.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Number of capacity or idle-TTL evictions since construction.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    #[cfg(test)]
+    fn bookkeeping_len(&self) -> usize {
+        self.order.len()
+    }
+}
+
 impl<K: Clone + Eq + Hash> BoundedTtlSet<K> {
     /// Create an empty set.
     pub fn new(capacity: usize, ttl: Duration) -> Self {
@@ -347,6 +500,50 @@ mod tests {
         assert!(!set.contains_at(&1, start));
         assert!(set.contains_at(&3, start));
         assert!(!set.contains_at(&3, start + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn ttl_map_refreshes_idle_ttl_and_evicts_oldest_deterministically() {
+        let start = Instant::now();
+        let mut map = BoundedTtlMap::new(2, Duration::from_secs(10));
+        *map.get_or_insert_with_at(1u8, start, || 10).unwrap() += 1;
+        map.get_or_insert_with_at(2u8, start + Duration::from_secs(1), || 20);
+        assert_eq!(map.len(), 2);
+
+        // Touch key 1, making key 2 the deterministic least-recently-used entry.
+        assert_eq!(
+            *map.get_or_insert_with_at(1u8, start + Duration::from_secs(2), || 0)
+                .unwrap(),
+            11
+        );
+        map.get_or_insert_with_at(3u8, start + Duration::from_secs(3), || 30);
+        assert_eq!(map.evictions(), 1);
+        assert_eq!(
+            *map.get_or_insert_with_at(1u8, start + Duration::from_secs(3), || 0)
+                .unwrap(),
+            11
+        );
+        // Key 2 was evicted, so it is reconstructed with the supplied value.
+        assert_eq!(
+            *map.get_or_insert_with_at(2u8, start + Duration::from_secs(3), || 99)
+                .unwrap(),
+            99
+        );
+        assert_eq!(map.evictions(), 2);
+
+        map.expire_at(start + Duration::from_secs(14));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn ttl_map_refresh_bookkeeping_remains_capacity_bounded() {
+        let start = Instant::now();
+        let mut map = BoundedTtlMap::new(2, Duration::from_secs(60));
+        for tick in 0..10_000 {
+            map.get_or_insert_with_at(1u8, start + Duration::from_millis(tick), || 1);
+        }
+        assert_eq!(map.len(), 1);
+        assert!(map.bookkeeping_len() <= 4);
     }
 
     #[test]

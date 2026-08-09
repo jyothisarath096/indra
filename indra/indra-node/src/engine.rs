@@ -72,6 +72,8 @@ pub struct NodeEngine {
     pub config: NodeConfig,
     /// Current chain state.
     pub state: ChainState,
+    /// Immutable canonical state published to RPC readers after each commit.
+    pub rpc_snapshot: crate::rpc_snapshot::RpcSnapshotPublisher,
     /// Pending transaction pool.
     pub mempool: Mempool,
     /// Pending staking operations waiting to be included in a block.
@@ -548,9 +550,17 @@ impl NodeEngine {
             };
 
         let pending_dependency_epoch = epoch_for_height(state.height.saturating_add(1));
+        let rpc_snapshot = crate::rpc_snapshot::RpcSnapshotPublisher::new(
+            &state,
+            mempool.len(),
+            !block_store.is_archive(),
+            block_store.lowest_height(),
+            block_store.len(),
+        );
         Ok(Self {
             config,
             state,
+            rpc_snapshot,
             mempool,
             staking_mempool: Vec::new(),
             governance_mempool: Vec::new(),
@@ -807,6 +817,16 @@ impl NodeEngine {
         self.verified_governance.insert(id, verified);
         self.debug_assert_pending_indexes();
         Ok(())
+    }
+
+    /// Validate and add a transaction while refreshing fast RPC metadata.
+    pub fn add_transaction(
+        &mut self,
+        transaction: indra_core::types::transaction::TransactionV1,
+    ) -> Result<Bytes32, indra_consensus::ConsensusError> {
+        let id = self.mempool.submit_validated(transaction, &self.state)?;
+        self.rpc_snapshot.set_mempool_size(self.mempool.len());
+        Ok(id)
     }
 
     /// Validate and add slash evidence to the bounded pending pool.
@@ -1582,7 +1602,19 @@ impl NodeEngine {
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
         self.apply_pending_canonical_effects(&outcome.effects);
+        self.refresh_rpc_snapshot();
         Ok(())
+    }
+
+    /// Publish a fresh immutable state view after canonical or pending-pool mutation.
+    pub fn refresh_rpc_snapshot(&self) {
+        self.rpc_snapshot.publish(
+            &self.state,
+            self.mempool.len(),
+            !self.block_store.is_archive(),
+            self.block_store.lowest_height(),
+            self.block_store.len(),
+        );
     }
 
     /// Persist a durable manifest for the currently committed state.

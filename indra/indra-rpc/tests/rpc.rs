@@ -106,8 +106,7 @@ fn rpc_get_block_beyond_tip() {
 fn rpc_invalid_method() {
     let e = engine("rpc_inv");
     let resp = call_rpc("indra_doesNotExist", &[], &e);
-    assert!(resp.contains("-32003"));
-    assert!(resp.contains("read-only listener"));
+    assert!(resp.contains("-32601"));
 
     let full_resp = call_rpc_with_mode("indra_doesNotExist", &[], &e, RpcMode::Full);
     assert!(full_resp.contains("-32601"));
@@ -149,7 +148,7 @@ fn old_public_utxo_scan_methods_are_removed_from_public_rpc() {
         RpcMode::ReadOnly,
     );
     assert!(resp.contains("\"error\""));
-    assert!(resp.contains("read-only listener"));
+    assert!(resp.contains("-32601"));
 
     let full_resp = call_rpc_with_mode(
         "indra_getUtxos",
@@ -515,8 +514,7 @@ fn readonly_listener_rejects_unclassified_method() {
     );
 
     let err = check_rpc_method_allowed(method, RpcMode::ReadOnly).unwrap_err();
-    assert!(matches!(err, indra_rpc::RpcError::Forbidden(_)));
-    assert!(err.message().contains("read-only listener"));
+    assert!(matches!(err, indra_rpc::RpcError::MethodNotFound(_)));
 }
 
 #[test]
@@ -602,7 +600,10 @@ fn full_listener_policy_gate_allows_classified_and_unclassified_methods() {
             "full listener should allow classified method {method}"
         );
     }
-    assert!(check_rpc_method_allowed("indra_unclassifiedFutureMethod", RpcMode::Full).is_ok());
+    assert!(matches!(
+        check_rpc_method_allowed("indra_unclassifiedFutureMethod", RpcMode::Full),
+        Err(indra_rpc::RpcError::MethodNotFound(_))
+    ));
 }
 
 #[test]

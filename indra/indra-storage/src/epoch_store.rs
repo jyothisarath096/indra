@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
@@ -24,20 +25,22 @@ const EPOCH_FILE_VERSION: u8 = 1;
 
 /// Append-only epoch summary log.
 pub struct EpochStore {
+    path: PathBuf,
     file: File,
-    index: HashMap<u64, u64>,
+    index: Arc<RwLock<HashMap<u64, u64>>>,
     next_epoch: u64,
 }
 
 impl EpochStore {
     /// Open or create an epoch store at the given path.
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
+        let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(&path)?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
         if file_len == 0 {
@@ -47,8 +50,9 @@ impl EpochStore {
         }
 
         let mut store = Self {
+            path,
             file,
-            index: HashMap::new(),
+            index: Arc::new(RwLock::new(HashMap::new())),
             next_epoch: 0,
         };
         store.rebuild_index()?;
@@ -73,7 +77,10 @@ impl EpochStore {
         self.file.write_all(&record_bytes)?;
         self.file.flush()?;
 
-        self.index.insert(record.epoch, offset);
+        self.index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.epoch, offset);
         self.next_epoch += 1;
         Ok(())
     }
@@ -82,6 +89,8 @@ impl EpochStore {
     pub fn get(&self, epoch: u64) -> StorageResult<EpochRecord> {
         let offset = self
             .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&epoch)
             .copied()
             .ok_or(StorageError::EpochNotFound { epoch })?;
@@ -128,18 +137,28 @@ impl EpochStore {
 
     /// Returns true if the given epoch has been recorded.
     pub fn has(&self, epoch: u64) -> bool {
-        self.index.contains_key(&epoch)
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&epoch)
     }
 
     /// The highest recorded epoch number. None if no epochs have been recorded.
     pub fn latest_epoch(&self) -> Option<u64> {
-        self.index.keys().max().copied()
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .max()
+            .copied()
     }
 
     /// Returns up to `limit` records ending at `to_epoch`, most recent first.
     pub fn get_range(&self, to_epoch: u64, limit: usize) -> StorageResult<Vec<EpochRecord>> {
         let mut epochs: Vec<u64> = self
             .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
             .copied()
             .filter(|epoch| *epoch <= to_epoch)
@@ -154,16 +173,25 @@ impl EpochStore {
 
     /// Total number of epoch records stored.
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// True if no epochs have been recorded yet.
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     fn rebuild_index(&mut self) -> StorageResult<()> {
-        self.index.clear();
+        self.index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.file.seek(SeekFrom::Start(FILE_HEADER_BYTES))?;
         let file_size = self.file.seek(SeekFrom::End(0))?;
         let mut offset = FILE_HEADER_BYTES;
@@ -199,7 +227,10 @@ impl EpochStore {
                 break;
             }
 
-            self.index.insert(epoch, offset);
+            self.index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(epoch, offset);
             max_epoch = Some(max_epoch.map_or(epoch, |max: u64| max.max(epoch)));
             offset = next_offset;
         }
@@ -208,6 +239,100 @@ impl EpochStore {
         self.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
+
+    /// Create a cloneable read handle independent of the canonical writer.
+    pub fn read_handle(&self) -> EpochStoreReadHandle {
+        EpochStoreReadHandle {
+            path: self.path.clone(),
+            index: Arc::clone(&self.index),
+        }
+    }
+}
+
+/// Cloneable epoch-log read capability independent of the canonical writer.
+#[derive(Clone)]
+pub struct EpochStoreReadHandle {
+    path: PathBuf,
+    index: Arc<RwLock<HashMap<u64, u64>>>,
+}
+
+impl EpochStoreReadHandle {
+    /// Read one epoch record.
+    pub fn get(&self, epoch: u64) -> StorageResult<EpochRecord> {
+        let offset = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&epoch)
+            .copied()
+            .ok_or(StorageError::EpochNotFound { epoch })?;
+        read_epoch_at(&self.path, epoch, offset)
+    }
+
+    /// Highest recorded epoch.
+    pub fn latest_epoch(&self) -> Option<u64> {
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .max()
+            .copied()
+    }
+
+    /// Read a bounded descending epoch range.
+    pub fn get_range(&self, to_epoch: u64, limit: usize) -> StorageResult<Vec<EpochRecord>> {
+        let mut epochs: Vec<_> = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .filter(|epoch| *epoch <= to_epoch)
+            .collect();
+        epochs.sort_by(|a, b| b.cmp(a));
+        epochs
+            .into_iter()
+            .take(limit)
+            .map(|epoch| self.get(epoch))
+            .collect()
+    }
+}
+
+fn read_epoch_at(path: &Path, epoch: u64, offset: u64) -> StorageResult<EpochRecord> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut header = [0u8; ENTRY_HEADER_BYTES];
+    file.read_exact(&mut header)?;
+    let stored_epoch =
+        u64::from_le_bytes(
+            header[..8]
+                .try_into()
+                .map_err(|_| StorageError::Corruption {
+                    height: epoch,
+                    detail: "entry header truncated while reading epoch".to_string(),
+                })?,
+        );
+    let length =
+        u32::from_le_bytes(
+            header[8..12]
+                .try_into()
+                .map_err(|_| StorageError::Corruption {
+                    height: epoch,
+                    detail: "entry header truncated while reading length".to_string(),
+                })?,
+        ) as usize;
+    if stored_epoch != epoch {
+        return Err(StorageError::Corruption {
+            height: epoch,
+            detail: format!("epoch index mismatch: stored epoch {stored_epoch}"),
+        });
+    }
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)?;
+    EpochRecord::decode(&mut ByteReader::new(&bytes)).map_err(|error| StorageError::Corruption {
+        height: epoch,
+        detail: error.to_string(),
+    })
 }
 
 fn write_file_header(file: &mut File) -> StorageResult<()> {
@@ -361,6 +486,25 @@ mod tests {
             .map(|record| record.epoch)
             .collect();
         assert_eq!(epochs, vec![9, 8, 7, 6, 5]);
+    }
+
+    #[test]
+    fn read_handle_observes_only_requested_range_and_later_appends() {
+        let path = temp_path("read_handle_range");
+        let mut store = EpochStore::open(&path).unwrap();
+        for epoch in 0..150 {
+            store.append(&record(epoch)).unwrap();
+        }
+        let handle = store.read_handle();
+        let page = handle.get_range(149, 3).unwrap();
+        assert_eq!(
+            page.iter().map(|item| item.epoch).collect::<Vec<_>>(),
+            vec![149, 148, 147]
+        );
+        store.append(&record(150)).unwrap();
+        assert_eq!(handle.latest_epoch(), Some(150));
+        assert_eq!(handle.get(150).unwrap().epoch, 150);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
