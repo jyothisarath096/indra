@@ -2051,15 +2051,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_vote_limit_is_keyed_by_validator_identity() {
+    async fn near_duplicate_votes_share_one_validator_identity_budget() {
         let validator = Bytes32::from([0xB2; 32]);
         let addr: SocketAddr = "127.0.0.1:32102".parse().unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        let started = Instant::now();
         for index in 0..81u8 {
+            // All votes claim the exact same consensus slot, but differ in
+            // signed content and encoded hash. They therefore evade the
+            // connection-local exact-message filter and model a validator
+            // spamming near-duplicates/equivocations with one identity.
             let msg = Message::Vote(VoteV1 {
                 height: 1,
-                round: index as u32,
+                round: 0,
                 step: VoteStep::Prevote,
                 block_hash: Bytes32::from([index; 32]),
                 validator_id: validator,
@@ -2079,8 +2084,13 @@ mod tests {
         while event_rx.try_recv().is_ok() {
             delivered += 1;
         }
+        let elapsed = started.elapsed();
         assert_eq!(delivered, 80);
         assert_eq!(actor.limiters_by_validator.len(), 1);
+        eprintln!(
+            "[near-duplicate-vote-rate-limit] attempted=81 delivered={delivered} elapsed_us={}",
+            elapsed.as_micros()
+        );
     }
 
     #[test]

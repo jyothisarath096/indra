@@ -255,6 +255,41 @@ fn signer_validators<'a>(
 }
 
 /// Verify a QC using hybrid Ed25519 + ML-DSA-87 signatures when active.
+/// # Why two disagreeing valid QCs for the same (height, round) cannot both exist
+///
+/// A QC is accepted only if `signed_stake >= bps_of(total_stake,
+/// CONSENSUS_QUORUM_BPS)`, where `CONSENSUS_QUORUM_BPS = 6_667` — i.e.,
+/// the signing set represents strictly more than 66.67% (> 2/3) of total
+/// stake.
+///
+/// Suppose two disagreeing QCs, A and B, both satisfy this bound for the
+/// same (height, round). Two subsets of a fixed total stake, each
+/// exceeding 2/3, cannot be disjoint: their intersection exceeds
+/// `2 * (6_667/10_000) - 1 ≈ 0.3334`, i.e., strictly more than 1/3 of
+/// total stake.
+///
+/// Under the standard BFT assumption that Byzantine stake is strictly
+/// below 1/3 of total, that intersection cannot consist entirely of
+/// Byzantine validators — at least one HONEST validator's signature must
+/// appear in both A and B.
+///
+/// Each per-signer signature is verified here over the exact (height,
+/// round, block_hash, election_result_hash, validator_id, chain_id)
+/// tuple it signs. For A and B to disagree while both containing that
+/// honest validator's valid signature, the honest validator would have
+/// had to sign two different values for the same (height, round) — which
+/// honest vote-casting logic never does (an honest validator signs at
+/// most one value per height/round/step). This verification relies on
+/// that invariant holding for the honest fraction of the validator set;
+/// it is a local property of honest signing behavior, not something this
+/// function itself observes or enforces for a remote signer.
+///
+/// This is reinforced by independent defense-in-depth at the driver
+/// layer: `ConsensusDriver`'s QC-caching logic explicitly rejects a
+/// second QC arriving for an already-cached height if its round,
+/// block_hash, or election_result_hash disagrees with what's cached
+/// (see driver.rs, "conflicting last_qc_bytes").
+
 pub fn verify_qc(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
@@ -859,5 +894,35 @@ mod tests {
     #[test]
     fn strict_consensus_quorum_is_above_two_thirds() {
         assert!(CONSENSUS_QUORUM_BPS > 6_666);
+    }
+
+    #[test]
+    fn conflicting_qcs_require_more_than_one_third_double_signing_weight() {
+        let validator_count = 4usize;
+        let stake_per_validator = 2_500u64;
+        let total_stake = stake_per_validator * validator_count as u64;
+        let quorum = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
+
+        // Any two signer sets which each satisfy the strict >2/3 quorum
+        // overlap in strictly more than 1/3 of total stake. With four equal
+        // validators, every quorum has three signers and two conflicting
+        // quorums share two signers (50% stake). Those shared validators
+        // would have to sign both block hashes.
+        let first = [true, true, true, false];
+        let second = [true, true, false, true];
+        let signed_stake = |set: &[bool; 4]| {
+            set.iter().filter(|signed| **signed).count() as u64 * stake_per_validator
+        };
+        let overlap_stake = first
+            .iter()
+            .zip(second.iter())
+            .filter(|(left, right)| **left && **right)
+            .count() as u64
+            * stake_per_validator;
+
+        assert!(signed_stake(&first) >= quorum);
+        assert!(signed_stake(&second) >= quorum);
+        assert!(overlap_stake > total_stake / 3);
+        assert_eq!(overlap_stake, 5_000);
     }
 }

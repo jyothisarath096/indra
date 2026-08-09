@@ -4633,6 +4633,7 @@ mod tests {
         first_quorum_online_round: Option<u32>,
         via_fallback: bool,
         event_stats: RealDriverSimEventStats,
+        signers: Vec<HybridKeypair>,
     }
 
     fn real_sim_seed(index: usize) -> [u8; 32] {
@@ -4673,20 +4674,11 @@ mod tests {
     }
 
     impl RealDriverSimHarness {
-        fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) {
-            std::fs::create_dir_all(to).unwrap();
-            for entry in std::fs::read_dir(from).unwrap() {
-                let entry = entry.unwrap();
-                let target = to.join(entry.file_name());
-                if entry.file_type().unwrap().is_dir() {
-                    Self::copy_dir_all(&entry.path(), &target);
-                } else {
-                    std::fs::copy(entry.path(), target).unwrap();
-                }
-            }
+        fn new(suffix: &str) -> Self {
+            Self::new_with_start_height(suffix, FINAL_REVEAL_SET_HEIGHT)
         }
 
-        fn new(suffix: &str) -> Self {
+        fn new_with_start_height(suffix: &str, start_height: u64) -> Self {
             let validators = real_driver_sim_n();
             let quorum = real_driver_sim_quorum(validators);
             let root = temp_dir(&format!("{suffix}_n{validators}"));
@@ -4697,9 +4689,6 @@ mod tests {
             std::fs::write(&genesis_path, genesis).unwrap();
 
             let mut nodes = Vec::with_capacity(validators);
-            let start_height = FINAL_REVEAL_SET_HEIGHT;
-            let tip_hash = Bytes32::from(indra_crypto::sha256(b"real-driver-sim-tip"));
-
             let template_dir = root.join("template_node");
             let template_seed = real_sim_seed(0);
             let template_pq = PqKeypair::from_seed(&template_seed).unwrap();
@@ -4714,13 +4703,19 @@ mod tests {
             let engine = NodeEngine::init(template_config).unwrap();
             let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
             let mut template_driver = ConsensusDriver::new(engine, vote_safety);
-            template_driver.engine.state.height = start_height;
-            template_driver.engine.state.tip_hash = tip_hash;
-            template_driver
-                .engine
-                .state_store
-                .save(&template_driver.engine.state)
-                .unwrap();
+            let tip_hash = if start_height == 0 {
+                template_driver.engine.state.tip_hash
+            } else {
+                let tip_hash = Bytes32::from(indra_crypto::sha256(b"real-driver-sim-tip"));
+                template_driver.engine.state.height = start_height;
+                template_driver.engine.state.tip_hash = tip_hash;
+                template_driver
+                    .engine
+                    .state_store
+                    .save(&template_driver.engine.state)
+                    .unwrap();
+                tip_hash
+            };
             template_driver.refresh_registered_voters();
             let quorum_signers: Vec<_> = signers.iter().take(quorum).collect();
             let qc = qc_bytes_from_signers(
@@ -4737,11 +4732,12 @@ mod tests {
                 let seed = real_sim_seed(i);
                 let pq = PqKeypair::from_seed(&seed).unwrap();
                 let node_dir = root.join(format!("node_{i}"));
-                Self::copy_dir_all(&template_dir, &node_dir);
                 let mut config = NodeConfig::local_test(node_dir);
-                // The template imported genesis once. Real restarted nodes
-                // must load their persisted snapshot, not re-run genesis.
-                config.genesis_path = None;
+                // Each simulated validator initializes its own canonical
+                // store from the same validated manifest. Copying a live
+                // template directory can omit atomically-managed manifest
+                // files and is not a faithful restart setup.
+                config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
                 config.validator_seed = Some(seed);
                 config.vrf_seed = Some(seed);
                 config.pq_pk = Some(pq.public_key().0.to_vec());
@@ -4760,6 +4756,15 @@ mod tests {
                 }
 
                 let mut driver = Self::restart_driver_from_config(config.clone(), &qc);
+                if start_height != 0 && driver.engine.state.height != start_height {
+                    driver.engine.state.height = start_height;
+                    driver.engine.state.tip_hash = tip_hash;
+                    driver
+                        .engine
+                        .state_store
+                        .save(&driver.engine.state)
+                        .unwrap();
+                }
                 driver.sync.mark_caught_up(driver.height());
                 driver.refresh_registered_voters();
                 driver.start_round(0);
@@ -4805,7 +4810,105 @@ mod tests {
                 first_quorum_online_round: None,
                 via_fallback: false,
                 event_stats: RealDriverSimEventStats::default(),
+                signers,
             }
+        }
+
+        /// Schedule the maximum steady-state traffic admitted for one
+        /// authenticated Byzantine identity across all three consensus
+        /// classes. Events are injected after the network rate gate, so this
+        /// measures the aggregate work the driver is intentionally allowed to
+        /// receive rather than traffic which would already have been dropped.
+        fn schedule_combined_consensus_flood(&mut self, duration_secs: u64) -> usize {
+            assert!(self.validators >= 4);
+            let attacker = 0usize;
+            let targets: Vec<usize> = (1..self.validators).collect();
+            let height = self.start_height.saturating_add(1);
+            let round = 0u32;
+            let attacker_id = Bytes32::from(indra_crypto::sha256(
+                &self.signers[attacker].public_key().classical.0,
+            ));
+            let mut scheduled = 0usize;
+
+            for second in 0..duration_secs {
+                for index in 0..20u64 {
+                    let sequence = second * 20 + index;
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&sequence.to_le_bytes());
+                    hash[8] = 0xF1;
+                    let vote = indra_consensus::vote::produce_vote(
+                        height,
+                        round,
+                        VoteStep::Prevote,
+                        Bytes32::from(hash),
+                        attacker_id,
+                        DEFAULT_CHAIN_ID,
+                        &self.signers[attacker],
+                    )
+                    .unwrap();
+                    for &to in &targets {
+                        self.schedule(
+                            second * 1_000 + index * 50,
+                            RealSimEventKind::Deliver {
+                                from: attacker,
+                                to,
+                                msg: RealSimMessage::Vote(vote.clone()),
+                            },
+                        );
+                        scheduled += 1;
+                    }
+                }
+
+                for index in 0..8u64 {
+                    let (mut commit, _) = signed_vrf_pair(
+                        self.nodes[attacker].driver.as_ref().unwrap(),
+                        real_sim_seed(attacker),
+                        height,
+                        round,
+                        DEFAULT_CHAIN_ID,
+                    );
+                    let sequence = second * 8 + index;
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&sequence.to_le_bytes());
+                    hash[8] = 0xF2;
+                    // Distinct, well-shaped messages with signatures that no
+                    // longer match model maximally expensive invalid commits.
+                    commit.commit_hash = Bytes32::from(hash);
+                    for &to in &targets {
+                        self.schedule(
+                            second * 1_000 + index * 125,
+                            RealSimEventKind::Deliver {
+                                from: attacker,
+                                to,
+                                msg: RealSimMessage::VrfCommit(commit.clone()),
+                            },
+                        );
+                        scheduled += 1;
+                    }
+                }
+
+                for index in 0..5u64 {
+                    let mut qc_bytes = self.initial_qc_bytes.clone();
+                    let sequence = second * 5 + index;
+                    let offset = qc_bytes.len() - 1 - (sequence as usize % 16);
+                    qc_bytes[offset] ^= 1u8 << (sequence % 8);
+                    for &to in &targets {
+                        self.schedule(
+                            second * 1_000 + index * 200,
+                            RealSimEventKind::Deliver {
+                                from: attacker,
+                                to,
+                                msg: RealSimMessage::QcResponse {
+                                    height: self.start_height,
+                                    qc_bytes: qc_bytes.clone(),
+                                },
+                            },
+                        );
+                        scheduled += 1;
+                    }
+                }
+            }
+            scheduled
         }
 
         fn restart_driver_from_config(
@@ -5753,6 +5856,50 @@ mod tests {
                 "scenario {name} should finalize on at least quorum validators"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "real-hardware aggregate consensus-flood benchmark; run explicitly with --ignored --nocapture and INDRA_REAL_DRIVER_SIM_N=4"]
+    fn real_driver_combined_consensus_flood_stays_within_round_budget() {
+        let mut baseline = RealDriverSimHarness::new_with_start_height("consensus_baseline", 0);
+        assert_eq!(baseline.validators, 4);
+        let baseline_outcome = baseline.run("consensus_baseline", 0, 0);
+
+        let mut harness =
+            RealDriverSimHarness::new_with_start_height("combined_consensus_flood", 0);
+        assert_eq!(
+            harness.validators, 4,
+            "set INDRA_REAL_DRIVER_SIM_N=4 for the below-BFT-threshold scenario"
+        );
+        let scheduled_flood_deliveries = harness.schedule_combined_consensus_flood(14);
+        let outcome = harness.run("combined_consensus_flood", 0, 0);
+        eprintln!(
+            "[combined-consensus-flood] baseline_virtual_ms={} baseline_wall_ms={} scheduled_flood_deliveries={} processed_by_class={:?} flood_virtual_ms={} flood_wall_ms={} finalized_nodes={} quorum={} finalized_round={:?}",
+            baseline_outcome.duration_ms,
+            baseline_outcome.wall_ms,
+            scheduled_flood_deliveries,
+            harness.event_stats.processed_by_class,
+            outcome.duration_ms,
+            outcome.wall_ms,
+            outcome.finalized_nodes,
+            outcome.quorum,
+            outcome.finalized_round,
+        );
+        assert!(outcome.finalized_nodes >= outcome.quorum);
+        assert!(
+            outcome.duration_ms
+                <= REAL_DRIVER_SIM_PROPOSE_TIMEOUT_MS
+                    + REAL_DRIVER_SIM_PREVOTE_TIMEOUT_MS
+                    + REAL_DRIVER_SIM_PRECOMMIT_TIMEOUT_MS,
+            "honest quorum must progress within one complete 8s/3s/3s round budget"
+        );
+        assert!(
+            outcome.wall_ms
+                <= (REAL_DRIVER_SIM_PROPOSE_TIMEOUT_MS
+                    + REAL_DRIVER_SIM_PREVOTE_TIMEOUT_MS
+                    + REAL_DRIVER_SIM_PRECOMMIT_TIMEOUT_MS) as u128,
+            "serial processing on this hardware must not consume an entire round budget"
+        );
     }
 
     #[test]
@@ -7378,6 +7525,47 @@ mod tests {
             )),
             "far-future commits must be cheap-dropped at the slot check before signature verification"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn implausible_vrf_slots_are_dropped_before_crypto_for_commit_and_reveal() {
+        let (mut driver, dir) = local_driver([0x17; 32], "vrf_implausible_slots");
+        install_active_validator(&mut driver, [0x27; 32], "peer");
+        let next_height = driver.next_height();
+        let current_round = driver.current_round;
+        let from: SocketAddr = "127.0.0.1:10004".parse().unwrap();
+
+        let cases = [
+            (next_height.saturating_sub(1), current_round),
+            (next_height.saturating_add(99), current_round),
+            (
+                next_height,
+                current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP + 1),
+            ),
+        ];
+        for (height, round) in cases {
+            let (mut commit, mut reveal) =
+                signed_vrf_pair(&driver, [0x27; 32], height, round, DEFAULT_CHAIN_ID);
+            // If either path reaches hybrid verification, these deliberately
+            // empty signatures produce a disconnect action.
+            commit.signature = ConsensusDriver::empty_signature().unwrap();
+            reveal.signature = ConsensusDriver::empty_signature().unwrap();
+
+            let commit_actions = driver.process(DriverEvent::InboundVrfCommit { from, commit });
+            let reveal_actions = driver.process(DriverEvent::InboundVrfReveal { from, reveal });
+            for actions in [commit_actions, reveal_actions] {
+                assert!(
+                    actions.iter().all(|action| !matches!(
+                        action,
+                        DriverAction::DisconnectInvalidConsensusPeer { .. }
+                            | DriverAction::BroadcastVrfCommit(_)
+                            | DriverAction::BroadcastVrfReveal(_)
+                    )),
+                    "an unallocated VRF slot must be cheap-dropped before cryptographic processing"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
