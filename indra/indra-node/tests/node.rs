@@ -32,7 +32,7 @@ use indra_node::{
     driver::{ConsensusDriver, DriverAction, DriverEvent},
     genesis::{build_genesis_state, genesis_block_hash},
     state_root::compute_state_root,
-    sync::{import_block, SyncState},
+    sync::{import_unfinalized_block_for_test, SyncState},
     NodeConfig, NodeEngine,
 };
 use indra_state::ChainState;
@@ -420,7 +420,7 @@ fn state_root_changes_after_each_block() {
     let root0 = compute_state_root(&state);
 
     let b1 = make_strict_block(&state, [0x11u8; 32], vec![]);
-    import_block(
+    import_unfinalized_block_for_test(
         &b1,
         &mut state,
         &mut mempool,
@@ -433,7 +433,7 @@ fn state_root_changes_after_each_block() {
 
     let qc1 = build_single_validator_qc_bytes(1, 0, b1.header.block_hash(), [0x11u8; 32]);
     let b2 = make_strict_block(&state, [0x11u8; 32], qc1);
-    import_block(
+    import_unfinalized_block_for_test(
         &b2,
         &mut state,
         &mut mempool,
@@ -465,7 +465,7 @@ fn block_store_survives_reopen() {
         let mut last_qc = Vec::new();
         for i in 1..=3u64 {
             let b = make_strict_block(&state, [0x12u8; 32], last_qc.clone());
-            import_block(
+            import_unfinalized_block_for_test(
                 &b,
                 &mut state,
                 &mut mempool,
@@ -534,7 +534,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
     for _ in 0..6u64 {
         let height = source_state.height + 1;
         let block = make_strict_block(&source_state, [0x13u8; 32], source_last_qc.clone());
-        import_block(
+        import_unfinalized_block_for_test(
             &block,
             &mut source_state,
             &mut source_mempool,
@@ -560,7 +560,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
 
     for height in 1..=source_state.height {
         let block = source_store.get(height).unwrap();
-        import_block(
+        import_unfinalized_block_for_test(
             &block,
             &mut follower_state,
             &mut follower_mempool,
@@ -659,7 +659,7 @@ fn full_node_pipeline() {
     let roots: Vec<Bytes32> = (1..=10u64)
         .map(|i| {
             let b = make_strict_block(&state, [0x14u8; 32], last_qc.clone());
-            import_block(
+            import_unfinalized_block_for_test(
                 &b,
                 &mut state,
                 &mut mempool,
@@ -893,7 +893,7 @@ fn full_restart_recovery_end_to_end() {
     for _ in 0..2u64 {
         let height = source_state.height + 1;
         let block = make_strict_block(&source_state, [0x15u8; 32], source_last_qc.clone());
-        import_block(
+        import_unfinalized_block_for_test(
             &block,
             &mut source_state,
             &mut source_mempool,
@@ -917,7 +917,7 @@ fn full_restart_recovery_end_to_end() {
         let follower_state_store = StateStore::open(follower_state_dir).unwrap();
 
         let block1 = source_store.get(1).unwrap();
-        import_block(
+        import_unfinalized_block_for_test(
             &block1,
             &mut follower_state,
             &mut follower_mempool,
@@ -935,7 +935,7 @@ fn full_restart_recovery_end_to_end() {
         );
 
         let block2 = source_store.get(2).unwrap();
-        import_block(
+        import_unfinalized_block_for_test(
             &block2,
             &mut follower_state,
             &mut follower_mempool,

@@ -57,7 +57,6 @@ pub use genesis::{
 pub use metrics::{start_metrics_server, start_observer_metrics_server, MetricsState};
 pub use net_driver::{action_to_message, message_to_event};
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};
-pub use sync::import_block;
 
 impl indra_rpc::handlers::RpcEngineView for NodeEngine {
     fn chain_state(&self) -> &indra_state::ChainState {

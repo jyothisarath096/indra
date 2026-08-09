@@ -1,6 +1,7 @@
 //! Block import and chain sync.
 //!
-//! `import_block` is the single entry point for adding a block to the chain.
+//! Live peer sync uses the buffered H/H+1 verification coordinator in the
+//! node binary. The eager import helper in this module exists only for tests.
 //! It:
 //!   1. Validates the block's structural invariants
 //!   2. Projects the block once, verifies the projected header roots
@@ -575,11 +576,17 @@ impl SyncState {
     }
 }
 
-/// Import a block into the chain.
+/// Eagerly import one block for isolated test harnesses.
 ///
-/// This is the canonical block processing pipeline:
-/// validate → project/verify → durable writes → publish state and pool effects.
-pub fn import_block(
+/// # Security warning
+///
+/// This helper does **not** perform the forward-looking verification of the
+/// block's own QC that the live H/H+1 buffered sync path requires. It must
+/// never be called for a block received from an untrusted peer. It remains
+/// public solely because `indra-node/tests/node.rs` is a separate integration
+/// test crate; production sync must use the provisional coordinator.
+#[doc(hidden)]
+pub fn import_unfinalized_block_for_test(
     block: &BlockV1,
     state: &mut ChainState,
     mempool: &mut Mempool,
@@ -587,7 +594,7 @@ pub fn import_block(
     state_store: &StateStore,
     timestamp_secs: u64,
 ) -> NodeResult<Option<EpochRecord>> {
-    import_block_with_effects(
+    import_unfinalized_block_with_effects_for_test(
         block,
         state,
         mempool,
@@ -598,8 +605,11 @@ pub fn import_block(
     .map(|outcome| outcome.epoch_record)
 }
 
-/// Import a block and return the canonical effects published after projection commit.
-pub fn import_block_with_effects(
+/// Test-only eager import returning the effects published after projection.
+///
+/// This omits forward-looking own-QC verification and must never be wired to
+/// untrusted network input. See [`import_unfinalized_block_for_test`].
+fn import_unfinalized_block_with_effects_for_test(
     block: &BlockV1,
     state: &mut ChainState,
     mempool: &mut Mempool,
@@ -607,7 +617,7 @@ pub fn import_block_with_effects(
     state_store: &StateStore,
     timestamp_secs: u64,
 ) -> NodeResult<indra_state::AppliedBlockOutcome> {
-    import_block_with_durable_hook(
+    import_unfinalized_block_with_durable_hook_for_test(
         block,
         state,
         mempool,
@@ -618,13 +628,12 @@ pub fn import_block_with_effects(
     )
 }
 
-/// Import with a caller-supplied durable commit hook.
+/// Test-only eager import with a caller-supplied durable commit hook.
 ///
-/// The hook runs after the block and interval snapshot are durable but before
-/// canonical memory or pending pools change. `block_log_next_height` reflects
-/// the newly appended block. Callers use this to persist epoch/manifest data
-/// as part of the same fail-closed publication boundary.
-pub(crate) fn import_block_with_durable_hook<F>(
+/// This omits forward-looking own-QC verification and must never be wired to
+/// untrusted network input. The hook runs after the block and interval
+/// snapshot are durable but before canonical memory or pending pools change.
+fn import_unfinalized_block_with_durable_hook_for_test<F>(
     block: &BlockV1,
     state: &mut ChainState,
     mempool: &mut Mempool,
@@ -708,7 +717,7 @@ where
 /// Validate and apply the canonical sync/import block pipeline up to, but not
 /// including, durable block/snapshot writes.
 ///
-/// `import_block` calls this helper before storage append. Tests that need to
+/// The eager test import calls this helper before storage append. Tests that need to
 /// exercise hard-fork boundary behavior at synthetic heights use this same
 /// path because `BlockStore` itself intentionally requires contiguous heights
 /// from genesis and cannot be jumped to `u64::MAX - 1`.
@@ -1783,7 +1792,7 @@ mod tests {
         let state_store = StateStore::open(dir.join("state")).unwrap();
 
         let block = make_block(&state);
-        import_block(
+        import_unfinalized_block_for_test(
             &block,
             &mut state,
             &mut mempool,
@@ -1929,7 +1938,7 @@ mod tests {
         let mut block = make_block(&state);
         block.header.state_root = Bytes32::from([0xEE; 32]);
 
-        let err = import_block(
+        let err = import_unfinalized_block_for_test(
             &block,
             &mut state,
             &mut mempool,
@@ -1973,7 +1982,7 @@ mod tests {
         let mut block = make_block(&state);
         block.header.base_fee = block.header.base_fee.saturating_add(1);
 
-        let err = import_block(
+        let err = import_unfinalized_block_for_test(
             &block,
             &mut state,
             &mut mempool,
@@ -2019,7 +2028,7 @@ mod tests {
             .append(&crate::genesis::build_genesis_block())
             .unwrap();
         block_store.append(&block).unwrap();
-        let error = import_block(
+        let error = import_unfinalized_block_for_test(
             &block,
             &mut state,
             &mut mempool,
@@ -2085,7 +2094,7 @@ mod tests {
         let mut prev_qc = Vec::new();
         for i in 1..=10u64 {
             let block = make_strict_block(&state, 0x41, 0, prev_qc.clone());
-            import_block(
+            import_unfinalized_block_for_test(
                 &block,
                 &mut state,
                 &mut mempool,
@@ -2129,7 +2138,7 @@ mod tests {
         // Try to import height 5 when we're at genesis (height 0)
         let mut block = make_block(&state);
         block.header.height = 5;
-        assert!(import_block(
+        assert!(import_unfinalized_block_for_test(
             &block,
             &mut state,
             &mut mempool,
@@ -3104,7 +3113,7 @@ mod tests {
         .unwrap();
         let state_store = StateStore::open(dir.join("state")).unwrap();
         let mut mempool = Mempool::default_config();
-        import_block(
+        import_unfinalized_block_for_test(
             &block1,
             &mut state,
             &mut mempool,

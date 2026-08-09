@@ -11,7 +11,7 @@
 //!   3. Collect prevotes from all validators (Phase 5: simulate locally)
 //!   4. If prevote quorum: broadcast precommit
 //!   5. Collect precommits until QC formed
-//!   6. Import the committed block via sync::import_block
+//!   6. Durably publish the buffered, own-QC-verified sync projection
 //!   7. Advance to next height
 
 use indra_consensus::{
