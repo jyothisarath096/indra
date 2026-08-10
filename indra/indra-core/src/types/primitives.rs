@@ -497,14 +497,6 @@ pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
 
 // ── Protocol Version ──────────────────────────────────────────────────────────
 
-/// Legacy transaction protocol version retained until its dedicated pure-format pass.
-pub const PROTOCOL_VERSION: u16 = 1;
-
-/// Transaction protocol version carrying optional payment-blinding note sidecars.
-///
-/// This reuses the existing in-transaction `ProtocolVersion` field rather than
-/// introducing a wrapper format. Version 1 transactions remain byte-identical;
-/// version 2 transactions encode the payment-notes tail and are admitted only
 /// Canonical transaction format carrying mandatory payment notes.
 pub const TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES: u16 = 2;
 
@@ -676,10 +668,7 @@ impl Encode for ProtocolVersion {
 impl Decode for ProtocolVersion {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let v = r.read_u16_le()?;
-        if v != PROTOCOL_VERSION
-            && v != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
-            && v != BLOCK_FORMAT_VERSION
-        {
+        if v != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES && v != BLOCK_FORMAT_VERSION {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
         Ok(Self(v))

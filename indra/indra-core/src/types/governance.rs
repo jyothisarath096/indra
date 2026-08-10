@@ -11,10 +11,18 @@ use crate::{
     },
 };
 
-const TAG_COLD_PROPOSE: u8 = 19;
-const TAG_COLD_COMMIT: u8 = 20;
-const TAG_COLD_REVEAL: u8 = 21;
-const TAG_COLD_CANCEL: u8 = 22;
+// Canonical governance payload tags. Authorization role is part of the wire
+// variant because it determines the signature domain and nonce namespace.
+const TAG_PROPOSE: u8 = 0;
+const TAG_COLD_PROPOSE: u8 = 1;
+const TAG_COMMIT: u8 = 2;
+const TAG_COLD_COMMIT: u8 = 3;
+const TAG_REVEAL: u8 = 4;
+const TAG_COLD_REVEAL: u8 = 5;
+const TAG_REDELEGATE: u8 = 6;
+const TAG_EXECUTE: u8 = 7;
+const TAG_CANCEL: u8 = 8;
+const TAG_COLD_CANCEL: u8 = 9;
 
 /// Stable authorization-envelope tag for cold governance proposals.
 pub const AUTH_TAG_COLD_PROPOSE: u16 = TAG_COLD_PROPOSE as u16;
@@ -387,7 +395,7 @@ impl Encode for GovernancePayload {
                 if cold_authorization.is_some() {
                     TAG_COLD_PROPOSE.encode(buf);
                 } else {
-                    0u8.encode(buf);
+                    TAG_PROPOSE.encode(buf);
                 }
                 action.encode(buf);
                 deposit_utxo_id.encode(buf);
@@ -406,7 +414,7 @@ impl Encode for GovernancePayload {
                 if cold_authorization.is_some() {
                     TAG_COLD_COMMIT.encode(buf);
                 } else {
-                    1u8.encode(buf);
+                    TAG_COMMIT.encode(buf);
                 }
                 proposal_id.encode(buf);
                 commit_hash.encode(buf);
@@ -423,7 +431,7 @@ impl Encode for GovernancePayload {
                 if cold_authorization.is_some() {
                     TAG_COLD_REVEAL.encode(buf);
                 } else {
-                    2u8.encode(buf);
+                    TAG_REVEAL.encode(buf);
                 }
                 proposal_id.encode(buf);
                 vote.encode(buf);
@@ -438,14 +446,14 @@ impl Encode for GovernancePayload {
                 to_validator,
                 amount_spark,
             } => {
-                3u8.encode(buf);
+                TAG_REDELEGATE.encode(buf);
                 proposal_id.encode(buf);
                 from_validator.encode(buf);
                 to_validator.encode(buf);
                 amount_spark.encode(buf);
             }
             Self::Execute { proposal_id } => {
-                4u8.encode(buf);
+                TAG_EXECUTE.encode(buf);
                 proposal_id.encode(buf);
             }
             Self::Cancel {
@@ -455,7 +463,7 @@ impl Encode for GovernancePayload {
                 if cold_authorization.is_some() {
                     TAG_COLD_CANCEL.encode(buf);
                 } else {
-                    5u8.encode(buf);
+                    TAG_CANCEL.encode(buf);
                 }
                 proposal_id.encode(buf);
                 if let Some(authorization) = cold_authorization {
@@ -500,7 +508,7 @@ impl Encode for GovernancePayload {
 impl Decode for GovernancePayload {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         match u8::decode(r)? {
-            0 => Ok(Self::Propose {
+            TAG_PROPOSE => Ok(Self::Propose {
                 action: GovernableAction::decode(r)?,
                 deposit_utxo_id: Bytes32::decode(r)?,
                 proposer_pubkey: HybridPubKey::decode(r)?,
@@ -508,27 +516,27 @@ impl Decode for GovernancePayload {
                 description: VariableBytes::decode(r)?,
                 cold_authorization: None,
             }),
-            1 => Ok(Self::Commit {
+            TAG_COMMIT => Ok(Self::Commit {
                 proposal_id: Bytes32::decode(r)?,
                 commit_hash: Bytes32::decode(r)?,
                 cold_authorization: None,
             }),
-            2 => Ok(Self::Reveal {
+            TAG_REVEAL => Ok(Self::Reveal {
                 proposal_id: Bytes32::decode(r)?,
                 vote: u8::decode(r)?,
                 nonce: Bytes32::decode(r)?,
                 cold_authorization: None,
             }),
-            3 => Ok(Self::Redelegate {
+            TAG_REDELEGATE => Ok(Self::Redelegate {
                 proposal_id: Bytes32::decode(r)?,
                 from_validator: Bytes32::decode(r)?,
                 to_validator: Bytes32::decode(r)?,
                 amount_spark: u64::decode(r)?,
             }),
-            4 => Ok(Self::Execute {
+            TAG_EXECUTE => Ok(Self::Execute {
                 proposal_id: Bytes32::decode(r)?,
             }),
-            5 => Ok(Self::Cancel {
+            TAG_CANCEL => Ok(Self::Cancel {
                 proposal_id: Bytes32::decode(r)?,
                 cold_authorization: None,
             }),
@@ -826,17 +834,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_governance_wire_round_trip_preserves_legacy_bytes() {
-        let legacy = GovernancePayload::Commit {
+    fn governance_commit_tags_encode_authorization_role_canonically() {
+        let hot = GovernancePayload::Commit {
             proposal_id: Bytes32::from([0x11; 32]),
             commit_hash: Bytes32::from([0x22; 32]),
             cold_authorization: None,
         };
-        let mut expected_legacy = vec![1u8];
-        expected_legacy.extend_from_slice(&[0x11; 32]);
-        expected_legacy.extend_from_slice(&[0x22; 32]);
-        assert_eq!(legacy.encode_to_vec(), expected_legacy);
-
         let cold = GovernancePayload::Commit {
             proposal_id: Bytes32::from([0x11; 32]),
             commit_hash: Bytes32::from([0x22; 32]),
@@ -845,12 +848,16 @@ mod tests {
                 cold_nonce: 9,
             }),
         };
+        assert_eq!(hot.encode_to_vec()[0], TAG_COMMIT);
         assert_eq!(cold.encode_to_vec()[0], TAG_COLD_COMMIT);
+        assert_eq!(
+            GovernancePayload::decode_exact(&hot.encode_to_vec()).unwrap(),
+            hot
+        );
         assert_eq!(
             GovernancePayload::decode_exact(&cold.encode_to_vec()).unwrap(),
             cold
         );
-        assert_ne!(cold.encode_to_vec(), legacy.encode_to_vec());
     }
 
     #[test]

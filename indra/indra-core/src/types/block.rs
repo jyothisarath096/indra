@@ -21,23 +21,19 @@ use crate::{
 /// Sentinel value meaning a proposal did not carry a prior PoLC round.
 pub const NO_POLC_ROUND: u32 = u32::MAX;
 
-/// INDRA v1 block header.
+/// Canonical INDRA block header.
 ///
-/// `block_hash` is the SHA-256 of the canonical on-disk/on-wire header
-/// encoding. That byte order is consensus-critical and must remain bit-for-bit
-/// compatible with the historical `57398f5` chain data: protocol_version,
-/// height, prev_hash, timestamp, state_root, validator_set_root,
-/// mempool_set_root, base_fee, proposer_round, proposer_vrf_output,
-/// proposer_vrf_proof, quorum_certificate, polc_round, value_hash.
+/// `block_hash` is SHA-256 over the complete canonical header encoding. Votes,
+/// QCs, chain links, and durable manifests all use this exact identity, so it
+/// binds every serialized consensus field, including `value_hash` and
+/// round-specific proposal metadata.
 ///
-/// `value_hash` is a separate consensus-layer identity that is stable across
-/// rounds for the same block content, but it is still serialized inside the
-/// header and therefore contributes to `block_hash()` for backwards
-/// compatibility with the existing chain. Changing that relationship would
-/// require a protocol-versioned hard fork.
+/// `value_hash` is the separately verified, round-stable content identity used
+/// only to recognize a value across reproposals. It is not a substitute for
+/// the full block hash certified by votes and QCs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeaderV1 {
-    /// Must equal PROTOCOL_VERSION.
+    /// Must equal [`BLOCK_FORMAT_VERSION`].
     pub protocol_version: ProtocolVersion,
     /// Block height (starts at 1, monotonically increasing).
     pub height: u64,
@@ -76,7 +72,7 @@ pub struct BlockHeaderV1 {
 }
 
 impl BlockHeaderV1 {
-    /// Compute the canonical block hash from the historical header encoding.
+    /// Compute the canonical full-header block hash.
     pub fn block_hash(&self) -> Bytes32 {
         Bytes32::from(sha256(&self.encode_to_vec()))
     }

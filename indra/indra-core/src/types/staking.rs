@@ -16,32 +16,34 @@ use crate::{
     },
 };
 
-/// Discriminant tags for StakingOp variants.
-const TAG_DELEGATE: u8 = 1;
-const TAG_EXIT_STAKE_POSITION: u8 = 2;
-const TAG_CLAIM_REWARDS: u8 = 3;
-const TAG_SET_COMMISSION: u8 = 5;
-const TAG_SELF_STAKE: u8 = 6;
-const TAG_SET_AUTO_DELEGATE: u8 = 8;
-const TAG_UPDATE_NETWORK_ADDRESS: u8 = 9;
-const TAG_REGISTER_VALIDATOR_WITH_COLD_KEY: u8 = 11;
-const TAG_COLD_CLAIM_REWARDS: u8 = 13;
-const TAG_COLD_SET_COMMISSION: u8 = 14;
-const TAG_COLD_SELF_STAKE: u8 = 15;
-const TAG_COLD_EXIT_STAKE_POSITION: u8 = 16;
-const TAG_COLD_SET_AUTO_DELEGATE: u8 = 17;
-const TAG_ROTATE_VALIDATOR_COLD_KEY: u8 = 23;
+/// Canonical staking payload tags. Authorization role is encoded explicitly
+/// wherever the same economic action has delegator/hot and validator-cold
+/// forms because those forms use different identities and nonce namespaces.
+const TAG_DELEGATE: u8 = 0;
+const TAG_DELEGATOR_EXIT_STAKE_POSITION: u8 = 1;
+const TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION: u8 = 2;
+const TAG_DELEGATOR_CLAIM_REWARDS: u8 = 3;
+const TAG_COLD_VALIDATOR_CLAIM_REWARDS: u8 = 4;
+const TAG_REGISTER_VALIDATOR: u8 = 5;
+const TAG_ROTATE_VALIDATOR_COLD_KEY: u8 = 6;
+const TAG_HOT_SET_COMMISSION: u8 = 7;
+const TAG_COLD_SET_COMMISSION: u8 = 8;
+const TAG_HOT_SELF_STAKE: u8 = 9;
+const TAG_COLD_SELF_STAKE: u8 = 10;
+const TAG_HOT_SET_AUTO_DELEGATE: u8 = 11;
+const TAG_COLD_SET_AUTO_DELEGATE: u8 = 12;
+const TAG_UPDATE_NETWORK_ADDRESS: u8 = 13;
 
 /// Stable operation tag used inside hot/cold registration envelopes.
-pub const AUTH_TAG_REGISTER_VALIDATOR: u16 = TAG_REGISTER_VALIDATOR_WITH_COLD_KEY as u16;
+pub const AUTH_TAG_REGISTER_VALIDATOR: u16 = TAG_REGISTER_VALIDATOR as u16;
 /// Stable envelope tag for cold validator reward claims.
-pub const AUTH_TAG_COLD_CLAIM_REWARDS: u16 = TAG_COLD_CLAIM_REWARDS as u16;
+pub const AUTH_TAG_COLD_CLAIM_REWARDS: u16 = TAG_COLD_VALIDATOR_CLAIM_REWARDS as u16;
 /// Stable envelope tag for cold commission updates.
 pub const AUTH_TAG_COLD_SET_COMMISSION: u16 = TAG_COLD_SET_COMMISSION as u16;
 /// Stable envelope tag for cold validator self-staking.
 pub const AUTH_TAG_COLD_SELF_STAKE: u16 = TAG_COLD_SELF_STAKE as u16;
 /// Stable envelope tag for cold-authorized validator position exits.
-pub const AUTH_TAG_COLD_EXIT_STAKE_POSITION: u16 = TAG_COLD_EXIT_STAKE_POSITION as u16;
+pub const AUTH_TAG_COLD_EXIT_STAKE_POSITION: u16 = TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION as u16;
 /// Stable envelope tag for cold auto-delegation updates.
 pub const AUTH_TAG_COLD_SET_AUTO_DELEGATE: u16 = TAG_COLD_SET_AUTO_DELEGATE as u16;
 /// Stable envelope tag for validator cold-key rotation.
@@ -617,9 +619,9 @@ impl Encode for StakingOpBody {
                 cold_authorization,
             } => {
                 buf.push(if cold_authorization.is_some() {
-                    TAG_COLD_EXIT_STAKE_POSITION
+                    TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION
                 } else {
-                    TAG_EXIT_STAKE_POSITION
+                    TAG_DELEGATOR_EXIT_STAKE_POSITION
                 });
                 position_id.encode(buf);
                 amount_spark.encode(buf);
@@ -634,9 +636,9 @@ impl Encode for StakingOpBody {
                 cold_authorization,
             } => {
                 buf.push(if cold_authorization.is_some() {
-                    TAG_COLD_CLAIM_REWARDS
+                    TAG_COLD_VALIDATOR_CLAIM_REWARDS
                 } else {
-                    TAG_CLAIM_REWARDS
+                    TAG_DELEGATOR_CLAIM_REWARDS
                 });
                 validator_id.encode(buf);
                 delegator_pubkey.encode(buf);
@@ -653,7 +655,7 @@ impl Encode for StakingOpBody {
                 cold_pubkey,
                 cold_signature,
             } => {
-                buf.push(TAG_REGISTER_VALIDATOR_WITH_COLD_KEY);
+                buf.push(TAG_REGISTER_VALIDATOR);
                 commission_bps.encode(buf);
                 deposit_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
@@ -689,7 +691,7 @@ impl Encode for StakingOpBody {
                 buf.push(if cold_authorization.is_some() {
                     TAG_COLD_SET_COMMISSION
                 } else {
-                    TAG_SET_COMMISSION
+                    TAG_HOT_SET_COMMISSION
                 });
                 validator_id.encode(buf);
                 new_commission_bps.encode(buf);
@@ -706,7 +708,7 @@ impl Encode for StakingOpBody {
                 buf.push(if cold_authorization.is_some() {
                     TAG_COLD_SELF_STAKE
                 } else {
-                    TAG_SELF_STAKE
+                    TAG_HOT_SELF_STAKE
                 });
                 deposit_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
@@ -723,7 +725,7 @@ impl Encode for StakingOpBody {
                 buf.push(if cold_authorization.is_some() {
                     TAG_COLD_SET_AUTO_DELEGATE
                 } else {
-                    TAG_SET_AUTO_DELEGATE
+                    TAG_HOT_SET_AUTO_DELEGATE
                 });
                 validator_id.encode(buf);
                 target_validator_id.encode(buf);
@@ -859,18 +861,18 @@ impl Decode for StakingOpBody {
                 delegator_pubkey: HybridPubKey::decode(r)?,
                 deposit_proof: decode_optional_deposit_proof(r)?,
             }),
-            TAG_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
+            TAG_DELEGATOR_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
                 position_id: Bytes32::decode(r)?,
                 amount_spark: u64::decode(r)?,
                 custody: PositionCustodyV1::decode(r)?,
                 cold_authorization: None,
             }),
-            TAG_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
+            TAG_DELEGATOR_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
                 validator_id: Bytes32::decode(r)?,
                 delegator_pubkey: HybridPubKey::decode(r)?,
                 cold_authorization: None,
             }),
-            TAG_REGISTER_VALIDATOR_WITH_COLD_KEY => {
+            TAG_REGISTER_VALIDATOR => {
                 let commission_bps = u32::decode(r)?;
                 let deposit_utxo_id = Bytes32::decode(r)?;
                 let validator_pubkey = HybridPubKey::decode(r)?;
@@ -908,18 +910,18 @@ impl Decode for StakingOpBody {
                     new_cold_signature,
                 })
             }
-            TAG_SET_COMMISSION => Ok(StakingOpBody::SetCommission {
+            TAG_HOT_SET_COMMISSION => Ok(StakingOpBody::SetCommission {
                 validator_id: Bytes32::decode(r)?,
                 new_commission_bps: u32::decode(r)?,
                 cold_authorization: None,
             }),
-            TAG_SELF_STAKE => Ok(StakingOpBody::SelfStake {
+            TAG_HOT_SELF_STAKE => Ok(StakingOpBody::SelfStake {
                 deposit_utxo_id: Bytes32::decode(r)?,
                 validator_pubkey: HybridPubKey::decode(r)?,
                 deposit_proof: decode_optional_deposit_proof(r)?,
                 cold_authorization: None,
             }),
-            TAG_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
+            TAG_HOT_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
                 validator_id: Bytes32::decode(r)?,
                 target_validator_id: Bytes32::decode(r)?,
                 cold_authorization: None,
@@ -928,7 +930,7 @@ impl Decode for StakingOpBody {
                 validator_id: Bytes32::decode(r)?,
                 network_addr: decode_optional_network_addr(r)?,
             }),
-            TAG_COLD_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
+            TAG_COLD_VALIDATOR_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
                 validator_id: Bytes32::decode(r)?,
                 delegator_pubkey: HybridPubKey::decode(r)?,
                 cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
@@ -944,7 +946,7 @@ impl Decode for StakingOpBody {
                 deposit_proof: decode_optional_deposit_proof(r)?,
                 cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
             }),
-            TAG_COLD_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
+            TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
                 position_id: Bytes32::decode(r)?,
                 amount_spark: u64::decode(r)?,
                 custody: PositionCustodyV1::decode(r)?,
@@ -1178,14 +1180,14 @@ mod tests {
     }
 
     #[test]
-    fn cold_staking_wire_extensions_round_trip_and_legacy_bytes_are_unchanged() {
+    fn staking_payload_tags_encode_authorization_roles_canonically() {
         let validator_id = Bytes32::from([0xD1; 32]);
         let validator_pubkey = dummy_pubkey();
         let authorization = ColdStakingAuthorization {
             cold_key_version: 7,
             cold_nonce: 9,
         };
-        let legacy_and_cold = vec![
+        let hot_or_delegator_and_cold = vec![
             (
                 StakingOpBody::ClaimRewards {
                     validator_id,
@@ -1197,8 +1199,8 @@ mod tests {
                     delegator_pubkey: validator_pubkey.clone(),
                     cold_authorization: Some(authorization),
                 },
-                TAG_CLAIM_REWARDS,
-                TAG_COLD_CLAIM_REWARDS,
+                TAG_DELEGATOR_CLAIM_REWARDS,
+                TAG_COLD_VALIDATOR_CLAIM_REWARDS,
             ),
             (
                 StakingOpBody::SetCommission {
@@ -1211,7 +1213,7 @@ mod tests {
                     new_commission_bps: 1_234,
                     cold_authorization: Some(authorization),
                 },
-                TAG_SET_COMMISSION,
+                TAG_HOT_SET_COMMISSION,
                 TAG_COLD_SET_COMMISSION,
             ),
             (
@@ -1227,14 +1229,16 @@ mod tests {
                     deposit_proof: Some(dummy_deposit_proof(0xD4, 100)),
                     cold_authorization: Some(authorization),
                 },
-                TAG_SELF_STAKE,
+                TAG_HOT_SELF_STAKE,
                 TAG_COLD_SELF_STAKE,
             ),
             (
                 StakingOpBody::ExitStakePosition {
                     position_id: Bytes32::from([0xD5; 32]),
                     amount_spark: 100,
-                    custody: PositionCustodyV1::ValidatorColdIdentity { validator_id },
+                    custody: PositionCustodyV1::DelegatorIdentity {
+                        delegator_id: validator_id,
+                    },
                     cold_authorization: None,
                 },
                 StakingOpBody::ExitStakePosition {
@@ -1243,8 +1247,8 @@ mod tests {
                     custody: PositionCustodyV1::ValidatorColdIdentity { validator_id },
                     cold_authorization: Some(authorization),
                 },
-                TAG_EXIT_STAKE_POSITION,
-                TAG_COLD_EXIT_STAKE_POSITION,
+                TAG_DELEGATOR_EXIT_STAKE_POSITION,
+                TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION,
             ),
             (
                 StakingOpBody::SetAutoDelegate {
@@ -1257,22 +1261,24 @@ mod tests {
                     target_validator_id: Bytes32::ZERO,
                     cold_authorization: Some(authorization),
                 },
-                TAG_SET_AUTO_DELEGATE,
+                TAG_HOT_SET_AUTO_DELEGATE,
                 TAG_COLD_SET_AUTO_DELEGATE,
             ),
         ];
 
-        for (legacy, cold, legacy_tag, cold_tag) in legacy_and_cold {
-            let legacy_bytes = legacy.encode_to_vec();
-            assert_eq!(legacy_bytes[0], legacy_tag);
-            assert_eq!(legacy_bytes.len(), legacy.encoded_len());
-            assert_eq!(StakingOpBody::decode_exact(&legacy_bytes).unwrap(), legacy);
+        for (hot_or_delegator, cold, hot_or_delegator_tag, cold_tag) in hot_or_delegator_and_cold {
+            let hot_or_delegator_bytes = hot_or_delegator.encode_to_vec();
+            assert_eq!(hot_or_delegator_bytes[0], hot_or_delegator_tag);
+            assert_eq!(hot_or_delegator_bytes.len(), hot_or_delegator.encoded_len());
+            assert_eq!(
+                StakingOpBody::decode_exact(&hot_or_delegator_bytes).unwrap(),
+                hot_or_delegator
+            );
 
             let cold_bytes = cold.encode_to_vec();
             assert_eq!(cold_bytes[0], cold_tag);
-            assert_eq!(cold_bytes.len(), legacy_bytes.len() + 16);
             assert_eq!(StakingOpBody::decode_exact(&cold_bytes).unwrap(), cold);
-            assert_ne!(legacy_bytes, cold_bytes);
+            assert_ne!(hot_or_delegator_bytes, cold_bytes);
         }
     }
 

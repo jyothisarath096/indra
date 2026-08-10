@@ -125,7 +125,7 @@ impl Decode for PaymentBlindingNoteV1 {
     }
 }
 
-/// A complete INDRA v1 transaction.
+/// A complete canonical INDRA transaction.
 ///
 /// Fee privacy model (Spec Section C4):
 ///   fee_amount   — PUBLIC. Validators verify ≥ base_fee × weight.
@@ -134,7 +134,7 @@ impl Decode for PaymentBlindingNoteV1 {
 ///   Transfer amounts in inputs/outputs remain fully private.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionV1 {
-    /// Must equal PROTOCOL_VERSION.
+    /// Must equal [`TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES`].
     pub version: ProtocolVersion,
     /// Identifies the signature module (must be a registered module ID).
     pub signature_module_id: u16,
@@ -157,20 +157,11 @@ pub struct TransactionV1 {
 impl TransactionV1 {
     /// Validate structural rules (does NOT verify crypto).
     pub fn validate_structure(&self) -> IndraResult<()> {
-        self.validate_structure_at_height(u64::MAX)
-    }
-
-    /// Validate structural rules under the transaction format active at `height`.
-    pub fn validate_structure_at_height(&self, height: u64) -> IndraResult<()> {
-        self.validate_structure_at_height_with_dust(height, DUST_LIMIT_SPARK)
+        self.validate_structure_with_dust(DUST_LIMIT_SPARK)
     }
 
     /// Validate structural rules using the dust floor frozen from block pre-state.
-    pub fn validate_structure_at_height_with_dust(
-        &self,
-        height: u64,
-        dust_limit_spark: u64,
-    ) -> IndraResult<()> {
+    pub fn validate_structure_with_dust(&self, dust_limit_spark: u64) -> IndraResult<()> {
         if self.inputs.is_empty() {
             return Err(IndraError::ZeroInputs);
         }
@@ -199,7 +190,6 @@ impl TransactionV1 {
                 });
             }
         }
-        let _ = height;
         if self.version.0 != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
             return Err(IndraError::UnsupportedVersion {
                 version: self.version.0,
@@ -429,11 +419,9 @@ mod tests {
     #[test]
     fn structural_validation_uses_caller_frozen_dust_floor() {
         let tx = minimal_tx();
-        assert!(tx
-            .validate_structure_at_height_with_dust(u64::MAX, 100_000)
-            .is_ok());
+        assert!(tx.validate_structure_with_dust(100_000).is_ok());
         assert!(matches!(
-            tx.validate_structure_at_height_with_dust(u64::MAX, 200_000),
+            tx.validate_structure_with_dust(200_000),
             Err(IndraError::BelowDustLimit {
                 value: 100_000,
                 limit: 200_000
@@ -488,7 +476,7 @@ mod tests {
 
         let decoded = TransactionV1::decode_exact(&tx.encode_to_vec()).unwrap();
         assert_eq!(decoded, tx);
-        assert!(decoded.validate_structure_at_height(u64::MAX).is_ok());
+        assert!(decoded.validate_structure().is_ok());
     }
 
     #[test]
@@ -497,7 +485,7 @@ mod tests {
         tx.payment_notes.clear();
 
         assert_eq!(
-            tx.validate_structure_at_height(u64::MAX),
+            tx.validate_structure(),
             Err(IndraError::InvalidTransaction(
                 "payment_notes length must equal outputs length".into()
             ))
@@ -508,8 +496,7 @@ mod tests {
     fn payment_notes_are_not_height_gated() {
         let mut tx = minimal_tx();
         tx.payment_notes[0].note_nonce = [0x30; 32];
-        assert!(tx.validate_structure_at_height(0).is_ok());
-        assert!(tx.validate_structure_at_height(u64::MAX).is_ok());
+        assert!(tx.validate_structure().is_ok());
     }
 
     #[test]
