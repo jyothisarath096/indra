@@ -22,7 +22,6 @@ use indra_core::{
     types::primitives::Bytes32,
     types::transaction::OutputV1,
 };
-use indra_crypto::sha256;
 use indra_state::UtxoSet;
 
 use crate::error::{CliError, CliResult};
@@ -48,19 +47,6 @@ pub struct WalletEntry {
     pub spent: bool,
     /// Confirmed block height that spent this entry, if discovered by scanning.
     pub spent_height: Option<u64>,
-}
-
-impl WalletEntry {
-    /// Compute the UTXO ID from its location.
-    ///
-    /// utxo_id = SHA-256(height_le || tx_index_le || out_index_le)
-    pub fn compute_id(height: u64, tx_index: u32, out_index: u32) -> Bytes32 {
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&height.to_le_bytes());
-        data.extend_from_slice(&tx_index.to_le_bytes());
-        data.extend_from_slice(&out_index.to_le_bytes());
-        Bytes32::from(sha256(&data))
-    }
 }
 
 /// A locally tracked change output waiting to be confirmed on-chain.

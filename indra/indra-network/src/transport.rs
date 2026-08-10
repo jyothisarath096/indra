@@ -59,11 +59,6 @@ impl Connection {
         })
     }
 
-    /// Clone the underlying stream for a dedicated writer thread.
-    pub fn clone_stream(&self) -> NetworkResult<TcpStream> {
-        Ok(self.stream.try_clone()?)
-    }
-
     /// Write raw framed bytes to this peer.
     pub fn write_raw(&mut self, bytes: &[u8]) -> NetworkResult<()> {
         self.stream.write_all(bytes)?;

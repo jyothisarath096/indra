@@ -256,15 +256,6 @@ impl PeerTable {
             .collect()
     }
 
-    /// Return all known (not banned) peer addresses for dialing.
-    pub fn dialable(&self) -> Vec<SocketAddr> {
-        self.peers
-            .values()
-            .filter(|p| !p.is_banned() && p.status != PeerStatus::Connected)
-            .map(|p| p.addr)
-            .collect()
-    }
-
     /// Return the peer with the highest reported height.
     pub fn best_peer(&self) -> Option<&PeerInfo> {
         self.peers

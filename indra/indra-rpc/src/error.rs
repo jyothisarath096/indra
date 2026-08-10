@@ -17,8 +17,6 @@ pub const ERR_INTERNAL_ERROR: i32 = -32603;
 pub const ERR_NOT_FOUND: i32 = -32000;
 /// Transaction rejected.
 pub const ERR_TX_REJECTED: i32 = -32001;
-/// Node is not synced.
-pub const ERR_NOT_SYNCED: i32 = -32002;
 /// Request is not permitted on this RPC listener.
 pub const ERR_FORBIDDEN: i32 = -32003;
 

@@ -21,7 +21,6 @@ pub(crate) fn vrf_authority_from_snapshot(
         .map(|entry| ProposerCandidate {
             validator_id: entry.validator_id,
             vrf_pubkey: entry.vrf_pk,
-            verified_vrf_output: None,
             stake: entry.consensus_weight_spark,
         })
         .collect();

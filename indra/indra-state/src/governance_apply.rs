@@ -16,8 +16,8 @@ use crate::{
     delegation::active_delegated_position_stake,
     error::{StateError, StateResult},
     governance::{
-        GovernableParams, GovernanceRedelegation, GovernanceState, ProposalPhase, ProposalRecord,
-        VoteCommit, VoteReveal, GOVERNANCE_CRITICAL_COMMIT_EPOCHS, GOVERNANCE_DELIBERATION_EPOCHS,
+        GovernanceRedelegation, ProposalPhase, ProposalRecord, VoteCommit, VoteReveal,
+        GOVERNANCE_CRITICAL_COMMIT_EPOCHS, GOVERNANCE_DELIBERATION_EPOCHS,
         GOVERNANCE_PROPOSAL_COOLDOWN_EPOCHS, GOVERNANCE_REVEAL_EPOCHS,
         GOVERNANCE_STANDARD_COMMIT_EPOCHS, MAX_ACTIVE_GOVERNANCE_PROPOSALS,
         MAX_ACTIVE_GOVERNANCE_PROPOSALS_PER_PROPOSER,
@@ -914,9 +914,6 @@ fn invalid<T>(reason: impl Into<String>) -> StateResult<T> {
         reason: reason.into(),
     })
 }
-
-#[allow(dead_code)]
-fn _assert_params_send(_: &GovernableParams, _: &GovernanceState) {}
 
 #[cfg(test)]
 mod tests {

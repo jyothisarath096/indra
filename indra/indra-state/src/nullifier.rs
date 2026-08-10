@@ -138,16 +138,6 @@ impl NullifierSet {
         inserted
     }
 
-    /// Insert a nullifier, returning an error if it was already present.
-    ///
-    /// This is the preferred method in the block application path.
-    pub fn insert_or_double_spend(
-        &mut self,
-        nullifier: Bytes32,
-    ) -> Result<(), crate::error::StateError> {
-        self.insert_or_double_spend_at_height(nullifier, 0)
-    }
-
     /// Insert a nullifier at a specific resulting block height, returning an
     /// error if it was already present.
     pub fn insert_or_double_spend_at_height(

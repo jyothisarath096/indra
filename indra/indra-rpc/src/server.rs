@@ -34,8 +34,7 @@ use indra_network::policy::BoundedTtlMap;
 use crate::{
     error::{ERR_INTERNAL_ERROR, ERR_INVALID_REQUEST, ERR_PARSE_ERROR},
     handlers::{
-        check_rpc_method_allowed, dispatch_with_mode, DispatchResult, NodeState, RpcEngineMut,
-        RpcEngineView, RpcMode,
+        dispatch_with_mode, DispatchResult, NodeState, RpcEngineMut, RpcEngineView, RpcMode,
     },
     types::{parse_request, JsonId, RpcResponse},
 };
@@ -529,129 +528,6 @@ where
             RpcMode::Full,
         ))
     }
-}
-
-/// Handle one HTTP/JSON-RPC request from a raw TCP stream with an engine reference.
-///
-/// This is the integration point for the node binary. It borrows the engine
-/// for the duration of one request only — no Arc or cloning required.
-pub fn handle_with_engine<E: RpcEngineView>(stream: TcpStream, engine: &E) {
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let response = match read_and_process_ref(&stream, engine) {
-        Ok(resp) => resp,
-        Err(e) => {
-            let resp = RpcResponse::err(JsonId::Null, ERR_INTERNAL_ERROR, e.to_string());
-            resp.to_json()
-        }
-    };
-
-    let http_response = if response == "__OPTIONS__" {
-        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
-    } else if response == "__METHOD_NOT_ALLOWED__" {
-        http_json_error("405 Method Not Allowed", -32600, "Method Not Allowed", "")
-    } else if response == "__PAYLOAD_TOO_LARGE__" {
-        http_json_error(
-            "413 Payload Too Large",
-            -32600,
-            "request body too large",
-            "",
-        )
-    } else {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response.len(),
-            response
-        )
-    };
-
-    if let Ok(mut w) = stream.try_clone() {
-        let _ = w.write_all(http_response.as_bytes());
-    }
-}
-
-/// Read and process one HTTP request using a plain engine reference.
-fn read_and_process_ref<E: RpcEngineView>(
-    stream: &TcpStream,
-    engine: &E,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut content_length = 0usize;
-    let mut method = String::new();
-    let mut line = String::new();
-    let mut first_line = true;
-
-    loop {
-        line.clear();
-        reader.read_line(&mut line)?;
-        let trimmed = line.trim();
-        if first_line {
-            method = trimmed
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            first_line = false;
-        }
-        if trimmed.is_empty() {
-            break;
-        }
-        if trimmed.to_lowercase().starts_with("content-length:") {
-            let val = trimmed["content-length:".len()..].trim();
-            content_length = val.parse().unwrap_or(0);
-        }
-    }
-
-    if method == "OPTIONS" {
-        return Ok("__OPTIONS__".to_string());
-    }
-    if method != "POST" {
-        return Ok("__METHOD_NOT_ALLOWED__".to_string());
-    }
-
-    if content_length == 0 {
-        return Ok(RpcResponse::err(
-            JsonId::Null,
-            ERR_PARSE_ERROR,
-            "empty request body".to_string(),
-        )
-        .to_json());
-    }
-
-    if body_exceeds_rpc_limit(content_length) {
-        return Ok("__PAYLOAD_TOO_LARGE__".to_string());
-    }
-
-    let mut body = vec![0u8; content_length];
-    use std::io::Read;
-    reader.read_exact(&mut body)?;
-    let body_str = String::from_utf8_lossy(&body);
-    let req = match parse_http_json_rpc_body(&body_str) {
-        Ok(r) => r,
-        Err(response) => {
-            return Ok(response.to_json());
-        }
-    };
-
-    if let Err(error) = check_rpc_method_allowed(&req.method, RpcMode::ReadOnly) {
-        return Ok(RpcResponse::err(req.id, error.code(), error.message().to_string()).to_json());
-    }
-
-    let state = NodeState::read_only(engine);
-    let resp = match dispatch_with_mode(&req.method, &req.params, &state, RpcMode::ReadOnly) {
-        DispatchResult::Ready(Ok(json)) => RpcResponse::ok(req.id, json),
-        DispatchResult::Ready(Err(e)) => {
-            RpcResponse::err(req.id, e.code(), e.message().to_string())
-        }
-        DispatchResult::SubmitStakingOp(_)
-        | DispatchResult::SubmitGovernanceOp(_)
-        | DispatchResult::SubmitTransaction(_) => RpcResponse::err(
-            req.id,
-            -32000,
-            "mutation not available in read-only mode".to_string(),
-        ),
-    };
-
-    Ok(resp.to_json())
 }
 
 /// Make a direct in-process RPC call (for testing without HTTP).

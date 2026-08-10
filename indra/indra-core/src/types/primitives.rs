@@ -14,9 +14,6 @@ use crate::{
 
 // ── Consensus ─────────────────────────────────────────────────────────────────
 
-/// Target block time in seconds.
-pub const BLOCK_TIME_TARGET_SECS: u64 = 6;
-
 /// Blocks per epoch.
 pub const EPOCH_DURATION_BLOCKS: u64 = 300;
 
@@ -39,13 +36,6 @@ pub const MAX_TRANCHES_PER_VALIDATOR: usize = 104_096;
 /// Binding network-wide maximum retained unbonding tranches.
 pub const MAX_TRANCHES_TOTAL: usize = 104_096;
 
-/// Maximum delegation-return events retained in consensus state.
-///
-/// This is a fixed rolling log for operator visibility after forced validator
-/// eviction. It intentionally does not scale with the theoretical
-/// validators × delegators product.
-pub const MAX_DELEGATION_RETURN_EVENTS: usize = 100_000;
-
 /// Epochs a validator's stake is locked after initiating exit.
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 1008; // 21 days at 2 epochs/hour (48 epochs/day × 21 days = 1008)
 
@@ -58,26 +48,11 @@ pub const SLASH_EVIDENCE_WINDOW_EPOCHS: u64 = 500;
 /// AUTH_WINDOW = UNBONDING_PERIOD + 100
 pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
 
-/// Epochs beyond which a new node must have a checkpoint to sync.
-pub const WS_WINDOW_EPOCHS: u64 = 500;
-
 /// Epochs within which a validator must claim rewards before expiry.
 pub const CLAIM_WINDOW_EPOCHS: u64 = 175_200; // ~10 years — rewards rarely expire in practice
 
-/// Default propose phase timeout (ms).
-pub const T_PROPOSE_MS: u64 = 2_000;
-
-/// Default prevote phase timeout (ms).
-pub const T_PREVOTE_MS: u64 = 1_500;
-
-/// Default precommit phase timeout (ms).
-pub const T_PRECOMMIT_MS: u64 = 1_500;
-
 /// Hard floor on total round time — immutable, not governable.
 pub const MIN_ROUND_TIME_MS: u64 = 3_000;
-
-/// Hard ceiling on total round time — immutable, not governable.
-pub const MAX_ROUND_TIME_MS: u64 = 15_000;
 
 /// Maximum logical rounds tracked per height when deriving proposer slots.
 ///
@@ -109,9 +84,6 @@ pub const MAX_VRF_EMPTY_REVEAL_ROUNDS: u32 = 3;
 /// Memory cap for commit/reveal entries retained for one election round.
 pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
 
-/// Epochs delay before a governance-approved timeout change takes effect.
-pub const TIMEOUT_CHANGE_DELAY_EPOCHS: u64 = 100;
-
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
 /// Double precommit slash: 5% of stake.
@@ -122,10 +94,6 @@ pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 500;
 /// Surround vote slash: 10% of stake.
 /// Surround voting is a deliberate protocol attack — higher penalty.
 pub const SLASH_SURROUND_VOTE_BPS: u32 = 1_000;
-
-/// Self-report slash: 1% of stake.
-/// Validator reports own equivocation within SLASH_GRACE_PERIOD_EPOCHS.
-pub const SLASH_SELF_REPORT_BPS: u32 = 100;
 
 /// Reporter reward: 50% of slashed amount paid directly to the block
 /// proposer who included the slash evidence as a spendable UTXO.
@@ -342,9 +310,6 @@ pub const FEE_BURN_BPS: u32 = 5_000;
 /// Fraction of transaction fees distributed to validators (basis points).
 pub const FEE_VALIDATOR_BPS: u32 = 5_000;
 
-/// Soft target for the number of active validators.
-pub const TARGET_VALIDATOR_COUNT: u64 = 200;
-
 /// Saturation is disabled until the active validator set reaches this size.
 pub const SATURATION_MIN_VALIDATORS: u64 = 20;
 
@@ -353,9 +318,6 @@ pub const MIN_ACTIVE_VALIDATORS: usize = 4;
 
 /// Maximum active validator set size (mature network).
 pub const MAX_ACTIVE_VALIDATORS: usize = 200;
-
-/// Target active validator set size for QC size management.
-pub const TARGET_VALIDATOR_SET_SIZE: u64 = 150;
 
 /// Phase 1 total-stake threshold for validator set expansion.
 pub const VALIDATOR_SET_PHASE1_STAKE: u64 = 1_000_000 * SPARK_PER_INDRA;
@@ -447,36 +409,6 @@ pub const DISK_WARN_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Disk space critical threshold in bytes (500 MB).
 pub const DISK_CRITICAL_THRESHOLD_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Legacy double-sign slash constant, in basis points.
-/// 1000 bps = 10% of stake burned.
-///
-/// ## Slashing and liveness-penalty philosophy
-///
-/// INDRA distinguishes explicit slash evidence from liveness penalties.
-///
-/// Explicit slash evidence is reserved for unambiguous consensus-safety
-/// violations: signing conflicting precommits or a surround vote. These
-/// evidence-based slashes can carry larger penalties and may change validator
-/// lifecycle status.
-///
-/// Offline validators are not subject to that explicit equivocation-evidence
-/// slashing path merely for downtime. However, persistent inactivity is not
-/// consequence-free: after `SLASH_LIVENESS_THRESHOLD_EPOCHS` missed epochs,
-/// `apply_liveness_penalties` reduces the validator's stake by
-/// `SLASH_LIVENESS_BPS` and burns the same amount from total supply at each
-/// penalised epoch transition.
-///
-/// Rationale:
-/// - Brief downtime loses rewards but does not trigger evidence-based
-///   equivocation slashing.
-/// - Persistent downtime eventually carries a small, compounding liveness
-///   penalty so inactive validators cannot remain in the active set with no
-///   stake consequence.
-/// - The terminology is intentionally narrower than "no stake can ever be
-///   burned for downtime": liveness penalties do burn stake/supply, but they
-///   are distinct from explicit malicious-equivocation slash evidence.
-pub const SLASH_DOUBLE_SIGN_BPS: u32 = 1_000;
-
 /// Initial base fee in Spark per KB.
 pub const INITIAL_BASE_FEE_SPARK_PER_KB: u64 = 100;
 
@@ -497,23 +429,9 @@ pub const TARGET_UTILISATION_DENOMINATOR: u64 = 100;
 
 // ── Governance ────────────────────────────────────────────────────────────────
 
-/// Deprecated legacy governance YES-stake threshold constant.
-///
-/// Current governance uses `GovernableParams::governance_quorum_bps` and
-/// `governance_critical_quorum_bps` as YES-stake thresholds over total
-/// proposal snapshot stake instead.
-#[deprecated(note = "superseded by GovernableParams governance YES-stake threshold fields")]
-pub const QUORUM_THRESHOLD_BPS: u32 = 3_300;
 /// Consensus quorum threshold — strictly more than 2/3 of stake must agree
 /// for a block to be finalised.
 pub const CONSENSUS_QUORUM_BPS: u32 = 6_667;
-
-/// Deprecated legacy governance pass threshold.
-///
-/// Current governance requires yes stake to exceed the per-proposal total-stake
-/// threshold in `GovernableParams`.
-#[deprecated(note = "superseded by GovernableParams governance YES-stake threshold fields")]
-pub const PASS_THRESHOLD_BPS: u32 = 6_600; // reduced from 8000 — 80% impossible at 500+ validators
 
 /// Minimum validator commission rate in basis points (500 = 5%).
 /// Validators cannot undercut this — prevents race-to-zero on delegator fees.
@@ -532,25 +450,10 @@ pub const DEFAULT_COMMISSION_BPS: u32 = 1_000;
 /// new commission rate affects reward distribution.
 pub const COMMISSION_CHANGE_DELAY_EPOCHS: u64 = 2;
 
-/// Veto threshold — if this fraction of total stake votes No, the proposal fails
-/// regardless of the yes percentage. Prevents minority capture via voter apathy.
-/// A coordinated third of stake can block any proposal (lazy-majority attack defence).
-pub const VETO_THRESHOLD_BPS: u32 = 3_300;
-/// Minimum validator commission rate in basis points (500 = 5%).
-/// Validators cannot undercut this — prevents race-to-zero on delegator fees.
-/// Veto threshold — if this fraction of total stake votes No, the proposal fails
-/// regardless of the yes percentage. Prevents minority capture via voter apathy.
-/// At 33%: a coordinated 1/3 of stake can block any proposal (lazy-majority attack defence).
-/// Required YES fraction of total stake for emergency proposals (9000 = 90.00%).
-pub const EMERGENCY_PASS_BPS: u32 = 9_000;
-
 /// Epochs before governance changes take effect.
 pub const GOVERNANCE_DELAY_EPOCHS: u64 = 100;
 
 // ── Networking ────────────────────────────────────────────────────────────────
-
-/// Minimum outbound peer connections.
-pub const MIN_OUTBOUND_PEERS: usize = 8;
 
 /// Default DNS seed hostname for peer discovery.
 pub const DNS_SEED_HOST: &str = "seeds.indraprotocol.com";
@@ -572,9 +475,6 @@ pub const PEER_LIST_INTERVAL_SECS: u64 = 60;
 /// Target number of outbound connections to maintain.
 pub const TARGET_OUTBOUND_PEERS: usize = 8;
 
-/// Maximum outbound peer connections.
-pub const MAX_OUTBOUND_PEERS: usize = 16;
-
 /// Maximum inbound peer connections.
 pub const MAX_INBOUND_PEERS: usize = 64;
 
@@ -595,18 +495,6 @@ pub const OBSERVER_PONG_TIMEOUT_SECS: u64 = 10;
 
 /// Peer table persistence interval (seconds).
 pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
-
-/// Maximum messages per second from one peer before rate limiting.
-pub const MAX_MSG_PER_SEC: u32 = 100;
-
-/// Maximum bytes per second from one peer.
-pub const MAX_BYTES_PER_SEC: u32 = 5_242_880; // 5 MB/s
-
-/// Epochs a banned peer remains banned.
-pub const BAN_DURATION_EPOCHS: u64 = 10;
-
-/// Block pruning window in epochs.
-pub const PRUNE_WINDOW_EPOCHS: u64 = 500;
 
 // ── Protocol Version ──────────────────────────────────────────────────────────
 
@@ -747,11 +635,6 @@ impl<const MAX: usize> VariableBytes<MAX> {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
-
-    /// Consume and return the inner Vec.
-    pub fn into_vec(self) -> Vec<u8> {
-        self.0
-    }
 }
 
 impl<const MAX: usize> Encode for VariableBytes<MAX> {
@@ -786,13 +669,6 @@ pub struct ProtocolVersion(pub u16);
 impl ProtocolVersion {
     /// The canonical baseline version emitted by this implementation.
     pub const CURRENT: Self = Self(BLOCK_FORMAT_VERSION);
-
-    /// True if this version is supported.
-    pub fn is_supported(&self) -> bool {
-        self.0 == PROTOCOL_VERSION
-            || self.0 == TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES
-            || self.0 == BLOCK_FORMAT_VERSION
-    }
 }
 
 impl Encode for ProtocolVersion {

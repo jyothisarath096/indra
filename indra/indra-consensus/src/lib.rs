@@ -59,5 +59,5 @@ pub use proposer::{
     compute_fallback_election_result, elect_proposer, elect_proposer_from_reveals,
     ProposerElection, SlotResult, VRF_FALLBACK_OUTPUT,
 };
-pub use qc::{build_qc, qc_signing_bytes, verify_qc, verify_qc_strict, QcBuilder};
+pub use qc::{build_qc, verify_qc, verify_qc_strict, QcBuilder};
 pub use vote::{produce_vote, VoteCollector, VoteDecision};

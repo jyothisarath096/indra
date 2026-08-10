@@ -14,10 +14,7 @@ use std::sync::{
 
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
-    types::{
-        block::BlockV1,
-        primitives::{DEFAULT_PRUNE_KEEP_BLOCKS, MIN_PRUNE_KEEP_BLOCKS},
-    },
+    types::{block::BlockV1, primitives::MIN_PRUNE_KEEP_BLOCKS},
 };
 
 use crate::{
@@ -42,12 +39,6 @@ pub struct PruneConfig {
 }
 
 impl PruneConfig {
-    /// Default validator retention.
-    pub fn default_validator() -> Self {
-        Self {
-            keep_blocks: Some(DEFAULT_PRUNE_KEEP_BLOCKS),
-        }
-    }
     /// Archive mode retains every segment.
     pub fn archive() -> Self {
         Self { keep_blocks: None }

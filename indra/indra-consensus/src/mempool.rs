@@ -511,13 +511,6 @@ impl Mempool {
             .collect()
     }
 
-    /// True if the mempool contains at least one transaction whose fee rate
-    /// currently meets this mempool's admission threshold.
-    pub fn has_fee_eligible_transactions(&self, current_base_fee: u64) -> bool {
-        let min_fee = current_base_fee.saturating_mul(self.config.min_fee_ratio_bps) / 10_000;
-        self.entries.values().any(|entry| entry.fee_rate >= min_fee)
-    }
-
     /// Check whether a transaction is present.
     pub fn contains(&self, tx_id: &Bytes32) -> bool {
         self.entries.contains_key(tx_id)

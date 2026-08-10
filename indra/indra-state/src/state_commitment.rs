@@ -145,22 +145,12 @@ impl StateCommitmentV2 {
         );
     }
 
-    /// Delete a validator leaf.
-    pub fn delete_validator(&mut self, validator_id: &Bytes32) {
-        self.tree.delete(validator_key(validator_id));
-    }
-
     /// Insert or replace a staking nonce leaf.
     pub fn put_staking_nonce(&mut self, signer_id: &Bytes32, nonce: u64) {
         self.tree.insert(
             staking_nonce_key(signer_id),
             staking_nonce_value_hash(signer_id, nonce),
         );
-    }
-
-    /// Delete a staking nonce leaf.
-    pub fn delete_staking_nonce(&mut self, signer_id: &Bytes32) {
-        self.tree.delete(staking_nonce_key(signer_id));
     }
 
     /// Insert or replace a canonical stake-position leaf.

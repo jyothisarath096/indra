@@ -16,12 +16,9 @@ legacy_raw_keys = []
 [dependencies]
 indra-core         = { path = "../indra-core" }
 indra-crypto       = { path = "../indra-crypto" }
-indra-state        = { path = "../indra-state" }
 indra-bulletproofs = { path = "../indra-bulletproofs" }
 indra-cli          = { path = "../indra-cli" }
-bip39.workspace    = true
 hex                = { version = "0.4", default-features = false, features = ["alloc"] }
-rand               = { version = "0.8", default-features = false, features = ["std"] }
 serde_json         = "1"
 zeroize.workspace  = true
 

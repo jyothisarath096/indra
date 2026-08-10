@@ -249,17 +249,8 @@ fn required_arg(args: &[String], flag: &str) -> String {
 mod tests {
     use super::*;
     use indra_cli::tx_builder::MIN_FEE_SPARK;
-    use indra_core::{
-        codec::Decode,
-        types::{
-            primitives::VariableBytes,
-            transaction::{OutputV1, TransactionV1},
-        },
-    };
-    use indra_crypto::{
-        commitment::verify_balance, hybrid::ClassicalKeypair, pedersen::commit, PedersenCommitment,
-        PqKeypair,
-    };
+    use indra_core::types::{primitives::VariableBytes, transaction::OutputV1};
+    use indra_crypto::{hybrid::ClassicalKeypair, PqKeypair};
 
     #[test]
     fn indra_tx_send_uses_shared_exact_indra_amount_parser() {
@@ -323,25 +314,6 @@ mod tests {
                 pq_pk: VariableBytes::from_slice(&pq_pk.0).unwrap(),
             },
         )
-    }
-
-    fn pubkey_hex(pubkey: &HybridPubKey) -> String {
-        format!(
-            "{}:{}",
-            hex::encode(pubkey.classical_pk.0),
-            hex::encode(pubkey.pq_pk.as_slice())
-        )
-    }
-
-    fn decode_built_tx(built: &indra_cli::BuiltTransaction) -> TransactionV1 {
-        TransactionV1::decode_exact(&hex::decode(&built.tx_hex).unwrap()).unwrap()
-    }
-
-    fn output_commitments(outputs: &[OutputV1]) -> Vec<PedersenCommitment> {
-        outputs
-            .iter()
-            .map(|output| PedersenCommitment(output.commitment.compressed_point.0))
-            .collect()
     }
 
     fn sample_output(value_spark: u64) -> OutputV1 {

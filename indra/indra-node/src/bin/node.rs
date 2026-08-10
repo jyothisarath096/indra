@@ -5666,7 +5666,6 @@ mod tests {
         for (left, right) in left.candidates.iter().zip(&right.candidates) {
             assert_eq!(left.validator_id, right.validator_id);
             assert_eq!(left.vrf_pubkey, right.vrf_pubkey);
-            assert_eq!(left.verified_vrf_output, right.verified_vrf_output);
             assert_eq!(left.stake, right.stake);
         }
     }

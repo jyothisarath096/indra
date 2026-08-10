@@ -290,7 +290,6 @@ mod tests {
             candidates: vec![crate::proposer::ProposerCandidate {
                 validator_id,
                 vrf_pubkey: vrf_pubkey,
-                verified_vrf_output: None,
                 stake,
             }],
         }
@@ -552,13 +551,11 @@ mod tests {
                 crate::proposer::ProposerCandidate {
                     validator_id: id_a,
                     vrf_pubkey: vrf_a.public_key(),
-                    verified_vrf_output: None,
                     stake: 1_000_000,
                 },
                 crate::proposer::ProposerCandidate {
                     validator_id: id_b,
                     vrf_pubkey: vrf_b.public_key(),
-                    verified_vrf_output: None,
                     stake: 1_000_000,
                 },
             ],

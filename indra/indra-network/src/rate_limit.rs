@@ -123,17 +123,6 @@ impl MessageClass {
         }
     }
 
-    /// True for consensus messages whose legitimate volume is bounded by
-    /// protocol slots rather than wall-clock message rate.
-    ///
-    /// These messages must not trigger punitive count-bucket penalties:
-    /// the consensus driver already enforces one vote/commit/reveal per
-    /// validator slot, and banning authenticated validators for duplicate
-    /// gossip can fragment BFT liveness.
-    pub fn is_consensus_slot_message(self) -> bool {
-        matches!(self, Self::Vote | Self::VrfElection)
-    }
-
     /// True for messages that authenticated validator peers must be able to
     /// send during consensus, sync, and recovery without punitive count-bucket
     /// ban risk. These classes may still be subject to byte-budget protection.

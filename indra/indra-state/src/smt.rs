@@ -21,7 +21,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use indra_core::types::primitives::Bytes32;
 use indra_crypto::sha256;
 
 /// Total depth of the sparse tree.
@@ -1027,11 +1026,6 @@ fn set_bit(bytes: &mut [u8; 32], bit_index: usize, value: bool) {
             *byte &= !(1u8 << bit_offset);
         }
     }
-}
-
-/// Convert a 32-byte root hash into `Bytes32`.
-pub fn as_bytes32(hash: [u8; 32]) -> Bytes32 {
-    Bytes32::from(hash)
 }
 
 #[cfg(test)]

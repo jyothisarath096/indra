@@ -15,8 +15,6 @@ pub struct ProposerCandidate {
     pub validator_id: Bytes32,
     /// Validator's VRF public key.
     pub vrf_pubkey: [u8; 32],
-    /// Verified VRF output for this exact election slot, when available.
-    pub verified_vrf_output: Option<VrfOutput>,
     /// Validator's stake in Spark.
     pub stake: u64,
 }
@@ -92,17 +90,6 @@ pub fn election_score(vrf_output: &VrfOutput, validator_stake: u64, total_stake:
     let score =
         (output_val as u128).saturating_mul(total_stake as u128) / (validator_stake as u128);
     score.min(u64::MAX as u128) as u64
-}
-
-/// Compute the deterministic public election output for a candidate.
-///
-/// This is derived only from the public VRF key and election input, so every
-/// node can reproduce the same ordering without access to any validator seed.
-pub fn candidate_output(vrf_pubkey: &[u8; 32], vrf_input: &[u8; 32]) -> VrfOutput {
-    let mut data = Vec::with_capacity(vrf_pubkey.len() + vrf_input.len());
-    data.extend_from_slice(vrf_pubkey);
-    data.extend_from_slice(vrf_input);
-    VrfOutput(sha256(&data))
 }
 
 /// Compute a deterministic public proposer score for a candidate.
@@ -265,7 +252,6 @@ mod tests {
         ProposerCandidate {
             validator_id: Bytes32::from([id_byte; 32]),
             vrf_pubkey: VrfKeypair::from_seed(&[id_byte; 32]).public_key(),
-            verified_vrf_output: None,
             stake,
         }
     }
@@ -392,31 +378,6 @@ mod tests {
         let keypair = VrfKeypair::from_seed(&[0x11u8; 32]);
         let slot = compute_proposer_vrf(validator_id, &keypair, &Bytes32::from([0x22u8; 32]), 7, 0);
         assert_eq!(slot.proposer_id, validator_id);
-    }
-
-    #[test]
-    fn elect_proposer_returns_same_winner_regardless_of_verified_vrf_output() {
-        let mut candidates_with_verified = vec![
-            candidate(0x01, 1_000_000),
-            candidate(0x02, 1_000_000),
-            candidate(0x03, 1_000_000),
-            candidate(0x04, 1_000_000),
-        ];
-        candidates_with_verified[2].verified_vrf_output = Some(VrfOutput([0u8; 32]));
-
-        let election_with_verified = election(candidates_with_verified);
-        let election_without_verified = election(vec![
-            candidate(0x01, 1_000_000),
-            candidate(0x02, 1_000_000),
-            candidate(0x03, 1_000_000),
-            candidate(0x04, 1_000_000),
-        ]);
-
-        assert_eq!(
-            elect_proposer(&election_with_verified, election_with_verified.height).unwrap(),
-            elect_proposer(&election_without_verified, election_without_verified.height).unwrap(),
-            "verified_vrf_output must not affect public deterministic election"
-        );
     }
 
     #[test]

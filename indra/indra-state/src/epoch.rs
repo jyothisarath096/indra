@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use indra_core::{
     types::primitives::{
-        bps_of, muldiv, Bytes32, BLOCKS_PER_YEAR, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
+        bps_of, muldiv, Bytes32, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
         ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
         ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
         SATURATION_MIN_VALIDATORS,
@@ -36,9 +36,6 @@ use crate::{
     governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
     validator::ValidatorStatus,
 };
-
-/// Number of epochs per year (5,256,000 blocks/year / 300 blocks/epoch).
-pub const EPOCHS_PER_YEAR: u64 = BLOCKS_PER_YEAR / EPOCH_DURATION_BLOCKS;
 
 /// Immutable, derived facts for one epoch-boundary state transition.
 ///

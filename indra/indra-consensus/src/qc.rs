@@ -36,23 +36,6 @@ pub struct QcValidator {
     pub stake: u64,
 }
 
-/// Canonical QC signing bytes.
-///
-/// Kept for compatibility with existing tests and callers. Individual PQ vote
-/// signatures still verify against `vote_signing_bytes`, which binds the
-/// validator identity.
-pub fn qc_signing_bytes(height: u64, round: u32, block_hash: &Bytes32, chain_id: &str) -> Vec<u8> {
-    vote_signing_bytes(
-        height,
-        round,
-        VoteStep::Precommit,
-        block_hash,
-        &Bytes32::ZERO,
-        None,
-        chain_id,
-    )
-}
-
 /// A QC builder — accumulates votes and builds the QC when quorum is reached.
 pub struct QcBuilder {
     height: u64,

@@ -18,11 +18,6 @@ pub use indra_keystore::{
     KeystoreError, PasswordSource, ValidatorKeys,
 };
 
-/// Convert a keystore result into the CLI error type.
-pub fn map_keystore<T>(result: indra_keystore::KeystoreResult<T>) -> CliResult<T> {
-    result.map_err(CliError::from)
-}
-
 /// Resolve the standard CLI key-password source.
 pub fn password_source_from_args<'a>(args: &'a [String]) -> PasswordSource<'a> {
     if let Some(path) = arg_value(args, "--keys-password-file") {

@@ -53,12 +53,8 @@ pub const PAYMENT_NOTE_V1_BYTES: usize = PAYMENT_NOTE_V1_ENCODED_LEN;
 pub const INDRA_OP_HEX_MAX_BYTES: usize = 32768;
 /// Length of a validator ID.
 pub const INDRA_VALIDATOR_ID_BYTES: usize = 32;
-/// Length of a UTXO ID.
-pub const INDRA_UTXO_ID_BYTES: usize = 32;
 /// Length of a VRF public key.
 pub const INDRA_VRF_PK_BYTES: usize = 32;
-/// Length of a proposal ID.
-pub const INDRA_PROPOSAL_ID_BYTES: usize = 32;
 /// Maximum number of UTXOs allowed in a single transaction.
 pub const MAX_UTXO_COUNT: usize = 100;
 /// Maximum byte length of a serialized transaction.

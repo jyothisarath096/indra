@@ -846,21 +846,15 @@ dependencies = [
  "rand 0.8.6",
  "rand_core 0.6.4",
  "sha2",
- "subtle",
- "thiserror 1.0.69",
- "zeroize",
 ]
 
 [[package]]
 name = "indra-cli"
 version = "0.1.0"
 dependencies = [
- "bip39",
  "blake3",
  "curve25519-dalek",
  "hex",
- "indra-bulletproofs",
- "indra-consensus",
  "indra-core",
  "indra-crypto",
  "indra-keystore",
@@ -921,15 +915,12 @@ dependencies = [
 name = "indra-ffi"
 version = "0.1.0"
 dependencies = [
- "bip39",
  "cc",
  "hex",
  "indra-bulletproofs",
  "indra-cli",
  "indra-core",
  "indra-crypto",
- "indra-state",
- "rand 0.8.6",
  "serde_json",
  "zeroize",
 ]
@@ -971,7 +962,6 @@ dependencies = [
  "fs2",
  "hex",
  "hickory-resolver",
- "indra-bulletproofs",
  "indra-consensus",
  "indra-core",
  "indra-crypto",
@@ -994,7 +984,6 @@ name = "indra-rpc"
 version = "0.1.0"
 dependencies = [
  "hex",
- "indra-consensus",
  "indra-core",
  "indra-crypto",
  "indra-network",

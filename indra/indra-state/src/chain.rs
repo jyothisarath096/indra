@@ -34,15 +34,6 @@ use crate::{
     validator::{EvictedValidatorTombstoneV2, ValidatorSet},
 };
 
-/// Defensive snapshot decode ceiling for staked-bond entries.
-///
-/// This must not be lower than the validator/delegator state that the protocol
-/// itself can accept: every retained delegator position may have at least one
-/// corresponding bonded UTXO. The guard remains finite so corrupted snapshots
-/// cannot request unbounded decode work.
-pub const MAX_STAKED_BONDS_DECODE: usize = indra_core::types::primitives::MAX_VALIDATORS
-    .saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR);
-
 /// Defensive snapshot decode ceiling for staking nonce entries.
 ///
 /// Staking nonces are keyed by staking signer identity: validator identities

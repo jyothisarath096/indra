@@ -41,13 +41,6 @@ pub fn compute_nullifier(secret_key_bytes: &[u8], utxo_id: &[u8; 32]) -> [u8; 32
     h.finalize().into()
 }
 
-/// Derive the epoch randomness seed from the previous epoch's block hash.
-///
-/// epoch_seed(n) = SHA-256(finalised_block_hash(epoch n-1))
-pub fn derive_epoch_seed(prev_epoch_block_hash: &[u8; 32]) -> [u8; 32] {
-    sha256(prev_epoch_block_hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,8 +131,6 @@ pub mod domains {
     pub const VOTE_SIGN: &[u8] = b"INDRA-VOTE-SIGN-v1";
     /// Hash domain for nullifier derivation.
     pub const NULLIFIER: &[u8] = b"INDRA-NULLIFIER-v1";
-    /// Hash domain for validator ID derivation.
-    pub const VALIDATOR_ID: &[u8] = b"INDRA-VALIDATOR-ID-v1";
     /// Hash domain for VRF input derivation.
     pub const VRF_INPUT: &[u8] = b"INDRA-VRF-INPUT-v1";
 }

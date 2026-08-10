@@ -6,10 +6,8 @@
 use crate::error::{IndraError, IndraResult};
 
 pub mod reader;
-pub mod writer;
 
 pub use reader::ByteReader;
-pub use writer::ByteWriter;
 
 // ── Core traits ───────────────────────────────────────────────────────────────
 

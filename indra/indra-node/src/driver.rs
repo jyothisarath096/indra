@@ -799,16 +799,6 @@ impl ConsensusDriver {
         self.last_qc_bytes.clear();
     }
 
-    /// Clear cached QC bytes when they no longer certify the local tip.
-    pub fn clear_last_qc_if_stale(&mut self) -> bool {
-        if self.last_qc_is_stale() {
-            self.clear_last_qc_bytes();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Proposal eligibility is enforced inside block construction, where the
     /// node can see the exact height and QC bytes being embedded.
     pub fn can_propose(&self) -> bool {
@@ -853,12 +843,6 @@ impl ConsensusDriver {
     pub fn has_accepted_proposal_for_height(&self, height: u64) -> bool {
         self.pending_block_for_slot(height, self.current_round)
             .is_some()
-    }
-
-    /// External compatibility hook used by the node loop.
-    pub fn advance_round(&mut self) {
-        self.prune_future_proposals();
-        self.start_round(self.current_round.saturating_add(1));
     }
 
     /// External compatibility hook used after height advancement.
@@ -988,7 +972,6 @@ impl ConsensusDriver {
                     .map(|vrf_pubkey| indra_consensus::proposer::ProposerCandidate {
                         validator_id: validator.validator_id,
                         vrf_pubkey,
-                        verified_vrf_output: None,
                         stake: validator.stake_spark,
                     })
             })
@@ -3540,7 +3523,7 @@ mod tests {
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut genesis = format!(
+        let genesis = format!(
             "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
@@ -4308,7 +4291,6 @@ mod tests {
                 v.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: v.validator_id,
                     vrf_pubkey: vrf_pk,
-                    verified_vrf_output: None,
                     stake: v.stake_spark,
                 })
             })
@@ -4427,7 +4409,6 @@ mod tests {
                     .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                         validator_id: v.validator_id,
                         vrf_pubkey: vrf_pk,
-                        verified_vrf_output: None,
                         stake: v.stake_spark,
                     })
             })
@@ -7664,7 +7645,6 @@ mod tests {
                         .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                             validator_id: v.validator_id,
                             vrf_pubkey: vrf_pk,
-                            verified_vrf_output: None,
                             stake: v.stake_spark,
                         })
                 })
@@ -7731,7 +7711,6 @@ mod tests {
                         .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                             validator_id: v.validator_id,
                             vrf_pubkey: vrf_pk,
-                            verified_vrf_output: None,
                             stake: v.stake_spark,
                         })
                 })
@@ -7786,7 +7765,6 @@ mod tests {
                         .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                             validator_id: v.validator_id,
                             vrf_pubkey: vrf_pk,
-                            verified_vrf_output: None,
                             stake: v.stake_spark,
                         })
                 })
@@ -9907,7 +9885,6 @@ mod tests {
                     .map(|vrf_pk| indra_consensus::proposer::ProposerCandidate {
                         validator_id: v.validator_id,
                         vrf_pubkey: vrf_pk,
-                        verified_vrf_output: None,
                         stake: v.stake_spark,
                     })
             })

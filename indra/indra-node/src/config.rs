@@ -299,11 +299,6 @@ impl NodeConfig {
         self.data_dir.join("state")
     }
 
-    /// Path to the mempool WAL file.
-    pub fn wal_path(&self) -> PathBuf {
-        self.data_dir.join("mempool.wal")
-    }
-
     /// Pruning configuration derived from this node config.
     pub fn prune_config(&self) -> PruneConfig {
         match self.prune_keep_blocks {

@@ -867,7 +867,6 @@ fn verify_proposer_vrf_key_ownership(
                 validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: validator.validator_id,
                     vrf_pubkey: vrf_pk,
-                    verified_vrf_output: None,
                     stake: validator.stake_spark,
                 })
             })
@@ -1056,7 +1055,6 @@ pub(crate) fn verify_reveal_set_evidence(
                 validator.vrf_pk.map(|vrf_pubkey| ProposerCandidate {
                     validator_id: validator.validator_id,
                     vrf_pubkey,
-                    verified_vrf_output: None,
                     stake: validator.stake_spark,
                 })
             })
@@ -1278,16 +1276,6 @@ pub struct PreparedSyncBlock {
     pub(crate) state: ChainState,
     pub(crate) epoch_record: Option<EpochRecord>,
     pub(crate) effects: CanonicalStateEffects,
-    // Retained for debug/test defense-in-depth assertions after committing the
-    // verified projection. Release builds skip those assertions, so these fields
-    // are intentionally release-dead even though the values are consumed when
-    // debug assertions are enabled.
-    #[allow(dead_code)]
-    pub(crate) state_root: Bytes32,
-    #[allow(dead_code)]
-    pub(crate) validator_set_root: Bytes32,
-    #[allow(dead_code)]
-    pub(crate) value_hash: Bytes32,
 }
 
 pub(crate) fn project_and_verify_block_state_root(
@@ -1356,13 +1344,10 @@ pub(crate) fn project_and_verify_block_state_root(
         state: projected,
         epoch_record,
         effects: outcome.effects,
-        state_root: actual_roots.state_root,
-        validator_set_root: actual_roots.validator_set_root,
-        value_hash: actual_value_hash,
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
     project_and_verify_block_state_root(block, state, 0).map(|_| ())
 }
@@ -1493,7 +1478,6 @@ mod tests {
                 validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: validator.validator_id,
                     vrf_pubkey: vrf_pk,
-                    verified_vrf_output: None,
                     stake: validator.stake_spark,
                 })
             })
@@ -1913,9 +1897,15 @@ mod tests {
                 project_and_verify_block_state_root(&block, &state, 1_900_000_000).unwrap();
             assert_eq!(optimized.epoch_record, old_epoch_record);
             assert_eq!(optimized.state, old_reference);
-            assert_eq!(optimized.state_root, old_state_root);
-            assert_eq!(optimized.validator_set_root, old_validator_set_root);
-            assert_eq!(optimized.value_hash, old_value_hash);
+            assert_eq!(compute_state_root(&optimized.state), old_state_root);
+            assert_eq!(
+                compute_validator_set_root(&optimized.state),
+                old_validator_set_root
+            );
+            assert_eq!(
+                block.compute_value_hash(optimized.state.total_supply),
+                old_value_hash
+            );
 
             state = optimized.state;
             prev_qc = build_qc_bytes(
@@ -2347,9 +2337,6 @@ mod tests {
             state,
             epoch_record: None,
             effects: CanonicalStateEffects::default(),
-            state_root: Bytes32::ZERO,
-            validator_set_root: Bytes32::ZERO,
-            value_hash: Bytes32::ZERO,
         };
         sync.stage_provisional(block, prepared, Bytes32::from([3; 32]), peer, now);
 

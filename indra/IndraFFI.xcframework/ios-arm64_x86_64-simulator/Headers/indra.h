@@ -30,9 +30,7 @@ extern "C" {
 #define INDRA_PQ_PK_BYTES       2592
 #define INDRA_PQ_SK_BYTES         32
 #define INDRA_VALIDATOR_ID_BYTES  32
-#define INDRA_UTXO_ID_BYTES       32
 #define INDRA_VRF_PK_BYTES        32
-#define INDRA_PROPOSAL_ID_BYTES   32
 #define INDRA_BYTES32_LEN         32
 #define INDRA_TX_ID_BYTES         32
 #define INDRA_MNEMONIC_MAX_BYTES 300

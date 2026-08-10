@@ -640,14 +640,7 @@ mod tests {
     use indra_core::codec::Decode;
     use indra_core::types::primitives::{Bytes32, DEFAULT_CHAIN_ID};
     use indra_core::types::transaction::TransactionV1;
-    use indra_crypto::{
-        hybrid::{
-            verify_hybrid, ClassicalSignature, HybridSignature as CryptoHybridSignature,
-            PqSignature,
-        },
-        payment_x25519_shared_secret, recipient_derive_payment_blinding_v1, PaymentBlindingNoteV1,
-        PaymentKeypairV1, PAYMENT_BLINDING_CONTEXT_V1,
-    };
+    use indra_crypto::{recipient_derive_payment_blinding_v1, PaymentKeypairV1};
 
     fn make_wallet_with_funds() -> (Wallet, [u8; 32], Vec<u8>, HybridPubKey) {
         let seed = [0x42u8; 32];
@@ -687,40 +680,6 @@ mod tests {
     fn decode_built_tx(built: &BuiltTransaction) -> TransactionV1 {
         let bytes = hex::decode(&built.tx_hex).unwrap();
         TransactionV1::decode_exact(&bytes).unwrap()
-    }
-
-    fn pubkey_hex(pubkey: &HybridPubKey) -> String {
-        format!(
-            "{}:{}",
-            hex::encode(pubkey.classical_pk.0),
-            hex::encode(pubkey.pq_pk.as_slice())
-        )
-    }
-
-    fn direct_blinding_oracle(
-        note: &PaymentBlindingNoteV1,
-        x_secret: [u8; 32],
-        kem_secret: [u8; 32],
-        chain_id: &[u8],
-        output_index: u32,
-        value_spark: u64,
-        lock_height: u64,
-    ) -> [u8; 32] {
-        let chain_id_len = u16::try_from(chain_id.len()).unwrap();
-        let mut ikm = Vec::new();
-        ikm.extend_from_slice(&x_secret);
-        ikm.extend_from_slice(&kem_secret);
-        ikm.extend_from_slice(&chain_id_len.to_le_bytes());
-        ikm.extend_from_slice(chain_id);
-        ikm.extend_from_slice(&note.owner_id);
-        ikm.extend_from_slice(&note.payment_pubkey_hash);
-        ikm.extend_from_slice(&output_index.to_le_bytes());
-        ikm.extend_from_slice(&value_spark.to_le_bytes());
-        ikm.extend_from_slice(&lock_height.to_le_bytes());
-        ikm.extend_from_slice(&note.sender_x25519_ephemeral_pk);
-        ikm.extend_from_slice(&note.ml_kem_1024_ciphertext);
-        ikm.extend_from_slice(&note.note_nonce);
-        blake3::derive_key(PAYMENT_BLINDING_CONTEXT_V1, &ikm)
     }
 
     fn deposit_proof(byte: u8, value: u64) -> StakeDepositProof {

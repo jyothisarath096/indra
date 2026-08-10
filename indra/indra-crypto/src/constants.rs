@@ -20,9 +20,6 @@ pub const PQ_PK_BYTES: usize = 2_592;
 /// INDRA stores the canonical 32-byte seed, not the expanded signing key.
 pub const PQ_SK_BYTES: usize = 32;
 
-/// Maximum ECVRF proof size in bytes.
-pub const VRF_PROOF_BYTES: usize = 1_024;
-
 /// X25519 public key size in bytes.
 pub const X25519_PK_BYTES: usize = 32;
 

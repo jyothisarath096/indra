@@ -698,8 +698,7 @@ fn print_nonce_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_cli::{generate_from_master_seed, ColdKeysFile};
-    use indra_crypto::hybrid::ColdHybridKeypair;
+    use indra_cli::generate_from_master_seed;
 
     #[test]
     fn parse_bytes32_accepts_32_byte_hex() {

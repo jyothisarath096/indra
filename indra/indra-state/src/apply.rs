@@ -582,12 +582,6 @@ pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
     Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
 }
 
-/// Hash an unproven equivocation pair while it is held in the node-local
-/// pending pool. Only `SlashEvidenceV2` is accepted by blocks/state transition.
-pub fn compute_pending_slash_evidence_hash(evidence: &SlashEvidenceV1) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
-}
-
 fn derive_slash_reward_blinding(evidence_hash: &Bytes32, block_height: u64) -> [u8; 32] {
     let mut data = b"INDRA-SLASH-REWARD-BLINDING-v1".to_vec();
     data.extend_from_slice(&evidence_hash.0);

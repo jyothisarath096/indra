@@ -84,7 +84,6 @@ fn make_strict_block(
             validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                 validator_id: validator.validator_id,
                 vrf_pubkey: vrf_pk,
-                verified_vrf_output: None,
                 stake: validator.stake_spark,
             })
         })
@@ -287,7 +286,7 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
     let cold_public = cold_public.as_complete_hybrid();
     let validator_id = indra_crypto::sha256(&classical.public_key().0);
     let genesis_path = dir.join("genesis.toml");
-    let mut genesis = format!(
+    let genesis = format!(
         "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
         name,
         hex::encode(validator_id),

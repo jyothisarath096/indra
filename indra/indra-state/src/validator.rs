@@ -22,15 +22,6 @@ const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 1;
 /// decode on restart or sync.
 pub const MAX_DELEGATORS_PER_VALIDATOR: usize = 100_000;
 
-/// Defensive snapshot decode ceiling for delegators under one validator.
-///
-/// This intentionally matches the live write cap so state that can be accepted
-/// during normal operation can always be decoded later from persisted snapshots.
-pub const MAX_DELEGATORS_PER_VALIDATOR_DECODE: usize = MAX_DELEGATORS_PER_VALIDATOR;
-
-/// Maximum unresolved validator self-bonds migrated by one enrollment.
-pub const MAX_ATOMIC_COLD_KEY_MIGRATION_SELF_BONDS: usize = 4_096;
-
 /// Lifecycle status of a validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidatorStatus {

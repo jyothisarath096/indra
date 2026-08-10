@@ -116,7 +116,6 @@ pub struct NodeEngine {
     /// State snapshot store.
     pub state_store: StateStore,
     /// The validator's hybrid keypair (if this is a validator node).
-    #[allow(dead_code)] // retained for future local signing flows
     hybrid_keypair: Option<HybridKeypair>,
     /// The validator's VRF keypair.
     vrf_keypair: Option<VrfKeypair>,
@@ -619,11 +618,6 @@ impl NodeEngine {
     /// Load the last committed QC bytes persisted on disk, if any.
     pub fn load_persisted_qc(&self) -> NodeResult<Option<Vec<u8>>> {
         indra_storage::load_last_qc(&self.config.state_dir()).map_err(NodeError::Storage)
-    }
-
-    /// True if this node has a local VRF keypair loaded.
-    pub fn has_vrf_keypair(&self) -> bool {
-        self.vrf_keypair.is_some()
     }
 
     /// Rebuild the current chain state by replaying the block log on top of a
@@ -1531,17 +1525,6 @@ impl NodeEngine {
             .map_err(NodeError::Consensus)
     }
 
-    /// Sign a consensus vote with this node's validator keypair.
-    pub fn sign_vote(
-        &self,
-        height: u64,
-        round: u32,
-        step: VoteStep,
-        block_hash: Bytes32,
-    ) -> NodeResult<indra_core::types::vote::VoteV1> {
-        self.sign_vote_with_election_result(height, round, step, block_hash, None)
-    }
-
     /// Sign a local vote with an optional commit-reveal election result hash.
     pub fn sign_vote_with_election_result(
         &self,
@@ -1981,7 +1964,7 @@ mod tests {
         let cold_public = cold_public.as_complete_hybrid();
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
-        let mut genesis = format!(
+        let genesis = format!(
             "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
@@ -2390,7 +2373,6 @@ mod tests {
                 validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                     validator_id: validator.validator_id,
                     vrf_pubkey: vrf_pk,
-                    verified_vrf_output: None,
                     stake: validator.stake_spark,
                 })
             })
@@ -4023,7 +4005,7 @@ mod tests {
         let cold_public = cold.public_key();
         let validator_id = indra_crypto::sha256(&classical.public_key().0);
         let genesis_path = dir.join("genesis.toml");
-        let mut genesis = format!(
+        let genesis = format!(
             "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
@@ -4061,7 +4043,6 @@ mod tests {
             candidates: vec![indra_consensus::proposer::ProposerCandidate {
                 validator_id: candidate.validator_id,
                 vrf_pubkey: candidate.vrf_pk.unwrap(),
-                verified_vrf_output: None,
                 stake: candidate.stake_spark,
             }],
         };
@@ -4089,7 +4070,6 @@ mod tests {
             candidates: vec![ProposerCandidate {
                 validator_id: candidate.validator_id,
                 vrf_pubkey: candidate.vrf_pk.unwrap(),
-                verified_vrf_output: None,
                 stake: candidate.stake_spark,
             }],
         };
@@ -4154,7 +4134,6 @@ mod tests {
             candidates: vec![ProposerCandidate {
                 validator_id: candidate.validator_id,
                 vrf_pubkey: candidate.vrf_pk.unwrap(),
-                verified_vrf_output: None,
                 stake: candidate.stake_spark,
             }],
         };
@@ -4205,7 +4184,6 @@ mod tests {
                         validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
                             validator_id: validator.validator_id,
                             vrf_pubkey: vrf_pk,
-                            verified_vrf_output: None,
                             stake: validator.stake_spark,
                         })
                     })
@@ -4736,7 +4714,6 @@ mod tests {
             candidates: vec![ProposerCandidate {
                 validator_id: proposer_id,
                 vrf_pubkey: VrfKeypair::from_seed(&[0x42; 32]).public_key(),
-                verified_vrf_output: None,
                 stake: engine
                     .state
                     .validators

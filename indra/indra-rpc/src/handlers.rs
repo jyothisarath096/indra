@@ -160,29 +160,6 @@ impl<'a> NodeState<'a> {
         }
     }
 
-    /// Construct directly from chain state and metadata.
-    pub fn from_parts(
-        chain: &'a ChainState,
-        mempool_size: usize,
-        pruned_mode: bool,
-        lowest_block: u64,
-        blocks_retained: usize,
-    ) -> Self {
-        Self {
-            engine: chain,
-            chain,
-            mempool_size,
-            pruned_mode,
-            lowest_block,
-            blocks_retained,
-            state_root: indra_state::compute_state_root(chain),
-            network: None,
-            rpc_mode: RpcMode::Full,
-            admin_token_configured: false,
-            execution_deadline: None,
-        }
-    }
-
     /// Attach a cooperative execution deadline for long-running handlers.
     pub fn with_execution_deadline(mut self, deadline: Instant) -> Self {
         self.execution_deadline = Some(deadline);

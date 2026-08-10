@@ -58,7 +58,6 @@ enum UndoEntry {
     },
     StakingNonces(PersistentOrdMap<Bytes32, u64>),
     SlashHashes(PersistentOrdSet<Bytes32>),
-    #[allow(dead_code)]
     DelegatorIdentities(PersistentOrdMap<Bytes32, HybridPubKey>),
     RetiredColdClassical(PersistentOrdSet<[u8; 32]>),
     RetiredColdPq(PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>),
@@ -88,9 +87,7 @@ pub(crate) struct StateTxn<'a> {
     position_state_recorded: bool,
     staking_nonces_recorded: bool,
     slash_hashes_recorded: bool,
-    #[allow(dead_code)]
     delegator_identities_recorded: bool,
-    #[allow(dead_code)]
     retired_cold_components_recorded: bool,
     governance_recorded: bool,
     utxos_recorded: bool,
@@ -455,9 +452,7 @@ impl<'a> StateTxn<'a> {
         self.mark_commitment_touched();
     }
 
-    /// Record delegator identity registry state before test-only or future
-    /// live-operation registry mutations.
-    #[allow(dead_code)]
+    /// Record delegator identity registry state before live-operation registry mutations.
     pub(crate) fn snapshot_delegator_identity_scope(&mut self) {
         self.snapshot_delegator_identities();
         self.mark_commitment_touched();
@@ -706,7 +701,6 @@ impl<'a> StateTxn<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn snapshot_delegator_identities(&mut self) {
         if !self.delegator_identities_recorded {
             // `PersistentOrdMap::clone()` is an O(1) root-handle copy.

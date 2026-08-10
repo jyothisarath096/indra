@@ -765,11 +765,6 @@ pub async fn resolve_dns_seeds_with_policies_and_replay_store(
     }
 }
 
-/// Resolve the default DNS seed hostnames.
-pub async fn resolve_default_dns_seeds(port: u16) -> Vec<SocketAddr> {
-    resolve_dns_seeds(&default_dns_seed_hosts_config(), port).await
-}
-
 async fn resolve_seed_with_hickory_dnssec_async(
     host: &str,
     port: u16,

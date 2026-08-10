@@ -10,7 +10,6 @@ license.workspace = true
 indra-crypto       = { path = "../indra-crypto" }
 sha2.workspace     = true
 thiserror.workspace = true
-hex.workspace       = true
 
 [dev-dependencies]
 proptest.workspace = true

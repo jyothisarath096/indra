@@ -16,7 +16,6 @@ indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
 indra-rpc       = { path = "../indra-rpc" }
 indra-keystore  = { path = "../indra-keystore" }
-indra-bulletproofs = { path = "../indra-bulletproofs" }
 hickory-resolver.workspace = true
 rand.workspace = true
 thiserror.workspace = true

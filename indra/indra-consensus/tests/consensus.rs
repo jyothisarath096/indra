@@ -242,7 +242,6 @@ fn mempool_to_block_pipeline() {
         candidates: vec![ProposerCandidate {
             validator_id,
             vrf_pubkey,
-            verified_vrf_output: None,
             stake: 1_000_000,
         }],
     };
