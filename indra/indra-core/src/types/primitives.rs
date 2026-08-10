@@ -461,9 +461,8 @@ pub const DNS_SEED_HOST: &str = "seeds.indraprotocol.com";
 /// Default DNS seed hostnames for peer discovery.
 ///
 /// Multiple independent seeds reduce reliance on any single poisoned or
-/// unavailable DNS seed. DNSSEC validation is still a mainnet TODO in the
-/// discovery layer; validator identity authentication remains the consensus
-/// trust boundary.
+/// unavailable DNS seed. Validator identity authentication remains the
+/// consensus trust boundary.
 pub const DNS_SEED_HOSTS: &[&str] = &[DNS_SEED_HOST, "seeds2.indraprotocol.com"];
 
 /// Maximum peers to share in a single PeerList message.

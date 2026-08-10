@@ -33,6 +33,7 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus", features = ["test-utils"] }
 indra-storage   = { path = "../indra-storage" }
 indra-network   = { path = "../indra-network" }
+tempfile        = "3"
 
 [[bin]]
 name = "indra-observer"

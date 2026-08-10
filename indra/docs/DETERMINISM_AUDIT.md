@@ -33,11 +33,11 @@ The immediate cause was the missing activation height. The broader impact is tha
 - **Fix:** BTreeMap-backed encoders now iterate map order directly. Validator/delegator encoders are canonical: validator and delegation keys are lexicographically ordered, and lists retain their explicit canonical handling. Historical explicit sorting was removed from maps now guaranteed ordered.
 - **Snapshot serialization:** `state_store.rs` serializes `ChainState` through its canonical codec and writes a snapshot format/schema marker. It does not serialize unordered map entries independently.
 
-### LOW: No Protocol Version in Block Header
+### LOW: No Height-Gated Block Protocol Activation Schedule
 
-- **Location:** `indra-core/src/types/block.rs`, `BlockHeaderV1`.
-- **Risk:** Snapshot schema versions describe decoding layout only; neither snapshots nor blocks prove the transition rules/binary protocol version used to produce a block.
-- **Status:** Pre-mainnet TODO. Add a consensus `protocol_version: u32` to the block header, bind it into the block hash/signatures, validate it by height, and reject incorrect versions. Do not treat a binary build version as a substitute.
+- **Current state:** `BlockHeaderV1` contains `protocol_version`; its canonical encoding contributes to `block_hash()`, block decoding checks it in `block.rs`, and authoritative application checks it again in `apply.rs`. The original finding that the header lacked a hash-bound, validated protocol version is no longer accurate.
+- **Remaining gap:** Validation is a flat equality check against the single current `BLOCK_FORMAT_VERSION`. There is no `expected_block_version(height)` or equivalent height-gated activation schedule that permits old and new block protocol versions to coexist across a deterministic transition boundary.
+- **Disposition:** Keep this open as future protocol-upgrade architecture. It is needed when a second block protocol version must coexist during a transition, not as part of the current cleanup phase.
 
 ## Snapshot and Replay Assessment
 

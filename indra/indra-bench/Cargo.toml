@@ -13,6 +13,7 @@ indra-state     = { path = "../indra-state" }
 indra-consensus = { path = "../indra-consensus" }
 indra-storage   = { path = "../indra-storage" }
 indra-node      = { path = "../indra-node" }
+tempfile        = "3"
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }

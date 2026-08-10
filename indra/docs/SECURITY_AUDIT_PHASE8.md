@@ -143,8 +143,6 @@ Because the same driver lock is used by consensus processing, a slow or repeated
 
 **Fix implemented:** The live node now builds a detached `RpcSnapshot` under a brief driver lock, then releases the lock before dispatching read-only RPC handlers. Mutation payloads are decoded before acquiring the driver lock; transaction gossip is broadcast after the mempool admission lock is released. Regression coverage: `rpc_read_state_is_consistent_snapshot`.
 
-**Mainnet architecture TODO:** For large mainnet state, replace per-request full `ChainState` cloning with an independently maintained `Arc<RwLock<ChainState>>` or indexed read model updated after commits.
-
 ### API-10 — FFI input validation and memory safety
 
 **Status:** FIXED  
@@ -162,8 +160,6 @@ The remaining issue is C string handling: mnemonic, chain ID, governance title/d
 
 **Fix implemented:** All production `CStr::from_ptr` uses for caller-provided FFI inputs were replaced with a bounded C-string scanner (`MAX_CSTR_LEN = 4096`). Strings without a NUL byte within the limit are rejected cleanly instead of scanning unbounded memory. This preserves the existing Swift-facing ABI while adding a bounded read. Regression coverage: `ffi_bounded_cstr_rejects_string_without_nul_in_limit` and `ffi_bounded_cstr_accepts_valid_short_string`.
 
-**Mainnet TODO:** Length-delimited `(ptr, len)` APIs remain cleaner long-term, but would require caller signature changes.
-
 ### API-11 — Key material handling in FFI
 
 **Status:** FIXED  
@@ -177,7 +173,7 @@ However, zeroization is caller-driven. If the iOS/Mac caller forgets to call the
 
 **Fix implemented:** The public C header now marks `IndraKeyPair` secret fields as private key material and documents `indra_zeroize_keypair()` as mandatory. Local FFI copies of wallet seed/PQ secret material are zeroed after use where feasible, including keygen/transaction/staking helper paths. Existing zeroizer coverage remains in place. Regression coverage: `keypair_zeroize_clears_private_fields`, `ffi_intermediate_key_buffers_are_zeroized`.
 
-**Mainnet TODO:** The strongest design is an opaque key handle API so raw private keys do not cross the FFI boundary. This would be an intentional wallet API redesign and was not introduced here.
+**Remaining mainnet work:** Opaque key handles are the default signing API, but raw private-key crossing has not been eliminated repository-wide. The optional `legacy_raw_keys` feature still compiles classical/PQ/VRF raw-key APIs, and the default payment API can still return an encoded private payment keypair. Treat complete removal or an explicit disposition of those surfaces as Phase 5 work; the existence of the handle API alone does not close this item.
 
 ### API-12 — FFI panic safety
 

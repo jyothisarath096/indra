@@ -6,7 +6,7 @@
 |----|-----------|---------|----------|--------|
 | NET-01 | Eclipse | Validator transport authenticates peers by active validator identity and keeps one connection per validator, but has no subnet/ASN diversity policy | LOW | PARTIAL |
 | NET-02 | Eclipse | PeerList gossip now uses trust-aware eviction that protects bootstrap and recently authenticated peer addresses | MEDIUM | FIXED |
-| NET-03 | Eclipse | DNS seed discovery now supports multiple seed hosts and treats DNS as bootstrap-supplemental, with DNSSEC documented as a mainnet TODO | MEDIUM | FIXED |
+| NET-03 | Eclipse | DNS seed discovery supports multiple seed hosts and DNSSEC-aware validation | MEDIUM | FIXED |
 | NET-04 | Eclipse | Bootstrap peers are config/genesis hints and are preferred before discovered peers; not on-chain mutable | SAFE | VERIFIED |
 | NET-05 | Eclipse | `peers.json` is bounded and parse-safe, but has no freshness or trust scoring across restarts | LOW | NEEDS HARDENING |
 | NET-06 | Resource | Inbound authenticated P2P connections are capped before handshake by total and per-IP admission budgets | MEDIUM | FIXED |
@@ -244,5 +244,4 @@ These tests demonstrate the old count-allocation and observer-budget attack shap
 ## Recommended Fix Order
 
 1. NET-05: persist richer peer metadata across restarts, including authenticated validator ID, last success, and failure count.
-2. NET-03: add DNSSEC-aware or signed seed validation for mainnet.
 3. NET-01: add optional subnet/ASN diversity accounting for larger deployments.

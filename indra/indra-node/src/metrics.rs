@@ -798,17 +798,14 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::atomic::AtomicUsize;
 
-    fn test_driver() -> (Arc<Mutex<ConsensusDriver>>, String) {
-        let dir = std::env::temp_dir().join(format!(
-            "indra-metrics-test-{}",
-            now_unix_seconds().saturating_mul(1_000_000) + u64::from(std::process::id())
-        ));
-        let config = crate::NodeConfig::local_test(dir.clone());
+    fn test_driver() -> (Arc<Mutex<ConsensusDriver>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("unique metrics test directory");
+        let config = crate::NodeConfig::local_test(dir.path().to_path_buf());
         let engine = crate::NodeEngine::init(config).expect("engine init");
         let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
         (
             Arc::new(Mutex::new(crate::ConsensusDriver::new(engine, vote_safety))),
-            dir.to_string_lossy().to_string(),
+            dir,
         )
     }
 
@@ -835,6 +832,7 @@ mod tests {
     #[test]
     fn test_render_metrics_has_all_fields() {
         let (driver, data_dir) = test_driver();
+        let data_dir = data_dir.path().to_string_lossy();
         let observer_count = Arc::new(AtomicUsize::new(0));
         let metrics_state = MetricsState::new();
         let last_block_timestamp = AtomicU64::new(0);
@@ -882,6 +880,7 @@ mod tests {
     #[test]
     fn test_render_metrics_prometheus_format() {
         let (driver, data_dir) = test_driver();
+        let data_dir = data_dir.path().to_string_lossy();
         let observer_count = Arc::new(AtomicUsize::new(0));
         let metrics_state = MetricsState::new();
         let last_block_timestamp = AtomicU64::new(0);
@@ -924,6 +923,7 @@ mod tests {
     #[test]
     fn test_node_info_has_labels() {
         let (driver, data_dir) = test_driver();
+        let data_dir = data_dir.path().to_string_lossy();
         let observer_count = Arc::new(AtomicUsize::new(0));
         let metrics_state = MetricsState::new();
         let last_block_timestamp = AtomicU64::new(0);
@@ -960,7 +960,7 @@ mod tests {
             Arc::new(MetricsState::new()),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicUsize::new(0)),
-            data_dir,
+            data_dir.path().to_string_lossy().into_owned(),
             "0.1.0".to_string(),
         );
 
@@ -986,6 +986,7 @@ mod tests {
     #[test]
     fn rpc_metrics_are_bounded_cardinality_and_render_incremented_values() {
         let (driver, data_dir) = test_driver();
+        let data_dir = data_dir.path().to_string_lossy();
         let observer_count = Arc::new(AtomicUsize::new(0));
         let metrics = MetricsState::new();
         metrics.rpc_requests_total.store(7, Ordering::Relaxed);
