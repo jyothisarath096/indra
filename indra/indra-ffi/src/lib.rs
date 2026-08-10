@@ -87,17 +87,11 @@ pub(crate) unsafe fn bounded_cstr(ptr: *const c_char) -> Result<String, IndraErr
 #[cfg(test)]
 mod handle_tests {
     use super::*;
-    use indra_cli::{build_transaction, TxParams, Wallet};
     use indra_core::{
         codec::Decode,
         types::{
-            block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-            crypto::HybridPubKey,
             governance::{GovernanceOpV2, GovernancePayload},
-            primitives::{
-                Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID,
-                TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
-            },
+            primitives::DEFAULT_CHAIN_ID,
             staking::{StakingOp, StakingOpBody},
             transaction::TransactionV1,
         },
@@ -106,7 +100,6 @@ mod handle_tests {
         mnemonic_to_seed, verify_opening, ClassicalKeypair, HybridKeypair, PaymentKeypairV1,
         PaymentPubKeyV1, PedersenCommitment, PedersenOpening, PqKeypair,
     };
-    use indra_state::{apply_block, apply_staking_op, ChainState};
     use std::{
         ffi::{CStr, CString},
         fs,
@@ -116,7 +109,6 @@ mod handle_tests {
     };
 
     const OK: i32 = IndraError::Ok as i32;
-    const INVALID_PARAM: i32 = IndraError::InvalidParam as i32;
     const INVALID_HANDLE: i32 = IndraError::InvalidHandle as i32;
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -398,50 +390,6 @@ mod handle_tests {
             tx_index: 0,
             out_index: 0,
             spent: 0,
-        }
-    }
-
-    fn hybrid_pubkey(public: &IndraPublicKeyInfo) -> HybridPubKey {
-        HybridPubKey {
-            classical_pk: Bytes32::from(public.classical_pk),
-            pq_pk: VariableBytes::from_slice(&public.pq_pk).unwrap(),
-        }
-    }
-
-    fn pubkey_hex(public: &IndraPublicKeyInfo) -> String {
-        format!(
-            "{}:{}",
-            hex::encode(public.classical_pk),
-            hex::encode(public.pq_pk)
-        )
-    }
-
-    fn block_with_tx(state: &ChainState, tx: TransactionV1) -> BlockV1 {
-        let height = state.height + 1;
-        BlockV1 {
-            header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
-                height,
-                prev_hash: state.tip_hash,
-                timestamp: 1_700_000_000 + height,
-                state_root: Bytes32::ZERO,
-                validator_set_root: Bytes32::ZERO,
-                mempool_set_root: Bytes32::ZERO,
-                value_hash: Bytes32::ZERO,
-                base_fee: state.base_fee,
-                proposer_round: 0,
-                polc_round: NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                quorum_certificate: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
-                election_result_hash: None,
-            },
-            transactions: vec![tx],
-            slashing_evidence: Vec::new(),
-            slashing_evidence_v2: Vec::new(),
-            governance_ops: Vec::new(),
-            staking_ops: Vec::new(),
-            vrf_reveals: Vec::new(),
         }
     }
 
