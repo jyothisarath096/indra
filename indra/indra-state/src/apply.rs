@@ -762,25 +762,24 @@ pub fn apply_block_with_effects(
     })
 }
 
-/// Atomically validate and apply one transaction to an evolving candidate state.
-///
-/// On failure the scoped state transaction restores `state` exactly. This is
-/// intentionally narrower than exposing [`StateTxn`] outside the state crate.
-pub fn try_apply_transaction_candidate(
+/// Atomically validate/apply a candidate with a block-attempt-frozen dust floor.
+pub fn try_apply_transaction_candidate_with_dust(
     state: &mut ChainState,
     tx: &TransactionV1,
     height: u64,
     tx_index: u32,
+    dust_limit_spark: u64,
 ) -> StateResult<()> {
     let mut block_nullifiers = HashSet::new();
     let mut block_input_utxos = HashSet::new();
-    validate_transaction(
+    validate_transaction_with_dust(
         state,
         tx,
         &state.chain_id,
         &mut block_nullifiers,
         &mut block_input_utxos,
         height,
+        dust_limit_spark,
     )?;
     let mut txn = StateTxn::begin(state, height);
     apply_transaction(&mut txn, tx, height, tx_index)?;
@@ -1005,15 +1004,18 @@ fn apply_block_inner(
     // intra-block double spends before any mutation occurs.
     let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
     let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
+    let transaction_dust_limit =
+        indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len());
 
     for tx in &block.transactions {
-        validate_transaction(
+        validate_transaction_with_dust(
             state,
             tx,
             &state.chain_id,
             &mut block_nullifiers,
             &mut block_input_utxos,
             block.header.height,
+            transaction_dust_limit,
         )?;
     }
 
@@ -1274,6 +1276,12 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
             max: MAX_TX_PER_BLOCK,
         });
     }
+    let spent_inputs = block
+        .transactions
+        .iter()
+        .map(|tx| tx.inputs.len())
+        .sum::<usize>();
+    validate_block_nullifier_count(spent_inputs)?;
 
     // base_fee field must match what we computed for this height
     // (the block proposer must use the correct fee or be rejected)
@@ -1284,6 +1292,16 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
         });
     }
 
+    Ok(())
+}
+
+fn validate_block_nullifier_count(spent_inputs: usize) -> StateResult<()> {
+    if spent_inputs > indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK {
+        return Err(StateError::TooManyNullifiers {
+            actual: spent_inputs,
+            max: indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK,
+        });
+    }
     Ok(())
 }
 
@@ -1301,6 +1319,27 @@ pub fn validate_transaction(
     block_nullifiers: &mut HashSet<Bytes32>,
     block_input_utxos: &mut HashSet<Bytes32>,
     current_height: u64,
+) -> StateResult<()> {
+    validate_transaction_with_dust(
+        state,
+        tx,
+        chain_id,
+        block_nullifiers,
+        block_input_utxos,
+        current_height,
+        indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len()),
+    )
+}
+
+/// Validate a transaction with the dust floor frozen from block pre-state.
+pub fn validate_transaction_with_dust(
+    state: &ChainState,
+    tx: &TransactionV1,
+    chain_id: &str,
+    block_nullifiers: &mut HashSet<Bytes32>,
+    block_input_utxos: &mut HashSet<Bytes32>,
+    current_height: u64,
+    dust_limit_spark: u64,
 ) -> StateResult<()> {
     if tx.inputs.is_empty() {
         return Err(StateError::ZeroInputs);
@@ -1441,7 +1480,7 @@ pub fn validate_transaction(
 
     let mut output_commitments = Vec::with_capacity(tx.outputs.len());
     for (idx, output) in tx.outputs.iter().enumerate() {
-        if output.value_spark < indra_core::types::primitives::DUST_LIMIT_SPARK {
+        if output.value_spark < dust_limit_spark {
             return Err(StateError::InvariantViolation {
                 message: "transaction output below dust limit",
             });
@@ -1496,6 +1535,23 @@ fn apply_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_wide_nullifier_ceiling_accepts_400_and_rejects_401() {
+        assert!(validate_block_nullifier_count(
+            indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_block_nullifier_count(
+                indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK + 1
+            ),
+            Err(StateError::TooManyNullifiers {
+                actual: 401,
+                max: 400
+            })
+        ));
+    }
     use crate::chain::ChainState;
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
@@ -3283,8 +3339,12 @@ mod tests {
         );
         let before = state.clone();
         let mut scratch = state;
+        let dust_limit =
+            indra_core::types::primitives::transaction_dust_limit_spark(scratch.utxos.len());
         crate::txn::set_fail_after_mutation(Some(1));
-        assert!(try_apply_transaction_candidate(&mut scratch, &tx, 1, 0).is_err());
+        assert!(
+            try_apply_transaction_candidate_with_dust(&mut scratch, &tx, 1, 0, dust_limit).is_err()
+        );
         crate::txn::set_fail_after_mutation(None);
         assert_eq!(scratch.encode_to_vec(), before.encode_to_vec());
         assert_eq!(scratch, before);

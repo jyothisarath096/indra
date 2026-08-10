@@ -16,6 +16,13 @@ pub enum NodeError {
     #[error("storage error: {0}")]
     Storage(#[from] indra_storage::StorageError),
 
+    /// Durable storage cannot safely accept another state transition.
+    #[error("critical local storage pressure: {detail}")]
+    StoragePressure {
+        /// Query failure or remaining-space detail.
+        detail: String,
+    },
+
     /// A state machine error.
     #[error("state error: {0}")]
     State(#[from] indra_state::StateError),

@@ -55,6 +55,13 @@ pub const MAX_STAKING_NONCES_DECODE: usize = indra_core::types::primitives::MAX_
             .saturating_mul(crate::validator::MAX_DELEGATORS_PER_VALIDATOR),
     );
 
+/// Defensive decode ceiling for permanently-retired classical cold components.
+pub const MAX_RETIRED_COLD_CLASSICAL_COMPONENTS_DECODE: usize =
+    indra_core::types::primitives::MAX_VALIDATORS.saturating_mul(2);
+/// Defensive decode ceiling for permanently-retired PQ cold components.
+pub const MAX_RETIRED_COLD_PQ_COMPONENTS_DECODE: usize =
+    indra_core::types::primitives::MAX_VALIDATORS.saturating_mul(2);
+
 /// The complete chain state at a given block height.
 ///
 /// Two `ChainState` values are equivalent if and only if they represent
@@ -1629,6 +1636,13 @@ fn decode_retired_cold_components(
     PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
 )> {
     let classical_count = u32::decode(r)? as usize;
+    if classical_count > MAX_RETIRED_COLD_CLASSICAL_COMPONENTS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.retired_cold_classical_components",
+            max: MAX_RETIRED_COLD_CLASSICAL_COMPONENTS_DECODE,
+            actual: classical_count,
+        });
+    }
     let mut classical = PersistentOrdSet::new();
     for _ in 0..classical_count {
         let component = r.read_bytes32()?;
@@ -1639,6 +1653,13 @@ fn decode_retired_cold_components(
         }
     }
     let pq_count = u32::decode(r)? as usize;
+    if pq_count > MAX_RETIRED_COLD_PQ_COMPONENTS_DECODE {
+        return Err(IndraError::LengthExceeded {
+            field: "snapshot.retired_cold_pq_components",
+            max: MAX_RETIRED_COLD_PQ_COMPONENTS_DECODE,
+            actual: pq_count,
+        });
+    }
     let mut pq = PersistentOrdSet::new();
     for _ in 0..pq_count {
         let bytes = r.read_bytes(indra_crypto::PQ_PK_BYTES)?;
@@ -1656,6 +1677,30 @@ fn decode_retired_cold_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_cold_component_decode_caps_fail_before_allocation() {
+        let mut classical = Vec::new();
+        ((MAX_RETIRED_COLD_CLASSICAL_COMPONENTS_DECODE + 1) as u32).encode(&mut classical);
+        assert!(matches!(
+            decode_retired_cold_components(&mut ByteReader::new(&classical)),
+            Err(IndraError::LengthExceeded {
+                field: "snapshot.retired_cold_classical_components",
+                ..
+            })
+        ));
+
+        let mut pq = Vec::new();
+        0u32.encode(&mut pq);
+        ((MAX_RETIRED_COLD_PQ_COMPONENTS_DECODE + 1) as u32).encode(&mut pq);
+        assert!(matches!(
+            decode_retired_cold_components(&mut ByteReader::new(&pq)),
+            Err(IndraError::LengthExceeded {
+                field: "snapshot.retired_cold_pq_components",
+                ..
+            })
+        ));
+    }
     use crate::ValidatorEntry;
     use std::collections::{BTreeMap, HashSet};
 

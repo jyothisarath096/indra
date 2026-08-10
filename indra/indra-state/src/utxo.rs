@@ -308,6 +308,13 @@ impl UtxoSet {
         output_index: u32,
         tranche_refund: Option<TrancheRefundEventV1>,
     ) -> StateResult<Bytes32> {
+        if live_utxo_capacity_exceeded(self.entries.len()) {
+            return Err(StateError::LiveStateCapacityExceeded {
+                collection: "UTXO set",
+                current: self.entries.len(),
+                max: indra_core::types::primitives::MAX_LIVE_UTXOS,
+            });
+        }
         let id = Self::compute_utxo_id(&output, height, tx_index, output_index);
         if self.entries.contains_key(&id) {
             return Err(StateError::InvariantViolation {
@@ -436,6 +443,10 @@ impl UtxoSet {
     }
 }
 
+fn live_utxo_capacity_exceeded(current: usize) -> bool {
+    current >= indra_core::types::primitives::MAX_LIVE_UTXOS
+}
+
 fn validate_tranche_refund_entry(entry: &UtxoEntry) -> IndraResult<()> {
     if let Some(event) = &entry.tranche_refund {
         event.validate()?;
@@ -454,6 +465,16 @@ fn validate_tranche_refund_entry(entry: &UtxoEntry) -> IndraResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_utxo_cap_boundary_rejects_creation_at_exact_consensus_cap() {
+        assert!(!live_utxo_capacity_exceeded(
+            indra_core::types::primitives::MAX_LIVE_UTXOS - 1
+        ));
+        assert!(live_utxo_capacity_exceeded(
+            indra_core::types::primitives::MAX_LIVE_UTXOS
+        ));
+    }
     use indra_core::types::{crypto::CommitmentV1, stake_position::PositionCustodyV1};
 
     fn dummy_output(byte: u8) -> OutputV1 {

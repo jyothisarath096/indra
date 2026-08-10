@@ -44,22 +44,22 @@
 #![deny(clippy::panic)]
 
 pub(crate) mod atomic;
-pub mod block_store;
 pub mod epoch_store;
 pub mod error;
 pub mod manifest;
 pub mod qc_store;
+pub mod segmented_block_store;
 pub mod state_store;
 pub mod vote_safety;
 pub mod wal;
 
-pub use block_store::{BlockStore, BlockStoreReadHandle, PruneConfig};
 pub use epoch_store::{EpochStore, EpochStoreReadHandle};
 pub use error::{StorageError, StorageResult};
 pub use manifest::{load_chain_manifest, save_chain_manifest, ChainManifest};
 pub use qc_store::{
     clear_pending_last_qc, load_last_qc, load_pending_last_qc, save_last_qc, save_pending_last_qc,
 };
+pub use segmented_block_store::{BlockStore, BlockStoreReadHandle, PruneConfig};
 pub use state_store::StateStore;
 pub use vote_safety::{VoteSafetyLoadResult, VoteSafetyRecord, VoteSafetyStore};
 pub use wal::MempoolWal;

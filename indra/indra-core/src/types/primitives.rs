@@ -151,11 +151,21 @@ pub const MAX_BLOCK_SIZE_BYTES: usize = 12_582_912; // 12 MB
 /// Maximum transactions per block.
 pub const MAX_TX_PER_BLOCK: usize = 200;
 
+/// Provisional consensus ceiling on spent inputs inserted as nullifiers per block.
+/// This requires a follow-up mainnet workload-sizing pass.
+pub const MAX_NULLIFIERS_PER_BLOCK: usize = 400;
+
 /// Maximum inputs per transaction.
 pub const MAX_INPUTS: usize = 16;
 
 /// Maximum outputs per transaction.
 pub const MAX_OUTPUTS: usize = 16;
+
+/// Consensus maximum number of simultaneously-live UTXOs.
+pub const MAX_LIVE_UTXOS: usize = 500_000;
+
+/// Consensus maximum number of permanent nullifiers.
+pub const MAX_LIVE_NULLIFIERS: usize = 1_000_000;
 
 /// Maximum quorum certificate size in bytes.
 pub const MAX_QC_SIZE_BYTES: usize = 10_485_760; // 10 MB
@@ -227,6 +237,40 @@ pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
 
 /// Minimum UTXO value in Spark. Outputs below this are rejected.
 pub const DUST_LIMIT_SPARK: u64 = 100_000;
+
+/// Return the transaction-output dust floor selected from pre-block UTXO occupancy.
+pub const fn transaction_dust_limit_spark(live_utxos: usize) -> u64 {
+    if live_utxos < MAX_LIVE_UTXOS / 4 {
+        100_000
+    } else if live_utxos < MAX_LIVE_UTXOS / 2 {
+        200_000
+    } else if live_utxos < MAX_LIVE_UTXOS * 70 / 100 {
+        500_000
+    } else if live_utxos < MAX_LIVE_UTXOS * 85 / 100 {
+        1_000_000
+    } else if live_utxos < MAX_LIVE_UTXOS * 95 / 100 {
+        5_000_000
+    } else {
+        20_000_000
+    }
+}
+
+/// Return the zero-based occupancy tier used by bounded-cardinality telemetry.
+pub const fn transaction_dust_tier(live_utxos: usize) -> u64 {
+    if live_utxos < MAX_LIVE_UTXOS / 4 {
+        0
+    } else if live_utxos < MAX_LIVE_UTXOS / 2 {
+        1
+    } else if live_utxos < MAX_LIVE_UTXOS * 70 / 100 {
+        2
+    } else if live_utxos < MAX_LIVE_UTXOS * 85 / 100 {
+        3
+    } else if live_utxos < MAX_LIVE_UTXOS * 95 / 100 {
+        4
+    } else {
+        5
+    }
+}
 
 /// Minimum validator self-bond required for registration.
 pub const MINIMUM_VALIDATOR_SELF_STAKE_SPARK: u64 = 1_000_000_000;
@@ -875,5 +919,23 @@ mod tests {
         assert_eq!(max_active_validators(u64::MAX), VALIDATOR_SET_PHASE4_MAX);
         assert!(MAX_QC_SIGNERS >= VALIDATOR_SET_PHASE4_MAX);
         assert!(MIN_ACTIVE_VALIDATORS <= VALIDATOR_SET_PHASE1_MAX);
+    }
+
+    #[test]
+    fn occupancy_scaled_dust_boundaries_are_exact() {
+        let cases = [
+            (0, 100_000, 0),
+            (MAX_LIVE_UTXOS / 4 - 1, 100_000, 0),
+            (MAX_LIVE_UTXOS / 4, 200_000, 1),
+            (MAX_LIVE_UTXOS / 2, 500_000, 2),
+            (MAX_LIVE_UTXOS * 70 / 100, 1_000_000, 3),
+            (MAX_LIVE_UTXOS * 85 / 100, 5_000_000, 4),
+            (MAX_LIVE_UTXOS * 95 / 100, 20_000_000, 5),
+            (MAX_LIVE_UTXOS, 20_000_000, 5),
+        ];
+        for (occupancy, floor, tier) in cases {
+            assert_eq!(transaction_dust_limit_spark(occupancy), floor);
+            assert_eq!(transaction_dust_tier(occupancy), tier);
+        }
     }
 }

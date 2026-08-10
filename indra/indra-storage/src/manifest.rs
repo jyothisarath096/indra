@@ -12,7 +12,7 @@ use crate::{
 const MANIFEST_FILE: &str = "chain_manifest.bin";
 const MANIFEST_TMP_FILE: &str = "chain_manifest.bin.tmp";
 const MANIFEST_MAGIC: &[u8; 4] = b"INMF";
-const MANIFEST_VERSION: u8 = 1;
+const MANIFEST_VERSION: u8 = 2;
 
 /// Last fully durable chain commit observed by the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +63,22 @@ pub fn load_chain_manifest(data_dir: &Path) -> StorageResult<Option<ChainManifes
 }
 
 fn store_has_committed_data(data_dir: &Path) -> StorageResult<bool> {
-    for (name, empty_header_len) in [("blocks.log", 16), ("epochs.log", 16)] {
+    if data_dir.join("blocks.log").exists() {
+        return Err(StorageError::LegacyBlockStore {
+            path: data_dir.join("blocks.log"),
+            data_dir: data_dir.to_path_buf(),
+        });
+    }
+    match std::fs::read_dir(data_dir.join("block_segments")) {
+        Ok(entries) => {
+            if entries.count() > 0 {
+                return Ok(true);
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    for (name, empty_header_len) in [("epochs.log", 16)] {
         let path = data_dir.join(name);
         match std::fs::metadata(path) {
             Ok(metadata) if metadata.len() > empty_header_len => return Ok(true),
@@ -207,7 +222,7 @@ mod tests {
             std::env::temp_dir().join(format!("indra_manifest_pristine_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).unwrap();
-        std::fs::write(dir.join("blocks.log"), [0u8; 16]).unwrap();
+        std::fs::create_dir_all(dir.join("block_segments")).unwrap();
         std::fs::write(dir.join("epochs.log"), [0u8; 16]).unwrap();
         assert!(load_chain_manifest(&dir).unwrap().is_none());
 
@@ -216,6 +231,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("nonempty store is missing chain manifest"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_before_manifest_rename_never_publishes_partial_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "indra_manifest_crash_before_rename_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("block_segments")).unwrap();
+        let confirmed = ChainManifest {
+            committed_height: 9,
+            committed_block_hash: Bytes32::from([1u8; 32]),
+            state_root: Bytes32::from([2u8; 32]),
+            snapshot_height: 0,
+            block_log_next_height: 10,
+            last_qc_height: 9,
+            epoch_log_latest_epoch: None,
+            chain_id: "indra-testnet-1".into(),
+        };
+        save_chain_manifest(&dir, &confirmed).unwrap();
+        // Model a process killed after creating/truncating the temporary next
+        // manifest but before atomic rename of the durable commit marker.
+        std::fs::write(dir.join(MANIFEST_TMP_FILE), &confirmed.encode()[..17]).unwrap();
+        assert_eq!(load_chain_manifest(&dir).unwrap(), Some(confirmed));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

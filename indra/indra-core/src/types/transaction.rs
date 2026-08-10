@@ -162,6 +162,15 @@ impl TransactionV1 {
 
     /// Validate structural rules under the transaction format active at `height`.
     pub fn validate_structure_at_height(&self, height: u64) -> IndraResult<()> {
+        self.validate_structure_at_height_with_dust(height, DUST_LIMIT_SPARK)
+    }
+
+    /// Validate structural rules using the dust floor frozen from block pre-state.
+    pub fn validate_structure_at_height_with_dust(
+        &self,
+        height: u64,
+        dust_limit_spark: u64,
+    ) -> IndraResult<()> {
         if self.inputs.is_empty() {
             return Err(IndraError::ZeroInputs);
         }
@@ -183,10 +192,10 @@ impl TransactionV1 {
             });
         }
         for output in &self.outputs {
-            if output.value_spark < DUST_LIMIT_SPARK {
+            if output.value_spark < dust_limit_spark {
                 return Err(IndraError::BelowDustLimit {
                     value: output.value_spark,
-                    limit: DUST_LIMIT_SPARK,
+                    limit: dust_limit_spark,
                 });
             }
         }
@@ -415,6 +424,21 @@ mod tests {
     #[test]
     fn weight_is_nonzero() {
         assert!(minimal_tx().weight_kb() >= 1);
+    }
+
+    #[test]
+    fn structural_validation_uses_caller_frozen_dust_floor() {
+        let tx = minimal_tx();
+        assert!(tx
+            .validate_structure_at_height_with_dust(u64::MAX, 100_000)
+            .is_ok());
+        assert!(matches!(
+            tx.validate_structure_at_height_with_dust(u64::MAX, 200_000),
+            Err(IndraError::BelowDustLimit {
+                value: 100_000,
+                limit: 200_000
+            })
+        ));
     }
 
     #[test]

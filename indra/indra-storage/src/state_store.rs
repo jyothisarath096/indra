@@ -18,10 +18,21 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION};
 use indra_state::{compute_state_roots, ChainState};
+
+static SNAPSHOT_CLEANUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+fn report_snapshot_cleanup_failure(path: &Path, error: &std::io::Error) {
+    SNAPSHOT_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "[storage] WARNING: failed to remove stale snapshot artifact {}: {error}",
+        path.display()
+    );
+}
 
 use crate::atomic::{crc32, write_atomic_synced};
 use crate::error::{StorageError, StorageResult};
@@ -55,6 +66,29 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    /// Count stale-snapshot cleanup failures observed by this process.
+    pub fn cleanup_failure_count() -> u64 {
+        SNAPSHOT_CLEANUP_FAILURES.load(Ordering::Relaxed)
+    }
+    /// Quarantine snapshots newer than the manifest-confirmed snapshot.
+    pub fn quarantine_newer_than(&self, confirmed_height: u64) -> StorageResult<()> {
+        let quarantine = self.dir.join("quarantine");
+        fs::create_dir_all(&quarantine)?;
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            let height = text
+                .strip_prefix("state_")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|value| value.parse::<u64>().ok());
+            if height.is_some_and(|height| height > confirmed_height) {
+                fs::rename(entry.path(), quarantine.join(name))?;
+            }
+        }
+        crate::atomic::fsync_dir(&self.dir)?;
+        Ok(())
+    }
     /// Open a state store in the given directory.
     pub fn open(dir: impl AsRef<Path>) -> StorageResult<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -252,9 +286,17 @@ impl StateStore {
                     .trim_end_matches(".snap");
                 if let Ok(h) = height_str.parse::<u64>() {
                     if h < keep_from {
-                        let _ = fs::remove_file(entry.path());
-                        let _ = fs::remove_file(self.dir.join(format!("state_{h}.snap.meta")));
-                        let _ = fs::remove_file(self.dir.join(format!("state_{h}.snap.meta.tmp")));
+                        for path in [
+                            entry.path(),
+                            self.dir.join(format!("state_{h}.snap.meta")),
+                            self.dir.join(format!("state_{h}.snap.meta.tmp")),
+                        ] {
+                            if let Err(error) = fs::remove_file(&path) {
+                                if error.kind() != std::io::ErrorKind::NotFound {
+                                    report_snapshot_cleanup_failure(&path, &error);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -485,6 +527,16 @@ fn validate_snapshot_state(mut state: ChainState, file_height: u64) -> Result<Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_failure_is_counted_and_not_silent() {
+        let before = StateStore::cleanup_failure_count();
+        report_snapshot_cleanup_failure(
+            Path::new("injected-stale-snapshot"),
+            &std::io::Error::other("injected deletion failure"),
+        );
+        assert_eq!(StateStore::cleanup_failure_count(), before + 1);
+    }
     use indra_core::{
         types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
         types::primitives::{DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES},
@@ -685,6 +737,18 @@ mod tests {
         let dir = temp_dir("b");
         let store = StateStore::open(&dir).unwrap();
         assert!(store.load_latest().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_during_snapshot_temp_write_never_publishes_partial_snapshot() {
+        let dir = temp_dir("partial_snapshot_tmp");
+        let store = StateStore::open(&dir).unwrap();
+        let state = finalized_test_state();
+        store.save(&state).unwrap();
+        std::fs::write(dir.join("state_300.tmp"), [0xAA; 19]).unwrap();
+        std::fs::write(dir.join("state_300.snap.meta.tmp"), [0xBB; 11]).unwrap();
+        assert_eq!(store.load_latest().unwrap(), Some(state));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

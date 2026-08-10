@@ -27,10 +27,10 @@ use indra_core::types::{
     crypto::HybridPubKey,
     governance::GovernanceOpV2,
     primitives::{
-        Bytes32, VariableBytes, MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
-        MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_STAKING_OPS_PER_BLOCK,
-        MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
-        MAX_VRF_PROOF_BYTES,
+        Bytes32, VariableBytes, DISK_CRITICAL_THRESHOLD_BYTES, MAX_GOV_OPS_PER_BLOCK,
+        MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK, MAX_STAKE_POSITIONS_PER_VALIDATOR,
+        MAX_STAKE_POSITIONS_TOTAL, MAX_STAKING_OPS_PER_BLOCK, MAX_TRANCHES_PER_POSITION,
+        MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL, MAX_VRF_PROOF_BYTES,
     },
     slash_membership::build_slash_membership_proof,
     slashing::{SlashEvidenceV1, SlashEvidenceV2},
@@ -39,14 +39,33 @@ use indra_core::types::{
     vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
     ConsensusSnapshot,
 };
+
+fn evaluate_disk_writable(available: std::io::Result<u64>) -> NodeResult<()> {
+    match available {
+        Ok(bytes) if bytes >= DISK_CRITICAL_THRESHOLD_BYTES => Ok(()),
+        Ok(bytes) => Err(NodeError::StoragePressure {
+            detail: format!(
+                "only {} bytes available; at least {} required",
+                bytes, DISK_CRITICAL_THRESHOLD_BYTES
+            ),
+        }),
+        Err(error) => Err(NodeError::StoragePressure {
+            detail: format!("free-space query failed: {error}"),
+        }),
+    }
+}
+
+fn ensure_disk_writable(data_dir: &std::path::Path) -> NodeResult<()> {
+    evaluate_disk_writable(fs2::available_space(data_dir))
+}
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
 };
 use indra_state::{
     apply::compute_slash_evidence_v2_hash, epoch::epoch_for_height, try_apply_governance_candidate,
-    try_apply_slash_candidate, try_apply_staking_candidate, try_apply_transaction_candidate,
-    ChainState,
+    try_apply_slash_candidate, try_apply_staking_candidate,
+    try_apply_transaction_candidate_with_dust, ChainState,
 };
 use indra_storage::{
     load_chain_manifest, load_last_qc, save_chain_manifest, BlockStore, ChainManifest, EpochStore,
@@ -463,8 +482,15 @@ impl NodeEngine {
         }
 
         let mut block_store = BlockStore::open(config.block_log_path(), config.prune_config())?;
-        let epoch_store = EpochStore::open(config.epoch_log_path())?;
+        if let Some(manifest) = load_chain_manifest(&config.data_dir)? {
+            block_store.recover_to_next_height(manifest.block_log_next_height)?;
+        }
+        let mut epoch_store = EpochStore::open(config.epoch_log_path())?;
         let state_store = StateStore::open(config.state_dir())?;
+        if let Some(manifest) = load_chain_manifest(&config.data_dir)? {
+            epoch_store.recover_to_latest(manifest.epoch_log_latest_epoch)?;
+            state_store.quarantine_newer_than(manifest.snapshot_height)?;
+        }
         let stored_schema_version = state_store.schema_version()?;
         if let Some(snapshot_version) = stored_schema_version {
             if snapshot_version != indra_core::types::primitives::SCHEMA_VERSION {
@@ -615,6 +641,7 @@ impl NodeEngine {
 
     /// Add a staking operation to the pending pool.
     pub fn add_staking_op(&mut self, op: StakingOp) -> NodeResult<()> {
+        ensure_disk_writable(&self.config.data_dir)?;
         self.ensure_pending_indexes();
         op.validate_structure()
             .map_err(|e| NodeError::InvalidStakingOp(e.to_string()))?;
@@ -787,6 +814,7 @@ impl NodeEngine {
 
     /// Add a governance operation to the pending pool.
     pub fn add_governance_op(&mut self, op: GovernanceOpV2) -> NodeResult<()> {
+        ensure_disk_writable(&self.config.data_dir)?;
         self.ensure_pending_indexes();
         let current_epoch = epoch_for_height(self.state.height.saturating_add(1));
         let verified = indra_state::pending::verify_pending_governance(
@@ -824,6 +852,8 @@ impl NodeEngine {
         &mut self,
         transaction: indra_core::types::transaction::TransactionV1,
     ) -> Result<Bytes32, indra_consensus::ConsensusError> {
+        ensure_disk_writable(&self.config.data_dir)
+            .map_err(|_| indra_consensus::ConsensusError::StoragePressure)?;
         let id = self.mempool.submit_validated(transaction, &self.state)?;
         self.rpc_snapshot.set_mempool_size(self.mempool.len());
         Ok(id)
@@ -932,6 +962,8 @@ impl NodeEngine {
         let height = self.state.height.saturating_add(1);
         let current_epoch = epoch_for_height(height);
         let mut scratch = self.state.clone();
+        let transaction_dust_limit =
+            indra_core::types::primitives::transaction_dust_limit_spark(self.state.utxos.len());
         let reporter_pubkey = self.hybrid_keypair.as_ref().map(|keypair| {
             let public = keypair.public_key();
             HybridPubKey {
@@ -952,11 +984,12 @@ impl NodeEngine {
             if transactions.len() >= indra_core::types::primitives::MAX_TX_PER_BLOCK {
                 break;
             }
-            match try_apply_transaction_candidate(
+            match try_apply_transaction_candidate_with_dust(
                 &mut scratch,
                 &tx,
                 height,
                 transactions.len() as u32,
+                transaction_dust_limit,
             ) {
                 Ok(()) => transactions.push(tx),
                 Err(error) => {
@@ -1189,6 +1222,7 @@ impl NodeEngine {
         election_result: Option<VrfElectionResult>,
         vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
+        ensure_disk_writable(&self.config.data_dir)?;
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && prev_qc_bytes.is_empty() {
             eprintln!(
@@ -1253,6 +1287,7 @@ impl NodeEngine {
         election_result: Option<VrfElectionResult>,
         vrf_reveals: Vec<VrfRevealEvidence>,
     ) -> NodeResult<BlockV1> {
+        ensure_disk_writable(&self.config.data_dir)?;
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && last_qc.is_empty() {
             eprintln!(
@@ -1602,19 +1637,15 @@ impl NodeEngine {
         self.evict_committed_governance_ops(&block.governance_ops);
         self.evict_committed_slashes(&block.slashing_evidence);
         self.apply_pending_canonical_effects(&outcome.effects);
-        self.refresh_rpc_snapshot();
-        Ok(())
-    }
-
-    /// Publish a fresh immutable state view after canonical or pending-pool mutation.
-    pub fn refresh_rpc_snapshot(&self) {
-        self.rpc_snapshot.publish(
+        self.rpc_snapshot.publish_with_effects(
             &self.state,
+            &outcome.effects,
             self.mempool.len(),
             !self.block_store.is_archive(),
             self.block_store.lowest_height(),
             self.block_store.len(),
         );
+        Ok(())
     }
 
     /// Persist a durable manifest for the currently committed state.
@@ -3641,6 +3672,62 @@ mod tests {
     }
 
     #[test]
+    fn manifest_last_recovery_discards_all_unconfirmed_store_artifacts() {
+        let dir = temp_dir("manifest_last_cross_store_recovery");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        let confirmed_tip;
+        {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            let first = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
+            engine.commit_block(&first).unwrap();
+            confirmed_tip = engine.state.tip_hash;
+
+            // Model a process killed after every component store made the next
+            // generation durable, but before manifest-v2 was atomically renamed.
+            let second = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
+            let mut projected = engine.state.clone();
+            indra_state::apply_block(&mut projected, &second, 0).unwrap();
+            engine.block_store.append(&second).unwrap();
+            engine.state_store.save(&projected).unwrap();
+            engine
+                .epoch_store
+                .append(&indra_core::EpochRecord {
+                    epoch: 0,
+                    start_height: 0,
+                    end_height: 299,
+                    timestamp_secs: 1,
+                    active_validators: 1,
+                    total_staked_spark: 1,
+                    block_rewards_distributed: 0,
+                    fee_rewards_distributed: 0,
+                    fees_burned: 0,
+                    total_slashed_spark: 0,
+                    slash_event_count: 0,
+                    liveness_penalty_count: 0,
+                    avg_base_fee: 1,
+                    validators_joined: vec![],
+                    validators_left: vec![],
+                    era: 0,
+                    block_reward_spark: 0,
+                    total_supply: projected.total_supply,
+                    treasury_balance: projected.treasury_balance,
+                })
+                .unwrap();
+        }
+
+        let restarted = NodeEngine::init(config).unwrap();
+        assert_eq!(restarted.state.height, 1);
+        assert_eq!(restarted.state.tip_hash, confirmed_tip);
+        assert_eq!(restarted.block_store.next_height(), 2);
+        assert_eq!(restarted.epoch_store.latest_epoch(), None);
+        assert!(dir.join("block_segments").join("quarantine").exists());
+        assert!(dir.join("state").join("quarantine").exists());
+        assert!(dir.join("epochs.log.unconfirmed").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn startup_replay_detects_corrupt_block_via_state_root_mismatch() {
         let dir = temp_dir("replay_bad_root");
         let mut config = NodeConfig::local_test(dir.clone());
@@ -3651,6 +3738,20 @@ mod tests {
             block.header.state_root = Bytes32::from([0xEE; 32]);
             engine.block_store.append(&build_genesis_block()).unwrap();
             engine.block_store.append(&block).unwrap();
+            indra_storage::save_chain_manifest(
+                &dir,
+                &ChainManifest {
+                    committed_height: 1,
+                    committed_block_hash: block.header.block_hash(),
+                    state_root: block.header.state_root,
+                    snapshot_height: 0,
+                    block_log_next_height: 2,
+                    last_qc_height: 0,
+                    epoch_log_latest_epoch: None,
+                    chain_id: engine.state.chain_id.clone(),
+                },
+            )
+            .unwrap();
         }
 
         match NodeEngine::init(config) {
@@ -3707,6 +3808,7 @@ mod tests {
             let mut bad_snapshot = engine.state.clone();
             bad_snapshot.tip_hash = Bytes32::from([0xDD; 32]);
             engine.state_store.save(&bad_snapshot).unwrap();
+            engine.write_chain_manifest().unwrap();
         }
 
         assert!(matches!(
@@ -3720,13 +3822,13 @@ mod tests {
     fn startup_from_snapshot_with_pruned_log() {
         let dir = temp_dir("snapshot_pruned");
         let mut config = NodeConfig::local_test(dir.clone());
-        config.prune_keep_blocks = Some(650);
+        config.prune_keep_blocks = Some(1_000);
 
         let final_tip_hash = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
             install_active_validator(&mut engine, [0x42u8; 32], "local");
             let mut last_qc = Vec::new();
-            for height in 1..=1_000u64 {
+            for height in 1..=1_300u64 {
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
                 last_qc = build_single_validator_qc_bytes(
@@ -3742,7 +3844,7 @@ mod tests {
         };
 
         let restarted = NodeEngine::init(config).unwrap();
-        assert_eq!(restarted.state.height, 1_000);
+        assert_eq!(restarted.state.height, 1_300);
         assert_eq!(restarted.state.tip_hash, final_tip_hash);
         assert!(restarted.block_store.lowest_height() > 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3822,13 +3924,13 @@ mod tests {
         let dir = temp_dir("snapshot_gap");
         let mut config = NodeConfig::local_test(dir.clone());
         config.snapshot_interval = 30;
-        config.prune_keep_blocks = Some(100);
+        config.prune_keep_blocks = Some(1_000);
 
         let extra_block = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
             install_active_validator(&mut engine, [0x42u8; 32], "local");
             let mut last_qc = Vec::new();
-            for _ in 0..160u64 {
+            for _ in 0..1_300u64 {
                 let height = engine.state.height + 1;
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
                 engine.commit_block(&block).unwrap();
@@ -3846,12 +3948,12 @@ mod tests {
             let mut store = BlockStore::open(
                 dir.join("blocks.log"),
                 indra_storage::PruneConfig {
-                    keep_blocks: Some(100),
+                    keep_blocks: Some(1_000),
                 },
             )
             .unwrap();
             store.append(&extra_block).unwrap();
-            assert_eq!(store.lowest_height(), 62);
+            assert_eq!(store.lowest_height(), 300);
         }
 
         let state_dir = dir.join("state");
@@ -3875,8 +3977,8 @@ mod tests {
                 gap,
             }) => {
                 assert_eq!(snapshot_height, 10);
-                assert_eq!(lowest_block, 62);
-                assert_eq!(gap, 51);
+                assert_eq!(lowest_block, 300);
+                assert_eq!(gap, 289);
             }
             Err(other) => panic!("expected SnapshotReplayGap, got {other}"),
             Ok(_) => panic!("expected SnapshotReplayGap, got successful startup"),
@@ -4719,5 +4821,18 @@ mod tests {
         assert_eq!(engine.staking_mempool, vec![retained]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_pressure_is_fail_closed_at_threshold_and_on_query_failure() {
+        assert!(evaluate_disk_writable(Ok(DISK_CRITICAL_THRESHOLD_BYTES)).is_ok());
+        assert!(matches!(
+            evaluate_disk_writable(Ok(DISK_CRITICAL_THRESHOLD_BYTES - 1)),
+            Err(NodeError::StoragePressure { .. })
+        ));
+        assert!(matches!(
+            evaluate_disk_writable(Err(std::io::Error::other("injected query failure"))),
+            Err(NodeError::StoragePressure { .. })
+        ));
     }
 }

@@ -155,6 +155,13 @@ impl NullifierSet {
         nullifier: Bytes32,
         height: u64,
     ) -> Result<(), crate::error::StateError> {
+        if live_nullifier_capacity_exceeded(self.spent.len()) && !self.spent.contains(&nullifier) {
+            return Err(crate::error::StateError::LiveStateCapacityExceeded {
+                collection: "nullifier set",
+                current: self.spent.len(),
+                max: indra_core::types::primitives::MAX_LIVE_NULLIFIERS,
+            });
+        }
         if !self.insert_at_height(nullifier, height) {
             return Err(crate::error::StateError::DoubleSpend);
         }
@@ -195,9 +202,27 @@ impl NullifierSet {
     }
 }
 
+fn live_nullifier_capacity_exceeded(current: usize) -> bool {
+    current >= indra_core::types::primitives::MAX_LIVE_NULLIFIERS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_nullifier_cap_boundary_is_independent_and_exact() {
+        assert!(!live_nullifier_capacity_exceeded(
+            indra_core::types::primitives::MAX_LIVE_NULLIFIERS - 1
+        ));
+        assert!(live_nullifier_capacity_exceeded(
+            indra_core::types::primitives::MAX_LIVE_NULLIFIERS
+        ));
+        assert_ne!(
+            indra_core::types::primitives::MAX_LIVE_NULLIFIERS,
+            indra_core::types::primitives::MAX_LIVE_UTXOS
+        );
+    }
 
     #[test]
     fn canonical_tree_round_trip_and_membership() {

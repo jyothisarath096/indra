@@ -4012,13 +4012,19 @@ fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<NetworkBr
 }
 
 fn check_disk_space(data_dir: &Path) -> u64 {
-    let available = available_space(data_dir).unwrap_or(0);
-    if available > 0 && available < DISK_CRITICAL_THRESHOLD_BYTES {
+    let available = match available_space(data_dir) {
+        Ok(available) => available,
+        Err(error) => {
+            eprintln!("[disk] CRITICAL: free-space query failed: {error}");
+            return 0;
+        }
+    };
+    if available < DISK_CRITICAL_THRESHOLD_BYTES {
         eprintln!(
             "[disk] CRITICAL: only {} MB remaining",
             available / 1024 / 1024
         );
-    } else if available > 0 && available < DISK_WARN_THRESHOLD_BYTES {
+    } else if available < DISK_WARN_THRESHOLD_BYTES {
         eprintln!(
             "[disk] WARNING: only {} GB remaining",
             available / 1024 / 1024 / 1024
@@ -7527,39 +7533,35 @@ mod tests {
 
     #[test]
     fn request_blocks_below_prune_window_returns_lowest_available() {
-        let path = std::env::temp_dir().join(format!(
-            "indra_node_pruned_blocks_{}.log",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let mut store = indra_storage::BlockStore::open(
-            &path,
-            indra_storage::PruneConfig {
-                keep_blocks: Some(11),
-            },
-        )
-        .unwrap();
-        for height in 0..=20u64 {
+        let dir =
+            std::env::temp_dir().join(format!("indra_node_pruned_blocks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+        let mut store =
+            indra_storage::BlockStore::open(&path, indra_storage::PruneConfig::keep(1_000))
+                .unwrap();
+        for height in 0..=1_299u64 {
             store.append(&block_response_test_block(height)).unwrap();
         }
-        assert_eq!(store.lowest_height(), 10);
+        assert_eq!(store.lowest_height(), 300);
 
         let (blocks, lowest_available, highest_available) =
             blocks_for_range_with_availability(&mut store, 5, 6);
         assert!(blocks.is_empty());
-        assert_eq!(lowest_available, Some(10));
-        assert_eq!(highest_available, Some(20));
+        assert_eq!(lowest_available, Some(300));
+        assert_eq!(highest_available, Some(1_299));
 
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn request_blocks_within_range_returns_blocks_normally() {
-        let path = std::env::temp_dir().join(format!(
-            "indra_node_in_range_blocks_{}.log",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let dir =
+            std::env::temp_dir().join(format!("indra_node_in_range_blocks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
         let mut store =
             indra_storage::BlockStore::open(&path, indra_storage::PruneConfig::archive()).unwrap();
         for height in 0..=20u64 {
@@ -7578,7 +7580,7 @@ mod tests {
         assert_eq!(lowest_available, None);
         assert_eq!(highest_available, None);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

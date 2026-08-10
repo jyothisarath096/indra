@@ -222,7 +222,12 @@ fn apply_propose(
         None
     };
 
-    let _ = state.utxos.spend_at_height(deposit_utxo_id, current_height);
+    state
+        .utxos
+        .spend_at_height(deposit_utxo_id, current_height)
+        .ok_or(StateError::InvariantViolation {
+            message: "validated governance deposit disappeared before spend",
+        })?;
     if let Some(change_output) = change_output {
         let output_index = state.utxos.len() as u32;
         state

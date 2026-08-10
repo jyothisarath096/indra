@@ -519,8 +519,8 @@ fn restarted_block_store_preserves_hash_chain() {
 fn sync_state_downloads_full_chain_from_genesis() {
     let dir = temp_dir("sync_chain");
     std::fs::create_dir_all(&dir).unwrap();
-    let source_log = dir.join("source.log");
-    let follower_log = dir.join("follower.log");
+    let source_log = dir.join("source").join("blocks.log");
+    let follower_log = dir.join("follower").join("blocks.log");
     let source_state_dir = dir.join("source_state");
     let follower_state_dir = dir.join("follower_state");
 
@@ -876,9 +876,9 @@ fn full_restart_recovery_end_to_end() {
     let dir = temp_dir("restart_recovery");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let source_log = dir.join("source.log");
-    let follower_a_log = dir.join("follower_a.log");
-    let follower_b_log = dir.join("follower_b.log");
+    let source_log = dir.join("source").join("blocks.log");
+    let follower_a_log = dir.join("follower_a").join("blocks.log");
+    let follower_b_log = dir.join("follower_b").join("blocks.log");
     let source_state_dir = dir.join("source_state");
     let follower_a_state_dir = dir.join("follower_a_state");
     let follower_b_state_dir = dir.join("follower_b_state");

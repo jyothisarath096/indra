@@ -1,18 +1,15 @@
 //! Immutable, once-per-canonical-commit state published to RPC readers.
 
-use std::{
-    collections::BTreeMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, RwLock,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, RwLock,
 };
 
 use indra_core::types::{
     primitives::Bytes32,
     stake_position::{StakePositionV1, UnbondingTrancheV1},
 };
-use indra_state::{compute_state_root, ChainState};
+use indra_state::{compute_state_root, ChainState, PersistentOrdMap};
 
 /// Dedicated append-independent storage readers used by historical RPCs.
 #[derive(Clone)]
@@ -24,22 +21,22 @@ pub struct RpcStorageReadHandles {
 }
 
 /// Secondary indexes precomputed once when a canonical state is published.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RpcReadIndexes {
     /// Position identifiers grouped by principal owner.
-    pub positions_by_owner: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub positions_by_owner: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
     /// Position identifiers grouped by validator.
-    pub positions_by_validator: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub positions_by_validator: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
     /// Tranche identifiers grouped by parent position.
-    pub tranches_by_position: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub tranches_by_position: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
     /// Tranche identifiers grouped by principal owner.
-    pub tranches_by_owner: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub tranches_by_owner: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
     /// Tranche identifiers grouped by validator.
-    pub tranches_by_validator: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub tranches_by_validator: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
     /// Position identifiers carrying rewards grouped by delegator.
-    pub rewards_by_delegator: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub rewards_by_delegator: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
     /// Position identifiers carrying rewards grouped by validator.
-    pub rewards_by_validator: BTreeMap<Bytes32, Vec<Bytes32>>,
+    pub rewards_by_validator: PersistentOrdMap<Bytes32, Vec<Bytes32>>,
 }
 
 /// Consistent immutable chain view used by all RPC read handlers.
@@ -65,16 +62,114 @@ impl RpcReadSnapshot {
         lowest_block: u64,
         blocks_retained: usize,
     ) -> Self {
+        Self::build_with_index_timing(
+            state,
+            mempool_size,
+            pruned_mode,
+            lowest_block,
+            blocks_retained,
+        )
+        .0
+    }
+
+    fn build_with_index_timing(
+        state: &ChainState,
+        mempool_size: Arc<AtomicUsize>,
+        pruned_mode: bool,
+        lowest_block: u64,
+        blocks_retained: usize,
+    ) -> (Self, std::time::Duration) {
         let chain = Arc::new(state.clone());
+        let index_started = std::time::Instant::now();
         let indexes = build_indexes(&chain);
+        let index_rebuild_duration = index_started.elapsed();
         let state_root = compute_state_root(&chain);
+        (
+            Self {
+                chain,
+                mempool_size,
+                pruned_mode,
+                lowest_block,
+                blocks_retained,
+                state_root,
+                indexes,
+            },
+            index_rebuild_duration,
+        )
+    }
+
+    fn build_incremental(
+        previous: &RpcReadSnapshot,
+        state: &ChainState,
+        effects: &indra_state::CanonicalStateEffects,
+        mempool_size: Arc<AtomicUsize>,
+        pruned_mode: bool,
+        lowest_block: u64,
+        blocks_retained: usize,
+    ) -> Self {
+        let chain = Arc::new(state.clone());
+        let mut indexes = previous.indexes.clone();
+        for position_id in &effects.stake_positions_changed {
+            if let Some(old) = previous.chain.stake_positions.get(position_id) {
+                remove_value(
+                    &mut indexes.positions_by_owner,
+                    &old.principal_owner_id,
+                    position_id,
+                );
+                remove_value(
+                    &mut indexes.positions_by_validator,
+                    &old.validator_id,
+                    position_id,
+                );
+                remove_value(
+                    &mut indexes.rewards_by_delegator,
+                    &old.principal_owner_id,
+                    position_id,
+                );
+                remove_value(
+                    &mut indexes.rewards_by_validator,
+                    &old.validator_id,
+                    position_id,
+                );
+            }
+            if let Some(position) = chain.stake_positions.get(position_id) {
+                index_position(&mut indexes, *position_id, position);
+            }
+        }
+        for position_id in &effects.position_tranche_capacity_changed_for {
+            let old_ids = indexes
+                .tranches_by_position
+                .remove(position_id)
+                .unwrap_or_default();
+            for tranche_id in old_ids {
+                if let Some(old_position) = previous.chain.stake_positions.get(position_id) {
+                    remove_value(
+                        &mut indexes.tranches_by_owner,
+                        &old_position.principal_owner_id,
+                        &tranche_id,
+                    );
+                    remove_value(
+                        &mut indexes.tranches_by_validator,
+                        &old_position.validator_id,
+                        &tranche_id,
+                    );
+                }
+            }
+            {
+                for tranche_id in chain.tranche_ids_for_position(position_id) {
+                    if let Some(tranche) = chain.unbonding_tranches.get(tranche_id) {
+                        index_tranche(&mut indexes, &chain, *tranche_id, tranche);
+                    }
+                }
+            }
+        }
         Self {
+            state_root: compute_state_root(&chain),
             chain,
             mempool_size,
             pruned_mode,
             lowest_block,
             blocks_retained,
-            state_root,
             indexes,
         }
     }
@@ -176,14 +271,20 @@ impl RpcSnapshotPublisher {
         blocks_retained: usize,
     ) -> Self {
         let mempool_size = Arc::new(AtomicUsize::new(mempool_size));
+        let (initial, index_rebuild_duration) = RpcReadSnapshot::build_with_index_timing(
+            state,
+            Arc::clone(&mempool_size),
+            pruned_mode,
+            lowest_block,
+            blocks_retained,
+        );
+        eprintln!(
+            "[rpc] startup secondary-index rebuild completed in {index_rebuild_duration:?} (positions={}, tranches={})",
+            state.stake_positions.len(),
+            state.unbonding_tranches.len()
+        );
         Self {
-            current: Arc::new(RwLock::new(Arc::new(RpcReadSnapshot::build(
-                state,
-                Arc::clone(&mempool_size),
-                pruned_mode,
-                lowest_block,
-                blocks_retained,
-            )))),
+            current: Arc::new(RwLock::new(Arc::new(initial))),
             mempool_size,
         }
     }
@@ -221,6 +322,33 @@ impl RpcSnapshotPublisher {
         self.mempool_size.store(mempool_size, Ordering::Relaxed);
     }
 
+    /// Incrementally update secondary indexes from canonical mutation effects.
+    pub fn publish_with_effects(
+        &self,
+        state: &ChainState,
+        effects: &indra_state::CanonicalStateEffects,
+        mempool_size: usize,
+        pruned_mode: bool,
+        lowest_block: u64,
+        blocks_retained: usize,
+    ) {
+        let previous = self.load();
+        let next = Arc::new(RpcReadSnapshot::build_incremental(
+            &previous,
+            state,
+            effects,
+            Arc::clone(&self.mempool_size),
+            pruned_mode,
+            lowest_block,
+            blocks_retained,
+        ));
+        *self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        self.mempool_size.store(mempool_size, Ordering::Relaxed);
+    }
+
     /// Publish fast-changing transaction-pool size without rebuilding chain state.
     pub fn set_mempool_size(&self, size: usize) {
         self.mempool_size.store(size, Ordering::Relaxed);
@@ -238,30 +366,49 @@ fn build_indexes(state: &ChainState) -> RpcReadIndexes {
     indexes
 }
 
+fn remove_value(map: &mut PersistentOrdMap<Bytes32, Vec<Bytes32>>, key: &Bytes32, value: &Bytes32) {
+    let Some(mut values) = map.get(key).cloned() else {
+        return;
+    };
+    if let Ok(index) = values.binary_search(value) {
+        values.remove(index);
+    }
+    if values.is_empty() {
+        map.remove(key);
+    } else {
+        map.insert(*key, values);
+    }
+}
+
+fn push_value(map: &mut PersistentOrdMap<Bytes32, Vec<Bytes32>>, key: Bytes32, value: Bytes32) {
+    let mut values = map.get(&key).cloned().unwrap_or_default();
+    match values.binary_search(&value) {
+        Ok(_) => return,
+        Err(index) => values.insert(index, value),
+    }
+    map.insert(key, values);
+}
+
 fn index_position(indexes: &mut RpcReadIndexes, id: Bytes32, position: &StakePositionV1) {
-    indexes
-        .positions_by_owner
-        .entry(position.principal_owner_id)
-        .or_default()
-        .push(id);
-    indexes
-        .positions_by_validator
-        .entry(position.validator_id)
-        .or_default()
-        .push(id);
+    push_value(
+        &mut indexes.positions_by_owner,
+        position.principal_owner_id,
+        id,
+    );
+    push_value(
+        &mut indexes.positions_by_validator,
+        position.validator_id,
+        id,
+    );
     if position.principal_owner_id != position.validator_id {
-        indexes
-            .rewards_by_validator
-            .entry(position.validator_id)
-            .or_default()
-            .push(id);
+        push_value(&mut indexes.rewards_by_validator, position.validator_id, id);
     }
     if position.pending_rewards_spark > 0 && position.principal_owner_id != position.validator_id {
-        indexes
-            .rewards_by_delegator
-            .entry(position.principal_owner_id)
-            .or_default()
-            .push(id);
+        push_value(
+            &mut indexes.rewards_by_delegator,
+            position.principal_owner_id,
+            id,
+        );
     }
 }
 
@@ -271,28 +418,174 @@ fn index_tranche(
     id: Bytes32,
     tranche: &UnbondingTrancheV1,
 ) {
-    indexes
-        .tranches_by_position
-        .entry(tranche.position_id)
-        .or_default()
-        .push(id);
+    push_value(&mut indexes.tranches_by_position, tranche.position_id, id);
     if let Some(position) = state.stake_positions.get(&tranche.position_id) {
-        indexes
-            .tranches_by_owner
-            .entry(position.principal_owner_id)
-            .or_default()
-            .push(id);
-        indexes
-            .tranches_by_validator
-            .entry(position.validator_id)
-            .or_default()
-            .push(id);
+        push_value(
+            &mut indexes.tranches_by_owner,
+            position.principal_owner_id,
+            id,
+        );
+        push_value(
+            &mut indexes.tranches_by_validator,
+            position.validator_id,
+            id,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::types::stake_position::{PositionCustodyV1, UnbondingTimingV1};
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
+
+    fn numbered_id(number: u64) -> Bytes32 {
+        let mut value = [0u8; 32];
+        value[..8].copy_from_slice(&number.to_le_bytes());
+        Bytes32(value)
+    }
+
+    fn populated_state(count: usize) -> ChainState {
+        populated_state_with_distribution(count, false)
+    }
+
+    fn populated_state_with_distribution(count: usize, dominant_validator: bool) -> ChainState {
+        let mut state = ChainState::new_genesis();
+        for number in 0..count as u64 {
+            let validator_id = if dominant_validator {
+                numbered_id(1)
+            } else {
+                numbered_id(number % 200 + 1)
+            };
+            let owner_id = numbered_id(number + 1_000);
+            let custody = PositionCustodyV1::DelegatorIdentity {
+                delegator_id: owner_id,
+            };
+            let position =
+                StakePositionV1::new(validator_id, owner_id, custody, None, 17 + number, 100)
+                    .unwrap();
+            let position_id = position.position_id;
+            state.stake_positions.insert(position_id, position);
+            let creation_op_id = numbered_id(number + 2_000_000);
+            let mut tranche = UnbondingTrancheV1::new(
+                position_id,
+                500_000 + number,
+                indra_crypto::commit(500_000 + number, &[0u8; 32]),
+                UnbondingTimingV1::height_precise(30_000).unwrap(),
+                custody,
+                creation_op_id,
+                0,
+            )
+            .unwrap();
+            let source_blinding = indra_crypto::derive_tranche_source_blinding_v1(
+                &indra_crypto::TrancheSourceBlindingInputsV1 {
+                    chain_id: state.chain_id.as_bytes(),
+                    position_id: position_id.0,
+                    tranche_id: tranche.tranche_id.0,
+                    principal_spark: tranche.principal_spark,
+                    start_height: tranche.timing.start_height(),
+                    creation_op_id: creation_op_id.0,
+                },
+            )
+            .unwrap();
+            tranche.source_commitment =
+                indra_crypto::commit(tranche.principal_spark, &source_blinding);
+            state.unbonding_tranches.insert(tranche.tranche_id, tranche);
+        }
+        state.rebuild_position_tranche_index().unwrap();
+        state.ensure_state_commitment_v2(state.height);
+        state
+    }
+
+    fn build_indexes_bulk(state: &ChainState) -> RpcReadIndexes {
+        #[derive(Default)]
+        struct MutableIndexes {
+            positions_by_owner: BTreeMap<Bytes32, Vec<Bytes32>>,
+            positions_by_validator: BTreeMap<Bytes32, Vec<Bytes32>>,
+            tranches_by_position: BTreeMap<Bytes32, Vec<Bytes32>>,
+            tranches_by_owner: BTreeMap<Bytes32, Vec<Bytes32>>,
+            tranches_by_validator: BTreeMap<Bytes32, Vec<Bytes32>>,
+            rewards_by_delegator: BTreeMap<Bytes32, Vec<Bytes32>>,
+            rewards_by_validator: BTreeMap<Bytes32, Vec<Bytes32>>,
+        }
+        let mut mutable = MutableIndexes::default();
+        for (id, position) in &state.stake_positions {
+            mutable
+                .positions_by_owner
+                .entry(position.principal_owner_id)
+                .or_default()
+                .push(*id);
+            mutable
+                .positions_by_validator
+                .entry(position.validator_id)
+                .or_default()
+                .push(*id);
+            if position.principal_owner_id != position.validator_id {
+                mutable
+                    .rewards_by_validator
+                    .entry(position.validator_id)
+                    .or_default()
+                    .push(*id);
+            }
+            if position.pending_rewards_spark > 0
+                && position.principal_owner_id != position.validator_id
+            {
+                mutable
+                    .rewards_by_delegator
+                    .entry(position.principal_owner_id)
+                    .or_default()
+                    .push(*id);
+            }
+        }
+        for (id, tranche) in &state.unbonding_tranches {
+            mutable
+                .tranches_by_position
+                .entry(tranche.position_id)
+                .or_default()
+                .push(*id);
+            if let Some(position) = state.stake_positions.get(&tranche.position_id) {
+                mutable
+                    .tranches_by_owner
+                    .entry(position.principal_owner_id)
+                    .or_default()
+                    .push(*id);
+                mutable
+                    .tranches_by_validator
+                    .entry(position.validator_id)
+                    .or_default()
+                    .push(*id);
+            }
+        }
+        RpcReadIndexes {
+            positions_by_owner: mutable.positions_by_owner.into_iter().collect(),
+            positions_by_validator: mutable.positions_by_validator.into_iter().collect(),
+            tranches_by_position: mutable.tranches_by_position.into_iter().collect(),
+            tranches_by_owner: mutable.tranches_by_owner.into_iter().collect(),
+            tranches_by_validator: mutable.tranches_by_validator.into_iter().collect(),
+            rewards_by_delegator: mutable.rewards_by_delegator.into_iter().collect(),
+            rewards_by_validator: mutable.rewards_by_validator.into_iter().collect(),
+        }
+    }
+
+    fn publisher_with_indexes(state: &ChainState, indexes: RpcReadIndexes) -> RpcSnapshotPublisher {
+        let mempool_size = Arc::new(AtomicUsize::new(0));
+        let snapshot = RpcReadSnapshot {
+            chain: Arc::new(state.clone()),
+            mempool_size: Arc::clone(&mempool_size),
+            pruned_mode: false,
+            lowest_block: 0,
+            blocks_retained: 0,
+            state_root: compute_state_root(state),
+            indexes,
+        };
+        RpcSnapshotPublisher {
+            current: Arc::new(RwLock::new(Arc::new(snapshot))),
+            mempool_size,
+        }
+    }
 
     #[test]
     fn publication_is_prior_or_new_and_never_torn() {
@@ -309,5 +602,147 @@ mod tests {
             (0, old.base_fee)
         );
         assert_eq!((held_new.height(), held_new.chain.base_fee), (7, 99));
+    }
+
+    #[test]
+    fn incremental_indexes_equal_full_rebuild_after_changed_position_and_tranche() {
+        let before = populated_state(8);
+        let publisher = RpcSnapshotPublisher::new(&before, 0, false, 0, 0);
+        let mut after = before.clone();
+        let position_id = *after.stake_positions.iter().next().unwrap().0;
+        let mut position = after.stake_positions.get(&position_id).unwrap().clone();
+        position.pending_rewards_spark += 1;
+        after.stake_positions.insert(position_id, position);
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.stake_positions_changed.insert(position_id);
+        effects
+            .position_tranche_capacity_changed_for
+            .insert(position_id);
+        publisher.publish_with_effects(&after, &effects, 0, false, 0, 0);
+        assert_eq!(publisher.load().indexes, build_indexes(&after));
+    }
+
+    #[test]
+    fn incremental_indexes_equal_full_rebuild_after_sequential_changes_and_removals() {
+        let mut state = populated_state(6);
+        let publisher = RpcSnapshotPublisher::new(&state, 0, false, 0, 0);
+        let position_ids: Vec<_> = state.stake_positions.iter().map(|(id, _)| *id).collect();
+
+        let changed_position_id = position_ids[0];
+        let mut changed_position = state
+            .stake_positions
+            .get(&changed_position_id)
+            .unwrap()
+            .clone();
+        changed_position.pending_rewards_spark = 0;
+        state
+            .stake_positions
+            .insert(changed_position_id, changed_position);
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.stake_positions_changed.insert(changed_position_id);
+        publisher.publish_with_effects(&state, &effects, 0, false, 0, 0);
+        assert_eq!(publisher.load().indexes, build_indexes(&state));
+
+        let removed_position_id = position_ids[1];
+        let removed_tranche_id = *state
+            .tranche_ids_for_position(&removed_position_id)
+            .first()
+            .unwrap();
+        state.unbonding_tranches.remove(&removed_tranche_id);
+        state.rebuild_position_tranche_index().unwrap();
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects
+            .position_tranche_capacity_changed_for
+            .insert(removed_position_id);
+        publisher.publish_with_effects(&state, &effects, 0, false, 0, 0);
+        assert_eq!(publisher.load().indexes, build_indexes(&state));
+
+        state.stake_positions.remove(&removed_position_id);
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.stake_positions_changed.insert(removed_position_id);
+        publisher.publish_with_effects(&state, &effects, 0, false, 0, 0);
+        assert_eq!(publisher.load().indexes, build_indexes(&state));
+    }
+
+    /// Real-scale benchmark requested by the Segment 6 review. Run explicitly
+    /// in release mode so it never inflates the ordinary test suite.
+    #[test]
+    #[ignore = "real-scale 104,096-position/tranche benchmark"]
+    fn benchmark_incremental_vs_full_at_structural_cap() {
+        const COUNT: usize = 104_096;
+        let state = populated_state(COUNT);
+        let publisher = RpcSnapshotPublisher::new(&state, 0, false, 0, 0);
+        let position_id = *state.stake_positions.iter().next().unwrap().0;
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.stake_positions_changed.insert(position_id);
+        effects
+            .position_tranche_capacity_changed_for
+            .insert(position_id);
+
+        let mut incremental = Vec::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            publisher.publish_with_effects(&state, &effects, 0, false, 0, 0);
+            incremental.push(started.elapsed());
+        }
+        let mut full = Vec::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            publisher.publish(&state, 0, false, 0, 0);
+            full.push(started.elapsed());
+        }
+        incremental.sort_unstable();
+        full.sort_unstable();
+        let incremental_median: Duration = incremental[incremental.len() / 2];
+        let full_median: Duration = full[full.len() / 2];
+        eprintln!(
+            "rpc snapshot structural-cap benchmark: incremental_median={incremental_median:?} full_median={full_median:?} incremental_samples={incremental:?} full_samples={full:?} positions={COUNT} tranches={COUNT}"
+        );
+        assert!(incremental_median < full_median);
+        assert_eq!(publisher.load().indexes, build_indexes(&state));
+    }
+
+    #[test]
+    #[ignore = "real-scale 100,001-position dominant-validator benchmark"]
+    fn benchmark_incremental_update_at_per_validator_structural_cap() {
+        const COUNT: usize = 100_001;
+        let state = populated_state_with_distribution(COUNT, true);
+        let indexes = build_indexes_bulk(&state);
+        assert_eq!(
+            indexes
+                .positions_by_validator
+                .get(&numbered_id(1))
+                .unwrap()
+                .len(),
+            COUNT
+        );
+        assert_eq!(
+            indexes
+                .tranches_by_validator
+                .get(&numbered_id(1))
+                .unwrap()
+                .len(),
+            COUNT
+        );
+        let publisher = publisher_with_indexes(&state, indexes);
+        let position_id = *state.stake_positions.iter().next().unwrap().0;
+        let mut effects = indra_state::CanonicalStateEffects::default();
+        effects.stake_positions_changed.insert(position_id);
+        effects
+            .position_tranche_capacity_changed_for
+            .insert(position_id);
+
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let started = Instant::now();
+            publisher.publish_with_effects(&state, &effects, 0, false, 0, 0);
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "rpc snapshot dominant-validator incremental benchmark: median={:?} samples={samples:?} positions={COUNT} tranches={COUNT}",
+            samples[samples.len() / 2]
+        );
+        assert_eq!(publisher.load().indexes, build_indexes_bulk(&state));
     }
 }

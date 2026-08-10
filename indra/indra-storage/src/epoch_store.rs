@@ -76,12 +76,49 @@ impl EpochStore {
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&record_bytes)?;
         self.file.flush()?;
+        self.file.sync_all()?;
 
         self.index
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(record.epoch, offset);
         self.next_epoch += 1;
+        Ok(())
+    }
+
+    /// Quarantine and remove epoch records newer than the manifest commit.
+    pub fn recover_to_latest(&mut self, latest: Option<u64>) -> StorageResult<()> {
+        let confirmed_next = latest.map_or(0, |epoch| epoch.saturating_add(1));
+        if self.next_epoch <= confirmed_next {
+            return Ok(());
+        }
+        let cut = if confirmed_next == 0 {
+            FILE_HEADER_BYTES
+        } else {
+            self.index
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&confirmed_next)
+                .copied()
+                .ok_or_else(|| StorageError::ManifestMismatch {
+                    detail: format!("epoch recovery boundary {confirmed_next} is missing"),
+                })?
+        };
+        let quarantine = self.path.with_extension("log.unconfirmed");
+        std::fs::rename(&self.path, &quarantine)?;
+        let mut source = File::open(&quarantine)?;
+        let mut replacement = File::create(&self.path)?;
+        std::io::copy(
+            &mut std::io::Read::by_ref(&mut source).take(cut),
+            &mut replacement,
+        )?;
+        replacement.flush()?;
+        replacement.sync_all()?;
+        if let Some(parent) = self.path.parent() {
+            crate::atomic::fsync_dir(parent)?;
+        }
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.rebuild_index()?;
         Ok(())
     }
 

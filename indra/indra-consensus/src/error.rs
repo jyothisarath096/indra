@@ -35,6 +35,10 @@ pub enum ConsensusError {
     #[error("transaction fee too low")]
     FeeTooLow,
 
+    /// Local durable storage is unavailable or below its fail-closed reserve.
+    #[error("transaction admission disabled by critical local storage pressure")]
+    StoragePressure,
+
     // ── Proposer election errors ──────────────────────────────────────────
     /// The validator set is empty — cannot elect a proposer.
     #[error("cannot elect proposer: validator set is empty")]

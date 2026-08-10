@@ -89,6 +89,26 @@ pub enum StateError {
         max: usize,
     },
 
+    /// A block exceeds the permanent-nullifier insertion budget.
+    #[error("block contains {actual} spent inputs, maximum is {max}")]
+    TooManyNullifiers {
+        /// Actual number of spent inputs.
+        actual: usize,
+        /// Consensus maximum.
+        max: usize,
+    },
+
+    /// A canonical collection has reached its live consensus capacity.
+    #[error("live {collection} capacity reached: {current} entries (maximum {max})")]
+    LiveStateCapacityExceeded {
+        /// Canonical collection name.
+        collection: &'static str,
+        /// Current collection size.
+        current: usize,
+        /// Consensus maximum.
+        max: usize,
+    },
+
     /// Block's base_fee field does not match the computed value.
     #[error("block base_fee {block_fee} does not match computed {computed_fee}")]
     BaseFeeIncorrect {
