@@ -9,10 +9,6 @@ license.workspace = true
 name = "indra_ffi"
 crate-type = ["staticlib", "cdylib"]
 
-[features]
-default = []
-legacy_raw_keys = []
-
 [dependencies]
 indra-core         = { path = "../indra-core" }
 indra-crypto       = { path = "../indra-crypto" }

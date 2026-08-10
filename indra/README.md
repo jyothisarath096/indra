@@ -46,11 +46,11 @@ indra/
 ├── indra-state/          State machine, UTXO set, epoch logic, governance
 ├── indra-consensus/      BFT consensus, mempool, proposer election
 ├── indra-network/        P2P networking, gossip, observer protocol
-├── indra-storage/        Block store, state snapshots, epoch history, migration
+├── indra-storage/        Block store, state snapshots, and epoch history
 ├── indra-node/           Node binary, engine, RPC dispatch
 ├── indra-rpc/            JSON-RPC 2.0 server and handlers
 ├── indra-cli/            CLI tools (stake, governance, keygen, send, wallet-scan)
-├── indra-keystore/       Encrypted keys.json parsing and migration support
+├── indra-keystore/       Canonical encrypted keys.json parsing and creation
 ├── indra-ffi/            C FFI bridge for iOS/Android wallets
 └── indra-bench/          Benchmarks
 ```
@@ -111,15 +111,8 @@ Argon2id + ChaCha20-Poly1305.
 
 For unattended validator startup, store the keystore password in a separate
 mode-0600 file and reference it from `[keys].password_file` in `config.toml`,
-or pass `--keys-password-file` to the node. For local test/dev only, keygen
-also supports an explicit `--plaintext-unsafe` opt-out.
-
-Existing plaintext files can be migrated without regenerating keys:
-
-```bash
-indra-keygen encrypt --keys ~/.indra/data/keys.json --replace --password-file ~/.indra/data/keys.pass
-indra-keygen inspect --keys ~/.indra/data/keys.json
-```
+or pass `--keys-password-file` to the node. Plaintext keystores are not
+accepted.
 
 ### 2. Generate config
 
@@ -418,8 +411,8 @@ remains a fallback during rollout.
 Native iOS wallet at [github.com/jyothisarath096/indra-ios](https://github.com/jyothisarath096/indra-ios).
 Built with SwiftUI. Uses `indra-ffi` via XCFramework. Production FFI builds use
 opaque in-process key handles (`IndraKeyHandle`) and public metadata structs so
-raw private keys do not cross the FFI boundary. Legacy raw-key exports are
-available only behind the `legacy_raw_keys` Cargo feature for migration/testing.
+raw private keys do not cross the FFI boundary. The opaque-handle API is the
+only supported signing surface.
 Long-term persistence remains the consuming app's platform secure storage
 (iOS Keychain today; Android Keystore for a future Android app).
 

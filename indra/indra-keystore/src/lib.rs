@@ -7,7 +7,7 @@
 use std::{
     fs::OpenOptions,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -208,46 +208,18 @@ impl KeysFile {
             .chain(self.payment_key_history.iter())
     }
 
-    /// Render the legacy plaintext JSON format.
-    pub fn to_json(&self) -> String {
-        plaintext_json(self)
-    }
-
-    /// Parse either the legacy plaintext format or an encrypted format if a
-    /// password source is supplied.
+    /// Parse the canonical encrypted format using the supplied password source.
     pub fn from_json_with_password(json: &str, source: PasswordSource<'_>) -> KeystoreResult<Self> {
-        match detect_format(json)? {
-            KeyFileFormat::Plaintext => plaintext_from_json(json),
-            KeyFileFormat::Encrypted => {
-                let password = source.resolve(false)?;
-                decrypt_encrypted_keys(json, password.as_bytes())
-            }
-        }
+        let password = source.resolve(false)?;
+        decrypt_encrypted_keys(json, password.as_bytes())
     }
 
-    /// Parse the legacy plaintext format.
-    pub fn from_json(json: &str) -> KeystoreResult<Self> {
-        plaintext_from_json(json)
-    }
-
-    /// Load either plaintext or encrypted keys.
+    /// Load canonical encrypted keys.
     pub fn load_with_password(path: &str, source: PasswordSource<'_>) -> KeystoreResult<Self> {
         warn_if_key_file_permissive(path);
         let json = std::fs::read_to_string(path)
             .map_err(|e| KeystoreError::Io(format!("{}: {}", path, e)))?;
-        if matches!(detect_format(&json)?, KeyFileFormat::Plaintext) {
-            eprintln!(
-                "WARNING: plaintext keys.json loaded. This is supported for compatibility, \
-                 but mainnet validators should run: indra-keygen encrypt --keys {}",
-                path
-            );
-        }
         Self::from_json_with_password(&json, source)
-    }
-
-    /// Load only legacy plaintext keys.
-    pub fn load(path: &str) -> KeystoreResult<Self> {
-        Self::load_with_password(path, PasswordSource::None)
     }
 }
 
@@ -301,30 +273,6 @@ impl<'a> PasswordSource<'a> {
             Self::None => Err(KeystoreError::PasswordRequired),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyFileFormat {
-    Plaintext,
-    Encrypted,
-}
-
-fn detect_format(json: &str) -> KeystoreResult<KeyFileFormat> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-    if value.get("format").and_then(|v| v.as_str()) == Some(KEYSTORE_FORMAT) {
-        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-        if version != KEYSTORE_VERSION as u64 {
-            return Err(KeystoreError::UnsupportedVersion(version));
-        }
-        return Ok(KeyFileFormat::Encrypted);
-    }
-    if value.get("private").is_some() {
-        return Ok(KeyFileFormat::Plaintext);
-    }
-    Err(KeystoreError::Parse(
-        "unrecognized key file format".to_string(),
-    ))
 }
 
 fn build_keys_file(
@@ -405,16 +353,16 @@ pub fn generate_from_passphrase(passphrase: &str, name: String) -> KeystoreResul
 }
 
 /// Encrypt keys to the v1 encrypted keystore format.
-pub fn encrypt_plaintext_keys(keys: &KeysFile, password: &[u8]) -> KeystoreResult<String> {
+pub fn encrypt_keys(keys: &KeysFile, password: &[u8]) -> KeystoreResult<String> {
     let mut salt = [0u8; ARGON2_SALT_BYTES];
     let mut nonce = [0u8; CHACHA_NONCE_BYTES];
     let mut rng = rand::rngs::OsRng;
     rng.fill_bytes(&mut salt);
     rng.fill_bytes(&mut nonce);
-    encrypt_plaintext_keys_with_params(keys, password, salt, nonce)
+    encrypt_keys_with_params(keys, password, salt, nonce)
 }
 
-fn encrypt_plaintext_keys_with_params(
+fn encrypt_keys_with_params(
     keys: &KeysFile,
     password: &[u8],
     salt: [u8; ARGON2_SALT_BYTES],
@@ -455,29 +403,20 @@ pub fn decrypt_encrypted_keys(json: &str, password: &[u8]) -> KeystoreResult<Key
     Ok(keys)
 }
 
-/// Return public metadata from either plaintext or encrypted keys without a
-/// password.
+/// Return public metadata from a canonical encrypted keystore without a password.
 pub fn inspect_public_metadata(json: &str) -> KeystoreResult<(String, ValidatorKeys)> {
-    match detect_format(json)? {
-        KeyFileFormat::Plaintext => {
-            let keys = plaintext_from_json(json)?;
-            Ok((keys.name, keys.public))
-        }
-        KeyFileFormat::Encrypted => {
-            let container: EncryptedContainer =
-                serde_json::from_str(json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-            if container.format != KEYSTORE_FORMAT {
-                return Err(KeystoreError::Parse("not an INDRA keystore".to_string()));
-            }
-            if container.version != KEYSTORE_VERSION {
-                return Err(KeystoreError::UnsupportedVersion(container.version as u64));
-            }
-            container.validate_crypto_params()?;
-            let public = container.public.to_validator_keys()?;
-            validate_public_container_identity(&container.validator_id, &public)?;
-            Ok((container.name, public))
-        }
+    let container: EncryptedContainer =
+        serde_json::from_str(json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+    if container.format != KEYSTORE_FORMAT {
+        return Err(KeystoreError::Parse("not an INDRA keystore".to_string()));
     }
+    if container.version != KEYSTORE_VERSION {
+        return Err(KeystoreError::UnsupportedVersion(container.version as u64));
+    }
+    container.validate_crypto_params()?;
+    let public = container.public.to_validator_keys()?;
+    validate_public_container_identity(&container.validator_id, &public)?;
+    Ok((container.name, public))
 }
 
 /// Inspect either canonical hot or cold keystore without decrypting secrets.
@@ -512,23 +451,9 @@ pub fn inspect_key_file_public_metadata(json: &str) -> KeystoreResult<KeyFilePub
                 pq_pk.len()
             )));
         }
-        if value.get("crypto").is_some() {
-            let container: ColdEncryptedContainer =
-                serde_json::from_value(value).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-            container.validate()?;
-        } else if value.get("private").is_some() {
-            let container: ColdPlaintextContainer =
-                serde_json::from_value(value).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-            if container.format != COLD_KEYSTORE_FORMAT
-                || container.version != COLD_KEYSTORE_VERSION
-            {
-                return Err(KeystoreError::Parse("invalid cold keystore format".into()));
-            }
-        } else {
-            return Err(KeystoreError::Parse(
-                "cold keystore contains neither encrypted nor plaintext secret material".into(),
-            ));
-        }
+        let container: ColdEncryptedContainer =
+            serde_json::from_value(value).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+        container.validate()?;
         return Ok(KeyFilePublicMetadata::Cold {
             classical_pk,
             pq_pk,
@@ -607,28 +532,6 @@ pub fn load_cold_keys(path: &str, source: PasswordSource<'_>) -> KeystoreResult<
     warn_if_key_file_permissive(path);
     let json =
         std::fs::read_to_string(path).map_err(|e| KeystoreError::Io(format!("{}: {}", path, e)))?;
-    if serde_json::from_str::<serde_json::Value>(&json)
-        .ok()
-        .and_then(|value| value.get("private").cloned())
-        .is_some()
-    {
-        let container: ColdPlaintextContainer =
-            serde_json::from_str(&json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-        if container.format != COLD_KEYSTORE_FORMAT || container.version != COLD_KEYSTORE_VERSION {
-            return Err(KeystoreError::Parse("invalid cold keystore format".into()));
-        }
-        let keys = ColdKeysFile {
-            classical_seed: decode_hex_fixed::<32>(
-                &container.private.classical_seed,
-                "classical_seed",
-            )?,
-            pq_seed: decode_hex_fixed::<32>(&container.private.pq_seed, "pq_seed")?,
-            classical_pk: decode_hex_fixed::<32>(&container.public.classical_pk, "classical_pk")?,
-            pq_pk: decode_hex(&container.public.pq_pk, "pq_pk")?,
-        };
-        keys.reconstruct()?;
-        return Ok(keys);
-    }
     let password = source.resolve(false)?;
     decrypt_cold_keys(&json, password.as_bytes())
 }
@@ -636,7 +539,7 @@ pub fn load_cold_keys(path: &str, source: PasswordSource<'_>) -> KeystoreResult<
 /// Generate and securely write a new dedicated cold-key file.
 pub fn generate_cold_keys_file(
     path: &Path,
-    password: Option<&[u8]>,
+    password: &[u8],
     force: bool,
 ) -> KeystoreResult<ColdKeysFile> {
     if path.exists() && !force {
@@ -646,32 +549,8 @@ pub fn generate_cold_keys_file(
         )));
     }
     let keys = ColdKeysFile::generate()?;
-    let contents = match password {
-        Some(password) => encrypt_cold_keys(&keys, password)?,
-        None => serde_json::to_string_pretty(&ColdPlaintextContainer::from(&keys))
-            .map_err(|e| KeystoreError::Parse(e.to_string()))?,
-    };
-    let verified = match password {
-        Some(password) => decrypt_cold_keys(&contents, password)?,
-        None => {
-            let container: ColdPlaintextContainer =
-                serde_json::from_str(&contents).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-            let verified = ColdKeysFile {
-                classical_seed: decode_hex_fixed::<32>(
-                    &container.private.classical_seed,
-                    "classical_seed",
-                )?,
-                pq_seed: decode_hex_fixed::<32>(&container.private.pq_seed, "pq_seed")?,
-                classical_pk: decode_hex_fixed::<32>(
-                    &container.public.classical_pk,
-                    "classical_pk",
-                )?,
-                pq_pk: decode_hex(&container.public.pq_pk, "pq_pk")?,
-            };
-            verified.reconstruct()?;
-            verified
-        }
-    };
+    let contents = encrypt_cold_keys(&keys, password)?;
+    let verified = decrypt_cold_keys(&contents, password)?;
     if verified != keys {
         return Err(KeystoreError::Crypto(
             "cold keystore round-trip verification failed".into(),
@@ -681,50 +560,9 @@ pub fn generate_cold_keys_file(
     Ok(keys)
 }
 
-/// Write encrypted contents to a temporary file, verify decryption, back up the
-/// original plaintext, and atomically replace it.
-pub fn encrypt_plaintext_keys_replace(
-    path: &Path,
-    keys: &KeysFile,
-    password: &[u8],
-) -> KeystoreResult<PathBuf> {
-    let encrypted = encrypt_plaintext_keys(keys, password)?;
-    let verified = decrypt_encrypted_keys(&encrypted, password)?;
-    if &verified != keys {
-        return Err(KeystoreError::Crypto(
-            "encrypted keystore round-trip verification failed".to_string(),
-        ));
-    }
-    let tmp = path.with_extension("json.encrypted.tmp");
-    write_keys_secure(path_to_str(&tmp)?, &encrypted)?;
-    let backup = timestamped_backup_path(path);
-    std::fs::rename(path, &backup).map_err(|e| KeystoreError::Io(e.to_string()))?;
-    set_secret_file_permissions(&backup)?;
-    std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-    set_secret_file_permissions(path)?;
-    Ok(backup)
-}
-
 fn path_to_str(path: &Path) -> KeystoreResult<&str> {
     path.to_str()
         .ok_or_else(|| KeystoreError::Io(format!("non-UTF-8 path: {}", path.display())))
-}
-
-fn timestamped_backup_path(path: &Path) -> PathBuf {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    path.with_extension(format!("plaintext-backup-{ts}.json"))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PlaintextContainer {
-    #[serde(default)]
-    name: String,
-    validator_id: String,
-    public: PublicJson,
-    private: PrivateJson,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -780,9 +618,6 @@ struct PrivateJson {
     payment_keypair: Option<String>,
     #[serde(default)]
     payment_key_history: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -806,7 +641,6 @@ impl PrivatePayload {
                     .iter()
                     .map(|keypair| hex::encode(keypair.encode()))
                     .collect(),
-                warning: None,
             },
         }
     }
@@ -957,31 +791,6 @@ struct ColdPrivateJson {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ColdPlaintextContainer {
-    format: String,
-    version: u8,
-    public: ColdPublicJson,
-    private: ColdPrivateJson,
-}
-
-impl From<&ColdKeysFile> for ColdPlaintextContainer {
-    fn from(keys: &ColdKeysFile) -> Self {
-        Self {
-            format: COLD_KEYSTORE_FORMAT.to_string(),
-            version: COLD_KEYSTORE_VERSION,
-            public: ColdPublicJson {
-                classical_pk: hex::encode(keys.classical_pk),
-                pq_pk: hex::encode(&keys.pq_pk),
-            },
-            private: ColdPrivateJson {
-                classical_seed: hex::encode(keys.classical_seed),
-                pq_seed: hex::encode(keys.pq_seed),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct ColdEncryptedContainer {
     format: String,
     version: u8,
@@ -1089,92 +898,6 @@ struct CipherJson {
 #[derive(Debug, Serialize, Deserialize)]
 struct CipherParamsJson {
     nonce: String,
-}
-
-fn plaintext_json(keys: &KeysFile) -> String {
-    let payment_pubkey_json = keys
-        .public
-        .payment_pubkey
-        .as_ref()
-        .map(|payment_pubkey| format!(r#""{}""#, hex::encode(payment_pubkey.encode())))
-        .unwrap_or_else(|| "null".to_string());
-    let payment_keypair_json = keys
-        .payment_keypair
-        .as_ref()
-        .map(|payment_keypair| format!(r#""{}""#, hex::encode(payment_keypair.encode())))
-        .unwrap_or_else(|| "null".to_string());
-    let payment_key_history_json = keys
-        .payment_key_history
-        .iter()
-        .map(|keypair| format!(r#""{}""#, hex::encode(keypair.encode())))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        r#"{{
-  "name": "{name}",
-  "validator_id": "{validator_id}",
-  "mnemonic_hint": "Back up your 24-word BIP-39 recovery phrase separately. It is never stored in this file.",
-  "public": {{
-    "hybrid_classical_pk": "{classical}",
-    "hybrid_pq_pk": "{pq}",
-    "vrf_pk": "{vrf}",
-    "payment_pubkey": {payment_pubkey}
-  }},
-  "private": {{
-    "hybrid_seed": "{h_seed}",
-    "vrf_seed": "{v_seed}",
-    "pq_sk": "{pq_sk}",
-    "payment_keypair": {payment_keypair},
-    "payment_key_history": [{payment_key_history}],
-    "WARNING": "Keep private seeds secret. Never share this section."
-  }}
-}}"#,
-        name = json_escape(&keys.name),
-        validator_id = hex::encode(keys.public.validator_id),
-        classical = hex::encode(keys.public.hybrid_classical_pk),
-        pq = hex::encode(&keys.public.hybrid_pq_pk),
-        vrf = hex::encode(keys.public.vrf_pk),
-        h_seed = hex::encode(keys.hybrid_seed),
-        v_seed = hex::encode(keys.vrf_seed),
-        pq_sk = hex::encode(&keys.pq_sk),
-        payment_pubkey = payment_pubkey_json,
-        payment_keypair = payment_keypair_json,
-        payment_key_history = payment_key_history_json,
-    )
-}
-
-fn plaintext_from_json(json: &str) -> KeystoreResult<KeysFile> {
-    let parsed: PlaintextContainer =
-        serde_json::from_str(json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-    let public = parsed.public.to_validator_keys()?;
-    validate_public_container_identity(&parsed.validator_id, &public)?;
-    let keys = KeysFile {
-        name: parsed.name,
-        public,
-        hybrid_seed: decode_hex_fixed::<32>(&parsed.private.hybrid_seed, "hybrid_seed")?,
-        vrf_seed: decode_hex_fixed::<32>(&parsed.private.vrf_seed, "vrf_seed")?,
-        pq_sk: decode_hex(&parsed.private.pq_sk, "pq_sk")?,
-        payment_keypair: parsed
-            .private
-            .payment_keypair
-            .as_deref()
-            .map(|value| {
-                PaymentKeypairV1::decode(&decode_hex(value, "payment_keypair")?)
-                    .map_err(|e| KeystoreError::Crypto(e.to_string()))
-            })
-            .transpose()?,
-        payment_key_history: parsed
-            .private
-            .payment_key_history
-            .iter()
-            .map(|value| {
-                PaymentKeypairV1::decode(&decode_hex(value, "payment_key_history")?)
-                    .map_err(|e| KeystoreError::Crypto(e.to_string()))
-            })
-            .collect::<KeystoreResult<Vec<_>>>()?,
-    };
-    verify_public_metadata(&keys)?;
-    Ok(keys)
 }
 
 fn validate_public_container_identity(
@@ -1335,16 +1058,6 @@ fn write_secret_file_secure(path: &str, contents: &[u8]) -> KeystoreResult<()> {
     std::fs::write(path, contents).map_err(|e| KeystoreError::Io(format!("{}: {}", path, e)))
 }
 
-fn set_secret_file_permissions(path: &Path) -> KeystoreResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE))
-            .map_err(|e| KeystoreError::Io(format!("{}: {}", path.display(), e)))?;
-    }
-    Ok(())
-}
-
 /// Print a warning if an existing key file is readable by group/other users.
 pub fn warn_if_key_file_permissive(path: &str) {
     #[cfg(unix)]
@@ -1474,14 +1187,6 @@ impl EchoGuard {
     }
 }
 
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
 /// Return true if a secret-bearing CLI flag was supplied with an argv value.
 pub fn has_secret_value_in_argv(args: &[String], flag: &str) -> bool {
     args.iter()
@@ -1493,6 +1198,7 @@ pub fn has_secret_value_in_argv(args: &[String], flag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn fixture() -> KeysFile {
         generate_from_master_seed("validator".to_string(), [1; 32]).unwrap()
@@ -1507,8 +1213,7 @@ mod tests {
     #[test]
     fn encrypted_keystore_round_trip_recovers_identical_keys() {
         let keys = fixture();
-        let json =
-            encrypt_plaintext_keys_with_params(&keys, b"correct horse", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"correct horse", [7; 32], [8; 12]).unwrap();
         let recovered = decrypt_encrypted_keys(&json, b"correct horse").unwrap();
         assert_eq!(recovered, keys);
     }
@@ -1529,7 +1234,7 @@ mod tests {
         let cold_path = dir.join("validator-cold-keys.json");
         let hot_bytes = b"existing-hot-identity-must-remain-byte-identical";
         write_secret_file_secure(hot_path.to_str().unwrap(), hot_bytes).unwrap();
-        let generated = generate_cold_keys_file(&cold_path, Some(b"cold-password"), false).unwrap();
+        let generated = generate_cold_keys_file(&cold_path, b"cold-password", false).unwrap();
         assert_eq!(std::fs::read(&hot_path).unwrap(), hot_bytes);
         let json = std::fs::read_to_string(&cold_path).unwrap();
         assert!(json.contains(COLD_KEYSTORE_FORMAT));
@@ -1566,7 +1271,7 @@ mod tests {
     #[test]
     fn unified_public_inspection_distinguishes_hot_and_cold_schemas() {
         let hot = fixture();
-        let hot_json = encrypt_plaintext_keys(&hot, b"pw").unwrap();
+        let hot_json = encrypt_keys(&hot, b"pw").unwrap();
         assert_eq!(
             inspect_key_file_public_metadata(&hot_json).unwrap(),
             KeyFilePublicMetadata::Hot {
@@ -1591,11 +1296,11 @@ mod tests {
     fn cold_key_file_refuses_overwrite_without_force() {
         let dir = test_dir("cold-key-overwrite");
         let path = dir.join("validator-cold-keys.json");
-        let first = generate_cold_keys_file(&path, Some(b"pw"), false).unwrap();
+        let first = generate_cold_keys_file(&path, b"pw", false).unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert!(generate_cold_keys_file(&path, Some(b"pw"), false).is_err());
+        assert!(generate_cold_keys_file(&path, b"pw", false).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let replacement = generate_cold_keys_file(&path, Some(b"pw"), true).unwrap();
+        let replacement = generate_cold_keys_file(&path, b"pw", true).unwrap();
         assert_ne!(replacement.classical_pk, first.classical_pk);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1617,21 +1322,10 @@ mod tests {
     }
 
     #[test]
-    fn payment_keypair_plaintext_json_round_trip() {
-        let keys = fixture();
-        let json = keys.to_json();
-        assert!(!json.contains("bls_seed"));
-        assert!(!json.contains("bls_pk"));
-        assert!(json.contains("\"payment_pubkey\""));
-        assert!(json.contains("\"payment_keypair\""));
-        assert_eq!(KeysFile::from_json(&json).unwrap(), keys);
-    }
-
-    #[test]
     fn payment_keypair_encrypted_storage_round_trip() {
         let mut keys = fixture();
         keys.payment_key_history.push(PaymentKeypairV1::generate());
-        let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         assert!(json.contains("\"payment_pubkey\""));
         assert!(!json.contains("\"payment_keypair\""));
         assert!(!json.contains("payment_key_history"));
@@ -1646,14 +1340,14 @@ mod tests {
     #[test]
     fn wrong_password_fails_authentication_cleanly() {
         let keys = fixture();
-        let json = encrypt_plaintext_keys_with_params(&keys, b"right", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"right", [7; 32], [8; 12]).unwrap();
         assert!(decrypt_encrypted_keys(&json, b"wrong").is_err());
     }
 
     #[test]
     fn public_metadata_inspectable_without_password() {
         let keys = fixture();
-        let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         let (name, public) = inspect_public_metadata(&json).unwrap();
         assert_eq!(name, keys.name);
         assert_eq!(public, keys.public);
@@ -1662,7 +1356,7 @@ mod tests {
     #[test]
     fn decrypted_private_material_rederives_cleartext_public_metadata() {
         let keys = fixture();
-        let mut json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let mut json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         let wrong_vrf = hex::encode([9u8; 32]);
         json = json.replacen(&hex::encode(keys.public.vrf_pk), &wrong_vrf, 1);
         assert!(matches!(
@@ -1674,7 +1368,7 @@ mod tests {
     #[test]
     fn tampering_with_public_metadata_causes_decrypt_failure() {
         let keys = fixture();
-        let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         let tampered = json.replacen("validator", "evil", 1);
         assert!(decrypt_encrypted_keys(&tampered, b"pw").is_err());
     }
@@ -1682,7 +1376,7 @@ mod tests {
     #[test]
     fn encrypted_public_validator_id_mismatch_is_rejected_without_password() {
         let keys = fixture();
-        let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         let bad = json.replacen(
             &format!(
                 "\"validator_id\": \"{}\"",
@@ -1698,7 +1392,7 @@ mod tests {
     #[test]
     fn encrypted_keystore_rejects_unsupported_crypto_params() {
         let keys = fixture();
-        let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         let bad = json.replacen("\"memory_kib\": 65536", "\"memory_kib\": 1024", 1);
         assert!(matches!(
             decrypt_encrypted_keys(&bad, b"pw"),
@@ -1707,36 +1401,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_keys_json_still_loads() {
-        let keys = fixture();
-        let parsed = KeysFile::from_json(&keys.to_json()).unwrap();
-        assert_eq!(parsed, keys);
-    }
-
-    #[test]
     fn unsupported_encrypted_version_fails_closed() {
         let keys = fixture();
-        let json = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let json = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         let bad = json.replacen("\"version\": 1", "\"version\": 99", 1);
         assert!(matches!(
             decrypt_encrypted_keys(&bad, b"pw"),
             Err(KeystoreError::UnsupportedVersion(99))
         ));
-    }
-
-    #[test]
-    fn migration_replace_verifies_before_replacing_original() {
-        let dir =
-            std::env::temp_dir().join(format!("indra-keystore-test-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("keys.json");
-        let keys = fixture();
-        write_keys_secure(path.to_str().unwrap(), &keys.to_json()).unwrap();
-        let backup = encrypt_plaintext_keys_replace(&path, &keys, b"pw").unwrap();
-        assert!(backup.exists());
-        let encrypted = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(decrypt_encrypted_keys(&encrypted, b"pw").unwrap(), keys);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1749,7 +1421,7 @@ mod tests {
         let keys_path = dir.join("keys.json");
         let password_path = dir.join("keys.pass");
         let keys = fixture();
-        let encrypted = encrypt_plaintext_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
+        let encrypted = encrypt_keys_with_params(&keys, b"pw", [7; 32], [8; 12]).unwrap();
         write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
         write_keys_secure(password_path.to_str().unwrap(), "pw\n").unwrap();
         let loaded = load_keys(

@@ -9,8 +9,7 @@
 //! - Ed25519 + ML-DSA-87 hybrid keypair (for signing transactions and votes)
 //! - VRF keypair (for proposer election)
 //!
-//! Output: an encrypted `keys.json` by default, with legacy plaintext available
-//! only through an explicit unsafe opt-out for test/dev use.
+//! Output: an encrypted `keys.json`.
 //!
 //! ### `genesis`
 //! Build a `genesis.toml` from a list of validator public keys and stake amounts.
@@ -54,8 +53,7 @@ pub use genesis_cmd::{
     with_cold_manifest, GenesisConfig, GenesisEntry,
 };
 pub use keygen::{
-    decrypt_encrypted_keys, encrypt_cold_keys, encrypt_plaintext_keys,
-    encrypt_plaintext_keys_replace, generate_cold_keys_file, generate_cold_share_ceremony,
+    encrypt_cold_keys, encrypt_keys, generate_cold_keys_file, generate_cold_share_ceremony,
     generate_from_master_seed, generate_from_new_mnemonic, generate_from_passphrase,
     has_secret_value_in_argv, inspect_key_file_public_metadata, inspect_public_metadata,
     load_cold_keys, load_keys_for_cli, password_source_from_args, read_cold_share,

@@ -88,15 +88,14 @@ fn keygen_from_passphrase() {
 #[test]
 fn keys_json_is_valid_structure() {
     let keys = generate_from_master_seed("TestValidator".to_string(), [0x01u8; 32]).unwrap();
-    let json = keys.to_json();
+    let json = indra_cli::encrypt_keys(&keys, b"pw").unwrap();
     // All required fields present
     for field in &[
         "name",
         "validator_id",
         "hybrid_classical_pk",
         "vrf_pk",
-        "hybrid_seed",
-        "WARNING",
+        "crypto",
     ] {
         assert!(json.contains(field), "missing: {field}");
     }
@@ -154,23 +153,6 @@ fn keygen_cold_cli_encrypts_preserves_hot_file_and_requires_force_to_overwrite()
     assert!(inspect_stdout.contains("validator cold authority"));
     assert!(inspect_stdout.contains("PQ PK bytes:"));
 
-    let forbidden_plaintext = dir.join("cold-plaintext.json");
-    let decrypt = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
-        .args([
-            "decrypt",
-            "--keys",
-            cold_path.to_str().unwrap(),
-            "--out",
-            forbidden_plaintext.to_str().unwrap(),
-            "--password-file",
-            password_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(!decrypt.status.success());
-    assert!(!forbidden_plaintext.exists());
-    assert!(String::from_utf8_lossy(&decrypt.stderr)
-        .contains("plaintext cold-key export is prohibited"));
     assert!(stdout.contains(&hex::encode(loaded.classical_pk)));
     assert!(stdout.contains(&hex::encode(&loaded.pq_pk)));
     #[cfg(unix)]
@@ -369,7 +351,7 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
     for i in 0..4u8 {
         let keys = generate_from_master_seed(format!("v{i}"), [i + 1; 32]).unwrap();
         let hot_path = dir.join(format!("hot-{i}.json"));
-        std::fs::write(&hot_path, keys.to_json()).unwrap();
+        std::fs::write(&hot_path, indra_cli::encrypt_keys(&keys, b"pw").unwrap()).unwrap();
         let cold =
             indra_crypto::ColdHybridKeypair::from_independent_seeds([i + 20; 32], [i + 84; 32])
                 .unwrap();
@@ -569,10 +551,10 @@ fn full_testnet_setup_pipeline() {
     assert_eq!(config.validators.len(), 4);
 
     // Step 3: Write keys.json (verify output is valid)
-    let alice_json = alice.to_json();
+    let alice_json = indra_cli::encrypt_keys(&alice, b"pw").unwrap();
     assert!(alice_json.contains("\"name\": \"alice\""));
     assert!(alice_json.contains("validator_id"));
-    assert!(alice_json.contains("WARNING"));
+    assert!(alice_json.contains("crypto"));
 
     // Step 4: Write genesis.toml
     let toml = config.to_toml();

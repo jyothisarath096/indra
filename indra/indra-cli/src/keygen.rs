@@ -1,14 +1,12 @@
-//! Validator keypair generation and key-file compatibility helpers.
+//! Validator keypair generation and encrypted key-file helpers.
 //!
 //! The canonical `keys.json` parser/writer now lives in `indra-keystore` so
-//! the CLI and node binary understand encrypted and legacy plaintext key files
-//! identically.
+//! the CLI and node binary use one encrypted format.
 
 use crate::{CliError, CliResult};
 
 pub use indra_keystore::{
-    check_password_file_permissions, decrypt_encrypted_keys, encrypt_cold_keys,
-    encrypt_plaintext_keys, encrypt_plaintext_keys_replace, generate_cold_keys_file,
+    check_password_file_permissions, encrypt_cold_keys, encrypt_keys, generate_cold_keys_file,
     generate_cold_share_ceremony, generate_from_master_seed, generate_from_new_mnemonic,
     generate_from_passphrase, has_secret_value_in_argv, inspect_key_file_public_metadata,
     inspect_public_metadata, load_cold_keys, load_keys, read_cold_share, reconstruct_cold_shares,
@@ -67,22 +65,15 @@ mod tests {
     }
 
     #[test]
-    fn keys_json_contains_required_fields_including_pq_secret() {
+    fn encrypted_keys_json_exposes_metadata_without_plaintext_secrets() {
         let keys = fixture();
-        let json = keys.to_json();
+        let json = encrypt_keys(&keys, b"pw").unwrap();
         assert!(json.contains("\"validator_id\""));
-        assert!(json.contains("\"hybrid_seed\""));
+        assert!(!json.contains("\"hybrid_seed\""));
         assert!(!json.contains("bls_seed"));
         assert!(!json.contains("bls_pk"));
-        assert!(json.contains("\"vrf_seed\""));
-        assert!(json.contains("\"pq_sk\""));
-    }
-
-    #[test]
-    fn keys_json_round_trips_with_nested_public_private_sections() {
-        let keys = fixture();
-        let parsed = KeysFile::from_json(&keys.to_json()).unwrap();
-        assert_eq!(parsed, keys);
+        assert!(!json.contains("\"vrf_seed\""));
+        assert!(!json.contains("\"pq_sk\""));
     }
 
     #[test]
@@ -93,7 +84,7 @@ mod tests {
         let keys_path = dir.join("keys.json");
         let password_path = dir.join("keys.pass");
         let keys = fixture();
-        let encrypted = encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        let encrypted = encrypt_keys(&keys, b"pw").unwrap();
         write_keys_file_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
         write_keys_file_secure(password_path.to_str().unwrap(), "pw\n").unwrap();
 
@@ -119,7 +110,7 @@ mod tests {
         for source in consumers {
             assert!(
                 source.contains("load_keys_for_cli"),
-                "CLI key consumer bypasses shared encrypted/plaintext loader"
+                "CLI key consumer bypasses shared encrypted loader"
             );
             assert!(
                 !source.contains("extract_hex32") && !source.contains("extract_hex_field"),

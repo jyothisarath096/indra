@@ -1,15 +1,7 @@
 use indra_cli::{generate_from_master_seed, recover_from_mnemonic, KeysFile};
 use indra_crypto::{generate_mnemonic, validate_mnemonic};
 
-#[cfg(not(feature = "legacy_raw_keys"))]
 use crate::errors::IndraError;
-#[cfg(feature = "legacy_raw_keys")]
-use crate::{errors::IndraError, IndraKeyPair};
-
-#[cfg(feature = "legacy_raw_keys")]
-const PQ_PK_BYTES: usize = 2592;
-#[cfg(feature = "legacy_raw_keys")]
-const PQ_SK_BYTES: usize = 32;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
 pub fn generate_keys(mut seed: [u8; 32]) -> Result<KeysFile, IndraError> {
@@ -17,13 +9,6 @@ pub fn generate_keys(mut seed: [u8; 32]) -> Result<KeysFile, IndraError> {
         generate_from_master_seed(String::new(), seed).map_err(|_| IndraError::KeygenFailed);
     seed.fill(0);
     result
-}
-
-/// Generate an INDRA keypair bundle from one wallet seed.
-#[cfg(feature = "legacy_raw_keys")]
-pub fn generate(seed: [u8; 32]) -> Result<IndraKeyPair, IndraError> {
-    let keys = generate_keys(seed)?;
-    keys_to_ffi(&keys)
 }
 
 /// Generate a new BIP-39 mnemonic phrase.
@@ -36,31 +21,7 @@ pub fn generate_keys_from_mnemonic(phrase: &str) -> Result<KeysFile, IndraError>
     recover_from_mnemonic(phrase, String::new()).map_err(|_| IndraError::InvalidParam)
 }
 
-/// Generate an INDRA keypair bundle from a BIP-39 mnemonic phrase.
-#[cfg(feature = "legacy_raw_keys")]
-pub fn generate_from_mnemonic(phrase: &str) -> Result<IndraKeyPair, IndraError> {
-    let keys = generate_keys_from_mnemonic(phrase)?;
-    keys_to_ffi(&keys)
-}
-
 /// Validate a mnemonic phrase.
 pub fn is_valid_mnemonic(phrase: &str) -> bool {
     validate_mnemonic(phrase)
-}
-
-#[cfg(feature = "legacy_raw_keys")]
-fn keys_to_ffi(keys: &indra_cli::KeysFile) -> Result<IndraKeyPair, IndraError> {
-    if keys.public.hybrid_pq_pk.len() != PQ_PK_BYTES || keys.pq_sk.len() != PQ_SK_BYTES {
-        return Err(IndraError::KeygenFailed);
-    }
-
-    let mut out = IndraKeyPair::zeroed();
-    out.validator_id.copy_from_slice(&keys.public.validator_id);
-    out.classical_pk
-        .copy_from_slice(&keys.public.hybrid_classical_pk);
-    out.pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
-    out.classical_seed.copy_from_slice(&keys.hybrid_seed);
-    out.pq_sk.copy_from_slice(&keys.pq_sk);
-    out.vrf_seed.copy_from_slice(&keys.vrf_seed);
-    Ok(out)
 }

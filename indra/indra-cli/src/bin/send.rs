@@ -49,8 +49,7 @@ fn main() {
     println!("Node:    {}", node_url);
     println!("──────────────────────────────────────");
 
-    // Load keys through the shared keystore loader so encrypted and legacy
-    // plaintext key files behave consistently across every CLI tool.
+    // Load keys through the shared canonical encrypted-keystore loader.
     let keys = indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
         eprintln!("Error loading keys: {}", e);
         std::process::exit(1);

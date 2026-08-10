@@ -6152,7 +6152,7 @@ mod tests {
         let password_path = dir.join("keys.pass");
         let keys =
             indra_keystore::generate_from_master_seed("validator".to_string(), [1; 32]).unwrap();
-        let encrypted = indra_keystore::encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        let encrypted = indra_keystore::encrypt_keys(&keys, b"pw").unwrap();
         indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
         indra_keystore::write_keys_secure(password_path.to_str().unwrap(), "pw\n").unwrap();
 
@@ -6177,7 +6177,7 @@ mod tests {
         let keys_path = dir.join("keys.json");
         let keys =
             indra_keystore::generate_from_master_seed("validator".to_string(), [1; 32]).unwrap();
-        let encrypted = indra_keystore::encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        let encrypted = indra_keystore::encrypt_keys(&keys, b"pw").unwrap();
         indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
 
         let result = std::panic::catch_unwind(|| load_keys_data(keys_path.to_str().unwrap(), None));
@@ -6199,7 +6199,7 @@ mod tests {
         let password_path = dir.join("keys.pass");
         let keys =
             indra_keystore::generate_from_master_seed("validator".to_string(), [1; 32]).unwrap();
-        let encrypted = indra_keystore::encrypt_plaintext_keys(&keys, b"pw").unwrap();
+        let encrypted = indra_keystore::encrypt_keys(&keys, b"pw").unwrap();
         indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
         std::fs::write(&password_path, "pw\n").unwrap();
         std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o644)).unwrap();

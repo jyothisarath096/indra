@@ -165,15 +165,7 @@ The remaining issue is C string handling: mnemonic, chain ID, governance title/d
 **Status:** FIXED  
 **Severity:** MEDIUM
 
-The FFI keygen API returns private key material in `IndraKeyPair`, including classical seed, PQ private key, BLS seed, and VRF seed (`indra-ffi/src/lib.rs:67`). Phase 1 added explicit zeroizers (`indra_zeroize_keypair`, `indra_zeroize_tx_result`) at `indra-ffi/src/lib.rs:148` and `indra-ffi/src/lib.rs:161`, and tests verify they clear sensitive fields.
-
-However, zeroization is caller-driven. If the iOS/Mac caller forgets to call the zeroizer, key material remains in app memory. Some local copies inside FFI helper functions are ordinary stack arrays and are not consistently zeroized after use.
-
-**Attack scenario:** A wallet crash dump or memory disclosure bug in the host app recovers `IndraKeyPair` or transaction-building seed buffers after the app finished using them.
-
-**Fix implemented:** The public C header now marks `IndraKeyPair` secret fields as private key material and documents `indra_zeroize_keypair()` as mandatory. Local FFI copies of wallet seed/PQ secret material are zeroed after use where feasible, including keygen/transaction/staking helper paths. Existing zeroizer coverage remains in place. Regression coverage: `keypair_zeroize_clears_private_fields`, `ffi_intermediate_key_buffers_are_zeroized`.
-
-**Remaining mainnet work:** Opaque key handles are the default signing API, but raw private-key crossing has not been eliminated repository-wide. The optional `legacy_raw_keys` feature still compiles classical/PQ/VRF raw-key APIs, and the default payment API can still return an encoded private payment keypair. Treat complete removal or an explicit disposition of those surfaces as Phase 5 work; the existence of the handle API alone does not close this item.
+The original raw-key API returned classical, PQ, and VRF private material to the caller and relied on caller-driven zeroization. Phase 5 deleted that compatibility surface, its Cargo feature, builders, tests, and C declarations. Signing now uses opaque process-local handles exclusively, so private signing material does not cross the C ABI. The consuming application remains responsible for protecting recovery material and recreating handles from platform secure storage after unlock.
 
 ### API-12 — FFI panic safety
 
@@ -192,7 +184,7 @@ No panic-across-FFI path was found in the inspected exported functions.
 The CLI previously exposed sensitive key material through several channels:
 
 - `indra-keygen --recover <phrase>` and `--passphrase <phrase>` read secrets from command-line arguments (`indra-cli/src/bin/keygen.rs:10`, `indra-cli/src/bin/keygen.rs:14`). These can appear in shell history and process listings.
-- `keys.json` stores private seeds and the ML-DSA private key in plaintext (`indra-cli/src/keygen.rs:90`).
+- Legacy `keys.json` stored private seeds and the ML-DSA private key in plaintext.
 - `indra-keygen` writes `keys.json` via `std::fs::write` without setting restrictive permissions (`indra-cli/src/bin/keygen.rs:60`).
 - `generate_from_passphrase` is explicitly documented as not cryptographically secure and derives keys from a passphrase using domain-separated SHA-256, not a password KDF (`indra-cli/src/keygen.rs:254`).
 
@@ -200,9 +192,7 @@ Printing a newly generated mnemonic once is intentional recovery UX and includes
 
 **Attack scenario:** On a shared validator host, another local user or monitoring agent reads process arguments while `indra-keygen --recover` is running, or reads a world/group-readable `keys.json` created under a permissive umask.
 
-**Fix implemented:** `indra-keygen` now rejects `--recover <phrase>` and `--passphrase <phrase>` secret values in argv. The flags are retained only as prompt triggers, and secrets are read from stdin with terminal echo disabled on Unix. `keys.json` is written through a secure helper that sets mode `0600`, and key-file reads warn if an existing file is group/other-readable. Passphrase-derived keygen now emits a clear warning that it is not suitable for mainnet/production. Regression coverage: `keygen_does_not_accept_mnemonic_as_argv`, `passphrase_secret_value_in_argv_is_detected`, and `keys_json_written_with_mode_0600`.
-
-**Residual note:** `keys.json` remains plaintext by design. File permissions and safer input close the confirmed leak paths; encrypted key storage remains a future wallet/validator UX improvement.
+**Fix implemented:** `indra-keygen` rejects secret values in argv and reads recovery/passphrase inputs from stdin with terminal echo disabled on Unix. Canonical `keys.json` is encrypted and authenticated; the CLI accepts no plaintext key-file format or conversion command. Files are written through a secure helper that sets mode `0600`, and password/key-file reads warn if an existing file is group/other-readable. Passphrase-derived keygen emits a clear warning that it is not suitable for mainnet/production. Regression coverage includes argv-secret rejection, encrypted-container round trips, absence of plaintext private fields, and restrictive file permissions.
 
 ### API-14 — CLI to RPC authentication
 
@@ -313,6 +303,4 @@ The original Phase 8 audit was audit-only, but follow-up fix tasks added regress
 All Phase 8 findings are now either FIXED or VERIFIED. Remaining mainnet design follow-ups, in priority order:
 
 1. **Wallet privacy redesign.** Decide whether address-indexed UTXO/balance queries should require view keys or signed ownership challenges instead of being public chain-data RPC.
-2. **Opaque FFI key handles.** Replace raw private-key return structs with opaque handles for production wallet integrations.
-3. **Full RPC stack hardening.** The explicit public/admin RPC policy has been implemented for admin-only diagnostics. Replacing the hand-written HTTP/JSON transport with a mature bounded HTTP implementation remains deliberately deferred architectural debt, not an active security gap under the current hardened transport envelope (body size limits, connection limits, per-IP rate limiting, batch rejection, method enforcement, and fail-closed read-only dispatch).
-4. **Encrypted key storage.** `keys.json` remains plaintext with mode `0600`; encrypted validator key storage remains a future operator UX/security improvement.
+2. **Full RPC stack hardening.** The explicit public/admin RPC policy has been implemented for admin-only diagnostics. Replacing the hand-written HTTP/JSON transport with a mature bounded HTTP implementation remains deliberately deferred architectural debt, not an active security gap under the current hardened transport envelope (body size limits, connection limits, per-IP rate limiting, batch rejection, method enforcement, and fail-closed read-only dispatch).
