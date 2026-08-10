@@ -1,9 +1,22 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
+
+cd "$(dirname "$0")"
 
 CRATE="indra-ffi"
 LIB="libindra_ffi.a"
+OUTPUT="${1:-IndraFFI.xcframework}"
+
+case "$OUTPUT" in
+    ""|"/"|"."|"..")
+        echo "Refusing unsafe XCFramework output path: '$OUTPUT'" >&2
+        exit 2
+        ;;
+esac
+
+echo "Cleaning XCFramework output: $OUTPUT"
+rm -rf -- "$OUTPUT"
 
 echo "Adding iOS targets..."
 rustup target add aarch64-apple-ios
@@ -20,21 +33,22 @@ echo "Building for simulator (Intel)..."
 cargo build -p $CRATE --release --target x86_64-apple-ios
 
 echo "Creating universal simulator library..."
+rm -rf -- target/universal-sim
 mkdir -p target/universal-sim
 lipo -create \
-    target/aarch64-apple-ios-sim/release/$LIB \
-    target/x86_64-apple-ios/release/$LIB \
-    -output target/universal-sim/$LIB
+    "target/aarch64-apple-ios-sim/release/$LIB" \
+    "target/x86_64-apple-ios/release/$LIB" \
+    -output "target/universal-sim/$LIB"
 
 echo "Creating XCFramework..."
 xcodebuild -create-xcframework \
-    -library target/aarch64-apple-ios/release/$LIB \
+    -library "target/aarch64-apple-ios/release/$LIB" \
     -headers indra-ffi/include/ \
-    -library target/universal-sim/$LIB \
+    -library "target/universal-sim/$LIB" \
     -headers indra-ffi/include/ \
-    -output IndraFFI.xcframework
+    -output "$OUTPUT"
 
-echo "Done: IndraFFI.xcframework"
+echo "Done: $OUTPUT"
 
 # Write module maps so Swift can import the framework
 MODULEMAP='framework module IndraFFI {
@@ -43,6 +57,6 @@ MODULEMAP='framework module IndraFFI {
     module * { export * }
 }'
 
-echo "$MODULEMAP" > IndraFFI.xcframework/ios-arm64/Headers/module.modulemap
-echo "$MODULEMAP" > IndraFFI.xcframework/ios-arm64_x86_64-simulator/Headers/module.modulemap
+echo "$MODULEMAP" > "$OUTPUT/ios-arm64/Headers/module.modulemap"
+echo "$MODULEMAP" > "$OUTPUT/ios-arm64_x86_64-simulator/Headers/module.modulemap"
 echo "Module maps written"

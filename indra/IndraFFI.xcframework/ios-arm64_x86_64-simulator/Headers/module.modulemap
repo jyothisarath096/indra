@@ -1,0 +1,5 @@
+framework module IndraFFI {
+    umbrella header "indra.h"
+    export *
+    module * { export * }
+}
