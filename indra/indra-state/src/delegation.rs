@@ -1943,35 +1943,6 @@ mod tests {
         op
     }
 
-    fn cold_auth(nonce: u64) -> Option<indra_core::types::staking::ColdStakingAuthorization> {
-        Some(indra_core::types::staking::ColdStakingAuthorization {
-            cold_key_version: 1,
-            cold_nonce: nonce,
-        })
-    }
-
-    fn set_cold_auth(body: &mut StakingOpBody, nonce: u64) {
-        let slot = match body {
-            StakingOpBody::ClaimRewards {
-                cold_authorization, ..
-            }
-            | StakingOpBody::SetCommission {
-                cold_authorization, ..
-            }
-            | StakingOpBody::SelfStake {
-                cold_authorization, ..
-            }
-            | StakingOpBody::ExitStakePosition {
-                cold_authorization, ..
-            }
-            | StakingOpBody::SetAutoDelegate {
-                cold_authorization, ..
-            } => cold_authorization,
-            _ => panic!("not a cold-designated staking body"),
-        };
-        *slot = cold_auth(nonce);
-    }
-
     fn dual_signed_register_op(
         deposit_utxo_id: Bytes32,
         hot_keypair: &HybridKeypair,
@@ -2151,52 +2122,6 @@ mod tests {
         )
     }
 
-    fn undelegate_op(
-        state: &ChainState,
-        validator_id: Bytes32,
-        _deposit_utxo_id: Bytes32,
-        delegator_keypair: &HybridKeypair,
-        nonce: u64,
-    ) -> StakingOp {
-        let delegator_id = pubkey_to_id(&pubkey_from_keypair(delegator_keypair));
-        let position = state
-            .stake_positions
-            .values()
-            .find(|position| {
-                position.validator_id == validator_id && position.principal_owner_id == delegator_id
-            })
-            .expect("delegation must have created a position");
-        signed_op(
-            StakingOpBody::ExitStakePosition {
-                position_id: position.position_id,
-                amount_spark: position.active.expect("active position").principal_spark,
-                custody: position.custody,
-                cold_authorization: None,
-            },
-            nonce,
-            delegator_keypair,
-            &state.chain_id,
-        )
-    }
-
-    fn claim_rewards_op(
-        state: &ChainState,
-        validator_id: Bytes32,
-        delegator_keypair: &HybridKeypair,
-        nonce: u64,
-    ) -> StakingOp {
-        signed_op(
-            StakingOpBody::ClaimRewards {
-                validator_id,
-                delegator_pubkey: pubkey_from_keypair(delegator_keypair),
-                cold_authorization: None,
-            },
-            nonce,
-            delegator_keypair,
-            &state.chain_id,
-        )
-    }
-
     fn self_stake_op(
         state: &ChainState,
         deposit_utxo_id: Bytes32,
@@ -2209,33 +2134,6 @@ mod tests {
                 deposit_utxo_id,
                 validator_pubkey: pubkey_from_keypair(validator_keypair),
                 deposit_proof: Some(deposit_proof),
-                cold_authorization: None,
-            },
-            nonce,
-            validator_keypair,
-            &state.chain_id,
-        )
-    }
-
-    fn self_unstake_op(
-        state: &ChainState,
-        _deposit_utxo_id: Bytes32,
-        validator_keypair: &HybridKeypair,
-        nonce: u64,
-    ) -> StakingOp {
-        let validator_id = pubkey_to_id(&pubkey_from_keypair(validator_keypair));
-        let position = state
-            .stake_positions
-            .values()
-            .find(|position| {
-                position.validator_id == validator_id && position.principal_owner_id == validator_id
-            })
-            .expect("self stake must have created a position");
-        signed_op(
-            StakingOpBody::ExitStakePosition {
-                position_id: position.position_id,
-                amount_spark: position.active.expect("active position").principal_spark,
-                custody: position.custody,
                 cold_authorization: None,
             },
             nonce,
@@ -3096,73 +2994,6 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::ValidatorNotActive)
         ));
-    }
-
-    fn raw_pubkey(byte: u8) -> HybridPubKey {
-        HybridPubKey {
-            classical_pk: Bytes32::from([byte; 32]),
-            pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-        }
-    }
-
-    fn raw_output(value_spark: u64, owner_pubkey: HybridPubKey, byte: u8) -> OutputV1 {
-        OutputV1 {
-            value_spark,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
-            },
-            owner_pubkey,
-            range_proof: VariableBytes::from_slice(&[byte]).unwrap(),
-            lock_height: 0,
-        }
-    }
-
-    fn raw_id(domain: u8, index: usize) -> Bytes32 {
-        let mut bytes = [0u8; 32];
-        bytes[0] = domain;
-        bytes[8..16].copy_from_slice(&(index as u64).to_be_bytes());
-        Bytes32::from(bytes)
-    }
-
-    fn install_valid_cap_registry_keys(state: &mut ChainState, validator_id: Bytes32, seed: u8) {
-        let hot = keypair(seed);
-        let hot_public = hot.public_key();
-        let cold = keypair(seed.wrapping_add(1));
-        let cold_public = cold.public_key();
-        let validator = state.validators.get_mut(&validator_id).unwrap();
-        validator.hybrid_classical_pk = Some(hot_public.classical.0);
-        validator.hybrid_pq_pk = Some(hot_public.pq.0.to_vec());
-        validator.vrf_pk =
-            Some(indra_crypto::VrfKeypair::from_seed(&[seed.wrapping_add(2); 32]).public_key());
-        validator.cold_hybrid_classical_pk = Some(cold_public.classical.0);
-        validator.cold_hybrid_pq_pk = Some(cold_public.pq.0);
-        validator.cold_key_version = 1;
-    }
-
-    fn registration_op_with_deposit(
-        state: &mut ChainState,
-        seed: u8,
-        amount: u64,
-        nonce: u64,
-    ) -> (StakingOp, Bytes32) {
-        let keypair = keypair(seed);
-        let pubkey = pubkey_from_keypair(&keypair);
-        let deposit_utxo_id = insert_delegator_utxo(state, pubkey.clone(), amount, seed);
-        let op = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                deposit_utxo_id,
-                validator_pubkey: pubkey,
-                vrf_pk: [seed; 32],
-                deposit_proof: Some(deposit_proof(amount, seed)),
-                cold_pubkey: None,
-                cold_signature: None,
-            },
-            nonce,
-            &keypair,
-            &state.chain_id,
-        );
-        (op, deposit_utxo_id)
     }
 
     fn registration_op_with_cold_deposit(

@@ -1570,7 +1570,7 @@ mod tests {
             },
             primitives::{
                 BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS,
-                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_INPUTS, MAX_OUTPUTS, MAX_STAKING_OPS_PER_BLOCK,
+                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_STAKING_OPS_PER_BLOCK,
                 MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
             },
             slash_membership::build_slash_membership_proof,
@@ -1595,21 +1595,6 @@ mod tests {
     fn make_test_keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
         let classical = ClassicalKeypair::from_seed(&seed);
         let pq = PqKeypair::from_seed(&seed).unwrap();
-        let keypair = HybridKeypair::new(classical, pq);
-        let public = keypair.public_key();
-        let wire = HybridPubKey {
-            classical_pk: Bytes32::from(public.classical.0),
-            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
-        };
-        (wire, keypair)
-    }
-
-    fn make_mixed_test_keypair(
-        classical_seed: [u8; 32],
-        pq_seed: [u8; 32],
-    ) -> (HybridPubKey, HybridKeypair) {
-        let classical = ClassicalKeypair::from_seed(&classical_seed);
-        let pq = PqKeypair::from_seed(&pq_seed).unwrap();
         let keypair = HybridKeypair::new(classical, pq);
         let public = keypair.public_key();
         let wire = HybridPubKey {
@@ -1647,19 +1632,6 @@ mod tests {
             ml_kem_1024_ciphertext: [seed.wrapping_add(2); 1568],
             note_nonce: [seed.wrapping_add(3); 32],
         }
-    }
-
-    fn staking_pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
-        let public = keypair.public_key();
-        HybridPubKey {
-            classical_pk: Bytes32::from(public.classical.0),
-            pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
-        }
-    }
-
-    fn pubkey_to_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
-        use indra_core::codec::Encode;
-        Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
     }
 
     fn staking_delegator_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
@@ -2103,34 +2075,6 @@ mod tests {
         };
         sign_staking_op(keypair, &state.chain_id, &mut op);
         op
-    }
-
-    fn active_validator(validator_id: Bytes32) -> ValidatorEntry {
-        ValidatorEntry {
-            validator_id,
-            name: "test-validator".into(),
-            hybrid_classical_pk: None,
-            hybrid_pq_pk: None,
-            vrf_pk: None,
-            stake_spark: 1_000_000,
-            status: ValidatorStatus::Active,
-            registered_epoch: 0,
-            last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
-            self_report_count: 0,
-            commission_bps: 1_000,
-            pending_commission_bps: None,
-            pending_commission_effective_epoch: None,
-            min_delegation_spark: 1,
-            auto_delegate_to: None,
-            network_addr: None,
-            network_addr_last_updated_epoch: None,
-            cold_hybrid_classical_pk: None,
-            cold_hybrid_pq_pk: None,
-            cold_key_version: 0,
-            cold_nonce: 0,
-        }
     }
 
     fn slash_validator_state(seed: [u8; 32], stake: u64) -> (ChainState, Bytes32, HybridKeypair) {
@@ -2713,75 +2657,6 @@ mod tests {
         tx
     }
 
-    fn make_multi_io_tx(
-        state: &ChainState,
-        keypair: &HybridKeypair,
-        inputs: &[(Bytes32, u64, [u8; 32], Bytes32)],
-        output_count: usize,
-    ) -> TransactionV1 {
-        assert_eq!(inputs.len(), MAX_INPUTS);
-        assert_eq!(output_count, MAX_OUTPUTS);
-        let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 100;
-        let input_total = inputs.iter().map(|(_, value, _, _)| *value).sum::<u64>();
-        let spendable = input_total - fee;
-        let base_output_value = spendable / output_count as u64;
-        let mut output_blindings = Vec::new();
-        let mut outputs = Vec::new();
-        let (owner_pubkey, _) = make_test_keypair([0x5A; 32]);
-        for idx in 0..output_count {
-            let value = if idx + 1 == output_count {
-                spendable - base_output_value * (output_count as u64 - 1)
-            } else {
-                base_output_value
-            };
-            let blinding = [0x80u8.saturating_add(idx as u8); 32];
-            output_blindings.push(blinding);
-            let commitment = commit(value, &blinding);
-            let mut rng = StdRng::from_seed(blinding);
-            let proof = prove_range(value, &blinding, &mut rng).unwrap();
-            outputs.push(OutputV1 {
-                value_spark: value,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::from(commitment.0),
-                },
-                owner_pubkey: owner_pubkey.clone(),
-                range_proof: VariableBytes::from_slice(&proof).unwrap(),
-                lock_height: 0,
-            });
-        }
-        let input_blindings = inputs
-            .iter()
-            .map(|(_, _, blinding, _)| *blinding)
-            .collect::<Vec<_>>();
-        let fee_blinding = derive_fee_blinding(&input_blindings, &output_blindings);
-        let fee_commitment = commit(fee, &fee_blinding);
-        let mut tx = TransactionV1 {
-            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
-            signature_module_id: 1,
-            inputs: inputs
-                .iter()
-                .map(|(utxo_id, _, _, nullifier)| InputV1 {
-                    utxo_id: *utxo_id,
-                    nullifier: *nullifier,
-                })
-                .collect(),
-            payment_notes: outputs
-                .iter()
-                .enumerate()
-                .map(|(index, output)| mandatory_note(&output.owner_pubkey, index as u8))
-                .collect(),
-            outputs,
-            fee_amount: fee,
-            fee_blinding: Bytes32::from(fee_blinding),
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(fee_commitment.0),
-            },
-            signature: dummy_sig(),
-        };
-        tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
-        tx
-    }
-
     fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
         let height = state.height + 1;
         make_block_at_height(state, txs, height, 1_700_000_000 + height)
@@ -2898,10 +2773,6 @@ mod tests {
     #[derive(Debug)]
     struct OracleOutcome {
         state: ChainState,
-        state_root: Bytes32,
-        validator_set_root: Bytes32,
-        value_hash: Bytes32,
-        epoch_record: Option<EpochRecord>,
     }
 
     fn clone_atomic_reference_apply_block(
@@ -2910,47 +2781,8 @@ mod tests {
         timestamp_secs: u64,
     ) -> StateResult<OracleOutcome> {
         let mut scratch = pre_state.clone();
-        let epoch_record = apply_block(&mut scratch, block, timestamp_secs)?;
-        let roots = crate::state_root::compute_state_roots(&scratch);
-        Ok(OracleOutcome {
-            state_root: roots.state_root,
-            validator_set_root: roots.validator_set_root,
-            value_hash: block.compute_value_hash(scratch.total_supply),
-            state: scratch,
-            epoch_record,
-        })
-    }
-
-    fn undo_apply_block_outcome(
-        pre_state: &ChainState,
-        block: &BlockV1,
-        timestamp_secs: u64,
-    ) -> StateResult<OracleOutcome> {
-        let mut state = pre_state.clone();
-        let epoch_record = apply_block(&mut state, block, timestamp_secs)?;
-        let roots = crate::state_root::compute_state_roots(&state);
-        Ok(OracleOutcome {
-            state_root: roots.state_root,
-            validator_set_root: roots.validator_set_root,
-            value_hash: block.compute_value_hash(state.total_supply),
-            state,
-            epoch_record,
-        })
-    }
-
-    fn assert_oracle_matches(pre_state: &ChainState, block: &BlockV1, timestamp_secs: u64) {
-        let reference = clone_atomic_reference_apply_block(pre_state, block, timestamp_secs)
-            .expect("clone-atomic reference apply must succeed");
-        let candidate = undo_apply_block_outcome(pre_state, block, timestamp_secs)
-            .expect("undo apply must succeed");
-        assert_eq!(
-            candidate.state.encode_to_vec(),
-            reference.state.encode_to_vec()
-        );
-        assert_eq!(candidate.state_root, reference.state_root);
-        assert_eq!(candidate.validator_set_root, reference.validator_set_root);
-        assert_eq!(candidate.value_hash, reference.value_hash);
-        assert_eq!(candidate.epoch_record, reference.epoch_record);
+        apply_block(&mut scratch, block, timestamp_secs)?;
+        Ok(OracleOutcome { state: scratch })
     }
 
     fn test_proposal_record(
@@ -2988,42 +2820,6 @@ mod tests {
             abstain_stake: 0,
             passed: None,
         }
-    }
-
-    fn install_reveal_phase_governance_proposal(
-        state: &mut ChainState,
-        proposal_id: Bytes32,
-        from_validator: Bytes32,
-        to_validator: Bytes32,
-    ) {
-        let (proposer_pubkey, _, proposer_id) =
-            install_governance_validator(state, [proposal_id.0[0]; 32], 100_000);
-        let mut proposal = test_proposal_record(
-            proposal_id,
-            proposer_id,
-            proposer_pubkey,
-            GovernableAction::SetMinDelegationSpark {
-                value: DUST_LIMIT_SPARK,
-            },
-            ProposalPhase::Reveal,
-        );
-        proposal.reveals.insert(
-            from_validator,
-            VoteReveal {
-                validator_id: from_validator,
-                vote: true,
-                revealed_epoch: 0,
-            },
-        );
-        proposal.reveals.insert(
-            to_validator,
-            VoteReveal {
-                validator_id: to_validator,
-                vote: true,
-                revealed_epoch: 0,
-            },
-        );
-        state.governance.proposals.insert(proposal_id, proposal);
     }
 
     fn governance_proposal_state(

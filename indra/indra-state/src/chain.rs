@@ -1712,9 +1712,7 @@ mod tests {
             primitives::{
                 VariableBytes, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS,
             },
-            transaction::OutputV1,
         },
-        CommitmentV1,
     };
 
     fn snapshot_validator(id_byte: u8, key_seed: u8, stake: u64) -> ValidatorEntry {
@@ -2153,21 +2151,6 @@ mod tests {
     #[test]
     fn genesis_epoch_is_zero() {
         assert_eq!(ChainState::new_genesis().current_epoch(), 0);
-    }
-
-    fn test_output(byte: u8) -> OutputV1 {
-        OutputV1 {
-            value_spark: 1_000_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
-            },
-            owner_pubkey: HybridPubKey {
-                classical_pk: Bytes32::from([byte; 32]),
-                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-            },
-            range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-            lock_height: 0,
-        }
     }
 
     fn test_hybrid_pubkey(byte: u8) -> HybridPubKey {

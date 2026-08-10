@@ -423,9 +423,8 @@ mod tests {
         codec::{Decode, Encode},
         types::{
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
-            crypto::{CommitmentV1, HybridPubKey},
+            crypto::HybridPubKey,
             reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
-            transaction::OutputV1,
         },
         VariableBytes,
     };
@@ -608,21 +607,6 @@ mod tests {
         );
     }
 
-    fn output(owner: u8, value: u64) -> OutputV1 {
-        OutputV1 {
-            value_spark: value,
-            commitment: CommitmentV1 {
-                compressed_point: id(owner),
-            },
-            owner_pubkey: HybridPubKey {
-                classical_pk: id(owner),
-                pq_pk: VariableBytes::from_slice(&[owner; 32]).unwrap_or_default(),
-            },
-            range_proof: VariableBytes::from_slice(&[]).unwrap_or_default(),
-            lock_height: 0,
-        }
-    }
-
     fn pubkey(byte: u8) -> HybridPubKey {
         HybridPubKey {
             classical_pk: id(byte),
@@ -680,30 +664,6 @@ mod tests {
         Bytes32::from(
             CompressedAuthTree::from_pairs(leaves)
                 .expect("legacy oracle keys are domain-separated and unique")
-                .root(),
-        )
-    }
-
-    fn pre_identity_state_commitment_v2_root(state: &ChainState, height: u64) -> Bytes32 {
-        let mut leaves = Vec::new();
-        for validator in state.validators.all_validators() {
-            leaves.push((
-                validator_key(&validator.validator_id),
-                validator_value_hash(validator, height),
-            ));
-        }
-        for (signer_id, nonce) in &state.staking_nonces {
-            leaves.push((
-                staking_nonce_key(signer_id),
-                staking_nonce_value_hash(signer_id, *nonce),
-            ));
-        }
-        for hash in &state.applied_slash_hashes {
-            leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
-        }
-        Bytes32::from(
-            CompressedAuthTree::from_pairs(leaves)
-                .expect("pre-identity oracle keys are domain-separated and unique")
                 .root(),
         )
     }

@@ -974,37 +974,6 @@ mod tests {
         );
     }
 
-    fn encode_legacy_validator_v1(validator: &ValidatorEntry) -> Vec<u8> {
-        let mut buf = Vec::new();
-        validator.validator_id.encode(&mut buf);
-        let name_bytes = validator.name.as_bytes();
-        (name_bytes.len() as u32).encode(&mut buf);
-        buf.extend_from_slice(name_bytes);
-        validator.hybrid_classical_pk.is_some().encode(&mut buf);
-        if let Some(pk) = validator.hybrid_classical_pk {
-            buf.extend_from_slice(&pk);
-        }
-        validator.hybrid_pq_pk.is_some().encode(&mut buf);
-        if let Some(pk) = &validator.hybrid_pq_pk {
-            (pk.len() as u32).encode(&mut buf);
-            buf.extend_from_slice(pk);
-        }
-        validator.vrf_pk.is_some().encode(&mut buf);
-        if let Some(pk) = validator.vrf_pk {
-            buf.extend_from_slice(&pk);
-        }
-        validator.stake_spark.encode(&mut buf);
-        validator.status.encode(&mut buf);
-        validator.registered_epoch.encode(&mut buf);
-        validator.last_active_epoch.encode(&mut buf);
-        validator.pending_rewards.encode(&mut buf);
-        validator.rewards_last_epoch.encode(&mut buf);
-        validator.self_report_count.encode(&mut buf);
-        validator.commission_bps.encode(&mut buf);
-        validator.min_delegation_spark.encode(&mut buf);
-        buf
-    }
-
     #[test]
     fn validator_entry_v2_round_trips_with_auto_delegate_some() {
         let mut validator = make_validator(0x43, 10_000, 3);

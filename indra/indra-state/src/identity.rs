@@ -138,13 +138,7 @@ pub fn resolve_delegator_identity_for_redelegation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::{
-        types::{
-            crypto::{CommitmentV1, HybridPubKey},
-            transaction::OutputV1,
-        },
-        VariableBytes,
-    };
+    use indra_core::{types::crypto::HybridPubKey, VariableBytes};
 
     fn id(byte: u8) -> Bytes32 {
         Bytes32::from([byte; 32])
@@ -154,18 +148,6 @@ mod tests {
         HybridPubKey {
             classical_pk: id(classical),
             pq_pk: VariableBytes::from_slice(&[pq; 32]).unwrap_or_default(),
-        }
-    }
-
-    fn output(owner_pubkey: HybridPubKey, byte: u8) -> OutputV1 {
-        OutputV1 {
-            value_spark: 1_000,
-            commitment: CommitmentV1 {
-                compressed_point: id(byte),
-            },
-            owner_pubkey,
-            range_proof: VariableBytes::from_slice(&[byte]).unwrap_or_default(),
-            lock_height: 0,
         }
     }
 

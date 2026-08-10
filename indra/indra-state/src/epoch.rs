@@ -1069,9 +1069,7 @@ mod tests {
                 MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
                 SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
-            transaction::OutputV1,
         },
-        CommitmentV1,
     };
 
     fn governance_test_pubkey(byte: u8) -> HybridPubKey {
@@ -1174,38 +1172,6 @@ mod tests {
         validator.vrf_pk =
             Some(indra_crypto::VrfKeypair::from_seed(&[id_byte.wrapping_add(2); 32]).public_key());
         validator
-    }
-
-    fn install_reward_basis(state: &mut ChainState) {
-        let consensus = state.build_consensus_snapshot(1, 0).unwrap();
-        let economic = state.build_reward_economic_snapshot(&consensus).unwrap();
-        state.consensus_snapshots = vec![consensus];
-        state.reward_economic_snapshot = Some(economic);
-    }
-
-    fn dummy_output(byte: u8) -> OutputV1 {
-        OutputV1 {
-            value_spark: 1_000_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
-            },
-            owner_pubkey: HybridPubKey {
-                classical_pk: Bytes32::from([byte; 32]),
-                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-            },
-            range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-            lock_height: 0,
-        }
-    }
-
-    fn register_test_bond_owner(state: &mut ChainState, delegator_id: Bytes32, byte: u8) {
-        state.delegator_identities.insert(
-            delegator_id,
-            HybridPubKey {
-                classical_pk: Bytes32::from([byte; 32]),
-                pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
-            },
-        );
     }
 
     #[test]

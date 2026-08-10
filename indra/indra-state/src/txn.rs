@@ -949,16 +949,6 @@ pub(crate) fn mutation_count() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_timing() {
-    TIMING.with(|cell| cell.set(StateTxnTiming::default()));
-}
-
-#[cfg(test)]
-pub(crate) fn timing() -> StateTxnTiming {
-    TIMING.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use indra_core::{
