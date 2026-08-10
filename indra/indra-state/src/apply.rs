@@ -1017,7 +1017,7 @@ fn apply_block_inner(
         let mut shadow = state.clone();
         let chain_id = state.chain_id.clone();
         for op in &block.staking_ops {
-            op.validate_structure_at_height(block.header.height)
+            op.validate_structure()
                 .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
             apply_staking_op(&mut shadow, op, &chain_id, block.header.height)?;
         }
@@ -1927,11 +1927,11 @@ mod tests {
                     committed_value_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
                     blinding_factor: Bytes32::from([seed[0]; 32]),
                 }),
-                cold_pubkey: Some(indra_core::types::crypto::ColdHybridPubKey {
+                cold_pubkey: indra_core::types::crypto::ColdHybridPubKey {
                     classical_pk: cold_pubkey.classical_pk,
                     pq_pk: cold_pubkey.pq_pk,
-                }),
-                cold_signature: Some(dummy_sig()),
+                },
+                cold_signature: dummy_sig(),
             },
             nonce,
             signature: dummy_sig(),
@@ -1949,10 +1949,10 @@ mod tests {
         let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body else {
             unreachable!()
         };
-        *cold_signature = Some(HybridSignature {
+        *cold_signature = HybridSignature {
             classical_sig: VariableBytes::from_slice(&cold_sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&cold_sig.pq.0).unwrap(),
-        });
+        };
         (op, validator_id)
     }
 

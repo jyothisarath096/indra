@@ -67,9 +67,7 @@ fn apply_governance_op_inner(
         .map_err(|error| StateError::InvalidGovernanceOp {
             reason: error.to_string(),
         })?;
-    let identity_registry_active = true;
-    let cold_authorized =
-        verify_governance_sig(state, op, chain_id, identity_registry_active, verify_crypto)?;
+    let cold_authorized = verify_governance_sig(state, op, chain_id, verify_crypto)?;
     apply_governance_nonce(state, op, current_height, cold_authorized)?;
 
     match &op.payload {
@@ -115,7 +113,6 @@ fn apply_governance_op_inner(
             from_validator,
             to_validator,
             *amount_spark,
-            identity_registry_active,
         ),
         GovernancePayload::Execute { proposal_id } => {
             apply_execute(state, current_epoch, current_height, proposal_id)
@@ -392,7 +389,6 @@ fn apply_redelegate(
     from_validator: &Bytes32,
     to_validator: &Bytes32,
     amount_spark: u64,
-    identity_registry_active: bool,
 ) -> StateResult<()> {
     if amount_spark == 0 {
         return invalid("redelegation amount cannot be zero");
@@ -416,8 +412,7 @@ fn apply_redelegate(
             return invalid("delegator already redelegated for proposal");
         }
     }
-    let should_populate_identity =
-        identity_registry_active && !state.delegator_identities.contains_key(&op.signer_id);
+    let should_populate_identity = !state.delegator_identities.contains_key(&op.signer_id);
     let resolved_identity = if should_populate_identity {
         Some(
             resolve_delegator_identity_for_redelegation(from_validator, &op.signer_id, state)
@@ -588,7 +583,6 @@ fn verify_governance_sig(
     state: &ChainState,
     op: &GovernanceOpV2,
     chain_id: &str,
-    identity_registry_active: bool,
     verify_crypto: bool,
 ) -> StateResult<bool> {
     let cold_designated = matches!(
@@ -655,7 +649,7 @@ fn verify_governance_sig(
     if op.cold_authorization().is_some() {
         return invalid("cold authorization is valid only for an Active validator");
     }
-    let pubkey = governance_signer_pubkey(state, op, identity_registry_active)?;
+    let pubkey = governance_signer_pubkey(state, op)?;
     let domain = governance_signing_domain(
         op.action_type,
         op.signer_id,
@@ -686,11 +680,7 @@ fn verify_governance_sig_with_pubkey(
     })
 }
 
-fn governance_signer_pubkey(
-    state: &ChainState,
-    op: &GovernanceOpV2,
-    identity_registry_active: bool,
-) -> StateResult<HybridPubKey> {
+fn governance_signer_pubkey(state: &ChainState, op: &GovernanceOpV2) -> StateResult<HybridPubKey> {
     match &op.payload {
         GovernancePayload::Propose {
             proposer_pubkey, ..
@@ -706,12 +696,8 @@ fn governance_signer_pubkey(
             validator_pubkey(state, &op.signer_id)
         }
         GovernancePayload::Redelegate { from_validator, .. } => {
-            if identity_registry_active {
-                resolve_delegator_identity_for_redelegation(from_validator, &op.signer_id, state)
-                    .map_err(identity_error_to_governance_error)
-            } else {
-                delegation_pubkey(state, from_validator, &op.signer_id)
-            }
+            resolve_delegator_identity_for_redelegation(from_validator, &op.signer_id, state)
+                .map_err(identity_error_to_governance_error)
         }
         GovernancePayload::Execute { .. } => validator_pubkey(state, &op.signer_id),
         GovernancePayload::Cancel { proposal_id, .. } => {
@@ -753,36 +739,10 @@ fn validator_pubkey(state: &ChainState, validator_id: &Bytes32) -> StateResult<H
     })
 }
 
-fn delegation_pubkey(
-    state: &ChainState,
-    validator_id: &Bytes32,
-    delegator_id: &Bytes32,
-) -> StateResult<HybridPubKey> {
-    let has_active_position = state.stake_positions.values().any(|position| {
-        &position.validator_id == validator_id
-            && &position.principal_owner_id == delegator_id
-            && position.active.is_some()
-    });
-    if !has_active_position {
-        return Err(StateError::DelegatorNotFound);
-    }
-    state
-        .delegator_identities
-        .get(delegator_id)
-        .cloned()
-        .ok_or(StateError::DelegatorNotFound)
-}
-
 fn identity_error_to_governance_error(err: IdentityError) -> StateError {
     let reason = match err {
         IdentityError::RegistryPubkeyMismatch { delegator_id } => {
             format!("delegator identity registry pubkey mismatch for {delegator_id}")
-        }
-        IdentityError::LegacyPubkeyMismatch { delegator_id } => {
-            format!("delegator identity legacy pubkey mismatch for {delegator_id}")
-        }
-        IdentityError::AmbiguousLegacyPubkeys { delegator_id } => {
-            format!("delegator identity has ambiguous legacy pubkeys for {delegator_id}")
         }
         IdentityError::UnresolvableIdentity {
             validator_id,
@@ -2425,13 +2385,16 @@ mod tests {
     #[test]
     fn governance_redelegation_uses_only_active_remainder_mid_unbonding() {
         let mut state = ChainState::new_genesis();
-        let (_, delegator_keys) = keypair(0xD8);
+        let (delegator_pubkey, delegator_keys) = keypair(0xD8);
         let delegator_id = Bytes32::from(indra_crypto::sha256(
             &delegator_keys.public_key().classical.0,
         ));
         let from_validator = Bytes32::from([0xD9; 32]);
         let to_validator = Bytes32::from([0xDA; 32]);
         let proposal_id = Bytes32::from([0xDB; 32]);
+        state
+            .delegator_identities
+            .insert(delegator_id, delegator_pubkey);
         install_reveal_phase_proposal(&mut state, proposal_id, from_validator, to_validator);
         let custody = indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
             delegator_id,
@@ -2464,7 +2427,6 @@ mod tests {
             &from_validator,
             &to_validator,
             60,
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -2506,7 +2468,6 @@ mod tests {
                 &from_validator,
                 &to_validator,
                 1,
-                false,
             ),
             Err(StateError::DelegatorNotFound)
         ));

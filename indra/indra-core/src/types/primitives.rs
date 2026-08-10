@@ -516,12 +516,6 @@ pub const BLOCK_FORMAT_VERSION: u16 = 1;
 /// Increment this whenever any persisted struct changes its encoding.
 pub const SCHEMA_VERSION: u8 = 4;
 
-/// Schema version used before validator network addresses were added.
-pub const SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS: u8 = 3;
-
-/// The schema version when INDRA was first deployed.
-pub const SCHEMA_VERSION_GENESIS: u8 = 1;
-
 /// Maximum length of a validator-advertised P2P network address.
 ///
 /// The field is deliberately stored as a bounded string so future schema

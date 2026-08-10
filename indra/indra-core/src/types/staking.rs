@@ -189,9 +189,9 @@ pub enum StakingOpBody {
         /// Proof binding the bonded UTXO commitment to its public value.
         deposit_proof: Option<StakeDepositProof>,
         /// Proposed independent cold hybrid public key.
-        cold_pubkey: Option<ColdHybridPubKey>,
+        cold_pubkey: ColdHybridPubKey,
         /// Complete cold hybrid signature over the dual authorization message.
-        cold_signature: Option<HybridSignature>,
+        cold_signature: HybridSignature,
     },
 
     /// Atomically replace an Active validator's cold hybrid key.
@@ -372,7 +372,7 @@ impl StakingOp {
             validator_pubkey,
             vrf_pk,
             deposit_proof,
-            cold_pubkey: Some(cold_pubkey),
+            cold_pubkey,
             ..
         } = &self.body
         else {
@@ -469,27 +469,6 @@ impl StakingOp {
         Ok(Some(message))
     }
 
-    /// Enforce the genesis-native cold-key registration shape.
-    pub fn validate_register_validator_cold_extension(&self, _height: u64) -> IndraResult<()> {
-        let StakingOpBody::RegisterValidator {
-            cold_pubkey,
-            cold_signature,
-            ..
-        } = &self.body
-        else {
-            return Ok(());
-        };
-        match (cold_pubkey.is_some(), cold_signature.is_some()) {
-            (true, true) => Ok(()),
-            (false, _) => Err(crate::error::IndraError::InvalidStakingOp(
-                "validator registration requires a cold hybrid public key".into(),
-            )),
-            (true, false) => Err(crate::error::IndraError::InvalidStakingOp(
-                "validator registration requires a cold hybrid signature".into(),
-            )),
-        }
-    }
-
     /// The signer's identity for nonce tracking.
     pub fn signer_id(&self) -> Bytes32 {
         match &self.body {
@@ -518,11 +497,6 @@ impl StakingOp {
 
     /// Validate structural rules (does NOT verify crypto or state).
     pub fn validate_structure(&self) -> IndraResult<()> {
-        self.validate_structure_at_height(u64::MAX)
-    }
-
-    /// Validate structural rules under the operation set active at `height`.
-    pub fn validate_structure_at_height(&self, height: u64) -> IndraResult<()> {
         use crate::error::IndraError;
         if let Some(authorization) = self.cold_authorization() {
             if self.nonce != 0 {
@@ -567,7 +541,6 @@ impl StakingOp {
                 }
             }
             StakingOpBody::RegisterValidator { commission_bps, .. } => {
-                self.validate_register_validator_cold_extension(height)?;
                 if *commission_bps > 10_000 {
                     return Err(IndraError::CommissionOutOfRange {
                         actual: *commission_bps,
@@ -686,14 +659,8 @@ impl Encode for StakingOpBody {
                 validator_pubkey.encode(buf);
                 buf.extend_from_slice(vrf_pk);
                 encode_optional_deposit_proof(deposit_proof, buf);
-                cold_pubkey.is_some().encode(buf);
-                if let Some(pubkey) = cold_pubkey {
-                    pubkey.encode(buf);
-                }
-                cold_signature.is_some().encode(buf);
-                if let Some(signature) = cold_signature {
-                    signature.encode(buf);
-                }
+                cold_pubkey.encode(buf);
+                cold_signature.encode(buf);
             }
             StakingOpBody::RotateValidatorColdKey {
                 validator_id,
@@ -821,13 +788,8 @@ impl Encode for StakingOpBody {
                     + validator_pubkey.encoded_len()
                     + 32
                     + optional_deposit_proof_encoded_len(deposit_proof)
-                    + 1
-                    + cold_pubkey.as_ref().map(Encode::encoded_len).unwrap_or(0)
-                    + 1
-                    + cold_signature
-                        .as_ref()
-                        .map(Encode::encoded_len)
-                        .unwrap_or(0)
+                    + cold_pubkey.encoded_len()
+                    + cold_signature.encoded_len()
             }
             StakingOpBody::RotateValidatorColdKey {
                 new_cold_pubkey,
@@ -914,21 +876,8 @@ impl Decode for StakingOpBody {
                 let validator_pubkey = HybridPubKey::decode(r)?;
                 let vrf_pk = r.read_bytes32()?;
                 let deposit_proof = decode_optional_deposit_proof(r)?;
-                let cold_pubkey = if bool::decode(r)? {
-                    Some(ColdHybridPubKey::decode(r)?)
-                } else {
-                    None
-                };
-                let cold_signature = if bool::decode(r)? {
-                    Some(HybridSignature::decode(r)?)
-                } else {
-                    None
-                };
-                if cold_pubkey.is_none() || cold_signature.is_none() {
-                    return Err(crate::error::IndraError::InvalidStakingOp(
-                        "validator registration requires complete cold-key authorization".into(),
-                    ));
-                }
+                let cold_pubkey = ColdHybridPubKey::decode(r)?;
+                let cold_signature = HybridSignature::decode(r)?;
                 Ok(StakingOpBody::RegisterValidator {
                     commission_bps,
                     deposit_utxo_id,
@@ -1193,8 +1142,8 @@ mod tests {
                 validator_pubkey: dummy_pubkey(),
                 vrf_pk: [4u8; 32],
                 deposit_proof: Some(dummy_deposit_proof(0xA2, 20_000)),
-                cold_pubkey: Some(dummy_cold_pubkey()),
-                cold_signature: Some(dummy_signature()),
+                cold_pubkey: dummy_cold_pubkey(),
+                cold_signature: dummy_signature(),
             }),
             op(StakingOpBody::SetCommission {
                 validator_id: Bytes32::from([5u8; 32]),
@@ -1341,8 +1290,8 @@ mod tests {
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [9u8; 32],
             deposit_proof: None,
-            cold_pubkey: None,
-            cold_signature: None,
+            cold_pubkey: dummy_cold_pubkey(),
+            cold_signature: dummy_signature(),
         });
         let delegate_bytes = delegate.signing_bytes("indra-testnet-1");
         assert!(delegate_bytes.starts_with(STAKING_OP_DOMAIN.as_bytes()));
@@ -1421,8 +1370,8 @@ mod tests {
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
             deposit_proof: None,
-            cold_pubkey: None,
-            cold_signature: None,
+            cold_pubkey: dummy_cold_pubkey(),
+            cold_signature: dummy_signature(),
         });
         assert!(bad_register.validate_structure().is_err());
 
@@ -1442,8 +1391,8 @@ mod tests {
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
             deposit_proof: None,
-            cold_pubkey: Some(dummy_cold_pubkey()),
-            cold_signature: Some(dummy_signature()),
+            cold_pubkey: dummy_cold_pubkey(),
+            cold_signature: dummy_signature(),
         });
         assert!(op.validate_structure().is_ok());
     }

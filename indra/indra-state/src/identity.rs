@@ -1,8 +1,7 @@
 //! Delegator identity-registry resolution helpers.
 //!
-//! Stage 3 intentionally exposes these helpers without wiring them into live
-//! staking or governance operations. Later stages use them to enforce
-//! post-activation PQ-key consistency while preserving legacy fallback behavior.
+//! These helpers enforce canonical identity-registry consistency for staking and
+//! governance operations.
 
 use indra_core::types::{crypto::HybridPubKey, primitives::Bytes32};
 
@@ -13,7 +12,7 @@ use crate::ChainState;
 pub enum IdentityCheckOutcome {
     /// The submitted key matched an existing registry entry.
     RegistryMatch,
-    /// No registry entry and no legacy bond history existed for this identity.
+    /// No registry entry exists for this identity.
     NoPriorRecord,
 }
 
@@ -25,19 +24,7 @@ pub enum IdentityError {
         /// Delegator identity being checked.
         delegator_id: Bytes32,
     },
-    /// Legacy bond history exists and is internally consistent, but differs from
-    /// the submitted public key.
-    LegacyPubkeyMismatch {
-        /// Delegator identity being checked.
-        delegator_id: Bytes32,
-    },
-    /// Legacy bond history has more than one embedded public key for the same
-    /// identity, so no key can be selected safely.
-    AmbiguousLegacyPubkeys {
-        /// Delegator identity being checked.
-        delegator_id: Bytes32,
-    },
-    /// No registry entry or usable legacy bond key exists for this identity.
+    /// No registry entry exists for this identity.
     UnresolvableIdentity {
         /// Validator context for validator-scoped lookup paths.
         validator_id: Option<Bytes32>,
@@ -97,8 +84,7 @@ pub(crate) fn resolve_active_validator_cold_pubkey(
 
 /// Resolve and check a submitted delegator public key against existing state.
 ///
-/// Registry entries are authoritative. If no registry entry exists, only legacy
-/// stake deposits with a retained range proof are considered fallback evidence.
+/// Registry entries are authoritative. Absence means this is a new identity.
 pub fn resolve_and_check_identity(
     delegator_id: &Bytes32,
     submitted_pubkey: &HybridPubKey,
@@ -118,8 +104,7 @@ pub fn resolve_and_check_identity(
 
 /// Resolve a delegator public key from state for governance redelegation.
 ///
-/// Registry entries are authoritative. If no registry entry exists, this falls
-/// back to the unique active legacy bond key for `(validator_id, delegator_id)`.
+/// Registry entries are authoritative; no historical fallback is accepted.
 pub fn resolve_delegator_identity_for_redelegation(
     validator_id: &Bytes32,
     delegator_id: &Bytes32,
@@ -181,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_new_identity_without_registry_or_legacy_bonds_reports_no_prior_record() {
+    fn resolve_new_identity_without_registry_reports_no_prior_record() {
         let state = ChainState::new_genesis();
         let delegator_id = id(0x12);
 

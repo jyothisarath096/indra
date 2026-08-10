@@ -8,17 +8,6 @@ use thiserror::Error;
 /// governed height or an error; this type carries no fallback value.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum ConsensusSnapshotLookupError {
-    /// Snapshot lookup was incorrectly requested for a legacy height.
-    #[error(
-        "consensus snapshot lookup requested for pre-gate height {height}; snapshot gate is {gate_height}"
-    )]
-    PreGateHeight {
-        /// Requested consensus height.
-        height: u64,
-        /// Global activation height.
-        gate_height: u64,
-    },
-
     /// Retained snapshot state was malformed or non-canonical.
     #[error("invalid retained consensus snapshots: {reason}")]
     InvalidRetainedState {

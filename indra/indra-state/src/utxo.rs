@@ -24,10 +24,7 @@ use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        primitives::{
-            Bytes32, SCHEMA_VERSION, SCHEMA_VERSION_GENESIS,
-            SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
-        },
+        primitives::{Bytes32, SCHEMA_VERSION},
         stake_position::TrancheRefundEventV1,
         transaction::OutputV1,
     },
@@ -96,43 +93,21 @@ impl Encode for UtxoEntry {
 
 impl Decode for UtxoEntry {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let marker = u8::decode(r)?;
-        match marker {
-            SCHEMA_VERSION_GENESIS
-            | SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
-            | SCHEMA_VERSION => decode_utxo_entry_fields(r, None),
-            other if r.remaining() == 0 => Err(IndraError::UnsupportedSchemaVersion {
+        let schema_version = u8::decode(r)?;
+        if schema_version != SCHEMA_VERSION {
+            return Err(IndraError::UnsupportedSchemaVersion {
                 struct_name: "UtxoEntry",
-                version: other,
+                version: schema_version,
                 max_supported: SCHEMA_VERSION,
-            }),
-            first_byte => decode_utxo_entry_fields(r, Some(first_byte)),
+            });
         }
+        decode_utxo_entry_fields(r)
     }
 }
 
-impl UtxoEntry {
-    /// Decode the legacy unversioned UTXO layout.
-    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        decode_utxo_entry_fields(r, None)
-    }
-}
-
-fn decode_utxo_entry_fields(
-    r: &mut ByteReader<'_>,
-    first_byte: Option<u8>,
-) -> IndraResult<UtxoEntry> {
-    let utxo_id = match first_byte {
-        Some(first) => {
-            let mut bytes = [0u8; 32];
-            bytes[0] = first;
-            bytes[1..].copy_from_slice(r.read_bytes(31)?);
-            Bytes32::from(bytes)
-        }
-        None => Bytes32::decode(r)?,
-    };
+fn decode_utxo_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<UtxoEntry> {
     Ok(UtxoEntry {
-        utxo_id,
+        utxo_id: Bytes32::decode(r)?,
         output: OutputV1::decode(r)?,
         created_height: u64::decode(r)?,
         tx_index: u32::decode(r)?,
@@ -223,37 +198,6 @@ impl UtxoSet {
             entries: PersistentOrdMap::new(),
             compressed: PersistentAuthTree::new(),
         }
-    }
-
-    /// Decode a legacy unversioned UTXO set.
-    pub fn decode_legacy(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        Self::decode_legacy_at_height(r, 0)
-    }
-
-    /// Decode a legacy unversioned UTXO set for a state snapshot at `height`.
-    pub fn decode_legacy_at_height(r: &mut ByteReader<'_>, height: u64) -> IndraResult<Self> {
-        let count = u32::decode(r)? as usize;
-        if count > MAX_UTXOS_DECODE {
-            return Err(IndraError::LengthExceeded {
-                field: "snapshot.utxos",
-                max: MAX_UTXOS_DECODE,
-                actual: count,
-            });
-        }
-        let mut set = Self::new();
-        let _ = height;
-        for _ in 0..count {
-            let entry = UtxoEntry::decode_legacy(r)?;
-            validate_tranche_refund_entry(&entry)?;
-            if set.entries.contains_key(&entry.utxo_id) {
-                return Err(IndraError::DuplicateEntries {
-                    field: "snapshot.utxos",
-                });
-            }
-            set.entries.insert(entry.utxo_id, entry);
-        }
-        set.rebuild_compressed_cache();
-        Ok(set)
     }
 
     /// Number of UTXOs currently in the set.
@@ -504,6 +448,30 @@ mod tests {
         let decoded = UtxoSet::decode(&mut ByteReader::new(&encoded)).unwrap();
         assert_eq!(decoded, set);
         assert_eq!(decoded.root_at_height(1), root);
+    }
+
+    #[test]
+    fn utxo_entry_rejects_pre_canonical_schema_versions() {
+        let entry = UtxoEntry {
+            utxo_id: Bytes32::from([1; 32]),
+            output: dummy_output(1),
+            created_height: 1,
+            tx_index: 0,
+            output_index: 0,
+            tranche_refund: None,
+        };
+        for old_version in [1, 3] {
+            let mut encoded = entry.encode_to_vec();
+            encoded[0] = old_version;
+            assert!(matches!(
+                UtxoEntry::decode(&mut ByteReader::new(&encoded)),
+                Err(IndraError::UnsupportedSchemaVersion {
+                    struct_name: "UtxoEntry",
+                    version,
+                    ..
+                }) if version == old_version
+            ));
+        }
     }
 
     #[test]

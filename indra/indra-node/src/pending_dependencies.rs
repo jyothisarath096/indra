@@ -297,14 +297,12 @@ pub(crate) fn staking_footprint(
                     DependencyKey::PendingGlobalFinalExitSlot,
                 ]);
             }
-            if let Some(cold) = cold_pubkey {
-                keys.extend([
-                    DependencyKey::ValidatorKey(component_key(2, &cold.classical_pk.0)),
-                    DependencyKey::ValidatorKey(component_key(3, cold.pq_pk.as_slice())),
-                    DependencyKey::RetiredColdComponent(component_key(2, &cold.classical_pk.0)),
-                    DependencyKey::RetiredColdComponent(component_key(3, cold.pq_pk.as_slice())),
-                ]);
-            }
+            keys.extend([
+                DependencyKey::ValidatorKey(component_key(2, &cold_pubkey.classical_pk.0)),
+                DependencyKey::ValidatorKey(component_key(3, cold_pubkey.pq_pk.as_slice())),
+                DependencyKey::RetiredColdComponent(component_key(2, &cold_pubkey.classical_pk.0)),
+                DependencyKey::RetiredColdComponent(component_key(3, cold_pubkey.pq_pk.as_slice())),
+            ]);
         }
         StakingOpBody::RotateValidatorColdKey {
             validator_id,
@@ -578,8 +576,8 @@ mod tests {
                 validator_pubkey: pubkey(0x13),
                 vrf_pk: [0x55; 32],
                 deposit_proof: None,
-                cold_pubkey: Some(cold.clone()),
-                cold_signature: None,
+                cold_pubkey: cold.clone(),
+                cold_signature: signature(),
             }),
             staking(StakingOpBody::RotateValidatorColdKey {
                 validator_id: validator,

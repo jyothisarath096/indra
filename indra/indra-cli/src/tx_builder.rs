@@ -350,8 +350,8 @@ pub fn build_register_validator_op_with_cold(
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
             deposit_proof: Some(deposit_proof),
-            cold_pubkey: Some(cold_pubkey),
-            cold_signature: Some(dummy_signature()?),
+            cold_pubkey,
+            cold_signature: dummy_signature()?,
         },
         nonce,
         signature: dummy_signature()?,
@@ -373,10 +373,10 @@ pub fn build_register_validator_op_with_cold(
         pq_sig: VariableBytes::from_slice(&hot_sig.pq.0).unwrap(),
     };
     if let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body {
-        *cold_signature = Some(HybridSignature {
+        *cold_signature = HybridSignature {
             classical_sig: VariableBytes::from_slice(&cold_sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&cold_sig.pq.0).unwrap(),
-        });
+        };
     }
     let op_bytes = op.encode_to_vec();
     Ok(BuiltStakingOp {

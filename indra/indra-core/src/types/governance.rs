@@ -7,9 +7,7 @@ use crate::{
     types::{
         authorization::AuthorizationEnvelope,
         crypto::{HybridPubKey, HybridSignature},
-        primitives::{
-            Bytes32, VariableBytes, SCHEMA_VERSION, SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS,
-        },
+        primitives::{Bytes32, VariableBytes, SCHEMA_VERSION},
     },
 };
 
@@ -678,9 +676,7 @@ impl Encode for GovernanceOpV2 {
 impl Decode for GovernanceOpV2 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let schema_version = u8::decode(r)?;
-        if schema_version != SCHEMA_VERSION
-            && schema_version != SCHEMA_VERSION_PRE_VALIDATOR_NETWORK_ADDRESS
-        {
+        if schema_version != SCHEMA_VERSION {
             return Err(IndraError::UnsupportedSchemaVersion {
                 struct_name: "GovernanceOpV2",
                 version: schema_version,
@@ -799,6 +795,34 @@ mod tests {
             op,
             GovernanceOpV2::decode_exact(&op.encode_to_vec()).unwrap()
         );
+    }
+
+    #[test]
+    fn governance_op_rejects_schema_three() {
+        let op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ProposeChange,
+            signer_id: Bytes32::from([3u8; 32]),
+            nonce: 1,
+            payload: GovernancePayload::Propose {
+                action: GovernableAction::SetSlashLivenessBps { value: 20 },
+                deposit_utxo_id: Bytes32::from([4u8; 32]),
+                proposer_pubkey: dummy_pubkey(),
+                title: VariableBytes::from_slice(b"title").unwrap(),
+                description: VariableBytes::from_slice(b"description").unwrap(),
+                cold_authorization: None,
+            },
+            signature: dummy_sig(),
+        };
+        let mut encoded = op.encode_to_vec();
+        encoded[0] = 3;
+        assert!(matches!(
+            GovernanceOpV2::decode(&mut ByteReader::new(&encoded)),
+            Err(IndraError::UnsupportedSchemaVersion {
+                struct_name: "GovernanceOpV2",
+                version: 3,
+                ..
+            })
+        ));
     }
 
     #[test]

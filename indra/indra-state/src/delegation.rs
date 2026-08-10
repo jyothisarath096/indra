@@ -40,9 +40,9 @@ pub fn apply_staking_op(
     chain_id: &str,
     current_height: u64,
 ) -> StateResult<()> {
-    op.validate_structure_at_height(current_height)
+    op.validate_structure()
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    apply_staking_op_with_identity_activation_mode(state, op, chain_id, current_height, true, true)
+    apply_staking_op_mode(state, op, chain_id, current_height, true)
 }
 
 /// Apply an admission-verified staking operation without repeating intrinsic crypto.
@@ -55,35 +55,16 @@ pub fn apply_verified_staking_op(
     chain_id: &str,
     current_height: u64,
 ) -> StateResult<()> {
-    op.validate_structure_at_height(current_height)
+    op.validate_structure()
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    apply_staking_op_with_identity_activation_mode(state, op, chain_id, current_height, true, false)
+    apply_staking_op_mode(state, op, chain_id, current_height, false)
 }
 
-#[cfg(test)]
-pub(crate) fn apply_staking_op_with_identity_activation(
+fn apply_staking_op_mode(
     state: &mut ChainState,
     op: &StakingOp,
     chain_id: &str,
     current_height: u64,
-    identity_registry_active: bool,
-) -> StateResult<()> {
-    apply_staking_op_with_identity_activation_mode(
-        state,
-        op,
-        chain_id,
-        current_height,
-        identity_registry_active,
-        true,
-    )
-}
-
-fn apply_staking_op_with_identity_activation_mode(
-    state: &mut ChainState,
-    op: &StakingOp,
-    chain_id: &str,
-    current_height: u64,
-    identity_registry_active: bool,
     verify_crypto: bool,
 ) -> StateResult<()> {
     if matches!(op.body, StakingOpBody::RotateValidatorColdKey { .. }) {
@@ -255,16 +236,6 @@ fn apply_staking_op_with_identity_activation_mode(
                 cold_signature,
                 ..
             } => {
-                let cold_pubkey = cold_pubkey.as_ref().ok_or_else(|| {
-                    StateError::InvalidStakingOp(
-                        "validator registration requires a cold hybrid public key".into(),
-                    )
-                })?;
-                let cold_signature = cold_signature.as_ref().ok_or_else(|| {
-                    StateError::InvalidStakingOp(
-                        "validator registration requires a cold hybrid signature".into(),
-                    )
-                })?;
                 let message = op
                     .register_validator_dual_signing_bytes(chain_id)
                     .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?
@@ -329,7 +300,6 @@ fn apply_staking_op_with_identity_activation_mode(
             delegator_pubkey,
             deposit_proof.as_ref(),
             current_height,
-            identity_registry_active,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
             verify_crypto,
         ),
@@ -340,13 +310,7 @@ fn apply_staking_op_with_identity_activation_mode(
             validator_id,
             delegator_pubkey,
             ..
-        } => apply_claim_rewards(
-            state,
-            validator_id,
-            delegator_pubkey,
-            current_height,
-            identity_registry_active,
-        ),
+        } => apply_claim_rewards(state, validator_id, delegator_pubkey, current_height),
         StakingOpBody::RegisterValidator {
             commission_bps,
             deposit_utxo_id,
@@ -362,7 +326,7 @@ fn apply_staking_op_with_identity_activation_mode(
             validator_pubkey,
             *vrf_pk,
             deposit_proof.as_ref(),
-            cold_pubkey.as_ref(),
+            cold_pubkey,
             current_height,
             verify_crypto,
         ),
@@ -393,7 +357,6 @@ fn apply_staking_op_with_identity_activation_mode(
             validator_pubkey,
             deposit_proof.as_ref(),
             current_height,
-            identity_registry_active,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
             verify_crypto,
         ),
@@ -663,7 +626,7 @@ fn apply_register_validator(
     validator_pubkey: &HybridPubKey,
     vrf_pk: [u8; 32],
     deposit_proof: Option<&StakeDepositProof>,
-    cold_pubkey: Option<&ColdHybridPubKey>,
+    cold_pubkey: &ColdHybridPubKey,
     current_height: u64,
     verify_crypto: bool,
 ) -> StateResult<()> {
@@ -694,11 +657,6 @@ fn apply_register_validator(
         validator_pubkey.pq_pk.as_slice(),
     )?;
     let validated_cold_key = {
-        let cold_pubkey = cold_pubkey.ok_or_else(|| {
-            StateError::InvalidStakingOp(
-                "validator registration requires a cold hybrid public key".into(),
-            )
-        })?;
         validate_cold_components_not_retired(
             state,
             &cold_pubkey.classical_pk.0,
@@ -970,7 +928,7 @@ fn evict_validator_for_registry_replacement(
 fn evict_validator_to_tombstone(
     state: &mut ChainState,
     validator_id: Bytes32,
-    _legacy_current_epoch: u64,
+    _current_epoch: u64,
     current_height: u64,
 ) -> StateResult<()> {
     let plan = build_evicted_validator_tombstone(state, validator_id, current_height)?;
@@ -1040,7 +998,6 @@ fn apply_delegate(
     delegator_pubkey: &HybridPubKey,
     deposit_proof: Option<&StakeDepositProof>,
     current_height: u64,
-    identity_registry_active: bool,
     bond_count_cap: Option<usize>,
     verify_crypto: bool,
 ) -> StateResult<()> {
@@ -1072,14 +1029,8 @@ fn apply_delegate(
             "UTXO does not belong to the delegator".into(),
         ));
     }
-    let identity_outcome = if identity_registry_active {
-        Some(
-            resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
-                .map_err(identity_error_to_state_error)?,
-        )
-    } else {
-        None
-    };
+    let identity_outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
+        .map_err(identity_error_to_state_error)?;
     require_and_validate_deposit_proof(
         current_height,
         &utxo_entry.output,
@@ -1116,7 +1067,7 @@ fn apply_delegate(
         current_height,
     )?;
 
-    if matches!(identity_outcome, Some(IdentityCheckOutcome::NoPriorRecord)) {
+    if matches!(identity_outcome, IdentityCheckOutcome::NoPriorRecord) {
         state
             .delegator_identities
             .insert(delegator_id, delegator_pubkey.clone());
@@ -1132,12 +1083,6 @@ fn identity_error_to_state_error(error: IdentityError) -> StateError {
     match error {
         IdentityError::RegistryPubkeyMismatch { delegator_id } => StateError::InvalidStakingOp(
             format!("delegator identity registry pubkey mismatch for {delegator_id}"),
-        ),
-        IdentityError::LegacyPubkeyMismatch { delegator_id } => StateError::InvalidStakingOp(
-            format!("delegator identity legacy pubkey mismatch for {delegator_id}"),
-        ),
-        IdentityError::AmbiguousLegacyPubkeys { delegator_id } => StateError::InvalidStakingOp(
-            format!("delegator identity has ambiguous legacy pubkeys for {delegator_id}"),
         ),
         IdentityError::UnresolvableIdentity { delegator_id, .. } => StateError::InvalidStakingOp(
             format!("delegator identity is unresolvable for {delegator_id}"),
@@ -1171,7 +1116,6 @@ fn apply_self_stake(
     validator_pubkey: &HybridPubKey,
     deposit_proof: Option<&StakeDepositProof>,
     current_height: u64,
-    identity_registry_active: bool,
     bond_count_cap: Option<usize>,
     verify_crypto: bool,
 ) -> StateResult<()> {
@@ -1180,9 +1124,7 @@ fn apply_self_stake(
         .validators
         .get(&validator_id)
         .ok_or(StateError::ValidatorNotFound)?;
-    if identity_registry_active {
-        check_validator_identity_consistency(state, &validator_id, validator_pubkey)?;
-    }
+    check_validator_identity_consistency(state, &validator_id, validator_pubkey)?;
     if !matches!(
         validator.status,
         ValidatorStatus::Active | ValidatorStatus::Registered
@@ -1323,7 +1265,6 @@ fn apply_claim_rewards(
     validator_id: &Bytes32,
     delegator_pubkey: &HybridPubKey,
     current_height: u64,
-    identity_registry_active: bool,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
     let claim_from_validator = *validator_id == delegator_id;
@@ -1360,22 +1301,17 @@ fn apply_claim_rewards(
             claimed, DUST_LIMIT_SPARK
         )));
     }
-    let identity_outcome = if identity_registry_active {
-        let outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
-            .map_err(identity_error_to_state_error)?;
-        if matches!(outcome, IdentityCheckOutcome::NoPriorRecord) {
-            check_claim_owner_identity_for_first_record(
-                state,
-                validator_id,
-                &delegator_id,
-                delegator_pubkey,
-                claim_from_validator,
-            )?;
-        }
-        Some(outcome)
-    } else {
-        None
-    };
+    let identity_outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
+        .map_err(identity_error_to_state_error)?;
+    if matches!(identity_outcome, IdentityCheckOutcome::NoPriorRecord) {
+        check_claim_owner_identity_for_first_record(
+            state,
+            validator_id,
+            &delegator_id,
+            delegator_pubkey,
+            claim_from_validator,
+        )?;
+    }
     let mut position = state
         .stake_positions
         .get(&position_id)
@@ -1386,7 +1322,7 @@ fn apply_claim_rewards(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_stake_position(&position);
     }
-    if matches!(identity_outcome, Some(IdentityCheckOutcome::NoPriorRecord)) {
+    if matches!(identity_outcome, IdentityCheckOutcome::NoPriorRecord) {
         state
             .delegator_identities
             .insert(delegator_id, delegator_pubkey.clone());
@@ -1893,8 +1829,8 @@ mod tests {
         } = &mut op.body
         {
             let cold_keypair = derived_test_cold_keypair(keypair);
-            *cold_pubkey = Some(cold_pubkey_from_keypair(&cold_keypair));
-            *cold_signature = Some(dummy_signature());
+            *cold_pubkey = cold_pubkey_from_keypair(&cold_keypair);
+            *cold_signature = dummy_signature();
             let message = op
                 .register_validator_dual_signing_bytes(chain_id)
                 .unwrap()
@@ -1904,7 +1840,7 @@ mod tests {
             let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body else {
                 unreachable!()
             };
-            *cold_signature = Some(cold_sig);
+            *cold_signature = cold_sig;
             return op;
         }
         let signing_bytes = op
@@ -1959,8 +1895,8 @@ mod tests {
                 validator_pubkey: pubkey_from_keypair(hot_keypair),
                 vrf_pk,
                 deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK, bond_seed)),
-                cold_pubkey: Some(cold_pubkey_from_keypair(cold_keypair)),
-                cold_signature: Some(dummy_signature()),
+                cold_pubkey: cold_pubkey_from_keypair(cold_keypair),
+                cold_signature: dummy_signature(),
             },
             nonce,
             signature: dummy_signature(),
@@ -1978,7 +1914,7 @@ mod tests {
         else {
             unreachable!()
         };
-        *slot = Some(cold_signature);
+        *slot = cold_signature;
         op
     }
 
@@ -2228,8 +2164,10 @@ mod tests {
                 validator_pubkey,
                 vrf_pk: [0x20; 32],
                 deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK / 2, 0x21)),
-                cold_pubkey: None,
-                cold_signature: None,
+                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
+                    &validator_keypair,
+                )),
+                cold_signature: dummy_signature(),
             },
             1,
             &validator_keypair,
@@ -2354,8 +2292,7 @@ mod tests {
         let chain_id = state.chain_id.clone();
         let before = state.clone();
 
-        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
-            .unwrap_err();
+        let err = apply_staking_op(&mut state, &op, &chain_id, 1).unwrap_err();
 
         assert!(matches!(
             err,
@@ -2383,8 +2320,7 @@ mod tests {
         let chain_id = state.chain_id.clone();
         let before = state.clone();
 
-        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
-            .unwrap_err();
+        let err = apply_staking_op(&mut state, &op, &chain_id, 1).unwrap_err();
 
         assert!(matches!(
             err,
@@ -2622,8 +2558,10 @@ mod tests {
                 validator_pubkey,
                 vrf_pk: [0xB2; 32],
                 deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK, 0xB2)),
-                cold_pubkey: None,
-                cold_signature: None,
+                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
+                    &validator_keypair,
+                )),
+                cold_signature: dummy_signature(),
             },
             1,
             &validator_keypair,
@@ -2632,8 +2570,7 @@ mod tests {
         let chain_id = state.chain_id.clone();
         let before = state.clone();
 
-        let err = apply_staking_op_with_identity_activation(&mut state, &op, &chain_id, 1, true)
-            .unwrap_err();
+        let err = apply_staking_op(&mut state, &op, &chain_id, 1).unwrap_err();
 
         assert!(matches!(
             err,
@@ -2834,8 +2771,10 @@ mod tests {
                 validator_pubkey,
                 vrf_pk: [0x44; 32],
                 deposit_proof: None,
-                cold_pubkey: None,
-                cold_signature: None,
+                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
+                    &validator_keypair,
+                )),
+                cold_signature: dummy_signature(),
             },
             1,
             &validator_keypair,
@@ -2866,8 +2805,10 @@ mod tests {
                 validator_pubkey,
                 vrf_pk: [0x4E; 32],
                 deposit_proof: None,
-                cold_pubkey: None,
-                cold_signature: None,
+                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
+                    &validator_keypair,
+                )),
+                cold_signature: dummy_signature(),
             },
             1,
             &validator_keypair,
@@ -2899,8 +2840,10 @@ mod tests {
                 validator_pubkey,
                 vrf_pk: [0x45; 32],
                 deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK - 1, 0xA2)),
-                cold_pubkey: None,
-                cold_signature: None,
+                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
+                    &validator_keypair,
+                )),
+                cold_signature: dummy_signature(),
             },
             1,
             &validator_keypair,
