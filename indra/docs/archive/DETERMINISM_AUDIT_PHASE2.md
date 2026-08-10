@@ -1,3 +1,5 @@
+> **Historical archive:** This records completed audit work and intermediate designs. It is not current guidance; canonical specifications and current code take precedence.
+
 # INDRA Determinism Audit — Phase 2
 
 ## Executive Summary

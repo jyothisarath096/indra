@@ -1,8 +1,10 @@
+> **Historical archive:** This records completed audit work and intermediate designs. It is not current guidance; canonical specifications and current code take precedence.
+
 # INDRA Consensus Determinism Audit
 
 ## Executive Summary
 
-The June 26, 2026 divergence was caused by applying changed consensus arithmetic while replaying blocks that had been committed under the previous arithmetic. This audit adds a height-gated overflow-fix framework, makes consensus-state maps ordered (`BTreeMap`), and verifies canonical map encoding. Snapshot schema versioning exists, but it is not a state-transition/protocol version and cannot identify the arithmetic rules that created a block. A `protocol_version` in `BlockHeaderV1` remains required before mainnet.
+The June 26, 2026 divergence was caused by replaying blocks with arithmetic different from that used when they were committed. The final canonical code uses one genesis-native arithmetic rule and one block format. `BlockHeaderV1.protocol_version` is hash-bound and checked during decode and authoritative application. A future second protocol version would require an explicit height-gated activation schedule; none is needed for the single current version.
 
 ## Incident Report
 
@@ -16,7 +18,7 @@ The immediate cause was the missing activation height. The broader impact is tha
 
 - **Locations:** `epoch.rs` reward, fee, saturation, and virtual auto-delegation reward math; `apply.rs` slash and bond-slash math; `governance.rs` quorum; `qc.rs` and `vote.rs` consensus quorum.
 - **Risk:** A restart used new arithmetic for blocks committed under old arithmetic.
-- **Fix:** `indra_core::types::primitives::hard_forks::OVERFLOW_FIX_HEIGHT` and `overflow_fix_active(height)` select legacy saturating arithmetic before activation and u128 arithmetic at/after activation. Testnet is explicitly configured as active from genesis (`0`).
+- **Historical resolution, corrected:** The proposed overflow activation constant and selector do not exist in the canonical code. The repository accepts only the current arithmetic from genesis, with no compatibility branch.
 - **Deployment height:** The repository contains no signed deployment manifest or protocol-version marker recording the historical testnet upgrade height. It must be recovered from validator release/deployment records before interpreting pre-existing testnet history. This is an operational documentation gap; the testnet constant intentionally applies the corrected rules from genesis after the required coordinated wipe.
 
 ### HIGH: HashMap Non-Determinism in State Transitions (FIXED)
@@ -45,6 +47,6 @@ The immediate cause was the missing activation height. The broader impact is tha
 
 ## Mainnet Readiness
 
-Before mainnet, set every hard-fork constant to an announced, future block height; never change a deployed constant retroactively. Record the release hash, activation height, and expected protocol version in release artifacts. Add the header `protocol_version`, test old/new replay across every fork boundary, and require multi-node state-root comparison after replay and epoch transitions.
+For any future second protocol version, introduce and test an explicit height-to-version activation schedule before deployment. The present single version is already header-bound and validated; multi-node state-root comparison after replay and epoch transitions remains sound release practice.
 
 For this testnet correction: wipe all four validators, build the same release for all nodes, deploy simultaneously rather than rolling, confirm progress past the old tip within 60 seconds, restart one validator, and compare roots after ten epochs. The existing chain cannot be safely reinterpreted with the genesis-active setting without that coordinated reset.

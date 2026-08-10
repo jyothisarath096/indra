@@ -1,3 +1,5 @@
+> **Historical archive:** This records completed audit work and intermediate designs. It is not current guidance; canonical specifications and current code take precedence.
+
 # INDRA Security Audit — Phase 1: Cryptographic Security
 
 Scope: `indra-crypto/`, `indra-bulletproofs/`, `indra-ffi/src/keygen.rs`, plus the consensus/state call sites needed to determine exploitability.
@@ -170,7 +172,7 @@ This is strongest when `epoch_seed` or future heights are predictable before val
 
 **Proof-of-concept:** `indra-crypto/tests/audit_phase1.rs::audit_vrf_public_candidate_output_is_grindable` grinds 2048 VRF public keys and reliably finds a very low first output byte for a fixed public election input.
 
-**Status:** FIXED. `ProposerCandidate` can now carry a `verified_vrf_output`; block production inserts the local proposer's computed VRF output, and block verification inserts the output verified from the header proof before re-running proposer election. The public-hash path remains only as the hard-fork-gated legacy fallback.
+**Historical resolution, corrected for the final design:** The interim single-header-proof design was superseded. Current proposer selection uses commit/reveal VRF evidence; the header binds `election_result_hash`, the QC attests that hash, and sync verifies the durable reveal evidence and proposer/output relationship. There is no public-hash legacy fallback in the canonical protocol.
 
 **Recommended fix:** Implemented for the current single-proposer block-header proof flow. For stronger future sortition, consider requiring/revealing verified VRF outputs for every candidate in the slot instead of relying on fallback scores for non-proposers.
 
@@ -218,7 +220,7 @@ This is strongest when `epoch_seed` or future heights are predictable before val
 
 **Recommended fix:** Return opaque key handles or encrypted key blobs where possible. Add explicit zeroize/free APIs and Swift-side secure memory handling.
 
-**Status:** FIXED on the Rust FFI boundary. `indra_zeroize_keypair` and `indra_zeroize_tx_result` were added and exported in `indra.h`; Rust tests verify private fields are cleared. Swift wrapper lifecycle integration remains a separate application task.
+**Historical status:** The then-current raw-key FFI added explicit keypair and transaction-result zeroizers. That entire raw-key surface was subsequently removed; the canonical API uses opaque handles.
 
 **References:** Rust `zeroize`; iOS Keychain/Secure Enclave key handling guidance.
 
@@ -283,7 +285,7 @@ This is strongest when `epoch_seed` or future heights are predictable before val
 **Description:** The FFI checks null pointers and some fixed lengths, but raw pointer lengths and counts are trusted before `from_raw_parts`. Examples:
 
 - `indra_tx_to_hex(tx_bytes, tx_bytes_len, ...)` accepts arbitrary `tx_bytes_len`.
-- `indra_build_tx` accepts arbitrary `utxo_count`.
+- The then-current raw transaction builder accepted arbitrary `utxo_count`.
 - `indra_free_bytes(ptr, len)` and `indra_free_usize(ptr, len)` trust caller-provided lengths.
 - Fixed-size pointer inputs such as seeds and public keys cannot prove the caller actually provided enough bytes.
 
@@ -313,7 +315,7 @@ This is partly inherent to C FFI, but unbounded `usize` lengths are avoidable.
 
 **Recommended fix:** Add explicit zeroizing free functions and Swift wrappers that call them; avoid returning raw long-term secrets when a handle/keychain design is possible.
 
-**Status:** PARTIAL FIX. The Rust FFI now exports `indra_zeroize_keypair` and `indra_zeroize_tx_result`, and tests verify the exposed private fields/blindings are cleared. Swift wrappers still need to call these APIs during wallet lock/deallocation.
+**Historical status:** The then-current raw-key FFI added zeroizers and tests for exposed private fields/blindings. That interface was subsequently deleted; current wallet integrations use opaque key handles and bounded result destruction APIs.
 
 **References:** Rust `zeroize`; mobile wallet key management practice.
 

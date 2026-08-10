@@ -237,12 +237,10 @@ consensus snapshots. This is necessary because the first imported block
 `K+1` carries QC `K`; if `K` was a boundary height, QC `K` uses the preceding
 snapshot, not the snapshot active for `K+1`.
 
-The complete-state snapshot format currently serializes canonical `ChainState`
-and checks its schema version (`indra-storage/src/state_store.rs:460-552`).
-The new records therefore require a schema migration and full invariant
-validation on restore. A state snapshot lacking the required governed snapshot
-MUST NOT be used as a post-gate starting point; the node must replay from a
-valid earlier state or fail startup.
+The complete-state snapshot format serializes the canonical `ChainState` and
+checks its single current schema. Governed consensus snapshots are mandatory
+fields and receive full invariant validation on restore. A snapshot lacking
+them is noncanonical and startup fails; no conversion path exists.
 
 ### 4.3 Sync, replay, and archival verification
 

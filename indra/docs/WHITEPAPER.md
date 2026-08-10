@@ -270,9 +270,8 @@ produces a nullifier recorded permanently on-chain. Double-spending
 is cryptographically impossible: once a nullifier exists, any
 transaction attempting to spend the same UTXO is rejected.
 
-UTXO entries use versioned encoding with schema migration support,
-ensuring compatibility across protocol upgrades without requiring
-chain state wipes.
+UTXO entries use one canonical genesis-native encoding. Nodes reject unknown
+schema and storage formats rather than attempting compatibility conversion.
 
 ### 2.8 BFT consensus
 
@@ -317,11 +316,13 @@ the last 50,000 blocks. The full state database (UTXO set, validator
 set, governance state) is always retained via periodic snapshots.
 Archive nodes retain all blocks.
 
-### 2.9 State migration framework
+### 2.9 Canonical state and storage format
 
-INDRA persists one canonical mainnet state schema. Unknown schema or storage
-formats fail closed; nodes do not expose or execute a historical migration
-ladder.
+INDRA persists one canonical mainnet state schema and one segmented block-store
+format. Genesis, snapshots, epoch records, staking positions/tranches, and
+governance state are produced directly in their current representations.
+Unknown formats fail closed; the runtime contains no historical decoder,
+converter, or migration ladder.
 
 ### 2.10 Discovery and operator trust boundaries
 
@@ -339,9 +340,9 @@ node list. Plain DNS A records remain a rollout fallback.
 
 Operator keys are stored in encrypted `keys.json` files by default using
 Argon2id password derivation and ChaCha20-Poly1305 authenticated
-encryption. For mobile/FFI consumers, production APIs use opaque
-in-process key handles so raw private keys do not cross the C ABI
-boundary; legacy raw-key exports are feature-gated for migration/testing.
+encryption. Plaintext keystores are not accepted. For mobile/FFI consumers,
+production APIs use opaque in-process key handles so raw private keys do not
+cross the C ABI boundary; no raw-key compatibility exports exist.
 
 ---
 
@@ -913,7 +914,7 @@ Core protocol in Rust, ML-DSA-87 hybrid signatures, ML-DSA-87-only
 QC consensus, hybrid PQ transport (X25519 + ML-KEM-1024), OutputV1 value
 commitment/range-proof machinery, BFT consensus with stability fixes, UTXO delegation,
 auto-delegation, five-phase commit-reveal governance, epoch history,
-state migration framework, encrypted key storage, CLI tooling (stake +
+canonical genesis-native state/storage formats, encrypted key storage, CLI tooling (stake +
 governance), JSON-RPC, and a four-validator testnet.
 
 **Phase 2 — Public testnet**

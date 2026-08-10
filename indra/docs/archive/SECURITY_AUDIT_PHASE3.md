@@ -1,3 +1,5 @@
+> **Historical archive:** This records completed audit work and intermediate designs. It is not current guidance; canonical specifications and current code take precedence.
+
 # INDRA Security Audit — Phase 3: Consensus Safety and Liveness
 
 ## Summary Table
@@ -140,7 +142,7 @@ Sync/import verification remains bounded: historical nodes verify the proposer o
 
 **Severity:** SAFE after fix. This is a consensus-rule and wire-format change for proposer validity, votes/QCs, and P2P gossip. It should be activated from genesis after a fresh testnet reset or via a hard-fork height. It does not change cryptographic derivation or genesis validator key material.
 
-**Recommended fix:** Complete. For mainnet design, consider a commit-reveal VRF election if private/unpredictable per-round proposer selection is required; the current public deterministic rule intentionally prioritizes a unique globally-computable proposer.
+**Historical resolution, corrected for the final design:** Complete. The canonical protocol now uses commit/reveal VRF election with durable reveal evidence and a QC-attested `election_result_hash`; the public deterministic design described here was interim.
 
 ### CS-06 — Sync and catch-up correctness
 
@@ -285,7 +287,7 @@ The CS-05 public deterministic proposer-election fix now removes the known hones
 ## Fix Priority
 
 1. **CS-04 — adaptive timeouts:** consider exponential/adaptive round timeouts for WAN stability. This is operational liveness hardening, not a correctness blocker.
-2. **Mainnet proposer-election design:** public deterministic election is now safe and unique, but it is predictable once the epoch seed and validator set are known. If mainnet requires private/unpredictable per-round proposer selection, design a commit-reveal VRF scheme as a separate protocol upgrade.
+2. **Mainnet proposer-election design:** resolved by the canonical commit/reveal VRF scheme with durable reveal evidence and QC-attested election results.
 
 ## Proof-of-Concept Tests
 

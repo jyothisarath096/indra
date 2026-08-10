@@ -113,8 +113,15 @@ The requested `cargo test --workspace --exclude indra-ffi --exclude indra-networ
 
 ### Remaining Risks
 
-Snapshots store a schema version but not an explicit consensus transition/protocol version. A mainnet header `protocol_version`, committed to block hashes and validated by height, is still required.
+`BlockHeaderV1.protocol_version` is committed to the block hash and checked by
+decode and authoritative application against the single current
+`BLOCK_FORMAT_VERSION`. No height-gated multi-version activation schedule
+exists; one must be designed before a future second protocol version is
+introduced.
 
 ## Conclusion
 
-The diagnosis is proven and all identified arithmetic and QC-ordering gaps are now height-gated or canonicalized. Before mainnet, add and enforce a block-header protocol version, set announced nonzero production activation heights, and run multi-node replay/root comparisons across every fork boundary.
+The diagnosis is proven and the current genesis-native arithmetic and QC
+ordering are canonicalized. Future protocol-version coexistence requires an
+explicit activation schedule; current releases should continue multi-node
+replay and state-root comparison across epoch transitions.
