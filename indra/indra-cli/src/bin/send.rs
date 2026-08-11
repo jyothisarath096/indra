@@ -54,8 +54,8 @@ fn main() {
         eprintln!("Error loading keys: {}", e);
         std::process::exit(1);
     });
-    let hybrid_seed = keys.hybrid_seed;
-    let pq_sk_bytes = keys.pq_sk.clone();
+    let ed25519_seed = keys.ed25519_seed;
+    let ml_dsa_seed_bytes = keys.ml_dsa_seed.to_vec();
     let pq_pk_bytes = keys.public.hybrid_pq_pk.clone();
 
     // Derive sender pubkey from seed
@@ -102,8 +102,8 @@ fn main() {
         amount_spark,
         fee_spark,
         wallet: &wallet,
-        hybrid_seed,
-        pq_sk_bytes,
+        ed25519_seed,
+        ml_dsa_seed_bytes,
         sender_pubkey,
         sender_payment_pubkey,
     };

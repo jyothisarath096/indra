@@ -210,7 +210,7 @@ This is strongest when `epoch_seed` or future heights are predictable before val
 
 ### C-11 — Seed zeroization is partial
 
-**Description:** `DerivedSeeds` implements `Zeroize` and `ZeroizeOnDrop`. However, `indra-ffi::IndraKeyPair` returns `classical_seed`, `pq_sk`, `bls_seed`, and `vrf_seed` as plain fixed arrays. There is no FFI destructor that zeroizes `IndraKeyPair`, and Swift ARC does not guarantee secure erasure.
+**Description:** `DerivedSeeds` implements `Zeroize` and `ZeroizeOnDrop`. However, the historical `indra-ffi::IndraKeyPair` returned classical, ML-DSA, BLS, and VRF seeds as plain fixed arrays. There was no FFI destructor that zeroized `IndraKeyPair`, and Swift ARC did not guarantee secure erasure.
 
 **Attack scenario:** A local memory disclosure on a jailbroken device or crash dump could recover long-lived private seed material from the Swift/Rust boundary.
 

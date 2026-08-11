@@ -63,20 +63,20 @@ impl KeyRegistry {
 struct StoredKeyMaterial {
     public: IndraPublicKeyInfo,
     classical_seed: [u8; CLASSICAL_SK_BYTES],
-    pq_sk: [u8; PQ_SK_BYTES],
+    ml_dsa_seed: [u8; PQ_SK_BYTES],
     vrf_seed: [u8; BYTES32_LEN],
     payment_keypair: PaymentKeypairV1,
 }
 
 impl StoredKeyMaterial {
     fn from_keys(keys: &KeysFile) -> Result<Self, IndraError> {
-        if keys.public.hybrid_pq_pk.len() != PQ_PK_BYTES || keys.pq_sk.len() != PQ_SK_BYTES {
+        if keys.public.hybrid_pq_pk.len() != PQ_PK_BYTES {
             return Err(IndraError::KeygenFailed);
         }
         let mut pq_pk = [0u8; PQ_PK_BYTES];
         pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
-        let mut pq_sk = [0u8; PQ_SK_BYTES];
-        pq_sk.copy_from_slice(&keys.pq_sk);
+        let mut ml_dsa_seed = [0u8; PQ_SK_BYTES];
+        ml_dsa_seed.copy_from_slice(&keys.ml_dsa_seed);
         let payment_keypair = keys
             .payment_keypair
             .clone()
@@ -88,8 +88,8 @@ impl StoredKeyMaterial {
                 pq_pk,
                 vrf_pk: keys.public.vrf_pk,
             },
-            classical_seed: keys.hybrid_seed,
-            pq_sk,
+            classical_seed: keys.ed25519_seed,
+            ml_dsa_seed,
             vrf_seed: keys.vrf_seed,
             payment_keypair,
         })
@@ -99,7 +99,7 @@ impl StoredKeyMaterial {
         SigningMaterial {
             public: self.public,
             classical_seed: self.classical_seed,
-            pq_sk: self.pq_sk,
+            ml_dsa_seed: self.ml_dsa_seed,
         }
     }
 
@@ -111,7 +111,7 @@ impl StoredKeyMaterial {
 impl Drop for StoredKeyMaterial {
     fn drop(&mut self) {
         self.classical_seed.zeroize();
-        self.pq_sk.zeroize();
+        self.ml_dsa_seed.zeroize();
         self.vrf_seed.zeroize();
         self.payment_keypair.x25519_sk.zeroize();
         self.payment_keypair.ml_kem_1024_seed.zeroize();
@@ -121,13 +121,13 @@ impl Drop for StoredKeyMaterial {
 pub(crate) struct SigningMaterial {
     pub public: IndraPublicKeyInfo,
     classical_seed: [u8; CLASSICAL_SK_BYTES],
-    pq_sk: [u8; PQ_SK_BYTES],
+    ml_dsa_seed: [u8; PQ_SK_BYTES],
 }
 
 impl SigningMaterial {
     pub(crate) fn keypair(&self) -> Result<HybridKeypair, IndraError> {
         let classical = ClassicalKeypair::from_seed(&self.classical_seed);
-        let pq = PqKeypair::from_bytes(&self.public.pq_pk, &self.pq_sk)
+        let pq = PqKeypair::from_bytes(&self.public.pq_pk, &self.ml_dsa_seed)
             .map_err(|_| IndraError::KeygenFailed)?;
         Ok(HybridKeypair::new(classical, pq))
     }
@@ -136,15 +136,15 @@ impl SigningMaterial {
         self.classical_seed
     }
 
-    pub(crate) fn pq_sk(&self) -> [u8; PQ_SK_BYTES] {
-        self.pq_sk
+    pub(crate) fn ml_dsa_seed(&self) -> [u8; PQ_SK_BYTES] {
+        self.ml_dsa_seed
     }
 }
 
 impl Drop for SigningMaterial {
     fn drop(&mut self) {
         self.classical_seed.zeroize();
-        self.pq_sk.zeroize();
+        self.ml_dsa_seed.zeroize();
     }
 }
 

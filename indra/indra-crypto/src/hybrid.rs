@@ -4,7 +4,7 @@
 //! This is the core cryptographic invariant of the INDRA protocol:
 //! security requires an attacker to break BOTH schemes simultaneously.
 
-use ed25519_dalek::{Signature as Ed25519Sig, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature as Ed25519Sig, Signer, SigningKey, VerifyingKey};
 use ml_dsa::{
     EncodedVerifyingKey, Generate, KeyExport, Keypair, MlDsa87, Signature as MlDsaSignature,
     SignatureEncoding, Signer as MlDsaSigner, SigningKey as MlDsaSigningKey,
@@ -64,7 +64,7 @@ pub fn verify_classical(
         actual: CLASSICAL_PK_BYTES,
     })?;
     let ed_sig = Ed25519Sig::from_bytes(&sig.0);
-    vk.verify(message, &ed_sig)
+    vk.verify_strict(message, &ed_sig)
         .map_err(|_| CryptoError::ClassicalVerifyFailed)
 }
 
@@ -387,6 +387,7 @@ pub fn verify_dual_hybrid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Verifier;
     use rand_core::{CryptoRng, Error as RandError, RngCore};
 
     struct CountingRng {
@@ -455,6 +456,36 @@ mod tests {
             verify_classical(msg, &bad_sig, &kp.public_key()).is_err(),
             "ed25519-dalek must reject non-canonical S values"
         );
+    }
+
+    #[test]
+    fn ed25519_strict_rejects_small_order_r_accepted_by_ordinary_verification() {
+        // ed25519-speccheck vector 2: mixed-order A, small-order R. Dalek's
+        // RFC-compatible `verify` accepts it; `verify_strict` must reject it.
+        let message =
+            hex::decode("aebf3f2601a0c8c5d39cc7d8911642f740b78168218da8471772b35f9d35b9ab")
+                .unwrap();
+        let public_key: [u8; 32] =
+            hex::decode("f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let signature: [u8; 64] = hex::decode(
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa8c4bd45aecaca5b24fb97bc10ac27ac8751a7dfe1baff8b953ec9f5833ca260e",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let vk = VerifyingKey::from_bytes(&public_key).unwrap();
+        let dalek_signature = Ed25519Sig::from_bytes(&signature);
+        assert!(vk.verify(&message, &dalek_signature).is_ok());
+        assert!(verify_classical(
+            &message,
+            &ClassicalSignature(signature),
+            &ClassicalPublicKey(public_key),
+        )
+        .is_err());
     }
 
     #[test]

@@ -3537,7 +3537,7 @@ mod tests {
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
-        config.pq_sk = Some(pq.secret_key_bytes());
+        config.pq_seed = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
         (ConsensusDriver::new(engine, vote_safety), dir)
@@ -4716,7 +4716,7 @@ mod tests {
             template_config.validator_seed = Some(template_seed);
             template_config.vrf_seed = Some(template_seed);
             template_config.pq_pk = Some(template_pq.public_key().0.to_vec());
-            template_config.pq_sk = Some(template_pq.secret_key_bytes());
+            template_config.pq_seed = Some(template_pq.secret_key_bytes());
             template_config.p2p_addr = "127.0.0.1:30000".to_string();
 
             let engine = NodeEngine::init(template_config).unwrap();
@@ -4760,7 +4760,7 @@ mod tests {
                 config.validator_seed = Some(seed);
                 config.vrf_seed = Some(seed);
                 config.pq_pk = Some(pq.public_key().0.to_vec());
-                config.pq_sk = Some(pq.secret_key_bytes());
+                config.pq_seed = Some(pq.secret_key_bytes());
                 config.p2p_addr = format!("127.0.0.1:{}", 30_000 + i);
                 if real_driver_sim_full_static_topology() {
                     config.bootstrap_peers = (0..validators)
@@ -9544,7 +9544,7 @@ mod tests {
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
-        config.pq_sk = Some(pq.secret_key_bytes());
+        config.pq_seed = Some(pq.secret_key_bytes());
         {
             let mut pristine = NodeEngine::init(config.clone()).unwrap();
             pristine.write_chain_manifest().unwrap();
@@ -9606,7 +9606,7 @@ mod tests {
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
-        config.pq_sk = Some(pq.secret_key_bytes());
+        config.pq_seed = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
         let restarted = ConsensusDriver::new(engine, vote_safety);

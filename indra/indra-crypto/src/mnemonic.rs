@@ -20,8 +20,10 @@ pub const MNEMONIC_WORD_COUNT: usize = 24;
 /// All seeds derived from a master seed.
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DerivedSeeds {
-    /// Ed25519 + ML-DSA-87 hybrid keypair seed.
-    pub hybrid_seed: [u8; 32],
+    /// Ed25519 signing-key seed.
+    pub ed25519_seed: [u8; 32],
+    /// ML-DSA-87 signing-key seed.
+    pub ml_dsa_seed: [u8; 32],
     /// VRF keypair seed.
     pub vrf_seed: [u8; 32],
     /// Payment X25519 key seed.
@@ -53,7 +55,8 @@ pub fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 32], CryptoError> {
 
 /// Derive all INDRA keypair seeds from a 32-byte master seed.
 pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
-    let hybrid_seed = derive_seed(master_seed, b"indra-hybrid-v1");
+    let ed25519_seed = derive_seed(master_seed, b"indra-ed25519-v1");
+    let ml_dsa_seed = derive_seed(master_seed, b"indra-ml-dsa-v1");
     let vrf_seed = derive_seed(master_seed, b"indra-vrf-v1");
     let payment_x25519_seed = derive_seed(master_seed, b"indra-payment-x25519-v1");
     let mut payment_ml_kem_seed = [0u8; 64];
@@ -62,7 +65,8 @@ pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
     payment_ml_kem_seed[32..]
         .copy_from_slice(&derive_seed(master_seed, b"indra-payment-ml-kem-v1:1"));
     DerivedSeeds {
-        hybrid_seed,
+        ed25519_seed,
+        ml_dsa_seed,
         vrf_seed,
         payment_x25519_seed,
         payment_ml_kem_seed,
@@ -116,7 +120,8 @@ mod tests {
         let seed = mnemonic_to_seed(&phrase).unwrap();
         let derived1 = derive_all_seeds(&seed);
         let derived2 = derive_all_seeds(&seed);
-        assert_eq!(derived1.hybrid_seed, derived2.hybrid_seed);
+        assert_eq!(derived1.ed25519_seed, derived2.ed25519_seed);
+        assert_eq!(derived1.ml_dsa_seed, derived2.ml_dsa_seed);
         assert_eq!(derived1.vrf_seed, derived2.vrf_seed);
         assert_eq!(derived1.payment_x25519_seed, derived2.payment_x25519_seed);
         assert_eq!(derived1.payment_ml_kem_seed, derived2.payment_ml_kem_seed);
@@ -159,14 +164,18 @@ mod tests {
         let phrase = generate_mnemonic();
         let seed = mnemonic_to_seed(&phrase).unwrap();
         let derived = derive_all_seeds(&seed);
-        assert_ne!(derived.hybrid_seed, derived.vrf_seed);
-        assert_ne!(derived.hybrid_seed, derived.payment_x25519_seed);
+        assert_ne!(derived.ed25519_seed, derived.ml_dsa_seed);
+        assert_ne!(derived.ed25519_seed, derived.vrf_seed);
+        assert_ne!(derived.ed25519_seed, derived.payment_x25519_seed);
+        assert_ne!(derived.ml_dsa_seed, derived.vrf_seed);
+        assert_ne!(derived.ml_dsa_seed, derived.payment_x25519_seed);
         assert_ne!(derived.vrf_seed, derived.payment_x25519_seed);
         assert_ne!(
             derived.payment_x25519_seed,
             derived.payment_ml_kem_seed[..32]
         );
-        assert_ne!(derived.hybrid_seed, derived.payment_ml_kem_seed[..32]);
+        assert_ne!(derived.ed25519_seed, derived.payment_ml_kem_seed[..32]);
+        assert_ne!(derived.ml_dsa_seed, derived.payment_ml_kem_seed[..32]);
         assert_ne!(derived.vrf_seed, derived.payment_ml_kem_seed[..32]);
     }
 
@@ -176,8 +185,12 @@ mod tests {
         let seed = mnemonic_to_seed(phrase).unwrap();
         let derived = derive_all_seeds(&seed);
         assert_eq!(
-            hex::encode(derived.hybrid_seed),
-            "e31cd6bbc6df5c923042490bd724e35cd77472fccdb8245c99ff17aec69cb3f6"
+            hex::encode(derived.ed25519_seed),
+            "47200e375715b909433a00a43e72958a32f04773fe8566b5cc9027e6f7ffef27"
+        );
+        assert_eq!(
+            hex::encode(derived.ml_dsa_seed),
+            "886b588417af15d5bed53dab0f07436d1e4854aa7c9889f8a8fc29dd6dcf63a2"
         );
         assert_eq!(
             hex::encode(derived.vrf_seed),
@@ -193,8 +206,23 @@ mod tests {
     #[test]
     fn hmac_derive_seed_is_deterministic() {
         let master = [0x42u8; 32];
-        let s1 = derive_seed(&master, b"indra-hybrid-v1");
-        let s2 = derive_seed(&master, b"indra-hybrid-v1");
+        let s1 = derive_seed(&master, b"indra-ed25519-v1");
+        let s2 = derive_seed(&master, b"indra-ed25519-v1");
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn boundary_master_seeds_derive_independent_nonzero_component_keys() {
+        for master in [[0u8; 32], [0xffu8; 32]] {
+            let derived = derive_all_seeds(&master);
+            assert_ne!(derived.ed25519_seed, [0u8; 32]);
+            assert_ne!(derived.ml_dsa_seed, [0u8; 32]);
+            assert_ne!(derived.ed25519_seed, derived.ml_dsa_seed);
+
+            let classical = crate::ClassicalKeypair::from_seed(&derived.ed25519_seed);
+            let pq = crate::PqKeypair::from_seed(&derived.ml_dsa_seed).unwrap();
+            crate::validate_classical_public_key(&classical.public_key()).unwrap();
+            crate::validate_pq_public_key(&pq.public_key()).unwrap();
+        }
     }
 }

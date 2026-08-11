@@ -38,7 +38,7 @@ pub struct NodeConfig {
 
     /// The node's ML-DSA-87 seed bytes (from keys.json).
     /// Required if validator_seed is set.
-    pub pq_sk: Option<Vec<u8>>,
+    pub pq_seed: Option<Vec<u8>>,
 
     /// The node's ML-DSA-87 public key bytes (from keys.json).
     pub pq_pk: Option<Vec<u8>>,
@@ -190,7 +190,7 @@ impl NodeConfig {
             genesis_validator_minimum: 1,
             validator_seed: Some([0x42u8; 32]),
             vrf_seed: Some([0x42u8; 32]),
-            pq_sk: None,
+            pq_seed: None,
             pq_pk: None,
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
@@ -219,7 +219,7 @@ impl NodeConfig {
             genesis_validator_minimum: 4,
             validator_seed: None,
             vrf_seed: None,
-            pq_sk: None,
+            pq_seed: None,
             pq_pk: None,
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
@@ -251,7 +251,7 @@ impl NodeConfig {
             genesis_validator_minimum: 4,
             validator_seed: None,
             vrf_seed: None,
-            pq_sk: None,
+            pq_seed: None,
             pq_pk: None,
             p2p_addr,
             bootstrap_peers: vec![],

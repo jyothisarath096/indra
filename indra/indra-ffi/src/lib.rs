@@ -121,6 +121,22 @@ mod handle_tests {
         (handle, public)
     }
 
+    fn direct_keypair_from_master_seed(seed: [u8; 32]) -> HybridKeypair {
+        let keys = keygen::generate_keys(seed).unwrap();
+        HybridKeypair::new(
+            ClassicalKeypair::from_seed(&keys.ed25519_seed),
+            PqKeypair::from_bytes(&keys.public.hybrid_pq_pk, &keys.ml_dsa_seed).unwrap(),
+        )
+    }
+
+    fn assert_wire_signature_matches_direct(
+        signature: &indra_core::types::crypto::HybridSignature,
+        direct: &indra_crypto::HybridSignature,
+    ) {
+        assert_eq!(signature.classical_sig.as_slice(), direct.classical.0);
+        assert_eq!(signature.pq_sig.as_slice(), direct.pq.0);
+    }
+
     fn out() -> Vec<c_char> {
         vec![0; INDRA_OP_HEX_MAX_BYTES]
     }
@@ -390,7 +406,7 @@ mod handle_tests {
     }
 
     #[test]
-    fn blinding_recovery_ffi_opens_real_transaction_commitment() {
+    fn transaction_handle_signature_matches_direct_and_blinding_recovery_opens_commitment() {
         let _guard = test_lock();
         let (sender_handle, _sender_public) = handle_from_seed([0x76; 32]);
         let (recipient_handle, _) = handle_from_seed([0x77; 32]);
@@ -423,6 +439,10 @@ mod handle_tests {
             OK
         );
         let tx = unsafe { decode_tx_result(&result) };
+        let direct = direct_keypair_from_master_seed([0x76; 32])
+            .sign(&tx.signing_bytes(DEFAULT_CHAIN_ID))
+            .unwrap();
+        assert_wire_signature_matches_direct(&tx.signature, &direct);
         let note = tx.payment_notes[0].encode();
         let mut recovered = [0u8; BYTES32_LEN];
 
@@ -482,7 +502,7 @@ mod handle_tests {
     }
 
     #[test]
-    fn staking_builders_with_handle_sign_with_canonical_validator_identity() {
+    fn staking_handle_signature_is_byte_identical_to_direct_signing() {
         let _guard = test_lock();
         let (handle, public) = handle_from_seed([0x44; 32]);
         let chain = CString::new("indra-testnet-1").unwrap();
@@ -499,7 +519,11 @@ mod handle_tests {
         assert_eq!(code, OK);
         let op = unsafe { decode_staking(&out) };
         assert_eq!(op.nonce, 7);
-        match op.body {
+        let direct = direct_keypair_from_master_seed([0x44; 32])
+            .sign(&op.signing_bytes("indra-testnet-1"))
+            .unwrap();
+        assert_wire_signature_matches_direct(&op.signature, &direct);
+        match &op.body {
             StakingOpBody::ClaimRewards {
                 validator_id,
                 delegator_pubkey,
@@ -513,7 +537,7 @@ mod handle_tests {
     }
 
     #[test]
-    fn governance_builders_with_handle_sign_with_canonical_identity() {
+    fn governance_handle_signature_is_byte_identical_to_direct_signing() {
         let _guard = test_lock();
         let (handle, public) = handle_from_seed([0x55; 32]);
         let chain = CString::new("indra-testnet-1").unwrap();
@@ -531,6 +555,17 @@ mod handle_tests {
         };
         assert_eq!(code, OK);
         let op = unsafe { decode_governance(&out) };
+        let domain = indra_core::types::governance::governance_signing_domain(
+            op.action_type,
+            op.signer_id,
+            op.nonce,
+            &op.payload,
+            "indra-testnet-1",
+        );
+        let direct = direct_keypair_from_master_seed([0x55; 32])
+            .sign(&indra_crypto::sha256(&domain))
+            .unwrap();
+        assert_wire_signature_matches_direct(&op.signature, &direct);
         assert_eq!(op.signer_id.0, public.validator_id);
         assert_eq!(op.nonce, 9);
         assert!(matches!(op.payload, GovernancePayload::Cancel { .. }));
@@ -998,7 +1033,7 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
         let signing = handles::signing_material(params_ref.sender_handle)?;
         let sender_payment_pubkey = handles::payment_pubkey(params_ref.sender_handle)?;
         let mut sender_classical_seed = signing.classical_seed();
-        let mut sender_pq_sk = signing.pq_sk();
+        let mut sender_ml_dsa_seed = signing.ml_dsa_seed();
         let wallet_context =
             wallet::build_wallet_context(sender_classical_seed, &signing.public.pq_pk, utxos)?;
         let built = match tx::build_with_address(
@@ -1006,7 +1041,7 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
             params_ref.amount_spark,
             params_ref.fee_spark,
             sender_classical_seed,
-            &sender_pq_sk,
+            &sender_ml_dsa_seed,
             &chain_id,
             sender_payment_pubkey,
             wallet_context,
@@ -1014,12 +1049,12 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
             Ok(built) => built,
             Err(error) => {
                 sender_classical_seed.fill(0);
-                sender_pq_sk.fill(0);
+                sender_ml_dsa_seed.fill(0);
                 return Err(error);
             }
         };
         sender_classical_seed.fill(0);
-        sender_pq_sk.fill(0);
+        sender_ml_dsa_seed.fill(0);
 
         let tx_bytes_len = built.tx_bytes.len();
         let tx_bytes_ptr = Box::into_raw(built.tx_bytes) as *mut u8;

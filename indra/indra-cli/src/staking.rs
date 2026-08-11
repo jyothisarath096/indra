@@ -19,8 +19,8 @@ use crate::{
 
 /// Reconstruct the hybrid signing keypair from a keys file.
 pub fn reconstruct_keypair(keys: &KeysFile) -> CliResult<HybridKeypair> {
-    let classical = ClassicalKeypair::from_seed(&keys.hybrid_seed);
-    let pq = PqKeypair::from_bytes(&keys.public.hybrid_pq_pk, &keys.pq_sk)
+    let classical = ClassicalKeypair::from_seed(&keys.ed25519_seed);
+    let pq = PqKeypair::from_bytes(&keys.public.hybrid_pq_pk, &keys.ml_dsa_seed)
         .map_err(|e| CliError::Crypto(e.to_string()))?;
     Ok(HybridKeypair::new(classical, pq))
 }

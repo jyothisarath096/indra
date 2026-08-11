@@ -52,8 +52,8 @@ pub fn build_with_address(
         amount_spark,
         fee_spark,
         wallet: &wallet_context.wallet,
-        hybrid_seed: sender_classical_seed,
-        pq_sk_bytes: sender_pq_sk.to_vec(),
+        ed25519_seed: sender_classical_seed,
+        ml_dsa_seed_bytes: sender_pq_sk.to_vec(),
         sender_pubkey: wallet_context.sender_pubkey,
         sender_payment_pubkey,
     };
@@ -61,13 +61,13 @@ pub fn build_with_address(
     let built = match build_transaction(&params) {
         Ok(built) => built,
         Err(error) => {
-            params.hybrid_seed.fill(0);
-            params.pq_sk_bytes.fill(0);
+            params.ed25519_seed.fill(0);
+            params.ml_dsa_seed_bytes.fill(0);
             return Err(IndraError::from(error));
         }
     };
-    params.hybrid_seed.fill(0);
-    params.pq_sk_bytes.fill(0);
+    params.ed25519_seed.fill(0);
+    params.ml_dsa_seed_bytes.fill(0);
     let tx_bytes = hex::decode(&built.tx_hex).map_err(|_| IndraError::Internal)?;
     let _ = decode_transaction(&tx_bytes)?;
     let tx_id = tx_id_from_bytes(&tx_bytes);

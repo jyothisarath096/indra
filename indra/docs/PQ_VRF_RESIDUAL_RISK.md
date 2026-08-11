@@ -10,7 +10,7 @@ This document is not a closure note. It is a standing risk-acceptance record for
 
 Scope searched: `indra-core`, `indra-crypto`, `indra-state`, `indra-consensus`, `indra-node`, `indra-rpc`, `indra-ffi`, `indra-cli`, `indra-storage`, `indra-network`, and `indra-bench`.
 
-Search terms: `VrfKeypair`, `vrf_pk`, `VrfOutput`, `VrfProof`, `VrfElectionResult`, `vrf_verify`, `vrf_prove`, `vrf_sign`, `compute_proposer_vrf`, `derive_all_seeds`, `hybrid_seed`, `vrf_seed`, `bls_seed`, `BlsKeypair`, `BlsPublicKey`, `BlsSignature`, `bls_pk`, and `bls_`.
+Search terms: `VrfKeypair`, `vrf_pk`, `VrfOutput`, `VrfProof`, `VrfElectionResult`, `vrf_verify`, `vrf_prove`, `vrf_sign`, `compute_proposer_vrf`, `derive_all_seeds`, `ed25519_seed`, `ml_dsa_seed`, `vrf_seed`, `bls_seed`, `BlsKeypair`, `BlsPublicKey`, `BlsSignature`, `bls_pk`, and `bls_`.
 
 Result: 525 live-crate occurrences across 49 files. The table groups contiguous line hits by file while preserving every hit location.
 
@@ -89,7 +89,8 @@ Verified at construction level in `indra-crypto/src/mnemonic.rs`.
 
 `derive_all_seeds(master_seed)` derives:
 
-- `hybrid_seed = derive_seed(master_seed, b"indra-hybrid-v1")`
+- `ed25519_seed = derive_seed(master_seed, b"indra-ed25519-v1")`
+- `ml_dsa_seed = derive_seed(master_seed, b"indra-ml-dsa-v1")`
 - `vrf_seed = derive_seed(master_seed, b"indra-vrf-v1")`
 - `bls_seed = derive_seed(master_seed, b"indra-bls-v1")`
 
@@ -173,4 +174,3 @@ This is a standing item for every future security audit phase. It is not a one-t
 This is not resolved or closed. INDRA still uses a classical VRF for live proposer election because no standardized PQ replacement exists today.
 
 The risk is accepted, bounded, and monitored. After this task, the confirmed live blast radius is limited to proposer-election behavior and sync/replay proposer-election verification. A previously discovered reward-routing dependency on live VRF verification was removed for the active commit-reveal path.
-

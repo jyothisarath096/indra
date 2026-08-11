@@ -107,12 +107,12 @@ pub struct KeysFile {
     pub name: String,
     /// All public keys.
     pub public: ValidatorKeys,
-    /// Hybrid keypair seed (keep secret).
-    pub hybrid_seed: [u8; 32],
+    /// Ed25519 signing-key seed (keep secret).
+    pub ed25519_seed: [u8; 32],
     /// VRF keypair seed (keep secret).
     pub vrf_seed: [u8; 32],
-    /// ML-DSA-87 secret key bytes (keep secret).
-    pub pq_sk: Vec<u8>,
+    /// ML-DSA-87 signing-key seed (keep secret).
+    pub ml_dsa_seed: [u8; 32],
     /// Optional payment key-exchange private keypair (keep secret).
     pub payment_keypair: Option<PaymentKeypairV1>,
     /// Ordered retained historical payment keys, oldest first.
@@ -190,8 +190,8 @@ impl ColdKeysFile {
 impl KeysFile {
     /// Build this identity's canonical, self-contained payment address.
     pub fn payment_address(&self, chain_id: &[u8]) -> KeystoreResult<PaymentAddress> {
-        let classical = ClassicalKeypair::from_seed(&self.hybrid_seed);
-        let pq = PqKeypair::from_bytes(&self.public.hybrid_pq_pk, &self.pq_sk)
+        let classical = ClassicalKeypair::from_seed(&self.ed25519_seed);
+        let pq = PqKeypair::from_bytes(&self.public.hybrid_pq_pk, &self.ml_dsa_seed)
             .map_err(|error| KeystoreError::Crypto(error.to_string()))?;
         let hybrid = HybridKeypair::new(classical, pq);
         let payment = self.payment_keypair.as_ref().ok_or_else(|| {
@@ -277,15 +277,15 @@ impl<'a> PasswordSource<'a> {
 
 fn build_keys_file(
     name: String,
-    hybrid_seed: [u8; 32],
+    ed25519_seed: [u8; 32],
+    ml_dsa_seed: [u8; 32],
     vrf_seed: [u8; 32],
     payment_x25519_seed: [u8; 32],
     payment_ml_kem_seed: [u8; 64],
 ) -> KeystoreResult<KeysFile> {
-    let classical = ClassicalKeypair::from_seed(&hybrid_seed);
+    let classical = ClassicalKeypair::from_seed(&ed25519_seed);
     let pq =
-        PqKeypair::from_seed(&hybrid_seed).map_err(|e| KeystoreError::Crypto(e.to_string()))?;
-    let pq_sk_bytes = pq.secret_key_bytes();
+        PqKeypair::from_seed(&ml_dsa_seed).map_err(|e| KeystoreError::Crypto(e.to_string()))?;
     let hybrid = HybridKeypair::new(classical, pq);
     let pk = hybrid.public_key();
     let vrf = VrfKeypair::from_seed(&vrf_seed);
@@ -304,9 +304,9 @@ fn build_keys_file(
             vrf_pk: vrf.public_key(),
             payment_pubkey: Some(payment_pubkey),
         },
-        hybrid_seed,
+        ed25519_seed,
         vrf_seed,
-        pq_sk: pq_sk_bytes,
+        ml_dsa_seed,
         payment_keypair: Some(payment_keypair),
         payment_key_history: Vec::new(),
     })
@@ -317,7 +317,8 @@ pub fn generate_from_master_seed(name: String, master_seed: [u8; 32]) -> Keystor
     let derived = derive_all_seeds(&master_seed);
     build_keys_file(
         name,
-        derived.hybrid_seed,
+        derived.ed25519_seed,
+        derived.ml_dsa_seed,
         derived.vrf_seed,
         derived.payment_x25519_seed,
         derived.payment_ml_kem_seed,
@@ -611,9 +612,9 @@ impl PublicJson {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrivateJson {
-    hybrid_seed: String,
+    ed25519_seed: String,
+    ml_dsa_seed: String,
     vrf_seed: String,
-    pq_sk: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payment_keypair: Option<String>,
     #[serde(default)]
@@ -629,9 +630,9 @@ impl PrivatePayload {
     fn from(keys: &KeysFile) -> Self {
         Self {
             private: PrivateJson {
-                hybrid_seed: hex::encode(keys.hybrid_seed),
+                ed25519_seed: hex::encode(keys.ed25519_seed),
+                ml_dsa_seed: hex::encode(keys.ml_dsa_seed),
                 vrf_seed: hex::encode(keys.vrf_seed),
-                pq_sk: hex::encode(&keys.pq_sk),
                 payment_keypair: keys
                     .payment_keypair
                     .as_ref()
@@ -649,9 +650,9 @@ impl PrivatePayload {
         Ok(KeysFile {
             name,
             public,
-            hybrid_seed: decode_hex_fixed::<32>(&self.private.hybrid_seed, "hybrid_seed")?,
+            ed25519_seed: decode_hex_fixed::<32>(&self.private.ed25519_seed, "ed25519_seed")?,
+            ml_dsa_seed: decode_hex_fixed::<32>(&self.private.ml_dsa_seed, "ml_dsa_seed")?,
             vrf_seed: decode_hex_fixed::<32>(&self.private.vrf_seed, "vrf_seed")?,
-            pq_sk: decode_hex(&self.private.pq_sk, "pq_sk")?,
             payment_keypair: self
                 .private
                 .payment_keypair
@@ -919,7 +920,8 @@ fn verify_public_metadata(keys: &KeysFile) -> KeystoreResult<()> {
     })?;
     let derived = build_keys_file(
         keys.name.clone(),
-        keys.hybrid_seed,
+        keys.ed25519_seed,
+        keys.ml_dsa_seed,
         keys.vrf_seed,
         payment_keypair.x25519_sk,
         payment_keypair.ml_kem_1024_seed,
@@ -933,7 +935,7 @@ fn verify_public_metadata(keys: &KeysFile) -> KeystoreResult<()> {
             "private key material does not match public metadata".to_string(),
         ));
     }
-    if derived.pq_sk != keys.pq_sk {
+    if derived.ml_dsa_seed != keys.ml_dsa_seed {
         return Err(KeystoreError::Crypto(
             "ML-DSA private key does not match public metadata".to_string(),
         ));
@@ -1228,6 +1230,20 @@ mod tests {
     }
 
     #[test]
+    fn boundary_master_seeds_produce_valid_independent_hot_keys() {
+        for master_seed in [[0u8; 32], [0xffu8; 32]] {
+            let keys = generate_from_master_seed("validator".to_string(), master_seed).unwrap();
+            assert_ne!(keys.ed25519_seed, [0u8; 32]);
+            assert_ne!(keys.ml_dsa_seed, [0u8; 32]);
+            assert_ne!(keys.ed25519_seed, keys.ml_dsa_seed);
+            let classical = ClassicalKeypair::from_seed(&keys.ed25519_seed);
+            let pq = PqKeypair::from_bytes(&keys.public.hybrid_pq_pk, &keys.ml_dsa_seed).unwrap();
+            assert_eq!(classical.public_key().0, keys.public.hybrid_classical_pk);
+            assert_eq!(pq.public_key().0.as_slice(), keys.public.hybrid_pq_pk);
+        }
+    }
+
+    #[test]
     fn cold_key_file_is_encrypted_independent_secure_and_does_not_touch_hot_keys() {
         let dir = test_dir("cold-key-generate");
         let hot_path = dir.join("keys.json");
@@ -1251,7 +1267,8 @@ mod tests {
         assert_ne!(generated.classical_seed, generated.pq_seed);
         let hot = derive_all_seeds(&[0x42; 32]);
         for cold_seed in [generated.classical_seed, generated.pq_seed] {
-            assert_ne!(cold_seed, hot.hybrid_seed);
+            assert_ne!(cold_seed, hot.ed25519_seed);
+            assert_ne!(cold_seed, hot.ml_dsa_seed);
             assert_ne!(cold_seed, hot.vrf_seed);
             assert_ne!(cold_seed, hot.payment_x25519_seed);
             assert_ne!(cold_seed, hot.payment_ml_kem_seed[..32]);

@@ -990,7 +990,7 @@ fn build_handshake_config(engine: &NodeEngine) -> indra_node::NodeResult<Option<
     };
     let pq_keypair = match (
         engine.config.pq_pk.as_deref(),
-        engine.config.pq_sk.as_deref(),
+        engine.config.pq_seed.as_deref(),
     ) {
         (Some(pk), Some(sk)) => match PqKeypair::from_bytes(pk, sk) {
             Ok(keypair) => keypair,
@@ -2278,13 +2278,9 @@ fn main() {
     // minimum cannot be weakened by executable configuration.
     let mut config = NodeConfig::full_node(std::path::PathBuf::from(&data_dir));
     config.genesis_path = Some(genesis_path);
-    config.validator_seed = Some(keys_data.hybrid_seed);
+    config.validator_seed = Some(keys_data.ed25519_seed);
     config.vrf_seed = Some(keys_data.vrf_seed);
-    config.pq_sk = if keys_data.pq_sk.is_empty() {
-        None
-    } else {
-        Some(keys_data.pq_sk)
-    };
+    config.pq_seed = Some(keys_data.ml_dsa_seed.to_vec());
     config.pq_pk = if keys_data.pq_pk.is_empty() {
         None
     } else {
@@ -4259,9 +4255,9 @@ fn load_keys_data(keys_path: &str, password_file: Option<&str>) -> KeysData {
         )
     });
     KeysData {
-        hybrid_seed: keys.hybrid_seed,
+        ed25519_seed: keys.ed25519_seed,
         vrf_seed: keys.vrf_seed,
-        pq_sk: keys.pq_sk,
+        ml_dsa_seed: keys.ml_dsa_seed,
         pq_pk: keys.public.hybrid_pq_pk,
     }
 }
@@ -5608,7 +5604,7 @@ mod tests {
         config.validator_seed = Some(seed);
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
-        config.pq_sk = Some(pq.secret_key_bytes());
+        config.pq_seed = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
         (ConsensusDriver::new(engine, vote_safety), dir)
@@ -6160,9 +6156,9 @@ mod tests {
             keys_path.to_str().unwrap(),
             Some(password_path.to_str().unwrap()),
         );
-        assert_eq!(loaded.hybrid_seed, keys.hybrid_seed);
+        assert_eq!(loaded.ed25519_seed, keys.ed25519_seed);
         assert_eq!(loaded.vrf_seed, keys.vrf_seed);
-        assert_eq!(loaded.pq_sk, keys.pq_sk);
+        assert_eq!(loaded.ml_dsa_seed, keys.ml_dsa_seed);
         assert_eq!(loaded.pq_pk, keys.public.hybrid_pq_pk);
         let _ = std::fs::remove_dir_all(&dir);
     }

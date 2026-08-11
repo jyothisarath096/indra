@@ -69,11 +69,11 @@ mod tests {
         let keys = fixture();
         let json = encrypt_keys(&keys, b"pw").unwrap();
         assert!(json.contains("\"validator_id\""));
-        assert!(!json.contains("\"hybrid_seed\""));
+        assert!(!json.contains("\"ed25519_seed\""));
         assert!(!json.contains("bls_seed"));
         assert!(!json.contains("bls_pk"));
         assert!(!json.contains("\"vrf_seed\""));
-        assert!(!json.contains("\"pq_sk\""));
+        assert!(!json.contains("\"ml_dsa_seed\""));
     }
 
     #[test]

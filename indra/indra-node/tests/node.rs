@@ -346,7 +346,7 @@ fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
     config.validator_seed = Some(seed);
     config.vrf_seed = Some(seed);
     config.pq_pk = Some(pq.public_key().0.to_vec());
-    config.pq_sk = Some(pq.secret_key_bytes());
+    config.pq_seed = Some(pq.secret_key_bytes());
     let engine = NodeEngine::init(config).unwrap();
     let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
     (ConsensusDriver::new(engine, vote_safety), dir)

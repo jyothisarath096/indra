@@ -91,8 +91,8 @@ fn cmd_send(args: &[String]) {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let hybrid_seed = keys.hybrid_seed;
-    let pq_sk_bytes = keys.pq_sk.clone();
+    let ed25519_seed = keys.ed25519_seed;
+    let ml_dsa_seed_bytes = keys.ml_dsa_seed.to_vec();
     let classical_pk = keys.public.hybrid_classical_pk;
     let pq_pk = keys.public.hybrid_pq_pk.clone();
     let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
@@ -120,8 +120,8 @@ fn cmd_send(args: &[String]) {
         amount_spark,
         fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
         wallet: &wallet,
-        hybrid_seed,
-        pq_sk_bytes,
+        ed25519_seed,
+        ml_dsa_seed_bytes,
         sender_pubkey,
         sender_payment_pubkey,
     })

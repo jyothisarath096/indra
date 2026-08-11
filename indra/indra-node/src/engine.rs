@@ -549,7 +549,7 @@ impl NodeEngine {
                 (Some(vs), Some(vrfs)) => {
                     let classical = ClassicalKeypair::from_seed(&vs);
                     let pq = if let (Some(pk), Some(sk)) =
-                        (config.pq_pk.as_deref(), config.pq_sk.as_deref())
+                        (config.pq_pk.as_deref(), config.pq_seed.as_deref())
                     {
                         PqKeypair::from_bytes(pk, sk).unwrap_or_else(|_| PqKeypair::generate())
                     } else {
@@ -3587,7 +3587,7 @@ mod tests {
         config.validator_seed = None;
         config.vrf_seed = None;
         config.pq_pk = None;
-        config.pq_sk = None;
+        config.pq_seed = None;
         let engine = NodeEngine::init(config).unwrap();
         assert!(engine.validator_id().is_none());
         let _ = std::fs::remove_dir_all(&dir);

@@ -55,9 +55,9 @@ pub struct TxParams<'a> {
     /// Sender's wallet (for coin selection).
     pub wallet: &'a Wallet,
     /// Sender's hybrid seed (for Ed25519 signing).
-    pub hybrid_seed: [u8; 32],
+    pub ed25519_seed: [u8; 32],
     /// Sender's ML-DSA-87 seed bytes (from keys.json).
-    pub pq_sk_bytes: Vec<u8>,
+    pub ml_dsa_seed_bytes: Vec<u8>,
     /// Sender's own pubkey (for change output).
     pub sender_pubkey: HybridPubKey,
     /// Sender's canonical payment key for self-directed change.
@@ -146,9 +146,9 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     let inputs: Vec<InputV1> = selected
         .iter()
         .map(|e| {
-            // nullifier = SHA-256(hybrid_seed || utxo_id)
+            // nullifier = SHA-256(ed25519_seed || utxo_id)
             let mut data = Vec::with_capacity(64);
-            data.extend_from_slice(&params.hybrid_seed);
+            data.extend_from_slice(&params.ed25519_seed);
             data.extend_from_slice(&e.utxo_id.0);
             let nullifier = Bytes32::from(sha256(&data));
             InputV1 {
@@ -265,11 +265,11 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     // 9. Sign: compute tx hash (all fields except signature), then sign
     let tx_bytes_unsigned = tx.signing_bytes(params.chain_id);
 
-    let classical = ClassicalKeypair::from_seed(&params.hybrid_seed);
+    let classical = ClassicalKeypair::from_seed(&params.ed25519_seed);
     let pq = PqKeypair::from_bytes(
         // pq_pk is embedded in sender_pubkey
         params.sender_pubkey.pq_pk.as_slice(),
-        &params.pq_sk_bytes,
+        &params.ml_dsa_seed_bytes,
     )
     .map_err(|e| CliError::Crypto(e.to_string()))?;
     let keypair = HybridKeypair::new(classical, pq);
@@ -651,14 +651,14 @@ mod tests {
         w.add_utxo(utxo_id, 10_000_000, blinding, 1, 0, 0);
 
         let pq = PqKeypair::generate();
-        let pq_sk = pq.secret_key_bytes();
+        let pq_seed = pq.secret_key_bytes();
         let pq_pk = pq.public_key().0;
         let classical = ClassicalKeypair::from_seed(&seed);
         let spk = HybridPubKey {
             classical_pk: Bytes32::from(classical.public_key().0),
             pq_pk: VariableBytes::from_slice(&pq_pk).unwrap(),
         };
-        (w, seed, pq_sk, spk)
+        (w, seed, pq_seed, spk)
     }
 
     fn test_keypair(seed: u8) -> HybridKeypair {
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn build_transaction_requires_valid_descriptor_and_mandatory_notes() {
-        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
+        let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
         let recipient_keypair = test_keypair(0x61);
         let recipient_payment = PaymentKeypairV1::generate();
         let recipient_address = payment_address(&recipient_keypair, &recipient_payment);
@@ -708,8 +708,8 @@ mod tests {
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
+            ed25519_seed: seed,
+            ml_dsa_seed_bytes: pq_seed,
             sender_pubkey,
             sender_payment_pubkey: sender_payment.public_key(),
         };
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn self_directed_change_uses_sender_payment_key() {
-        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
+        let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
         let recipient_keypair = test_keypair(0x62);
         let recipient_address = payment_address(&recipient_keypair, &PaymentKeypairV1::generate());
         let sender_payment = PaymentKeypairV1::generate();
@@ -746,8 +746,8 @@ mod tests {
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
-            hybrid_seed: seed,
-            pq_sk_bytes: pq_sk,
+            ed25519_seed: seed,
+            ml_dsa_seed_bytes: pq_seed,
             sender_pubkey,
             sender_payment_pubkey: sender_payment.public_key(),
         })
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn malformed_or_wrong_chain_descriptor_is_rejected() {
-        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
+        let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
         let sender_payment = PaymentKeypairV1::generate();
         for recipient_address in [
             "not-an-address".to_string(),
@@ -784,8 +784,8 @@ mod tests {
                 amount_spark: 1_000_000,
                 fee_spark: MIN_FEE_SPARK,
                 wallet: &wallet,
-                hybrid_seed: seed,
-                pq_sk_bytes: pq_sk.clone(),
+                ed25519_seed: seed,
+                ml_dsa_seed_bytes: pq_seed.clone(),
                 sender_pubkey: sender_pubkey.clone(),
                 sender_payment_pubkey: sender_payment.public_key(),
             })
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn insufficient_balance_and_dust_are_rejected() {
-        let (wallet, seed, pq_sk, sender_pubkey) = make_wallet_with_funds();
+        let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
         let recipient_address = payment_address(&test_keypair(0x64), &PaymentKeypairV1::generate());
         let sender_payment = PaymentKeypairV1::generate().public_key();
         for amount_spark in [1, 100_000_000] {
@@ -805,8 +805,8 @@ mod tests {
                 amount_spark,
                 fee_spark: MIN_FEE_SPARK,
                 wallet: &wallet,
-                hybrid_seed: seed,
-                pq_sk_bytes: pq_sk.clone(),
+                ed25519_seed: seed,
+                ml_dsa_seed_bytes: pq_seed.clone(),
                 sender_pubkey: sender_pubkey.clone(),
                 sender_payment_pubkey: sender_payment.clone(),
             })
