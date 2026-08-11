@@ -27,8 +27,8 @@ use zeroize::{Zeroize, Zeroizing};
 mod cold_shamir;
 pub use cold_shamir::{
     generate_cold_share_ceremony, read_cold_share, reconstruct_cold_shares,
-    validate_cold_share_manifest, write_cold_share_secure, ColdShareCeremony, ColdShareFile,
-    ColdShareManifest,
+    validate_cold_share_manifest, verify_cold_share, write_cold_share_secure, ColdShareCeremony,
+    ColdShareFile, ColdShareManifest, ExpectedColdPublicKey,
 };
 
 /// Required filesystem mode for key/password files on Unix: owner read/write only.
@@ -120,7 +120,7 @@ pub struct KeysFile {
 }
 
 /// Dedicated validator cold-key material. It contains no hot identity fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ColdKeysFile {
     /// Ed25519 seed.
     pub classical_seed: [u8; 32],
@@ -178,12 +178,6 @@ impl ColdKeysFile {
             ));
         }
         Ok(keypair)
-    }
-
-    /// Zeroize the persisted secret seeds held by this in-memory value.
-    pub fn zeroize_secret_material(&mut self) {
-        self.classical_seed.zeroize();
-        self.pq_seed.zeroize();
     }
 }
 

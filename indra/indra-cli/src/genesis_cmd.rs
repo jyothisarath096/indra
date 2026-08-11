@@ -205,7 +205,27 @@ pub fn with_cold_manifest(
     mut entry: GenesisEntry,
     manifest: &crate::keygen::ColdShareManifest,
 ) -> CliResult<GenesisEntry> {
-    crate::keygen::validate_cold_share_manifest(manifest)?;
+    let classical: [u8; 32] = hex::decode(&entry.hybrid_classical_pk)
+        .map_err(|_| CliError::Genesis("hot classical key is invalid hex".into()))?
+        .try_into()
+        .map_err(|_| CliError::Genesis("hot classical key has wrong length".into()))?;
+    let validator_id: [u8; 32] = hex::decode(&entry.validator_id)
+        .map_err(|_| CliError::Genesis("validator ID is invalid hex".into()))?
+        .try_into()
+        .map_err(|_| CliError::Genesis("validator ID has wrong length".into()))?;
+    let vrf_pk: [u8; 32] = hex::decode(&entry.vrf_pk)
+        .map_err(|_| CliError::Genesis("VRF key is invalid hex".into()))?
+        .try_into()
+        .map_err(|_| CliError::Genesis("VRF key has wrong length".into()))?;
+    let expected_hot = crate::keygen::ValidatorKeys {
+        validator_id,
+        hybrid_classical_pk: classical,
+        hybrid_pq_pk: hex::decode(&entry.hybrid_pq_pk)
+            .map_err(|_| CliError::Genesis("hot PQ key is invalid hex".into()))?,
+        vrf_pk,
+        payment_pubkey: None,
+    };
+    crate::keygen::validate_cold_share_manifest(manifest, &expected_hot)?;
     if manifest.validator_id != entry.validator_id {
         return Err(CliError::Genesis(
             "cold ceremony validator_id does not match hot identity".into(),
@@ -216,14 +236,14 @@ pub fn with_cold_manifest(
     Ok(entry)
 }
 
-/// Attach cold public metadata from either a ceremony manifest or a canonical
-/// plain/encrypted cold keystore. The explicit format discriminator selects
+/// Attach cold public metadata from either a signed ceremony manifest or a
+/// canonical encrypted cold keystore. The explicit format discriminator selects
 /// the schema; field-presence guessing is prohibited.
 pub fn with_cold_file(mut entry: GenesisEntry, json: &str) -> CliResult<GenesisEntry> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| CliError::Genesis(format!("invalid cold JSON: {error}")))?;
     match value.get("format").and_then(|format| format.as_str()) {
-        Some("indra-cold-key-share") => {
+        Some("indra-cold-key-pedersen-share") => {
             let manifest: crate::keygen::ColdShareManifest = serde_json::from_value(value)
                 .map_err(|error| CliError::Genesis(format!("invalid cold ceremony: {error}")))?;
             with_cold_manifest(entry, &manifest)
@@ -244,7 +264,7 @@ pub fn with_cold_file(mut entry: GenesisEntry, json: &str) -> CliResult<GenesisE
             Ok(entry)
         }
         Some(format) => Err(CliError::Genesis(format!(
-            "unsupported cold-file format '{format}'; expected indra-cold-key-share or indra-cold-keystore"
+            "unsupported cold-file format '{format}'; expected indra-cold-key-pedersen-share or indra-cold-keystore"
         ))),
         None => Err(CliError::Genesis(
             "cold file is missing its required format discriminator".into(),

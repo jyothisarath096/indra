@@ -116,7 +116,7 @@ pub fn validate_pq_public_key(pk: &PqPublicKey) -> CryptoResult<()> {
 }
 
 /// An ML-DSA-87 signing keypair represented canonically by its 32-byte seed.
-#[derive(Clone)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct PqKeypair {
     seed: [u8; PQ_SK_BYTES],
 }

@@ -10,10 +10,11 @@ pub use indra_keystore::{
     generate_cold_share_ceremony, generate_from_master_seed, generate_from_new_mnemonic,
     generate_from_passphrase, has_secret_value_in_argv, inspect_key_file_public_metadata,
     inspect_public_metadata, load_cold_keys, load_keys, read_cold_share, reconstruct_cold_shares,
-    recover_from_mnemonic, validate_cold_share_manifest, warn_if_key_file_permissive,
-    write_cold_share_secure, write_keys_secure as write_keys_file_secure, ColdKeysFile,
-    ColdShareCeremony, ColdShareFile, ColdShareManifest, KeyFilePublicMetadata, KeysFile,
-    KeystoreError, PasswordSource, ValidatorKeys,
+    recover_from_mnemonic, validate_cold_share_manifest, verify_cold_share,
+    warn_if_key_file_permissive, write_cold_share_secure,
+    write_keys_secure as write_keys_file_secure, ColdKeysFile, ColdShareCeremony, ColdShareFile,
+    ColdShareManifest, ExpectedColdPublicKey, KeyFilePublicMetadata, KeysFile, KeystoreError,
+    PasswordSource, ValidatorKeys,
 };
 
 /// Resolve the standard CLI key-password source.

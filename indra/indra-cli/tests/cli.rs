@@ -184,18 +184,28 @@ fn keygen_cold_cli_encrypts_preserves_hot_file_and_requires_force_to_overwrite()
 fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
     let dir = temp_dir("cold-share-ceremony");
     let shares_dir = dir.join("shares");
+    let rekey_dir = dir.join("rekeyed-shares");
+    let verification_receipt = dir.join("rekey-verification.json");
     let recovered = dir.join("recovered-cold.json");
     let password_path = dir.join("cold-password.txt");
+    let hot_path = dir.join("hot.json");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(&password_path, b"ceremony-password\n").unwrap();
-    let validator_id = hex::encode([0x42; 32]);
+    let hot = generate_from_master_seed("ceremony-hot".into(), [0x42; 32]).unwrap();
+    std::fs::write(
+        &hot_path,
+        indra_cli::encrypt_keys(&hot, b"ceremony-password").unwrap(),
+    )
+    .unwrap();
 
     let generated = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
         .args([
             "cold",
             "ceremony",
-            "--validator-id",
-            &validator_id,
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--hot-keys-password-file",
+            password_path.to_str().unwrap(),
             "--threshold",
             "2",
             "--shares",
@@ -214,8 +224,24 @@ fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
 
     let share_1 = shares_dir.join("share-001.json");
     let share_2 = shares_dir.join("share-002.json");
+    let manifest: indra_cli::ColdShareManifest =
+        serde_json::from_str(&std::fs::read_to_string(shares_dir.join("ceremony.json")).unwrap())
+            .unwrap();
+    let expected_classical = manifest.cold_classical_pk.clone();
+    let expected_pq = manifest.cold_pq_pk.clone();
     let insufficient = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
-        .args(["cold", "verify", "--share", share_1.to_str().unwrap()])
+        .args([
+            "cold",
+            "verify",
+            "--share",
+            share_1.to_str().unwrap(),
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--expected-cold-classical-pk",
+            &expected_classical,
+            "--expected-cold-pq-pk",
+            &expected_pq,
+        ])
         .output()
         .unwrap();
     assert!(!insufficient.status.success());
@@ -228,10 +254,76 @@ fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
             share_1.to_str().unwrap(),
             "--share",
             share_2.to_str().unwrap(),
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--expected-cold-classical-pk",
+            &expected_classical,
+            "--expected-cold-pq-pk",
+            &expected_pq,
         ])
         .output()
         .unwrap();
     assert!(verified.status.success());
+
+    let rekeyed = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "dealer-rekey",
+            "--share",
+            share_1.to_str().unwrap(),
+            "--share",
+            share_2.to_str().unwrap(),
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--hot-keys-password-file",
+            password_path.to_str().unwrap(),
+            "--expected-cold-classical-pk",
+            &expected_classical,
+            "--expected-cold-pq-pk",
+            &expected_pq,
+            "--threshold",
+            "2",
+            "--shares",
+            "3",
+            "--out-dir",
+            rekey_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rekeyed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rekeyed.stderr)
+    );
+    assert!(rekey_dir.join("REKEY_PENDING.json").exists());
+    assert!(!verification_receipt.exists());
+
+    let rekey_verified = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "cold",
+            "verify",
+            "--share",
+            rekey_dir.join("share-001.json").to_str().unwrap(),
+            "--share",
+            rekey_dir.join("share-002.json").to_str().unwrap(),
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--expected-cold-classical-pk",
+            &expected_classical,
+            "--expected-cold-pq-pk",
+            &expected_pq,
+            "--verification-output",
+            verification_receipt.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rekey_verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rekey_verified.stderr)
+    );
+    let receipt = std::fs::read_to_string(&verification_receipt).unwrap();
+    assert!(receipt.contains("indra-cold-dealer-rekey-verification"));
 
     let no_ack = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
         .args([
@@ -241,6 +333,12 @@ fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
             share_1.to_str().unwrap(),
             "--share",
             share_2.to_str().unwrap(),
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--expected-cold-classical-pk",
+            &expected_classical,
+            "--expected-cold-pq-pk",
+            &expected_pq,
             "--output",
             recovered.to_str().unwrap(),
             "--keys-password-file",
@@ -259,6 +357,12 @@ fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
             share_1.to_str().unwrap(),
             "--share",
             share_2.to_str().unwrap(),
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--expected-cold-classical-pk",
+            &expected_classical,
+            "--expected-cold-pq-pk",
+            &expected_pq,
             "--output",
             recovered.to_str().unwrap(),
             "--keys-password-file",
@@ -361,13 +465,13 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         let pq_hex = hex::encode(cold_public.pq.0);
         expected_cold_public.push((classical_hex.clone(), pq_hex.clone()));
         let cold_path = dir.join(format!("cold-{i}.json"));
+        let cold_keys = indra_cli::ColdKeysFile {
+            classical_seed: [i + 20; 32],
+            pq_seed: [i + 84; 32],
+            classical_pk: cold_public.classical.0,
+            pq_pk: cold_public.pq.0.to_vec(),
+        };
         if i < 3 {
-            let cold_keys = indra_cli::ColdKeysFile {
-                classical_seed: [i + 20; 32],
-                pq_seed: [i + 84; 32],
-                classical_pk: cold_public.classical.0,
-                pq_pk: cold_public.pq.0.to_vec(),
-            };
             let encrypted = indra_cli::encrypt_cold_keys(&cold_keys, b"test-password").unwrap();
             std::fs::write(&cold_path, encrypted).unwrap();
 
@@ -380,18 +484,20 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
             assert!(inspected.contains(&format!("Classical PK:   {classical_hex}")));
             assert!(inspected.contains(&format!("PQ PK:          {pq_hex}")));
         } else {
-            let ceremony = indra_cli::ColdShareManifest {
-                format: "indra-cold-key-share".into(),
-                version: 1,
-                ceremony_id: hex::encode([i + 50; 32]),
-                created_unix_seconds: 1,
-                validator_id: hex::encode(keys.public.validator_id),
-                cold_classical_pk: classical_hex,
-                cold_pq_pk: pq_hex,
-                threshold: 2,
-                share_count: 3,
-            };
-            std::fs::write(&cold_path, serde_json::to_string(&ceremony).unwrap()).unwrap();
+            let ceremony = indra_cli::generate_cold_share_ceremony(
+                &cold_keys,
+                &keys,
+                2,
+                3,
+                1,
+                &mut rand::rngs::OsRng,
+            )
+            .unwrap();
+            std::fs::write(
+                &cold_path,
+                serde_json::to_string(&ceremony.manifest).unwrap(),
+            )
+            .unwrap();
         }
         command.arg("--validator").arg(format!(
             "v{i},{stake},{},{}",

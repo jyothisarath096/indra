@@ -1,25 +1,57 @@
-//! Offline Shamir backup ceremonies for validator cold-key seeds.
+//! Authenticated Pedersen-verifiable cold-key sharing ceremonies.
 //!
-//! This module deliberately implements only secret sharing and reconstruction.
-//! It performs no network or chain-state access. The byte-wise GF(256)
-//! construction is intentionally small and isolated for external review.
+//! The 64 secret bytes are losslessly represented as four 128-bit limbs. Each
+//! limb is shared by an independent Shamir polynomial over the Ristretto scalar
+//! field. Hiding Pedersen coefficient commitments let one custodian verify one
+//! share without reconstructing the secret or exposing a bare commitment to a
+//! secret limb. The complete public manifest is signed by the validator's
+//! registered hot hybrid identity.
 
 use std::path::Path;
 
-use indra_crypto::{hybrid::ColdHybridKeypair, sha256};
+use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT,
+    ristretto::{CompressedRistretto, RistrettoPoint},
+    scalar::Scalar,
+};
+use indra_crypto::{
+    hybrid::{
+        ClassicalKeypair, ClassicalPublicKey, ClassicalSignature, ColdHybridKeypair, HybridKeypair,
+        HybridPublicKey, HybridSignature, PqKeypair, PqPublicKey, PqSignature,
+    },
+    sha256, verify_hybrid, CLASSICAL_SIG_BYTES, PQ_PK_BYTES, PQ_SIG_BYTES,
+};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use sha2::Sha512;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::{write_keys_secure, ColdKeysFile, KeystoreError, KeystoreResult};
+use crate::{
+    write_keys_secure, ColdKeysFile, KeysFile, KeystoreError, KeystoreResult, ValidatorKeys,
+};
 
-const SHARE_FORMAT: &str = "indra-cold-key-share";
+const SHARE_FORMAT: &str = "indra-cold-key-pedersen-share";
 const SHARE_VERSION: u8 = 1;
-const CHECKSUM_DOMAIN: &[u8] = b"INDRA-COLD-KEY-SHARE-CHECKSUM-v1";
+const MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"INDRA-COLD-SHARE-MANIFEST-v1";
+const CHECKSUM_DOMAIN: &[u8] = b"INDRA-COLD-SHARE-CHECKSUM-v1";
+const PEDERSEN_H_DOMAIN: &[u8] = b"INDRA-COLD-SHARE-PEDERSEN-H-v1";
 const SECRET_BYTES: usize = 64;
+const SECRET_LIMBS: usize = 4;
+const LIMB_BYTES: usize = 16;
+const SCALAR_BYTES: usize = 32;
+const SHARE_BYTES: usize = SECRET_LIMBS * SCALAR_BYTES;
 
-/// Public description of one cold-key sharing ceremony.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Public cold key expected independently by recovery policy or chain state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedColdPublicKey {
+    /// Expected Ed25519 cold public key.
+    pub classical: [u8; 32],
+    /// Expected ML-DSA-87 cold public key.
+    pub pq: Vec<u8>,
+}
+
+/// Public, hot-authenticated description of one cold-key sharing ceremony.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 #[serde(deny_unknown_fields)]
 pub struct ColdShareManifest {
     pub format: String,
@@ -27,25 +59,32 @@ pub struct ColdShareManifest {
     pub ceremony_id: String,
     pub created_unix_seconds: u64,
     pub validator_id: String,
+    pub hot_classical_pk: String,
+    pub hot_pq_pk: String,
     pub cold_classical_pk: String,
     pub cold_pq_pk: String,
     pub threshold: u8,
     pub share_count: u8,
+    /// Four rows of hiding Pedersen coefficient commitments.
+    pub pedersen_commitments: Vec<Vec<String>>,
+    pub hot_classical_signature: String,
+    pub hot_pq_signature: String,
 }
 
-/// One self-identifying, checksummed Shamir share.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One authenticated, independently Pedersen-verifiable Shamir share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct ColdShareFile {
     #[serde(flatten)]
     pub manifest: ColdShareManifest,
     pub share_index: u8,
     pub share_value: String,
+    pub blinding_value: String,
     pub share_checksum: String,
 }
 
-/// A generated public manifest and its complete share set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A generated public manifest and its complete secret share set.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct ColdShareCeremony {
     pub manifest: ColdShareManifest,
     pub shares: Vec<ColdShareFile>,
@@ -65,132 +104,266 @@ fn validate_threshold(threshold: u8, share_count: u8) -> KeystoreResult<()> {
     Ok(())
 }
 
-// Multiplication in GF(2^8), reduced by x^8+x^4+x^3+x+1 (0x11B).
-fn gf_mul(mut a: u8, mut b: u8) -> u8 {
-    let mut product = 0u8;
-    for _ in 0..8 {
-        if b & 1 != 0 {
-            product ^= a;
-        }
-        let high = a & 0x80;
-        a <<= 1;
-        if high != 0 {
-            a ^= 0x1b;
-        }
-        b >>= 1;
-    }
-    product
-}
-
-fn gf_pow(mut value: u8, mut exponent: u8) -> u8 {
-    let mut result = 1u8;
-    while exponent != 0 {
-        if exponent & 1 != 0 {
-            result = gf_mul(result, value);
-        }
-        value = gf_mul(value, value);
-        exponent >>= 1;
-    }
-    result
-}
-
-fn gf_inv(value: u8) -> KeystoreResult<u8> {
-    if value == 0 {
-        return Err(share_error("attempted inversion of zero field element"));
-    }
-    Ok(gf_pow(value, 254))
-}
-
-fn evaluate(coefficients: &[u8], x: u8) -> u8 {
-    coefficients
-        .iter()
-        .rev()
-        .fold(0u8, |acc, coefficient| gf_mul(acc, x) ^ coefficient)
-}
-
-fn interpolate_at(points: &[(u8, u8)], x: u8) -> KeystoreResult<u8> {
-    let mut result = 0u8;
-    for (i, &(x_i, y_i)) in points.iter().enumerate() {
-        let mut numerator = 1u8;
-        let mut denominator = 1u8;
-        for (j, &(x_j, _)) in points.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            numerator = gf_mul(numerator, x ^ x_j);
-            denominator = gf_mul(denominator, x_i ^ x_j);
-        }
-        result ^= gf_mul(y_i, gf_mul(numerator, gf_inv(denominator)?));
-    }
-    Ok(result)
-}
-
-fn context_bytes(manifest: &ColdShareManifest) -> KeystoreResult<Vec<u8>> {
-    let ceremony_id = decode_fixed::<32>(&manifest.ceremony_id, "ceremony_id")?;
-    let validator_id = decode_fixed::<32>(&manifest.validator_id, "validator_id")?;
-    let classical_pk = decode_fixed::<32>(&manifest.cold_classical_pk, "cold_classical_pk")?;
-    let pq_pk = hex::decode(&manifest.cold_pq_pk)
-        .map_err(|_| share_error("cold_pq_pk is not canonical hex"))?;
-    let mut out = Vec::with_capacity(128 + pq_pk.len());
-    out.extend_from_slice(&(manifest.format.len() as u16).to_le_bytes());
-    out.extend_from_slice(manifest.format.as_bytes());
-    out.push(manifest.version);
-    out.extend_from_slice(&ceremony_id);
-    out.extend_from_slice(&manifest.created_unix_seconds.to_le_bytes());
-    out.extend_from_slice(&validator_id);
-    out.extend_from_slice(&classical_pk);
-    out.extend_from_slice(&(pq_pk.len() as u32).to_le_bytes());
-    out.extend_from_slice(&pq_pk);
-    out.push(manifest.threshold);
-    out.push(manifest.share_count);
-    Ok(out)
-}
-
-fn checksum(
-    manifest: &ColdShareManifest,
-    index: u8,
-    value: &[u8; SECRET_BYTES],
-) -> KeystoreResult<[u8; 32]> {
-    let mut payload = context_bytes(manifest)?;
-    payload.push(index);
-    payload.extend_from_slice(value);
-    let mut bytes = Vec::with_capacity(CHECKSUM_DOMAIN.len() + 4 + payload.len());
-    bytes.extend_from_slice(CHECKSUM_DOMAIN);
-    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&payload);
-    Ok(sha256(&bytes))
-}
-
 fn decode_fixed<const N: usize>(value: &str, field: &str) -> KeystoreResult<[u8; N]> {
-    if value.len() != N * 2 || value.bytes().any(|b| b.is_ascii_uppercase()) {
+    if value.len() != N * 2 || value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(share_error(format!(
+            "{field} is not canonical lowercase hex"
+        )));
+    }
+    let bytes = Zeroizing::new(
+        hex::decode(value).map_err(|_| share_error(format!("{field} is invalid hex")))?,
+    );
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| share_error(format!("{field} has the wrong length")))
+}
+
+fn decode_public_hex(value: &str, expected: usize, field: &str) -> KeystoreResult<Vec<u8>> {
+    if value.len() != expected * 2 || value.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(share_error(format!(
             "{field} is not canonical lowercase hex"
         )));
     }
     let bytes = hex::decode(value).map_err(|_| share_error(format!("{field} is invalid hex")))?;
-    bytes
-        .try_into()
-        .map_err(|_| share_error(format!("{field} has the wrong length")))
+    if bytes.len() != expected {
+        return Err(share_error(format!("{field} has the wrong length")));
+    }
+    Ok(bytes)
 }
 
-fn validate_manifest(manifest: &ColdShareManifest) -> KeystoreResult<()> {
+fn hot_public(keys: &ValidatorKeys) -> KeystoreResult<HybridPublicKey> {
+    let pq: [u8; PQ_PK_BYTES] = keys
+        .hybrid_pq_pk
+        .as_slice()
+        .try_into()
+        .map_err(|_| share_error("hot ML-DSA-87 public key has the wrong length"))?;
+    Ok(HybridPublicKey {
+        classical: ClassicalPublicKey(keys.hybrid_classical_pk),
+        pq: PqPublicKey(pq),
+    })
+}
+
+fn hot_keypair(keys: &KeysFile) -> KeystoreResult<HybridKeypair> {
+    let classical = ClassicalKeypair::from_seed(&keys.ed25519_seed);
+    let pq = PqKeypair::from_bytes(&keys.public.hybrid_pq_pk, &keys.ml_dsa_seed)
+        .map_err(|error| share_error(error.to_string()))?;
+    Ok(HybridKeypair::new(classical, pq))
+}
+
+fn manifest_signing_bytes(manifest: &ColdShareManifest) -> KeystoreResult<Zeroizing<Vec<u8>>> {
+    let mut unsigned = manifest.clone();
+    unsigned.hot_classical_signature.clear();
+    unsigned.hot_pq_signature.clear();
+    let encoded = serde_json::to_vec(&unsigned).map_err(|error| share_error(error.to_string()))?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        MANIFEST_SIGNATURE_DOMAIN.len() + 4 + encoded.len(),
+    ));
+    bytes.extend_from_slice(MANIFEST_SIGNATURE_DOMAIN);
+    bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&encoded);
+    Ok(bytes)
+}
+
+fn manifest_signature(manifest: &ColdShareManifest) -> KeystoreResult<HybridSignature> {
+    Ok(HybridSignature {
+        classical: ClassicalSignature(decode_fixed::<CLASSICAL_SIG_BYTES>(
+            &manifest.hot_classical_signature,
+            "hot_classical_signature",
+        )?),
+        pq: PqSignature(decode_fixed::<PQ_SIG_BYTES>(
+            &manifest.hot_pq_signature,
+            "hot_pq_signature",
+        )?),
+    })
+}
+
+fn pedersen_h() -> RistrettoPoint {
+    RistrettoPoint::hash_from_bytes::<Sha512>(PEDERSEN_H_DOMAIN)
+}
+
+fn parse_commitments(manifest: &ColdShareManifest) -> KeystoreResult<Vec<Vec<RistrettoPoint>>> {
+    if manifest.pedersen_commitments.len() != SECRET_LIMBS {
+        return Err(share_error(
+            "Pedersen manifest must contain four polynomial rows",
+        ));
+    }
+    manifest
+        .pedersen_commitments
+        .iter()
+        .map(|row| {
+            if row.len() != manifest.threshold as usize {
+                return Err(share_error("Pedersen row length does not equal threshold"));
+            }
+            row.iter()
+                .map(|encoded| {
+                    let bytes = decode_fixed::<32>(encoded, "pedersen_commitment")?;
+                    CompressedRistretto(bytes)
+                        .decompress()
+                        .ok_or_else(|| share_error("invalid compressed Ristretto commitment"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn validate_manifest_structure(manifest: &ColdShareManifest) -> KeystoreResult<()> {
     if manifest.format != SHARE_FORMAT || manifest.version != SHARE_VERSION {
         return Err(share_error("unsupported share format or version"));
     }
     validate_threshold(manifest.threshold, manifest.share_count)?;
-    context_bytes(manifest)?;
+    let validator_id = decode_fixed::<32>(&manifest.validator_id, "validator_id")?;
+    let hot_classical = decode_fixed::<32>(&manifest.hot_classical_pk, "hot_classical_pk")?;
+    decode_public_hex(&manifest.hot_pq_pk, PQ_PK_BYTES, "hot_pq_pk")?;
+    decode_fixed::<32>(&manifest.cold_classical_pk, "cold_classical_pk")?;
+    decode_public_hex(&manifest.cold_pq_pk, PQ_PK_BYTES, "cold_pq_pk")?;
+    decode_fixed::<32>(&manifest.ceremony_id, "ceremony_id")?;
+    manifest_signature(manifest)?;
+    parse_commitments(manifest)?;
+    if validator_id != sha256(&hot_classical) {
+        return Err(share_error(
+            "validator_id does not match hot Ed25519 identity",
+        ));
+    }
     Ok(())
 }
 
-/// Validate the public, self-identifying portion of a cold-key ceremony.
-pub fn validate_cold_share_manifest(manifest: &ColdShareManifest) -> KeystoreResult<()> {
-    validate_manifest(manifest)
+/// Validate a manifest against independently known hot validator metadata.
+pub fn validate_cold_share_manifest(
+    manifest: &ColdShareManifest,
+    expected_hot: &ValidatorKeys,
+) -> KeystoreResult<()> {
+    validate_manifest_structure(manifest)?;
+    if manifest.validator_id != hex::encode(expected_hot.validator_id)
+        || manifest.hot_classical_pk != hex::encode(expected_hot.hybrid_classical_pk)
+        || manifest.hot_pq_pk != hex::encode(&expected_hot.hybrid_pq_pk)
+    {
+        return Err(share_error(
+            "manifest hot identity does not match expected validator",
+        ));
+    }
+    verify_hybrid(
+        &manifest_signing_bytes(manifest)?,
+        &manifest_signature(manifest)?,
+        &hot_public(expected_hot)?,
+    )
+    .map_err(|_| share_error("manifest hot hybrid signature verification failed"))
 }
 
-/// Split the two independent cold-key seeds into a new offline ceremony.
+fn random_scalar<R: CryptoRng + RngCore>(rng: &mut R) -> Scalar {
+    let mut wide = Zeroizing::new([0u8; 64]);
+    rng.fill_bytes(wide.as_mut());
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+fn secret_limbs(keys: &ColdKeysFile) -> [Scalar; SECRET_LIMBS] {
+    let mut secret = Zeroizing::new([0u8; SECRET_BYTES]);
+    secret[..32].copy_from_slice(&keys.classical_seed);
+    secret[32..].copy_from_slice(&keys.pq_seed);
+    std::array::from_fn(|limb| {
+        let start = limb * LIMB_BYTES;
+        let mut bytes = Zeroizing::new([0u8; LIMB_BYTES]);
+        bytes.copy_from_slice(&secret[start..start + LIMB_BYTES]);
+        Scalar::from(u128::from_le_bytes(*bytes))
+    })
+}
+
+fn evaluate(coefficients: &[Scalar], x: Scalar) -> Scalar {
+    coefficients
+        .iter()
+        .rev()
+        .fold(Scalar::ZERO, |acc, coefficient| acc * x + coefficient)
+}
+
+fn encode_share(values: &[Scalar; SECRET_LIMBS]) -> String {
+    let mut bytes = Zeroizing::new([0u8; SHARE_BYTES]);
+    for (limb, value) in values.iter().enumerate() {
+        let start = limb * SCALAR_BYTES;
+        bytes[start..start + SCALAR_BYTES].copy_from_slice(value.as_bytes());
+    }
+    hex::encode(bytes.as_slice())
+}
+
+fn decode_share(value: &str) -> KeystoreResult<[Scalar; SECRET_LIMBS]> {
+    let bytes = Zeroizing::new(decode_fixed::<SHARE_BYTES>(value, "share_value")?);
+    let mut values = [Scalar::ZERO; SECRET_LIMBS];
+    for (limb, output) in values.iter_mut().enumerate() {
+        let start = limb * SCALAR_BYTES;
+        let scalar_bytes = Zeroizing::new(
+            bytes[start..start + SCALAR_BYTES]
+                .try_into()
+                .map_err(|_| share_error("share scalar has the wrong length"))?,
+        );
+        *output = Option::<Scalar>::from(Scalar::from_canonical_bytes(*scalar_bytes))
+            .ok_or_else(|| share_error("share contains a non-canonical scalar"))?;
+    }
+    Ok(values)
+}
+
+fn checksum(
+    manifest: &ColdShareManifest,
+    index: u8,
+    value: &str,
+    blinding: &str,
+) -> KeystoreResult<[u8; 32]> {
+    let context = manifest_signing_bytes(manifest)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        CHECKSUM_DOMAIN.len() + context.len() + value.len() + blinding.len() + 1,
+    ));
+    bytes.extend_from_slice(CHECKSUM_DOMAIN);
+    bytes.extend_from_slice(&context);
+    bytes.push(index);
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.extend_from_slice(blinding.as_bytes());
+    Ok(sha256(&bytes))
+}
+
+/// Independently verify one custodian share without pooling or reconstruction.
+pub fn verify_cold_share(
+    share: &ColdShareFile,
+    expected_hot: &ValidatorKeys,
+) -> KeystoreResult<()> {
+    validate_cold_share_manifest(&share.manifest, expected_hot)?;
+    if share.share_index == 0 || share.share_index > share.manifest.share_count {
+        return Err(share_error("share index is outside 1..=share_count"));
+    }
+    let supplied_checksum = decode_fixed::<32>(&share.share_checksum, "share_checksum")?;
+    if checksum(
+        &share.manifest,
+        share.share_index,
+        &share.share_value,
+        &share.blinding_value,
+    )? != supplied_checksum
+    {
+        return Err(share_error("share checksum mismatch"));
+    }
+    let values = Zeroizing::new(decode_share(&share.share_value)?);
+    let blindings = Zeroizing::new(decode_share(&share.blinding_value)?);
+    let commitments = parse_commitments(&share.manifest)?;
+    let x = Scalar::from(u64::from(share.share_index));
+    let h = pedersen_h();
+    for limb in 0..SECRET_LIMBS {
+        let expected = commitments[limb]
+            .iter()
+            .rev()
+            .fold(RistrettoPoint::default(), |acc, commitment| {
+                acc * x + commitment
+            });
+        let supplied = values[limb] * RISTRETTO_BASEPOINT_POINT + blindings[limb] * h;
+        if supplied != expected {
+            return Err(share_error(format!(
+                "share {} fails Pedersen verification for limb {limb}",
+                share.share_index
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Split the cold seeds using hot-authenticated Pedersen VSS.
 pub fn generate_cold_share_ceremony<R: CryptoRng + RngCore>(
     keys: &ColdKeysFile,
-    validator_id: [u8; 32],
+    hot_keys: &KeysFile,
     threshold: u8,
     share_count: u8,
     created_unix_seconds: u64,
@@ -198,65 +371,132 @@ pub fn generate_cold_share_ceremony<R: CryptoRng + RngCore>(
 ) -> KeystoreResult<ColdShareCeremony> {
     validate_threshold(threshold, share_count)?;
     keys.reconstruct()?;
-
-    let mut ceremony_id = [0u8; 32];
-    rng.fill_bytes(&mut ceremony_id);
-    let mut secret = Zeroizing::new([0u8; SECRET_BYTES]);
-    secret[..32].copy_from_slice(&keys.classical_seed);
-    secret[32..].copy_from_slice(&keys.pq_seed);
-
-    let coefficient_len = (threshold as usize - 1) * SECRET_BYTES;
-    let mut random_coefficients = Zeroizing::new(vec![0u8; coefficient_len]);
-    rng.fill_bytes(&mut random_coefficients);
-    let mut values = vec![[0u8; SECRET_BYTES]; share_count as usize];
-    for byte in 0..SECRET_BYTES {
-        let mut coefficients = Zeroizing::new(vec![0u8; threshold as usize]);
-        coefficients[0] = secret[byte];
-        for degree in 1..threshold as usize {
-            coefficients[degree] = random_coefficients[(degree - 1) * SECRET_BYTES + byte];
+    let mut ceremony_id = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(ceremony_id.as_mut());
+    let secrets = Zeroizing::new(secret_limbs(keys));
+    let mut polynomials =
+        Zeroizing::new(vec![vec![Scalar::ZERO; threshold as usize]; SECRET_LIMBS]);
+    let mut blinding_polynomials =
+        Zeroizing::new(vec![vec![Scalar::ZERO; threshold as usize]; SECRET_LIMBS]);
+    for limb in 0..SECRET_LIMBS {
+        polynomials[limb][0] = secrets[limb];
+        for coefficient in polynomials[limb].iter_mut().skip(1) {
+            *coefficient = random_scalar(rng);
         }
-        for (offset, value) in values.iter_mut().enumerate() {
-            value[byte] = evaluate(&coefficients, (offset + 1) as u8);
+        for coefficient in &mut blinding_polynomials[limb] {
+            *coefficient = random_scalar(rng);
         }
     }
-
+    let h = pedersen_h();
+    let commitments: Vec<Vec<String>> = polynomials
+        .iter()
+        .zip(blinding_polynomials.iter())
+        .map(|(polynomial, blinding_polynomial)| {
+            polynomial
+                .iter()
+                .zip(blinding_polynomial.iter())
+                .map(|(coefficient, blinding_coefficient)| {
+                    hex::encode(
+                        (coefficient * RISTRETTO_BASEPOINT_POINT + blinding_coefficient * h)
+                            .compress()
+                            .to_bytes(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     let public = keys.reconstruct()?.public_key();
     let public = public.as_complete_hybrid();
-    let manifest = ColdShareManifest {
+    let mut manifest = ColdShareManifest {
         format: SHARE_FORMAT.to_string(),
         version: SHARE_VERSION,
-        ceremony_id: hex::encode(ceremony_id),
+        ceremony_id: hex::encode(ceremony_id.as_slice()),
         created_unix_seconds,
-        validator_id: hex::encode(validator_id),
+        validator_id: hex::encode(hot_keys.public.validator_id),
+        hot_classical_pk: hex::encode(hot_keys.public.hybrid_classical_pk),
+        hot_pq_pk: hex::encode(&hot_keys.public.hybrid_pq_pk),
         cold_classical_pk: hex::encode(public.classical.0),
-        cold_pq_pk: hex::encode(public.pq.0.as_slice()),
+        cold_pq_pk: hex::encode(public.pq.0),
         threshold,
         share_count,
+        pedersen_commitments: commitments,
+        hot_classical_signature: String::new(),
+        hot_pq_signature: String::new(),
     };
+    let signature = hot_keypair(hot_keys)?
+        .sign(&manifest_signing_bytes(&manifest)?)
+        .map_err(|error| share_error(error.to_string()))?;
+    manifest.hot_classical_signature = hex::encode(signature.classical.0);
+    manifest.hot_pq_signature = hex::encode(signature.pq.0);
+    validate_cold_share_manifest(&manifest, &hot_keys.public)?;
 
+    let mut values = Zeroizing::new(vec![[Scalar::ZERO; SECRET_LIMBS]; share_count as usize]);
+    let mut blinding_values =
+        Zeroizing::new(vec![[Scalar::ZERO; SECRET_LIMBS]; share_count as usize]);
+    for (offset, share) in values.iter_mut().enumerate() {
+        let x = Scalar::from((offset + 1) as u64);
+        for limb in 0..SECRET_LIMBS {
+            share[limb] = evaluate(&polynomials[limb], x);
+            blinding_values[offset][limb] = evaluate(&blinding_polynomials[limb], x);
+        }
+    }
     let shares = values
         .iter()
+        .zip(blinding_values.iter())
         .enumerate()
-        .map(|(offset, value)| {
+        .map(|(offset, (value, blinding_value))| {
             let index = (offset + 1) as u8;
-            Ok(ColdShareFile {
+            let encoded = Zeroizing::new(encode_share(value));
+            let encoded_blinding = Zeroizing::new(encode_share(blinding_value));
+            let share = ColdShareFile {
                 manifest: manifest.clone(),
                 share_index: index,
-                share_value: hex::encode(value),
-                share_checksum: hex::encode(checksum(&manifest, index, value)?),
-            })
+                share_checksum: hex::encode(checksum(
+                    &manifest,
+                    index,
+                    &encoded,
+                    &encoded_blinding,
+                )?),
+                share_value: encoded.to_string(),
+                blinding_value: encoded_blinding.to_string(),
+            };
+            verify_cold_share(&share, &hot_keys.public)?;
+            Ok(share)
         })
         .collect::<KeystoreResult<Vec<_>>>()?;
-    values.zeroize();
     Ok(ColdShareCeremony { manifest, shares })
 }
 
-/// Validate and reconstruct a cold key from a threshold share collection.
-pub fn reconstruct_cold_shares(shares: &[ColdShareFile]) -> KeystoreResult<ColdKeysFile> {
+fn interpolate_zero(points: &[(Scalar, Scalar)]) -> KeystoreResult<Scalar> {
+    let mut result = Scalar::ZERO;
+    for (i, (x_i, y_i)) in points.iter().enumerate() {
+        let mut numerator = Scalar::ONE;
+        let mut denominator = Scalar::ONE;
+        for (j, (x_j, _)) in points.iter().enumerate() {
+            if i != j {
+                numerator *= -*x_j;
+                denominator *= *x_i - *x_j;
+            }
+        }
+        if denominator == Scalar::ZERO {
+            return Err(share_error("duplicate interpolation point"));
+        }
+        result += y_i * numerator * denominator.invert();
+    }
+    Ok(result)
+}
+
+/// Reconstruct only after hot authentication, per-share VSS, and comparison
+/// against an independently supplied expected cold public key.
+pub fn reconstruct_cold_shares(
+    shares: &[ColdShareFile],
+    expected_hot: &ValidatorKeys,
+    expected_cold: &ExpectedColdPublicKey,
+) -> KeystoreResult<ColdKeysFile> {
     let first = shares
         .first()
         .ok_or_else(|| share_error("no shares supplied"))?;
-    validate_manifest(&first.manifest)?;
+    validate_cold_share_manifest(&first.manifest, expected_hot)?;
     if shares.len() < first.manifest.threshold as usize {
         return Err(share_error(format!(
             "need at least {} shares, received {}",
@@ -264,72 +504,78 @@ pub fn reconstruct_cold_shares(shares: &[ColdShareFile]) -> KeystoreResult<ColdK
             shares.len()
         )));
     }
-    let mut parsed = Vec::with_capacity(shares.len());
+    if first.manifest.cold_classical_pk != hex::encode(expected_cold.classical)
+        || first.manifest.cold_pq_pk != hex::encode(&expected_cold.pq)
+    {
+        return Err(share_error(
+            "manifest cold key does not match independently expected key",
+        ));
+    }
+    let mut parsed = Zeroizing::new(Vec::with_capacity(shares.len()));
     let mut seen = [false; 256];
     for share in shares {
-        validate_manifest(&share.manifest)?;
         if share.manifest != first.manifest {
             return Err(share_error("shares belong to different ceremonies"));
         }
+        verify_cold_share(share, expected_hot)?;
         let index = share.share_index;
-        if index == 0 || index > share.manifest.share_count || seen[index as usize] {
-            return Err(share_error("share indices must be unique and within 1..=n"));
+        if seen[index as usize] {
+            return Err(share_error("share indices must be unique"));
         }
         seen[index as usize] = true;
-        let value = decode_fixed::<SECRET_BYTES>(&share.share_value, "share_value")?;
-        let supplied_checksum = decode_fixed::<32>(&share.share_checksum, "share_checksum")?;
-        if checksum(&share.manifest, index, &value)? != supplied_checksum {
-            return Err(share_error(format!("share {index} checksum mismatch")));
-        }
-        parsed.push((index, value));
+        parsed.push((index, decode_share(&share.share_value)?));
     }
     parsed.sort_by_key(|(index, _)| *index);
-    let threshold = first.manifest.threshold as usize;
-    let basis = &parsed[..threshold];
+    let basis = &parsed[..first.manifest.threshold as usize];
     let mut secret = Zeroizing::new([0u8; SECRET_BYTES]);
-    for byte in 0..SECRET_BYTES {
-        let points: Vec<(u8, u8)> = basis.iter().map(|(x, value)| (*x, value[byte])).collect();
-        secret[byte] = interpolate_at(&points, 0)?;
-        for (x, value) in parsed.iter().skip(threshold) {
-            if interpolate_at(&points, *x)? != value[byte] {
-                return Err(share_error(format!(
-                    "share {x} is inconsistent with threshold set"
-                )));
-            }
+    for limb in 0..SECRET_LIMBS {
+        let points = Zeroizing::new(
+            basis
+                .iter()
+                .map(|(index, values)| (Scalar::from(u64::from(*index)), values[limb]))
+                .collect::<Vec<_>>(),
+        );
+        let scalar = Zeroizing::new(interpolate_zero(&points)?);
+        let scalar_bytes = Zeroizing::new(scalar.to_bytes());
+        if scalar_bytes[LIMB_BYTES..].iter().any(|byte| *byte != 0) {
+            return Err(share_error(
+                "reconstructed limb is outside the canonical 128-bit range",
+            ));
         }
+        let start = limb * LIMB_BYTES;
+        secret[start..start + LIMB_BYTES].copy_from_slice(&scalar_bytes[..LIMB_BYTES]);
     }
-    let mut classical_seed = [0u8; 32];
-    let mut pq_seed = [0u8; 32];
+    let mut classical_seed = Zeroizing::new([0u8; 32]);
+    let mut pq_seed = Zeroizing::new([0u8; 32]);
     classical_seed.copy_from_slice(&secret[..32]);
     pq_seed.copy_from_slice(&secret[32..]);
-    let keypair = ColdHybridKeypair::from_independent_seeds(classical_seed, pq_seed)
-        .map_err(|e| share_error(e.to_string()))?;
+    let keypair = ColdHybridKeypair::from_independent_seeds(*classical_seed, *pq_seed)
+        .map_err(|error| share_error(error.to_string()))?;
     let public = keypair.public_key();
     let public = public.as_complete_hybrid();
-    let expected_classical =
-        decode_fixed::<32>(&first.manifest.cold_classical_pk, "cold_classical_pk")?;
-    let expected_pq = hex::decode(&first.manifest.cold_pq_pk)
-        .map_err(|_| share_error("cold_pq_pk is invalid hex"))?;
-    if public.classical.0 != expected_classical || public.pq.0.as_slice() != expected_pq {
+    if public.classical.0 != expected_cold.classical || public.pq.0.as_slice() != expected_cold.pq {
         return Err(share_error(
             "reconstructed secret does not match expected cold public key",
         ));
     }
     Ok(ColdKeysFile {
-        classical_seed,
-        pq_seed,
-        classical_pk: expected_classical,
-        pq_pk: expected_pq,
+        classical_seed: *classical_seed,
+        pq_seed: *pq_seed,
+        classical_pk: expected_cold.classical,
+        pq_pk: expected_cold.pq.clone(),
     })
 }
 
-/// Read and strictly decode one share file.
+/// Read and strictly decode one canonical share file. Trust is established
+/// separately by `verify_cold_share` against independently known hot metadata.
 pub fn read_cold_share(path: &Path) -> KeystoreResult<ColdShareFile> {
-    let json = std::fs::read_to_string(path)
-        .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?;
+    let json = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|error| KeystoreError::Io(format!("{}: {error}", path.display())))?,
+    );
     let share: ColdShareFile =
-        serde_json::from_str(&json).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-    validate_manifest(&share.manifest)?;
+        serde_json::from_str(&json).map_err(|error| KeystoreError::Parse(error.to_string()))?;
+    validate_manifest_structure(&share.manifest)?;
     Ok(share)
 }
 
@@ -345,8 +591,10 @@ pub fn write_cold_share_secure(
             path.display()
         )));
     }
-    let json =
-        serde_json::to_string_pretty(share).map_err(|e| KeystoreError::Parse(e.to_string()))?;
+    let json = Zeroizing::new(
+        serde_json::to_string_pretty(share)
+            .map_err(|error| KeystoreError::Parse(error.to_string()))?,
+    );
     write_keys_secure(
         path.to_str()
             .ok_or_else(|| KeystoreError::Io("share path is not UTF-8".into()))?,
@@ -358,38 +606,16 @@ pub fn write_cold_share_secure(
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
-    struct IncrementingRng(u8);
-
-    impl RngCore for IncrementingRng {
-        fn next_u32(&mut self) -> u32 {
-            let mut bytes = [0u8; 4];
-            self.fill_bytes(&mut bytes);
-            u32::from_le_bytes(bytes)
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut bytes = [0u8; 8];
-            self.fill_bytes(&mut bytes);
-            u64::from_le_bytes(bytes)
-        }
-
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
-            for byte in dest {
-                *byte = self.0;
-                self.0 = self.0.wrapping_add(1);
-            }
-        }
-
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-            self.fill_bytes(dest);
-            Ok(())
-        }
+    fn hot_fixture(seed: [u8; 32]) -> KeysFile {
+        crate::generate_from_master_seed("hot".into(), seed).unwrap()
     }
 
-    impl CryptoRng for IncrementingRng {}
-
-    fn fixture() -> ColdKeysFile {
+    fn cold_fixture() -> ColdKeysFile {
         let keypair = ColdHybridKeypair::from_independent_seeds([0x11; 32], [0x22; 32]).unwrap();
         let public = keypair.public_key();
         let public = public.as_complete_hybrid();
@@ -401,25 +627,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn aes_field_vectors_and_interpolation_are_independent_oracles() {
-        assert_eq!(gf_mul(0x57, 0x13), 0xfe);
-        assert_eq!(gf_mul(0x53, 0xca), 0x01);
-        let coefficients = [0x42, 0x19, 0xa7];
-        let points = [
-            (1, evaluate(&coefficients, 1)),
-            (2, evaluate(&coefficients, 2)),
-            (3, evaluate(&coefficients, 3)),
-        ];
-        assert_eq!(points, [(1, 0xfc), (2, 0xda), (3, 0x64)]);
-        assert_eq!(interpolate_at(&points, 0).unwrap(), 0x42);
+    fn expected(keys: &ColdKeysFile) -> ExpectedColdPublicKey {
+        ExpectedColdPublicKey {
+            classical: keys.classical_pk,
+            pq: keys.pq_pk.clone(),
+        }
+    }
+
+    fn ceremony() -> (KeysFile, ColdKeysFile, ColdShareCeremony) {
+        let hot = hot_fixture([0x44; 32]);
+        let cold = cold_fixture();
+        let mut rng = StdRng::from_seed([7; 32]);
+        let ceremony = generate_cold_share_ceremony(&cold, &hot, 3, 5, 1234, &mut rng).unwrap();
+        (hot, cold, ceremony)
     }
 
     #[test]
     fn threshold_subsets_reconstruct_exact_original() {
-        let keys = fixture();
-        let mut rng = StdRng::from_seed([7; 32]);
-        let ceremony = generate_cold_share_ceremony(&keys, [9; 32], 3, 5, 1234, &mut rng).unwrap();
+        let (hot, cold, ceremony) = ceremony();
         for first in 0..3 {
             for second in first + 1..4 {
                 for third in second + 1..5 {
@@ -428,126 +653,133 @@ mod tests {
                         ceremony.shares[second].clone(),
                         ceremony.shares[third].clone(),
                     ];
-                    assert_eq!(reconstruct_cold_shares(&shares).unwrap(), keys);
+                    assert_eq!(
+                        reconstruct_cold_shares(&shares, &hot.public, &expected(&cold)).unwrap(),
+                        cold
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn fixed_rng_end_to_end_vector() {
-        let keys = fixture();
-        let ceremony = generate_cold_share_ceremony(
-            &keys,
-            [0x33; 32],
-            2,
-            3,
-            0x0102_0304_0506_0708,
-            &mut IncrementingRng(0),
-        )
-        .unwrap();
-        assert_eq!(
-            ceremony.shares[0].share_value,
-            "313033323534373639383b3a3d3c3f3e212023222524272629282b2a2d2c2f2e62636061666764656a6b68696e6f6c6d72737071767774757a7b78797e7f7c7d"
-        );
-        assert_eq!(
-            ceremony.shares[0].share_checksum,
-            "9e03726a5d619f6ed9f108bf054a38c1afa4293d684346c3c4a99d9ad6ac16c0"
-        );
-        assert_eq!(
-            reconstruct_cold_shares(&ceremony.shares[1..]).unwrap(),
-            keys
-        );
-    }
-
-    #[test]
-    fn fewer_than_threshold_is_rejected_and_one_byte_has_perfect_secrecy() {
-        let keys = fixture();
-        let mut rng = StdRng::from_seed([8; 32]);
-        let ceremony = generate_cold_share_ceremony(&keys, [9; 32], 2, 3, 1234, &mut rng).unwrap();
-        assert!(reconstruct_cold_shares(&ceremony.shares[..1]).is_err());
-
-        // With one observation of a degree-one polynomial, every possible
-        // secret byte has exactly one compatible slope.
-        let x = 7u8;
-        let observed = 0x91u8;
-        for candidate_secret in 0u8..=255 {
-            let slope = gf_mul(observed ^ candidate_secret, gf_inv(x).unwrap());
-            assert_eq!(evaluate(&[candidate_secret, slope], x), observed);
-        }
-
-        // With two observations of a degree-two polynomial, every possible
-        // secret byte likewise has exactly one compatible coefficient pair.
-        let observations = [(5u8, 0x27u8), (11u8, 0xd4u8)];
-        for candidate_secret in 0u8..=255 {
-            let mut compatible_polynomials = 0usize;
-            for linear in 0u8..=255 {
-                let x = observations[0].0;
-                let quadratic = gf_mul(
-                    observations[0].1 ^ candidate_secret ^ gf_mul(linear, x),
-                    gf_inv(gf_mul(x, x)).unwrap(),
-                );
-                if evaluate(&[candidate_secret, linear, quadratic], observations[1].0)
-                    == observations[1].1
-                {
-                    compatible_polynomials += 1;
-                }
-            }
-            assert_eq!(compatible_polynomials, 1);
-        }
-    }
-
-    #[test]
-    fn corruption_cross_ceremony_and_inconsistent_extra_share_fail_closed() {
-        let keys = fixture();
-        let mut rng_a = StdRng::from_seed([1; 32]);
-        let mut rng_b = StdRng::from_seed([2; 32]);
-        let a = generate_cold_share_ceremony(&keys, [9; 32], 2, 3, 1, &mut rng_a).unwrap();
-        let b = generate_cold_share_ceremony(&keys, [9; 32], 2, 3, 1, &mut rng_b).unwrap();
-        let mut corrupt = a.shares[0].clone();
-        corrupt.share_value.replace_range(0..2, "ff");
-        assert!(reconstruct_cold_shares(&[corrupt, a.shares[1].clone()]).is_err());
-        assert!(reconstruct_cold_shares(&[a.shares[0].clone(), b.shares[1].clone()]).is_err());
-
-        let mut malicious = a.shares[2].clone();
-        malicious.share_value.replace_range(0..2, "00");
-        let value = decode_fixed::<SECRET_BYTES>(&malicious.share_value, "share_value").unwrap();
-        malicious.share_checksum =
-            hex::encode(checksum(&malicious.manifest, malicious.share_index, &value).unwrap());
-        assert!(
-            reconstruct_cold_shares(&[a.shares[0].clone(), a.shares[1].clone(), malicious])
-                .is_err()
-        );
-
-        // Even if an attacker recomputes the unkeyed checksum, a corrupted
-        // threshold subset cannot silently reconstruct a different cold key.
-        let mut threshold_only_tamper = a.shares[0].clone();
-        threshold_only_tamper.share_value.replace_range(0..2, "00");
-        let value = decode_fixed::<SECRET_BYTES>(&threshold_only_tamper.share_value, "share_value")
-            .unwrap();
-        threshold_only_tamper.share_checksum = hex::encode(
+    fn one_custodian_detects_vss_inconsistent_share_without_pooling() {
+        let (hot, _cold, ceremony) = ceremony();
+        let mut tampered = ceremony.shares[0].clone();
+        tampered.share_value.replace_range(0..2, "00");
+        tampered.share_checksum = hex::encode(
             checksum(
-                &threshold_only_tamper.manifest,
-                threshold_only_tamper.share_index,
-                &value,
+                &tampered.manifest,
+                tampered.share_index,
+                &tampered.share_value,
+                &tampered.blinding_value,
             )
             .unwrap(),
         );
-        assert!(reconstruct_cold_shares(&[threshold_only_tamper, a.shares[1].clone()]).is_err());
+        assert!(verify_cold_share(&tampered, &hot.public).is_err());
+
+        let mut tampered_blinding = ceremony.shares[0].clone();
+        tampered_blinding.blinding_value.replace_range(0..2, "00");
+        tampered_blinding.share_checksum = hex::encode(
+            checksum(
+                &tampered_blinding.manifest,
+                tampered_blinding.share_index,
+                &tampered_blinding.share_value,
+                &tampered_blinding.blinding_value,
+            )
+            .unwrap(),
+        );
+        assert!(verify_cold_share(&tampered_blinding, &hot.public).is_err());
     }
 
     #[test]
-    fn threshold_and_unknown_json_fields_fail_closed() {
-        let keys = fixture();
+    fn substituted_or_tampered_manifest_is_rejected() {
+        let (hot, cold, ceremony) = ceremony();
+        let other = hot_fixture([0x55; 32]);
+        assert!(validate_cold_share_manifest(&ceremony.manifest, &other.public).is_err());
+        let mut tampered = ceremony.shares[0].clone();
+        tampered.manifest.cold_classical_pk = hex::encode([0x99; 32]);
+        assert!(verify_cold_share(&tampered, &hot.public).is_err());
+        assert!(reconstruct_cold_shares(
+            &ceremony.shares[..3],
+            &hot.public,
+            &ExpectedColdPublicKey {
+                classical: [0x99; 32],
+                pq: cold.pq_pk.clone(),
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pedersen_constant_commitment_is_hiding_and_rerandomized() {
+        let (hot, cold, first) = ceremony();
+        let commitments = parse_commitments(&first.manifest).unwrap();
+        let limbs = Zeroizing::new(secret_limbs(&cold));
+        for limb in 0..SECRET_LIMBS {
+            let bare_secret_commitment = limbs[limb] * RISTRETTO_BASEPOINT_POINT;
+            assert_ne!(commitments[limb][0], bare_secret_commitment);
+        }
+
+        let mut rng = StdRng::from_seed([8; 32]);
+        let second = generate_cold_share_ceremony(&cold, &hot, 3, 5, 1234, &mut rng).unwrap();
+        assert_ne!(
+            first.manifest.pedersen_commitments,
+            second.manifest.pedersen_commitments
+        );
+        assert_ne!(pedersen_h(), RistrettoPoint::default());
+        assert_ne!(pedersen_h(), RISTRETTO_BASEPOINT_POINT);
+    }
+
+    #[test]
+    fn threshold_and_unknown_fields_fail_closed() {
+        let hot = hot_fixture([0x44; 32]);
+        let cold = cold_fixture();
         let mut rng = StdRng::from_seed([3; 32]);
-        assert!(generate_cold_share_ceremony(&keys, [0; 32], 1, 3, 0, &mut rng).is_err());
-        assert!(generate_cold_share_ceremony(&keys, [0; 32], 4, 3, 0, &mut rng).is_err());
-        let ceremony = generate_cold_share_ceremony(&keys, [0; 32], 2, 3, 0, &mut rng).unwrap();
+        assert!(generate_cold_share_ceremony(&cold, &hot, 1, 3, 0, &mut rng).is_err());
+        assert!(generate_cold_share_ceremony(&cold, &hot, 4, 3, 0, &mut rng).is_err());
+        let ceremony = generate_cold_share_ceremony(&cold, &hot, 2, 3, 0, &mut rng).unwrap();
         let mut value = serde_json::to_value(&ceremony.shares[0]).unwrap();
         value
             .as_object_mut()
             .unwrap()
             .insert("unexpected".into(), serde_json::json!(1));
         assert!(serde_json::from_value::<ColdShareFile>(value).is_err());
+    }
+
+    struct PanicZeroizeProbe {
+        observed: Arc<AtomicBool>,
+    }
+
+    impl Zeroize for PanicZeroizeProbe {
+        fn zeroize(&mut self) {
+            self.observed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn zeroizing_runs_during_panic_unwind() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<ColdShareFile>();
+        assert_zeroize_on_drop::<ColdShareCeremony>();
+        assert_zeroize_on_drop::<ColdKeysFile>();
+        assert_zeroize_on_drop::<PqKeypair>();
+        let observed = Arc::new(AtomicBool::new(false));
+        let result = std::panic::catch_unwind({
+            let observed = observed.clone();
+            move || {
+                let _secret = Zeroizing::new(PanicZeroizeProbe { observed });
+                panic!("injected ceremony failure");
+            }
+        });
+        assert!(result.is_err());
+        assert!(observed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn no_custom_branching_gf256_arithmetic_remains() {
+        let source = include_str!("cold_shamir.rs");
+        assert!(!source.contains(&["fn", "gf_mul"].join(" ")));
+        assert!(!source.contains(&["fn", "gf_inv"].join(" ")));
     }
 }
