@@ -43,15 +43,22 @@ pub fn apply_governance_op(
 
 /// Apply an admission-verified governance operation without repeating crypto.
 ///
-/// Callers must first confirm that its admission authority fingerprint still
-/// matches canonical state.
+/// The certificate is checked against both the operation and current canonical
+/// authority before the intrinsic cryptographic checks may be reused.
 pub fn apply_verified_governance_op(
     state: &mut ChainState,
     op: &GovernanceOpV2,
+    verified: &crate::pending::VerifiedPendingGovernance,
     current_epoch: u64,
     current_height: u64,
     chain_id: &str,
 ) -> StateResult<()> {
+    if !crate::pending::governance_authority_unchanged(state, op, verified) {
+        return Err(StateError::InvariantViolation {
+            message:
+                "pending governance certificate does not match operation or canonical authority",
+        });
+    }
     apply_governance_op_inner(state, op, current_epoch, current_height, chain_id, false)
 }
 

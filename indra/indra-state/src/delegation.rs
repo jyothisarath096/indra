@@ -47,14 +47,20 @@ pub fn apply_staking_op(
 
 /// Apply an admission-verified staking operation without repeating intrinsic crypto.
 ///
-/// Callers must compare the operation's authority fingerprint with the one
-/// captured during full admission verification before using this function.
+/// The certificate is checked against both the operation and current canonical
+/// authority before the intrinsic cryptographic checks may be reused.
 pub fn apply_verified_staking_op(
     state: &mut ChainState,
     op: &StakingOp,
+    verified: &crate::pending::VerifiedPendingStaking,
     chain_id: &str,
     current_height: u64,
 ) -> StateResult<()> {
+    if !crate::pending::staking_authority_unchanged(state, op, verified) {
+        return Err(StateError::InvariantViolation {
+            message: "pending staking certificate does not match operation or canonical authority",
+        });
+    }
     op.validate_structure()
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
     apply_staking_op_mode(state, op, chain_id, current_height, false)

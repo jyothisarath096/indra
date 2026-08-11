@@ -801,13 +801,14 @@ pub fn try_apply_staking_candidate(
 pub fn try_apply_verified_staking_candidate(
     state: &mut ChainState,
     op: &StakingOp,
+    verified: &crate::pending::VerifiedPendingStaking,
     height: u64,
 ) -> StateResult<()> {
     let chain_id = state.chain_id.clone();
     let mut txn = StateTxn::begin(state, height);
     txn.snapshot_staking_scope();
     txn.snapshot_delegator_identity_scope();
-    crate::apply_verified_staking_op(txn.state_mut(), op, &chain_id, height)?;
+    crate::apply_verified_staking_op(txn.state_mut(), op, verified, &chain_id, height)?;
     txn.after_mutation()?;
     txn.commit_scratch();
     Ok(())
@@ -834,6 +835,7 @@ pub fn try_apply_governance_candidate(
 pub fn try_apply_verified_governance_candidate(
     state: &mut ChainState,
     op: &GovernanceOpV2,
+    verified: &crate::pending::VerifiedPendingGovernance,
     current_epoch: u64,
     height: u64,
 ) -> StateResult<()> {
@@ -841,7 +843,14 @@ pub fn try_apply_verified_governance_candidate(
     let mut txn = StateTxn::begin(state, height);
     txn.snapshot_governance_scope();
     txn.snapshot_delegator_identity_scope();
-    crate::apply_verified_governance_op(txn.state_mut(), op, current_epoch, height, &chain_id)?;
+    crate::apply_verified_governance_op(
+        txn.state_mut(),
+        op,
+        verified,
+        current_epoch,
+        height,
+        &chain_id,
+    )?;
     txn.after_mutation()?;
     txn.commit_scratch();
     Ok(())
@@ -2124,9 +2133,23 @@ mod tests {
         let mut full = state.clone();
         let mut targeted = state.clone();
         let full_result = try_apply_staking_candidate(&mut full, op, height);
-        let targeted_result = try_apply_verified_staking_candidate(&mut targeted, op, height);
+        let targeted_result =
+            try_apply_verified_staking_candidate(&mut targeted, op, &verified, height);
         assert_eq!(full_result.is_ok(), targeted_result.is_ok());
         assert_eq!(full.encode_to_vec(), targeted.encode_to_vec());
+
+        let mut mismatched_op = op.clone();
+        mismatched_op.nonce = mismatched_op.nonce.saturating_add(1);
+        let mut mismatch_state = state.clone();
+        assert!(matches!(
+            try_apply_verified_staking_candidate(
+                &mut mismatch_state,
+                &mismatched_op,
+                &verified,
+                height,
+            ),
+            Err(StateError::InvariantViolation { .. })
+        ));
 
         // A canonical nonce advance is sufficient to make every operation
         // variant stale. This compares the retained/evicted decision, which
@@ -2140,9 +2163,32 @@ mod tests {
         }
         let mut full_changed = changed.clone();
         let mut targeted_changed = changed;
+        let targeted_changed_result =
+            if crate::pending::staking_authority_unchanged(&targeted_changed, op, &verified) {
+                try_apply_verified_staking_candidate(&mut targeted_changed, op, &verified, height)
+            } else {
+                assert!(matches!(
+                    try_apply_verified_staking_candidate(
+                        &mut targeted_changed.clone(),
+                        op,
+                        &verified,
+                        height,
+                    ),
+                    Err(StateError::InvariantViolation { .. })
+                ));
+                match crate::pending::verify_pending_staking(&targeted_changed, op, height) {
+                    Ok(refreshed) => try_apply_verified_staking_candidate(
+                        &mut targeted_changed,
+                        op,
+                        &refreshed,
+                        height,
+                    ),
+                    Err(error) => Err(error),
+                }
+            };
         assert_eq!(
             try_apply_staking_candidate(&mut full_changed, op, height).is_ok(),
-            try_apply_verified_staking_candidate(&mut targeted_changed, op, height).is_ok(),
+            targeted_changed_result.is_ok(),
         );
     }
 
@@ -2162,9 +2208,24 @@ mod tests {
         let mut targeted = state.clone();
         assert_eq!(
             try_apply_governance_candidate(&mut full, op, epoch, height).is_ok(),
-            try_apply_verified_governance_candidate(&mut targeted, op, epoch, height).is_ok(),
+            try_apply_verified_governance_candidate(&mut targeted, op, &verified, epoch, height)
+                .is_ok(),
         );
         assert_eq!(full.encode_to_vec(), targeted.encode_to_vec());
+
+        let mut mismatched_op = op.clone();
+        mismatched_op.nonce = mismatched_op.nonce.saturating_add(1);
+        let mut mismatch_state = state.clone();
+        assert!(matches!(
+            try_apply_verified_governance_candidate(
+                &mut mismatch_state,
+                &mismatched_op,
+                &verified,
+                epoch,
+                height,
+            ),
+            Err(StateError::InvariantViolation { .. })
+        ));
 
         let mut changed = state.clone();
         if let Some(validator) = changed.validators.get_mut(&op.signer_id) {
@@ -2177,10 +2238,45 @@ mod tests {
         }
         let mut full_changed = changed.clone();
         let mut targeted_changed = changed;
+        let targeted_changed_result =
+            if crate::pending::governance_authority_unchanged(&targeted_changed, op, &verified) {
+                try_apply_verified_governance_candidate(
+                    &mut targeted_changed,
+                    op,
+                    &verified,
+                    epoch,
+                    height,
+                )
+            } else {
+                assert!(matches!(
+                    try_apply_verified_governance_candidate(
+                        &mut targeted_changed.clone(),
+                        op,
+                        &verified,
+                        epoch,
+                        height,
+                    ),
+                    Err(StateError::InvariantViolation { .. })
+                ));
+                match crate::pending::verify_pending_governance(
+                    &targeted_changed,
+                    op,
+                    epoch,
+                    height,
+                ) {
+                    Ok(refreshed) => try_apply_verified_governance_candidate(
+                        &mut targeted_changed,
+                        op,
+                        &refreshed,
+                        epoch,
+                        height,
+                    ),
+                    Err(error) => Err(error),
+                }
+            };
         assert_eq!(
             try_apply_governance_candidate(&mut full_changed, op, epoch, height,).is_ok(),
-            try_apply_verified_governance_candidate(&mut targeted_changed, op, epoch, height,)
-                .is_ok(),
+            targeted_changed_result.is_ok(),
         );
     }
 

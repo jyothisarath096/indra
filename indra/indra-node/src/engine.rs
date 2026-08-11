@@ -374,9 +374,14 @@ impl NodeEngine {
                 Some(verified)
                     if indra_state::pending::staking_authority_unchanged(state, op, verified) =>
                 {
-                    indra_state::try_apply_verified_staking_candidate(&mut scratch, op, height)
-                        .is_ok()
-                        .then(|| verified.clone())
+                    indra_state::try_apply_verified_staking_candidate(
+                        &mut scratch,
+                        op,
+                        verified,
+                        height,
+                    )
+                    .is_ok()
+                    .then(|| verified.clone())
                 }
                 _ => indra_state::pending::verify_pending_staking(state, op, height).ok(),
             };
@@ -411,6 +416,7 @@ impl NodeEngine {
                     indra_state::try_apply_verified_governance_candidate(
                         &mut scratch,
                         op,
+                        verified,
                         epoch,
                         height,
                     )
@@ -3252,6 +3258,7 @@ mod tests {
             indra_state::try_apply_verified_staking_candidate(
                 &mut scratch,
                 &staking,
+                &verified_staking,
                 engine.state.height.saturating_add(1),
             )
             .unwrap();
@@ -3321,6 +3328,7 @@ mod tests {
             indra_state::try_apply_verified_governance_candidate(
                 &mut scratch,
                 &governance,
+                &verified_governance,
                 epoch,
                 height,
             )
